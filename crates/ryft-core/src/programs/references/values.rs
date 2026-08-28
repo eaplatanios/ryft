@@ -1108,14 +1108,26 @@ pub struct ReferenceCompletion {
 
 // TODO(eaplatanios): Review this block.
 impl ReferenceCompletion {
-    /// Wraps a backend completion in a cloneable type-erased token.
-    pub fn new(backend: impl ReferenceCompletionBackend) -> Self {
+    /// Wraps a [`ReferenceCompletionBackend`] into a new [`ReferenceCompletion`].
+    #[inline]
+    pub fn new<B: ReferenceCompletionBackend>(backend: B) -> Self {
         Self { storage: ReferenceCompletionStorage::Backend(Arc::new(backend)) }
     }
 
-    /// Creates a token with an already-known terminal `result`.
+    /// Creates a new [`ReferenceCompletion`] token with an already-known terminal `result`.
+    #[inline]
     pub fn ready(result: Result<(), Arc<str>>) -> Self {
         Self::new(ReadyReferenceCompletion(result))
+    }
+
+    // TODO(eaplatanios): Why is the "terminal failure" an `Arc<str>`?
+    /// Returns `Ok(false)` while any represented work is pending, `Ok(true)` after success, or the terminal failure.
+    #[inline]
+    pub fn is_ready(&self) -> Result<bool, Arc<str>> {
+        match &self.storage {
+            ReferenceCompletionStorage::Backend(backend) => backend.is_ready(),
+            ReferenceCompletionStorage::Joined(joined) => joined.is_ready(),
+        }
     }
 
     /// Returns a token that completes after every input token and reports the first failure in input order.
@@ -1155,15 +1167,6 @@ impl ReferenceCompletion {
         match &self.storage {
             ReferenceCompletionStorage::Backend(backend) => backend.r#await(),
             ReferenceCompletionStorage::Joined(joined) => joined.r#await(),
-        }
-    }
-
-    /// Returns `Ok(false)` while any represented work is pending, `Ok(true)` after success, or the terminal failure.
-    #[inline]
-    pub fn is_ready(&self) -> Result<bool, Arc<str>> {
-        match &self.storage {
-            ReferenceCompletionStorage::Backend(backend) => backend.is_ready(),
-            ReferenceCompletionStorage::Joined(joined) => joined.is_ready(),
         }
     }
 }
@@ -1273,7 +1276,9 @@ mod tests {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     use std::panic::{AssertUnwindSafe, catch_unwind};
-    use std::sync::Condvar;
+    use std::sync::mpsc::{TryRecvError, channel};
+    use std::sync::{Arc, Condvar, Mutex, Weak};
+    use std::thread;
     use std::time::Duration;
 
     use pretty_assertions::assert_eq;
@@ -1286,12 +1291,10 @@ mod tests {
 
     use super::*;
 
-    fn reference_new<V: Value>(value: V) -> Reference<V> {
-        Reference::new(value).unwrap()
-    }
+    const TEST_TIMEOUT: Duration = Duration::from_secs(10);
 
     // Simulates the successful-submission and pending-installation phases used by asynchronous backend tests.
-    fn submit_pending<V: Value>(
+    fn transition_to_pending<V: Value>(
         guard: &mut ReferenceGuard<'_, V>,
         completion: ReferenceCompletion,
         replacement: ReferenceReplacement<V>,
@@ -1303,7 +1306,7 @@ mod tests {
         Ok(generation)
     }
 
-    // Completion backend that lets tests observe when a waiter blocks and resolve it explicitly.
+    // Completion backend with a bounded waiter handshake so a broken asynchronous protocol fails instead of hanging.
     #[derive(Clone)]
     struct ControlledCompletion {
         state: Arc<(Mutex<ControlledCompletionState>, Condvar)>,
@@ -1325,11 +1328,10 @@ mod tests {
         }
 
         fn wait_until_awaited(&self) {
-            let (state, awaiting) = &*self.state;
-            let mut state = state.lock().unwrap();
-            while !state.awaiting {
-                state = awaiting.wait(state).unwrap();
-            }
+            let (state, changed) = &*self.state;
+            let state = state.lock().unwrap();
+            let (state, _) = changed.wait_timeout_while(state, TEST_TIMEOUT, |state| !state.awaiting).unwrap();
+            assert!(state.awaiting, "completion was not awaited within {TEST_TIMEOUT:?}");
         }
 
         fn complete(&self, result: Result<(), Arc<str>>) {
@@ -1343,13 +1345,12 @@ mod tests {
 
     impl ReferenceCompletionBackend for ControlledCompletion {
         fn r#await(&self) -> Result<(), Arc<str>> {
-            let (state, ready) = &*self.state;
+            let (state, changed) = &*self.state;
             let mut state = state.lock().unwrap();
             state.awaiting = true;
-            ready.notify_all();
-            while state.result.is_none() {
-                state = ready.wait(state).unwrap();
-            }
+            changed.notify_all();
+            let (state, _) = changed.wait_timeout_while(state, TEST_TIMEOUT, |state| state.result.is_none()).unwrap();
+            assert!(state.result.is_some(), "completion was not resolved within {TEST_TIMEOUT:?}");
             state.result.clone().unwrap()
         }
 
@@ -1360,7 +1361,807 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_completion_join_preserves_ordered_failure() {
+    fn test_reference_new_rejects_an_immediate_reference_referent() {
+        let nested = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
+
+        assert!(matches!(
+            Reference::new(nested),
+            Err(ReferenceError::NestedReferent { referent_type }) if referent_type == "ref<f32[]>"
+        ));
+    }
+
+    #[test]
+    fn test_reference_clone_shares_allocation_identity_hashing_and_rendering() {
+        let initial = Array::vector(vec![1.0_f32, 2.0]);
+        let reference = Reference::new(initial.clone()).unwrap();
+        let alias = reference.clone();
+        let distinct = Reference::new(initial).unwrap();
+
+        assert_eq!(&reference, &reference);
+        assert_eq!(reference, alias);
+        assert_ne!(reference, distinct);
+        assert_eq!(reference.id(), alias.id());
+        assert_ne!(reference.id(), distinct.id());
+        assert_eq!(reference.read(), Ok(Array::vector(vec![1.0_f32, 2.0])));
+        assert_eq!(reference.r#type(), alias.r#type());
+        assert_eq!(reference.r#type(), distinct.r#type());
+        assert!(reference.uses_root_type_identities());
+        assert!(alias.uses_root_type_identities());
+
+        // Display is deterministic and type-based, while Debug also exposes process-local allocation identity.
+        assert_eq!(reference.to_string(), "ref<f32[2]>");
+        assert_eq!(reference.to_string(), distinct.to_string());
+        assert_eq!(
+            format!("{reference:?}"),
+            format!("Reference {{ id: {:?}, type: {:?} }}", reference.id(), reference.r#type()),
+        );
+
+        let mut reference_hasher = DefaultHasher::new();
+        reference.hash(&mut reference_hasher);
+        let mut alias_hasher = DefaultHasher::new();
+        alias.hash(&mut alias_hasher);
+        assert_eq!(reference_hasher.finish(), alias_hasher.finish());
+
+        let references = HashMap::from([(reference.clone(), "root")]);
+        assert_eq!(references.get(&alias), Some(&"root"));
+        assert_eq!(references.get(&distinct), None);
+    }
+
+    #[test]
+    fn test_reference_clone_shares_one_word_handle_storage() {
+        assert_eq!(size_of::<Reference<Array>>(), size_of::<usize>());
+
+        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let alias = reference.clone();
+        assert!(Arc::ptr_eq(&alias.handle, &reference.handle));
+    }
+
+    #[test]
+    fn test_reference_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+
+        assert_send_sync::<Reference<Array>>();
+    }
+
+    #[test]
+    fn test_reference_mutations_preserve_snapshots_and_independent_allocations() {
+        let initializer = Array::vector(vec![1.0_f32, 2.0]);
+        let first = Reference::new(initializer.clone()).unwrap();
+        let second = Reference::new(initializer.clone()).unwrap();
+        let read_snapshot = first.read().unwrap();
+        let replacement = Array::vector(vec![3.0_f32, 4.0]);
+        let retained_replacement = replacement.clone();
+
+        assert_eq!(first.write(replacement), Ok(()));
+        assert_eq!(first.swap(Array::vector(vec![7.0_f32, 8.0])), Ok(Array::vector(vec![3.0_f32, 4.0])));
+        assert_eq!(
+            first.update(|current| {
+                current.add(&Array::vector(vec![10.0_f32, 20.0])).map(|updated| (updated, "updated"))
+            }),
+            Ok("updated"),
+        );
+        assert_eq!(second.read(), Ok(initializer.clone()));
+        assert_eq!(second.swap(Array::vector(vec![5.0_f32, 6.0])), Ok(initializer.clone()));
+
+        assert_eq!(initializer, Array::vector(vec![1.0_f32, 2.0]));
+        assert_eq!(read_snapshot, Array::vector(vec![1.0_f32, 2.0]));
+        assert_eq!(retained_replacement, Array::vector(vec![3.0_f32, 4.0]));
+        assert_eq!(first.read(), Ok(Array::vector(vec![17.0_f32, 28.0])));
+        assert_eq!(second.read(), Ok(Array::vector(vec![5.0_f32, 6.0])));
+    }
+
+    #[test]
+    fn test_reference_rejected_replacements_and_updates_preserve_state() {
+        let initial = Array::vector(vec![1.0_f32, 2.0]);
+        let reference = Reference::new(initial.clone()).unwrap();
+        let mismatch =
+            ReferenceError::ReferentTypeMismatch { expected: "f32[2]".to_string(), actual: "f32[3]".to_string() };
+
+        assert_eq!(reference.swap(Array::vector(vec![3.0_f32, 4.0, 5.0])), Err(mismatch.clone()));
+        assert_eq!(reference.read(), Ok(initial.clone()));
+        assert_eq!(reference.write(Array::vector(vec![3.0_f32, 4.0, 5.0])), Err(mismatch.clone()));
+        assert_eq!(reference.read(), Ok(initial.clone()));
+
+        let update_error = ProgramError::InvalidArgument { message: "test update failed".to_string() };
+        assert_eq!(reference.update::<(), _>(|_| Err(update_error.clone())), Err(update_error));
+        assert_eq!(reference.read(), Ok(initial.clone()));
+
+        let error = reference.update(|_| Ok((Array::vector(vec![3.0_f32, 4.0, 5.0]), ()))).unwrap_err();
+        assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&mismatch));
+        assert_eq!(reference.read(), Ok(initial));
+    }
+
+    #[test]
+    fn test_reference_generation_advances_only_after_committed_mutations() {
+        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let initial_observation = reference.lock().unwrap().observe().unwrap();
+        let initial_generation = initial_observation.generation();
+
+        assert_eq!(reference.read(), Ok(Array::scalar(1.0_f32)));
+        assert_eq!(reference.lock().unwrap().observe().unwrap().generation(), initial_generation);
+        assert!(reference.lock().unwrap().is_current(&initial_observation).unwrap());
+
+        assert_eq!(reference.swap(Array::scalar(2.0_f32)), Ok(Array::scalar(1.0_f32)));
+        let swapped_generation = reference.lock().unwrap().observe().unwrap().generation();
+        assert_eq!(swapped_generation, ReferenceGeneration(initial_generation.0 + 1));
+        assert!(!reference.lock().unwrap().is_current(&initial_observation).unwrap());
+
+        assert_eq!(reference.write(Array::scalar(3.0_f32)), Ok(()));
+        let written_generation = reference.lock().unwrap().observe().unwrap().generation();
+        assert_eq!(written_generation, ReferenceGeneration(swapped_generation.0 + 1));
+
+        let rejected = ProgramError::InvalidArgument { message: "rejected update".to_string() };
+        assert_eq!(reference.update::<(), _>(|_| Err(rejected.clone())), Err(rejected));
+        assert_eq!(reference.lock().unwrap().observe().unwrap().generation(), written_generation);
+
+        assert_eq!(reference.update(|_| Ok((Array::scalar(4.0_f32), "updated"))), Ok("updated"));
+        let updated_generation = reference.lock().unwrap().observe().unwrap().generation();
+        assert_eq!(updated_generation, ReferenceGeneration(written_generation.0 + 1));
+    }
+
+    #[test]
+    fn test_reference_mutations_preserve_state_when_the_generation_is_exhausted() {
+        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        {
+            let mut state = reference.handle.holder.state.lock().unwrap();
+            let ReferenceState::Ready { generation, .. } = &mut *state else {
+                unreachable!("a newly allocated reference is ready")
+            };
+            *generation = ReferenceGeneration(u64::MAX);
+        }
+
+        assert_eq!(reference.write(Array::scalar(2.0_f32)), Err(ReferenceError::GenerationExhausted));
+        let mut guard = reference.lock().unwrap();
+        assert_eq!(guard.next_generation(), Err(ReferenceError::GenerationExhausted));
+        assert_eq!(guard.take(), Err(ReferenceError::GenerationExhausted));
+        let observation = guard.observe().unwrap();
+        assert_eq!(observation.generation(), ReferenceGeneration(u64::MAX));
+        assert_eq!(observation.snapshot(), &Array::scalar(1.0_f32));
+        drop(guard);
+        assert_eq!(reference.read(), Ok(Array::scalar(1.0_f32)));
+    }
+
+    #[test]
+    fn test_reference_write_commits_calls_from_multiple_threads() {
+        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let initial_generation = reference.lock().unwrap().observe().unwrap().generation();
+        let first_reference = reference.clone();
+        let second_reference = reference.clone();
+        let (sender, receiver) = channel();
+        let first_sender = sender.clone();
+        let first = thread::spawn(move || first_sender.send(first_reference.write(Array::scalar(2.0_f32))).unwrap());
+        let second = thread::spawn(move || sender.send(second_reference.write(Array::scalar(3.0_f32))).unwrap());
+
+        assert_eq!(
+            receiver
+                .recv_timeout(TEST_TIMEOUT)
+                .unwrap_or_else(|error| { panic!("first reference write result within {TEST_TIMEOUT:?}: {error}") }),
+            Ok(()),
+        );
+        assert_eq!(
+            receiver
+                .recv_timeout(TEST_TIMEOUT)
+                .unwrap_or_else(|error| { panic!("second reference write result within {TEST_TIMEOUT:?}: {error}") }),
+            Ok(()),
+        );
+        first.join().unwrap();
+        second.join().unwrap();
+        assert!(
+            matches!(reference.read(), Ok(value) if value == Array::scalar(2.0_f32) || value == Array::scalar(3.0_f32))
+        );
+        assert_eq!(reference.lock().unwrap().observe().unwrap().generation().0, initial_generation.0 + 2);
+    }
+
+    #[test]
+    fn test_reference_access_reports_unexpected_mutex_poisoning() {
+        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let allocation = Arc::clone(&reference.handle.holder);
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                let _guard = allocation.state.lock().unwrap();
+                panic!("poison reference allocation");
+            }))
+            .is_err(),
+        );
+        assert_eq!(reference.read(), Err(ReferenceError::Poisoned));
+        assert_eq!(reference.write(Array::scalar(2.0_f32)), Err(ReferenceError::Poisoned));
+    }
+
+    #[test]
+    fn test_reference_freeze_invalidates_every_alias_before_running_later_updates() {
+        let reference = Reference::new(Array::vector(vec![1.0_f32, 2.0])).unwrap();
+        let alias = reference.clone();
+        assert_eq!(reference.freeze(), Ok(Array::vector(vec![1.0_f32, 2.0])));
+
+        assert_eq!(alias.read(), Err(ReferenceError::Frozen));
+        assert_eq!(alias.write(Array::vector(vec![3.0_f32, 4.0])), Err(ReferenceError::Frozen));
+        assert_eq!(alias.swap(Array::vector(vec![3.0_f32, 4.0])), Err(ReferenceError::Frozen));
+        assert_eq!(reference.freeze(), Err(ReferenceError::Frozen));
+
+        let update_executed = Cell::new(false);
+        let error = alias
+            .update(|_| {
+                update_executed.set(true);
+                Ok((Array::vector(vec![3.0_f32, 4.0]), ()))
+            })
+            .unwrap_err();
+        assert!(!update_executed.get());
+        assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
+    }
+
+    #[test]
+    fn test_reference_rename_type_identities_composes_aliases_and_preserves_allocation_identity() {
+        let bounds = DimensionBounds::positive(Some(9)).unwrap();
+        let source = DimensionVariable::new("source", bounds);
+        let middle = DimensionVariable::new("middle", bounds);
+        let target = DimensionVariable::new("target", bounds);
+        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone())]));
+        let middle_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(middle.clone())]));
+        let target_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(target.clone())]));
+        let reference = Reference::new(CaptureReference::new(0, source_type.clone())).unwrap();
+
+        let no_op = reference.rename_type_identities(&TypeIdentityRenaming::new()).unwrap();
+        let mut source_to_middle = TypeIdentityRenaming::new();
+        source_to_middle.insert(source, middle.clone()).unwrap();
+        let renamed = reference.rename_type_identities(&source_to_middle).unwrap();
+        let mut middle_to_target = TypeIdentityRenaming::new();
+        middle_to_target.insert(middle, target).unwrap();
+        let chained = renamed.rename_type_identities(&middle_to_target).unwrap();
+
+        // Renaming creates distinct handle-local type and identity metadata over the same allocation. Equality and
+        // hashing follow allocation identity rather than alias-local metadata.
+        assert!(reference.uses_root_type_identities());
+        assert!(no_op.uses_root_type_identities());
+        assert!(!renamed.uses_root_type_identities());
+        assert!(!chained.uses_root_type_identities());
+        assert!(!Arc::ptr_eq(&renamed.handle, &reference.handle));
+        assert!(Arc::ptr_eq(&renamed.handle.holder, &reference.handle.holder));
+        assert_eq!(renamed, reference);
+        assert_eq!(renamed.r#type().as_ref(), &ReferenceType::new(middle_type.clone()));
+        assert_eq!(chained.r#type().as_ref(), &ReferenceType::new(target_type.clone()));
+        assert_eq!(renamed.read(), Ok(CaptureReference::new(0, middle_type.clone())));
+        assert_eq!(chained.read(), Ok(CaptureReference::new(0, target_type.clone())));
+        assert_eq!(HashMap::from([(reference.clone(), "root")]).get(&renamed), Some(&"root"));
+
+        // Observation validity follows allocation identity, while its snapshot retains the originating handle's type
+        // identities and therefore needs no reinterpretation through the validating alias.
+        let observation = reference.lock().unwrap().observe().unwrap();
+        let unrelated = Reference::new(CaptureReference::new(0, source_type.clone())).unwrap();
+        assert!(reference.lock().unwrap().is_current(&observation).unwrap());
+        assert!(renamed.lock().unwrap().is_current(&observation).unwrap());
+        assert!(!unrelated.lock().unwrap().is_current(&observation).unwrap());
+
+        assert_eq!(chained.write(CaptureReference::new(1, target_type)), Ok(()));
+        assert_eq!(reference.read(), Ok(CaptureReference::new(1, source_type)));
+        assert_eq!(renamed.read(), Ok(CaptureReference::new(1, middle_type)));
+    }
+
+    #[test]
+    fn test_reference_rename_type_identities_rejects_a_non_injective_mapping() {
+        let bounds = DimensionBounds::positive(Some(9)).unwrap();
+        let source = DimensionVariable::new("source", bounds);
+        let second = DimensionVariable::new("second", bounds);
+        let target = DimensionVariable::new("target", bounds);
+        let source_type = ArrayType::new(
+            DataType::F32,
+            Shape::new(vec![Dimension::Dynamic(source.clone()), Dimension::Dynamic(second.clone())]),
+        );
+        let reference = Reference::new(CaptureReference::new(0, source_type)).unwrap();
+        let mut renaming = TypeIdentityRenaming::new();
+        renaming.insert(source, target.clone()).unwrap();
+        renaming.insert(second, target).unwrap();
+
+        assert_eq!(
+            reference.rename_type_identities(&renaming),
+            Err(TypeError::invalid("type identities `source` and `second` are both renamed to `target`")),
+        );
+    }
+
+    #[test]
+    fn test_reference_observation_reports_terminal_state_before_identity_mismatch() {
+        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let unrelated = Reference::new(Array::scalar(2.0_f32)).unwrap();
+        let unrelated_observation = unrelated.lock().unwrap().observe().unwrap();
+        let mut guard = reference.lock().unwrap();
+
+        assert_eq!(guard.take(), Ok(Array::scalar(1.0_f32)));
+        assert!(matches!(guard.observe(), Err(ReferenceError::TransactionInProgress)));
+        assert_eq!(guard.is_current(&unrelated_observation), Err(ReferenceError::TransactionInProgress));
+        guard.poison("injected failure");
+        assert!(matches!(
+            guard.observe(),
+            Err(ReferenceError::ExecutionPoisoned { reason }) if reason == "injected failure",
+        ));
+        assert_eq!(
+            guard.is_current(&unrelated_observation),
+            Err(ReferenceError::ExecutionPoisoned { reason: "injected failure".to_string() }),
+        );
+    }
+
+    #[test]
+    fn test_reference_guard_prepare_replacement_validates_type_without_changing_state() {
+        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let mut guard = reference.lock().unwrap();
+
+        assert!(matches!(
+            guard.prepare_replacement(Array::vector(vec![2.0_f32])),
+            Err(ReferenceError::ReferentTypeMismatch { expected, actual })
+                if expected == "f32[]" && actual == "f32[1]"
+        ));
+        let replacement = guard.prepare_replacement(Array::scalar(2.0_f32)).unwrap();
+        assert_eq!(
+            guard.validate_pending_install(ReferenceGeneration(1), &replacement),
+            Err(ReferenceError::TransactionInProgress),
+        );
+        assert_eq!(guard.install(replacement), Err(ReferenceError::TransactionInProgress));
+        drop(guard);
+        assert_eq!(reference.read(), Ok(Array::scalar(1.0_f32)));
+    }
+
+    #[test]
+    fn test_reference_guard_install_rejects_a_replacement_for_another_allocation() {
+        let first = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let second = Reference::new(Array::scalar(2.0_f32)).unwrap();
+        let mut first_guard = first.lock().unwrap();
+        let second_guard = second.lock().unwrap();
+        assert_eq!(first_guard.take(), Ok(Array::scalar(1.0_f32)));
+        let foreign_replacement = second_guard.prepare_replacement(Array::scalar(3.0_f32)).unwrap();
+        assert_eq!(first_guard.install(foreign_replacement), Err(ReferenceError::ReplacementHolderMismatch));
+        let replacement = first_guard.prepare_replacement(Array::scalar(4.0_f32)).unwrap();
+        assert_eq!(first_guard.install(replacement), Ok(()));
+        drop(first_guard);
+        drop(second_guard);
+        assert_eq!(first.read(), Ok(Array::scalar(4.0_f32)));
+        assert_eq!(second.read(), Ok(Array::scalar(2.0_f32)));
+    }
+
+    #[test]
+    fn test_reference_guard_validate_pending_install_rejects_a_replacement_from_another_allocation() {
+        let first = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let second = Reference::new(Array::scalar(2.0_f32)).unwrap();
+        let mut first_guard = first.lock().unwrap();
+        let second_guard = second.lock().unwrap();
+        let generation = first_guard.next_generation().unwrap();
+        first_guard.begin_submitted_mutation(generation);
+        let foreign_replacement = second_guard.prepare_replacement(Array::scalar(3.0_f32)).unwrap();
+
+        assert_eq!(
+            first_guard.validate_pending_install(generation, &foreign_replacement),
+            Err(ReferenceError::ReplacementHolderMismatch),
+        );
+        first_guard.poison("test cleanup");
+        drop(second_guard);
+    }
+
+    #[test]
+    fn test_reference_replacement_pins_allocation_identity_after_the_last_handle_is_dropped() {
+        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let original_id = reference.id();
+        let replacement = reference.lock().unwrap().prepare_replacement(Array::scalar(2.0_f32)).unwrap();
+        let original_allocation = replacement.holder.clone();
+        drop(reference);
+        assert!(original_allocation.upgrade().is_none());
+
+        // The surviving weak control block prevents reuse of the retired allocation's address. Pointer equality
+        // therefore remains a stable ownership check after every strong handle to the original allocation is gone.
+        let replacement_reference = Reference::new(Array::scalar(3.0_f32)).unwrap();
+        assert_ne!(replacement_reference.id(), original_id);
+        let mut guard = replacement_reference.lock().unwrap();
+        assert_eq!(guard.take(), Ok(Array::scalar(3.0_f32)));
+        assert_eq!(guard.install(replacement), Err(ReferenceError::ReplacementHolderMismatch));
+        guard.poison("test cleanup");
+    }
+
+    #[test]
+    fn test_reference_read_ignores_a_stale_pending_completion() {
+        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32)).unwrap());
+        let first_backend = ControlledCompletion::new();
+        let second_backend = ControlledCompletion::new();
+
+        let first_generation = {
+            let mut guard = reference.lock().unwrap();
+            let replacement = guard.prepare_replacement(Array::scalar(2.0_f32)).unwrap();
+            transition_to_pending(&mut guard, ReferenceCompletion::new(first_backend.clone()), replacement).unwrap()
+        };
+
+        // The reader captures generation one and releases the mutex while awaiting its completion.
+        let (sender, receiver) = channel();
+        let reader_reference = Arc::clone(&reference);
+        let reader = thread::spawn(move || sender.send(reader_reference.read()).unwrap());
+        first_backend.wait_until_awaited();
+
+        // Install generation two while the reader is waiting. Its completion includes generation one's dependency,
+        // matching the cumulative dependency contract required of chained submissions.
+        let second_generation = {
+            let mut guard = reference.lock().unwrap();
+            let observation = guard.observe().unwrap();
+            assert_eq!(observation.generation(), first_generation);
+            let completion = ReferenceCompletion::join([
+                observation.dependency().unwrap().clone(),
+                ReferenceCompletion::new(second_backend.clone()),
+            ]);
+            let replacement = guard.prepare_replacement(Array::scalar(3.0_f32)).unwrap();
+            transition_to_pending(&mut guard, completion, replacement).unwrap()
+        };
+        assert_eq!(second_generation, ReferenceGeneration(first_generation.0 + 1));
+
+        // Resolving generation one wakes the reader, but its stale result cannot promote generation two. Waiting until
+        // the reader reaches the second completion proves that it retried through the ordinary reconciliation path.
+        first_backend.complete(Ok(()));
+        second_backend.wait_until_awaited();
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        second_backend.complete(Ok(()));
+        assert_eq!(
+            receiver
+                .recv_timeout(TEST_TIMEOUT)
+                .unwrap_or_else(|error| panic!("reference read result within {TEST_TIMEOUT:?}: {error}")),
+            Ok(Array::scalar(3.0_f32)),
+        );
+        reader.join().unwrap();
+
+        let observation = reference.lock().unwrap().observe().unwrap();
+        assert_eq!(observation.generation(), second_generation);
+        assert_eq!(observation.snapshot(), &Array::scalar(3.0_f32));
+        assert!(observation.dependency().is_none());
+    }
+
+    #[test]
+    fn test_reference_guard_drop_during_submitted_mutation_unwind_poisons_reference() {
+        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        assert!(
+            catch_unwind(AssertUnwindSafe(|| {
+                let mut guard = reference.lock().unwrap();
+                let generation = guard.next_generation().unwrap();
+                guard.begin_submitted_mutation(generation);
+                panic!("injected backend unwind");
+            }))
+            .is_err(),
+        );
+        assert_eq!(
+            reference.read(),
+            Err(ReferenceError::ExecutionPoisoned {
+                reason: "stateful transaction ended without restoring state".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_reference_guard_next_generation_requires_terminal_read_leases_to_be_pruned() {
+        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let mut guard = reference.lock().unwrap();
+        guard.validate_read_lease_publication().unwrap();
+        guard.publish_read_lease_unchecked(ReferenceCompletion::ready(Ok(())));
+        assert_eq!(guard.next_generation(), Err(ReferenceError::TransactionInProgress));
+        assert!(guard.active_read_leases().is_empty());
+        let generation = guard.next_generation().unwrap();
+        guard.begin_submitted_mutation(generation);
+        guard.poison("test cleanup");
+    }
+
+    #[test]
+    fn test_reference_read_waits_for_pending_completion_without_holding_the_lock() {
+        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32)).unwrap());
+        let backend = ControlledCompletion::new();
+        let mut guard = reference.lock().unwrap();
+        let value = guard.prepare_replacement(Array::scalar(2.0_f32)).unwrap();
+        transition_to_pending(&mut guard, ReferenceCompletion::new(backend.clone()), value).unwrap();
+        let pending_observation = guard.observe().unwrap();
+        assert!(pending_observation.dependency().is_some());
+        drop(guard);
+
+        let (sender, receiver) = channel();
+        let reader_reference = Arc::clone(&reference);
+        let reader = thread::spawn(move || sender.send(reader_reference.read()).unwrap());
+        backend.wait_until_awaited();
+        assert!(reference.lock().unwrap().observe().unwrap().dependency().is_some());
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        backend.complete(Ok(()));
+        assert_eq!(
+            receiver
+                .recv_timeout(TEST_TIMEOUT)
+                .unwrap_or_else(|error| panic!("reference read result within {TEST_TIMEOUT:?}: {error}")),
+            Ok(Array::scalar(2.0_f32)),
+        );
+        reader.join().unwrap();
+
+        // Applying the successful completion made the shared value ready without changing its generation. The pending
+        // observation remains current, while a new observation no longer carries the completed dependency.
+        let guard = reference.lock().unwrap();
+        assert!(guard.is_current(&pending_observation).unwrap());
+        assert!(guard.observe().unwrap().dependency().is_none());
+        drop(guard);
+        assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32)));
+    }
+
+    #[test]
+    fn test_reference_write_waits_for_pending_completion_without_holding_the_lock() {
+        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32)).unwrap());
+        let backend = ControlledCompletion::new();
+        let mut guard = reference.lock().unwrap();
+        let value = guard.prepare_replacement(Array::scalar(2.0_f32)).unwrap();
+        transition_to_pending(&mut guard, ReferenceCompletion::new(backend.clone()), value).unwrap();
+        drop(guard);
+
+        let (sender, receiver) = channel();
+        let writing_reference = Arc::clone(&reference);
+        let writer = thread::spawn(move || sender.send(writing_reference.write(Array::scalar(3.0_f32))).unwrap());
+        backend.wait_until_awaited();
+        assert!(reference.lock().unwrap().observe().unwrap().dependency().is_some());
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        backend.complete(Ok(()));
+        assert_eq!(
+            receiver
+                .recv_timeout(TEST_TIMEOUT)
+                .unwrap_or_else(|error| panic!("reference write result within {TEST_TIMEOUT:?}: {error}")),
+            Ok(()),
+        );
+        writer.join().unwrap();
+        assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32)));
+    }
+
+    #[test]
+    fn test_reference_read_reports_a_failed_pending_completion_as_execution_poisoned() {
+        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let backend = ControlledCompletion::new();
+        let mut guard = reference.lock().unwrap();
+        let value = guard.prepare_replacement(Array::scalar(2.0_f32)).unwrap();
+        transition_to_pending(&mut guard, ReferenceCompletion::new(backend.clone()), value).unwrap();
+        drop(guard);
+
+        // The completion resolves before the read reaches it, so the read observes the failure through the same lazy
+        // reconciliation path and reports the backend-owned reason. Poisoning is terminal for every later access.
+        backend.complete(Err("device execution failed".into()));
+        let poisoned = ReferenceError::ExecutionPoisoned { reason: "device execution failed".to_string() };
+        assert_eq!(reference.read(), Err(poisoned.clone()));
+        assert_eq!(reference.write(Array::scalar(3.0_f32)), Err(poisoned.clone()));
+        assert_eq!(reference.swap(Array::scalar(3.0_f32)), Err(poisoned.clone()));
+        assert_eq!(reference.freeze(), Err(poisoned));
+    }
+
+    #[test]
+    fn test_reference_write_waits_for_an_active_read_lease() {
+        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32)).unwrap());
+        let lease = ControlledCompletion::new();
+        let mut guard = reference.lock().unwrap();
+        guard.validate_read_lease_publication().unwrap();
+        guard.publish_read_lease_unchecked(ReferenceCompletion::new(lease.clone()));
+        drop(guard);
+
+        let (sender, receiver) = channel();
+        let writing_reference = Arc::clone(&reference);
+        let writer = thread::spawn(move || sender.send(writing_reference.write(Array::scalar(2.0_f32))).unwrap());
+        lease.wait_until_awaited();
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        lease.complete(Ok(()));
+        assert_eq!(
+            receiver
+                .recv_timeout(TEST_TIMEOUT)
+                .unwrap_or_else(|error| panic!("reference write result within {TEST_TIMEOUT:?}: {error}")),
+            Ok(()),
+        );
+        writer.join().unwrap();
+        assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32)));
+    }
+
+    #[test]
+    fn test_reference_swap_waits_for_an_active_read_lease() {
+        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32)).unwrap());
+        let lease = ControlledCompletion::new();
+        let mut guard = reference.lock().unwrap();
+        guard.validate_read_lease_publication().unwrap();
+        guard.publish_read_lease_unchecked(ReferenceCompletion::new(lease.clone()));
+        drop(guard);
+
+        // A leased snapshot pins the current value, so the replacement cannot be installed until the lease completes.
+        let (sender, receiver) = channel();
+        let swapping_reference = Arc::clone(&reference);
+        let swapper = thread::spawn(move || sender.send(swapping_reference.swap(Array::scalar(2.0_f32))).unwrap());
+        lease.wait_until_awaited();
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        lease.complete(Ok(()));
+        assert_eq!(
+            receiver
+                .recv_timeout(TEST_TIMEOUT)
+                .unwrap_or_else(|error| panic!("reference swap result within {TEST_TIMEOUT:?}: {error}")),
+            Ok(Array::scalar(1.0_f32)),
+        );
+        swapper.join().unwrap();
+        assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32)));
+    }
+
+    #[test]
+    fn test_reference_freeze_waits_for_an_active_read_lease() {
+        let reference = Arc::new(Reference::new(Array::scalar(1.0_f32)).unwrap());
+        let lease = ControlledCompletion::new();
+        let mut guard = reference.lock().unwrap();
+        guard.validate_read_lease_publication().unwrap();
+        guard.publish_read_lease_unchecked(ReferenceCompletion::new(lease.clone()));
+        drop(guard);
+
+        // Consumption is a mutation of the alias family, so it waits for the same leases a replacement would.
+        let (sender, receiver) = channel();
+        let freezing_reference = Arc::clone(&reference);
+        let freezer = thread::spawn(move || sender.send(freezing_reference.freeze()).unwrap());
+        lease.wait_until_awaited();
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        lease.complete(Ok(()));
+        assert_eq!(
+            receiver
+                .recv_timeout(TEST_TIMEOUT)
+                .unwrap_or_else(|error| panic!("reference freeze result within {TEST_TIMEOUT:?}: {error}")),
+            Ok(Array::scalar(1.0_f32)),
+        );
+        freezer.join().unwrap();
+        assert_eq!(reference.read(), Err(ReferenceError::Frozen));
+    }
+
+    #[test]
+    fn test_reference_guard_validate_pending_install_rejects_a_stale_generation() {
+        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let mut guard = reference.lock().unwrap();
+        let first_value = guard.prepare_replacement(Array::scalar(2.0_f32)).unwrap();
+        let first = transition_to_pending(&mut guard, ReferenceCompletion::ready(Ok(())), first_value).unwrap();
+        let second = guard.next_generation().unwrap();
+        guard.begin_submitted_mutation(second);
+
+        // Rejecting a late installation leaves the newer `Taken` transition intact, allowing that transaction to
+        // install its own replacement.
+        let value = guard.prepare_replacement(Array::scalar(3.0_f32)).unwrap();
+        assert_eq!(guard.validate_pending_install(first, &value), Err(ReferenceError::StaleGeneration));
+        guard.install_pending_unchecked(second, ReferenceCompletion::ready(Ok(())), value);
+        drop(guard);
+        assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32)));
+    }
+
+    #[test]
+    fn test_reference_guard_take_rejects_an_active_read_lease() {
+        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let lease = ControlledCompletion::new();
+        let mut guard = reference.lock().unwrap();
+        guard.validate_read_lease_publication().unwrap();
+        guard.publish_read_lease_unchecked(ReferenceCompletion::new(lease.clone()));
+
+        // Handing leased buffers to a donating execution would let the device mutate storage a submitted read-only
+        // execution still observes, so extraction is rejected until the lease completes and is pruned.
+        assert_eq!(guard.take(), Err(ReferenceError::TransactionInProgress));
+        lease.complete(Ok(()));
+        assert_eq!(guard.take(), Ok(Array::scalar(1.0_f32)));
+        let restored = guard.prepare_replacement(Array::scalar(4.0_f32)).unwrap();
+        guard.install(restored).unwrap();
+        drop(guard);
+        assert_eq!(reference.read(), Ok(Array::scalar(4.0_f32)));
+    }
+
+    #[test]
+    fn test_reference_guard_poison_affects_only_the_taken_reference() {
+        let first = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let second = Reference::new(Array::scalar(2.0_f32)).unwrap();
+        let mut first_guard = first.lock().unwrap();
+        let second_guard = second.lock().unwrap();
+        first_guard.take().unwrap();
+        first_guard.poison("test execution failed");
+        drop(first_guard);
+        drop(second_guard);
+        assert_eq!(
+            first.read(),
+            Err(ReferenceError::ExecutionPoisoned { reason: "test execution failed".to_string() }),
+        );
+        assert_eq!(second.read(), Ok(Array::scalar(2.0_f32)));
+    }
+
+    #[test]
+    fn test_reference_guard_poison_leaves_a_ready_reference_unchanged() {
+        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let mut guard = reference.lock().unwrap();
+        let generation = guard.observe().unwrap().generation();
+
+        // Poisoning is infallible so a cleanup path cannot replace the original backend error with a guard-state error.
+        // A guard that does not own a `Taken` transaction has nothing to invalidate, so the reference remains ready at
+        // its current generation.
+        guard.poison("unrelated backend failure");
+        let observation = guard.observe().unwrap();
+        assert_eq!(observation.generation(), generation);
+        assert_eq!(observation.snapshot(), &Array::scalar(1.0_f32));
+        drop(guard);
+        assert_eq!(reference.read(), Ok(Array::scalar(1.0_f32)));
+        assert_eq!(reference.swap(Array::scalar(2.0_f32)), Ok(Array::scalar(1.0_f32)));
+    }
+
+    #[test]
+    fn test_reference_guard_poison_leaves_a_pending_reference_unchanged() {
+        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let completion = ControlledCompletion::new();
+        let mut guard = reference.lock().unwrap();
+        let replacement = guard.prepare_replacement(Array::scalar(2.0_f32)).unwrap();
+        let generation =
+            transition_to_pending(&mut guard, ReferenceCompletion::new(completion.clone()), replacement).unwrap();
+
+        // Explicit poisoning applies only to an uninstalled `Taken` transaction. Once a replacement is installed,
+        // its cumulative completion remains the sole authority for promoting or poisoning that pending generation.
+        guard.poison("unrelated backend failure");
+        let observation = guard.observe().unwrap();
+        assert_eq!(observation.generation(), generation);
+        assert!(observation.dependency().is_some());
+        drop(guard);
+        completion.complete(Ok(()));
+        assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32)));
+    }
+
+    #[test]
+    fn test_reference_guard_read_lease_publication_releases_terminal_leases() {
+        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let first = ControlledCompletion::new();
+        let second = ControlledCompletion::new();
+        let third = ControlledCompletion::new();
+        first.complete(Ok(()));
+        second.complete(Err("read failed".into()));
+
+        // Lease publication is the only lifecycle update guaranteed for a read-only reference, so it must also release
+        // terminal leases instead of retaining their backend resources indefinitely. The strong counts make those
+        // releases observable here.
+        let mut guard = reference.lock().unwrap();
+        guard.validate_read_lease_publication().unwrap();
+        guard.publish_read_lease_unchecked(ReferenceCompletion::new(first.clone()));
+        guard.validate_read_lease_publication().unwrap();
+        guard.publish_read_lease_unchecked(ReferenceCompletion::new(second.clone()));
+        assert_eq!(Arc::strong_count(&first.state), 1);
+        assert_eq!(Arc::strong_count(&second.state), 2);
+        guard.validate_read_lease_publication().unwrap();
+        guard.publish_read_lease_unchecked(ReferenceCompletion::new(third.clone()));
+        assert_eq!(Arc::strong_count(&second.state), 1);
+        assert_eq!(Arc::strong_count(&third.state), 2);
+
+        // Only the running lease remains. It blocks the next submitted mutation until completion and pruning.
+        assert_eq!(guard.active_read_leases().len(), 1);
+        assert_eq!(guard.next_generation(), Err(ReferenceError::TransactionInProgress));
+        third.complete(Ok(()));
+        assert!(guard.active_read_leases().is_empty());
+        assert_eq!(Arc::strong_count(&third.state), 1);
+        assert_eq!(guard.next_generation(), Ok(ReferenceGeneration(1)));
+    }
+
+    #[test]
+    fn test_reference_guard_drop_after_take_poisons_reference() {
+        let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
+        let mut guard = reference.lock().unwrap();
+        assert_eq!(guard.take(), Ok(Array::scalar(1.0_f32)));
+        drop(guard);
+        assert_eq!(
+            reference.read(),
+            Err(ReferenceError::ExecutionPoisoned {
+                reason: "stateful transaction ended without restoring state".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_reference_completion_ready_reports_terminal_results_and_debug_state() {
+        let succeeded = ReferenceCompletion::ready(Ok(()));
+        let failed = ReferenceCompletion::ready(Err("execution failed".into()));
+
+        assert_eq!(succeeded.is_ready(), Ok(true));
+        assert_eq!(succeeded.r#await(), Ok(()));
+        assert_eq!(format!("{succeeded:?}"), "ReferenceCompletion { is_ready: Ok(true) }");
+        assert_eq!(failed.is_ready(), Err(Arc::<str>::from("execution failed")));
+        assert_eq!(failed.r#await(), Err(Arc::<str>::from("execution failed")));
+        assert_eq!(format!("{failed:?}"), "ReferenceCompletion { is_ready: Err(\"execution failed\") }",);
+    }
+
+    #[test]
+    fn test_reference_completion_join_normalizes_empty_singleton_and_succeeded_inputs() {
+        let pending = ControlledCompletion::new();
+        let singleton = ReferenceCompletion::join([ReferenceCompletion::new(pending.clone())]);
+
+        assert_eq!(ReferenceCompletion::join([]).is_ready(), Ok(true));
+        assert_eq!(ReferenceCompletion::join([ReferenceCompletion::ready(Ok(()))]).is_ready(), Ok(true));
+        assert_eq!(singleton.is_ready(), Ok(false));
+        pending.complete(Ok(()));
+        assert_eq!(singleton.is_ready(), Ok(true));
+        assert_eq!(singleton.r#await(), Ok(()));
+    }
+
+    #[test]
+    fn test_reference_completion_join_reports_first_failure_in_input_order() {
         let completion = ReferenceCompletion::join([
             ReferenceCompletion::ready(Ok(())),
             ReferenceCompletion::ready(Err("first failure".into())),
@@ -1371,7 +2172,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_completion_flat_join_waits_for_all_and_preserves_input_failure_order() {
+    fn test_reference_completion_join_flattens_nested_joins_and_waits_for_every_input() {
         let first = ControlledCompletion::new();
         let second = ControlledCompletion::new();
         let third = ControlledCompletion::new();
@@ -1383,24 +2184,30 @@ mod tests {
             ReferenceCompletion::new(third.clone()),
         ]);
 
-        // Resolve later failures first. The join must remain pending until every member is terminal so input order,
-        // rather than completion order, determines the reported failure.
-        third.complete(Err("third failure".into()));
-        second.complete(Err("second failure".into()));
+        // An early failure does not make the join terminal while later work remains pending.
+        first.complete(Err("first failure".into()));
         assert_eq!(joined.is_ready(), Ok(false));
         let waiting = joined.clone();
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let waiter = std::thread::spawn(move || sender.send(waiting.r#await()).unwrap());
-        first.wait_until_awaited();
-        assert!(receiver.try_recv().is_err());
-        first.complete(Err("first failure".into()));
-        assert_eq!(receiver.recv().unwrap(), Err(Arc::<str>::from("first failure")));
+        let (sender, receiver) = channel();
+        let waiter = thread::spawn(move || sender.send(waiting.r#await()).unwrap());
+        second.wait_until_awaited();
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        second.complete(Err("second failure".into()));
+        third.wait_until_awaited();
+        assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));
+        third.complete(Err("third failure".into()));
+        assert_eq!(
+            receiver
+                .recv_timeout(TEST_TIMEOUT)
+                .unwrap_or_else(|error| panic!("joined completion result within {TEST_TIMEOUT:?}: {error}")),
+            Err(Arc::<str>::from("first failure")),
+        );
         waiter.join().unwrap();
         assert_eq!(joined.is_ready(), Err(Arc::<str>::from("first failure")));
     }
 
     #[test]
-    fn test_reference_completion_rejoin_releases_successes_and_preserves_dependencies_and_failures() {
+    fn test_reference_completion_join_releases_successes_and_retains_pending_work_and_failures() {
         let succeeded = ControlledCompletion::new();
         let failed = ControlledCompletion::new();
         let pending = ControlledCompletion::new();
@@ -1460,697 +2267,5 @@ mod tests {
         cumulative = ReferenceCompletion::join([cumulative]);
         assert!(completed_states.iter().all(|state| state.upgrade().is_none()));
         assert_eq!(cumulative.r#await(), Ok(()));
-    }
-
-    #[test]
-    fn test_reference_generation_advances_only_after_committed_mutations() {
-        let reference = reference_new(Array::scalar(1.0_f32));
-        let initial_observation = reference.lock().unwrap().observe().unwrap();
-        let initial_generation = initial_observation.generation();
-
-        assert_eq!(reference.read(), Ok(Array::scalar(1.0_f32)));
-        assert_eq!(reference.lock().unwrap().observe().unwrap().generation(), initial_generation);
-        assert!(reference.lock().unwrap().is_current(&initial_observation).unwrap());
-
-        assert_eq!(reference.swap(Array::scalar(2.0_f32)), Ok(Array::scalar(1.0_f32)));
-        let swapped_generation = reference.lock().unwrap().observe().unwrap().generation();
-        assert!(swapped_generation > initial_generation);
-        assert!(!reference.lock().unwrap().is_current(&initial_observation).unwrap());
-
-        assert_eq!(reference.write(Array::scalar(3.0_f32)), Ok(()));
-        let written_generation = reference.lock().unwrap().observe().unwrap().generation();
-        assert!(written_generation > swapped_generation);
-
-        let rejected = ProgramError::InvalidArgument { message: "rejected update".to_string() };
-        assert_eq!(reference.update::<(), _>(|_| Err(rejected.clone())), Err(rejected));
-        assert_eq!(reference.lock().unwrap().observe().unwrap().generation(), written_generation);
-
-        assert_eq!(reference.update(|_| Ok((Array::scalar(4.0_f32), "updated"))), Ok("updated"));
-        let updated_generation = reference.lock().unwrap().observe().unwrap().generation();
-        assert!(updated_generation > written_generation);
-    }
-
-    #[test]
-    fn test_reference_observation_validation_reports_terminal_state_before_identity_mismatch() {
-        let reference = reference_new(Array::scalar(1.0_f32));
-        let unrelated = reference_new(Array::scalar(2.0_f32));
-        let unrelated_observation = unrelated.lock().unwrap().observe().unwrap();
-        let mut guard = reference.lock().unwrap();
-
-        assert_eq!(guard.take(), Ok(Array::scalar(1.0_f32)));
-        assert_eq!(guard.is_current(&unrelated_observation), Err(ReferenceError::TransactionInProgress));
-        guard.poison("injected failure");
-        assert_eq!(
-            guard.is_current(&unrelated_observation),
-            Err(ReferenceError::ExecutionPoisoned { reason: "injected failure".to_string() }),
-        );
-    }
-
-    #[test]
-    fn test_reference_write_preserves_state_when_the_generation_is_exhausted() {
-        let reference = reference_new(Array::scalar(1.0_f32));
-        {
-            let mut state = reference.handle.holder.state.lock().unwrap();
-            let ReferenceState::Ready { generation, .. } = &mut *state else {
-                unreachable!("a newly allocated reference is ready")
-            };
-            *generation = ReferenceGeneration(u64::MAX);
-        }
-
-        assert_eq!(reference.write(Array::scalar(2.0_f32)), Err(ReferenceError::GenerationExhausted));
-        assert_eq!(reference.read(), Ok(Array::scalar(1.0_f32)));
-        assert_eq!(reference.lock().unwrap().observe().unwrap().generation(), ReferenceGeneration(u64::MAX));
-    }
-
-    #[test]
-    fn test_concurrent_reference_writes_serialize_on_one_holder() {
-        let reference = reference_new(Array::scalar(1.0_f32));
-        let initial_generation = reference.lock().unwrap().observe().unwrap().generation();
-        let first = reference.clone();
-        let second = reference.clone();
-        let first = std::thread::spawn(move || first.write(Array::scalar(2.0_f32)));
-        let second = std::thread::spawn(move || second.write(Array::scalar(3.0_f32)));
-
-        assert_eq!(first.join().unwrap(), Ok(()));
-        assert_eq!(second.join().unwrap(), Ok(()));
-        assert!(
-            matches!(reference.read(), Ok(value) if value == Array::scalar(2.0_f32) || value == Array::scalar(3.0_f32))
-        );
-        assert_eq!(reference.lock().unwrap().observe().unwrap().generation().0, initial_generation.0 + 2);
-    }
-
-    #[test]
-    fn test_reference_read_reports_a_poisoned_holder() {
-        let reference = reference_new(Array::scalar(1.0_f32));
-        let holder = Arc::clone(&reference.handle.holder);
-        assert!(
-            catch_unwind(AssertUnwindSafe(|| {
-                let _guard = holder.state.lock().unwrap();
-                panic!("poison reference holder");
-            }))
-            .is_err(),
-        );
-        assert_eq!(reference.read(), Err(ReferenceError::Poisoned));
-        assert_eq!(reference.write(Array::scalar(2.0_f32)), Err(ReferenceError::Poisoned));
-    }
-
-    #[test]
-    fn test_reference_guard_prepares_replacement_for_the_exact_holder() {
-        let first = reference_new(Array::scalar(1.0_f32));
-        let second = reference_new(Array::scalar(2.0_f32));
-        let mut first_guard = first.lock().unwrap();
-        let second_guard = second.lock().unwrap();
-        assert_eq!(first_guard.take(), Ok(Array::scalar(1.0_f32)));
-        let replacement = first_guard.prepare_replacement(Array::scalar(3.0_f32)).unwrap();
-        assert_eq!(second_guard.accepts(&replacement), Err(ReferenceError::ReplacementHolderMismatch));
-        first_guard.install(replacement).unwrap();
-        drop(first_guard);
-        drop(second_guard);
-        assert_eq!(first.read(), Ok(Array::scalar(3.0_f32)));
-        assert_eq!(second.read(), Ok(Array::scalar(2.0_f32)));
-    }
-
-    #[test]
-    fn test_reference_replacement_pins_holder_allocation_identity_after_last_handle_is_dropped() {
-        let reference = reference_new(Array::scalar(1.0_f32));
-        let original_id = reference.id();
-        let replacement = reference.lock().unwrap().prepare_replacement(Array::scalar(2.0_f32)).unwrap();
-        let original_holder = replacement.holder.clone();
-        drop(reference);
-        assert!(original_holder.upgrade().is_none());
-
-        // The surviving weak control block prevents reuse of the retired allocation's address. Pointer equality
-        // therefore remains a stable ownership check after every strong handle to the original allocation is gone.
-        let new_reference = reference_new(Array::scalar(3.0_f32));
-        assert_ne!(new_reference.id(), original_id);
-        assert_eq!(new_reference.lock().unwrap().accepts(&replacement), Err(ReferenceError::ReplacementHolderMismatch),);
-    }
-
-    #[test]
-    fn test_reference_pending_generations_ignore_stale_completion() {
-        let reference = Arc::new(reference_new(Array::scalar(1.0_f32)));
-        let first_backend = ControlledCompletion::new();
-        let second_backend = ControlledCompletion::new();
-
-        let first_generation = {
-            let mut guard = reference.lock().unwrap();
-            let replacement = guard.prepare_replacement(Array::scalar(2.0_f32)).unwrap();
-            submit_pending(&mut guard, ReferenceCompletion::new(first_backend.clone()), replacement).unwrap()
-        };
-
-        // The reader captures generation one and releases the mutex while awaiting its completion.
-        let (sender, receiver) = std::sync::mpsc::channel();
-        let reader_reference = Arc::clone(&reference);
-        let reader = std::thread::spawn(move || sender.send(reader_reference.read()).unwrap());
-        first_backend.wait_until_awaited();
-
-        // Install generation two while the reader is waiting. Its completion includes generation one's dependency,
-        // matching the cumulative dependency contract required of chained submissions.
-        let second_generation = {
-            let mut guard = reference.lock().unwrap();
-            let observation = guard.observe().unwrap();
-            assert_eq!(observation.generation(), first_generation);
-            let completion = ReferenceCompletion::join([
-                observation.dependency().unwrap().clone(),
-                ReferenceCompletion::new(second_backend.clone()),
-            ]);
-            let replacement = guard.prepare_replacement(Array::scalar(3.0_f32)).unwrap();
-            submit_pending(&mut guard, completion, replacement).unwrap()
-        };
-        assert!(second_generation > first_generation);
-
-        // Resolving generation one wakes the reader, but its stale result cannot promote generation two. Waiting until
-        // the reader reaches the second completion proves that it retried through the ordinary reconciliation path.
-        first_backend.complete(Ok(()));
-        second_backend.wait_until_awaited();
-        assert!(matches!(receiver.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)));
-        second_backend.complete(Ok(()));
-        assert_eq!(receiver.recv_timeout(Duration::from_secs(10)).unwrap(), Ok(Array::scalar(3.0_f32)),);
-        reader.join().unwrap();
-
-        let observation = reference.lock().unwrap().observe().unwrap();
-        assert_eq!(observation.generation(), second_generation);
-        assert_eq!(observation.snapshot(), &Array::scalar(3.0_f32));
-        assert!(observation.dependency().is_none());
-    }
-
-    #[test]
-    fn test_reference_guard_drop_poisons_an_unfinished_submitted_mutation() {
-        let reference = reference_new(Array::scalar(1.0_f32));
-        {
-            let mut guard = reference.lock().unwrap();
-            let generation = guard.next_generation().unwrap();
-            guard.begin_submitted_mutation(generation);
-        }
-        assert_eq!(
-            reference.read(),
-            Err(ReferenceError::ExecutionPoisoned {
-                reason: "stateful transaction ended without restoring state".to_string(),
-            }),
-        );
-    }
-
-    #[test]
-    fn test_unwinding_an_unfinished_submitted_mutation_reports_execution_poisoning() {
-        let reference = reference_new(Array::scalar(1.0_f32));
-        assert!(
-            catch_unwind(AssertUnwindSafe(|| {
-                let mut guard = reference.lock().unwrap();
-                let generation = guard.next_generation().unwrap();
-                guard.begin_submitted_mutation(generation);
-                panic!("injected backend unwind");
-            }))
-            .is_err(),
-        );
-        assert_eq!(
-            reference.read(),
-            Err(ReferenceError::ExecutionPoisoned {
-                reason: "stateful transaction ended without restoring state".to_string(),
-            }),
-        );
-    }
-
-    #[test]
-    fn test_reference_read_lease_must_be_pruned_before_submitted_mutation() {
-        let reference = reference_new(Array::scalar(1.0_f32));
-        let mut guard = reference.lock().unwrap();
-        guard.validate_read_lease_publication().unwrap();
-        guard.publish_read_lease_unchecked(ReferenceCompletion::ready(Ok(())));
-        assert_eq!(guard.next_generation(), Err(ReferenceError::TransactionInProgress));
-        assert!(guard.active_read_leases().is_empty());
-        let generation = guard.next_generation().unwrap();
-        guard.begin_submitted_mutation(generation);
-        guard.poison("test cleanup");
-    }
-
-    #[test]
-    fn test_reference_read_awaits_a_pending_completion_resolved_by_another_thread() {
-        let reference = Arc::new(reference_new(Array::scalar(1.0_f32)));
-        let backend = ControlledCompletion::new();
-        let mut guard = reference.lock().unwrap();
-        let value = guard.prepare_replacement(Array::scalar(2.0_f32)).unwrap();
-        submit_pending(&mut guard, ReferenceCompletion::new(backend.clone()), value).unwrap();
-        let pending_observation = guard.observe().unwrap();
-        assert!(pending_observation.dependency().is_some());
-        drop(guard);
-
-        // A read cannot return before the installed value's cumulative completion resolves, so the reader's slot is
-        // guaranteed to still be empty here regardless of how far the spawned thread has progressed.
-        let observed = Arc::new(Mutex::new(None));
-        let reader_reference = Arc::clone(&reference);
-        let reader_observed = Arc::clone(&observed);
-        let reader = std::thread::spawn(move || {
-            let value = reader_reference.read();
-            *reader_observed.lock().unwrap() = Some(value);
-        });
-        backend.wait_until_awaited();
-        assert_eq!(*observed.lock().unwrap(), None);
-        backend.complete(Ok(()));
-        reader.join().unwrap();
-        assert_eq!(*observed.lock().unwrap(), Some(Ok(Array::scalar(2.0_f32))));
-
-        // Applying the successful completion made the shared value ready without changing its generation. The pending
-        // observation remains current, while a new observation no longer carries the completed dependency.
-        let guard = reference.lock().unwrap();
-        assert!(guard.is_current(&pending_observation).unwrap());
-        assert!(guard.observe().unwrap().dependency().is_none());
-        drop(guard);
-        assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32)));
-    }
-
-    #[test]
-    fn test_reference_write_awaits_a_pending_completion_resolved_by_another_thread() {
-        let reference = Arc::new(reference_new(Array::scalar(1.0_f32)));
-        let backend = ControlledCompletion::new();
-        let mut guard = reference.lock().unwrap();
-        let value = guard.prepare_replacement(Array::scalar(2.0_f32)).unwrap();
-        submit_pending(&mut guard, ReferenceCompletion::new(backend.clone()), value).unwrap();
-        drop(guard);
-
-        let observed = Arc::new(Mutex::new(None));
-        let writing_reference = Arc::clone(&reference);
-        let writing_observed = Arc::clone(&observed);
-        let writer = std::thread::spawn(move || {
-            let result = writing_reference.write(Array::scalar(3.0_f32));
-            *writing_observed.lock().unwrap() = Some(result);
-        });
-        backend.wait_until_awaited();
-        assert_eq!(*observed.lock().unwrap(), None);
-        backend.complete(Ok(()));
-        writer.join().unwrap();
-        assert_eq!(*observed.lock().unwrap(), Some(Ok(())));
-        assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32)));
-    }
-
-    #[test]
-    fn test_reference_read_reports_a_failed_pending_completion_as_execution_poisoned() {
-        let reference = reference_new(Array::scalar(1.0_f32));
-        let backend = ControlledCompletion::new();
-        let mut guard = reference.lock().unwrap();
-        let value = guard.prepare_replacement(Array::scalar(2.0_f32)).unwrap();
-        submit_pending(&mut guard, ReferenceCompletion::new(backend.clone()), value).unwrap();
-        drop(guard);
-
-        // The completion resolves before the read reaches it, so the read observes the failure through the same lazy
-        // reconciliation path and reports the backend-owned reason. Poisoning is terminal for every later access.
-        backend.complete(Err("device execution failed".into()));
-        let poisoned = ReferenceError::ExecutionPoisoned { reason: "device execution failed".to_string() };
-        assert_eq!(reference.read(), Err(poisoned.clone()));
-        assert_eq!(reference.write(Array::scalar(3.0_f32)), Err(poisoned.clone()));
-        assert_eq!(reference.swap(Array::scalar(3.0_f32)), Err(poisoned.clone()));
-        assert_eq!(reference.freeze(), Err(poisoned));
-    }
-
-    #[test]
-    fn test_reference_write_waits_for_an_active_read_lease() {
-        let reference = Arc::new(reference_new(Array::scalar(1.0_f32)));
-        let lease = ControlledCompletion::new();
-        let mut guard = reference.lock().unwrap();
-        guard.validate_read_lease_publication().unwrap();
-        guard.publish_read_lease_unchecked(ReferenceCompletion::new(lease.clone()));
-        drop(guard);
-
-        let observed = Arc::new(Mutex::new(None));
-        let writing_reference = Arc::clone(&reference);
-        let writing_observed = Arc::clone(&observed);
-        let writer = std::thread::spawn(move || {
-            let result = writing_reference.write(Array::scalar(2.0_f32));
-            *writing_observed.lock().unwrap() = Some(result);
-        });
-        lease.wait_until_awaited();
-        assert_eq!(*observed.lock().unwrap(), None);
-        lease.complete(Ok(()));
-        writer.join().unwrap();
-        assert_eq!(*observed.lock().unwrap(), Some(Ok(())));
-        assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32)));
-    }
-
-    #[test]
-    fn test_reference_swap_waits_for_an_active_read_lease() {
-        let reference = Arc::new(reference_new(Array::scalar(1.0_f32)));
-        let lease = ControlledCompletion::new();
-        let mut guard = reference.lock().unwrap();
-        guard.validate_read_lease_publication().unwrap();
-        guard.publish_read_lease_unchecked(ReferenceCompletion::new(lease.clone()));
-        drop(guard);
-
-        // A leased snapshot pins the current value, so the replacement cannot be installed until the lease completes.
-        let observed = Arc::new(Mutex::new(None));
-        let swapping_reference = Arc::clone(&reference);
-        let swapping_observed = Arc::clone(&observed);
-        let swapper = std::thread::spawn(move || {
-            let old = swapping_reference.swap(Array::scalar(2.0_f32));
-            *swapping_observed.lock().unwrap() = Some(old);
-        });
-        lease.wait_until_awaited();
-        assert_eq!(*observed.lock().unwrap(), None);
-        lease.complete(Ok(()));
-        swapper.join().unwrap();
-        assert_eq!(*observed.lock().unwrap(), Some(Ok(Array::scalar(1.0_f32))));
-        assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32)));
-    }
-
-    #[test]
-    fn test_reference_freeze_waits_for_an_active_read_lease() {
-        let reference = Arc::new(reference_new(Array::scalar(1.0_f32)));
-        let lease = ControlledCompletion::new();
-        let mut guard = reference.lock().unwrap();
-        guard.validate_read_lease_publication().unwrap();
-        guard.publish_read_lease_unchecked(ReferenceCompletion::new(lease.clone()));
-        drop(guard);
-
-        // Consumption is a mutation of the alias family, so it waits for the same leases a replacement would.
-        let observed = Arc::new(Mutex::new(None));
-        let freezing_reference = Arc::clone(&reference);
-        let freezing_observed = Arc::clone(&observed);
-        let freezer = std::thread::spawn(move || {
-            let value = freezing_reference.freeze();
-            *freezing_observed.lock().unwrap() = Some(value);
-        });
-        lease.wait_until_awaited();
-        assert_eq!(*observed.lock().unwrap(), None);
-        lease.complete(Ok(()));
-        freezer.join().unwrap();
-        assert_eq!(*observed.lock().unwrap(), Some(Ok(Array::scalar(1.0_f32))));
-        assert_eq!(reference.read(), Err(ReferenceError::Frozen));
-    }
-
-    #[test]
-    fn test_reference_pending_install_rejects_a_stale_generation() {
-        let reference = reference_new(Array::scalar(1.0_f32));
-        let mut guard = reference.lock().unwrap();
-        let first_value = guard.prepare_replacement(Array::scalar(2.0_f32)).unwrap();
-        let first = submit_pending(&mut guard, ReferenceCompletion::ready(Ok(())), first_value).unwrap();
-        let second = guard.next_generation().unwrap();
-        guard.begin_submitted_mutation(second);
-
-        // Rejecting a late installation leaves the newer `Taken` transition intact, allowing that transaction to
-        // install its own replacement.
-        let value = guard.prepare_replacement(Array::scalar(3.0_f32)).unwrap();
-        assert_eq!(guard.validate_pending_install(first, &value), Err(ReferenceError::StaleGeneration));
-        guard.install_pending_unchecked(second, ReferenceCompletion::ready(Ok(())), value);
-        drop(guard);
-        assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32)));
-    }
-
-    #[test]
-    fn test_reference_take_rejects_an_active_read_lease() {
-        let reference = reference_new(Array::scalar(1.0_f32));
-        let lease = ControlledCompletion::new();
-        let mut guard = reference.lock().unwrap();
-        guard.validate_read_lease_publication().unwrap();
-        guard.publish_read_lease_unchecked(ReferenceCompletion::new(lease.clone()));
-
-        // Handing leased buffers to a donating execution would let the device mutate storage a submitted read-only
-        // execution still observes, so extraction is rejected until the lease completes and is pruned.
-        assert_eq!(guard.take(), Err(ReferenceError::TransactionInProgress));
-        lease.complete(Ok(()));
-        assert_eq!(guard.take(), Ok(Array::scalar(1.0_f32)));
-        let restored = guard.prepare_replacement(Array::scalar(4.0_f32)).unwrap();
-        guard.install(restored).unwrap();
-        drop(guard);
-        assert_eq!(reference.read(), Ok(Array::scalar(4.0_f32)));
-    }
-
-    #[test]
-    fn test_reference_guard_poison_isolated_to_the_extracted_holder() {
-        let first = reference_new(Array::scalar(1.0_f32));
-        let second = reference_new(Array::scalar(2.0_f32));
-        let mut first_guard = first.lock().unwrap();
-        let second_guard = second.lock().unwrap();
-        first_guard.take().unwrap();
-        first_guard.poison("test execution failed");
-        drop(first_guard);
-        drop(second_guard);
-        assert_eq!(
-            first.read(),
-            Err(ReferenceError::ExecutionPoisoned { reason: "test execution failed".to_string() }),
-        );
-        assert_eq!(second.read(), Ok(Array::scalar(2.0_f32)));
-    }
-
-    #[test]
-    fn test_reference_guard_poison_leaves_an_idle_holder_untouched() {
-        let reference = reference_new(Array::scalar(1.0_f32));
-        let mut guard = reference.lock().unwrap();
-        let generation = guard.observe().unwrap().generation();
-
-        // Poisoning is infallible so a cleanup path cannot replace the original backend error with a guard-state error.
-        // A guard that does not own a `Taken` transaction has nothing to invalidate, so the reference remains ready at
-        // its current generation.
-        guard.poison("unrelated backend failure");
-        let observation = guard.observe().unwrap();
-        assert_eq!(observation.generation(), generation);
-        assert_eq!(observation.snapshot(), &Array::scalar(1.0_f32));
-        drop(guard);
-        assert_eq!(reference.read(), Ok(Array::scalar(1.0_f32)));
-        assert_eq!(reference.swap(Array::scalar(2.0_f32)), Ok(Array::scalar(1.0_f32)));
-    }
-
-    #[test]
-    fn test_reference_guard_poison_leaves_a_pending_holder_untouched() {
-        let reference = reference_new(Array::scalar(1.0_f32));
-        let completion = ControlledCompletion::new();
-        let mut guard = reference.lock().unwrap();
-        let replacement = guard.prepare_replacement(Array::scalar(2.0_f32)).unwrap();
-        let generation = submit_pending(&mut guard, ReferenceCompletion::new(completion.clone()), replacement).unwrap();
-
-        // Explicit poisoning applies only to an uninstalled `Taken` transaction. Once a replacement is installed,
-        // its cumulative completion remains the sole authority for promoting or poisoning that pending generation.
-        guard.poison("unrelated backend failure");
-        let observation = guard.observe().unwrap();
-        assert_eq!(observation.generation(), generation);
-        assert!(observation.dependency().is_some());
-        drop(guard);
-        completion.complete(Ok(()));
-        assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32)));
-    }
-
-    #[test]
-    fn test_read_lease_publication_releases_completed_leases() {
-        let reference = reference_new(Array::scalar(1.0_f32));
-        let first = ControlledCompletion::new();
-        let second = ControlledCompletion::new();
-        let third = ControlledCompletion::new();
-        first.complete(Ok(()));
-        second.complete(Ok(()));
-
-        // Lease publication is the only lifecycle update guaranteed for a read-only reference, so it must also release
-        // completed leases instead of retaining their backend resources indefinitely. The strong counts make those
-        // releases observable here.
-        let mut guard = reference.lock().unwrap();
-        guard.validate_read_lease_publication().unwrap();
-        guard.publish_read_lease_unchecked(ReferenceCompletion::new(first.clone()));
-        guard.validate_read_lease_publication().unwrap();
-        guard.publish_read_lease_unchecked(ReferenceCompletion::new(second.clone()));
-        assert_eq!(Arc::strong_count(&first.state), 1);
-        assert_eq!(Arc::strong_count(&second.state), 2);
-        guard.validate_read_lease_publication().unwrap();
-        guard.publish_read_lease_unchecked(ReferenceCompletion::new(third.clone()));
-        assert_eq!(Arc::strong_count(&second.state), 1);
-        assert_eq!(Arc::strong_count(&third.state), 2);
-
-        // Only the running lease remains. It blocks the next submitted mutation until completion and pruning.
-        assert_eq!(guard.active_read_leases().len(), 1);
-        assert_eq!(guard.next_generation(), Err(ReferenceError::TransactionInProgress));
-        third.complete(Ok(()));
-        assert!(guard.active_read_leases().is_empty());
-        assert_eq!(Arc::strong_count(&third.state), 1);
-        assert!(guard.next_generation().is_ok());
-    }
-
-    #[test]
-    fn test_dropping_reference_guard_poisons_extracted_holder() {
-        let reference = reference_new(Array::scalar(1.0_f32));
-        let mut guard = reference.lock().unwrap();
-        assert_eq!(guard.take(), Ok(Array::scalar(1.0_f32)));
-        drop(guard);
-        assert_eq!(
-            reference.read(),
-            Err(ReferenceError::ExecutionPoisoned {
-                reason: "stateful transaction ended without restoring state".to_string(),
-            }),
-        );
-    }
-
-    #[test]
-    fn test_reference_clones_alias_one_holder_and_reads_snapshots() {
-        let initial = Array::vector(vec![1.0_f32, 2.0]);
-        let reference = reference_new(initial.clone());
-        let alias = reference.clone();
-        let distinct = reference_new(initial);
-        assert_eq!(reference, alias);
-        assert_ne!(reference, distinct);
-        assert_eq!(reference.id(), alias.id());
-        assert_eq!(reference.read().unwrap(), Array::vector(vec![1.0_f32, 2.0]));
-        assert_eq!(reference.r#type(), alias.r#type());
-        assert_eq!(reference.r#type(), distinct.r#type());
-        // `Display` is deterministic and type-based; including the allocation address would make diagnostics and
-        // program renderings nondeterministic. Runtime identity remains available through `Debug`.
-        assert_eq!(reference.to_string(), "ref<f32[2]>");
-        assert_eq!(reference.to_string(), distinct.to_string());
-        assert_eq!(
-            format!("{reference:?}"),
-            format!("Reference {{ id: {:?}, type: {:?} }}", reference.id(), reference.r#type()),
-        );
-
-        let mut reference_type_hasher = DefaultHasher::new();
-        reference.r#type().hash(&mut reference_type_hasher);
-        let mut distinct_type_hasher = DefaultHasher::new();
-        distinct.r#type().hash(&mut distinct_type_hasher);
-        assert_eq!(reference_type_hasher.finish(), distinct_type_hasher.finish());
-
-        let references = HashMap::from([(reference.clone(), "root")]);
-        assert_eq!(references.get(&alias), Some(&"root"));
-        assert_eq!(references.get(&distinct), None);
-    }
-
-    #[test]
-    fn test_reference_is_send_and_sync() {
-        // Exact clones share immutable handle-local type and identity metadata across threads, so the production array
-        // reference type must remain `Send + Sync`.
-        fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<Reference<Array>>();
-    }
-
-    #[test]
-    fn test_reference_handle_layout_and_clone_sharing() {
-        // `Reference` stores one `Arc`; exact clones share its immutable type and identity metadata, so cloning requires
-        // only a reference-count increment.
-        assert_eq!(size_of::<Reference<Array>>(), size_of::<usize>());
-
-        let reference = reference_new(Array::scalar(1.0_f32));
-        let clone = reference.clone();
-        assert!(Arc::ptr_eq(&clone.handle, &reference.handle));
-    }
-
-    #[test]
-    fn test_reference_allocation_rejects_an_immediate_reference_referent() {
-        let nested = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
-        assert!(matches!(
-            Reference::new(nested),
-            Err(ReferenceError::NestedReferent { referent_type }) if referent_type == "ref<f32[]>"
-        ));
-    }
-
-    #[test]
-    fn test_reference_freeze_invalidates_the_complete_alias_family() {
-        let reference = reference_new(Array::vector(vec![1.0_f32, 2.0]));
-        let alias = reference.clone();
-        assert_eq!(reference.freeze(), Ok(Array::vector(vec![1.0_f32, 2.0])));
-
-        assert_eq!(alias.read(), Err(ReferenceError::Frozen));
-        assert_eq!(alias.write(Array::vector(vec![3.0_f32, 4.0])), Err(ReferenceError::Frozen));
-        assert_eq!(alias.swap(Array::vector(vec![3.0_f32, 4.0])), Err(ReferenceError::Frozen));
-        assert_eq!(reference.freeze(), Err(ReferenceError::Frozen));
-
-        // Once the alias family is frozen, state validation must reject the update before invoking value-family code.
-        let update_executed = Cell::new(false);
-        let error = alias
-            .update(|_| {
-                update_executed.set(true);
-                Ok((Array::vector(vec![3.0_f32, 4.0]), ()))
-            })
-            .unwrap_err();
-        assert!(!update_executed.get());
-        assert_eq!(error.downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
-    }
-
-    #[test]
-    fn test_reference_rejected_replacements_and_updates_leave_the_holder_unchanged() {
-        let initial = Array::vector(vec![1.0_f32, 2.0]);
-        let reference = reference_new(initial.clone());
-
-        assert_eq!(
-            reference.swap(Array::vector(vec![3.0_f32, 4.0, 5.0])),
-            Err(ReferenceError::ReferentTypeMismatch { expected: "f32[2]".to_string(), actual: "f32[3]".to_string() }),
-        );
-        assert_eq!(reference.read(), Ok(initial.clone()));
-
-        assert_eq!(
-            reference.write(Array::vector(vec![3.0_f32, 4.0, 5.0])),
-            Err(ReferenceError::ReferentTypeMismatch { expected: "f32[2]".to_string(), actual: "f32[3]".to_string() }),
-        );
-        assert_eq!(reference.read(), Ok(initial.clone()));
-
-        let update_error = ProgramError::InvalidArgument { message: "test update failed".to_string() };
-        assert_eq!(reference.update::<(), _>(|_| Err(update_error.clone())), Err(update_error));
-        assert_eq!(reference.read(), Ok(initial.clone()));
-
-        let error = reference.update(|_| Ok((Array::vector(vec![3.0_f32, 4.0, 5.0]), ()))).unwrap_err();
-        assert_eq!(
-            error.downcast_custom::<ReferenceError>(),
-            Some(&ReferenceError::ReferentTypeMismatch {
-                expected: "f32[2]".to_string(),
-                actual: "f32[3]".to_string(),
-            }),
-        );
-        assert_eq!(reference.read(), Ok(initial));
-    }
-
-    #[test]
-    fn test_reference_mutation_preserves_snapshots_and_independent_roots() {
-        let initializer = Array::vector(vec![1.0_f32, 2.0]);
-        let first = reference_new(initializer.clone());
-        let second = reference_new(initializer.clone());
-        let read_snapshot = first.read().unwrap();
-        let replacement = Array::vector(vec![3.0_f32, 4.0]);
-        let retained_replacement = replacement.clone();
-
-        first.write(replacement).unwrap();
-        let swapped_snapshot = first.swap(Array::vector(vec![7.0_f32, 8.0])).unwrap();
-        first
-            .update(|current| current.add(&Array::vector(vec![10.0_f32, 20.0])).map(|updated| (updated, ())))
-            .unwrap();
-        assert_eq!(second.read(), Ok(initializer.clone()));
-        assert_eq!(second.swap(Array::vector(vec![5.0_f32, 6.0])), Ok(initializer.clone()));
-
-        assert_eq!(initializer, Array::vector(vec![1.0_f32, 2.0]));
-        assert_eq!(read_snapshot, Array::vector(vec![1.0_f32, 2.0]));
-        assert_eq!(swapped_snapshot, Array::vector(vec![3.0_f32, 4.0]));
-        assert_eq!(retained_replacement, Array::vector(vec![3.0_f32, 4.0]));
-        assert_eq!(first.read(), Ok(Array::vector(vec![17.0_f32, 28.0])));
-        assert_eq!(second.read(), Ok(Array::vector(vec![5.0_f32, 6.0])));
-    }
-
-    #[test]
-    fn test_identity_renamed_reference_preserves_location_equality_hashing_and_replacement_ownership() {
-        let bounds = DimensionBounds::positive(Some(9)).unwrap();
-        let source = DimensionVariable::new("source", bounds);
-        let target = DimensionVariable::new("target", bounds);
-        let source_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(source.clone())]));
-        let target_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(target.clone())]));
-        let reference = reference_new(CaptureReference::new(0, source_type.clone()));
-        let mut renaming = TypeIdentityRenaming::new();
-        renaming.insert(source, target).unwrap();
-        let renamed = reference.rename_type_identities(&renaming).unwrap();
-
-        // Renaming creates distinct handle-local type and identity metadata over the same allocation. Equality and
-        // hashing follow allocation identity rather than alias-local metadata.
-        assert!(!Arc::ptr_eq(&renamed.handle, &reference.handle));
-        assert!(Arc::ptr_eq(&renamed.handle.holder, &reference.handle.holder));
-        assert_eq!(renamed, reference);
-        assert_ne!(renamed.r#type(), reference.r#type());
-        let mut reference_hasher = DefaultHasher::new();
-        reference.hash(&mut reference_hasher);
-        let mut renamed_hasher = DefaultHasher::new();
-        renamed.hash(&mut renamed_hasher);
-        assert_eq!(reference_hasher.finish(), renamed_hasher.finish());
-        assert_eq!(HashMap::from([(reference.clone(), "root")]).get(&renamed), Some(&"root"));
-
-        // Observation validity follows the shared allocation and generation. The observation owns its already-converted
-        // snapshot, so identity-renamed aliases can validate it without reinterpreting that value.
-        let observation = reference.lock().unwrap().observe().unwrap();
-        let unrelated = reference_new(CaptureReference::new(0, source_type.clone()));
-        assert!(reference.clone().lock().unwrap().is_current(&observation).unwrap());
-        assert!(renamed.lock().unwrap().is_current(&observation).unwrap());
-        assert!(!unrelated.lock().unwrap().is_current(&observation).unwrap());
-
-        let mut guard = renamed.lock().unwrap();
-        assert_eq!(guard.take(), Ok(CaptureReference::new(0, target_type.clone())));
-        let replacement = guard.prepare_replacement(CaptureReference::new(1, target_type)).unwrap();
-        guard.install(replacement).unwrap();
-        drop(guard);
-        assert_eq!(reference.read(), Ok(CaptureReference::new(1, source_type)));
     }
 }
