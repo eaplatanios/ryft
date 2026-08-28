@@ -102,10 +102,10 @@ pub trait ReferenceFreeze<Output = Self>: Sized {
     /// ```compile_fail
     /// use ryft_core::{Array, ArrayIrValue, ReferenceFreeze, ReferenceNew, ReferenceRead};
     ///
-    /// let root = ArrayIrValue::Array(Array::scalar(1.0_f32)).reference_new()?;
-    /// let frozen = root.freeze()?;
+    /// let allocation = ArrayIrValue::Array(Array::scalar(1.0_f32)).reference_new()?;
+    /// let frozen = allocation.freeze()?;
     /// // The handle was consumed, so reading it again does not compile.
-    /// let stale = root.read()?;
+    /// let stale = allocation.read()?;
     /// # Ok::<(), ryft_core::ProgramError>(())
     /// ```
     ///
@@ -113,9 +113,9 @@ pub trait ReferenceFreeze<Output = Self>: Sized {
     /// use ryft_core::{Array, ArrayIrValue, ReferenceFreeze, ReferenceNew, ReferenceError, ReferenceRead};
     ///
     /// // A clone is a separate handle onto the same reference allocation, so misuse is caught dynamically instead.
-    /// let root = ArrayIrValue::Array(Array::scalar(1.0_f32)).reference_new()?;
-    /// let alias = root.clone();
-    /// assert_eq!(root.freeze()?, ArrayIrValue::Array(Array::scalar(1.0_f32)));
+    /// let allocation = ArrayIrValue::Array(Array::scalar(1.0_f32)).reference_new()?;
+    /// let alias = allocation.clone();
+    /// assert_eq!(allocation.freeze()?, ArrayIrValue::Array(Array::scalar(1.0_f32)));
     /// assert_eq!(
     ///     alias.read().unwrap_err().downcast_custom::<ReferenceError>(),
     ///     Some(&ReferenceError::Frozen),
@@ -127,8 +127,9 @@ pub trait ReferenceFreeze<Output = Self>: Sized {
 
 // Reference semantics descriptors are constant per operation type. Sharing them through `LazyLock` statics lets the
 // per-instruction program analysis read them through `Cow::Borrowed` without allocating.
-static REFERENCE_NEW_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> =
-    LazyLock::new(|| ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceOutput::Root { output_index: 0 }]));
+static REFERENCE_NEW_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> = LazyLock::new(|| {
+    ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceOutput::Allocation { output_index: 0 }])
+});
 
 static REFERENCE_READ_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> = LazyLock::new(|| {
     ReferenceOperationSemantics::new(vec![ReferenceInput::new(0, ReferenceAccessMode::Read)], Vec::new())
@@ -206,7 +207,7 @@ macro_rules! define_reference_primitive_payload {
 }
 
 define_reference_primitive_payload!(
-    /// Allocates a reference root for a referent of type `T` in the enclosing type universe `U`.
+    /// Allocates a reference allocation for a referent of type `T` in the enclosing type universe `U`.
     ReferenceNewOperation
 );
 
@@ -231,7 +232,7 @@ define_reference_primitive_payload!(
 );
 
 define_reference_primitive_payload!(
-    /// Consumes a root reference, returning its final referent and invalidating its complete alias family.
+    /// Consumes an allocation reference, returning its final referent and invalidating its complete alias family.
     ReferenceFreezeOperation
 );
 
@@ -610,10 +611,10 @@ where
         check_count!("input", inputs, 1, ProgramError);
 
         // Interpretation replays an already-built instruction, so the operand is borrowed from the environment rather
-        // than owned, and cloning it is the faithful replay: a clone names the same root, so consuming it invalidates
+        // than owned, and cloning it is the faithful replay: a clone names the same allocation, so consuming it invalidates
         // the whole alias family exactly as the source program asked. The linearity the value-level capability
         // enforces is not weakened by the clone, because it was never this layer's to enforce: a staged handle is
-        // held to it while the program is traced, and an eager clone shares the holder that reports the misuse.
+        // held to it while the program is traced, and an eager clone shares the allocation that reports the misuse.
         Ok(vec![inputs[0].clone().freeze()?])
     }
 }
@@ -646,13 +647,13 @@ where
 }
 
 // Every reference primitive owns its own discharge rewrite, and each one is expressed purely through the discharge
-// context's root services and the policy's alias mechanics, so these six rules serve every reference universe. None
-// of them names the referent type parameter `T`: an allocation reads its fresh root's reference type back out of its
+// context's allocation services and the policy's alias mechanics, so these six rules serve every reference universe. None
+// of them names the referent type parameter `T`: an allocation reads its fresh allocation's reference type back out of its
 // own inferred output type through the policy's projection, and every access reads the type off the flowing handle.
 //
-// Accesses to the roots partial discharge *preserves* never reach these rules: the dispatch path replays them
+// Accesses to the allocations partial discharge *preserves* never reach these rules: the dispatch path replays them
 // verbatim through `discharge_preserved_access` before rule dispatch, so each access rule below rewrites only
-// discharged roots. The rules still bind their destination by `Context` rather than by `Domain` because the
+// discharged references. The rules still bind their destination by `Context` rather than by `Domain` because the
 // allocation rule and the shared replay path require the conversion seam into the destination's own operation
 // family.
 impl<T, U, C, P> ReferenceDischargeableOperation<C, P> for ReferenceNewOperation<T, U>
@@ -686,8 +687,8 @@ where
             return Ok(vec![context.allocate_discharged(r#type, initial)?]);
         }
 
-        // An unselected allocation site survives, so the allocation is replayed and the root it binds is the
-        // destination reference that replay produced.
+        // An unselected allocation site survives, so the operation is replayed and its result is the destination
+        // reference bound to that allocation.
         let mut outputs = context.parent().bind(*self, Vec::new(), std::slice::from_ref(&initial))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(vec![context.bind_preserved(r#type, outputs.remove(0))?])
@@ -766,7 +767,7 @@ where
 // Accumulation is the one rule that needs more than the base policy, so it is also the only one that names
 // `ReferenceAccumulationPolicy`. A universe that cannot accumulate therefore fails to discharge exactly the programs
 // that contain this operation, and keeps discharging every program that only reads and replaces. The requirement holds
-// even where a root is preserved and the accumulation is only replayed, because whether a program is dischargeable at
+// even where an allocation is preserved and the accumulation is only replayed, because whether a program is dischargeable at
 // all must not depend on which sites the caller happened to select.
 impl<T, U, C, P> ReferenceDischargeableOperation<C, P> for ReferenceAddUpdateOperation<T, U>
 where
@@ -1394,8 +1395,8 @@ mod tests {
     // deliberately view-less, so that these tests isolate the rules themselves: composed views are the policy's
     // concern and are covered where a universe with real view mechanics lives.
     //
-    // Two destinations are named because the rules serve two kinds of root. A discharged root's rewrite reaches only
-    // ordinary values, so the eager destination executes it and the tests read the results directly. A preserved root
+    // Two destinations are named because the rules serve two kinds of allocation. A discharged reference's rewrite reaches only
+    // ordinary values, so the eager destination executes it and the tests read the results directly. A preserved reference
     // is a *reference* of the destination universe, which an eager value of this fixture cannot be, so the preserved
     // replay is exercised against the staging destination and read back as the program it recorded.
 
@@ -1410,7 +1411,7 @@ mod tests {
 
     /// Operation family of the discharge-rule test destinations.
     ///
-    /// It carries the six reference primitives, because replaying an access to a preserved root binds the access
+    /// It carries the six reference primitives, because replaying an access to a preserved reference binds the access
     /// itself into the destination, and one addition, because that is how this universe's accumulation policy reaches
     /// its sum. A real family reaches the same shape through a dispatch derive.
     #[derive(Copy, Clone, Debug)]
@@ -1496,7 +1497,7 @@ mod tests {
     }
 
     // Only the addition is executable: a reference primitive reaches an eager destination exclusively as the replay of
-    // an access to a preserved root, and a preserved root lives in the staging destination, which records rather than
+    // an access to a preserved reference, and a preserved reference lives in the staging destination, which records rather than
     // executes.
     impl<C: Domain<Type = TestType, Value = TestValue>> InterpretableOperation<C> for TestOperation {
         fn interpret<D: InterpretationDriver<C>>(
@@ -1519,7 +1520,7 @@ mod tests {
 
     macro_rules! impl_test_operation_from_reference_primitive {
         // Lifts one reference primitive into the test destination family, which is the conversion seam a rule spends
-        // when it replays an access to a preserved root.
+        // when it replays an access to a preserved reference.
         ($variant:ident, $payload:ident) => {
             impl From<$payload> for TestOperation {
                 fn from(operation: $payload) -> Self {
@@ -1634,7 +1635,7 @@ mod tests {
         type Referent = TestReferent;
         type Alias = TestAlias;
 
-        fn root_alias(_referent: &TestReferent) -> TestAlias {
+        fn storage_alias(_referent: &TestReferent) -> TestAlias {
             TestAlias
         }
 
@@ -1701,7 +1702,7 @@ mod tests {
         type Referent = TestReferent;
         type Alias = TestAlias;
 
-        fn root_alias(_referent: &TestReferent) -> TestAlias {
+        fn storage_alias(_referent: &TestReferent) -> TestAlias {
             TestAlias
         }
 
@@ -1743,19 +1744,19 @@ mod tests {
         }
     }
 
-    /// Handle to one live root in the discharge-rule test universe.
+    /// Handle to one live allocation in the discharge-rule test universe.
     type TestDischargeReference = ReferenceDischargeReference<TestDestination, TestReferenceDischarge>;
 
-    /// Referent every discharge-rule test allocates its root over.
+    /// Referent every discharge-rule test allocates its allocation over.
     const REFERENT: TestReferent = TestReferent::new(7, 16);
 
-    // Allocates one root holding `payload` through the allocation rule and returns the discharge context together
-    // with the handle denoting that root.
-    fn allocated_root(payload: i64) -> (TestDischargeContext, TestDischargeReference) {
+    // Allocates one allocation holding `payload` through the allocation rule and returns the discharge context together
+    // with the handle denoting that allocation.
+    fn allocated_allocation(payload: i64) -> (TestDischargeContext, TestDischargeReference) {
         let context = TestDischargeContext::new(TestDestination::new());
         let initial = ReferenceDischargeValue::Ordinary(TestValue::new(REFERENT, payload));
         let allocated = New::new().discharge_references(&context, &EmptyRegionDriver, &[initial]).unwrap();
-        let reference = allocated[0].expect_reference("the allocated root").unwrap().clone();
+        let reference = allocated[0].expect_reference("the allocated allocation").unwrap().clone();
         (context, reference)
     }
 
@@ -1935,7 +1936,7 @@ mod tests {
         assert_eq!(AddUpdate::new().effects(), Effects::single(Effect::OrderedState));
         assert_eq!(Freeze::new().effects(), Effects::single(Effect::OrderedState));
 
-        assert_eq!(New::new().reference_semantics().outputs(), &[ReferenceOutput::Root { output_index: 0 }],);
+        assert_eq!(New::new().reference_semantics().outputs(), &[ReferenceOutput::Allocation { output_index: 0 }],);
         assert_eq!(New::new().reference_semantics().inputs(), &[]);
         assert_eq!(Read::new().reference_semantics().outputs(), &[]);
         assert_eq!(Read::new().reference_semantics().inputs(), &[ReferenceInput::new(0, ReferenceAccessMode::Read)],);
@@ -1965,7 +1966,7 @@ mod tests {
         type Referent = TestReferent;
         type Alias = TestAlias;
 
-        fn root_alias(_referent: &TestReferent) -> TestAlias {
+        fn storage_alias(_referent: &TestReferent) -> TestAlias {
             TestAlias
         }
 
@@ -2006,15 +2007,15 @@ mod tests {
 
     #[test]
     fn test_reference_new_operation_reference_discharge() {
-        // Allocation binds a fresh discharged root whose entering state is the initializer and whose reference type is
-        // the one this operation's own inference derives, exposed through the identity alias of an unviewed root.
-        let (context, reference) = allocated_root(4);
-        assert_eq!(context.live_roots(), vec![reference.root()]);
+        // Allocation binds a fresh discharged reference whose entering state is the initializer and whose reference type is
+        // the one this operation's own inference derives, exposed through the storage alias of a complete value.
+        let (context, reference) = allocated_allocation(4);
+        assert_eq!(context.live_allocations(), vec![reference.allocation()]);
         assert_eq!(reference.r#type(), &ReferenceType::new(REFERENT));
         assert_eq!(reference.alias(), &TestAlias);
         assert_eq!(reference.preserved(), None);
-        assert_eq!(context.discharged_state(reference.root()), Ok(TestValue::new(REFERENT, 4)));
-        assert_eq!(context.is_mutated(reference.root()), Ok(false));
+        assert_eq!(context.discharged_state(reference.allocation()), Ok(TestValue::new(REFERENT, 4)));
+        assert_eq!(context.is_mutated(reference.allocation()), Ok(false));
 
         // A reference operand is not an initial state, and the diagnostic says which operand the rule expected.
         let context = TestDischargeContext::new(TestDestination::new());
@@ -2026,8 +2027,8 @@ mod tests {
             ))),
         );
 
-        // The rule reads its fresh root's reference type back out of its own inferred output type, so a policy whose
-        // projection disagrees with that inference cannot silently allocate an unclassifiable root.
+        // The rule reads its fresh allocation's reference type back out of its own inferred output type, so a policy whose
+        // projection disagrees with that inference cannot silently allocate an unclassifiable allocation.
         let disagreeing =
             ReferenceDischargeContext::<TestDestination, NonProjectingReferenceDischarge>::new(TestDestination::new());
         let initial = ReferenceDischargeValue::Ordinary(TestValue::new(REFERENT, 4));
@@ -2041,16 +2042,16 @@ mod tests {
 
     #[test]
     fn test_reference_read_operation_reference_discharge() {
-        // A read observes the root's current state without changing it, so the root stays unmutated.
-        let (context, reference) = allocated_root(4);
+        // A read observes the allocation's current state without changing it, so the allocation stays unmutated.
+        let (context, reference) = allocated_allocation(4);
         let handle = ReferenceDischargeValue::Reference(reference.clone());
         assert_eq!(
             Read::new().discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&handle)),
             Ok(vec![ReferenceDischargeValue::Ordinary(TestValue::new(REFERENT, 4))]),
         );
-        assert_eq!(context.is_mutated(reference.root()), Ok(false));
+        assert_eq!(context.is_mutated(reference.allocation()), Ok(false));
 
-        // An ordinary operand denotes no root, so the rule reports what it expected instead of reading a value.
+        // An ordinary operand denotes no allocation, so the rule reports what it expected instead of reading a value.
         let pure: TestDischargeValue = ReferenceDischargeValue::Ordinary(TestValue::new(REFERENT, 4));
         assert_eq!(
             Read::new().discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&pure)),
@@ -2063,21 +2064,21 @@ mod tests {
     #[test]
     fn test_reference_write_operation_reference_discharge() {
         // A policy with no accumulation capability replaces state through `write`, produces no old-value
-        // result, and marks the root mutated. Its `replace` path is an error, making accidental swap dispatch visible.
+        // result, and marks the allocation mutated. Its `replace` path is an error, making accidental swap dispatch visible.
         let context =
             ReferenceDischargeContext::<TestDestination, WriteOnlyReferenceDischarge>::new(TestDestination::new());
         let initial = TestValue::new(REFERENT, 4);
         let allocated = context.allocate_discharged(ReferenceType::new(REFERENT), initial).unwrap();
-        let reference = allocated.expect_reference("the allocated root").unwrap().clone();
+        let reference = allocated.expect_reference("the allocated allocation").unwrap().clone();
         let inputs = vec![
             ReferenceDischargeValue::Reference(reference.clone()),
             ReferenceDischargeValue::Ordinary(TestValue::new(REFERENT, 9)),
         ];
         assert_eq!(Write::new().discharge_references(&context, &EmptyRegionDriver, inputs.as_slice()), Ok(Vec::new()),);
         assert_eq!(context.read(&reference), Ok(TestValue::new(REFERENT, 9)));
-        assert_eq!(context.is_mutated(reference.root()), Ok(true));
+        assert_eq!(context.is_mutated(reference.allocation()), Ok(true));
 
-        // Exact operand inference runs before mutation, so a rejected replacement leaves the root unchanged.
+        // Exact operand inference runs before mutation, so a rejected replacement leaves the allocation unchanged.
         let invalid = vec![
             ReferenceDischargeValue::Reference(reference.clone()),
             ReferenceDischargeValue::Ordinary(TestValue::new(TestReferent::new(7, 32), 1)),
@@ -2095,8 +2096,8 @@ mod tests {
 
     #[test]
     fn test_reference_swap_operation_reference_discharge() {
-        // A replacement returns the previous state and commits the successor, which marks the root mutated.
-        let (context, reference) = allocated_root(4);
+        // A replacement returns the previous state and commits the successor, which marks the allocation mutated.
+        let (context, reference) = allocated_allocation(4);
         let inputs = vec![
             ReferenceDischargeValue::Reference(reference.clone()),
             ReferenceDischargeValue::Ordinary(TestValue::new(REFERENT, 9)),
@@ -2106,7 +2107,7 @@ mod tests {
             Ok(vec![ReferenceDischargeValue::Ordinary(TestValue::new(REFERENT, 4))]),
         );
         assert_eq!(context.read(&reference), Ok(TestValue::new(REFERENT, 9)));
-        assert_eq!(context.is_mutated(reference.root()), Ok(true));
+        assert_eq!(context.is_mutated(reference.allocation()), Ok(true));
 
         // The replacement itself must be an ordinary value rather than a second reference handle.
         let handles =
@@ -2123,7 +2124,7 @@ mod tests {
     #[test]
     fn test_reference_add_update_operation_reference_discharge() {
         // An accumulation produces no result and replaces the current state with its sum with the update.
-        let (context, reference) = allocated_root(4);
+        let (context, reference) = allocated_allocation(4);
         let inputs = vec![
             ReferenceDischargeValue::Reference(reference.clone()),
             ReferenceDischargeValue::Ordinary(TestValue::new(REFERENT, 9)),
@@ -2133,10 +2134,10 @@ mod tests {
             Ok(Vec::new()),
         );
         assert_eq!(context.read(&reference), Ok(TestValue::new(REFERENT, 13)));
-        assert_eq!(context.is_mutated(reference.root()), Ok(true));
+        assert_eq!(context.is_mutated(reference.allocation()), Ok(true));
 
         // An update whose sum with the referent would not itself be the referent is rejected by this operation's own
-        // inference before the universe accumulates anything, so the root keeps its previous state.
+        // inference before the universe accumulates anything, so the allocation keeps its previous state.
         let promoted = vec![
             ReferenceDischargeValue::Reference(reference.clone()),
             ReferenceDischargeValue::Ordinary(TestValue::new(TestReferent::new(7, 32), 1)),
@@ -2154,26 +2155,29 @@ mod tests {
 
     #[test]
     fn test_reference_freeze_operation_reference_discharge() {
-        // A freeze yields the root's final state and unbinds the root, so every later access is a use-after-consume.
-        let (context, reference) = allocated_root(4);
+        // A freeze yields the allocation's final state and unbinds the allocation, so every later access is a use-after-consume.
+        let (context, reference) = allocated_allocation(4);
         let handle = ReferenceDischargeValue::Reference(reference.clone());
         assert_eq!(
             Freeze::new().discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&handle)),
             Ok(vec![ReferenceDischargeValue::Ordinary(TestValue::new(REFERENT, 4))]),
         );
-        assert_eq!(context.live_roots(), Vec::new());
+        assert_eq!(context.live_allocations(), Vec::new());
         assert_eq!(
             Freeze::new().discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&handle)),
-            Err(ProgramError::MalformedProgram(format!("reference discharge accessed consumed {}", reference.root()))),
+            Err(ProgramError::MalformedProgram(format!(
+                "reference discharge accessed consumed {}",
+                reference.allocation(),
+            ))),
         );
     }
 
     #[test]
-    fn test_reference_primitive_discharge_replays_accesses_to_a_preserved_root() {
-        // A root that partial discharge preserved survives in the destination as an ordinary reference, so the
+    fn test_reference_primitive_discharge_replays_accesses_to_a_preserved_allocation() {
+        // An allocation that partial discharge preserved survives in the destination as an ordinary reference, so the
         // dispatch path replays every access verbatim over the handle's destination value instead of acting on
         // threaded state, and the access rules themselves never run. The rewritten program therefore performs the
-        // same reference operations the source did, in the same order, and the consumed root contributes no binding.
+        // same reference operations the source did, in the same order, and the consumed allocation contributes no binding.
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = builder.add_input(TestType::Reference(ReferenceType::new(REFERENT)));
         let update = builder.add_input(TestType::Value(REFERENT));
@@ -2219,16 +2223,18 @@ mod tests {
     #[test]
     fn test_reference_primitive_discharge_preserves_an_unselected_allocation() {
         // The allocation rule consults its own replay position against the selection, so an unselected allocation
-        // site is replayed rather than turned into threaded state and the root it binds survives in the destination.
+        // site is replayed rather than turned into threaded state, and its allocated reference survives in the destination.
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let initial = builder.add_input(TestType::Value(REFERENT));
         let update = builder.add_input(TestType::Value(REFERENT));
-        let root = builder.add_instruction(TestOperation::New(New::new()), Vec::new(), vec![initial], None).unwrap()[0];
+        let allocation =
+            builder.add_instruction(TestOperation::New(New::new()), Vec::new(), vec![initial], None).unwrap()[0];
         builder
-            .add_instruction(TestOperation::AddUpdate(AddUpdate::new()), Vec::new(), vec![root, update], None)
+            .add_instruction(TestOperation::AddUpdate(AddUpdate::new()), Vec::new(), vec![allocation, update], None)
             .unwrap();
-        let frozen =
-            builder.add_instruction(TestOperation::Freeze(Freeze::new()), Vec::new(), vec![root], None).unwrap()[0];
+        let frozen = builder
+            .add_instruction(TestOperation::Freeze(Freeze::new()), Vec::new(), vec![allocation], None)
+            .unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![frozen], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();

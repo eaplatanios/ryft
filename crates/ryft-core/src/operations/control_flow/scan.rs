@@ -836,7 +836,7 @@ where
 
     #[inline]
     fn reference_output_identity_input(&self, output_index: usize) -> Option<usize> {
-        // Only the leading carries preserve their input roots positionally; stacked per-step outputs are fresh
+        // Only the leading carries preserve their input allocations positionally; stacked per-step outputs are fresh
         // values with no identity constraint.
         (output_index < self.carry_count).then_some(output_index)
     }
@@ -1726,7 +1726,7 @@ where
         let (carry_operands, stacked_operands) = inputs.split_at(carry_count);
         let carries = carry_operands
             .iter()
-            .map(|input| context.operand_root(input, name))
+            .map(|input| context.operand_allocation(input, name))
             .collect::<Result<Vec<_>, _>>()?;
 
         // Only the carries forward positionally into the body. Every remaining body input is a per-iteration slice of
@@ -1739,11 +1739,11 @@ where
                 body_input_types.len(),
             )));
         }
-        let mut body_roots = carries.clone();
-        body_roots.resize(body_input_types.len(), None);
-        let summary = context.region_summary(self, 0, body, body_roots.as_slice())?;
+        let mut body_allocations = carries.clone();
+        body_allocations.resize(body_input_types.len(), None);
+        let summary = context.region_summary(self, 0, body, body_allocations.as_slice())?;
 
-        // A root the body returns is threaded even if the body never accesses it, so that a boundary the loop's fixed
+        // An allocation the body returns is threaded even if the body never accesses it, so that a boundary the loop's fixed
         // point requires is reported as a broken fixed point rather than as a reference the rebuilt body cannot
         // resolve. The widening excludes the carries that survive as references: those occupy their declared carry
         // positions as the references they already are.
@@ -1754,22 +1754,22 @@ where
         let boundary = ReferenceRegionDischargeBoundary::symmetric(
             self,
             0,
-            body_roots,
+            body_allocations,
             ReferenceRegionStateInsertion::new(entering.clone(), carry_count),
         );
         let fork = driver.discharge_region_program(context, 0, &boundary)?;
         fork.validate_predicted_mutations(widening.published(), name)?;
-        fork.validate_predicted_output_roots(summary.output_roots(), name)?;
+        fork.validate_predicted_output_allocations(summary.output_allocations(), name)?;
 
         // A carry must leave the body as the reference it entered with, or a zero-length scan would not return its
         // entering state.
-        let source_output_count = fork.output_roots().len();
+        let source_output_count = fork.output_allocations().len();
         if source_output_count < carry_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "operation `{name}` declares {carry_count} carries but its body declares {source_output_count} outputs",
             )));
         }
-        for (position, (returned, carry)) in fork.output_roots()[..carry_count].iter().zip(&carries).enumerate() {
+        for (position, (returned, carry)) in fork.output_allocations()[..carry_count].iter().zip(&carries).enumerate() {
             if returned != carry {
                 return Err(ProgramError::MalformedProgram(format!(
                     "operation `{name}` does not return carry {position} as the reference it entered with, so its \
@@ -1782,8 +1782,8 @@ where
         for input in carry_operands {
             operands.push(context.operand_value(input)?);
         }
-        for root in &entering {
-            operands.push(context.discharged_state(*root)?);
+        for allocation in &entering {
+            operands.push(context.discharged_state(*allocation)?);
         }
         for (position, input) in stacked_operands.iter().enumerate() {
             operands.push(
@@ -1803,15 +1803,15 @@ where
         for (position, output) in outputs.into_iter().enumerate() {
             if position < carry_count {
                 match carries[position] {
-                    Some(root) => {
-                        context.merge_boundary_state(&summary, widening.threaded(), root, output)?;
+                    Some(allocation) => {
+                        context.merge_boundary_state(&summary, widening.threaded(), allocation, output)?;
                         results.push(carry_operands[position].clone());
                     }
                     None => results.push(ReferenceDischargeValue::Ordinary(output)),
                 }
             } else if position < carry_count + entering.len() {
-                let root = entering[position - carry_count];
-                context.merge_boundary_state(&summary, widening.threaded(), root, output)?;
+                let allocation = entering[position - carry_count];
+                context.merge_boundary_state(&summary, widening.threaded(), allocation, output)?;
             } else {
                 results.push(ReferenceDischargeValue::Ordinary(output));
             }
@@ -5220,7 +5220,7 @@ mod tests {
             .unwrap();
 
         // The rewritten payload keeps every attribute that is not about state: a reversed, fully unrolled scan of the
-        // same length stays exactly that, and only its carry count would move if a root reached the body without
+        // same length stays exactly that, and only its carry count would move if an allocation reached the body without
         // being one of its declared carries.
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let body = builder.import_program(body);
@@ -5286,7 +5286,7 @@ mod tests {
         assert!(scan.reverse());
         assert_eq!(scan.unroll(), 3);
 
-        // The root is local to the program, so nothing crosses the entry boundary and the rewritten program must
+        // The allocation is local to the program, so nothing crosses the entry boundary and the rewritten program must
         // reproduce the eager reference execution output for output.
         assert_eq!(discharged.public_output_count(), 3);
         assert_eq!(discharged.external_states(), &[]);

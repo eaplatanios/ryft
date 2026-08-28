@@ -20,43 +20,44 @@
 //!   allocation, so mutation through one handle is visible through every alias. A read returns an immutable snapshot,
 //!   and a consuming [`freeze`](Reference::freeze) invalidates the complete alias family.
 //! - [`ReferenceDischargeReference`] is a temporary handle used only while a program is being discharged. It names a
-//!   root in the transform's environment and carries the policy-owned alias metadata for that particular handle.
+//!   reference allocation in the transform's environment and carries the policy-owned alias metadata for that handle.
 //!
-//! A reference family has one canonical root and any number of aliases. An alias preserves the root while possibly
-//! selecting a narrower view. Every access resolves through that root, and consumption invalidates the whole family.
+//! A reference family has one canonical allocation and any number of aliases. An alias preserves the allocation while
+//! possibly selecting a narrower view. Every access resolves through that allocation, and consumption invalidates the
+//! complete family.
 //!
-//! # Roots, Aliases, and Views
+//! # Allocations, Aliases, and Views
 //!
 //! The reference terms used throughout this module and its consumers are defined relative to one concept:
 //!
-//! - A **root** is the canonical mutable storage cell that a reference family denotes. Only
-//!   [`reference_new`](ReferenceNewOperation) mints one. Eagerly, the root is the reference allocation whose
+//! - A **reference allocation** is the canonical mutable storage cell that a reference family denotes. Only
+//!   [`reference_new`](ReferenceNewOperation) mints one. Eagerly, the allocation is the reference allocation whose
 //!   synchronized state every [`Reference`] clone shares; in operation semantics, it is the identity that
-//!   [`ReferenceOutput::Root`] introduces and [`ReferenceOutput::Alias`] preserves; during discharge, it is the unit
-//!   of state threading, named by a [`ReferenceRootHandle`].
+//!   [`ReferenceOutput::Allocation`] introduces and [`ReferenceOutput::Alias`] preserves; during discharge, it is the
+//!   unit of state threading, named by a [`ReferenceAllocationHandle`].
 //! - The **referent** is the structural type of the value a handle exposes, written `ref<T>` as [`ReferenceType`].
-//!   The root has its own referent — the type of the complete stored value — and a view's handle-local referent may
+//!   The allocation has its own referent — the type of the complete stored value — and a view's handle-local referent may
 //!   be narrower.
-//! - A **handle** is one name for a root: a program value of reference type, or an eager [`Reference`] clone.
-//! - An **alias** is a handle derived from another handle. It always denotes the same root, either identically or
+//! - A **handle** is one name for an allocation: a program value of reference type, or an eager [`Reference`] clone.
+//! - An **alias** is a handle derived from another handle. It always denotes the same allocation, either identically or
 //!   through operation-owned view metadata ([`ReferenceAliasKind`]).
 //! - A **view** is a narrowing alias, such as the result of
 //!   [`reference_slice`](crate::arrays::ReferenceSliceOperation) or
-//!   [`reference_index`](crate::arrays::ReferenceIndexOperation): it selects part of the root's value while every
-//!   access through it still resolves to the root.
-//! - The **alias family** is the complete set of handles denoting one root. Mutation through any member is visible
+//!   [`reference_index`](crate::arrays::ReferenceIndexOperation): it selects part of the allocation's value while every
+//!   access through it still resolves to the allocation.
+//! - The **alias family** is the complete set of handles denoting one allocation. Mutation through any member is visible
 //!   through every other member.
-//! - A **whole-root handle** exposes the root's complete stored value with no narrowing view. State that crosses a
-//!   structured-region or discharge boundary is always whole-root; views are re-derived from the root inside the
-//!   region that needs them.
+//! - A **complete-value handle** exposes the allocation's complete stored value with no narrowing view. State that
+//!   crosses a structured-region or discharge boundary is always represented by a complete-value handle; views are
+//!   re-derived from that handle inside the region that needs them.
 //!
-//! Every handle resolves to exactly one root: multi-source aliases (e.g., a hypothetical `select_reference(a, b)`)
-//! are structurally unrepresentable rather than merely rejected, so analyses reason about state per root. Access-mode
-//! summaries, discharge state threading, and race validation are per-root facts, and consumption
-//! ([`reference_freeze`](ReferenceFreezeOperation)) is a whole-root lifetime event that invalidates the complete
-//! family, which is why consuming through a narrowing view is rejected. Roots also split by provenance: a *local*
-//! root is allocated inside the program and disappears entirely after discharge, while an *external* root denotes
-//! caller-owned state entering through an input or capture ([`ReferenceSource`]) and is what a
+//! Every handle resolves to exactly one allocation: multi-source aliases (e.g., a hypothetical `select_reference(a, b)`)
+//! are structurally unrepresentable rather than merely rejected, so analyses reason about state per allocation.
+//! Access-mode summaries, discharge state threading, and race validation are per-allocation facts, and consumption
+//! ([`reference_freeze`](ReferenceFreezeOperation)) is a complete-value lifetime event that invalidates the complete
+//! family, which is why consuming through a narrowing view is rejected. Allocations also split by provenance: a *local*
+//! allocation is created inside the program and disappears entirely after discharge, while an *external* allocation
+//! denotes caller-owned state entering through an input or capture ([`ReferenceSource`]) and is what a
 //! [`ReferenceStateBinding`] describes to the backend.
 //!
 //! # Module Structure
@@ -68,32 +69,32 @@
 //!   completion dependencies, and the synchronized state machine for each reference allocation, including identity,
 //!   generations, guards, read leases, pending completion, and terminal poisoning.
 //! - `semantics.rs` defines the operation-local [`ReferenceOperationSemantics`] descriptor, access modes, and
-//!   root/alias classifications.
+//!   allocation/alias classifications.
 //! - `operations.rs` defines the six generic primitives and their value-level capabilities: allocation
 //!   ([`ReferenceNew`]), immutable reads ([`ReferenceRead`]), write-only replacement ([`ReferenceWrite`]), swapping
 //!   ([`ReferenceSwap`]), ordered additive updates ([`ReferenceAddUpdate`]), and consuming finalization
 //!   ([`ReferenceFreeze`]). It also owns their type inference, effects, eager interpretation, and discharge rules.
 //! - `discharge/` implements [`ReferenceDischarge`]: an interpreter-style transform that replaces selected mutable
-//!   roots with explicitly threaded immutable values. Its policy, context, driver, and operation-rule contracts keep
-//!   the transform open to non-array value families and to third-party operations.
+//!   allocations with explicitly threaded immutable values. Its policy, context, driver, and operation-rule contracts
+//!   keep the transform open to non-array value families and to third-party operations.
 //!
 //! Structured operations own their reference boundary rewrites. For example, condition, while, and scan operations
 //! decide how immutable state is added to their branch or loop boundaries; the discharge driver supplies isolated
-//! region rebuilding, root summaries, and validation rather than choosing the rewrite for them. The one rewrite the
-//! replay path owns itself is the preserved-access replay: a region-free, access-only application over exclusively
-//! preserved roots is replayed verbatim before any rule runs.
+//! region rebuilding, allocation summaries, and validation rather than choosing the rewrite for them. The one rewrite
+//! the replay path owns itself is preserved-access replay: a region-free, access-only application over exclusively
+//! preserved references is replayed verbatim before any rule runs.
 //!
 //! # Eager and Staged State
 //!
 //! Eager code acts directly through a [`Reference`] handle. Staged programs instead use the six reference operations.
 //! Before a staged program reaches a backend that accepts only ordinary immutable values, discharge rewrites those
-//! operations into explicit state dataflow. A local root disappears entirely after that rewrite. An external root
-//! becomes an ordinary state input and, when mutated, a hidden final-state output described by a
+//! operations into explicit state dataflow. A local allocation disappears entirely after that rewrite. An external
+//! allocation becomes an ordinary state input and, when mutated, a hidden final-state output described by a
 //! [`ReferenceStateBinding`]; the backend's stateful invocation surface snapshots and publishes those values through
 //! the caller's reference. [`ReferenceDischarge`] exposes the value-level entry point for this rewrite; the discharge
 //! module documentation contains a concrete before-and-after example.
 //!
-//! [`PartialReferenceDischargeResult`] supports the kernel use case in which selected implementation-owned roots
+//! [`PartialReferenceDischargeResult`] supports the kernel use case in which selected implementation-owned allocations
 //! become immutable state while other references deliberately remain in the program. A full
 //! [`ReferenceDischargeResult`] additionally proves that no reference type or reference operation survives anywhere
 //! in the rewritten region closure.
@@ -106,8 +107,8 @@
 //!    under construction and rejects an access after consumption or consumption through a narrowing view.
 //! 2. The eager [`Reference`] rejects frozen, poisoned, conflicting, and stale-generation accesses while preserving
 //!    atomic replacement semantics across its alias family.
-//! 3. Discharge validates the complete rewrite it observes, including use after consumption, unbound roots, invalid
-//!    structured-region threading, escaping local allocations, and surviving references in a claimed full result.
+//! 3. Discharge validates the complete rewrite it observes, including use after consumption, unbound allocations,
+//!    invalid structured-region threading, escaping local allocations, and surviving references in a claimed full result.
 //!
 //! These checks are complementary. Construction sees the source call, the eager reference sees runtime aliases and
 //! concurrency, and discharge sees the state-threading transformation and complete attached-region closure.
@@ -126,7 +127,7 @@ pub enum ReferenceError {
         referent_type: String,
     },
 
-    /// A replacement or update result did not preserve the root's exact declared referent type.
+    /// A replacement or update result did not preserve the allocation's exact declared referent type.
     #[error("reference value type `{actual}` must exactly match declared referent type `{expected}`")]
     ReferentTypeMismatch {
         /// Exact declared referent type.
@@ -180,12 +181,13 @@ mod values;
 
 pub use discharge::{
     PartialReferenceDischargeResult, RecursiveReferenceDischargeDriver, ReferenceAccumulationPolicy,
-    ReferenceDischarge, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePayload,
-    ReferenceDischargePolicy, ReferenceDischargeReference, ReferenceDischargeRegionDestination,
-    ReferenceDischargeResult, ReferenceDischargeSite, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork, ReferenceRegionStateInsertion,
-    ReferenceRegionSummary, ReferenceRootHandle, ReferenceSource, ReferenceStateBinding, ReferenceStateWidening,
-    discharge_positional_region_operation, discharge_preserved_access, discharge_reference_free_operation,
+    ReferenceAllocationHandle, ReferenceDischarge, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePayload, ReferenceDischargePolicy, ReferenceDischargeReference,
+    ReferenceDischargeRegionDestination, ReferenceDischargeResult, ReferenceDischargeSite, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork,
+    ReferenceRegionStateInsertion, ReferenceRegionSummary, ReferenceSource, ReferenceStateBinding,
+    ReferenceStateWidening, discharge_positional_region_operation, discharge_preserved_access,
+    discharge_reference_free_operation,
 };
 pub use operations::{
     REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME,

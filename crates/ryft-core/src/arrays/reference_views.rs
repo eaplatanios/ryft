@@ -502,7 +502,7 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
     #[doc(hidden)]
     #[inline]
     pub fn is_runtime_root_handle(&self) -> bool {
-        self.view.is_root() && self.root.uses_root_type_identities()
+        self.view.is_root() && self.root.uses_storage_type_identities()
     }
 
     /// Locks an unrenamed root for one backend-owned state transaction.
@@ -900,7 +900,7 @@ mod tests {
     fn test_array_reference_view_derivation_is_pure_structural_composition() {
         let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]));
         let mut guard = root.lock_root().unwrap();
-        let generation = guard.next_generation().unwrap();
+        let generation = guard.next_replacement_generation().unwrap();
         let _transaction = guard.begin_replacement(generation, ReferenceCompletion::ready(Ok(())));
 
         // A derived handle is pure structural metadata over a live reference, so composing one must never resolve its

@@ -18,19 +18,20 @@ pub enum ReferenceAccessMode {
 
     /// Combines an update with the current state as an _ordered_ additive accumulation. Accumulation stays distinct
     /// from [`ReferenceAccessMode::Write`] because it is linear in the update operand and therefore transposable,
-    /// unlike a replacement. It carries no commutativity or atomicity promise: same-root accumulations execute in
-    /// program order (floating-point addition cannot generally be reordered while preserving results), and
+    /// unlike a replacement. It carries no commutativity or atomicity promise: same-allocation accumulations execute
+    /// in program order (floating-point addition cannot generally be reordered while preserving results), and
     /// atomic/commutative accumulation is not supported by this mode.
     Accumulate,
 
-    /// Consumes the root. After such an access the root and its entire alias family are rendered invalid. Consumption
-    /// is a lifetime event, not a memory-access flavor: [`ReferenceFreezeOperation`](crate::ReferenceFreezeOperation)
-    /// is the consuming access that also returns the final value.
+    /// Consumes the allocation. After such an access, the allocation and its entire alias family are invalid.
+    /// Consumption is a lifetime event, not a memory-access flavor:
+    /// [`ReferenceFreezeOperation`](crate::ReferenceFreezeOperation) is the consuming access that also returns
+    /// the final value.
     Consume,
 }
 
 impl ReferenceAccessMode {
-    /// Returns whether this [`ReferenceAccessMode`] consumes the complete reference root.
+    /// Returns whether this [`ReferenceAccessMode`] consumes the complete reference allocation.
     #[inline]
     pub const fn is_consuming(self) -> bool {
         match self {
@@ -53,20 +54,21 @@ impl Display for ReferenceAccessMode {
     }
 }
 
-/// Kind of a root-preserving [`ReferenceOutput::Alias`].
+/// Kind of an allocation-preserving [`ReferenceOutput::Alias`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ReferenceAliasKind {
     /// The alias preserves the input handle's exact referent type and mapping.
     Identity,
 
-    /// The alias selects a view of the input handle's root, and the aliasing operation itself carries the metadata that
-    /// maps the new handle's coordinates onto that root. The generic program layer records only that the output aliases
-    /// the input's root; interpreting and validating the operation-owned metadata is the job of the value family's
-    /// reference discharge policy, which obtains it through the operation family's reference view operation contract.
+    /// The alias selects a view of the input handle's allocation, and the aliasing operation itself carries the
+    /// metadata that maps the new handle's coordinates onto that allocation. The generic program layer records only
+    /// that the output aliases the input's allocation; interpreting and validating the operation-owned metadata is the
+    /// job of the value family's reference discharge policy, which obtains it through the operation family's reference
+    /// view contract.
     ///
     /// For example, [`ReferenceSliceOperation`](crate::ReferenceSliceOperation) declares `Alias { output_index: 0,
-    /// input_index: 0, kind: View }` specifying that its result is a handle onto the same root whose referent is the
-    /// sliced window, the slice axes live on the operation, and the array discharge policy reads those axes to
+    /// input_index: 0, kind: View }` specifying that its result is a handle onto the same allocation whose referent
+    /// is the sliced window, the slice axes live on the operation, and the array discharge policy reads those axes to
     /// materialize or reconstruct the selected coordinates during discharge.
     View,
 }
@@ -102,27 +104,27 @@ impl ReferenceInput {
 }
 
 /// Reference classification of a [`Reference`](crate::Reference)-valued [`Operation`](crate::Operation) output that is
-/// either a fresh canonical root or an alias of one input's root.The two cases are mutually exclusive by construction,
-/// so an output can never be declared as both a new root and an alias. [`Self::Alias`] carries exactly one
-/// `input_index` on purpose as every reference operand must resolve to exactly one canonical root, so multi-source
-/// aliases (e.g., a hypothetical `select_reference(a, b)`) are structurally unrepresentable rather than merely
-/// rejected. [`ReferenceAliasKind`] distinguishes an identity-preserving edge from an operation-owned view edge.
-/// Generic root analysis needs only that marker; the value family's discharge policy obtains and validates its exact
-/// metadata through the operation family's view-operation contract.
+/// either a fresh canonical allocation or an alias of one input's allocation. The two cases are mutually exclusive by
+/// construction, so an output can never be declared as both a new allocation and an alias. [`Self::Alias`] carries
+/// exactly one `input_index` because every reference operand must resolve to exactly one canonical allocation, so
+/// multi-source aliases (e.g., a hypothetical `select_reference(a, b)`) are structurally unrepresentable rather than
+/// merely rejected. [`ReferenceAliasKind`] distinguishes an identity-preserving edge from an operation-owned view edge.
+/// Generic allocation analysis needs only that marker; the value family's discharge policy obtains and validates its
+/// exact metadata through the operation family's view-operation contract.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ReferenceOutput {
-    /// The output allocates a fresh resource and defines a new canonical root.
-    Root {
-        /// Index of the [`Operation`](crate::Operation) output defining the new root.
+    /// The output allocates a fresh resource and defines a new canonical allocation.
+    Allocation {
+        /// Index of the [`Operation`](crate::Operation) output defining the new allocation.
         output_index: usize,
     },
 
-    /// The output aliases the canonical root of a [`Reference`](crate::Reference)-valued input.
+    /// The output aliases the canonical allocation of a [`Reference`](crate::Reference)-valued input.
     Alias {
         /// Index of the [`Operation`](crate::Operation) output producing the alias.
         output_index: usize,
 
-        /// [`Operation`](crate::Operation) input index whose canonical root is preserved.
+        /// [`Operation`](crate::Operation) input index whose canonical allocation is preserved.
         input_index: usize,
 
         /// [`ReferenceAliasKind`] specifying whether this alias preserves the exact handle or adds an
@@ -136,7 +138,7 @@ impl ReferenceOutput {
     #[inline]
     pub const fn output_index(self) -> usize {
         match self {
-            Self::Root { output_index } | Self::Alias { output_index, .. } => output_index,
+            Self::Allocation { output_index } | Self::Alias { output_index, .. } => output_index,
         }
     }
 }
@@ -147,11 +149,11 @@ static EMPTY_REFERENCE_OPERATION_SEMANTICS: ReferenceOperationSemantics =
     ReferenceOperationSemantics { inputs: Vec::new(), outputs: Vec::new() };
 
 /// [`Operation`](crate::Operation)-local reference semantics that describes the input [`Reference`](crate::Reference)
-/// accesses and the output root/alias [`Reference`](crate::Reference) classifications, expressed in operand/result
-/// index space. All indices are operation-local input/operand and output/result positions, never resource identifiers.
-/// [`Program`](crate::Program)-level analysis later resolves them to canonical roots (i.e., an entry input, a capture,
-/// or an allocation instruction), so the descriptor intentionally contains no runtime resource IDs. The empty default
-/// describes operations that neither create, alias, nor access references.
+/// accesses and the output allocation/alias [`Reference`](crate::Reference) classifications, expressed in input/operand
+/// and output/result index space. All indices are operation-local input/operand and output/result positions, never
+/// resource identifiers. [`Program`](crate::Program)-level analysis later resolves them to canonical allocations (i.e.,
+/// an entry input, a capture, or an allocation instruction), so the descriptor intentionally contains no runtime
+/// resource IDs. The empty default describes operations that neither create, alias, nor access references.
 ///
 /// # Examples
 ///
@@ -160,7 +162,7 @@ static EMPTY_REFERENCE_OPERATION_SEMANTICS: ReferenceOperationSemantics =
 /// ```text
 /// reference_new(x) -> r
 ///     inputs  = []
-///     outputs = [Root { output_index: 0 }]
+///     outputs = [Allocation { output_index: 0 }]
 ///
 /// reference_read(r) -> x
 ///     inputs  = [ReferenceInput { input_index: 0, mode: Read }]
@@ -258,11 +260,11 @@ impl ReferenceOperationSemantics {
     }
 
     /// Returns the output positions at which the corresponding [`Operation`](crate::Operation) allocates a fresh
-    /// [`ReferenceOutput::Root`], in deterministic operation-defined order.
+    /// [`ReferenceOutput::Allocation`], in deterministic operation-defined order.
     #[inline]
-    pub fn root_output_indices(&self) -> impl Iterator<Item = usize> {
+    pub fn allocation_output_indices(&self) -> impl Iterator<Item = usize> {
         self.outputs.iter().filter_map(|output| match output {
-            ReferenceOutput::Root { output_index } => Some(*output_index),
+            ReferenceOutput::Allocation { output_index } => Some(*output_index),
             ReferenceOutput::Alias { .. } => None,
         })
     }
@@ -431,10 +433,10 @@ mod tests {
             )),
         );
 
-        let invalid_root =
-            ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceOutput::Root { output_index: 0 }]);
+        let invalid_allocation =
+            ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceOutput::Allocation { output_index: 0 }]);
         assert_eq!(
-            invalid_root.validate_arity("test.reference_new", 1, 0),
+            invalid_allocation.validate_arity("test.reference_new", 1, 0),
             Err(ProgramError::MalformedProgram(
                 "operation `test.reference_new` classifies output 0 but the application output count is 0".to_string(),
             )),
@@ -447,7 +449,7 @@ mod tests {
         ReferenceOperationSemantics::new(
             Vec::new(),
             vec![
-                ReferenceOutput::Root { output_index: 0 },
+                ReferenceOutput::Allocation { output_index: 0 },
                 ReferenceOutput::Alias { output_index: 0, input_index: 0, kind: ReferenceAliasKind::Identity },
             ],
         );

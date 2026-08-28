@@ -18,9 +18,9 @@ use super::boundaries::{ReferenceRegionDischargeBoundary, ReferenceRegionStateIn
 /// constant leading offset and whose results are each region's own outputs: a condition, whose branches follow its
 /// predicate, and a positional call, whose single callee follows nothing. Both widen the same way, so both reach it:
 ///
-///   - the roots every region closure touches are threaded in as operands appended after the declared ones, unless
+///   - the allocations every region closure touches are threaded in as operands appended after the declared ones, unless
 ///     they are already reference operands, in which case they thread at their own position;
-///   - only the roots some closure *mutates* are published back, as outputs appended after the declared ones. A root
+///   - only the allocations some closure *mutates* are published back, as outputs appended after the declared ones. An allocation
 ///     the closures merely read needs no successor state, and pruning it is what keeps a read-only branch's boundary
 ///     identical to its source boundary;
 ///   - every attached region receives the identical state positions, so a rebuilt condition's branches keep agreeing
@@ -31,7 +31,7 @@ use super::boundaries::{ReferenceRegionDischargeBoundary, ReferenceRegionStateIn
 ///
 ///   - `operation`: Operation application being rewritten. It is replayed unchanged, because threading state past a
 ///     positional boundary changes only the boundary.
-///   - `context`: Active discharge context owning the root environment.
+///   - `context`: Active discharge context owning the allocation environment.
 ///   - `driver`: Application-scoped driver supplying the attached regions.
 ///   - `inputs`: Carriers supplied as this application's operands, in operation-defined order.
 ///   - `leading_operand_count`: Number of leading operands that parameterize the operation itself rather than being
@@ -42,9 +42,9 @@ use super::boundaries::{ReferenceRegionDischargeBoundary, ReferenceRegionStateIn
 /// Returns [`ProgramError::MalformedProgram`] when the application has fewer operands than
 /// `leading_operand_count`, when a leading operand is a live reference handle, when an attached region's boundary does
 /// not forward the remaining operands positionally, when a reference operand names a derived view rather than a whole
-/// root, when a region closure reaches a root that never entered the boundary or consumes one, when a region returns a
-/// root its caller never threaded, when the attached regions disagree on which outputs denote references, or when a
-/// region mutates a root the widening did not predict.
+/// allocation, when a region closure reaches an allocation that never entered the boundary or consumes one, when a region returns a
+/// allocation its caller never threaded, when the attached regions disagree on which outputs denote references, or when a
+/// region mutates an allocation the widening did not predict.
 pub fn discharge_positional_region_operation<C, P, O, D>(
     operation: &O,
     context: &ReferenceDischargeContext<C, P>,
@@ -70,18 +70,20 @@ where
     for (index, input) in leading.iter().enumerate() {
         input.expect_ordinary(&format!("an ordinary leading operand {index} of `{name}`"))?;
     }
-    let forwarded_roots =
-        forwarded.iter().map(|operand| context.operand_root(operand, name)).collect::<Result<Vec<_>, _>>()?;
+    let forwarded_allocations = forwarded
+        .iter()
+        .map(|operand| context.operand_allocation(operand, name))
+        .collect::<Result<Vec<_>, _>>()?;
 
     // Every region forwards the same operands, so one summary of all of them decides one shared boundary. It is seeded
     // from the first region rather than from an empty summary, because merging keeps the receiver's declared output
-    // roots and an empty summary declares none.
+    // allocations and an empty summary declares none.
     let region_count = driver.region_count();
     let mut summary: Option<ReferenceRegionSummary> = None;
     for index in 0..region_count {
         let region = driver.region(index)?;
         check_count!("input", region.input_ids(), forwarded.len(), ProgramError);
-        let region_summary = context.region_summary(operation, index, region, forwarded_roots.as_slice())?;
+        let region_summary = context.region_summary(operation, index, region, forwarded_allocations.as_slice())?;
         summary = Some(match summary {
             Some(summary) => summary.merged(&region_summary),
             None => region_summary,
@@ -91,30 +93,30 @@ where
         ProgramError::MalformedProgram(format!("operation `{name}` forwards its operands but attaches no regions"))
     })?;
 
-    // A region that returns a discharged root already publishes its final state at that output position, so only a
-    // mutated state root absent from the declared outputs needs an appended output. The added input set also includes
-    // a returned preserved root absent from the operands: its inherited capture must be rebound in the rebuilt region
+    // A region that returns a discharged reference already publishes its final state at that output position, so only a
+    // mutated state allocation absent from the declared outputs needs an appended output. The added input set also includes
+    // a returned preserved reference absent from the operands: its inherited capture must be rebound in the rebuilt region
     // even though it contributes no state.
-    let represented = summary.output_roots().iter().copied().flatten().collect::<BTreeSet<_>>();
-    let threaded = context.threaded_state_roots(&summary, name)?;
-    let operand_roots = forwarded_roots.iter().copied().flatten().collect::<BTreeSet<_>>();
+    let represented = summary.output_allocations().iter().copied().flatten().collect::<BTreeSet<_>>();
+    let threaded = context.threaded_state_allocations(&summary, name)?;
+    let operand_allocations = forwarded_allocations.iter().copied().flatten().collect::<BTreeSet<_>>();
     let entering = threaded
         .union(&represented)
-        .filter(|root| !operand_roots.contains(root))
+        .filter(|allocation| !operand_allocations.contains(allocation))
         .copied()
         .collect::<Vec<_>>();
     let leaving = threaded
         .difference(&represented)
         .copied()
-        .filter(|root| summary.is_mutated(*root))
+        .filter(|allocation| summary.is_mutated(*allocation))
         .collect::<Vec<_>>();
 
-    // Every mutated root is published, whether through an appended output or through a declared reference output, and
+    // Every mutated allocation is published, whether through an appended output or through a declared reference output, and
     // that complete set is what the rebuilt regions are held to.
-    let published = threaded.iter().copied().filter(|root| summary.is_mutated(*root)).collect::<Vec<_>>();
+    let published = threaded.iter().copied().filter(|allocation| summary.is_mutated(*allocation)).collect::<Vec<_>>();
 
     let source_output_count = driver.region(0)?.output_ids().len();
-    let declared_input_roots = forwarded_roots.clone();
+    let declared_input_allocations = forwarded_allocations.clone();
     let mut regions = Vec::with_capacity(region_count);
     for index in 0..region_count {
         // Every region receives the same state positions, so a rebuilt condition's branches keep agreeing with each
@@ -122,30 +124,30 @@ where
         let boundary = ReferenceRegionDischargeBoundary::new(
             operation,
             index,
-            declared_input_roots.clone(),
+            declared_input_allocations.clone(),
             ReferenceRegionStateInsertion::new(entering.clone(), forwarded.len()),
             ReferenceRegionStateInsertion::new(leaving.clone(), source_output_count),
         );
         let fork = driver.discharge_region_program(context, index, &boundary)?;
         fork.validate_predicted_mutations(published.as_slice(), name)?;
-        fork.validate_predicted_output_roots(summary.output_roots(), name)?;
+        fork.validate_predicted_output_allocations(summary.output_allocations(), name)?;
         regions.push(fork.into_program());
     }
-    let output_roots = summary.output_roots();
+    let output_allocations = summary.output_allocations();
 
     let mut operands = Vec::with_capacity(inputs.len() + entering.len());
     for input in inputs {
         operands.push(context.operand_value(input)?);
     }
-    for root in &entering {
-        let carrier = context.root_handle(*root)?;
+    for allocation in &entering {
+        let carrier = context.allocation_handle(*allocation)?;
         operands.push(context.operand_value(&carrier)?);
     }
     let outputs = context.parent().bind(operation.clone(), regions, operands.as_slice())?;
     check_count!("output", outputs, source_output_count + leaving.len(), ProgramError);
 
     // A declared output that denotes a reference is reported as the handle the caller already holds rather than as a
-    // value. For a discharged root that output carried its final state, which is merged back; for a preserved root it
+    // value. For a discharged reference that output carried its final state, which is merged back; for a preserved reference it
     // carried the reference itself, and there is nothing to merge. Appended outputs publish the remaining final
     // states.
     let mut results = Vec::with_capacity(source_output_count);
@@ -154,16 +156,16 @@ where
             context.set_discharged_state(leaving[position - source_output_count], output)?;
             continue;
         }
-        match output_roots[position] {
-            Some(root) => {
-                context.merge_boundary_state(&summary, &threaded, root, output)?;
-                let forwarded = forwarded_roots
+        match output_allocations[position] {
+            Some(allocation) => {
+                context.merge_boundary_state(&summary, &threaded, allocation, output)?;
+                let forwarded = forwarded_allocations
                     .iter()
-                    .position(|candidate| *candidate == Some(root))
+                    .position(|candidate| *candidate == Some(allocation))
                     .and_then(|position| forwarded.get(position).cloned());
                 results.push(match forwarded {
                     Some(forwarded) => forwarded,
-                    None => context.root_handle(root)?,
+                    None => context.allocation_handle(allocation)?,
                 });
             }
             None => results.push(ReferenceDischargeValue::Ordinary(output)),
@@ -192,8 +194,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_reference_discharge_preserves_aliasing_between_repeated_declared_region_roots() {
-        // Both declared callee inputs denote one caller root. A write through the first must therefore be visible to
+    fn test_reference_discharge_preserves_aliasing_between_repeated_declared_region_allocations() {
+        // Both declared callee inputs denote one caller allocation. A write through the first must therefore be visible to
         // a read through the second even though the rebuilt boundary retains both declared positions.
         let mut callee_builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let written = callee_builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
@@ -218,8 +220,8 @@ mod tests {
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        // Full discharge turns the shared root into state. The public snapshot and hidden final-state output both
-        // observe the write, proving that the duplicate boundary position did not mint an independent fork root.
+        // Full discharge turns the shared allocation into state. The public snapshot and hidden final-state output both
+        // observe the write, proving that the duplicate boundary position did not mint an independent fork allocation.
         let discharged = source.clone().discharge_references_with_policy::<ListReferenceDischarge>(0).unwrap();
         assert_eq!(
             discharged.program().interpret(vec![ListIrValue::List(vec![1, 2])]),
@@ -247,8 +249,8 @@ mod tests {
     }
 
     #[test]
-    fn test_positional_region_discharge_recovers_a_returned_capture_scoped_root() {
-        // This root reaches the region through its inherited capture scope, not through any forwarded operand. The
+    fn test_positional_region_discharge_recovers_a_returned_capture_scoped_allocation() {
+        // This allocation reaches the region through its inherited capture scope, not through any forwarded operand. The
         // declared result must therefore be recovered from the context rather than from the empty operand list.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let captured = builder.add_constant(ListIrValue::Reference(ReferenceType::new(ListType { length: 2 })));
@@ -260,24 +262,27 @@ mod tests {
         let allocated = context
             .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
-        let root = allocated.expect_reference("the capture-scoped root").unwrap().root();
-        let context =
-            context.with_captures(ReferenceCaptureScope::new(list_capture_position, vec![None, None, Some(root)]));
+        let allocation = allocated.expect_reference("the capture-scoped allocation").unwrap().allocation();
+        let context = context
+            .with_captures(ReferenceCaptureScope::new(list_capture_position, vec![None, None, Some(allocation)]));
         let regions = [program];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
 
         let results = discharge_positional_region_operation(&ListOperation::Call, &context, &driver, &[], 0).unwrap();
         assert_eq!(results.len(), 1);
-        assert_eq!(results[0].expect_reference("the returned capture-scoped root").unwrap().root(), root);
         assert_eq!(
-            context.read(results[0].expect_reference("the returned capture-scoped root").unwrap()),
+            results[0].expect_reference("the returned capture-scoped allocation").unwrap().allocation(),
+            allocation
+        );
+        assert_eq!(
+            context.read(results[0].expect_reference("the returned capture-scoped allocation").unwrap()),
             Ok(ListIrValue::List(vec![1, 2]),)
         );
-        assert_eq!(context.is_mutated(root), Ok(false));
+        assert_eq!(context.is_mutated(allocation), Ok(false));
     }
 
     #[test]
-    fn test_positional_region_discharge_recovers_a_returned_preserved_capture_scoped_root() {
+    fn test_positional_region_discharge_recovers_a_returned_preserved_capture_scoped_allocation() {
         let reference_type = ReferenceType::new(ListType { length: 2 });
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let captured = builder.add_constant(ListIrValue::Reference(reference_type.clone()));
@@ -288,16 +293,16 @@ mod tests {
         let context = ListDischargeContext::new(ListDestination::new());
         let destination_reference = ListIrValue::Reference(reference_type.clone());
         let preserved = context.bind_preserved(reference_type, destination_reference.clone()).unwrap();
-        let root = preserved.expect_reference("the preserved capture-scoped root").unwrap().root();
-        let context =
-            context.with_captures(ReferenceCaptureScope::new(list_capture_position, vec![None, None, Some(root)]));
+        let allocation = preserved.expect_reference("the preserved capture-scoped allocation").unwrap().allocation();
+        let context = context
+            .with_captures(ReferenceCaptureScope::new(list_capture_position, vec![None, None, Some(allocation)]));
         let regions = [program];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
 
         let results = discharge_positional_region_operation(&ListOperation::Call, &context, &driver, &[], 0).unwrap();
         assert_eq!(results.len(), 1);
-        let returned = results[0].expect_reference("the returned preserved capture-scoped root").unwrap();
-        assert_eq!(returned.root(), root);
+        let returned = results[0].expect_reference("the returned preserved capture-scoped allocation").unwrap();
+        assert_eq!(returned.allocation(), allocation);
         assert_eq!(returned.preserved(), Some(&destination_reference));
         assert_eq!(context.operand_value(&results[0]), Ok(destination_reference));
     }
@@ -305,7 +310,7 @@ mod tests {
     #[test]
     fn test_reference_discharge_call_rule_threads_state_through_a_non_array_callee() {
         // The whole structured rewrite is universe-generic, so the prototype universe exercises it end to end: a
-        // callee mutates the root it receives and returns only the previous snapshot, and discharge widens the call
+        // callee mutates the allocation it receives and returns only the previous snapshot, and discharge widens the call
         // with the final state the caller needs afterwards.
         let mut callee_builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let callee_reference =
@@ -322,9 +327,11 @@ mod tests {
         let initial = builder.add_input(ListIrType::List(ListType { length: 2 }));
         let update = builder.add_input(ListIrType::List(ListType { length: 2 }));
         let callee = builder.import_program(callee);
-        let root = builder.add_instruction(ListOperation::ReferenceNew, Vec::new(), vec![initial], None).unwrap()[0];
-        let previous = builder.add_instruction(ListOperation::Call, vec![callee], vec![root, update], None).unwrap()[0];
-        let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![root], None).unwrap()[0];
+        let allocation =
+            builder.add_instruction(ListOperation::ReferenceNew, Vec::new(), vec![initial], None).unwrap()[0];
+        let previous =
+            builder.add_instruction(ListOperation::Call, vec![callee], vec![allocation, update], None).unwrap()[0];
+        let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![allocation], None).unwrap()[0];
         let source = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(
                 vec![previous, frozen],

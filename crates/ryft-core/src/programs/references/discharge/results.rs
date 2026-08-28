@@ -7,7 +7,7 @@ use crate::programs::programs::Program;
 use crate::programs::types::Type;
 use crate::programs::values::Value;
 
-/// Invocation source of one external reference root.
+/// Invocation source of one external reference allocation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReferenceSource {
@@ -75,7 +75,7 @@ impl Display for ReferenceSource {
     }
 }
 
-/// Logical binding recipe for one external reference root in a discharged program.
+/// Logical binding recipe for one external reference allocation in a discharged program.
 ///
 /// The [`serde::Serialize`] implementation exposes the canonical in-memory shape for diagnostics and snapshots and is
 /// deliberately distinct from the stable XLA persistence schema, which keeps its own versioned representation
@@ -85,7 +85,7 @@ pub struct ReferenceStateBinding {
     /// Capture or input argument supplying the eager reference handle.
     source: ReferenceSource,
 
-    /// Hidden output position containing final state, or [`None`] for a read-only root.
+    /// Hidden output position containing final state, or [`None`] for a read-only allocation.
     final_state_output_index: Option<usize>,
 }
 
@@ -95,7 +95,7 @@ impl ReferenceStateBinding {
     /// # Parameters
     ///
     ///   - `source`: Capture or input supplying the eager reference handle.
-    ///   - `final_state_output_index`: Hidden output containing the final state, or [`None`] for a read-only root.
+    ///   - `final_state_output_index`: Hidden output containing the final state, or [`None`] for a read-only allocation.
     pub const fn new(source: ReferenceSource, final_state_output_index: Option<usize>) -> Self {
         Self { source, final_state_output_index }
     }
@@ -251,12 +251,12 @@ impl<P> ReferenceDischargeResult<P> {
 }
 
 /// Program payload produced by *partial* reference discharge, in which only the caller-selected reference sites became
-/// explicit immutable state and every unselected root survives as a well-typed reference value.
+/// explicit immutable state and every unselected allocation survives as a well-typed reference value.
 ///
 /// The discharged part of the boundary obeys exactly the invariants of [`ReferenceDischargeResult`]: discharged
-/// external roots are reported as [`ReferenceStateBinding`]s in canonical entry-boundary order, and the mutated
+/// external allocations are reported as [`ReferenceStateBinding`]s in canonical entry-boundary order, and the mutated
 /// subset of those bindings tiles the hidden output suffix that follows the public outputs. Discharged local
-/// allocations leave no binding, because no caller owns their state. Preserved roots contribute neither bindings
+/// allocations leave no binding, because no caller owns their state. Preserved references contribute neither bindings
 /// nor hidden outputs; they simply remain reference-typed values inside the payload, and their accesses replay
 /// verbatim.
 ///
@@ -274,7 +274,7 @@ pub struct PartialReferenceDischargeResult<P> {
 impl<P: ReferenceDischargePayload> PartialReferenceDischargeResult<P> {
     /// Creates a checked partial reference discharge result.
     ///
-    /// The external-state bindings describe the *discharged* roots only and must satisfy the same canonical boundary
+    /// The external-state bindings describe the *discharged* allocations only and must satisfy the same canonical boundary
     /// invariants as [`ReferenceDischargeResult::from_provider_payload`]: they must name valid discharged inputs in
     /// canonical source order, and their final-state output indices, omitting read-only bindings, must exactly cover
     /// the hidden output suffix in binding order.
@@ -284,7 +284,7 @@ impl<P: ReferenceDischargePayload> PartialReferenceDischargeResult<P> {
     ///   - `program`: Mixed discharged program payload.
     ///   - `capture_count`: Number of leading inputs originating in the source program's capture table.
     ///   - `public_output_count`: Number of public outputs preceding hidden final-state outputs.
-    ///   - `external_states`: Logical external-state bindings for the discharged roots, in canonical entry-boundary
+    ///   - `external_states`: Logical external-state bindings for the discharged references, in canonical entry-boundary
     ///     order.
     ///
     /// # Errors
@@ -322,8 +322,8 @@ impl<P> PartialReferenceDischargeResult<P> {
         self.envelope.public_output_count
     }
 
-    /// Returns the binding recipes of the discharged external reference roots, in canonical entry-boundary order.
-    /// Preserved roots are deliberately absent: they were never turned into state and so have nothing to bind.
+    /// Returns the binding recipes of the discharged external reference allocations, in canonical entry-boundary order.
+    /// Preserved references are deliberately absent: they were never turned into state and so have nothing to bind.
     #[inline]
     pub fn external_states(&self) -> &[ReferenceStateBinding] {
         self.envelope.external_states.as_slice()

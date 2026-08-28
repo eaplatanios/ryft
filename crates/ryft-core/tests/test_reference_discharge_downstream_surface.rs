@@ -152,7 +152,7 @@ impl Value for RegisterValue {
 }
 
 /// View chain of the downstream universe. Registers have no interior structure, so every handle denotes its complete
-/// root and the alias carries nothing.
+/// allocation and the alias carries nothing.
 #[derive(Copy, Clone, Debug, PartialEq)]
 struct WholeRegister;
 
@@ -170,7 +170,7 @@ impl<C: Domain<Type = RegisterIrType>> ReferenceDischargePolicy<C> for RegisterR
     type Referent = RegisterType;
     type Alias = WholeRegister;
 
-    fn root_alias(_referent: &RegisterType) -> WholeRegister {
+    fn storage_alias(_referent: &RegisterType) -> WholeRegister {
         WholeRegister
     }
 
@@ -306,7 +306,7 @@ impl Operation for RegisterOperation {
             Self::Negate => Cow::Borrowed(ReferenceOperationSemantics::empty()),
             Self::ReferenceNew => Cow::Owned(ReferenceOperationSemantics::new(
                 Vec::new(),
-                vec![ReferenceOutput::Root { output_index: 0 }],
+                vec![ReferenceOutput::Allocation { output_index: 0 }],
             )),
             Self::Read => Cow::Owned(ReferenceOperationSemantics::new(
                 vec![ReferenceInput::new(0, ReferenceAccessMode::Read)],
@@ -367,7 +367,7 @@ where
         driver: &D,
         inputs: &[ReferenceDischargeValue<C, RegisterReferenceDischarge>],
     ) -> Result<Vec<ReferenceDischargeValue<C, RegisterReferenceDischarge>>, ProgramError> {
-        // Access arms see only discharged roots: the dispatch path replays accesses to preserved roots verbatim
+        // Access arms see only discharged references: the dispatch path replays accesses to preserved references verbatim
         // before any rule runs, so only the allocation arm still distinguishes selected from preserved.
         match self {
             Self::Negate => discharge_reference_free_operation(self, context, driver, inputs),
@@ -413,17 +413,17 @@ where
                 check_count!("input", region.input_ids(), inputs.len(), ProgramError);
                 let mut declared = Vec::with_capacity(inputs.len());
                 for input in inputs {
-                    declared.push(context.operand_root(input, self.name())?);
+                    declared.push(context.operand_allocation(input, self.name())?);
                 }
                 let summary = context.region_summary(self, 0, region, declared.as_slice())?;
-                if summary.output_roots().iter().any(Option::is_some) {
+                if summary.output_allocations().iter().any(Option::is_some) {
                     return Err(ProgramError::MalformedProgram(format!(
                         "`{}` does not return references from its callee",
                         self.name(),
                     )));
                 }
-                let operand_roots = declared.iter().copied().flatten().collect::<BTreeSet<_>>();
-                let widening = context.state_widening(&summary, &operand_roots, self.name())?;
+                let operand_allocations = declared.iter().copied().flatten().collect::<BTreeSet<_>>();
+                let widening = context.state_widening(&summary, &operand_allocations, self.name())?;
                 let entering = widening.entering().to_vec();
                 let source_output_count = region.output_ids().len();
 
@@ -439,14 +439,14 @@ where
                     ),
                 )?;
                 fork.validate_predicted_mutations(widening.published(), self.name())?;
-                fork.validate_predicted_output_roots(summary.output_roots(), self.name())?;
+                fork.validate_predicted_output_allocations(summary.output_allocations(), self.name())?;
 
                 let mut operands = Vec::with_capacity(inputs.len() + entering.len());
                 for input in inputs {
                     operands.push(context.operand_value(input)?);
                 }
-                for root in &entering {
-                    operands.push(context.discharged_state(*root)?);
+                for allocation in &entering {
+                    operands.push(context.discharged_state(*allocation)?);
                 }
                 let outputs = context.parent().bind(*self, vec![fork.into_program()], operands.as_slice())?;
                 check_count!("output", outputs, source_output_count + widening.published().len(), ProgramError);
@@ -456,8 +456,8 @@ where
                     if position < source_output_count {
                         results.push(ReferenceDischargeValue::Ordinary(output));
                     } else {
-                        let root = widening.published()[position - source_output_count];
-                        context.merge_boundary_state(&summary, widening.threaded(), root, output)?;
+                        let allocation = widening.published()[position - source_output_count];
+                        context.merge_boundary_state(&summary, widening.threaded(), allocation, output)?;
                     }
                 }
                 Ok(results)
@@ -473,11 +473,13 @@ fn test_downstream_reference_universe_discharges_through_the_public_surface() {
     let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
     let initial = builder.add_input(RegisterIrType::Register(RegisterType));
     let replacement = builder.add_input(RegisterIrType::Register(RegisterType));
-    let root = builder.add_instruction(RegisterOperation::ReferenceNew, Vec::new(), vec![initial], None).unwrap()[0];
-    let replaced =
-        builder.add_instruction(RegisterOperation::Swap, Vec::new(), vec![root, replacement], None).unwrap()[0];
-    let snapshot = builder.add_instruction(RegisterOperation::Read, Vec::new(), vec![root], None).unwrap()[0];
-    let frozen = builder.add_instruction(RegisterOperation::Freeze, Vec::new(), vec![root], None).unwrap()[0];
+    let allocation =
+        builder.add_instruction(RegisterOperation::ReferenceNew, Vec::new(), vec![initial], None).unwrap()[0];
+    let replaced = builder
+        .add_instruction(RegisterOperation::Swap, Vec::new(), vec![allocation, replacement], None)
+        .unwrap()[0];
+    let snapshot = builder.add_instruction(RegisterOperation::Read, Vec::new(), vec![allocation], None).unwrap()[0];
+    let frozen = builder.add_instruction(RegisterOperation::Freeze, Vec::new(), vec![allocation], None).unwrap()[0];
     let program = builder
         .build::<Vec<RegisterValue>, Vec<RegisterValue>>(
             vec![replaced, snapshot, frozen],
@@ -501,7 +503,7 @@ fn test_downstream_reference_universe_discharges_through_the_public_surface() {
             RegisterDischargeValue::Ordinary(RegisterValue(3)),
         ]),
     );
-    assert_eq!(context.live_roots(), Vec::new());
+    assert_eq!(context.live_allocations(), Vec::new());
 }
 
 #[test]
@@ -511,11 +513,13 @@ fn test_downstream_reference_universe_discharges_into_a_staged_program() {
     let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
     let initial = builder.add_input(RegisterIrType::Register(RegisterType));
     let replacement = builder.add_input(RegisterIrType::Register(RegisterType));
-    let root = builder.add_instruction(RegisterOperation::ReferenceNew, Vec::new(), vec![initial], None).unwrap()[0];
-    let replaced =
-        builder.add_instruction(RegisterOperation::Swap, Vec::new(), vec![root, replacement], None).unwrap()[0];
+    let allocation =
+        builder.add_instruction(RegisterOperation::ReferenceNew, Vec::new(), vec![initial], None).unwrap()[0];
+    let replaced = builder
+        .add_instruction(RegisterOperation::Swap, Vec::new(), vec![allocation, replacement], None)
+        .unwrap()[0];
     let negated = builder.add_instruction(RegisterOperation::Negate, Vec::new(), vec![replaced], None).unwrap()[0];
-    let frozen = builder.add_instruction(RegisterOperation::Freeze, Vec::new(), vec![root], None).unwrap()[0];
+    let frozen = builder.add_instruction(RegisterOperation::Freeze, Vec::new(), vec![allocation], None).unwrap()[0];
     let source = builder
         .build::<Vec<RegisterValue>, Vec<RegisterValue>>(
             vec![negated, frozen],
@@ -530,7 +534,7 @@ fn test_downstream_reference_universe_discharges_into_a_staged_program() {
         let regions = [source];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let outputs = driver.discharge_region(&context, 0, carriers)?;
-        assert_eq!(context.live_roots(), Vec::new());
+        assert_eq!(context.live_allocations(), Vec::new());
         outputs
             .iter()
             .map(|output| output.expect_ordinary("a discharged output").cloned())
@@ -577,7 +581,7 @@ fn test_downstream_program_level_discharge_threads_external_state_through_the_en
         .unwrap();
 
     // Each reference input keeps its boundary position and becomes an ordinary input carrying the referent's lifted
-    // type, the public outputs are exactly the source outputs, and only the written root appends a hidden final-state
+    // type, the public outputs are exactly the source outputs, and only the written allocation appends a hidden final-state
     // output after them.
     let discharged = source.discharge_references_with_policy::<RegisterReferenceDischarge>(1).unwrap();
     assert_eq!(discharged.public_output_count(), 2);
@@ -596,7 +600,7 @@ fn test_downstream_program_level_discharge_threads_external_state_through_the_en
             in (%0, %3, %2)"},
     );
 
-    // A caller-owned root's holder belongs to the caller, so a program that consumes one is rejected by name.
+    // An external reference remains owned by the caller, so a program that consumes one is rejected by name.
     let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
     let external = builder.add_input(RegisterIrType::Reference(ReferenceType::new(RegisterType)));
     let frozen = builder.add_instruction(RegisterOperation::Freeze, Vec::new(), vec![external], None).unwrap()[0];
@@ -606,7 +610,7 @@ fn test_downstream_program_level_discharge_threads_external_state_through_the_en
     assert_eq!(
         source.discharge_references_with_policy::<RegisterReferenceDischarge>(0).unwrap_err(),
         ProgramError::MalformedProgram(
-            "reference discharge consumed external input 0, whose holder belongs to the caller".to_string(),
+            "reference discharge consumed external input 0, whose state must remain owned by the caller".to_string(),
         ),
     );
 }
@@ -633,23 +637,23 @@ fn test_downstream_region_summary_exposes_exact_access_modes() {
 
     let context = RegisterDischargeContext::new(RegisterDestination::new());
     let reference = context.allocate_discharged(ReferenceType::new(RegisterType), RegisterValue(1)).unwrap();
-    let root = reference.expect_reference("a downstream root").unwrap().root();
+    let allocation = reference.expect_reference("a downstream allocation").unwrap().allocation();
     let summary = context
-        .region_summary(&RegisterOperation::Call, 0, region.entry_region_ref(), &[Some(root), None])
+        .region_summary(&RegisterOperation::Call, 0, region.entry_region_ref(), &[Some(allocation), None])
         .unwrap();
 
-    assert_eq!(summary.accessed().collect::<Vec<_>>(), vec![root]);
+    assert_eq!(summary.accessed().collect::<Vec<_>>(), vec![allocation]);
     assert_eq!(
-        summary.access_modes(root).collect::<Vec<_>>(),
+        summary.access_modes(allocation).collect::<Vec<_>>(),
         vec![ReferenceAccessMode::Read, ReferenceAccessMode::Write, ReferenceAccessMode::ReadWrite],
     );
-    assert!(summary.has_access(root, ReferenceAccessMode::ReadWrite));
-    assert!(!summary.has_access(root, ReferenceAccessMode::Accumulate));
-    assert!(summary.is_mutated(root));
+    assert!(summary.has_access(allocation, ReferenceAccessMode::ReadWrite));
+    assert!(!summary.has_access(allocation, ReferenceAccessMode::Accumulate));
+    assert!(summary.is_mutated(allocation));
 }
 
 #[test]
-fn test_downstream_partial_discharge_preserves_the_roots_it_was_not_asked_to_discharge() {
+fn test_downstream_partial_discharge_preserves_the_allocations_it_was_not_asked_to_discharge() {
     // Partial discharge is reachable from downstream position too, and the register universe declines accumulation
     // and views entirely, so this is the minimal shape a backend needs: `f(counter, buffer, replacement) = replaced`,
     // where `counter` is selected and `buffer` stays a reference the rewritten program still reads and writes.
@@ -679,8 +683,8 @@ fn test_downstream_partial_discharge_preserves_the_roots_it_was_not_asked_to_dis
         .partially_discharge_references_with_policy::<RegisterReferenceDischarge>(0, &sites[..1])
         .unwrap();
 
-    // The selected root became state at its own boundary position and publishes its final state as a hidden output;
-    // the preserved root kept its reference type and reports no binding, and both of its accesses replayed verbatim.
+    // The selected allocation became state at its own boundary position and publishes its final state as a hidden output;
+    // the preserved reference kept its reference type and reports no binding, and both of its accesses replayed verbatim.
     assert_eq!(discharged.public_output_count(), 1);
     assert_eq!(
         discharged.external_states(),
@@ -700,7 +704,7 @@ fn test_downstream_partial_discharge_preserves_the_roots_it_was_not_asked_to_dis
 fn test_downstream_structured_rule_discharges_through_the_region_boundary_api() {
     // The hand-rolled `register.call` rule exercises the complete structured surface from a third-party position:
     // region summaries, state widening, boundary construction, isolated region rebuilding, prediction validation,
-    // and successor-state merging. The same caller root enters at two declared positions, so the rebuilt region must
+    // and successor-state merging. The same caller allocation enters at two declared positions, so the rebuilt region must
     // preserve the aliasing: the write through position 0 is observed by the read through position 1.
     let mut callee = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
     let first = callee.add_input(RegisterIrType::Reference(ReferenceType::new(RegisterType)));
@@ -812,7 +816,7 @@ fn test_downstream_partial_selection_reaches_an_allocation_inside_a_structured_r
 fn test_downstream_reference_handles_cannot_be_fabricated() {
     // The tests above establish that the discharge surface is reachable from outside `ryft-core`. This is the
     // matching negative proof: a handle's checked construction cannot be bypassed from that same position, so a
-    // third-party rule can read root identity, alias, derived type, and preserved value but can invent none of them.
+    // third-party rule can read allocation identity, alias, derived type, and preserved value but can invent none of them.
     // The two cases are separate files because their rejections belong to different compiler passes, and only the
     // earlier one is reported when they share a file.
     let test_cases = trybuild::TestCases::new();

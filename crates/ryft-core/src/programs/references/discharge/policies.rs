@@ -43,29 +43,30 @@ use super::super::types::ReferenceType;
 /// implementing the capability directly either, because the value-level arithmetic sugar is a blanket implementation
 /// whose disjointness a downstream crate cannot prove.
 pub trait ReferenceDischargePolicy<C: Domain>: Copy + Clone + Debug {
-    /// Referent type system of this universe's references. A discharged root's immutable state is a
+    /// Referent type system of this universe's references. A discharged reference's immutable state is a
     /// [`Domain::Value`] whose type is this universe's lift of the referent.
     type Referent: Type;
 
-    /// Composed alias metadata carried by one flowing reference handle. This is the complete view chain from the root
-    /// to the handle, so a handle's view has exactly one source of truth during discharge. A reference family with no
-    /// views uses a unit alias, whose composition and application are trivially the identity.
+    /// Composed alias metadata carried by one flowing reference handle. This is the complete mapping from the stored
+    /// value to the handle's selected coordinates, so a handle's view has exactly one source of truth during discharge.
+    /// A reference family with no views uses a unit alias, whose composition and application are the identity.
     type Alias: Clone + Debug + Parameter;
 
-    /// Returns the identity alias of an unviewed root with the provided referent type, which is the alias that
-    /// allocation and entry-boundary binding assign to a fresh root handle.
+    /// Returns the storage alias for a complete value with the provided referent type.
+    ///
+    /// Allocation and entry-boundary binding assign this alias to each new complete-value handle.
     ///
     /// This is infallible by design. Validating a referent type is type inference's job, and deriving the identity
     /// alias of an already-valid referent is total.
-    fn root_alias(referent: &Self::Referent) -> Self::Alias;
+    fn storage_alias(referent: &Self::Referent) -> Self::Alias;
 
     /// Lifts a reference type into the destination type universe. This is the direction that types a reference-typed
     /// boundary position or a preserved handle in the destination program.
     fn lift_reference_type(r#type: ReferenceType<Self::Referent>) -> C::Type;
 
-    /// Lifts a referent type into the destination type universe. A discharged root's immutable state is an ordinary
-    /// destination value of exactly this type, so this is the direction that types an entry-boundary position whose
-    /// reference became state, and the direction a rule uses to describe that state to the destination.
+    /// Lifts a referent type into the destination type universe. A discharged reference's immutable state is an ordinary
+    /// destination value of exactly this type, so this function types an entry-boundary position whose reference became
+    /// state and lets a rule describe that state to the destination.
     fn lift_referent_type(referent: Self::Referent) -> C::Type;
 
     /// Projects a destination type back onto the reference type it denotes, or returns [`None`] when it denotes an
@@ -79,17 +80,17 @@ pub trait ReferenceDischargePolicy<C: Domain>: Copy + Clone + Debug {
     /// # Parameters
     ///
     ///   - `context`: Destination context that owns `current` and any work this application performs.
-    ///   - `current`: Current immutable state of the whole root.
+    ///   - `current`: Current immutable state of the complete stored value.
     ///   - `alias`: Composed view chain selecting the coordinates to read.
     fn read(context: &C, current: &C::Value, alias: &Self::Alias) -> Result<C::Value, ProgramError>;
 
-    /// Replaces the coordinates that `alias` selects and returns the successor state of the whole root without
-    /// observing the previous selection.
+    /// Replaces the coordinates that `alias` selects and returns the successor state of the complete stored value
+    /// without observing the previous selection.
     ///
     /// # Parameters
     ///
     ///   - `context`: Destination context that owns `current` and any work this application performs.
-    ///   - `current`: Current immutable state of the whole root. A view implementation may consult it only to
+    ///   - `current`: Current immutable state of the complete stored value. A view implementation may consult it only to
     ///     preserve coordinates outside the selected logical handle.
     ///   - `replacement`: Value written into the selected coordinates.
     ///   - `alias`: Composed view chain selecting the coordinates to replace.
@@ -101,12 +102,12 @@ pub trait ReferenceDischargePolicy<C: Domain>: Copy + Clone + Debug {
     ) -> Result<C::Value, ProgramError>;
 
     /// Replaces the coordinates that `alias` selects and returns the previous selection followed by the successor
-    /// state of the whole root.
+    /// state of the complete stored value.
     ///
     /// # Parameters
     ///
     ///   - `context`: Destination context that owns `current` and any work this application performs.
-    ///   - `current`: Current immutable state of the whole root.
+    ///   - `current`: Current immutable state of the complete stored value.
     ///   - `replacement`: Value written into the selected coordinates.
     ///   - `alias`: Composed view chain selecting the coordinates to replace.
     fn replace(
@@ -132,13 +133,13 @@ pub trait ReferenceDischargePolicy<C: Domain>: Copy + Clone + Debug {
 /// instead. Closed operation-enum dispatch reintroduces the requirement for any enum whose members include an
 /// accumulating operation, exactly as ordinary interpretation already does.
 pub trait ReferenceAccumulationPolicy<C: Domain>: ReferenceDischargePolicy<C> {
-    /// Accumulates `update` into the coordinates that `alias` selects and returns the successor state of the whole
-    /// root.
+    /// Accumulates `update` into the coordinates that `alias` selects and returns the successor state of the complete
+    /// stored value.
     ///
     /// # Parameters
     ///
     ///   - `context`: Destination context that owns `current` and any work this application performs.
-    ///   - `current`: Current immutable state of the whole root.
+    ///   - `current`: Current immutable state of the complete stored value.
     ///   - `update`: Value added into the selected coordinates.
     ///   - `alias`: Composed view chain selecting the coordinates to accumulate into.
     fn accumulate(
@@ -167,10 +168,11 @@ mod tests {
         let destination = ListDestination::new();
         let referent = ListType { length: 4 };
 
-        // The identity alias of a root covers its complete referent, and the lift/project pair round-trips a
+        // The identity alias of an allocation covers its complete referent, and the lift/project pair round-trips a
         // reference type through the destination universe while classifying an ordinary type as not a reference.
-        let root_alias = <ListReferenceDischarge as ReferenceDischargePolicy<ListDestination>>::root_alias(&referent);
-        assert_eq!(root_alias, ListAlias { offset: 0, length: 4 });
+        let storage_alias =
+            <ListReferenceDischarge as ReferenceDischargePolicy<ListDestination>>::storage_alias(&referent);
+        assert_eq!(storage_alias, ListAlias { offset: 0, length: 4 });
         let reference_type = ReferenceType::new(referent.clone());
         let lifted = <ListReferenceDischarge as ReferenceDischargePolicy<ListDestination>>::lift_reference_type(
             reference_type.clone(),
@@ -188,7 +190,7 @@ mod tests {
         );
 
         // A composed alias selects only its own coordinates on every access, and replacement and accumulation return
-        // the successor state of the whole root rather than of the selection.
+        // the successor state of the complete stored value rather than of the selection.
         let current = ListIrValue::List(vec![1, 2, 3, 4]);
         let view = ListAlias { offset: 1, length: 2 };
         assert_eq!(ListReferenceDischarge::read(&destination, &current, &view), Ok(ListIrValue::List(vec![2, 3])));

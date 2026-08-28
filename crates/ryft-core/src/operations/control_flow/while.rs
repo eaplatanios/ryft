@@ -370,7 +370,7 @@ impl<T: WhileTypeSemantics> Operation for WhileOperation<T> {
 
     #[inline]
     fn reference_output_identity_input(&self, output_index: usize) -> Option<usize> {
-        // Every `while` output is a loop carry aligned with the same-position input, so the root constraint maps
+        // Every `while` output is a loop carry aligned with the same-position input, so the allocation constraint maps
         // positionally for any output the operation actually declares.
         Some(output_index)
     }
@@ -928,7 +928,7 @@ where
 
 // A `while`'s boundaries are all one state signature: its operands, its outputs, its condition's inputs, and its
 // body's inputs and outputs carry the same carries at the same positions. Threading discharged state therefore appends
-// the same carries to every one of them, and the loop deliberately applies no read-only pruning: a root the loop
+// the same carries to every one of them, and the loop deliberately applies no read-only pruning: an allocation the loop
 // merely reads still occupies a carry position, because dropping it would leave the body's boundary disagreeing with
 // the condition's. The one asymmetry is forced by the operation's own contract — the condition returns only a
 // predicate, so it receives the entering state and publishes none, which is also why a mutating condition is rejected
@@ -950,7 +950,8 @@ where
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
         let name = self.name();
         self.validate_region_count(driver.region_count())?;
-        let carries = inputs.iter().map(|input| context.operand_root(input, name)).collect::<Result<Vec<_>, _>>()?;
+        let carries =
+            inputs.iter().map(|input| context.operand_allocation(input, name)).collect::<Result<Vec<_>, _>>()?;
 
         // Both regions observe the same entering state, so one summary of the two sizes one boundary.
         let condition = driver.region(0)?;
@@ -962,7 +963,7 @@ where
         let body_summary = context.region_summary(self, 1, body, carries.as_slice())?;
         let summary = body_summary.merged(&condition_summary);
 
-        // A root the body returns is threaded even if the body never accesses it, so that a boundary the loop's fixed
+        // An allocation the body returns is threaded even if the body never accesses it, so that a boundary the loop's fixed
         // point requires is reported as a broken fixed point rather than as a reference the rebuilt body cannot
         // resolve. The widening excludes the carries that survive as references: those occupy their declared carry
         // positions as the references they already are.
@@ -970,8 +971,8 @@ where
         let widening = context.state_widening(&summary, &carried, name)?;
         let entering = widening.entering().to_vec();
 
-        // The condition publishes nothing — it returns only its predicate — so its declared output roots need no
-        // `validate_predicted_output_roots` pass; the body's fixed-point carry check below is the stronger version of
+        // The condition publishes nothing — it returns only its predicate — so its declared output allocations need no
+        // `validate_predicted_output_allocations` pass; the body's fixed-point carry check below is the stronger version of
         // that agreement for the one region that does return references.
         let condition_fork = driver.discharge_region_program(
             context,
@@ -999,7 +1000,7 @@ where
 
         // Every carry must leave the body as the reference it entered with, or the loop's state has no fixed point and
         // its zero-iteration result would not be its entering state.
-        for (position, (returned, carry)) in body_fork.output_roots().iter().zip(&carries).enumerate() {
+        for (position, (returned, carry)) in body_fork.output_allocations().iter().zip(&carries).enumerate() {
             if returned != carry {
                 return Err(ProgramError::MalformedProgram(format!(
                     "operation `{name}` does not return carry {position} as the reference it entered with, so its \
@@ -1012,8 +1013,8 @@ where
         for input in inputs {
             operands.push(context.operand_value(input)?);
         }
-        for root in &entering {
-            operands.push(context.discharged_state(*root)?);
+        for allocation in &entering {
+            operands.push(context.discharged_state(*allocation)?);
         }
         let outputs = context.parent().bind(
             *self,
@@ -1022,21 +1023,21 @@ where
         )?;
         check_count!("output", outputs, inputs.len() + entering.len(), ProgramError);
 
-        // A symmetric boundary returns a successor state for every carried root, including ones the loop only read,
+        // A symmetric boundary returns a successor state for every carried allocation, including ones the loop only read,
         // so the merge records a mutation exactly where the summary saw one. Marking a read-only carry as written
-        // would publish a hidden final-state output for a root the program never writes. A carry that survives as a
+        // would publish a hidden final-state output for an allocation the program never writes. A carry that survives as a
         // reference came back out as the same reference and has no state to merge.
         let mut results = Vec::with_capacity(inputs.len());
         for (position, output) in outputs.into_iter().enumerate() {
             match carries.get(position).copied().flatten() {
-                Some(root) => {
-                    context.merge_boundary_state(&summary, widening.threaded(), root, output)?;
+                Some(allocation) => {
+                    context.merge_boundary_state(&summary, widening.threaded(), allocation, output)?;
                     results.push(inputs[position].clone());
                 }
                 None if position < inputs.len() => results.push(ReferenceDischargeValue::Ordinary(output)),
                 None => {
-                    let root = entering[position - inputs.len()];
-                    context.merge_boundary_state(&summary, widening.threaded(), root, output)?;
+                    let allocation = entering[position - inputs.len()];
+                    context.merge_boundary_state(&summary, widening.threaded(), allocation, output)?;
                 }
             }
         }
@@ -4852,8 +4853,8 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F32);
         let reference_type = ReferenceType::new(scalar_type.clone());
 
-        // A loop applies no read-only pruning. The condition merely reads the root and the body never touches it, yet
-        // the root keeps a carry position in every boundary, because a carry must exist in the condition's and the
+        // A loop applies no read-only pruning. The condition merely reads the allocation and the body never touches it, yet
+        // the allocation keeps a carry position in every boundary, because a carry must exist in the condition's and the
         // body's boundaries or in neither. The asymmetry the operation's own contract forces is visible beside it: the
         // condition region receives the entering state and publishes none, returning exactly one Boolean.
         let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
@@ -4925,7 +4926,7 @@ mod tests {
         );
 
         // The carry survives inside the loop, but the *entry* boundary is a different question: nothing writes the
-        // root, so it publishes no hidden final-state output and its caller's holder is left alone. Symmetry is a
+        // allocation, so it publishes no hidden final-state output and its caller's holder is left alone. Symmetry is a
         // property of the loop's own boundaries, not a claim that the loop wrote what it carried.
         assert_eq!(discharged.public_output_count(), 1);
         assert_eq!(discharged.program().output_types().len(), 1);
@@ -4939,7 +4940,7 @@ mod tests {
             Ok(vec![TestValue::Array(Array::scalar(2.0f32))]),
         );
 
-        // A condition that mutates a root is rejected rather than widened, because the condition's boundary returns
+        // A condition that mutates an allocation is rejected rather than widened, because the condition's boundary returns
         // only a predicate and so can publish no successor state: a loop that exits on its first test would lose the
         // write entirely. The summary reports it while the offending region can still be named, and the rebuilt
         // condition is held to the exact rejected access mode before replay.
@@ -4968,16 +4969,16 @@ mod tests {
             EagerContext::new(),
         );
         let reference = context.allocate_discharged(reference_type, TestValue::Array(Array::scalar(0.0_f32))).unwrap();
-        let root = reference.expect_reference("the loop-carried root").unwrap().root();
+        let allocation = reference.expect_reference("the loop-carried allocation").unwrap().allocation();
         assert_eq!(
             context.region_summary(
                 &WhileOperation::<ArrayIrType>::new(),
                 0,
                 condition.entry_region_ref(),
-                &[Some(root)],
+                &[Some(allocation)],
             ),
             Err(ProgramError::MalformedProgram(format!(
-                "operation `while` does not allow region 0 to access {root} with mode `accumulate`",
+                "operation `while` does not allow region 0 to access {allocation} with mode `accumulate`",
             ))),
         );
     }

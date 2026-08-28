@@ -1,9 +1,9 @@
 //! Contains machinery related to _reference discharge_, which is the process of rewriting mutable reference state into
 //! explicit immutable dataflow. Specifically, a program containing reference operations is not ordinary functional
-//! Single Static Assignment (SSA) dataflow. A read operation depends on the latest write operation to the same root
+//! Single Static Assignment (SSA) dataflow. A read operation depends on the latest write operation to the same allocation
 //! even though that dependency is represented by a reference handle rather than by an SSA operand carrying the current
 //! value. Many transforms and backends require the dependency to be explicit. Reference discharge makes it explicit by
-//! replaying the program while replacing each selected root with an immutable state value that is threaded from one
+//! replaying the program while replacing each selected allocation with an immutable state value that is threaded from one
 //! access to the next.
 //!
 //! # Example
@@ -18,7 +18,7 @@
 //! return %before, %after, %final
 //! ```
 //!
-//! Discharge removes the mutable root and exposes the same dependencies as immutable values:
+//! Discharge removes the mutable allocation and exposes the same dependencies as immutable values:
 //!
 //! ```text
 //! %state0 = %initial
@@ -35,11 +35,11 @@
 //! full result.
 //!
 //! An external reference follows the same rewrite but its state crosses the program boundary. Its reference-typed
-//! input becomes an ordinary input carrying the entering referent. If the program mutates the root, its final state is
-//! appended after the public outputs as a hidden output. [`ReferenceStateBinding`] records which capture or public
-//! argument owns that state and which hidden output must replace the caller's reference value. Its discharged
-//! input position follows from that logical source and the result's capture count. A read-only external root has no
-//! hidden output.
+//! input becomes an ordinary input carrying the entering referent. If the program mutates the reference, its final
+//! state is appended after the public outputs as a hidden output. [`ReferenceStateBinding`] records which capture or public
+//! argument owns that state and which hidden output must replace the caller's reference value. Its discharged input
+//! position follows from that logical source and the result's capture count. A read-only external reference has no hidden
+//! output.
 //!
 //! Discharge rewrites a program; it does not itself lock eager reference state or execute a backend. The stateful
 //! compilation surface uses the result's binding metadata together with the runtime reference protocol after
@@ -51,10 +51,10 @@
 //! [`Program::discharge_references_with_policy`](crate::Program::discharge_references_with_policy) to
 //! eliminate every reference, or
 //! [`Program::partially_discharge_references_with_policy`](crate::Program::partially_discharge_references_with_policy)
-//! when selected roots should become explicit state while
-//! other roots remain references. The full entry point returns a [`ReferenceDischargeResult`], whose payload is
+//! when selected allocations should become explicit state while
+//! other allocations remain references. The full entry point returns a [`ReferenceDischargeResult`], whose payload is
 //! proven reference-free. The partial entry point returns a [`PartialReferenceDischargeResult`], which describes only
-//! the discharged roots and can be converted into a full result after proving that no references remain. Generic
+//! the discharged references and can be converted into a full result after proving that no references remain. Generic
 //! transforms that accept only local references use [`ReferenceDischarge::discharge_local_references`].
 //!
 //! A reference universe participates by implementing [`ReferenceDischargePolicy`] and, when supported,
@@ -67,10 +67,10 @@
 //!
 //! [`ReferenceDischargeResult`] is the full-discharge contract. Its payload is proven reference-free across the
 //! complete attached-region closure, its public outputs form a prefix of its complete outputs, and the remaining
-//! suffix contains exactly the final states of mutated external roots in canonical boundary order.
+//! suffix contains exactly the final states of mutated external allocations in canonical boundary order.
 //!
-//! [`PartialReferenceDischargeResult`] permits selected roots to become immutable state while unselected roots and
-//! their operations remain in the payload. Callers select entry roots or allocation sites through
+//! [`PartialReferenceDischargeResult`] permits selected allocations to become immutable state while unselected references
+//! and their operations remain in the payload. Callers select external references or allocation sites through
 //! [`ReferenceDischargeSite`]. This is useful when normalizing a pipeline's internal state while deliberately
 //! preserving references that a kernel will lower to target memory operations. Conversion from a partial result to a
 //! full result performs a closure-wide proof that no reference type or reference operation remains.
@@ -84,12 +84,12 @@
 //!   selected value. [`ReferenceAccumulationPolicy`] adds ordered accumulation only for universes that support it.
 //! - [`ReferenceDischargeValue`] is the context-free carrier flowing between rules. It contains either an ordinary
 //!   destination value or an opaque [`ReferenceDischargeReference`] handle.
-//! - [`ReferenceDischargeContext`] owns the live root environment. Each root is either `Discharged`, with a current
-//!   immutable state and mutation bit, or `Preserved`, with the exact destination reference value that survived.
+//! - [`ReferenceDischargeContext`] owns the live allocation environment. Each allocation is either `Discharged`, with a
+//!   current immutable state and mutation bit, or `Preserved`, with the exact destination reference value that survived.
 //! - [`ReferenceDischargeableOperation`] is the rule implemented by each operation. Reference primitives rewrite
 //!   their own *discharged* accesses, structured operations own their boundary widening, and reference-free
-//!   operations replay unchanged through the parent context. Accesses to preserved roots never reach a rule: the
-//!   replay path itself replays every region-free, access-only application over exclusively preserved roots
+//!   operations replay unchanged through the parent context. Accesses to preserved references never reach a rule: the
+//!   replay path itself replays every region-free, access-only application over exclusively preserved references
 //!   verbatim.
 //! - [`ReferenceDischargeDriver`] exposes the current source instruction and attached regions. It can replay a region
 //!   against the live environment or rebuild one against an isolated environment and return a sealed
@@ -100,46 +100,46 @@
 //! a third-party primitive or structured operation participates by implementing its own rule, while a non-array
 //! value family supplies its own policy without changing this interpreter.
 //!
-//! # Root Identities and Boundaries
+//! # Allocation Identities and Boundaries
 //!
-//! [`ReferenceDischargeSite`] is a source-program coordinate used before replay to select an external root or an
-//! allocation. [`ReferenceRootHandle`] is different: it is a temporary identity minted inside one live discharge
-//! environment. Handles from isolated region forks cannot address parent roots, and fork results carry sealed
-//! programs and context-free summaries rather than child-context values.
+//! [`ReferenceDischargeSite`] is a source-program coordinate used before replay to select an external reference or a
+//! locally allocated reference. [`ReferenceAllocationHandle`] is different: it is a temporary identity minted inside one
+//! live discharge environment. Handles from isolated region forks cannot address parent allocations, and fork results
+//! carry sealed programs and context-free summaries rather than child-context values.
 //!
 //! Structured rules use [`ReferenceRegionDischargeBoundary`] to describe their declared inputs plus the discharged
-//! roots that must enter and leave a rebuilt region. Read-only roots are pruned where the operation's boundary permits
+//! allocations that must enter and leave a rebuilt region. Read-only allocations are pruned where the operation's boundary permits
 //! it; loop-shaped operations retain the symmetry their fixed-point contracts require. Every rebuilt region is
-//! validated against the roots and mutations its summary predicted before the parent environment accepts its outputs.
+//! validated against the allocations and mutations its summary predicted before the parent environment accepts its outputs.
 //!
 //! # End-to-End Flow
 //!
 //! 1. The program entry point validates the selected sites and binds each external reference as either discharged
 //!    state or a preserved reference in a new [`ReferenceDischargeContext`].
-//! 2. The driver replays each instruction. An access involving only preserved roots is replayed unchanged; every
+//! 2. The driver replays each instruction. An access involving only preserved references is replayed unchanged; every
 //!    other application dispatches to its [`ReferenceDischargeableOperation`] rule.
-//! 3. A rule reads or updates the root environment. A structured rule may first summarize an attached region, widen
+//! 3. A rule reads or updates the allocation environment. A structured rule may first summarize an attached region, widen
 //!    its boundary, and rebuild it in an isolated context before merging the resulting state into its caller.
 //! 4. The transform reconstructs the program's public outputs, appends one hidden final-state output for each mutated
-//!    external root, validates the complete boundary, and returns the appropriate result envelope.
+//!    external allocation, validates the complete boundary, and returns the appropriate result envelope.
 //!
 //! # Glossary
 //!
 //! - An **external source** is the capture or public input through which caller-owned reference state enters, named by
 //!   [`ReferenceSource`].
-//! - A **discharge site** is a stable source-program coordinate used to select an external root or allocation for
+//! - A **discharge site** is a stable source-program coordinate used to select an external reference or allocation site for
 //!   partial discharge, represented by [`ReferenceDischargeSite`].
-//! - A **root identity** is the temporary [`ReferenceRootHandle`] by which one running interpreter identifies a
-//!   reference root. It is not a source-program coordinate and cannot cross between isolated environments.
-//! - A **discharged root** is represented by its current immutable state. A **preserved root** remains represented by
-//!   a reference value and its reference operations are replayed rather than rewritten.
+//! - An **allocation identity** is the temporary [`ReferenceAllocationHandle`] by which one running interpreter identifies
+//!   a reference allocation. It is not a source-program coordinate and cannot cross between isolated environments.
+//! - A **discharged reference** is represented by its current immutable state. A **preserved reference** remains
+//!   represented by a reference value and its reference operations are replayed rather than rewritten.
 //! - A **carrier** is a [`ReferenceDischargeValue`]: either an ordinary destination value or a temporary reference
 //!   handle passed between operation rules.
-//! - A summary root is **reached** when a region's closure accesses, returns, or otherwise rematerializes it. It is
-//!   **accessed** only when the closure performs a semantic reference access on it. Reached roots may need to cross a
+//! - A summary allocation is **reached** when a region's closure accesses, returns, or otherwise rematerializes it. It is
+//!   **accessed** only when the closure performs a semantic reference access on it. Reached allocations may need to cross a
 //!   rebuilt boundary even when they are read nowhere inside the region.
-//! - A widening's **threaded** roots cross a structured boundary, its **entering** roots require added inputs because
-//!   no declared input already carries them, and its **published** roots require added outputs because the region may
+//! - A widening's **threaded** allocations cross a structured boundary, its **entering** allocations require added inputs because
+//!   no declared input already carries them, and its **published** allocations require added outputs because the region may
 //!   mutate them and no declared output already publishes their state.
 
 mod interpreter;
@@ -149,10 +149,10 @@ mod selection;
 mod transform;
 
 pub use interpreter::{
-    RecursiveReferenceDischargeDriver, ReferenceDischargeContext, ReferenceDischargeDriver,
+    RecursiveReferenceDischargeDriver, ReferenceAllocationHandle, ReferenceDischargeContext, ReferenceDischargeDriver,
     ReferenceDischargeReference, ReferenceDischargeRegionDestination, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork,
-    ReferenceRegionStateInsertion, ReferenceRegionSummary, ReferenceRootHandle, ReferenceStateWidening,
+    ReferenceRegionStateInsertion, ReferenceRegionSummary, ReferenceStateWidening,
     discharge_positional_region_operation, discharge_preserved_access, discharge_reference_free_operation,
 };
 pub use policies::{ReferenceAccumulationPolicy, ReferenceDischargePolicy};
@@ -250,7 +250,7 @@ pub(crate) mod tests {
     /// reference, plus one positional call-like region operation.
     #[derive(Copy, Clone, Debug)]
     pub(crate) enum TestOperation {
-        NewRoot,
+        NewAllocation,
         Read,
         Consume,
         Call,
@@ -267,7 +267,7 @@ pub(crate) mod tests {
 
         fn name(&self) -> &'static str {
             match self {
-                Self::NewRoot => "test.new_root",
+                Self::NewAllocation => "test.new_allocation",
                 Self::Read => "test.read",
                 Self::Consume => "test.consume",
                 Self::Call => "test.call",
@@ -287,7 +287,9 @@ pub(crate) mod tests {
             region_interfaces: &[RegionInterface<TestType>],
         ) -> Result<Vec<TestType>, TypeError> {
             match self {
-                Self::NewRoot => Ok(vec![TestType::Reference(Box::new(ReferenceType::new(input_types[0].clone())))]),
+                Self::NewAllocation => {
+                    Ok(vec![TestType::Reference(Box::new(ReferenceType::new(input_types[0].clone())))])
+                }
                 Self::Read | Self::Consume => match input_types.first() {
                     Some(TestType::Reference(reference)) => Ok(vec![reference.referent().clone()]),
                     _ => Err(TypeError::invalid("test operation expected a reference input")),
@@ -324,8 +326,8 @@ pub(crate) mod tests {
 
         fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
             let semantics = match self {
-                Self::NewRoot => {
-                    ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceOutput::Root { output_index: 0 }])
+                Self::NewAllocation => {
+                    ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceOutput::Allocation { output_index: 0 }])
                 }
                 Self::Read => ReferenceOperationSemantics::new(
                     vec![ReferenceInput::new(0, ReferenceAccessMode::Read)],
@@ -510,7 +512,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// View chain of the prototype universe: one contiguous sub-range of the root list.
+    /// View chain of the prototype universe: one contiguous sub-range of the allocation list.
     #[derive(Copy, Clone, Debug, PartialEq)]
     pub(crate) struct ListAlias {
         pub(crate) offset: usize,
@@ -545,7 +547,7 @@ pub(crate) mod tests {
         type Referent = ListType;
         type Alias = ListAlias;
 
-        fn root_alias(referent: &ListType) -> ListAlias {
+        fn storage_alias(referent: &ListType) -> ListAlias {
             ListAlias { offset: 0, length: referent.length }
         }
 
@@ -756,7 +758,7 @@ pub(crate) mod tests {
         fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
             let semantics = match self {
                 Self::ReferenceNew => {
-                    ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceOutput::Root { output_index: 0 }])
+                    ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceOutput::Allocation { output_index: 0 }])
                 }
                 Self::Slice { .. } => ReferenceOperationSemantics::new(
                     Vec::new(),

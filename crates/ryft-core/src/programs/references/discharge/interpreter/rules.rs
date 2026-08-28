@@ -93,16 +93,16 @@ pub(in crate::programs::references::discharge) fn region_closure_touches_referen
 /// or returns [`None`] to hand the application to its own discharge rule.
 ///
 /// This is the dispatch half of the preserved/discharged split: an operation whose reference semantics declare
-/// accessed inputs and no reference outputs performs no rewrite over preserved roots — its honest rewrite is itself,
+/// accessed inputs and no reference outputs performs no rewrite over preserved references — its honest rewrite is itself,
 /// replayed through the destination — so the replay is owned by the dispatch path and rules see only discharged
 /// accesses. Operations that declare reference outputs (allocations and view derivations) keep their own preserved
 /// handling, because their outputs mint or derive handles. An application whose accessed reference operands mix
-/// preserved and discharged roots still reaches its rule, which rejects it exactly as it would have rejected the
+/// preserved and discharged references still reaches its rule, which rejects it exactly as it would have rejected the
 /// discharged half before this dispatch existed.
 ///
 /// The operation's own inference is re-derived before the replay so that an operand-relationship mismatch is
 /// reported with the same diagnostic a discharged access produces. Consuming accesses additionally unbind their
-/// consumed roots after the replay so the environment stops handing them out.
+/// consumed allocations after the replay so the environment stops handing them out.
 pub(super) fn replay_preserved_access<C, P>(
     operation: &C::Operation,
     context: &ReferenceDischargeContext<C, P>,
@@ -137,9 +137,9 @@ where
     Ok(Some(outputs))
 }
 
-/// Replays one access to a *preserved* root verbatim into the destination.
+/// Replays one access to a *preserved* allocation verbatim into the destination.
 ///
-/// A preserved root survives partial reference discharge as an ordinary reference of the destination universe, so the
+/// A preserved reference survives partial reference discharge as an ordinary reference of the destination universe, so the
 /// honest rewrite of an access to it is no rewrite at all: the operation is bound again, over the exact destination
 /// reference value each handle denotes, and its results are the destination's own. The dispatch path owns the replay
 /// for every region-free, access-only application, so access rules never call this themselves; it remains public for
@@ -151,7 +151,7 @@ where
 /// value lives. Replaying reproduces the source's own operation, which the destination is free to reject later, but a
 /// use-after-consume is discharge's own invariant and belongs at the access that violates it.
 ///
-/// A reference-typed result is rejected rather than wrapped. The environment would have no root for it, so it could
+/// A reference-typed result is rejected rather than wrapped. The environment would have no allocation for it, so it could
 /// later cross a boundary or reach an access as an untracked value; an operation that derives a reference owns that
 /// bookkeeping and must state it in its own rule, as the view primitives do.
 ///
@@ -163,8 +163,8 @@ where
 ///
 /// # Errors
 ///
-/// Returns [`ProgramError::MalformedProgram`] when an operand's root is no longer live, when an operand denotes a
-/// discharged root, which has no destination reference value, or when a result is reference-typed, and propagates the
+/// Returns [`ProgramError::MalformedProgram`] when an operand's allocation is no longer live, when an operand denotes a
+/// discharged reference, which has no destination reference value, or when a result is reference-typed, and propagates the
 /// destination's error from the replay itself.
 pub fn discharge_preserved_access<C, P, O>(
     operation: &O,
@@ -182,14 +182,14 @@ where
             ReferenceDischargeValue::Ordinary(value) => Ok(value.clone()),
             ReferenceDischargeValue::Reference(reference) => match reference.preserved() {
                 Some(value) => {
-                    context.validate_live_root(reference.root())?;
+                    context.validate_live_allocation(reference.allocation())?;
                     Ok(value.clone())
                 }
                 None => Err(ProgramError::MalformedProgram(format!(
                     "reference discharge cannot replay `{}` over discharged {}, which has no destination reference \
                      value",
                     operation.name(),
-                    reference.root(),
+                    reference.allocation(),
                 ))),
             },
         })
@@ -201,8 +201,8 @@ where
         .map(|(output_index, output)| {
             if let Some(r#type) = P::project_reference_type(output.r#type().as_ref()) {
                 return Err(ProgramError::MalformedProgram(format!(
-                    "reference discharge replayed `{}` over a preserved root, but its output {output_index} is the \
-                     reference `{type}`; an operation that derives a reference owns that root and needs a reference \
+                    "reference discharge replayed `{}` over a preserved reference, but its output {output_index} is the \
+                     reference `{type}`; an operation that derives a reference owns that allocation and needs a reference \
                      discharge rule of its own",
                     operation.name(),
                 )));
@@ -216,7 +216,7 @@ where
 ///
 /// # Parameters
 ///
-///   - `value`: Destination value offered as a preserved root's reference.
+///   - `value`: Destination value offered as a preserved reference's reference.
 ///   - `r#type`: Reference type the handle that will carry `value` exposes.
 pub(super) fn validate_preserved_value<C: Domain, P: ReferenceDischargePolicy<C>>(
     value: &C::Value,
@@ -225,10 +225,10 @@ pub(super) fn validate_preserved_value<C: Domain, P: ReferenceDischargePolicy<C>
     match P::project_reference_type(value.r#type().as_ref()) {
         Some(actual) if &actual == r#type => Ok(()),
         Some(actual) => Err(ProgramError::MalformedProgram(format!(
-            "reference discharge preserved a root as `{actual}` but its handle exposes `{type}`",
+            "reference discharge preserved an allocation as `{actual}` but its handle exposes `{type}`",
         ))),
         None => Err(ProgramError::MalformedProgram(format!(
-            "reference discharge preserved a root as `{}`, which is not a reference type",
+            "reference discharge preserved an allocation as `{}`, which is not a reference type",
             value.r#type(),
         ))),
     }
@@ -242,7 +242,7 @@ pub(super) fn validate_discharged_value_type<C: Domain, P: ReferenceDischargePol
     let expected = P::lift_referent_type(r#type.referent().clone());
     if value.r#type().as_ref() != &expected {
         return Err(ProgramError::MalformedProgram(format!(
-            "reference discharge state has type `{}` but root `{}` requires `{expected}`",
+            "reference discharge state has type `{}` but allocation `{}` requires `{expected}`",
             value.r#type(),
             r#type,
         )));
@@ -302,22 +302,22 @@ pub trait ReferenceDischargeDriver<C: Domain, P: ReferenceDischargePolicy<C>>:
     /// This is the transactional fork every structured rule builds on, and it is what
     /// [`discharge_region`](Self::discharge_region) is deliberately not: that service inlines a region's rewritten
     /// work into the live destination, which is right for an operation whose region is invoked in place and wrong for
-    /// one whose region must survive as a region. The fork's environment contains exactly the roots `boundary` names,
-    /// each entering as an ordinary value at its boundary position, so a region cannot reach a root its caller did not
+    /// one whose region must survive as a region. The fork's environment contains exactly the allocations `boundary` names,
+    /// each entering as an ordinary value at its boundary position, so a region cannot reach an allocation its caller did not
     /// thread, and nothing it does can reach the caller's environment. The owning rule binds the rebuilt operation in
     /// its own context and merges the final states from the outputs of that binding.
     ///
     /// # Parameters
     ///
     ///   - `context`: Active discharge context supplying the entering state, or the surviving reference, of every
-    ///     root the boundary names.
+    ///     allocation the boundary names.
     ///   - `index`: Position of the attached region in operation-defined order.
     ///   - `boundary`: Complete requested boundary of the rebuilt region.
     ///
     /// # Errors
     ///
     /// Returns [`ProgramError::MalformedProgram`] when this application has no region at `index`, when `boundary` does
-    /// not describe that region's declared boundary, when a root is threaded twice, when the region publishes a root
+    /// not describe that region's declared boundary, when an allocation is threaded twice, when the region publishes an allocation
     /// its caller did not thread or publishes one through a derived view, and propagates every failure the rebuilt
     /// region's own rules raise.
     fn discharge_region_program(
@@ -361,18 +361,18 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeDriver<C, P> f
 ///
 /// The trait is parameterized by the destination [`Domain`] `C` that owns the rewritten values and by the
 /// [`ReferenceDischargePolicy`] `P` naming the reference universe being discharged. Every rule receives the active
-/// [`ReferenceDischargeContext`], which owns the root environment, plus a [`ReferenceDischargeDriver`] exposing the
+/// [`ReferenceDischargeContext`], which owns the allocation environment, plus a [`ReferenceDischargeDriver`] exposing the
 /// application's replay position and attached regions.
 ///
-/// Reference primitives implement their own rewrites: an allocation binds a fresh root, an access acts on the root's
-/// current state through the policy's alias mechanics, and a freeze yields the current state and unbinds the root.
+/// Reference primitives implement their own rewrites: an allocation binds a fresh allocation, an access acts on the allocation's
+/// current state through the policy's alias mechanics, and a freeze yields the current state and unbinds the allocation.
 /// Structured operations implement their own boundary widening, because widening is a property of what the operation
 /// does with its regions and therefore belongs to the operation. Everything else replays as-is over rewritten
 /// operands. The system is consequently open over primitives: a third-party operation family participates by
 /// implementing this trait, with no companion declaration surface beyond the generic
 /// [`Operation::reference_semantics`] and region-provenance hooks it already implements.
 ///
-/// Access rules see only *discharged* roots. When partial discharge preserves a root, the dispatch path replays every
+/// Access rules see only *discharged* allocations. When partial discharge preserves an allocation, the dispatch path replays every
 /// region-free, access-only application over it verbatim through [`discharge_preserved_access`] before rule dispatch,
 /// so an access rule never needs a preserved branch of its own. The exceptions own their preserved handling because
 /// their outputs mint or derive handles: an allocation rule consults its replay position against the selection, and a
@@ -395,7 +395,7 @@ pub trait ReferenceDischargeableOperation<C: Domain, P: ReferenceDischargePolicy
     ///
     /// # Parameters
     ///
-    ///   - `context`: Active discharge context owning the root environment, through whose
+    ///   - `context`: Active discharge context owning the allocation environment, through whose
     ///     [`parent`](ReferenceDischargeContext::parent) the rewritten work is bound.
     ///   - `driver`: Application-scoped driver exposing the replay position and any attached regions.
     ///   - `inputs`: Carriers supplied as this application's operands, in operation-defined order.
@@ -461,11 +461,11 @@ mod tests {
 
         let reference_type = ReferenceType::new(ListType { length: 2 });
         let allocated = context.allocate_discharged(reference_type, ListIrValue::List(vec![1, 2])).unwrap();
-        let root = allocated.expect_reference("the allocated root").unwrap().root();
+        let allocation = allocated.expect_reference("the allocated allocation").unwrap().allocation();
         assert_eq!(
             discharge_reference_free_operation(&ListOperation::Add, &context, &EmptyRegionDriver, &[allocated, rhs]),
             Err(ProgramError::MalformedProgram(format!(
-                "reference discharge expected an ordinary operand 0 of `list.add` but received {root} ref<list<2>>",
+                "reference discharge expected an ordinary operand 0 of `list.add` but received {allocation} ref<list<2>>",
             ))),
         );
 
@@ -544,7 +544,7 @@ mod tests {
 
     #[test]
     fn test_reference_discharge_replays_preserved_accesses_inside_their_source_provenance() {
-        // The dispatch path replays a preserved-root access itself, before any rule runs, and that replay must still
+        // The dispatch path replays a preserved-allocation access itself, before any rule runs, and that replay must still
         // happen inside the source instruction's recorded origin: provenance renders only under `WithProvenance`, so
         // no semantic rendering can catch an unwrapped replay dropping it.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
@@ -572,13 +572,14 @@ mod tests {
 
     #[test]
     fn test_reference_discharge_rules_thread_state_through_a_replayed_program() {
-        // The program allocates one local root, narrows it to a composed view, accumulates into that view, replaces
-        // it, adds the replaced and current selections, and finally freezes the whole root.
+        // The program allocates one local allocation, narrows it to a composed view, accumulates into that view, replaces
+        // it, adds the replaced and current selections, and finally freezes the complete stored value.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let initial = builder.add_input(ListIrType::List(ListType { length: 4 }));
-        let root = builder.add_instruction(ListOperation::ReferenceNew, Vec::new(), vec![initial], None).unwrap()[0];
+        let allocation =
+            builder.add_instruction(ListOperation::ReferenceNew, Vec::new(), vec![initial], None).unwrap()[0];
         let view = builder
-            .add_instruction(ListOperation::Slice { offset: 1, length: 2 }, Vec::new(), vec![root], None)
+            .add_instruction(ListOperation::Slice { offset: 1, length: 2 }, Vec::new(), vec![allocation], None)
             .unwrap()[0];
         let update = builder.add_constant(ListIrValue::List(vec![10, 20]));
         builder.add_instruction(ListOperation::AddUpdate, Vec::new(), vec![view, update], None).unwrap();
@@ -588,7 +589,7 @@ mod tests {
             builder.add_instruction(ListOperation::Swap, Vec::new(), vec![view, replacement], None).unwrap()[0];
         let snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![view], None).unwrap()[0];
         let total = builder.add_instruction(ListOperation::Add, Vec::new(), vec![replaced, snapshot], None).unwrap()[0];
-        let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![root], None).unwrap()[0];
+        let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![allocation], None).unwrap()[0];
         let program = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![total, frozen], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
@@ -609,8 +610,8 @@ mod tests {
             ],
         );
 
-        // Every root the program created is gone once its `freeze` consumed it, so nothing leaks into the context.
-        assert_eq!(context.live_roots(), Vec::new());
+        // Every allocation the program created is gone once its `freeze` consumed it, so nothing leaks into the context.
+        assert_eq!(context.live_allocations(), Vec::new());
 
         // Replaying through the driver supplies every instruction's own source coordinate, which is what makes the
         // allocation selectable by a partial-discharge site.
@@ -622,7 +623,7 @@ mod tests {
     #[test]
     fn test_discharge_preserved_access_replays_one_access_verbatim_into_the_destination() {
         // The shared preserved replay consumes each handle's own destination reference value and binds the source's
-        // own operation over it, which is what makes an access to a surviving root no rewrite at all. It runs against
+        // own operation over it, which is what makes an access to a surviving allocation no rewrite at all. It runs against
         // a staging destination, because the eager destination of this universe declines to execute a reference
         // primitive and recording is what production discharge does anyway.
         let referent = ListType { length: 2 };
@@ -655,30 +656,30 @@ mod tests {
                 in (%1)"},
         );
 
-        // A replayed access that produces a reference would leave the environment without a root for it, so the
-        // operation owning that root has to state its own rule instead.
+        // A replayed access that produces a reference would leave the environment without an allocation for it, so the
+        // operation owning that allocation has to state its own rule instead.
         let staging = TracingContext::<ListIrValue, ListOperation>::new();
         let staged = ReferenceDischargeContext::<_, ListReferenceDischarge>::new(staging.clone());
         let initial = ReferenceDischargeValue::Ordinary(staging.input(ListIrType::List(referent.clone())));
         assert_eq!(
             discharge_preserved_access(&ListOperation::ReferenceNew, &staged, std::slice::from_ref(&initial)),
             Err(ProgramError::MalformedProgram(
-                "reference discharge replayed `list.reference_new` over a preserved root, but its output 0 is the \
-                 reference `ref<list<2>>`; an operation that derives a reference owns that root and needs a reference \
+                "reference discharge replayed `list.reference_new` over a preserved reference, but its output 0 is the \
+                 reference `ref<list<2>>`; an operation that derives a reference owns that allocation and needs a reference \
                  discharge rule of its own"
                     .to_string(),
             )),
         );
 
-        // A discharged root has no destination reference value at all, so it cannot be replayed over.
+        // A discharged reference has no destination reference value at all, so it cannot be replayed over.
         let context = ListDischargeContext::new(ListDestination::new());
         let discharged =
             context.allocate_discharged(ReferenceType::new(referent), ListIrValue::List(vec![1, 2])).unwrap();
-        let discharged_root = discharged.expect_reference("the discharged root").unwrap().root();
+        let discharged_allocation = discharged.expect_reference("the discharged reference").unwrap().allocation();
         assert_eq!(
             discharge_preserved_access(&ListOperation::Read, &context, std::slice::from_ref(&discharged)),
             Err(ProgramError::MalformedProgram(format!(
-                "reference discharge cannot replay `list.read` over discharged {discharged_root}, which has no \
+                "reference discharge cannot replay `list.read` over discharged {discharged_allocation}, which has no \
                  destination reference value",
             ))),
         );

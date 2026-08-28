@@ -2975,7 +2975,7 @@ impl<'c> XlaDomain<'c> {
                     .collect::<Result<Vec<ReferenceGuard<'_, Array<'c>>>, ProgramError>>()?;
                 let mut observations_are_current = true;
                 for (guard, observation) in guards.iter().zip(&observations) {
-                    if !guard.is_current(observation)? {
+                    if !observation.is_current(guard)? {
                         observations_are_current = false;
                         break;
                     }
@@ -3011,7 +3011,7 @@ impl<'c> XlaDomain<'c> {
                     .iter()
                     .map(|(guard_index, logical_output_index)| {
                         guards[*guard_index]
-                            .next_generation()
+                            .next_replacement_generation()
                             .map(|generation| (*guard_index, *logical_output_index, generation))
                     })
                     .collect::<Result<Vec<_>, _>>()?;

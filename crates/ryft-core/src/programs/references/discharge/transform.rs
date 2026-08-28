@@ -40,7 +40,7 @@ pub trait ReferenceDischarge: Sized {
         capture_count: usize,
     ) -> Result<ReferenceDischargeResult<Self::DischargedProgram>, ProgramError>;
 
-    /// Discharges local references for `transform`, rejecting every caller-owned external root.
+    /// Discharges local references for `transform`, rejecting every caller-owned external allocation.
     ///
     /// The full-discharge implementation must prove that the result contains neither reference types nor unresolved
     /// ordered reference state. The checked result envelope ensures that an external-state-free result has no hidden
@@ -85,9 +85,9 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// the same rewrite under a populated capture scope.
     ///
     /// Each source input keeps its position. A reference-typed input becomes an ordinary input carrying the referent's
-    /// lifted type, which is the entering immutable state of the root that input denotes; every other input is
+    /// lifted type, which is the entering immutable state of the allocation that input denotes; every other input is
     /// replayed unchanged. The public outputs are exactly the source outputs, in order, and the final state of each
-    /// *mutated* external root is appended after them as a hidden output in entry-boundary order. A root that the
+    /// *mutated* external allocation is appended after them as a hidden output in entry-boundary order. An allocation that the
     /// program only reads contributes no hidden output, so a read-only program keeps its original boundary exactly.
     ///
     /// The replay runs through [`ReferenceDischargeDriver::discharge_region`] rather than through
@@ -108,9 +108,9 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// # Errors
     ///
     /// Returns [`ProgramError::MalformedProgram`] when `capture_count` exceeds the program's input count, when an
-    /// output still denotes a reference, when the program consumes an external root, whose state belongs to the
+    /// output still denotes a reference, when the program consumes an external allocation, whose state belongs to the
     /// caller, or when the rewritten payload fails the reference-freedom proof. Rule-level failures, including a
-    /// use-after-consume and an access to an unbound root, propagate from the replay itself.
+    /// use-after-consume and an access to an unbound allocation, propagate from the replay itself.
     pub fn discharge_references_with_policy<P>(
         self,
         capture_count: usize,
@@ -128,14 +128,14 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     }
 
     /// Discharges the references the caller *selected* and preserves every other one, returning the mixed program
-    /// together with the logical external-state bindings of the roots that became state.
+    /// together with the logical external-state bindings of the allocations that became state.
     ///
     /// This is the same rewrite [`discharge_references_with_policy`](Self::discharge_references_with_policy) performs;
-    /// full discharge is exactly its everything-selected case, and the two share one body. A selected root threads as
-    /// immutable state in every respect described there. An unselected root instead *survives*: it keeps its
+    /// full discharge is exactly its everything-selected case, and the two share one body. A selected allocation threads as
+    /// immutable state in every respect described there. An unselected allocation instead *survives*: it keeps its
     /// reference-typed boundary position or its allocating instruction, every access to it replays verbatim as the
     /// reference operation the source performed, and a view derived from it replays its view operation too, so the
-    /// rewritten program still denotes the same coordinates. Preserved roots contribute no state input, no hidden
+    /// rewritten program still denotes the same coordinates. Preserved references contribute no state input, no hidden
     /// final-state output, and no [`ReferenceStateBinding`]: the payload's own boundary is where the caller sees them.
     ///
     /// This is what a kernel pipeline needs — normalize the pipeline's own state into explicit carries while the
@@ -144,15 +144,15 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// selection to have covered everything asks for the proof explicitly through
     /// [`try_into_full`](PartialReferenceDischargeResult::try_into_full).
     ///
-    /// A preserved root crosses a structured operation's region boundary the same way it crosses anything else: as the
+    /// A preserved reference crosses a structured operation's region boundary the same way it crosses anything else: as the
     /// reference it already is, at its own declared operand position, exactly as the source passed it. It occupies no
     /// state carry, publishes no successor, and widens nothing, so a condition, loop, scan, or call can thread
-    /// discharged state and surviving references side by side. What a preserved root cannot become is *added* state
+    /// discharged state and surviving references side by side. What a preserved reference cannot become is *added* state
     /// that a rule synthesizes onto a rebuilt boundary, which is reported by name.
     ///
     /// Where a structured operation *declares* a reference-typed output — a loop carry, say — the rewritten operation
     /// still produces one, and it is deliberately left unused: the caller keeps the handle it already holds, because
-    /// both denote the same root and one destination value per root is enough. A later full discharge of the same
+    /// both denote the same allocation and one destination value per allocation is enough. A later full discharge of the same
     /// payload collapses that position into an ordinary state carry.
     ///
     /// A *capture-lifted* program has no partial form: this entry point recognizes no capture constant, so a
@@ -166,14 +166,14 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     ///     to split the entry boundary into [`ReferenceSource::Capture`] and [`ReferenceSource::Input`]
     ///     positions.
     ///   - `sites`: Reference sites to discharge, enumerated from this same program through
-    ///     [`reference_discharge_sites`](Self::reference_discharge_sites). Every other root is preserved.
+    ///     [`reference_discharge_sites`](Self::reference_discharge_sites). Every other allocation is preserved.
     ///
     /// # Errors
     ///
     /// Returns [`ProgramError::MalformedProgram`] when `sites` does not validate against this program, when a rule
-    /// synthesizes a preserved root onto a rebuilt region's added state positions, and otherwise for every reason
+    /// synthesizes a preserved reference onto a rebuilt region's added state positions, and otherwise for every reason
     /// [`discharge_references_with_policy`](Self::discharge_references_with_policy) documents — with one deliberate
-    /// exception. Consuming a *discharged* external root is still rejected, because a
+    /// exception. Consuming a *discharged* external allocation is still rejected, because a
     /// [`ReferenceStateBinding`] cannot express a caller-owned reference that no longer denotes live state; consuming
     /// a *preserved* one is accepted, because the payload retains the consuming operation and the caller passes its
     /// reference handle to that operation directly.
@@ -200,11 +200,11 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// A capture-lifted program is one whose captures have been turned into a leading input prefix by
     /// [`ClosedProgram::to_program_with_lifted_captures`](crate::ClosedProgram::to_program_with_lifted_captures).
     /// Lifting rewrites the entry boundary, but an attached region keeps naming the same captures through
-    /// [`CaptureReference`](crate::CaptureReference) constants, and those constants denote the very roots the lifted
+    /// [`CaptureReference`](crate::CaptureReference) constants, and those constants denote the very allocations the lifted
     /// prefix binds. This entry point therefore differs from
     /// [`discharge_references_with_policy`](Self::discharge_references_with_policy) in exactly one respect: it seeds
     /// the entry capture scope from that prefix, so a reference-typed capture constant resolves to the
-    /// root its position already binds instead of being rejected as belonging to no root.
+    /// allocation its position already binds instead of being rejected as belonging to no allocation.
     ///
     /// Everything else — the boundary rewrite, the hidden final-state outputs, and the reference-freedom proof — is
     /// identical, and a program with no capture-scoped reference constant discharges to exactly the same result
@@ -219,7 +219,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// # Errors
     ///
     /// Returns the same errors as [`discharge_references_with_policy`](Self::discharge_references_with_policy), and
-    /// additionally reports a capture constant whose declared reference type disagrees with the root its position
+    /// additionally reports a capture constant whose declared reference type disagrees with the allocation its position
     /// binds.
     pub fn discharge_references_with_lifted_captures_and_policy<P>(
         self,
@@ -252,7 +252,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     ///
     ///   - `capture_count`: Number of leading flat inputs that originated in the source program's capture table.
     ///   - `capture_index`: Seam reporting the capture position a stored constant names.
-    ///   - `selection`: Reference sites to discharge; every root the selection omits is preserved.
+    ///   - `selection`: Reference sites to discharge; every allocation the selection omits is preserved.
     ///
     /// # Errors
     ///
@@ -294,8 +294,8 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
             let context =
                 ReferenceDischargeContext::<TracingContext<V, O>, P>::new_selecting(destination.clone(), selection);
             let mut inputs = Vec::with_capacity(input_count);
-            let mut discharged_roots = Vec::new();
-            let mut capture_roots = vec![None; capture_count];
+            let mut discharged_allocations = Vec::new();
+            let mut capture_allocations = vec![None; capture_count];
             for (input_index, input_type) in input_types.into_iter().enumerate() {
                 let Some(reference_type) = P::project_reference_type(&input_type) else {
                     inputs.push(ReferenceDischargeValue::Ordinary(destination.input(input_type)));
@@ -307,24 +307,24 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
                     let state = destination.input(P::lift_referent_type(reference_type.referent().clone()));
                     context.allocate_discharged(reference_type, state)?
                 } else {
-                    // An unselected external root keeps its reference-typed boundary position exactly as the source
-                    // declared it, so the caller still supplies a holder and every access to it replays verbatim.
+                    // An unselected external allocation keeps its reference-typed boundary position exactly as the source
+                    // declared it, so the caller still supplies the reference and every access to it replays verbatim.
                     context.bind_preserved(reference_type, destination.input(input_type))?
                 };
-                let root = carrier.expect_reference("an entry-boundary reference root")?.root();
+                let allocation = carrier.expect_reference("an entry-boundary reference allocation")?.allocation();
                 if selected {
-                    discharged_roots.push((source, root));
+                    discharged_allocations.push((source, allocation));
                 }
                 if input_index < capture_count {
-                    capture_roots[input_index] = Some(root);
+                    capture_allocations[input_index] = Some(allocation);
                 }
                 inputs.push(carrier);
             }
 
-            // The capture scope can only be established once the prefix has minted its roots, and it is what lets a
+            // The capture scope can only be established once the prefix has minted its allocations, and it is what lets a
             // nested region resolve the caller references it names through capture constants rather than through its
             // own boundary.
-            let context = context.with_captures(ReferenceCaptureScope::new(capture_index, capture_roots));
+            let context = context.with_captures(ReferenceCaptureScope::new(capture_index, capture_allocations));
 
             let regions = [self];
             let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
@@ -335,12 +335,12 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
                 .map(|(output_index, output)| match output {
                     ReferenceDischargeValue::Ordinary(value) => value.atom_id(),
 
-                    // A preserved root survives in the rewritten program, so returning one returns its destination
-                    // reference value. A discharged root has no such value, because it became state. Returning a root
+                    // A preserved reference survives in the rewritten program, so returning one returns its destination
+                    // reference value. A discharged reference has no such value, because it became state. Returning an allocation
                     // is a use of it like any other, so its liveness is resolved against the environment rather than
-                    // taken from the handle, which is what reports a root the program already consumed.
+                    // taken from the handle, which is what reports an allocation the program already consumed.
                     ReferenceDischargeValue::Reference(reference) => {
-                        context.validate_live_root(reference.root())?;
+                        context.validate_live_allocation(reference.allocation())?;
                         reference
                             .preserved()
                             .ok_or_else(|| {
@@ -354,19 +354,19 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
-            // A mutated external root publishes its final state as a hidden output; a read-only one publishes nothing,
+            // A mutated external allocation publishes its final state as a hidden output; a read-only one publishes nothing,
             // which is what keeps a read-only program's boundary identical to its source boundary. A preserved
-            // external root binds nothing at all: it never became state, so there is no state for a caller to supply
+            // external allocation binds nothing at all: it never became state, so there is no state for a caller to supply
             // or to write back.
-            let mut external_states = Vec::with_capacity(discharged_roots.len());
-            for (source, root) in discharged_roots {
-                if context.validate_live_root(root).is_err() {
+            let mut external_states = Vec::with_capacity(discharged_allocations.len());
+            for (source, allocation) in discharged_allocations {
+                if context.validate_live_allocation(allocation).is_err() {
                     return Err(ProgramError::MalformedProgram(format!(
                         "reference discharge consumed external {source}, whose state must remain owned by the caller",
                     )));
                 }
-                let final_state_output_index = if context.is_mutated(root)? {
-                    output_ids.push(context.discharged_state(root)?.atom_id()?);
+                let final_state_output_index = if context.is_mutated(allocation)? {
+                    output_ids.push(context.discharged_state(allocation)?.atom_id()?);
                     Some(output_ids.len() - 1)
                 } else {
                     None
@@ -434,8 +434,8 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_reference_discharge_preserves_unselected_external_roots() {
-        // The kernel-pipeline shape, in a universe that mentions no arrays: one caller-owned root is selected and
+    fn test_partial_reference_discharge_preserves_unselected_external_allocations() {
+        // The kernel-pipeline shape, in a universe that mentions no arrays: one caller-owned allocation is selected and
         // becomes threaded state, while the other survives as a reference the rewritten program still accesses
         // through the very operations the source used.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
@@ -460,8 +460,8 @@ mod tests {
         let discharged = source.partially_discharge_references_with_policy::<ListReferenceDischarge>(0, &sites[..1]);
         let discharged = discharged.unwrap();
 
-        // The selected root became an ordinary state input at its own boundary position and publishes its final state
-        // as a hidden output; the preserved root kept its reference type, so it binds nothing at all.
+        // The selected allocation became an ordinary state input at its own boundary position and publishes its final state
+        // as a hidden output; the preserved reference kept its reference type, so it binds nothing at all.
         assert_eq!(discharged.public_output_count(), 1);
         assert_eq!(
             discharged.external_states(),
@@ -493,16 +493,17 @@ mod tests {
     #[test]
     fn test_partial_reference_discharge_preserves_an_unselected_allocation_site() {
         // An interior allocation is selectable in its own right, so a program can normalize its pipeline state while
-        // the root a kernel body addresses is allocated, viewed, accessed, and consumed as a reference throughout.
+        // the allocation a kernel body addresses is allocated, viewed, accessed, and consumed as a reference throughout.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let initial = builder.add_input(ListIrType::List(ListType { length: 4 }));
         let update = builder.add_input(ListIrType::List(ListType { length: 2 }));
-        let root = builder.add_instruction(ListOperation::ReferenceNew, Vec::new(), vec![initial], None).unwrap()[0];
+        let allocation =
+            builder.add_instruction(ListOperation::ReferenceNew, Vec::new(), vec![initial], None).unwrap()[0];
         let view = builder
-            .add_instruction(ListOperation::Slice { offset: 1, length: 2 }, Vec::new(), vec![root], None)
+            .add_instruction(ListOperation::Slice { offset: 1, length: 2 }, Vec::new(), vec![allocation], None)
             .unwrap()[0];
         builder.add_instruction(ListOperation::AddUpdate, Vec::new(), vec![view, update], None).unwrap();
-        let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![root], None).unwrap()[0];
+        let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![allocation], None).unwrap()[0];
         let source = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![frozen], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -544,10 +545,10 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_reference_discharge_lets_a_program_consume_a_preserved_external_root() {
-        // Full discharge rejects a program that consumes a caller-owned root, because a `ReferenceStateBinding`
-        // cannot describe a holder that no longer exists. A preserved root has no binding to describe: the payload
-        // keeps the consuming operation, and the caller hands its holder to that operation directly, so partial
+    fn test_partial_reference_discharge_lets_a_program_consume_a_preserved_external_allocation() {
+        // Full discharge rejects a program that consumes a caller-owned allocation, because a `ReferenceStateBinding`
+        // cannot describe reference state that no longer exists. A preserved reference has no binding to describe: the
+        // payload keeps the consuming operation, and the caller passes its reference to that operation directly, so partial
         // discharge accepts what full discharge cannot express.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let external = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
@@ -574,7 +575,7 @@ mod tests {
             ),
         );
 
-        // Returning the root afterwards is a use of it like any other, so the consumed root is reported at the output
+        // Returning the allocation afterwards is a use of it like any other, so the consumed allocation is reported at the output
         // that names it rather than published as a stale reference.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let external = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
@@ -587,19 +588,19 @@ mod tests {
             )
             .unwrap();
 
-        // A root rendering embeds the identity of the environment that minted it, which is process-global, so the
+        // An allocation rendering embeds the identity of the environment that minted it, which is process-global, so the
         // assertion pins everything around it.
         let error = source.partially_discharge_references_with_policy::<ListReferenceDischarge>(0, &[]).unwrap_err();
         let ProgramError::MalformedProgram(message) = &error else {
             panic!("expected a malformed-program rejection but got {error:?}");
         };
-        assert!(message.starts_with("reference discharge accessed consumed reference root "), "{message}");
+        assert!(message.starts_with("reference discharge accessed consumed reference allocation "), "{message}");
         assert!(message.ends_with(":0"), "{message}");
     }
 
     #[test]
-    fn test_partial_reference_discharge_threads_a_preserved_root_beside_discharged_state() {
-        // A structured boundary carries both kinds of root at once: a discharged carry crosses as immutable state and
+    fn test_partial_reference_discharge_threads_a_preserved_allocation_beside_discharged_state() {
+        // A structured boundary carries both kinds of allocation at once: a discharged carry crosses as immutable state and
         // is widened with a published successor, while a preserved carry crosses as the reference it already is, at
         // its own declared operand position, and widens nothing at all.
         let mut callee_builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
@@ -628,8 +629,8 @@ mod tests {
         let discharged =
             source.partially_discharge_references_with_policy::<ListReferenceDischarge>(0, &sites[..1]).unwrap();
 
-        // The selected root's entering state occupies its own operand position and its successor is appended as a
-        // published output; the preserved root's operand position still carries a reference, and the rebuilt callee
+        // The selected allocation's entering state occupies its own operand position and its successor is appended as a
+        // published output; the preserved reference's operand position still carries a reference, and the rebuilt callee
         // performs the read on it exactly as the source did.
         assert_eq!(discharged.public_output_count(), 1);
         assert_eq!(
@@ -657,7 +658,7 @@ mod tests {
     #[test]
     fn test_partial_reference_discharge_validates_its_selection_against_the_program() {
         // The selection is checked before anything is replayed, so a site this program does not expose is reported
-        // against the program rather than surfacing later as a root that never appeared.
+        // against the program rather than surfacing later as an allocation that never appeared.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let external = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let observed = builder.add_instruction(ListOperation::Read, Vec::new(), vec![external], None).unwrap()[0];

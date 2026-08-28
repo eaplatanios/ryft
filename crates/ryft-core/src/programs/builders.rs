@@ -1508,7 +1508,10 @@ mod tests {
         };
         let allocation = TestReferenceOperation {
             name: "reference_new",
-            semantics: ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceOutput::Root { output_index: 0 }]),
+            semantics: ReferenceOperationSemantics::new(
+                Vec::new(),
+                vec![ReferenceOutput::Allocation { output_index: 0 }],
+            ),
             forwarded: None,
         };
         let read = access("reference_read", ReferenceAccessMode::Read);

@@ -7,73 +7,73 @@ use crate::programs::programs::Program;
 use crate::programs::values::Value;
 use crate::tracing::TracingContext;
 
-use super::super::ReferenceRootHandle;
+use super::super::ReferenceAllocationHandle;
 
 /// of the same program universe, which seals into a program the rule attaches to its rewritten operation.
 ///
-/// It is deliberately a fresh root trace rather than a nested trace of the live destination. A rebuilt region is a
+/// It is deliberately a fresh allocation trace rather than a nested trace of the live destination. A rebuilt region is a
 /// self-contained artifact whose complete interface is its own boundary, so it must not close over any value of the
-/// destination it will be attached in. Being a root trace is also what makes the type a fixed point of its own
+/// destination it will be attached in. Being an allocation trace is also what makes the type a fixed point of its own
 /// construction — the destination of a destination is that same destination — which is what keeps the obligation that
 /// this universe's operations discharge into it finite.
 pub type ReferenceDischargeRegionDestination<C> = TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>;
 
-/// One group of state positions a rebuilt region gains: the roots crossing there and the source-boundary position at
+/// One group of state positions a rebuilt region gains: the allocations crossing there and the source-boundary position at
 /// which they are inserted.
 ///
-/// Grouping the roots with their insertion position keeps a boundary request's input and output groups from being
+/// Grouping the allocations with their insertion position keeps a boundary request's input and output groups from being
 /// transposable: the two groups have the same shape, and passing them positionally compiled silently when swapped.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReferenceRegionStateInsertion {
-    /// Roots crossing at this group's positions, in canonical root order.
-    roots: Vec<ReferenceRootHandle>,
+    /// Allocations crossing at this group's positions, in canonical allocation order.
+    allocations: Vec<ReferenceAllocationHandle>,
 
     /// Position in the source region's boundary at which the group is inserted.
     position: usize,
 }
 
 impl ReferenceRegionStateInsertion {
-    /// Creates a state-position group inserting `roots` at `position`.
+    /// Creates a state-position group inserting `allocations` at `position`.
     #[inline]
-    pub fn new(roots: Vec<ReferenceRootHandle>, position: usize) -> Self {
-        Self { roots, position }
+    pub fn new(allocations: Vec<ReferenceAllocationHandle>, position: usize) -> Self {
+        Self { allocations, position }
     }
 }
 
 /// Symmetric widening facts one structured rule derives from a region summary through
 /// [`state_widening`](crate::programs::references::ReferenceDischargeContext::state_widening).
 ///
-/// The three sets state one algorithm every symmetric structured rewrite shares: the *threaded* roots cross the
+/// The three sets state one algorithm every symmetric structured rewrite shares: the *threaded* allocations cross the
 /// rebuilt boundary as immutable state, the *entering* subset gains added positions because no declared position
 /// already carries it, and the *published* subset is what the rebuilt regions must report as mutated.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReferenceStateWidening {
-    /// Every discharged root the region closures reach, in canonical root order.
-    pub(super) threaded: BTreeSet<ReferenceRootHandle>,
+    /// Every discharged reference the region closures reach, in canonical allocation order.
+    pub(super) threaded: BTreeSet<ReferenceAllocationHandle>,
 
-    /// Threaded roots gaining added state positions, in canonical root order.
-    pub(super) entering: Vec<ReferenceRootHandle>,
+    /// Threaded allocations gaining added state positions, in canonical allocation order.
+    pub(super) entering: Vec<ReferenceAllocationHandle>,
 
-    /// Threaded roots some closure mutates, in canonical root order.
-    pub(super) published: Vec<ReferenceRootHandle>,
+    /// Threaded allocations some closure mutates, in canonical allocation order.
+    pub(super) published: Vec<ReferenceAllocationHandle>,
 }
 
 impl ReferenceStateWidening {
-    /// Returns every discharged root the region closures reach, in canonical root order.
+    /// Returns every discharged reference the region closures reach, in canonical allocation order.
     #[inline]
-    pub fn threaded(&self) -> &BTreeSet<ReferenceRootHandle> {
+    pub fn threaded(&self) -> &BTreeSet<ReferenceAllocationHandle> {
         &self.threaded
     }
 
-    /// Returns the threaded roots gaining added state positions, in canonical root order.
+    /// Returns the threaded allocations gaining added state positions, in canonical allocation order.
     #[inline]
-    pub fn entering(&self) -> &[ReferenceRootHandle] {
+    pub fn entering(&self) -> &[ReferenceAllocationHandle] {
         self.entering.as_slice()
     }
 
-    /// Returns the threaded roots some closure mutates, in canonical root order.
+    /// Returns the threaded allocations some closure mutates, in canonical allocation order.
     #[inline]
-    pub fn published(&self) -> &[ReferenceRootHandle] {
+    pub fn published(&self) -> &[ReferenceAllocationHandle] {
         self.published.as_slice()
     }
 }
@@ -82,26 +82,26 @@ impl ReferenceStateWidening {
 ///
 /// The rule owns the mapping from its own operands onto a region's declared inputs, because that mapping is part of
 /// what the operation *is*. It therefore describes the declared input boundary itself, in region order, and names
-/// separately the threaded state the rebuilt region gains: which roots enter, which roots it must publish, and where
+/// separately the threaded state the rebuilt region gains: which allocations enter, which allocations it must publish, and where
 /// each group is inserted.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReferenceRegionDischargeBoundary {
-    /// Root entering at each declared source-region input position, or [`None`] for an ordinary value.
-    declared_input_roots: Vec<Option<ReferenceRootHandle>>,
+    /// Allocation entering at each declared source-region input position, or [`None`] for an ordinary value.
+    declared_input_allocations: Vec<Option<ReferenceAllocationHandle>>,
 
     /// Length of the region's own leading capture prefix, from [`Operation::region_capture_input_count`], or [`None`]
     /// when the region inherits the capture scope of the region its operation is applied in.
     capture_input_count: Option<usize>,
 
-    /// Roots whose entering carrier the rebuilt region receives as added inputs, in canonical root order.
-    /// Discharged roots enter as immutable state; preserved roots enter as their destination reference value.
-    added_input_roots: Vec<ReferenceRootHandle>,
+    /// Allocations whose entering carrier the rebuilt region receives as added inputs, in canonical allocation order.
+    /// Discharged references enter as immutable state; preserved references enter as their destination reference value.
+    added_input_allocations: Vec<ReferenceAllocationHandle>,
 
     /// Position in the source region's input boundary at which the added state inputs are inserted.
     state_input_insertion: usize,
 
-    /// Roots whose final state the rebuilt region publishes as added outputs, in canonical root order.
-    added_state_output_roots: Vec<ReferenceRootHandle>,
+    /// Allocations whose final state the rebuilt region publishes as added outputs, in canonical allocation order.
+    added_state_output_allocations: Vec<ReferenceAllocationHandle>,
 
     /// Position in the source region's output boundary at which the added state outputs are inserted.
     state_output_insertion: usize,
@@ -125,49 +125,49 @@ impl ReferenceRegionDischargeBoundary {
     ///     [`region_capture_input_count`](Operation::region_capture_input_count) states the region's own leading
     ///     capture prefix.
     ///   - `region_index`: Position of the region among that operation's attached regions.
-    ///   - `declared_input_roots`: Root entering at each declared boundary position, or [`None`] for an ordinary value.
+    ///   - `declared_input_allocations`: Allocation entering at each declared boundary position, or [`None`] for an ordinary value.
     ///     Reference positions must come from
-    ///     [`operand_root`](crate::programs::references::ReferenceDischargeContext::operand_root), which validates that
-    ///     each operand carries the whole root rather than a derived view. Its length must equal the source region's
+    ///     [`operand_allocation`](crate::programs::references::ReferenceDischargeContext::operand_allocation), which validates that
+    ///     each operand carries the complete stored value rather than a derived view. Its length must equal the source region's
     ///     input count, because every declared position is rebuilt.
-    ///   - `added_inputs`: Roots whose entering state or preserved reference the rebuilt region receives as added
+    ///   - `added_inputs`: Allocations whose entering state or preserved reference the rebuilt region receives as added
     ///     inputs, grouped with the source input position receiving them.
-    ///   - `added_state_outputs`: Roots whose final state the rebuilt region publishes as added outputs, grouped with
+    ///   - `added_state_outputs`: Allocations whose final state the rebuilt region publishes as added outputs, grouped with
     ///     the source output position receiving them.
     #[inline]
     pub fn new<O: Operation>(
         operation: &O,
         region_index: usize,
-        declared_input_roots: Vec<Option<ReferenceRootHandle>>,
+        declared_input_allocations: Vec<Option<ReferenceAllocationHandle>>,
         added_inputs: ReferenceRegionStateInsertion,
         added_state_outputs: ReferenceRegionStateInsertion,
     ) -> Self {
         Self {
-            declared_input_roots,
+            declared_input_allocations,
             capture_input_count: operation.region_capture_input_count(region_index),
-            added_input_roots: added_inputs.roots,
+            added_input_allocations: added_inputs.allocations,
             state_input_insertion: added_inputs.position,
-            added_state_output_roots: added_state_outputs.roots,
+            added_state_output_allocations: added_state_outputs.allocations,
             state_output_insertion: added_state_outputs.position,
         }
     }
 
-    /// Creates a rebuilt-region boundary request whose added inputs and added state outputs are the same roots at the
+    /// Creates a rebuilt-region boundary request whose added inputs and added state outputs are the same allocations at the
     /// same position, which is the symmetric loop-carry shape `while` bodies and `scan` bodies thread.
     #[inline]
     pub fn symmetric<O: Operation>(
         operation: &O,
         region_index: usize,
-        declared_input_roots: Vec<Option<ReferenceRootHandle>>,
+        declared_input_allocations: Vec<Option<ReferenceAllocationHandle>>,
         state: ReferenceRegionStateInsertion,
     ) -> Self {
-        Self::new(operation, region_index, declared_input_roots, state.clone(), state)
+        Self::new(operation, region_index, declared_input_allocations, state.clone(), state)
     }
 
-    /// Returns the root entering at each declared boundary position, or [`None`] for an ordinary value.
+    /// Returns the allocation entering at each declared boundary position, or [`None`] for an ordinary value.
     #[inline]
-    pub(super) fn declared_input_roots(&self) -> &[Option<ReferenceRootHandle>] {
-        self.declared_input_roots.as_slice()
+    pub(super) fn declared_input_allocations(&self) -> &[Option<ReferenceAllocationHandle>] {
+        self.declared_input_allocations.as_slice()
     }
 
     /// Returns the region's own leading capture prefix, or [`None`] when it inherits its caller's capture scope.
@@ -176,10 +176,10 @@ impl ReferenceRegionDischargeBoundary {
         self.capture_input_count
     }
 
-    /// Returns the roots whose entering state or preserved reference the rebuilt region receives as added inputs.
+    /// Returns the allocations whose entering state or preserved reference the rebuilt region receives as added inputs.
     #[inline]
-    pub(super) fn added_input_roots(&self) -> &[ReferenceRootHandle] {
-        self.added_input_roots.as_slice()
+    pub(super) fn added_input_allocations(&self) -> &[ReferenceAllocationHandle] {
+        self.added_input_allocations.as_slice()
     }
 
     /// Returns the source input position at which the added state inputs are inserted.
@@ -188,10 +188,10 @@ impl ReferenceRegionDischargeBoundary {
         self.state_input_insertion
     }
 
-    /// Returns the roots whose final state the rebuilt region publishes as added outputs.
+    /// Returns the allocations whose final state the rebuilt region publishes as added outputs.
     #[inline]
-    pub(super) fn added_state_output_roots(&self) -> &[ReferenceRootHandle] {
-        self.added_state_output_roots.as_slice()
+    pub(super) fn added_state_output_allocations(&self) -> &[ReferenceAllocationHandle] {
+        self.added_state_output_allocations.as_slice()
     }
 
     /// Returns the source output position at which the added state outputs are inserted.
@@ -214,18 +214,18 @@ pub struct ReferenceRegionDischargeFork<V: Value, O: Operation<Type = V::Type>> 
     /// Rebuilt, discharged region program.
     pub(super) program: Program<V, O, Vec<V>, Vec<V>>,
 
-    /// Root each *declared* region output denotes, or [`None`] for an ordinary output, in region-boundary order.
-    pub(super) output_roots: Vec<Option<ReferenceRootHandle>>,
+    /// Allocation each *declared* region output denotes, or [`None`] for an ordinary output, in region-boundary order.
+    pub(super) output_allocations: Vec<Option<ReferenceAllocationHandle>>,
 
-    /// Threaded roots the region's closure mutated, in canonical root order.
-    pub(super) mutated_roots: Vec<ReferenceRootHandle>,
+    /// Threaded allocations the region's closure mutated, in canonical allocation order.
+    pub(super) mutated_allocations: Vec<ReferenceAllocationHandle>,
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> ReferenceRegionDischargeFork<V, O> {
-    /// Returns the root each declared region output denotes, or [`None`] where the output is an ordinary value.
+    /// Returns the allocation each declared region output denotes, or [`None`] where the output is an ordinary value.
     #[inline]
-    pub fn output_roots(&self) -> &[Option<ReferenceRootHandle>] {
-        self.output_roots.as_slice()
+    pub fn output_allocations(&self) -> &[Option<ReferenceAllocationHandle>] {
+        self.output_allocations.as_slice()
     }
 
     /// Consumes this fork and returns the rebuilt region program.
@@ -234,11 +234,11 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceRegionDischargeFork<V, O> 
         self.program
     }
 
-    /// Validates that this region's declared outputs denote exactly the roots the widening that sized its boundary
+    /// Validates that this region's declared outputs denote exactly the allocations the widening that sized its boundary
     /// expected them to.
     ///
-    /// The widening reads the declared output roots from a *static* summary, and the boundary it sizes depends on
-    /// them: a root a region already returns publishes its final state at that output's own position and must not be
+    /// The widening reads the declared output allocations from a *static* summary, and the boundary it sizes depends on
+    /// them: an allocation a region already returns publishes its final state at that output's own position and must not be
     /// published a second time. This is where that prediction is held to what the replay actually produced, so a rule
     /// whose operation disagrees with its own generic hooks is reported instead of silently losing an update. It also
     /// makes the several regions of one operation agree with each other, because they are all checked against the one
@@ -246,18 +246,18 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceRegionDischargeFork<V, O> 
     ///
     /// # Parameters
     ///
-    ///   - `expected`: Root each declared output was predicted to denote, in region-boundary order.
+    ///   - `expected`: Allocation each declared output was predicted to denote, in region-boundary order.
     ///   - `operation`: Name of the operation being rewritten, used in the diagnostic.
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::MalformedProgram`] when this region's declared outputs denote different roots.
-    pub fn validate_predicted_output_roots(
+    /// Returns [`ProgramError::MalformedProgram`] when this region's declared outputs denote different allocations.
+    pub fn validate_predicted_output_allocations(
         &self,
-        expected: &[Option<ReferenceRootHandle>],
+        expected: &[Option<ReferenceAllocationHandle>],
         operation: &str,
     ) -> Result<(), ProgramError> {
-        if self.output_roots != expected {
+        if self.output_allocations != expected {
             return Err(ProgramError::MalformedProgram(format!(
                 "operation `{operation}` attaches a region whose outputs do not denote the references its state \
                  widening expected",
@@ -266,7 +266,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceRegionDischargeFork<V, O> 
         Ok(())
     }
 
-    /// Validates that this region mutated no root the widening that sized its boundary did not publish.
+    /// Validates that this region mutated no allocation the widening that sized its boundary did not publish.
     ///
     /// The boundary was sized from a summary computed before the region ran, so this is where the summary and the
     /// replay are held to each other. A mismatch means one of the generic hooks the summary follows under-reports what
@@ -274,22 +274,22 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceRegionDischargeFork<V, O> 
     ///
     /// # Parameters
     ///
-    ///   - `published`: Roots whose final state the widening decided this region publishes.
+    ///   - `published`: Allocations whose final state the widening decided this region publishes.
     ///   - `operation`: Name of the operation being rewritten, used in the diagnostic.
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::MalformedProgram`] naming the first root this region mutated that `published` does not
+    /// Returns [`ProgramError::MalformedProgram`] naming the first allocation this region mutated that `published` does not
     /// contain.
     pub fn validate_predicted_mutations(
         &self,
-        published: &[ReferenceRootHandle],
+        published: &[ReferenceAllocationHandle],
         operation: &str,
     ) -> Result<(), ProgramError> {
-        for root in &self.mutated_roots {
-            if !published.contains(root) {
+        for allocation in &self.mutated_allocations {
+            if !published.contains(allocation) {
                 return Err(ProgramError::MalformedProgram(format!(
-                    "operation `{operation}` mutated {root} in an attached region that its state widening did not \
+                    "operation `{operation}` mutated {allocation} in an attached region that its state widening did not \
                      predict",
                 )));
             }
@@ -340,38 +340,38 @@ mod tests {
         let allocated = context
             .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
-        let root = allocated.expect_reference("the caller root").unwrap().root();
+        let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation();
         let regions = [program];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let boundary = ReferenceRegionDischargeBoundary::new(
             &ListOperation::Call,
             0,
-            vec![Some(root), None],
+            vec![Some(allocation), None],
             ReferenceRegionStateInsertion::new(Vec::new(), 2),
             ReferenceRegionStateInsertion::new(Vec::new(), 2),
         );
         let fork = driver.discharge_region_program(&context, 0, &boundary).unwrap();
 
-        // The region writes its entering root, so a widening that published nothing lost that update.
+        // The region writes its entering allocation, so a widening that published nothing lost that update.
         assert_eq!(
             fork.validate_predicted_mutations(&[], "list.call"),
             Err(ProgramError::MalformedProgram(format!(
-                "operation `list.call` mutated {root} in an attached region that its state widening did not predict",
+                "operation `list.call` mutated {allocation} in an attached region that its state widening did not predict",
             ))),
         );
-        assert_eq!(fork.validate_predicted_mutations(&[root], "list.call"), Ok(()));
+        assert_eq!(fork.validate_predicted_mutations(&[allocation], "list.call"), Ok(()));
 
-        // The region returns that root at its second output, so a widening that predicted an ordinary value there
-        // would have published the root's final state twice.
-        assert_eq!(fork.output_roots(), &[None, Some(root)]);
+        // The region returns that allocation at its second output, so a widening that predicted an ordinary value there
+        // would have published the allocation's final state twice.
+        assert_eq!(fork.output_allocations(), &[None, Some(allocation)]);
         assert_eq!(
-            fork.validate_predicted_output_roots(&[None, None], "list.call"),
+            fork.validate_predicted_output_allocations(&[None, None], "list.call"),
             Err(ProgramError::MalformedProgram(
                 "operation `list.call` attaches a region whose outputs do not denote the references its state \
                  widening expected"
                     .to_string(),
             )),
         );
-        assert_eq!(fork.validate_predicted_output_roots(&[None, Some(root)], "list.call"), Ok(()));
+        assert_eq!(fork.validate_predicted_output_allocations(&[None, Some(allocation)], "list.call"), Ok(()));
     }
 }

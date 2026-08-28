@@ -6013,7 +6013,7 @@ mod tests {
             type Referent = ArrayType;
             type Alias = WholeArray;
 
-            fn root_alias(_referent: &ArrayType) -> WholeArray {
+            fn storage_alias(_referent: &ArrayType) -> WholeArray {
                 WholeArray
             }
 

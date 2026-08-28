@@ -15,10 +15,10 @@ use super::results::ReferenceSource;
 /// One caller-selectable reference site for partial reference discharge.
 ///
 /// Selection needs an identity that exists in the *source* program, before any replay begins, so it cannot reuse the
-/// environment's [`ReferenceRootHandle`](crate::programs::references::ReferenceRootHandle)s. In particular, a nested
+/// environment's [`ReferenceAllocationHandle`](crate::programs::references::ReferenceAllocationHandle)s. In particular, a nested
 /// region's formal reference input is invocation-parameterized — the region may be invoked from several call sites —
 /// so it names no single caller-owned reference and is deliberately not selectable. Sites resolve internally to
-/// roots once discharge starts.
+/// allocations once discharge starts.
 ///
 /// Sites are arena-relative in exactly the sense that every other reference artifact is: their coordinates are
 /// meaningful only against the program they were enumerated from. Site validation rejects every kind mismatch, and
@@ -27,16 +27,16 @@ use super::results::ReferenceSource;
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum ReferenceDischargeSite {
-    /// Entry-boundary root supplied by the caller as a lifted capture or a public reference argument.
+    /// Entry-boundary allocation supplied by the caller as a lifted capture or a public reference argument.
     External(ReferenceSource),
 
     /// Interior allocation site, identified by the allocating instruction and the output position that defines the
-    /// fresh root.
+    /// fresh allocation.
     Allocation {
         /// Allocating instruction.
         instruction: InstructionId,
 
-        /// Output position defining the fresh root.
+        /// Output position defining the fresh allocation.
         output_index: usize,
     },
 }
@@ -54,7 +54,7 @@ impl Display for ReferenceDischargeSite {
     }
 }
 
-/// Reference sites one discharge normalizes into immutable state, with every unselected root preserved.
+/// Reference sites one discharge normalizes into immutable state, with every unselected allocation preserved.
 ///
 /// Selecting everything is deliberately a state of its own rather than a set listing every site. A program's sites are
 /// enumerated from its own arena while a selection is caller-supplied, so full discharge — which is exactly the
@@ -73,7 +73,7 @@ impl ReferenceDischargeSelection {
         Self { sites: None }
     }
 
-    /// Returns the selection naming exactly `sites`, which preserves every root they do not name.
+    /// Returns the selection naming exactly `sites`, which preserves every allocation they do not name.
     #[inline]
     pub(super) fn from_sites(sites: &[ReferenceDischargeSite]) -> Self {
         Self { sites: Some(Rc::new(sites.iter().copied().collect())) }
@@ -100,8 +100,8 @@ where
     /// This is a deliberately lightweight query. It reads only the entry boundary types and the generic
     /// [`Operation::reference_semantics`] hook over the attached region closure, so it does not run the discharge
     /// rewrite or construct its environments, and callers can enumerate selectable sites without paying for either.
-    /// Allocations inside nested regions are included, because an allocation is a concrete program-local root
-    /// wherever it occurs.
+    /// Allocations inside nested regions are included because every allocating instruction defines a concrete local
+    /// reference wherever it occurs.
     ///
     /// One class of enumerated site is inert: an allocation inside a closure that no operation ever replays, such as
     /// the dormant derivative rule region of a `custom_jvp`. Discharge rejects such a program outright, whichever way
@@ -140,7 +140,7 @@ where
                 instruction
                     .operation()
                     .reference_semantics()
-                    .root_output_indices()
+                    .allocation_output_indices()
                     .collect::<Vec<_>>()
                     .into_iter()
                     .map(move |output_index| ReferenceDischargeSite::Allocation {
@@ -172,8 +172,8 @@ where
     ///
     /// Returns [`ProgramError::MalformedProgram`] naming the offending site when a site is duplicated, names an
     /// out-of-range or non-reference entry position, names an instruction that this program does not contain, names
-    /// an operation that allocates no reference root, or names an output position of an allocating operation that is
-    /// not itself an allocation.
+    /// an operation that defines no reference allocation, or names an output position of an allocating operation that
+    /// is not itself an allocation.
     pub(crate) fn validate_reference_discharge_sites(
         &self,
         capture_count: usize,
@@ -216,7 +216,8 @@ where
                 ReferenceDischargeSite::Allocation { instruction, output_index } => {
                     let instruction = instructions.get(instruction).ok_or_else(invalid_site)?;
                     let operation = instruction.operation();
-                    let output_indices = operation.reference_semantics().root_output_indices().collect::<Vec<_>>();
+                    let output_indices =
+                        operation.reference_semantics().allocation_output_indices().collect::<Vec<_>>();
                     if !output_indices.contains(output_index) {
                         return Err(invalid_site());
                     }
@@ -245,12 +246,15 @@ mod tests {
 
     #[test]
     fn test_reference_discharge_sites_enumerate_externals_before_allocations() {
-        // A callee region that allocates its own local root, so that enumeration is exercised across the complete
+        // A callee region that allocates its own local allocation, so that enumeration is exercised across the complete
         // attached region closure rather than the entry region alone.
         let mut callee_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let initial = callee_builder.add_input(TestType::Value(0));
-        let root = callee_builder.add_instruction(TestOperation::NewRoot, Vec::new(), vec![initial], None).unwrap()[0];
-        let frozen = callee_builder.add_instruction(TestOperation::Consume, Vec::new(), vec![root], None).unwrap()[0];
+        let allocation = callee_builder
+            .add_instruction(TestOperation::NewAllocation, Vec::new(), vec![initial], None)
+            .unwrap()[0];
+        let frozen =
+            callee_builder.add_instruction(TestOperation::Consume, Vec::new(), vec![allocation], None).unwrap()[0];
         let callee = callee_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -260,7 +264,7 @@ mod tests {
         let public = builder.add_input(reference_type(0));
         let initial = builder.add_input(TestType::Value(0));
         let callee = builder.import_program(callee);
-        let local = builder.add_instruction(TestOperation::NewRoot, Vec::new(), vec![initial], None).unwrap()[0];
+        let local = builder.add_instruction(TestOperation::NewAllocation, Vec::new(), vec![initial], None).unwrap()[0];
         builder.add_instruction(TestOperation::Read, Vec::new(), vec![captured], None).unwrap();
         builder.add_instruction(TestOperation::Read, Vec::new(), vec![public], None).unwrap();
         let called = builder.add_instruction(TestOperation::Call, vec![callee], vec![initial], None).unwrap()[0];
@@ -319,9 +323,10 @@ mod tests {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let public = builder.add_input(reference_type(0));
         let initial = builder.add_input(TestType::Value(0));
-        let root = builder.add_instruction(TestOperation::NewRoot, Vec::new(), vec![initial], None).unwrap()[0];
+        let allocation =
+            builder.add_instruction(TestOperation::NewAllocation, Vec::new(), vec![initial], None).unwrap()[0];
         let read = builder.add_instruction(TestOperation::Read, Vec::new(), vec![public], None).unwrap()[0];
-        let frozen = builder.add_instruction(TestOperation::Consume, Vec::new(), vec![root], None).unwrap()[0];
+        let frozen = builder.add_instruction(TestOperation::Consume, Vec::new(), vec![allocation], None).unwrap()[0];
         let program = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![read, frozen], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
