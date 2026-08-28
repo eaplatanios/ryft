@@ -1,10 +1,10 @@
-//! Reference discharge: rewriting mutable reference state into explicit immutable dataflow.
-//!
-//! A program containing reference operations is not ordinary functional Single Static Assignment (SSA) dataflow. A
-//! read depends on the latest write to the same root even though that dependency is represented by a reference handle
-//! rather than by an SSA operand carrying the current value. Many transforms and backends require the dependency to
-//! be explicit. Reference discharge makes it explicit by replaying the program while replacing each selected root
-//! with an immutable state value that is threaded from one access to the next.
+//! Contains machinery related to _reference discharge_, which is the process of rewriting mutable reference state into
+//! explicit immutable dataflow. Specifically, a program containing reference operations is not ordinary functional
+//! Single Static Assignment (SSA) dataflow. A read operation depends on the latest write operation to the same root
+//! even though that dependency is represented by a reference handle rather than by an SSA operand carrying the current
+//! value. Many transforms and backends require the dependency to be explicit. Reference discharge makes it explicit by
+//! replaying the program while replacing each selected root with an immutable state value that is threaded from one
+//! access to the next.
 //!
 //! # Example
 //!
@@ -37,7 +37,7 @@
 //! An external reference follows the same rewrite but its state crosses the program boundary. Its reference-typed
 //! input becomes an ordinary input carrying the entering referent. If the program mutates the root, its final state is
 //! appended after the public outputs as a hidden output. [`ReferenceStateBinding`] records which capture or public
-//! argument owns that state and which hidden output must be installed back into the caller's reference. Its discharged
+//! argument owns that state and which hidden output must replace the caller's reference value. Its discharged
 //! input position follows from that logical source and the result's capture count. A read-only external root has no
 //! hidden output.
 //!
