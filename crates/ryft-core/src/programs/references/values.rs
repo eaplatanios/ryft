@@ -111,23 +111,23 @@ pub struct Reference<V: Value> {
 impl<V: Value> Reference<V> {
     /// Creates a new independent [`Reference`] whose underlying storage is initialized with `value`.
     pub fn new(value: V) -> Result<Self, ReferenceError> {
-        let root_type = value.r#type().into_owned();
-        if root_type.is_reference() {
-            return Err(ReferenceError::NestedReferent { referent_type: root_type.to_string() });
+        let referent_type = value.r#type().into_owned();
+        if referent_type.is_reference() {
+            return Err(ReferenceError::NestedReferent { referent_type: referent_type.to_string() });
         }
         Ok(Self {
             handle: Arc::new(ReferenceHandle {
                 holder: Arc::new(ReferenceHolder {
-                    root_type: root_type.clone(),
+                    referent_type: referent_type.clone(),
                     state: Mutex::new(ReferenceState::Ready {
                         value,
                         generation: ReferenceGeneration::initial(),
                         read_leases: Vec::new(),
                     }),
                 }),
-                r#type: ReferenceType::new(root_type),
-                root_to_handle: TypeIdentityRenaming::new(),
-                handle_to_root: TypeIdentityRenaming::new(),
+                r#type: ReferenceType::new(referent_type),
+                storage_to_handle: TypeIdentityRenaming::new(),
+                handle_to_storage: TypeIdentityRenaming::new(),
             }),
         })
     }
@@ -144,7 +144,7 @@ impl<V: Value> Reference<V> {
     /// same reference allocation but returns `false` when that operation changes any identity.
     #[inline]
     pub fn uses_root_type_identities(&self) -> bool {
-        self.handle.root_to_handle.is_identity() && self.handle.handle_to_root.is_identity()
+        self.handle.storage_to_handle.is_identity() && self.handle.handle_to_storage.is_identity()
     }
 
     /// Returns an immutable snapshot of this [`Reference`]'s current value. If a submitted mutation is still pending,
@@ -164,7 +164,7 @@ impl<V: Value> Reference<V> {
             unreachable!("`lock_ready_state` yields only ready states")
         };
         value
-            .rename_type_identities(&self.handle.root_to_handle)
+            .rename_type_identities(&self.handle.storage_to_handle)
             .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })
     }
 
@@ -214,7 +214,7 @@ impl<V: Value> Reference<V> {
         };
         let replacement = self.prepare_replacement(replacement)?;
         let previous = current
-            .rename_type_identities(&self.handle.root_to_handle)
+            .rename_type_identities(&self.handle.storage_to_handle)
             .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })?;
         Self::commit_replacement(current, generation, replacement)?;
         Ok(previous)
@@ -241,7 +241,7 @@ impl<V: Value> Reference<V> {
             unreachable!("`lock_ready_state` yields only ready states")
         };
         let local = current
-            .rename_type_identities(&self.handle.root_to_handle)
+            .rename_type_identities(&self.handle.storage_to_handle)
             .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })
             .map_err(ProgramError::custom)?;
         let (updated, result) = update(&local)?;
@@ -267,7 +267,7 @@ impl<V: Value> Reference<V> {
             unreachable!("`lock_ready_state` yields only ready states")
         };
         let value = value
-            .rename_type_identities(&self.handle.root_to_handle)
+            .rename_type_identities(&self.handle.storage_to_handle)
             .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })?;
         *state = ReferenceState::Frozen;
         Ok(value)
@@ -432,26 +432,27 @@ impl<V: Value> Reference<V> {
         let inverse_step =
             V::Type::derive_identity_renaming(std::slice::from_ref(&renamed_type), std::slice::from_ref(current_type))?;
 
-        // Reads begin with values represented in the allocation's original identity space. Compose the existing
-        // root-to-current conversion with the requested current-to-renamed step to produce the new read conversion.
-        let root_type = &self.handle.holder.root_type;
-        let mut root_to_handle = TypeIdentityRenaming::new();
-        for (_, identity) in root_type.identities() {
-            root_to_handle.insert(identity.clone(), renaming.rename(&self.handle.root_to_handle.rename(identity)))?;
+        // Reads begin with values represented in the shared storage identity space. Compose the existing
+        // storage-to-current conversion with the requested current-to-renamed step to produce the new read conversion.
+        let referent_type = &self.handle.holder.referent_type;
+        let mut storage_to_handle = TypeIdentityRenaming::new();
+        for (_, identity) in referent_type.identities() {
+            storage_to_handle
+                .insert(identity.clone(), renaming.rename(&self.handle.storage_to_handle.rename(identity)))?;
         }
 
         // Writes travel in the opposite direction. Compose the renamed-to-current inverse with this alias's existing
-        // current-to-root conversion to produce the new write conversion.
-        let mut handle_to_root = TypeIdentityRenaming::new();
+        // current-to-storage conversion to produce the new write conversion.
+        let mut handle_to_storage = TypeIdentityRenaming::new();
         for (_, identity) in renamed_type.identities() {
-            handle_to_root
-                .insert(identity.clone(), self.handle.handle_to_root.rename(&inverse_step.rename(identity)))?;
+            handle_to_storage
+                .insert(identity.clone(), self.handle.handle_to_storage.rename(&inverse_step.rename(identity)))?;
         }
 
         // Check each complete conversion against its concrete endpoint types. This catches inconsistent identity
         // implementations even when every individual mapping above was constructible.
-        if root_type.rename_identities(&root_to_handle)? != renamed_type
-            || renamed_type.rename_identities(&handle_to_root)? != *root_type
+        if referent_type.rename_identities(&storage_to_handle)? != renamed_type
+            || renamed_type.rename_identities(&handle_to_storage)? != *referent_type
         {
             return Err(TypeError::invalid(
                 "reference identity renaming must admit an exact bidirectional value reconstruction",
@@ -464,8 +465,8 @@ impl<V: Value> Reference<V> {
             handle: Arc::new(ReferenceHandle {
                 holder: Arc::clone(&self.handle.holder),
                 r#type: ReferenceType::new(renamed_type),
-                root_to_handle,
-                handle_to_root,
+                storage_to_handle,
+                handle_to_storage,
             }),
         })
     }
@@ -498,9 +499,9 @@ impl<V: Value> Reference<V> {
         true
     }
 
-    /// Validates a handle-local replacement value and converts it to the shared root representation. The input must
-    /// exactly match this [`Reference`]'s referent type. After applying the handle-to-root identity mapping, the
-    /// converted value must exactly match the reference allocation's root referent type. Both checks finish before
+    /// Validates a handle-local replacement value and converts it to the shared storage representation. The input must
+    /// exactly match this [`Reference`]'s referent type. After applying the handle-to-storage identity mapping, the
+    /// converted value must exactly match the reference allocation's canonical referent type. Both checks finish before
     /// any reference state is changed, so callers may safely commit or install the returned value.
     fn prepare_replacement(&self, value: V) -> Result<V, ReferenceError> {
         // `Typed::r#type` may return a `Cow` that borrows its value. Keeping that borrow inside this closure lets each
@@ -516,15 +517,15 @@ impl<V: Value> Reference<V> {
         // Reject the replacement in the handle's public type-identity namespace before translating it for storage.
         validate_type(&value, self.handle.r#type.referent())?;
 
-        // Every alias stores values in the reference allocation's root identity namespace. This mapping converts the
-        // handle-local replacement into that shared representation.
+        // Every alias stores values in the reference allocation's shared identity namespace. This mapping converts
+        // the handle-local replacement into that storage representation.
         let stored = value
-            .rename_type_identities(&self.handle.handle_to_root)
+            .rename_type_identities(&self.handle.handle_to_storage)
             .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })?;
 
         // Identity renaming is implemented by the value family, so verify that its result exactly matches the root
         // referent type before allowing the value to reach shared state.
-        validate_type(&stored, &self.handle.holder.root_type)?;
+        validate_type(&stored, &self.handle.holder.referent_type)?;
 
         Ok(stored)
     }
@@ -532,7 +533,7 @@ impl<V: Value> Reference<V> {
     /// Installs a prepared replacement into an already-locked `Ready` state and advances its [`ReferenceGeneration`].
     /// The next generation is computed before either field is changed. If the generation space is exhausted, this
     /// function returns [`ReferenceError::GenerationExhausted`] and leaves both `current` and `generation` unchanged.
-    /// `replacement` must already have been validated and converted to the shared root representation by
+    /// `replacement` must already have been validated and converted to the shared storage representation by
     /// [`Self::prepare_replacement`].
     fn commit_replacement(
         current: &mut V,
@@ -617,10 +618,10 @@ struct ReferenceHandle<V: Value> {
     r#type: ReferenceType<V::Type>,
 
     /// Converts stored values from the allocation's identities to this handle's identities.
-    root_to_handle: TypeIdentityRenaming<<V::Type as Type>::Identity>,
+    storage_to_handle: TypeIdentityRenaming<<V::Type as Type>::Identity>,
 
     /// Converts values from this handle's identities to the allocation's identities.
-    handle_to_root: TypeIdentityRenaming<<V::Type as Type>::Identity>,
+    handle_to_storage: TypeIdentityRenaming<<V::Type as Type>::Identity>,
 }
 
 /// Allocation shared by every handle in one reference alias family.
@@ -630,7 +631,7 @@ struct ReferenceHolder<V: Value> {
     /// Identity-renamed aliases may expose a different handle-local type and convert at this allocation boundary. The
     /// canonical type is immutable and available without locking so replacement validation does not need to acquire
     /// the lifecycle mutex.
-    root_type: V::Type,
+    referent_type: V::Type,
 
     /// Synchronized value and lifecycle state.
     state: Mutex<ReferenceState<V>>,
@@ -732,7 +733,7 @@ impl<V: Value> ReferenceGuard<'_, V> {
     pub fn snapshot(&self) -> Result<V, ReferenceError> {
         match &*self.state {
             ReferenceState::Ready { value, .. } | ReferenceState::Pending { value, .. } => value
-                .rename_type_identities(&self.reference.handle.root_to_handle)
+                .rename_type_identities(&self.reference.handle.storage_to_handle)
                 .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() }),
             ReferenceState::Frozen => Err(ReferenceError::Frozen),
             ReferenceState::Poisoned(reason) => Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() }),
