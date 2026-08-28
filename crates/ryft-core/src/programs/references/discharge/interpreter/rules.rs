@@ -12,6 +12,8 @@ use crate::programs::references::types::ReferenceType;
 
 use super::{ReferenceDischargeContext, ReferenceDischargeValue};
 
+// TODO(eaplatanios): Review this module.
+
 /// Replays one reference-free operation application verbatim over its rewritten operands.
 ///
 /// This is the shared rule body for every operation that touches no reference: it is the discharge counterpart of the

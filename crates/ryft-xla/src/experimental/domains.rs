@@ -3033,7 +3033,7 @@ impl<'c> XlaDomain<'c> {
                         }
                         let completion = ReferenceCompletion::joined(completions);
                         for guard in read_only_guard_storage.borrow_mut().iter_mut() {
-                            guard.publish_read_lease(completion.clone());
+                            guard.preserve_value_until(completion.clone());
                         }
                         let mut transactions = replacement_transactions.borrow_mut();
                         for (logical_output_index, prepared) in

@@ -1,5 +1,7 @@
 //! Generic consuming reference finalization operation and its value-level capability.
 
+// TODO(eaplatanios): Review this module.
+
 use std::borrow::Cow;
 use std::sync::LazyLock;
 

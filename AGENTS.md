@@ -119,6 +119,8 @@ update this file so that they do not need to remind you again in the future.
   `Type`, `Value`, `Typed`, `Parameter`, `Operation`, `LinearOperation`, `DifferentiableOperation`,
   `SupportsZero`, `SupportsOne`, `SupportsZeroLike`, `SupportsOneLike`, `SupportsNeg`, `SupportsAdd`, `SupportsSub`,
   `SupportsMul`, `SupportsDiv`, etc.
+- Place lifetime bounds before trait bounds within a bound list (e.g., `T: 'static + Send + Sync`, not
+  `T: Send + Sync + 'static`).
 - `Type` requires `Clone + Debug + Display + PartialEq + Parameter`, so a `T: Type` bound already implies all of those.
   Never write `T: Parameter + PartialEq + Type` (or any subset). Just write `T: Type`.
 - Do not add inherent type accessors that duplicate `Typed::r#type` (e.g., an inherent `r#type()` or `array_type()`

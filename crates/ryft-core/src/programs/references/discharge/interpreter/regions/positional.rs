@@ -11,6 +11,8 @@ use super::super::{ReferenceDischargeContext, ReferenceDischargeValue};
 use super::ReferenceRegionSummary;
 use super::boundaries::{ReferenceRegionDischargeBoundary, ReferenceRegionStateInsertion};
 
+// TODO(eaplatanios): Review this module.
+
 /// Rewrites one *positionally forwarding* region-carrying application so that the references its region closures
 /// touch become explicit immutable state.
 ///

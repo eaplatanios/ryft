@@ -5,6 +5,8 @@
 //! This facade retains only machinery genuinely shared by multiple primitives and re-exports the established public
 //! operation surface.
 
+// TODO(eaplatanios): Review this module.
+
 use crate::contexts::Domain;
 use crate::programs::ProgramError;
 use crate::programs::operations::Operation;

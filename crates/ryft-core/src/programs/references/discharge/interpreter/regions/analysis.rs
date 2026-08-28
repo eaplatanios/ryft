@@ -18,6 +18,8 @@ use super::super::{
 };
 use super::boundaries::ReferenceStateWidening;
 
+// TODO(eaplatanios): Review this module.
+
 /// Exact non-consuming access modes recorded for one caller allocation.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 struct ReferenceAccessModes {

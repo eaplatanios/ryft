@@ -9,6 +9,8 @@ use crate::tracing::TracingContext;
 
 use super::super::ReferenceAllocationHandle;
 
+// TODO(eaplatanios): Review this module.
+
 /// of the same program universe, which seals into a program the rule attaches to its rewritten operation.
 ///
 /// It is deliberately a fresh allocation trace rather than a nested trace of the live destination. A rebuilt region is a

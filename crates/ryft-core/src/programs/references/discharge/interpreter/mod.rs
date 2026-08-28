@@ -29,6 +29,8 @@ use super::policies::{ReferenceAccumulationPolicy, ReferenceDischargePolicy};
 use super::results::ReferenceSource;
 use super::selection::{ReferenceDischargeSelection, ReferenceDischargeSite};
 
+// TODO(eaplatanios): Review this module.
+
 /// Identity of one reference allocation inside a running reference discharge.
 ///
 /// Handles are minted by [`ReferenceDischargeContext`] as allocations enter its environment, so they are interpreter
