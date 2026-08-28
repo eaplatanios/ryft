@@ -603,48 +603,44 @@ impl<V: Value> Typed for Reference<V> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Immutable metadata for one [`Reference`] handle.
-///
-/// Exact clones share this metadata. An identity-renamed alias receives a new `ReferenceHandle` with its own referent
-/// type and conversion mappings while continuing to share the same [`ReferenceHolder`] and runtime state. The fields
-/// are never changed after construction.
+/// Immutable metadata for one [`Reference`] handle. Exact clones share this metadata. An identity-renamed alias
+/// receives a new [`ReferenceHandle`] with its own [`ReferenceType`] and conversion mappings while continuing to
+/// share the same [`ReferenceHolder`] and runtime state.
 struct ReferenceHandle<V: Value> {
     /// Shared allocation whose pointer identity defines reference equality, hashing, and [`ReferenceId`].
     holder: Arc<ReferenceHolder<V>>,
 
-    /// Referent type exposed through this handle.
+    /// [`ReferenceType`] exposed through this handle.
     r#type: ReferenceType<V::Type>,
 
-    /// Converts stored values from the allocation's identities to this handle's identities.
+    /// [`TypeIdentityRenaming`] that converts stored values from the allocation's identities to this
+    /// [`ReferenceHandle`]'s identities.
     storage_to_handle: TypeIdentityRenaming<<V::Type as Type>::Identity>,
 
-    /// Converts values from this handle's identities to the allocation's identities.
+    /// [`TypeIdentityRenaming`] that converts values from this [`ReferenceHandle`]'s identities to the allocation's
+    /// identities.
     handle_to_storage: TypeIdentityRenaming<<V::Type as Type>::Identity>,
 }
 
-/// Allocation shared by every handle in one reference alias family.
+/// Allocation shared by every handle in one [`Reference`] alias family.
 struct ReferenceHolder<V: Value> {
-    /// Canonical referent type of stored values.
-    ///
-    /// Identity-renamed aliases may expose a different handle-local type and convert at this allocation boundary. The
-    /// canonical type is immutable and available without locking so replacement validation does not need to acquire
-    /// the lifecycle mutex.
+    /// Canonical referent [`Type`] of stored values. Identity-renamed aliases may expose a different handle-local
+    /// type and convert at this allocation boundary. The canonical type is immutable and available without locking
+    /// so replacement validation does not need to acquire the lifecycle mutex.
     referent_type: V::Type,
 
     /// Synchronized value and lifecycle state.
     state: Mutex<ReferenceState<V>>,
 }
 
-/// Value and lifecycle state shared by one reference alias family.
+/// Value and lifecycle state shared by one [`Reference`] alias family.
 enum ReferenceState<V: Value> {
     /// Current value is available and the mutation that produced it has completed.
     Ready {
         /// Current immutable value in the allocation's canonical identity space.
         value: V,
 
-        /// Generation of `value`.
+        /// [`ReferenceGeneration`] of `value`.
         generation: ReferenceGeneration,
 
         /// Submitted read-only executions that may still be using `value`.
@@ -656,19 +652,19 @@ enum ReferenceState<V: Value> {
         /// Pending replacement in the allocation's canonical identity space.
         value: V,
 
-        /// Generation that installed `value`.
+        /// [`ReferenceGeneration`] that installed `value`.
         generation: ReferenceGeneration,
 
-        /// Completion of this generation and every predecessor on which it depends.
+        /// Completion of this [`ReferenceGeneration`] and every predecessor on which it depends.
         completion: ReferenceCompletion,
 
         /// Submitted read-only executions that may still be using `value`.
         read_leases: Vec<ReferenceCompletion>,
     },
 
-    /// A backend transaction has claimed the next generation but has not installed its replacement.
+    /// A backend transaction has claimed the next [`ReferenceGeneration`] but has not installed its replacement.
     Taken {
-        /// Generation claimed by the transaction.
+        /// [`ReferenceGeneration`] claimed by the transaction.
         generation: ReferenceGeneration,
     },
 
@@ -678,6 +674,8 @@ enum ReferenceState<V: Value> {
     /// Value was consumed by [`Reference::freeze`].
     Frozen,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Backend-facing exclusive access to one reference allocation.
 ///
