@@ -148,7 +148,19 @@ impl<V: Value> Reference<V> {
     }
 
     // TODO(eaplatanios): Review this function.
-    /// Returns a clone of the currently stored value, which is an immutable snapshot for a valid reference referent.
+    /// Returns an immutable snapshot of this reference's current value.
+    ///
+    /// If a submitted mutation is still pending, this method waits for its completion without holding the state mutex
+    /// and then reads the installed value. It does not wait for active read-only executions because they may safely
+    /// share the same immutable snapshot. For an identity-renamed alias, the returned value uses that alias's referent
+    /// type identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReferenceError::Frozen`] after the alias family has been consumed,
+    /// [`ReferenceError::ExecutionPoisoned`] after a submitted mutation fails, or [`ReferenceError::Poisoned`] after
+    /// unexpected mutex poisoning. It returns [`ReferenceError::ValueReconstruction`] if the stored value cannot be
+    /// converted to this alias's type identities.
     pub fn read(&self) -> Result<V, ReferenceError> {
         let state = self.lock_ready_state(false)?;
         let ReferenceState::Ready { value, .. } = &*state else {
@@ -160,30 +172,61 @@ impl<V: Value> Reference<V> {
     }
 
     // TODO(eaplatanios): Review this function.
-    /// Atomically replaces the stored value without reconstructing or returning the previous handle-local value.
+    /// Atomically replaces this reference's current value.
     ///
-    /// The replacement must have exactly the declared referent type. A rejected replacement leaves the reference
-    /// unchanged. Reference-state errors such as freezing, poisoning, or an active transaction take precedence over a
-    /// replacement-type error, because the reference must first admit the mutation before its replacement is validated.
+    /// This method first waits for pending mutations and active read-only executions to finish. It then verifies that
+    /// `replacement` exactly matches this alias's referent type, converts identity-renamed values to the shared storage
+    /// representation, installs the replacement, and advances the reference generation. The previous value is not
+    /// reconstructed or returned.
+    ///
+    /// Reference-state errors take precedence over replacement validation. Once the current value is ready, type
+    /// validation, identity conversion, and generation-exhaustion errors leave the stored value and generation
+    /// unchanged.
+    ///
+    /// # Parameters
+    ///
+    ///   - `replacement`: New value, expressed using this alias's referent type identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns the applicable lifecycle-state error if the reference cannot be mutated,
+    /// [`ReferenceError::ReferentTypeMismatch`] if `replacement` has the wrong type,
+    /// [`ReferenceError::ValueReconstruction`] if identity conversion fails, or
+    /// [`ReferenceError::GenerationExhausted`] if no next generation can be assigned.
     pub fn write(&self, replacement: V) -> Result<(), ReferenceError> {
         let mut state = self.lock_ready_state(true)?;
         let ReferenceState::Ready { value: current, generation, .. } = &mut *state else {
-            unreachable!("lock_ready_state yields only ready states")
+            unreachable!("`lock_ready_state` yields only ready states")
         };
         let stored_replacement = self.prepare_replacement(replacement)?;
         Self::commit_replacement(current, generation, stored_replacement)
     }
 
     // TODO(eaplatanios): Review this function.
-    /// Atomically replaces the stored value and returns the previous referent value.
+    /// Atomically replaces this reference's current value and returns its previous value.
     ///
-    /// The replacement must have exactly the declared referent type. A rejected replacement leaves the reference
-    /// unchanged. Reference-state errors such as freezing, poisoning, or an active transaction take precedence over a
-    /// replacement-type error, because the reference must first admit the mutation before its replacement is validated.
+    /// Like [`write`](Self::write), this method waits for pending mutations and active read-only executions, requires an
+    /// exact replacement type, converts identity-renamed values to and from shared storage, and advances the reference
+    /// generation. The returned snapshot uses this alias's referent type identities.
+    ///
+    /// Reference-state errors take precedence over replacement validation. Once the current value is ready, the
+    /// replacement, previous-value reconstruction, and next generation are all prepared before either the stored value
+    /// or generation is changed, so errors during those steps leave the reference unchanged.
+    ///
+    /// # Parameters
+    ///
+    ///   - `replacement`: New value, expressed using this alias's referent type identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns the applicable lifecycle-state error if the reference cannot be mutated,
+    /// [`ReferenceError::ReferentTypeMismatch`] if `replacement` has the wrong type,
+    /// [`ReferenceError::ValueReconstruction`] if either identity conversion fails, or
+    /// [`ReferenceError::GenerationExhausted`] if no next generation can be assigned.
     pub fn swap(&self, replacement: V) -> Result<V, ReferenceError> {
         let mut state = self.lock_ready_state(true)?;
         let ReferenceState::Ready { value: current, generation, .. } = &mut *state else {
-            unreachable!("lock_ready_state yields only ready states")
+            unreachable!("`lock_ready_state` yields only ready states")
         };
         let stored_replacement = self.prepare_replacement(replacement)?;
         let old = current
@@ -229,12 +272,21 @@ impl<V: Value> Reference<V> {
         Ok(result)
     }
 
-    // TODO(eaplatanios): Review this function.
-    /// Consumes this reference's current value and invalidates every handle in its alias family.
+    /// Returns this [`Reference`]'s current value and permanently invalidates its complete alias family. This method
+    /// waits for pending mutations and active read-only executions, converts the stored value to this alias's referent
+    /// type identities, and only then transitions the shared state to `Frozen`. After it succeeds, every alias reports
+    /// [`ReferenceError::Frozen`] on subsequent access. A failed value conversion leaves the reference unfrozen.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReferenceError::Frozen`] if the alias family was already consumed,
+    /// [`ReferenceError::ExecutionPoisoned`] after a submitted mutation fails, or [`ReferenceError::Poisoned`] after
+    /// unexpected mutex poisoning, and [`ReferenceError::ValueReconstruction`] if the stored value cannot be converted
+    /// to this alias's type identities.
     pub fn freeze(&self) -> Result<V, ReferenceError> {
         let mut state = self.lock_ready_state(true)?;
         let ReferenceState::Ready { value, .. } = &*state else {
-            unreachable!("lock_ready_state yields only ready states")
+            unreachable!("`lock_ready_state` yields only ready states")
         };
         let value = value
             .rename_type_identities(&self.handle.root_to_handle)
@@ -375,6 +427,8 @@ impl<V: Value> Reference<V> {
         &self,
         renaming: &TypeIdentityRenaming<<V::Type as Type>::Identity>,
     ) -> Result<Self, TypeError> {
+        // First, apply the requested current-to-renamed mapping to this alias's referent type. The remaining work
+        // derives the two complete value conversions needed to keep the new alias backed by the existing allocation.
         let current_type = self.handle.r#type.referent();
         let renamed_type = current_type.rename_identities(renaming)?;
 
@@ -395,19 +449,29 @@ impl<V: Value> Reference<V> {
             }
         }
 
+        // Derive the inverse step from the renamed referent back to the current referent. The explicit collision check
+        // above keeps errors for non-injective user mappings oriented from their source identities to their target.
         let inverse_step =
             V::Type::derive_identity_renaming(std::slice::from_ref(&renamed_type), std::slice::from_ref(current_type))?;
 
+        // Reads begin with values represented in the allocation's original identity space. Compose the existing
+        // root-to-current conversion with the requested current-to-renamed step to produce the new read conversion.
         let root_type = &self.handle.holder.root_type;
         let mut root_to_handle = TypeIdentityRenaming::new();
         for (_, identity) in root_type.identities() {
             root_to_handle.insert(identity.clone(), renaming.rename(&self.handle.root_to_handle.rename(identity)))?;
         }
+
+        // Writes travel in the opposite direction. Compose the renamed-to-current inverse with this alias's existing
+        // current-to-root conversion to produce the new write conversion.
         let mut handle_to_root = TypeIdentityRenaming::new();
         for (_, identity) in renamed_type.identities() {
             handle_to_root
                 .insert(identity.clone(), self.handle.handle_to_root.rename(&inverse_step.rename(identity)))?;
         }
+
+        // Check each complete conversion against its concrete endpoint types. This catches inconsistent identity
+        // implementations even when every individual mapping above was constructible.
         if root_type.rename_identities(&root_to_handle)? != renamed_type
             || renamed_type.rename_identities(&handle_to_root)? != *root_type
         {
@@ -416,6 +480,8 @@ impl<V: Value> Reference<V> {
             ));
         }
 
+        // Only alias-local type and conversion metadata is new. Sharing the existing allocation keeps the returned
+        // alias attached to the same mutable value and lifecycle state.
         Ok(Self {
             handle: Arc::new(ReferenceHandle {
                 holder: Arc::clone(&self.handle.holder),
