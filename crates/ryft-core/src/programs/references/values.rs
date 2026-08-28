@@ -689,24 +689,24 @@ enum ReferenceState<V: Value> {
 
 /// Backend-facing exclusive access to a [`Reference`] in observable `Ready` or `Pending` state. This guard acquires
 /// the reference mutex without waiting for pending backend work. It can capture a coherent [`ReferenceObservation`],
-/// publish a read lease, prepare an asynchronous replacement, or wait for the stricter [`ReadyReferenceGuard`] needed
-/// by synchronous extraction. Each function that creates a mandatory replacement obligation consumes this guard and
-/// returns a more specific owning type. The guard holds the mutex for its entire lifetime and cannot move to another
-/// thread.
+/// preserve the current value for a submitted read-only execution, prepare an asynchronous replacement, or wait for
+/// the stricter [`ReadyReferenceGuard`] needed by synchronous extraction. Each function that creates a mandatory
+/// replacement obligation consumes this guard and returns a more specific owning type. The guard holds the mutex for
+/// its entire lifetime and cannot move to another thread.
 ///
-/// An asynchronous read keeps the state `Ready` or `Pending` and publishes its completion as a read lease:
+/// An asynchronous read keeps the state `Ready` or `Pending` and records how long its snapshot must remain valid:
 ///
 /// ```mermaid
 /// flowchart LR
 ///   state["Ready or Pending"] -->|observe| observation["ReferenceObservation"]
 ///   observation --> submission["Submit backend read"]
 ///   submission -->|use snapshot after dependency| execution["Backend execution"]
-///   submission -->|publish completion as read lease| state
+///   submission -->|preserve value until completion| state
 /// ```
 ///
-/// [`Self::publish_read_lease`] is infallible because this guard can protect only observable state. Before a later
-/// mutation removes the value, [`Self::prepare_replacement`] prunes completed leases and returns every lease that may
-/// still be reading the snapshot.
+/// [`Self::preserve_value_until`] is infallible because this guard can protect only observable state. Before a later
+/// mutation removes the value, [`Self::prepare_replacement`] prunes completed read records and returns every completion
+/// for an execution that may still be reading the snapshot.
 ///
 /// An asynchronous mutation first observes the value and prepares backend work. It then reacquires the guard and
 /// verifies that the observed generation is still current before submitting that work:
@@ -756,14 +756,10 @@ pub struct ReadyOrPendingReferenceGuard<'g, V: Value> {
     guard: ReferenceGuard<'g, V>,
 }
 
-// TODO(eaplatanios): Review this block.
 impl<'g, V: Value> ReadyOrPendingReferenceGuard<'g, V> {
-    // Observation and retry coordination.
-
-    /// Observes the reference's value, generation, and pending dependency without waiting for backend work.
-    ///
-    /// In `Ready` or `Pending` state, this function converts the stored value to this handle's type identities and
-    /// returns all three fields as one coherent [`ReferenceObservation`]. A `Pending` value is returned immediately
+    /// Observes the underlying [`Reference`]'s value, generation, and pending dependency without waiting for backend
+    /// work. In `Ready` or `Pending` state, this function converts the stored value to this handle's type identities
+    /// and returns all three fields as one coherent [`ReferenceObservation`]. A `Pending` value is returned immediately
     /// together with the cumulative dependency that backend work must wait for before using it. After preparing work
     /// and reacquiring the guard, use [`ReferenceObservation::is_current`] to determine whether the observed value is
     /// still the one stored by this reference.
@@ -792,68 +788,66 @@ impl<'g, V: Value> ReadyOrPendingReferenceGuard<'g, V> {
         })
     }
 
-    /// Removes completed read leases and returns the leases for executions that may still be reading the value.
+    /// Preserves the current value until a submitted read-only execution completes. The caller must retain this guard
+    /// after confirming that its [`ReferenceObservation`] is current and through backend submission, then call this
+    /// function before releasing the guard. `completion` must cover the submitted read and, when the snapshot came from
+    /// `Pending` state, that snapshot's prior dependency. This function returns immediately and does not keep the mutex
+    /// locked. Instead, later attempts to take, replace, or freeze the value wait until `completion` resolves.
+    /// Completed read records are removed first so a reference used only for reads does not retain backend
+    /// resources indefinitely.
     ///
-    /// Both successful and failed completed leases are removed because neither can still access the value. The returned
-    /// tokens can be awaited before restarting an asynchronous mutation attempt.
-    fn active_read_leases(&mut self) -> Vec<ReferenceCompletion> {
+    /// # Parameters
+    ///
+    ///   - `completion`: [`ReferenceCompletion`] for the submitted read-only execution and its prior dependency.
+    pub fn preserve_value_until(&mut self, completion: ReferenceCompletion) {
+        match &mut *self.guard.state {
+            ReferenceState::Ready { read_leases, .. } | ReferenceState::Pending { read_leases, .. } => {
+                // Preserving the value may be the only lifecycle update made for a read-only reference.
+                // Prune completed executions here so they cannot accumulate when no mutation path runs.
+                read_leases.retain(|lease| matches!(lease.is_ready(), Ok(false)));
+                read_leases.push(completion);
+            }
+            ReferenceState::Frozen | ReferenceState::Poisoned(_) | ReferenceState::Taken { .. } => {
+                unreachable!("`ReadyOrPendingReferenceGuard` protects only `Ready` or `Pending` state")
+            }
+        }
+    }
+
+    /// Consumes this [`ReadyOrPendingReferenceGuard`] and prepares its value for asynchronous replacement. Completed
+    /// read leases are removed first. If submitted readers may still be using the value, the guard is released and
+    /// their completion tokens are returned in [`ReferenceReplacementPreparation::Waiting`]. Otherwise,
+    /// the next [`ReferenceGeneration`] is computed and returned with the still-locked guard in
+    /// [`ReferenceReplacementPreparation::Prepared`]. Apart from pruning completed read leases, the stored value,
+    /// lifecycle variant, and generation do not change until [`PreparedReferenceReplacement::begin`] records a
+    /// successful backend submission.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReferenceError::GenerationExhausted`] when the current generation has no successor.
+    pub fn prepare_replacement(mut self) -> Result<ReferenceReplacementPreparation<'g, V>, ReferenceError> {
+        // Both states protected by this typestate store every submitted execution that may still be reading the current
+        // value. Other lifecycle states cannot be reached while this guard exists.
         let read_leases = match &mut *self.guard.state {
             ReferenceState::Ready { read_leases, .. } | ReferenceState::Pending { read_leases, .. } => read_leases,
             ReferenceState::Frozen | ReferenceState::Poisoned(_) | ReferenceState::Taken { .. } => {
                 unreachable!("`ReadyOrPendingReferenceGuard` protects only `Ready` or `Pending` state")
             }
         };
-        // A terminal failure matters to the invocation that submitted the lease, but it no longer pins this reference's
-        // value. Retain only executions that can still be reading the snapshot.
+
+        // A terminal lease can no longer access the value, regardless of whether it succeeded or failed. Remove those
+        // leases so they do not retain backend resources or unnecessarily delay replacement.
         read_leases.retain(|lease| matches!(lease.is_ready(), Ok(false)));
-        read_leases.clone()
-    }
 
-    // Asynchronous read publication.
-
-    /// Records a submitted read-only execution while retaining the observable reference guard.
-    ///
-    /// The caller must retain this guard after confirming that its [`ReferenceObservation`] is current and through
-    /// backend submission. `lease` must cover the submitted read and, when the snapshot came from `Pending` state, that
-    /// snapshot's prior dependency. It must remain pending for as long as the execution may access the snapshot.
-    /// Completed leases are removed before the new lease is recorded so a reference used only for reads does not retain
-    /// backend resources indefinitely.
-    ///
-    /// # Parameters
-    ///
-    ///   - `lease`: Completion token for the submitted read-only execution.
-    pub fn publish_read_lease(&mut self, lease: ReferenceCompletion) {
-        match &mut *self.guard.state {
-            ReferenceState::Ready { read_leases, .. } | ReferenceState::Pending { read_leases, .. } => {
-                // Publication is the only lifecycle update guaranteed for a read-only reference. Pruning here keeps
-                // completed executions from accumulating when no mutation path runs.
-                read_leases.retain(|lease| matches!(lease.is_ready(), Ok(false)));
-                read_leases.push(lease);
-            }
-            ReferenceState::Frozen | ReferenceState::Poisoned(_) | ReferenceState::Taken { .. } => {
-                unreachable!("`ReadyOrPendingReferenceGuard` protects only `Ready` or `Pending` state")
-            }
-        }
-    }
-
-    // Asynchronous replacement transactions.
-
-    /// Consumes this guard and prepares its value for asynchronous replacement.
-    ///
-    /// Completed read leases are removed first. If submitted readers may still be using the value, the guard is
-    /// released and their completion tokens are returned in [`ReferenceReplacementPreparation::Waiting`]. Otherwise,
-    /// the next generation is computed and returned with the still-locked guard in
-    /// [`ReferenceReplacementPreparation::Prepared`]. The reference state does not change until
-    /// [`PreparedReferenceReplacement::begin`] records successful backend submission.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ReferenceError::GenerationExhausted`] when the current generation has no successor.
-    pub fn prepare_replacement(mut self) -> Result<ReferenceReplacementPreparation<'g, V>, ReferenceError> {
-        let read_leases = self.active_read_leases();
+        // Replacing the value while a submitted reader may still access it would invalidate that reader's snapshot.
+        // Return cloned completion tokens for the caller to await; consuming `self` releases the mutex while it waits,
+        // while the originals remain recorded until a later attempt observes that they are terminal and prunes them.
         if !read_leases.is_empty() {
-            return Ok(ReferenceReplacementPreparation::Waiting(read_leases));
+            return Ok(ReferenceReplacementPreparation::Waiting(read_leases.clone()));
         }
+
+        // Compute the generation that the replacement will receive before backend submission, but leave the lifecycle
+        // variant and current generation unchanged until `PreparedReferenceReplacement::begin` records successful
+        // submission.
         let generation = match &*self.guard.state {
             ReferenceState::Ready { generation, .. } | ReferenceState::Pending { generation, .. } => {
                 generation.next().ok_or(ReferenceError::GenerationExhausted)?
@@ -862,6 +856,9 @@ impl<'g, V: Value> ReadyOrPendingReferenceGuard<'g, V> {
                 unreachable!("`ReadyOrPendingReferenceGuard` protects only `Ready` or `Pending` state")
             }
         };
+
+        // Retain the lock across backend submission so no other access can invalidate the checked prerequisites
+        // or the generation selected above before the caller begins the replacement transaction.
         Ok(ReferenceReplacementPreparation::Prepared(PreparedReferenceReplacement { guard: self, generation }))
     }
 
@@ -873,7 +870,6 @@ impl<'g, V: Value> ReadyOrPendingReferenceGuard<'g, V> {
     /// # Errors
     ///
     /// Returns the applicable terminal lifecycle error, unexpected mutex poisoning, or a failed pending completion.
-    #[inline]
     pub fn wait_until_ready(self) -> Result<ReadyReferenceGuard<'g, V>, ReferenceError> {
         let reference = self.guard.reference;
 
@@ -1973,7 +1969,7 @@ mod tests {
     fn test_ready_or_pending_reference_guard_prepare_replacement_prunes_terminal_read_leases() {
         let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
         let mut guard = reference.lock().unwrap();
-        guard.publish_read_lease(ReferenceCompletion::ready(Ok(())));
+        guard.preserve_value_until(ReferenceCompletion::ready(Ok(())));
         let ReferenceReplacementPreparation::Prepared(prepared) = guard.prepare_replacement().unwrap() else {
             panic!("completed read lease unexpectedly blocked replacement preparation")
         };
@@ -2066,7 +2062,7 @@ mod tests {
         let reference = Arc::new(Reference::new(Array::scalar(1.0_f32)).unwrap());
         let lease = ControlledCompletion::new();
         let mut guard = reference.lock().unwrap();
-        guard.publish_read_lease(ReferenceCompletion::new(lease.clone()));
+        guard.preserve_value_until(ReferenceCompletion::new(lease.clone()));
         drop(guard);
 
         let (sender, receiver) = channel();
@@ -2090,7 +2086,7 @@ mod tests {
         let reference = Arc::new(Reference::new(Array::scalar(1.0_f32)).unwrap());
         let lease = ControlledCompletion::new();
         let mut guard = reference.lock().unwrap();
-        guard.publish_read_lease(ReferenceCompletion::new(lease.clone()));
+        guard.preserve_value_until(ReferenceCompletion::new(lease.clone()));
         drop(guard);
 
         // A leased snapshot pins the current value, so the replacement cannot be committed until the lease completes.
@@ -2115,7 +2111,7 @@ mod tests {
         let reference = Arc::new(Reference::new(Array::scalar(1.0_f32)).unwrap());
         let lease = ControlledCompletion::new();
         let mut guard = reference.lock().unwrap();
-        guard.publish_read_lease(ReferenceCompletion::new(lease.clone()));
+        guard.preserve_value_until(ReferenceCompletion::new(lease.clone()));
         drop(guard);
 
         // Consumption is a mutation of the alias family, so it waits for the same leases a replacement would.
@@ -2153,7 +2149,7 @@ mod tests {
         let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
         let lease = ControlledCompletion::new();
         let mut guard = reference.lock().unwrap();
-        guard.publish_read_lease(ReferenceCompletion::new(lease.clone()));
+        guard.preserve_value_until(ReferenceCompletion::new(lease.clone()));
 
         // Preparing a mutation releases the mutex and returns every execution that can still read the current value.
         // The caller waits for those leases before restarting observation and replacement preparation.
@@ -2189,7 +2185,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ready_or_pending_reference_guard_read_lease_publication_releases_terminal_leases() {
+    fn test_ready_or_pending_reference_guard_preserve_value_until_releases_terminal_read_leases() {
         let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
         let first = ControlledCompletion::new();
         let second = ControlledCompletion::new();
@@ -2197,15 +2193,15 @@ mod tests {
         first.complete(Ok(()));
         second.complete(Err("read failed".into()));
 
-        // Lease publication is the only lifecycle update guaranteed for a read-only reference, so it must also release
+        // Preserving the value may be the only lifecycle update made for a read-only reference, so it must also release
         // terminal leases instead of retaining their backend resources indefinitely. The strong counts make those
         // releases observable here.
         let mut guard = reference.lock().unwrap();
-        guard.publish_read_lease(ReferenceCompletion::new(first.clone()));
-        guard.publish_read_lease(ReferenceCompletion::new(second.clone()));
+        guard.preserve_value_until(ReferenceCompletion::new(first.clone()));
+        guard.preserve_value_until(ReferenceCompletion::new(second.clone()));
         assert_eq!(Arc::strong_count(&first.state), 1);
         assert_eq!(Arc::strong_count(&second.state), 2);
-        guard.publish_read_lease(ReferenceCompletion::new(third.clone()));
+        guard.preserve_value_until(ReferenceCompletion::new(third.clone()));
         assert_eq!(Arc::strong_count(&second.state), 1);
         assert_eq!(Arc::strong_count(&third.state), 2);
 
