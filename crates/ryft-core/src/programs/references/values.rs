@@ -143,7 +143,7 @@ impl<V: Value> Reference<V> {
     /// state without type-identity renaming. A handle produced by [`Self::rename_type_identities`] still refers to the
     /// same reference allocation but returns `false` when that operation changes any identity.
     #[inline]
-    pub fn uses_root_type_identities(&self) -> bool {
+    pub fn uses_storage_type_identities(&self) -> bool {
         self.handle.storage_to_handle.is_identity() && self.handle.handle_to_storage.is_identity()
     }
 
@@ -714,9 +714,9 @@ enum ReferenceState<V: Value> {
 ///   taken -->|poison or guard drop| poisoned
 /// ```
 ///
-/// [`Self::next_generation`] validates the mutation before submission, while [`Self::begin_replacement`] marks the
-/// value unavailable only after submission succeeds and returns a [`ReferenceReplacementTransaction`]. The backend
-/// then validates every transaction with its replacement value. Each successful validation returns a
+/// [`Self::next_replacement_generation`] validates the mutation before submission, while [`Self::begin_replacement`]
+/// marks the value unavailable only after submission succeeds and returns a [`ReferenceReplacementTransaction`]. The
+/// backend then validates every transaction with its replacement value. Each successful validation returns a
 /// [`ValidatedPendingReplacementTransaction`] that exclusively borrows its guard. Only after every replacement
 /// validates does the backend commit those transactions. This validate-all/commit-all split prevents a malformed
 /// multi-reference result from being committed partially. Guards for multiple references must be acquired and retained
@@ -752,8 +752,8 @@ impl<V: Value> ReferenceGuard<'_, V> {
     ///
     /// The value is converted to this handle's type identities. A `Pending` value is returned immediately together with
     /// the cumulative dependency that must precede backend use of that value; this function never waits for backend
-    /// work. Use [`Self::is_current`] after reacquiring the reference to determine whether work prepared from the
-    /// observation may still be submitted.
+    /// work. Use [`ReferenceObservation::is_current`] after reacquiring the reference to determine whether work
+    /// prepared from the observation may still be submitted.
     ///
     /// # Errors
     ///
@@ -779,30 +779,6 @@ impl<V: Value> ReferenceGuard<'_, V> {
             snapshot,
             dependency,
         })
-    }
-
-    /// Returns whether `observation` still describes the value protected by this guard.
-    ///
-    /// An observation is current for any handle backed by the same reference allocation while that allocation remains
-    /// at the same generation. This includes identity-renamed aliases because the observation owns its already-converted
-    /// snapshot. A `Pending` value may become `Ready` without changing its generation; the observation remains valid in
-    /// that case and its captured dependency is simply already complete. This function returns `false` for another
-    /// allocation or generation instead of treating an optimistic retry as an error.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ReferenceError::Frozen`] for `Frozen` state, [`ReferenceError::ExecutionPoisoned`] for `Poisoned`
-    /// state, or [`ReferenceError::TransactionInProgress`] for `Taken` state.
-    pub fn is_current(&self, observation: &ReferenceObservation<V>) -> Result<bool, ReferenceError> {
-        match &*self.state {
-            ReferenceState::Ready { generation, .. } | ReferenceState::Pending { generation, .. } => {
-                Ok(std::ptr::eq(observation.holder.as_ptr(), Arc::as_ptr(&self.reference.handle.holder))
-                    && *generation == observation.generation)
-            }
-            ReferenceState::Frozen => Err(ReferenceError::Frozen),
-            ReferenceState::Poisoned(reason) => Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() }),
-            ReferenceState::Taken { .. } => Err(ReferenceError::TransactionInProgress),
-        }
     }
 
     /// Prunes completed read leases and returns clones of those that remain pending.
@@ -874,7 +850,7 @@ impl<V: Value> ReferenceGuard<'_, V> {
     /// Returns [`ReferenceError::TransactionInProgress`] while a read lease is recorded or the state is `Taken`, the
     /// applicable terminal-state error for `Frozen` or `Poisoned`, or [`ReferenceError::GenerationExhausted`] when the
     /// current generation has no successor.
-    pub fn next_generation(&self) -> Result<ReferenceGeneration, ReferenceError> {
+    pub fn next_replacement_generation(&self) -> Result<ReferenceGeneration, ReferenceError> {
         let generation = match &*self.state {
             ReferenceState::Ready { generation, read_leases, .. } => {
                 if !read_leases.is_empty() {
@@ -899,8 +875,8 @@ impl<V: Value> ReferenceGuard<'_, V> {
 
     /// Starts the replacement transaction for a successfully submitted asynchronous mutation.
     ///
-    /// The caller must first obtain `generation` from [`Self::next_generation`] under this same guard. This transition
-    /// makes the previous value unavailable while the backend reconstructs its replacement. The returned
+    /// The caller must first obtain `generation` from [`Self::next_replacement_generation`] under this same guard. This
+    /// transition makes the previous value unavailable while the backend reconstructs its replacement. The returned
     /// [`ReferenceReplacementTransaction`] binds this allocation and generation to `completion`, so later code cannot
     /// accidentally commit the replacement with a different dependency. The caller must retain the guard on the
     /// submitting thread until the transaction commits a replacement or [`Self::poison`] records a failure; dropping
@@ -908,14 +884,14 @@ impl<V: Value> ReferenceGuard<'_, V> {
     ///
     /// # Parameters
     ///
-    ///   - `generation`: Generation returned by the immediately preceding [`Self::next_generation`] call.
+    ///   - `generation`: Generation returned by the immediately preceding [`Self::next_replacement_generation`] call.
     ///   - `completion`: Cumulative completion of the submitted mutation and all of its predecessor dependencies.
     pub fn begin_replacement(
         &mut self,
         generation: ReferenceGeneration,
         completion: ReferenceCompletion,
     ) -> ReferenceReplacementTransaction<V> {
-        debug_assert_eq!(self.next_generation(), Ok(generation));
+        debug_assert_eq!(self.next_replacement_generation(), Ok(generation));
         *self.state = ReferenceState::Taken { generation };
         ReferenceReplacementTransaction {
             holder: Arc::downgrade(&self.reference.handle.holder),
@@ -1008,8 +984,8 @@ impl<V: Value> Drop for ReferenceGuard<'_, V> {
 /// Represents a coherent observation of a [`Reference`] value and the work that must precede its use.
 /// [`ReferenceGuard::observe`] captures the handle-local value, its [`ReferenceGeneration`], and its optional
 /// [`ReferenceCompletion`] under one lock. A backend can prepare work from [`Self::snapshot`], reacquire any handle for
-/// the same reference allocation, and use [`ReferenceGuard::is_current`] to verify that the observation is still valid.
-/// When [`Self::dependency`] is present, submitted work must wait for it before accessing the snapshot.
+/// the same reference allocation, and use [`Self::is_current`] to verify that the observation is still valid. When
+/// [`Self::dependency`] is present, submitted work must wait for it before accessing the snapshot.
 pub struct ReferenceObservation<V: Value> {
     /// [`Reference`] allocation from which this observation was created. Keeping its weak control block alive prevents
     /// a later allocation from reusing the same address while this observation exists.
@@ -1044,6 +1020,34 @@ impl<V: Value> ReferenceObservation<V> {
     #[inline]
     pub fn dependency(&self) -> Option<&ReferenceCompletion> {
         self.dependency.as_ref()
+    }
+
+    /// Returns `true` if this [`ReferenceObservation`] still describes the value protected by `guard` and `false`
+    /// otherwise. An observation is current for any handle backed by the same reference allocation while that
+    /// allocation remains at the same generation. This includes identity-renamed aliases because the observation owns
+    /// its already-converted snapshot. A `Pending` value may become `Ready` without changing its generation; the
+    /// observation remains valid in that case and its captured dependency is simply already complete. This function
+    /// returns `false` for another allocation or generation instead of treating an optimistic retry as an error.
+    ///
+    /// # Parameters
+    ///
+    ///   - `guard`: Guard protecting the reference state against which this observation is checked.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReferenceError::Frozen`] for `Frozen` state, [`ReferenceError::ExecutionPoisoned`] for `Poisoned`
+    /// state, and [`ReferenceError::TransactionInProgress`] for `Taken` state.
+    #[inline]
+    pub fn is_current(&self, guard: &ReferenceGuard<'_, V>) -> Result<bool, ReferenceError> {
+        match &*guard.state {
+            ReferenceState::Ready { generation, .. } | ReferenceState::Pending { generation, .. } => {
+                Ok(std::ptr::eq(self.holder.as_ptr(), Arc::as_ptr(&guard.reference.handle.holder))
+                    && *generation == self.generation)
+            }
+            ReferenceState::Frozen => Err(ReferenceError::Frozen),
+            ReferenceState::Poisoned(reason) => Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() }),
+            ReferenceState::Taken { .. } => Err(ReferenceError::TransactionInProgress),
+        }
     }
 }
 
@@ -1339,7 +1343,7 @@ mod tests {
         completion: ReferenceCompletion,
         replacement: V,
     ) -> Result<ReferenceGeneration, ReferenceError> {
-        let generation = guard.next_generation()?;
+        let generation = guard.next_replacement_generation()?;
         let transaction = guard.begin_replacement(generation, completion);
         transaction.validate(guard, replacement)?.commit();
         Ok(generation)
@@ -1424,8 +1428,8 @@ mod tests {
         assert_eq!(reference.read(), Ok(Array::vector(vec![1.0_f32, 2.0])));
         assert_eq!(reference.r#type(), alias.r#type());
         assert_eq!(reference.r#type(), distinct.r#type());
-        assert!(reference.uses_root_type_identities());
-        assert!(alias.uses_root_type_identities());
+        assert!(reference.uses_storage_type_identities());
+        assert!(alias.uses_storage_type_identities());
 
         // Display is deterministic and type-based, while Debug also exposes process-local allocation identity.
         assert_eq!(reference.to_string(), "ref<f32[2]>");
@@ -1518,12 +1522,12 @@ mod tests {
 
         assert_eq!(reference.read(), Ok(Array::scalar(1.0_f32)));
         assert_eq!(reference.lock().unwrap().observe().unwrap().generation(), initial_generation);
-        assert!(reference.lock().unwrap().is_current(&initial_observation).unwrap());
+        assert!(initial_observation.is_current(&reference.lock().unwrap()).unwrap());
 
         assert_eq!(reference.swap(Array::scalar(2.0_f32)), Ok(Array::scalar(1.0_f32)));
         let swapped_generation = reference.lock().unwrap().observe().unwrap().generation();
         assert_eq!(swapped_generation, ReferenceGeneration(initial_generation.0 + 1));
-        assert!(!reference.lock().unwrap().is_current(&initial_observation).unwrap());
+        assert!(!initial_observation.is_current(&reference.lock().unwrap()).unwrap());
 
         assert_eq!(reference.write(Array::scalar(3.0_f32)), Ok(()));
         let written_generation = reference.lock().unwrap().observe().unwrap().generation();
@@ -1551,7 +1555,7 @@ mod tests {
 
         assert_eq!(reference.write(Array::scalar(2.0_f32)), Err(ReferenceError::GenerationExhausted));
         let mut guard = reference.lock().unwrap();
-        assert_eq!(guard.next_generation(), Err(ReferenceError::GenerationExhausted));
+        assert_eq!(guard.next_replacement_generation(), Err(ReferenceError::GenerationExhausted));
         assert_eq!(guard.take(), Err(ReferenceError::GenerationExhausted));
         let observation = guard.observe().unwrap();
         assert_eq!(observation.generation(), ReferenceGeneration(u64::MAX));
@@ -1649,10 +1653,10 @@ mod tests {
 
         // Renaming creates distinct handle-local type and identity metadata over the same allocation. Equality and
         // hashing follow allocation identity rather than alias-local metadata.
-        assert!(reference.uses_root_type_identities());
-        assert!(no_op.uses_root_type_identities());
-        assert!(!renamed.uses_root_type_identities());
-        assert!(!chained.uses_root_type_identities());
+        assert!(reference.uses_storage_type_identities());
+        assert!(no_op.uses_storage_type_identities());
+        assert!(!renamed.uses_storage_type_identities());
+        assert!(!chained.uses_storage_type_identities());
         assert!(!Arc::ptr_eq(&renamed.handle, &reference.handle));
         assert!(Arc::ptr_eq(&renamed.handle.holder, &reference.handle.holder));
         assert_eq!(renamed, reference);
@@ -1666,9 +1670,9 @@ mod tests {
         // identities and therefore needs no reinterpretation through the validating alias.
         let observation = reference.lock().unwrap().observe().unwrap();
         let unrelated = Reference::new(CaptureReference::new(0, source_type.clone())).unwrap();
-        assert!(reference.lock().unwrap().is_current(&observation).unwrap());
-        assert!(renamed.lock().unwrap().is_current(&observation).unwrap());
-        assert!(!unrelated.lock().unwrap().is_current(&observation).unwrap());
+        assert!(observation.is_current(&reference.lock().unwrap()).unwrap());
+        assert!(observation.is_current(&renamed.lock().unwrap()).unwrap());
+        assert!(!observation.is_current(&unrelated.lock().unwrap()).unwrap());
 
         assert_eq!(chained.write(CaptureReference::new(1, target_type.clone())), Ok(()));
         assert_eq!(reference.read(), Ok(CaptureReference::new(1, source_type.clone())));
@@ -1683,7 +1687,7 @@ mod tests {
         assert_eq!(reference.read(), Ok(CaptureReference::new(2, source_type.clone())));
 
         let mut guard = renamed.lock().unwrap();
-        let generation = guard.next_generation().unwrap();
+        let generation = guard.next_replacement_generation().unwrap();
         let transaction = guard.begin_replacement(generation, ReferenceCompletion::ready(Ok(())));
         transaction.validate(&mut guard, CaptureReference::new(3, middle_type)).unwrap().commit();
         drop(guard);
@@ -1720,14 +1724,14 @@ mod tests {
 
         assert_eq!(guard.take(), Ok(Array::scalar(1.0_f32)));
         assert!(matches!(guard.observe(), Err(ReferenceError::TransactionInProgress)));
-        assert_eq!(guard.is_current(&unrelated_observation), Err(ReferenceError::TransactionInProgress));
+        assert_eq!(unrelated_observation.is_current(&guard), Err(ReferenceError::TransactionInProgress));
         guard.poison("injected failure");
         assert!(matches!(
             guard.observe(),
             Err(ReferenceError::ExecutionPoisoned { reason }) if reason == "injected failure",
         ));
         assert_eq!(
-            guard.is_current(&unrelated_observation),
+            unrelated_observation.is_current(&guard),
             Err(ReferenceError::ExecutionPoisoned { reason: "injected failure".to_string() }),
         );
     }
@@ -1765,7 +1769,7 @@ mod tests {
         let second = Reference::new(Array::scalar(2.0_f32)).unwrap();
         let mut first_guard = first.lock().unwrap();
         let mut second_guard = second.lock().unwrap();
-        let generation = first_guard.next_generation().unwrap();
+        let generation = first_guard.next_replacement_generation().unwrap();
         let transaction = first_guard.begin_replacement(generation, ReferenceCompletion::ready(Ok(())));
 
         assert!(matches!(
@@ -1782,7 +1786,7 @@ mod tests {
     fn test_reference_replacement_transaction_reports_terminal_state_during_validation() {
         let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
         let mut guard = reference.lock().unwrap();
-        let generation = guard.next_generation().unwrap();
+        let generation = guard.next_replacement_generation().unwrap();
         let transaction = guard.begin_replacement(generation, ReferenceCompletion::ready(Ok(())));
         guard.poison("injected failure");
 
@@ -1796,7 +1800,7 @@ mod tests {
     fn test_reference_replacement_transaction_preserves_taken_state_after_type_mismatch() {
         let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
         let mut guard = reference.lock().unwrap();
-        let generation = guard.next_generation().unwrap();
+        let generation = guard.next_replacement_generation().unwrap();
         let transaction = guard.begin_replacement(generation, ReferenceCompletion::ready(Ok(())));
 
         assert!(matches!(
@@ -1866,7 +1870,7 @@ mod tests {
         assert!(
             catch_unwind(AssertUnwindSafe(|| {
                 let mut guard = reference.lock().unwrap();
-                let generation = guard.next_generation().unwrap();
+                let generation = guard.next_replacement_generation().unwrap();
                 let _transaction = guard.begin_replacement(generation, ReferenceCompletion::ready(Ok(())));
                 panic!("injected backend unwind");
             }))
@@ -1881,14 +1885,14 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_guard_next_generation_requires_terminal_read_leases_to_be_pruned() {
+    fn test_reference_guard_next_replacement_generation_requires_terminal_read_leases_to_be_pruned() {
         let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
         let mut guard = reference.lock().unwrap();
         guard.validate_read_lease_publication().unwrap();
         guard.publish_read_lease_unchecked(ReferenceCompletion::ready(Ok(())));
-        assert_eq!(guard.next_generation(), Err(ReferenceError::TransactionInProgress));
+        assert_eq!(guard.next_replacement_generation(), Err(ReferenceError::TransactionInProgress));
         assert!(guard.active_read_leases().is_empty());
-        let generation = guard.next_generation().unwrap();
+        let generation = guard.next_replacement_generation().unwrap();
         let _transaction = guard.begin_replacement(generation, ReferenceCompletion::ready(Ok(())));
         guard.poison("test cleanup");
     }
@@ -1921,7 +1925,7 @@ mod tests {
         // Applying the successful completion made the shared value ready without changing its generation. The pending
         // observation remains current, while a new observation no longer carries the completed dependency.
         let guard = reference.lock().unwrap();
-        assert!(guard.is_current(&pending_observation).unwrap());
+        assert!(pending_observation.is_current(&guard).unwrap());
         assert!(guard.observe().unwrap().dependency().is_none());
         drop(guard);
         assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32)));
@@ -2053,7 +2057,7 @@ mod tests {
         let mut guard = reference.lock().unwrap();
         let first =
             transition_to_pending(&mut guard, ReferenceCompletion::ready(Ok(())), Array::scalar(2.0_f32)).unwrap();
-        let second = guard.next_generation().unwrap();
+        let second = guard.next_replacement_generation().unwrap();
         let transaction = guard.begin_replacement(second, ReferenceCompletion::ready(Ok(())));
         transaction.validate(&mut guard, Array::scalar(3.0_f32)).unwrap().commit();
         assert_eq!(first.next(), Some(second));
@@ -2160,11 +2164,11 @@ mod tests {
 
         // Only the running lease remains. It blocks the next submitted mutation until completion and pruning.
         assert_eq!(guard.active_read_leases().len(), 1);
-        assert_eq!(guard.next_generation(), Err(ReferenceError::TransactionInProgress));
+        assert_eq!(guard.next_replacement_generation(), Err(ReferenceError::TransactionInProgress));
         third.complete(Ok(()));
         assert!(guard.active_read_leases().is_empty());
         assert_eq!(Arc::strong_count(&third.state), 1);
-        assert_eq!(guard.next_generation(), Ok(ReferenceGeneration(1)));
+        assert_eq!(guard.next_replacement_generation(), Ok(ReferenceGeneration(1)));
     }
 
     #[test]
