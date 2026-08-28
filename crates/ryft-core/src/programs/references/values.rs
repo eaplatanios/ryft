@@ -988,24 +988,8 @@ impl<'g, V: Value> TakenReferenceGuard<'g, V> {
         debug_assert!(matches!(*guard.state, ReferenceState::Taken { .. }));
         *guard.state = ReferenceState::Poisoned(reason.into());
     }
-
-    /// Stores an asynchronous replacement and changes the reference from `Taken` to `Pending`.
-    #[inline]
-    fn commit_pending(mut self, value: V, completion: ReferenceCompletion) -> ReadyOrPendingReferenceGuard<'g, V> {
-        let guard = self.guard.as_mut().unwrap();
-        let generation = match *guard.state {
-            ReferenceState::Taken { generation } => generation,
-            ReferenceState::Ready { .. }
-            | ReferenceState::Pending { .. }
-            | ReferenceState::Poisoned(_)
-            | ReferenceState::Frozen => unreachable!("`TakenReferenceGuard` protects only taken reference state"),
-        };
-        *guard.state = ReferenceState::Pending { value, generation, completion, read_leases: Vec::new() };
-        ReadyOrPendingReferenceGuard { guard: self.guard.take().unwrap() }
-    }
 }
 
-// TODO(eaplatanios): Review this block.
 impl<V: Value> Drop for TakenReferenceGuard<'_, V> {
     #[inline]
     fn drop(&mut self) {
@@ -1013,8 +997,8 @@ impl<V: Value> Drop for TakenReferenceGuard<'_, V> {
             return;
         };
         if matches!(*guard.state, ReferenceState::Taken { .. }) {
-            // No value remains in `Taken`, and the previous value may already have been consumed by irreversible
-            // backend work. Make an abandoned replacement obligation a permanent, explicit failure.
+            // No value remains in the `Taken` state, and the previous value may already have been consumed by
+            // irreversible backend work. Make an abandoned replacement obligation a permanent, explicit failure.
             *guard.state = ReferenceState::Poisoned("stateful transaction ended without restoring state".into());
         }
     }
@@ -1373,13 +1357,27 @@ pub struct ValidatedPendingReplacementTransaction<'g, V: Value> {
 
 impl<'g, V: Value> ValidatedPendingReplacementTransaction<'g, V> {
     /// Stores the validated replacement and changes its [`Reference`] state from `Taken` to `Pending`. This function is
-    /// infallible because validation established every precondition while retaining the exact taken guard.
-    /// After the stored completion resolves, ordinary reference access reconciles `Pending` to `Ready` on success or
-    /// `Poisoned` on backend failure.
+    /// infallible because validation established every precondition while retaining the exact taken guard. After the
+    /// stored completion resolves, ordinary reference access reconciles `Pending` to `Ready` on success or `Poisoned`
+    /// on backend failure.
     #[inline]
     pub fn commit(self) -> ReadyOrPendingReferenceGuard<'g, V> {
-        let Self { taken, value, completion } = self;
-        taken.commit_pending(value, completion)
+        let Self { mut taken, value, completion } = self;
+
+        // Move the shared guard out before `taken` is dropped so its drop implementation does not poison
+        // the reference after this successful replacement.
+        let mut guard = taken.guard.take().unwrap();
+
+        let generation = match *guard.state {
+            ReferenceState::Taken { generation } => generation,
+            ReferenceState::Ready { .. }
+            | ReferenceState::Pending { .. }
+            | ReferenceState::Poisoned(_)
+            | ReferenceState::Frozen => unreachable!("`TakenReferenceGuard` protects only taken reference state"),
+        };
+
+        *guard.state = ReferenceState::Pending { value, generation, completion, read_leases: Vec::new() };
+        ReadyOrPendingReferenceGuard { guard }
     }
 
     /// Permanently poisons the validated replacement instead of committing it.

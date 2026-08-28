@@ -70,10 +70,11 @@
 //!   generations, guards, read leases, pending completion, and terminal poisoning.
 //! - `semantics.rs` defines the operation-local [`ReferenceOperationSemantics`] descriptor, access modes, and
 //!   allocation/alias classifications.
-//! - `operations.rs` defines the six generic primitives and their value-level capabilities: allocation
-//!   ([`ReferenceNew`]), immutable reads ([`ReferenceRead`]), write-only replacement ([`ReferenceWrite`]), swapping
-//!   ([`ReferenceSwap`]), ordered additive updates ([`ReferenceAddUpdate`]), and consuming finalization
-//!   ([`ReferenceFreeze`]). It also owns their type inference, effects, eager interpretation, and discharge rules.
+//! - `operations/` defines the six generic primitives in separate modules together with their value-level
+//!   capabilities: allocation ([`ReferenceNew`]), immutable reads ([`ReferenceRead`]), write-only replacement
+//!   ([`ReferenceWrite`]), swapping ([`ReferenceSwap`]), ordered additive updates ([`ReferenceAddUpdate`]), and
+//!   consuming finalization ([`ReferenceFreeze`]). Each primitive module also owns its type inference, effects, eager
+//!   interpretation, discharge rule, and unit tests.
 //! - `discharge/` implements [`ReferenceDischarge`]: an interpreter-style transform that replaces selected mutable
 //!   allocations with explicitly threaded immutable values. Its policy, context, driver, and operation-rule contracts
 //!   keep the transform open to non-array value families and to third-party operations.
