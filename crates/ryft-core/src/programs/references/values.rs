@@ -1071,15 +1071,14 @@ impl<V: Value> ReferenceObservation<V> {
 
 /// Cloneable backend-neutral token for work that reads or replaces a [`Reference`] value. A token has one immutable
 /// terminal result: success or a backend-owned failure reason. It can be polled with [`Self::is_ready`], waited on with
-/// [`Self::r#await`], and combined in dependency order with [`Self::join`].
+/// [`Self::r#await`], and combined in dependency order with [`Self::joined`].
 #[derive(Clone)]
 pub struct ReferenceCompletion {
     /// Private representation kept behind this public wrapper so callers cannot construct or match its variants and
-    /// bypass [`Self::join`]'s normalization.
+    /// bypass [`Self::joined`]'s normalization.
     storage: ReferenceCompletionStorage,
 }
 
-// TODO(eaplatanios): Review this block.
 impl ReferenceCompletion {
     /// Wraps a [`ReferenceCompletionBackend`] into a new [`ReferenceCompletion`].
     #[inline]
@@ -1093,22 +1092,11 @@ impl ReferenceCompletion {
         Self::new(ReadyReferenceCompletion(result))
     }
 
-    // TODO(eaplatanios): Why is the "terminal failure" an `Arc<str>`?
-    /// Returns `Ok(false)` while any represented work is pending, `Ok(true)` after success, or the terminal failure.
-    #[inline]
-    pub fn is_ready(&self) -> Result<bool, Arc<str>> {
-        match &self.storage {
-            ReferenceCompletionStorage::Backend(backend) => backend.is_ready(),
-            ReferenceCompletionStorage::Joined(joined) => joined.is_ready(),
-        }
-    }
-
-    /// Returns a token that completes after every input token and reports the first failure in input order.
-    ///
-    /// Nested joins are flattened. Inputs that have already succeeded are discarded because their terminal result
-    /// cannot change. Pending and failed inputs are retained in order. The join remains pending until every retained
-    /// input is terminal, and waiting on it waits for every input even after observing a failure.
-    pub fn join(completions: impl IntoIterator<Item = Self>) -> Self {
+    /// Returns a new [`ReferenceCompletion`] that completes after every input token and reports the first failure in
+    /// input order. Nested joins are flattened. Inputs that have already succeeded are discarded because their terminal
+    /// result cannot change. Pending and failed inputs are retained in order. The join remains pending until every
+    /// retained input is terminal, and waiting on it waits for every input even after observing a failure.
+    pub fn joined<C: IntoIterator<Item = Self>>(completions: C) -> Self {
         let mut flattened = Vec::new();
         for completion in completions {
             // Keep primitive order while removing dependencies whose immutable terminal result is already success.
@@ -1134,7 +1122,17 @@ impl ReferenceCompletion {
         }
     }
 
-    /// Blocks until all represented work completes and returns its terminal result.
+    // TODO(eaplatanios): Why is the "terminal failure" an `Arc<str>`?
+    /// Returns `Ok(false)` while any underlying work is pending, `Ok(true)` after success, or the terminal failure.
+    #[inline]
+    pub fn is_ready(&self) -> Result<bool, Arc<str>> {
+        match &self.storage {
+            ReferenceCompletionStorage::Backend(backend) => backend.is_ready(),
+            ReferenceCompletionStorage::Joined(joined) => joined.is_ready(),
+        }
+    }
+
+    /// Blocks until all underlying work completes and returns its terminal result.
     #[inline]
     pub fn r#await(&self) -> Result<(), Arc<str>> {
         match &self.storage {
@@ -1153,7 +1151,7 @@ impl Debug for ReferenceCompletion {
 
 /// Private representation of one primitive [`ReferenceCompletion`] or a flattened join. This is separate from the
 /// public [`ReferenceCompletion`] because keeping the enum private prevents callers from constructing nested joins
-/// directly, ensuring every joined completion passes through [`ReferenceCompletion::join`], which flattens nested
+/// directly, ensuring every joined completion passes through [`ReferenceCompletion::joined`], which flattens nested
 /// joins, removes completed successes, and preserves the original input order.
 #[derive(Clone)]
 enum ReferenceCompletionStorage {
@@ -1166,7 +1164,7 @@ enum ReferenceCompletionStorage {
 
 /// Backend implementation stored behind a type-erased [`ReferenceCompletion`]. [`Self::is_ready`] may return
 /// `Ok(false)` before completion. Once either function observes success or failure, that terminal result must never
-/// change, and both functions must agree on it. [`ReferenceCompletion::join`] relies on this contract when it discards
+/// change, and both functions must agree on it. [`ReferenceCompletion::joined`] relies on this contract when it discards
 /// completed successes.
 pub trait ReferenceCompletionBackend: 'static + Send + Sync {
     /// Blocks until the represented work completes and returns its terminal result.
@@ -1191,7 +1189,7 @@ impl ReferenceCompletionBackend for ReadyReferenceCompletion {
     }
 }
 
-/// Flattened and ordered [`ReferenceCompletion`] join created by [`ReferenceCompletion::join`].
+/// Flattened and ordered [`ReferenceCompletion`] join created by [`ReferenceCompletion::joined`].
 struct JoinedReferenceCompletion {
     /// Flat, input-ordered primitive [`ReferenceCompletion`]s.
     completions: Vec<ReferenceCompletion>,
@@ -1884,7 +1882,7 @@ mod tests {
             let mut guard = reference.lock().unwrap();
             let observation = guard.observe().unwrap();
             assert_eq!(observation.generation(), first_generation);
-            let completion = ReferenceCompletion::join([
+            let completion = ReferenceCompletion::joined([
                 observation.dependency().unwrap().clone(),
                 ReferenceCompletion::new(second_backend.clone()),
             ]);
@@ -2255,10 +2253,10 @@ mod tests {
     #[test]
     fn test_reference_completion_join_normalizes_empty_singleton_and_succeeded_inputs() {
         let pending = ControlledCompletion::new();
-        let singleton = ReferenceCompletion::join([ReferenceCompletion::new(pending.clone())]);
+        let singleton = ReferenceCompletion::joined([ReferenceCompletion::new(pending.clone())]);
 
-        assert_eq!(ReferenceCompletion::join([]).is_ready(), Ok(true));
-        assert_eq!(ReferenceCompletion::join([ReferenceCompletion::ready(Ok(()))]).is_ready(), Ok(true));
+        assert_eq!(ReferenceCompletion::joined([]).is_ready(), Ok(true));
+        assert_eq!(ReferenceCompletion::joined([ReferenceCompletion::ready(Ok(()))]).is_ready(), Ok(true));
         assert_eq!(singleton.is_ready(), Ok(false));
         pending.complete(Ok(()));
         assert_eq!(singleton.is_ready(), Ok(true));
@@ -2267,7 +2265,7 @@ mod tests {
 
     #[test]
     fn test_reference_completion_join_reports_first_failure_in_input_order() {
-        let completion = ReferenceCompletion::join([
+        let completion = ReferenceCompletion::joined([
             ReferenceCompletion::ready(Ok(())),
             ReferenceCompletion::ready(Err("first failure".into())),
             ReferenceCompletion::ready(Err("second failure".into())),
@@ -2281,8 +2279,8 @@ mod tests {
         let first = ControlledCompletion::new();
         let second = ControlledCompletion::new();
         let third = ControlledCompletion::new();
-        let joined = ReferenceCompletion::join([
-            ReferenceCompletion::join([
+        let joined = ReferenceCompletion::joined([
+            ReferenceCompletion::joined([
                 ReferenceCompletion::new(first.clone()),
                 ReferenceCompletion::new(second.clone()),
             ]),
@@ -2319,7 +2317,7 @@ mod tests {
         let succeeded_state = Arc::downgrade(&succeeded.state);
         let failed_state = Arc::downgrade(&failed.state);
         let pending_state = Arc::downgrade(&pending.state);
-        let nested = ReferenceCompletion::join([
+        let nested = ReferenceCompletion::joined([
             ReferenceCompletion::new(succeeded.clone()),
             ReferenceCompletion::new(failed.clone()),
         ]);
@@ -2328,7 +2326,7 @@ mod tests {
         drop(succeeded);
         drop(failed);
 
-        let joined = ReferenceCompletion::join([
+        let joined = ReferenceCompletion::joined([
             nested,
             ReferenceCompletion::new(pending.clone()),
             ReferenceCompletion::ready(Ok(())),
@@ -2343,7 +2341,7 @@ mod tests {
         pending.complete(Ok(()));
         drop(pending);
         assert_eq!(joined.is_ready(), Err(Arc::<str>::from("retained failure")));
-        let rejoined = ReferenceCompletion::join([joined]);
+        let rejoined = ReferenceCompletion::joined([joined]);
         assert!(pending_state.upgrade().is_none());
         assert!(failed_state.upgrade().is_some());
         assert_eq!(rejoined.r#await(), Err(Arc::<str>::from("retained failure")));
@@ -2360,7 +2358,7 @@ mod tests {
             let current_state = Arc::downgrade(&current.state);
 
             // Each new join must release the previously succeeded backend instead of retaining an ever-growing chain.
-            cumulative = ReferenceCompletion::join([cumulative, ReferenceCompletion::new(current.clone())]);
+            cumulative = ReferenceCompletion::joined([cumulative, ReferenceCompletion::new(current.clone())]);
             assert!(completed_states.iter().all(|state: &Weak<_>| state.upgrade().is_none()));
 
             current.complete(Ok(()));
@@ -2369,7 +2367,7 @@ mod tests {
             completed_states.push(current_state);
         }
 
-        cumulative = ReferenceCompletion::join([cumulative]);
+        cumulative = ReferenceCompletion::joined([cumulative]);
         assert!(completed_states.iter().all(|state| state.upgrade().is_none()));
         assert_eq!(cumulative.r#await(), Ok(()));
     }
