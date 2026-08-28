@@ -90,7 +90,8 @@
 //! operations into explicit state dataflow. A local root disappears entirely after that rewrite. An external root
 //! becomes an ordinary state input and, when mutated, a hidden final-state output described by a
 //! [`ReferenceStateBinding`]; the backend's stateful invocation surface snapshots and publishes those values through
-//! the caller's reference. Refer to the `discharge.rs` module documentation for a concrete before-and-after example.
+//! the caller's reference. [`ReferenceDischarge`] exposes the value-level entry point for this rewrite; the discharge
+//! module documentation contains a concrete before-and-after example.
 //!
 //! [`PartialReferenceDischargeResult`] supports the kernel use case in which selected implementation-owned roots
 //! become immutable state while other references deliberately remain in the program. A full

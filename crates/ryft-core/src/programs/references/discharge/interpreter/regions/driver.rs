@@ -1,0 +1,929 @@
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::rc::Rc;
+
+use crate::contexts::{Context, StagingContext};
+use crate::macros::check_count;
+use crate::parameters::Placeholder;
+use crate::programs::ProgramError;
+use crate::programs::instructions::InstructionId;
+use crate::programs::operations::Operation;
+use crate::programs::regions::{RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver};
+use crate::programs::types::Typed;
+use crate::programs::values::Value;
+
+use super::super::super::policies::ReferenceDischargePolicy;
+use super::super::rules::{ReferenceDischargeDriver, replay_preserved_access};
+use super::super::{
+    ReferenceDischargeContext, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceRootHandle,
+};
+use super::analysis::nested_capture_scope;
+use super::boundaries::{
+    ReferenceDischargeRegionDestination, ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork,
+};
+
+/// [`ReferenceDischargeDriver`] scoped to one [`Operation`] application. It borrows the application's complete region
+/// driver, which preserves the operation-defined ordering of owned regions, borrowed regions, and shared callees
+/// without materializing a combined region collection.
+pub struct RecursiveReferenceDischargeDriver<'r, D> {
+    /// Application-scoped [`RegionDriver`].
+    driver: &'r D,
+
+    /// Source coordinate of the application, or [`None`] for an application that replays no instruction.
+    instruction: Option<InstructionId>,
+}
+
+impl<'r, D> RecursiveReferenceDischargeDriver<'r, D> {
+    /// Creates a new [`RecursiveReferenceDischargeDriver`].
+    ///
+    /// # Parameters
+    ///
+    ///   - `driver`: Application-scoped [`RegionDriver`] exposing the attached regions.
+    ///   - `instruction`: Source coordinate of the application, or [`None`] for an application that replays no
+    ///     instruction.
+    #[inline]
+    pub const fn new(driver: &'r D, instruction: Option<InstructionId>) -> Self {
+        Self { driver, instruction }
+    }
+}
+
+impl<V: Value, O: Operation<Type = V::Type>, D: RegionDriver<V, O>> RegionDriver<V, O>
+    for RecursiveReferenceDischargeDriver<'_, D>
+{
+    #[inline]
+    fn regions<'r>(&'r self) -> impl Iterator<Item = RegionRef<'r, V, O>>
+    where
+        V: 'r,
+        O: 'r,
+    {
+        self.driver.regions()
+    }
+}
+
+// Recursive discharge replays the attached region one instruction at a time against the live environment, so a root
+// created outside the region stays the same root inside it and the region's own allocations are ordinary new roots.
+// Constants lift into the destination through the parent, exactly as they do at the top level.
+//
+// The nested obligation is the one this crate's other structural transforms already carry: rebuilding a region needs
+// this universe's operations to discharge into a fresh trace of the same universe as well as into the live
+// destination. The requested reference type of a threaded root crosses that boundary, so the two policy
+// instantiations must agree on their referent type system. Both obligations are stated here rather than on the
+// per-operation rules on purpose. A rule that stated them would make the enum dispatcher's obligation graph circular,
+// because the dispatcher's own predicate for a structured payload would then demand that the whole enum discharge
+// into the destination whose dischargeability is what the graph is trying to establish.
+impl<C, P, D> ReferenceDischargeDriver<C, P> for RecursiveReferenceDischargeDriver<'_, D>
+where
+    C: Context<
+        Operation: ReferenceDischargeableOperation<C, P>
+                       + ReferenceDischargeableOperation<ReferenceDischargeRegionDestination<C>, P>,
+    >,
+    P: ReferenceDischargePolicy<C>
+        + ReferenceDischargePolicy<
+            ReferenceDischargeRegionDestination<C>,
+            Referent = <P as ReferenceDischargePolicy<C>>::Referent,
+        >,
+    D: RegionDriver<C::Constant, C::Operation>,
+{
+    #[inline]
+    fn instruction(&self) -> Option<InstructionId> {
+        self.instruction
+    }
+
+    #[inline]
+    fn discharge_region(
+        &self,
+        context: &ReferenceDischargeContext<C, P>,
+        index: usize,
+        inputs: Vec<ReferenceDischargeValue<C, P>>,
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        discharge_region_instructions(context, self.region(index)?, inputs)
+    }
+
+    #[inline]
+    fn discharge_region_program(
+        &self,
+        context: &ReferenceDischargeContext<C, P>,
+        index: usize,
+        boundary: &ReferenceRegionDischargeBoundary,
+    ) -> Result<ReferenceRegionDischargeFork<C::Constant, C::Operation>, ProgramError> {
+        rebuild_discharged_region(context, self.region(index)?, boundary)
+    }
+}
+
+/// Replays one region's instructions against the live environment of `context`, binding their rewritten work through
+/// the destination that context already owns.
+///
+/// This is the inlining replay both [`ReferenceDischargeDriver::discharge_region`] and the region fork use: the fork
+/// differs only in which context it hands over, not in how a region's instructions are discharged.
+///
+/// # Parameters
+///
+///   - `context`: Active discharge context whose environment the replay observes and mutates.
+///   - `region`: Source region being replayed.
+///   - `inputs`: Carriers supplied to the region's boundary, in boundary order.
+fn discharge_region_instructions<C, P>(
+    context: &ReferenceDischargeContext<C, P>,
+    region: RegionRef<'_, C::Constant, C::Operation>,
+    inputs: Vec<ReferenceDischargeValue<C, P>>,
+) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError>
+where
+    C: Context<
+        Operation: ReferenceDischargeableOperation<C, P>
+                       + ReferenceDischargeableOperation<ReferenceDischargeRegionDestination<C>, P>,
+    >,
+    P: ReferenceDischargePolicy<C>
+        + ReferenceDischargePolicy<
+            ReferenceDischargeRegionDestination<C>,
+            Referent = <P as ReferenceDischargePolicy<C>>::Referent,
+        >,
+{
+    let mappings = RegionReplayMappings::new();
+    let mut instruction_index = 0;
+    region.interpret_with(
+        inputs,
+        |_, constant| lift_constant::<C, P>(context, constant.clone()),
+        |instruction, instruction_inputs| {
+            let position = InstructionId::new(region.id(), instruction_index);
+            instruction_index += 1;
+            // Run the complete rewrite of one application — the preserved-access replay included — inside the source
+            // instruction's recorded origin, so every staged instruction records where it came from. Rules stage
+            // their rewritten work through the destination parent, which is where the provenance state lives.
+            context.parent().invoke_with_provenance_origin(instruction.provenance().clone(), || {
+                // Access-only applications over exclusively preserved roots replay verbatim here, so rules see only
+                // discharged accesses; operations that attach regions or declare reference outputs keep their own
+                // rules.
+                if instruction.regions().is_empty()
+                    && let Some(outputs) =
+                        replay_preserved_access(instruction.operation(), context, instruction_inputs)?
+                {
+                    return Ok(outputs);
+                }
+                let regions = ReplayRegionDriver::new(region, instruction.regions(), &mappings)?;
+                let driver = RecursiveReferenceDischargeDriver::new(&regions, Some(position));
+                instruction.operation().discharge_references(context, &driver, instruction_inputs)
+            })
+        },
+    )
+}
+
+/// Discharges `region` against an isolated environment over a fresh destination and seals the result.
+///
+/// The fork's environment is built rather than copied: it holds exactly the roots `boundary` names, each entering as
+/// an ordinary destination value at its own boundary position. Because the fork mints its own environment identity,
+/// a handle from the caller cannot address a fork root and a handle from the fork cannot address a caller root — a
+/// leak in either direction is reported instead of silently aliasing.
+///
+/// # Parameters
+///
+///   - `context`: Active discharge context supplying the entering state, or the surviving reference, of every root
+///     the boundary names.
+///   - `region`: Source region being rebuilt.
+///   - `boundary`: Complete requested boundary of the rebuilt region.
+fn rebuild_discharged_region<C, P>(
+    context: &ReferenceDischargeContext<C, P>,
+    region: RegionRef<'_, C::Constant, C::Operation>,
+    boundary: &ReferenceRegionDischargeBoundary,
+) -> Result<ReferenceRegionDischargeFork<C::Constant, C::Operation>, ProgramError>
+where
+    C: Context<Operation: ReferenceDischargeableOperation<ReferenceDischargeRegionDestination<C>, P>>,
+    P: ReferenceDischargePolicy<C>
+        + ReferenceDischargePolicy<
+            ReferenceDischargeRegionDestination<C>,
+            Referent = <P as ReferenceDischargePolicy<C>>::Referent,
+        >,
+{
+    type Destination<C> = ReferenceDischargeRegionDestination<C>;
+
+    check_count!("input", boundary.declared_input_roots(), region.input_ids().len(), ProgramError);
+    let source_input_types = region.input_types();
+    let source_input_count = source_input_types.len();
+    let source_output_count = region.output_ids().len();
+    if boundary.state_input_insertion() > source_input_count {
+        return Err(ProgramError::MalformedProgram(format!(
+            "reference discharge inserts region state inputs at {} but region `{}` declares {source_input_count} \
+             inputs",
+            boundary.state_input_insertion(),
+            region.id(),
+        )));
+    }
+    if boundary.state_output_insertion() > source_output_count {
+        return Err(ProgramError::MalformedProgram(format!(
+            "reference discharge inserts region state outputs at {} but region `{}` declares {source_output_count} \
+             outputs",
+            boundary.state_output_insertion(),
+            region.id(),
+        )));
+    }
+
+    // Added state may not land inside the region's own capture prefix: the rebuilt region keeps the prefix length its
+    // operation declares, so a state input placed before the end of it would silently renumber the captures the
+    // rebound operation still names.
+    let capture_input_count = boundary.capture_input_count().unwrap_or(0);
+    if boundary.state_input_insertion() < capture_input_count {
+        return Err(ProgramError::MalformedProgram(format!(
+            "reference discharge inserts region state inputs at {} but region `{}` declares a capture prefix of \
+             {capture_input_count}",
+            boundary.state_input_insertion(),
+            region.id(),
+        )));
+    }
+
+    // Every carrier, the fork's context, and the destination itself stay inside this block, because recovering the
+    // rebuilt program below requires unique ownership of the destination's builder.
+    let destination = Destination::<C>::new();
+    let builder = destination.builder().clone();
+    let (output_ids, output_roots, mutated_roots) = {
+        // The fork inherits its caller's selection, because a site names a source coordinate that means the same thing
+        // wherever the replay reaches it: an unselected allocation inside a rebuilt region survives there exactly as
+        // it would have in the caller's own body.
+        let fork = ReferenceDischargeContext::<Destination<C>, P>::new_selecting(
+            destination.clone(),
+            context.selection.clone(),
+        );
+
+        let mut declared_roots = BTreeSet::new();
+        declared_roots.extend(boundary.declared_input_roots().iter().copied().flatten());
+        let mut added_roots = BTreeSet::new();
+        for root in boundary.added_input_roots() {
+            if declared_roots.contains(root) || !added_roots.insert(*root) {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "reference discharge adds {root} to region `{}` more than once",
+                    region.id(),
+                )));
+            }
+        }
+
+        // Caller and fork roots live in different environments, so explicit directional maps are the only
+        // correspondence between them. Repeated declared positions may intentionally alias one caller root, while
+        // synthesized state positions were already proven unique (and disjoint from the declared roots) above. The
+        // caller-to-fork map is ordered because the mutation-reconciliation loop below iterates it fallibly, and
+        // diagnostics must not depend on hash order.
+        let mut caller_to_fork = BTreeMap::<ReferenceRootHandle, ReferenceRootHandle>::new();
+        let mut fork_to_caller = HashMap::<ReferenceRootHandle, ReferenceRootHandle>::new();
+        let mut thread =
+            |root: ReferenceRootHandle| -> Result<ReferenceDischargeValue<Destination<C>, P>, ProgramError> {
+                let r#type = context.root_reference_type(root)?;
+                let discharged = context.root_is_discharged(root)?;
+                let input_type = if discharged {
+                    <P as ReferenceDischargePolicy<Destination<C>>>::lift_referent_type(r#type.referent().clone())
+                } else {
+                    <P as ReferenceDischargePolicy<Destination<C>>>::lift_reference_type(r#type.clone())
+                };
+                let input = destination.input(input_type);
+                if let Some(forked) = caller_to_fork.get(&root).copied() {
+                    return fork.root_handle(forked);
+                }
+                let carrier = if discharged {
+                    fork.allocate_discharged(r#type, input)?
+                } else {
+                    fork.bind_preserved(r#type, input)?
+                };
+                let forked = carrier.expect_reference("a threaded region root")?.root();
+                caller_to_fork.insert(root, forked);
+                fork_to_caller.insert(forked, root);
+                Ok(carrier)
+            };
+
+        // Only the declared positions are replayed. An added input occupies a destination boundary position and a
+        // caller operand position, but the source region's body never named it and so cannot consume it. A preserved
+        // root occupies an added position only when an inherited capture is returned without a declared operand.
+        let mut declared = Vec::with_capacity(source_input_count);
+        for position in 0..=source_input_count {
+            if position == boundary.state_input_insertion() {
+                for root in boundary.added_input_roots() {
+                    thread(*root)?;
+                }
+            }
+            let Some(root) = boundary.declared_input_roots().get(position) else {
+                continue;
+            };
+            let source_type = &source_input_types[position];
+            declared.push(match root {
+                None => {
+                    if <P as ReferenceDischargePolicy<C>>::project_reference_type(source_type).is_some() {
+                        return Err(ProgramError::MalformedProgram(format!(
+                            "reference discharge declares reference input {position} of region `{}` without a root",
+                            region.id(),
+                        )));
+                    }
+                    ReferenceDischargeValue::Ordinary(destination.input(source_type.clone()))
+                }
+                Some(root) => {
+                    let Some(source_reference_type) =
+                        <P as ReferenceDischargePolicy<C>>::project_reference_type(source_type)
+                    else {
+                        return Err(ProgramError::MalformedProgram(format!(
+                            "reference discharge assigns {root} to ordinary input {position} of region `{}`",
+                            region.id(),
+                        )));
+                    };
+                    let root_type = context.root_reference_type(*root)?;
+                    if root_type != source_reference_type {
+                        return Err(ProgramError::MalformedProgram(format!(
+                            "reference discharge assigns {root} of type `{root_type}` to input {position} of region \
+                             `{}` with reference type `{source_reference_type}`",
+                            region.id(),
+                        )));
+                    }
+                    thread(*root)?
+                }
+            });
+        }
+
+        // The rebuilt region discharges under a scope naming only fork roots, so the isolation the fork mints holds
+        // for capture-scoped references too: a region declaring its own capture prefix reads that prefix off its
+        // threaded declared inputs, and every other region inherits the caller's scope mapped onto the fork roots
+        // standing for its caller roots. A caller root the boundary did not thread binds nothing. Discharged capture
+        // accesses and outputs enter as state, while a preserved capture-scoped output enters as its destination
+        // reference, so both states mint fork roots before the inherited scope is installed.
+        let inherited = context.captures().with_roots(
+            context
+                .captures()
+                .roots()
+                .iter()
+                .map(|root| root.and_then(|caller| caller_to_fork.get(&caller).copied()))
+                .collect(),
+        );
+        let fork_declared_roots = declared
+            .iter()
+            .map(|input| match input {
+                ReferenceDischargeValue::Ordinary(_) => None,
+                ReferenceDischargeValue::Reference(reference) => Some(reference.root()),
+            })
+            .collect::<Vec<_>>();
+        let fork = fork.with_captures(nested_capture_scope(
+            boundary.capture_input_count(),
+            fork_declared_roots.as_slice(),
+            &inherited,
+            region.id(),
+        )?);
+
+        let outputs = discharge_region_instructions(&fork, region, declared)?;
+        check_count!("output", outputs, source_output_count, ProgramError);
+
+        let mut output_ids = Vec::with_capacity(source_output_count + boundary.added_state_output_roots().len());
+        let mut output_roots = Vec::with_capacity(source_output_count);
+        for position in 0..=source_output_count {
+            if position == boundary.state_output_insertion() {
+                for root in boundary.added_state_output_roots() {
+                    let forked = caller_to_fork.get(root).copied().ok_or_else(|| {
+                        ProgramError::MalformedProgram(format!(
+                            "reference discharge publishes {root} from region `{}` without threading it in",
+                            region.id(),
+                        ))
+                    })?;
+                    output_ids.push(fork.discharged_state(forked)?.atom_id()?);
+                }
+            }
+            let Some(output) = outputs.get(position) else {
+                continue;
+            };
+            match output {
+                ReferenceDischargeValue::Ordinary(value) => {
+                    output_roots.push(None);
+                    output_ids.push(value.atom_id()?);
+                }
+                ReferenceDischargeValue::Reference(reference) => {
+                    // A reference-typed region output publishes its root at that exact position — a discharged root's
+                    // current state, a preserved root's own reference — and the owning rule maps it back onto the
+                    // caller root through `output_roots`. A root the caller did not thread has nowhere to be
+                    // published, which is how a region-local allocation is stopped from escaping through the boundary.
+                    let caller = fork_to_caller.get(&reference.root()).copied().ok_or_else(|| {
+                        ProgramError::MalformedProgram(format!(
+                            "reference discharge cannot publish {} from region `{}`, whose caller did not thread \
+                             that root",
+                            reference.root(),
+                            region.id(),
+                        ))
+                    })?;
+
+                    // The published value denotes the whole root, so only a handle with whole-root provenance may
+                    // cross. A view returned from a region has to be re-derived by whoever needs it, exactly as one
+                    // passed into a region does.
+                    let whole = fork.root_reference_type(reference.root())?;
+                    if !reference.denotes_whole_root() {
+                        return Err(ProgramError::MalformedProgram(format!(
+                            "reference discharge cannot publish the derived view `{}` of {caller} from region `{}`, \
+                             whose boundary carries the whole root `{whole}`",
+                            reference.r#type(),
+                            region.id(),
+                        )));
+                    }
+                    output_roots.push(Some(caller));
+                    output_ids.push(match reference.preserved() {
+                        Some(value) => value.atom_id()?,
+                        None => fork.discharged_state(reference.root())?.atom_id()?,
+                    });
+                }
+            }
+        }
+
+        // Only threaded *state* can have been mutated. A preserved root's writes replayed into the rebuilt region as
+        // the operations the source performed, so there is no successor state for the caller to merge.
+        let mut mutated_roots = BTreeSet::new();
+        for (caller, forked) in &caller_to_fork {
+            if fork.root_is_discharged(*forked)? && fork.is_mutated(*forked)? {
+                mutated_roots.insert(*caller);
+            }
+        }
+        let mutated_roots = mutated_roots.into_iter().collect::<Vec<_>>();
+        (output_ids, output_roots, mutated_roots)
+    };
+    drop(destination);
+
+    let input_count = source_input_count + boundary.added_input_roots().len();
+    let output_count = output_ids.len();
+    let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+    let program = builder.build(output_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?;
+    Ok(ReferenceRegionDischargeFork { program, output_roots, mutated_roots })
+}
+
+/// Lifts one stored program constant into a discharge carrier.
+///
+/// A reference-typed constant resolves through the active [`ReferenceCaptureScope`], which is how a capture-lifted
+/// program's nested regions name their caller's references: the constant denotes the root that capture position
+/// already binds, so it yields that root's whole-root handle rather than a second root of its own.
+///
+/// A reference-typed constant that no scope resolves is rejected rather than lifted. Reference discharge threads roots
+/// through the environment it owns, and such a reference belongs to no root: it never entered through an input, a
+/// capture binding, or an allocation, so nothing in the environment describes it. Wrapping it as an ordinary value
+/// instead would let it survive into the destination and silently break the reference-freedom guarantee of
+/// [`ReferenceDischargeResult`].
+///
+/// # Parameters
+///
+///   - `context`: Active discharge context, supplying both the capture scope and the destination that lifts the
+///     constant.
+///   - `constant`: Stored program constant being lifted.
+///
+/// # Errors
+///
+/// Returns [`ProgramError::MalformedProgram`] when a reference-typed constant resolves to no root, or resolves to a
+/// root whose reference type is not the one the constant declares, and propagates the destination's own lift error.
+fn lift_constant<C: Context, P: ReferenceDischargePolicy<C>>(
+    context: &ReferenceDischargeContext<C, P>,
+    constant: C::Constant,
+) -> Result<ReferenceDischargeValue<C, P>, ProgramError> {
+    if let Some(r#type) = P::project_reference_type(constant.r#type().as_ref()) {
+        let Some(root) = context.captures().resolve(&constant) else {
+            return Err(ProgramError::MalformedProgram(format!(
+                "reference discharge cannot lift a constant of reference type `{type}`; a reference enters a program \
+                 through an input, a capture binding, or an allocation",
+            )));
+        };
+
+        // A capture constant names the whole root its position binds, so a narrower declared type would silently
+        // widen to the root's own value where the constant is used.
+        let bound = context.root_reference_type(root)?;
+        if r#type != bound {
+            return Err(ProgramError::MalformedProgram(format!(
+                "reference discharge resolved a capture constant of reference type `{type}` to {root}, which carries \
+                 the reference type `{bound}`",
+            )));
+        }
+        return context.root_handle(root);
+    }
+    Ok(ReferenceDischargeValue::Ordinary(context.parent().lift(constant)?))
+}
+
+#[cfg(test)]
+mod tests {
+
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
+    use crate::contexts::StagingContext;
+
+    use crate::parameters::Placeholder;
+    use crate::programs::ProgramError;
+    use crate::programs::atoms::AtomId;
+    use crate::programs::builders::ProgramBuilder;
+
+    use crate::programs::instructions::{Instruction, InstructionId};
+
+    use crate::programs::references::discharge::tests::*;
+
+    use crate::programs::references::types::ReferenceType;
+    use crate::programs::regions::{EmptyRegionDriver, RegionId};
+
+    use crate::programs::{
+        RecursiveReferenceDischargeDriver, ReferenceDischargeDriver, ReferenceRegionDischargeBoundary,
+        ReferenceRegionStateInsertion,
+    };
+    use crate::tracing::TracingContext;
+
+    use super::super::super::ReferenceCaptureScope;
+    use super::*;
+
+    #[test]
+    fn test_reference_discharge_rejects_reference_typed_constants() {
+        // A reference stored as a program constant belongs to no root, so lifting it as an ordinary value would let it
+        // survive into the destination and break the reference-freedom guarantee. Both lifting paths reject it.
+        let reference_type = ReferenceType::new(ListType { length: 2 });
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let stored = builder.add_constant(ListIrValue::Reference(reference_type.clone()));
+        let program = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![stored], Vec::new(), vec![Placeholder])
+            .unwrap();
+
+        let context = ListDischargeContext::new(ListDestination::new());
+        let rejection = ProgramError::MalformedProgram(
+            "reference discharge cannot lift a constant of reference type `ref<list<2>>`; a reference enters a \
+             program through an input, a capture binding, or an allocation"
+                .to_string(),
+        );
+        assert_eq!(lift_constant(&context, ListIrValue::Reference(reference_type)).err(), Some(rejection.clone()));
+        let regions = [program];
+        let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
+        assert_eq!(driver.discharge_region(&context, 0, Vec::new()), Err(rejection));
+    }
+
+    #[test]
+    fn test_reference_discharge_lifts_a_capture_scoped_constant_as_its_bound_root() {
+        // A capture-lifted program names its caller's references through constants, and such a constant denotes the
+        // root that capture position already binds rather than a second root of its own.
+        let pair = ReferenceType::new(ListType { length: 2 });
+        let triple = ReferenceType::new(ListType { length: 3 });
+        let context = ListDischargeContext::new(ListDestination::new());
+        let allocated = context.allocate_discharged(pair.clone(), ListIrValue::List(vec![1, 2])).unwrap();
+        let root = allocated.expect_reference("the captured root").unwrap().root();
+        let scoped =
+            context.with_captures(ReferenceCaptureScope::new(list_capture_position, vec![None, None, Some(root)]));
+
+        let lifted = lift_constant(&scoped, ListIrValue::Reference(pair.clone())).unwrap();
+        let reference = lifted.expect_reference("the resolved capture").unwrap();
+        assert_eq!(reference.root(), root);
+        assert_eq!(reference.r#type(), &pair);
+        assert_eq!(scoped.live_roots(), vec![root]);
+
+        // An ordinary constant is unaffected by the scope and lifts through the destination as usual.
+        let ordinary = lift_constant(&scoped, ListIrValue::List(vec![3, 4])).unwrap();
+        assert_eq!(ordinary, ReferenceDischargeValue::Ordinary(ListIrValue::List(vec![3, 4])));
+
+        // A capture position the scope does not bind keeps the ordinary reference-constant rejection.
+        assert_eq!(
+            lift_constant(&scoped, ListIrValue::Reference(triple.clone())).err(),
+            Some(ProgramError::MalformedProgram(
+                "reference discharge cannot lift a constant of reference type `ref<list<3>>`; a reference enters a \
+                 program through an input, a capture binding, or an allocation"
+                    .to_string(),
+            )),
+        );
+
+        // A capture constant names the whole root its position binds, so a declared type the bound root does not
+        // carry is reported rather than silently widened where the constant is used.
+        let allocated = context.allocate_discharged(triple, ListIrValue::List(vec![1, 2, 3])).unwrap();
+        let wider = allocated.expect_reference("the mismatched root").unwrap().root();
+        let mismatched = scoped.with_captures(scoped.captures().with_roots(vec![None, None, Some(wider)]));
+        assert_eq!(
+            lift_constant(&mismatched, ListIrValue::Reference(pair)).err(),
+            Some(ProgramError::MalformedProgram(format!(
+                "reference discharge resolved a capture constant of reference type `ref<list<2>>` to {wider}, which \
+                 carries the reference type `ref<list<3>>`",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_reference_discharge_region_program_rebinds_the_capture_scope_in_fork_roots() {
+        // A region whose closure reaches a caller root through a capture constant declares no boundary position for
+        // it, so the rule threads it as added state. The fork rebinds the caller's scope onto the fork root standing
+        // for that caller root, which is what lets the rebuilt body resolve the very same constant against its own
+        // isolated environment.
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let captured = builder.add_constant(ListIrValue::Reference(ReferenceType::new(ListType { length: 2 })));
+        let snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![captured], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![snapshot], Vec::new(), vec![Placeholder])
+            .unwrap();
+
+        let context = ListDischargeContext::new(ListDestination::new());
+        let allocated = context
+            .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
+            .unwrap();
+        let root = allocated.expect_reference("the captured root").unwrap().root();
+        let context =
+            context.with_captures(ReferenceCaptureScope::new(list_capture_position, vec![None, None, Some(root)]));
+
+        // The summary reports the capture-scoped access in caller-root terms, which is what sizes the boundary.
+        let summary = context.region_summary(&ListOperation::Call, 0, program.entry_region_ref(), &[]).unwrap();
+        assert_eq!(summary.accessed().collect::<Vec<_>>(), vec![root]);
+        assert!(!summary.is_mutated(root));
+        assert_eq!(summary.output_roots(), &[None]);
+
+        let regions = [program];
+        let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
+        let boundary = ReferenceRegionDischargeBoundary::new(
+            &ListOperation::Call,
+            0,
+            Vec::new(),
+            ReferenceRegionStateInsertion::new(vec![root], 0),
+            ReferenceRegionStateInsertion::new(Vec::new(), 0),
+        );
+        let fork = driver.discharge_region_program(&context, 0, &boundary).unwrap();
+        assert_eq!(
+            fork.program.to_string(),
+            indoc! {"
+                lambda %0:list<2> .
+                let %1:list<2> = list.select %0
+                in (%1)"},
+        );
+        assert_eq!(fork.output_roots(), &[None]);
+        assert_eq!(fork.mutated_roots, []);
+
+        // The caller environment is untouched: the fork read its own threaded copy of the state.
+        assert_eq!(context.discharged_state(root), Ok(ListIrValue::List(vec![1, 2])));
+        assert_eq!(context.is_mutated(root), Ok(false));
+    }
+
+    #[test]
+    fn test_reference_discharge_drivers_report_their_replay_position() {
+        let context = ListDischargeContext::new(ListDestination::new());
+        let position = InstructionId::new(RegionId::new(0), 3);
+
+        // A driver built without a source instruction reports none, and one built for a replayed instruction reports
+        // exactly that coordinate.
+        assert_eq!(
+            ReferenceDischargeDriver::<ListDestination, ListReferenceDischarge>::instruction(&EmptyRegionDriver),
+            None,
+        );
+        let driver = RecursiveReferenceDischargeDriver::new(&EmptyRegionDriver, Some(position));
+        assert_eq!(
+            ReferenceDischargeDriver::<ListDestination, ListReferenceDischarge>::instruction(&driver),
+            Some(position),
+        );
+
+        // Neither driver can serve a nested region, because neither has one.
+        let no_regions = ProgramError::MalformedProgram("empty region driver cannot discharge a region".to_string());
+        assert_eq!(EmptyRegionDriver.discharge_region(&context, 0, Vec::new()), Err(no_regions));
+        assert_eq!(
+            driver.discharge_region(&context, 0, Vec::new()),
+            Err(ProgramError::MalformedProgram("region index 0 is out of range".to_string())),
+        );
+    }
+
+    #[test]
+    fn test_region_discharge_rejects_a_same_type_derived_root_output() {
+        let reference_type = ReferenceType::new(ListType { length: 2 });
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let reference = builder.add_input(ListIrType::Reference(reference_type.clone()));
+        let view = builder
+            .add_instruction(ListOperation::Slice { offset: 0, length: 2 }, Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![view], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let context = ListDischargeContext::new(ListDestination::new());
+        let allocated = context.allocate_discharged(reference_type, ListIrValue::List(vec![1, 2])).unwrap();
+        let root = allocated.expect_reference("the caller root").unwrap().root();
+        let regions = [program];
+        let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
+        let boundary = ReferenceRegionDischargeBoundary::new(
+            &ListOperation::Call,
+            0,
+            vec![Some(root)],
+            ReferenceRegionStateInsertion::new(Vec::new(), 1),
+            ReferenceRegionStateInsertion::new(Vec::new(), 1),
+        );
+
+        assert_eq!(
+            driver.discharge_region_program(&context, 0, &boundary).unwrap_err(),
+            ProgramError::MalformedProgram(format!(
+                "reference discharge cannot publish the derived view `ref<list<2>>` of {root} from region `{}`, \
+                 whose boundary carries the whole root `ref<list<2>>`",
+                regions[0].entry_region_ref().id(),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_reference_discharge_region_program_isolates_the_caller_environment() {
+        // A region that accumulates into the root it receives and returns that root unchanged, which is the shape a
+        // structured rule threads state through.
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let reference = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
+        let update = builder.add_constant(ListIrValue::List(vec![10, 10]));
+        builder
+            .add_instruction(ListOperation::AddUpdate, Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let program = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let destination = TracingContext::<ListIrValue, ListOperation>::new();
+        let context = ReferenceDischargeContext::<_, ListReferenceDischarge>::new(destination.clone());
+        let state = destination.input(ListIrType::List(ListType { length: 2 }));
+        let allocated = context.allocate_discharged(ReferenceType::new(ListType { length: 2 }), state).unwrap();
+        let root = allocated.expect_reference("the caller root").unwrap().root();
+        let regions = [program];
+        let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
+        let boundary = ReferenceRegionDischargeBoundary::new(
+            &ListOperation::Call,
+            0,
+            vec![Some(root)],
+            ReferenceRegionStateInsertion::new(Vec::new(), 0),
+            ReferenceRegionStateInsertion::new(Vec::new(), 1),
+        );
+        let fork = driver.discharge_region_program(&context, 0, &boundary).unwrap();
+
+        // The rebuilt region reports what it did in the caller's own terms, and the caller's environment is untouched:
+        // the root is still unmutated and still holds the state it entered with.
+        assert_eq!(fork.mutated_roots, [root]);
+        assert_eq!(fork.output_roots(), &[Some(root)]);
+        assert!(!context.is_mutated(root).unwrap());
+        assert_eq!(context.discharged_state(root).unwrap().atom_id().unwrap(), AtomId::new(0));
+        assert_eq!(
+            fork.program.to_string(),
+            indoc! {"
+                lambda %0:list<2> .
+                let %1:list<2> = const [10, 10]
+                    %2:list<2> = list.select %0
+                    %3:list<2> = list.add %2 %1
+                    %4:list<2> = list.splice %0 %3
+                in (%4)"},
+        );
+
+        // A replay that fails leaves the caller's environment exactly as it was and yields no values at all, because
+        // the fork's result type carries none. The checked append rejects a read of a consumed family at
+        // construction, so the failing program is assembled through the unchecked rebuild hatch.
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let reference = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
+        builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![reference], None).unwrap();
+        let failing = builder.add_variable(ListIrType::List(ListType { length: 2 }));
+        builder.add_instruction_unchecked(Instruction::new(
+            ListOperation::Read,
+            vec![reference],
+            vec![failing],
+            Vec::new(),
+        ));
+        let program = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![failing], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let regions = [program];
+        let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
+        assert!(matches!(
+            driver.discharge_region_program(&context, 0, &boundary),
+            Err(ProgramError::MalformedProgram(message))
+                if message.starts_with("reference discharge accessed consumed reference root "),
+        ));
+        assert!(!context.is_mutated(root).unwrap());
+        assert_eq!(context.discharged_state(root).unwrap().atom_id().unwrap(), AtomId::new(0));
+    }
+
+    #[test]
+    fn test_reference_discharge_region_program_rejects_duplicate_added_roots() {
+        let builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let program = builder.build::<Vec<ListIrValue>, Vec<ListIrValue>>(Vec::new(), Vec::new(), Vec::new()).unwrap();
+
+        let context = ListDischargeContext::new(ListDestination::new());
+        let allocated = context
+            .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
+            .unwrap();
+        let root = allocated.expect_reference("the added root").unwrap().root();
+        let regions = [program];
+        let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
+        let boundary = ReferenceRegionDischargeBoundary::new(
+            &ListOperation::Call,
+            0,
+            Vec::new(),
+            ReferenceRegionStateInsertion::new(vec![root, root], 0),
+            ReferenceRegionStateInsertion::new(Vec::new(), 0),
+        );
+
+        assert_eq!(
+            driver.discharge_region_program(&context, 0, &boundary).unwrap_err(),
+            ProgramError::MalformedProgram(format!(
+                "reference discharge adds {root} to region `{}` more than once",
+                regions[0].entry_region_ref().id(),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_reference_discharge_region_program_rejects_an_added_root_duplicating_a_declared_root() {
+        // A repeated *declared* position deliberately aliases one caller root, but a synthesized state position must
+        // never restate a root the boundary already declares: the rebuilt region would carry two boundary positions
+        // for one state with no rule deciding which successor wins.
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
+        let program = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(Vec::new(), vec![Placeholder], Vec::new())
+            .unwrap();
+
+        let context = ListDischargeContext::new(ListDestination::new());
+        let allocated = context
+            .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
+            .unwrap();
+        let root = allocated.expect_reference("the declared root").unwrap().root();
+        let regions = [program];
+        let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
+        let boundary = ReferenceRegionDischargeBoundary::new(
+            &ListOperation::Call,
+            0,
+            vec![Some(root)],
+            ReferenceRegionStateInsertion::new(vec![root], 1),
+            ReferenceRegionStateInsertion::new(Vec::new(), 0),
+        );
+
+        assert_eq!(
+            driver.discharge_region_program(&context, 0, &boundary).unwrap_err(),
+            ProgramError::MalformedProgram(format!(
+                "reference discharge adds {root} to region `{}` more than once",
+                regions[0].entry_region_ref().id(),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_reference_discharge_region_program_propagates_a_consumed_fork_root() {
+        // This operation deliberately violates the generic contract: its summary claims no reference access, while
+        // its discharge rule consumes the root. Fork sealing must report that consumed root instead of silently
+        // omitting it from the mutation report.
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let reference = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
+        let frozen =
+            builder.add_instruction(ListOperation::UnreportedFreeze, Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let context = ListDischargeContext::new(ListDestination::new());
+        let allocated = context
+            .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
+            .unwrap();
+        let root = allocated.expect_reference("the caller root").unwrap().root();
+        let regions = [program];
+        let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
+        let boundary = ReferenceRegionDischargeBoundary::new(
+            &ListOperation::Call,
+            0,
+            vec![Some(root)],
+            ReferenceRegionStateInsertion::new(Vec::new(), 1),
+            ReferenceRegionStateInsertion::new(Vec::new(), 1),
+        );
+
+        assert!(matches!(
+            driver.discharge_region_program(&context, 0, &boundary),
+            Err(ProgramError::MalformedProgram(message))
+                if message.contains("reference discharge accessed consumed reference root"),
+        ));
+    }
+
+    #[test]
+    fn test_reference_discharge_region_program_inserts_added_state_at_its_boundary_position() {
+        // Added state is what a region closure reaches without receiving it as a declared operand. No source construct
+        // the interpreter currently accepts produces one — a reference reaches a region only through its boundary,
+        // because a reference-typed constant is rejected outright — so the mechanics are exercised here directly,
+        // against the boundary request a rule would make once capture-scoped references resolve.
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let update = builder.add_input(ListIrType::List(ListType { length: 2 }));
+        let reference = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
+        builder
+            .add_instruction(ListOperation::AddUpdate, Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let destination = TracingContext::<ListIrValue, ListOperation>::new();
+        let context = ReferenceDischargeContext::<_, ListReferenceDischarge>::new(destination.clone());
+        let reference_type = ReferenceType::new(ListType { length: 2 });
+        let accessed = context
+            .allocate_discharged(reference_type.clone(), destination.input(ListIrType::List(ListType { length: 2 })))
+            .unwrap();
+        let accessed = accessed.expect_reference("the accessed root").unwrap().root();
+        let carried = context
+            .allocate_discharged(reference_type, destination.input(ListIrType::List(ListType { length: 2 })))
+            .unwrap();
+        let carried = carried.expect_reference("the carried root").unwrap().root();
+
+        // The added input goes between the two declared inputs and the added output goes before the declared output,
+        // which is the insertion arithmetic a scan's carry prefix depends on.
+        let regions = [program];
+        let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
+        let boundary = ReferenceRegionDischargeBoundary::new(
+            &ListOperation::Call,
+            0,
+            vec![None, Some(accessed)],
+            ReferenceRegionStateInsertion::new(vec![carried], 1),
+            ReferenceRegionStateInsertion::new(vec![carried], 0),
+        );
+        let fork = driver.discharge_region_program(&context, 0, &boundary).unwrap();
+        assert_eq!(
+            fork.program.to_string(),
+            indoc! {"
+                lambda %0:list<2>, %1:list<2>, %2:list<2> .
+                let %3:list<2> = list.select %2
+                    %4:list<2> = list.add %3 %0
+                    %5:list<2> = list.splice %2 %4
+                    %6:list<2> = list.select %5
+                in (%1, %6)"},
+        );
+
+        // Only the root the closure actually reached is reported as mutated; the carried one passes through, which is
+        // why a symmetric boundary can thread it without claiming the region wrote it.
+        assert_eq!(fork.mutated_roots, [accessed]);
+        assert_eq!(fork.output_roots(), &[None]);
+    }
+}
