@@ -2004,8 +2004,6 @@ mod tests {
         );
     }
 
-    // Ready-or-pending guards and coherent observations.
-
     #[test]
     fn test_reference_observation_tracks_allocation_and_generation() {
         let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
@@ -2160,8 +2158,6 @@ mod tests {
         assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32)));
     }
 
-    // Ready and taken guards.
-
     #[test]
     fn test_ready_reference_guard_take_and_replace_advance_the_generation() {
         let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
@@ -2181,7 +2177,6 @@ mod tests {
         let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
         let ready = reference.lock().unwrap().wait_until_ready().unwrap();
         let (_, taken) = ready.take().unwrap();
-
         let error = match taken.replace(Array::vector(vec![2.0_f32])) {
             Ok(_) => panic!("replacement with the wrong type unexpectedly succeeded"),
             Err(error) => error,
@@ -2224,8 +2219,6 @@ mod tests {
         );
     }
 
-    // Asynchronous replacement transactions.
-
     #[test]
     fn test_reference_replacement_transaction_commits_its_prepared_generation() {
         let reference = Reference::new(Array::scalar(1.0_f32)).unwrap();
@@ -2247,7 +2240,6 @@ mod tests {
             panic!("new reference unexpectedly has a preserved reader")
         };
         let transaction = prepared.begin(ReferenceCompletion::ready(Ok(())));
-
         let error = match transaction.validate(Array::vector(vec![2.0_f32])) {
             Ok(_) => panic!("replacement with the wrong type unexpectedly validated"),
             Err(error) => error,
@@ -2268,7 +2260,6 @@ mod tests {
         };
         let transaction = prepared.begin(ReferenceCompletion::ready(Ok(())));
         let validated = transaction.validate(Array::scalar(2.0_f32)).unwrap();
-
         drop(validated);
         assert_eq!(
             reference.read(),
@@ -2295,13 +2286,11 @@ mod tests {
         let first_transaction = first_prepared.begin(ReferenceCompletion::ready(Ok(())));
         let second_transaction = second_prepared.begin(ReferenceCompletion::ready(Ok(())));
         let first_validated = first_transaction.validate(Array::scalar(3.0_f32)).unwrap();
-
         let error = match second_transaction.validate(Array::vector(vec![4.0_f32])) {
             Ok(_) => panic!("replacement with the wrong type unexpectedly validated"),
             Err(error) => error,
         };
         first_validated.poison(error.to_string());
-
         let expected = ReferenceError::ExecutionPoisoned { reason: error.to_string() };
         assert_eq!(first.read(), Err(expected.clone()));
         assert_eq!(second.read(), Err(expected));
@@ -2329,13 +2318,10 @@ mod tests {
         );
     }
 
-    // Reference completions and joins.
-
     #[test]
     fn test_reference_completion_ready_reports_terminal_results_and_debug_state() {
         let succeeded = ReferenceCompletion::ready(Ok(()));
         let failed = ReferenceCompletion::ready(Err("execution failed".into()));
-
         assert_eq!(succeeded.is_ready(), Ok(true));
         assert_eq!(succeeded.r#await(), Ok(()));
         assert_eq!(format!("{succeeded:?}"), "ReferenceCompletion { is_ready: Ok(true) }");
@@ -2348,7 +2334,6 @@ mod tests {
     fn test_reference_completion_join_normalizes_empty_singleton_and_succeeded_inputs() {
         let pending = ControlledCompletion::new();
         let singleton = ReferenceCompletion::joined([ReferenceCompletion::new(pending.clone())]);
-
         assert_eq!(ReferenceCompletion::joined([]).is_ready(), Ok(true));
         assert_eq!(ReferenceCompletion::joined([ReferenceCompletion::ready(Ok(()))]).is_ready(), Ok(true));
         assert_eq!(singleton.is_ready(), Ok(false));
