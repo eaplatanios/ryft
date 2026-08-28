@@ -147,6 +147,66 @@ impl<V: Value> Reference<V> {
         self.handle.root_to_handle.is_identity() && self.handle.handle_to_root.is_identity()
     }
 
+    // TODO(eaplatanios): Review this function.
+    /// Returns a clone of the currently stored value, which is an immutable snapshot for a valid reference referent.
+    pub fn read(&self) -> Result<V, ReferenceError> {
+        let state = self.lock_ready_state(false)?;
+        let ReferenceState::Ready { value, .. } = &*state else {
+            unreachable!("`lock_ready_state` yields only ready states")
+        };
+        value
+            .rename_type_identities(&self.handle.root_to_handle)
+            .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })
+    }
+
+    // TODO(eaplatanios): Review this function.
+    /// Atomically replaces the stored value without reconstructing or returning the previous handle-local value.
+    ///
+    /// The replacement must have exactly the declared referent type. A rejected replacement leaves the reference
+    /// unchanged. Reference-state errors such as freezing, poisoning, or an active transaction take precedence over a
+    /// replacement-type error, because the reference must first admit the mutation before its replacement is validated.
+    pub fn write(&self, replacement: V) -> Result<(), ReferenceError> {
+        let mut state = self.lock_ready_state(true)?;
+        let ReferenceState::Ready { value: current, generation, .. } = &mut *state else {
+            unreachable!("lock_ready_state yields only ready states")
+        };
+        let stored_replacement = self.prepare_replacement(replacement)?;
+        Self::commit_replacement(current, generation, stored_replacement)
+    }
+
+    // TODO(eaplatanios): Review this function.
+    /// Atomically replaces the stored value and returns the previous referent value.
+    ///
+    /// The replacement must have exactly the declared referent type. A rejected replacement leaves the reference
+    /// unchanged. Reference-state errors such as freezing, poisoning, or an active transaction take precedence over a
+    /// replacement-type error, because the reference must first admit the mutation before its replacement is validated.
+    pub fn swap(&self, replacement: V) -> Result<V, ReferenceError> {
+        let mut state = self.lock_ready_state(true)?;
+        let ReferenceState::Ready { value: current, generation, .. } = &mut *state else {
+            unreachable!("lock_ready_state yields only ready states")
+        };
+        let stored_replacement = self.prepare_replacement(replacement)?;
+        let old = current
+            .rename_type_identities(&self.handle.root_to_handle)
+            .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })?;
+        Self::commit_replacement(current, generation, stored_replacement)?;
+        Ok(old)
+    }
+
+    // TODO(eaplatanios): Review this function.
+    /// Consumes this reference's current value and invalidates every handle in its alias family.
+    pub fn freeze(&self) -> Result<V, ReferenceError> {
+        let mut state = self.lock_ready_state(true)?;
+        let ReferenceState::Ready { value, .. } = &*state else {
+            unreachable!("lock_ready_state yields only ready states")
+        };
+        let value = value
+            .rename_type_identities(&self.handle.root_to_handle)
+            .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })?;
+        *state = ReferenceState::Frozen;
+        Ok(value)
+    }
+
     /// Acquires this [`Reference`]'s shared lifecycle state for one backend-managed transaction. This is the
     /// backend-facing wrapper around the private raw state lock. It returns as soon as the state mutex is acquired and
     /// deliberately does not await a `Pending` value or active read leases. The returned [`ReferenceGuard`] exposes the
@@ -217,14 +277,20 @@ impl<V: Value> Reference<V> {
                     return Err(ReferenceError::TransactionInProgress);
                 }
             };
+
             let Some((pending, read_leases)) = wait else {
                 return Ok(state);
             };
+
+            // `wait` owns cloned completion tokens, so it no longer borrows the protected state. Release the
+            // non-reentrant mutex before awaiting backend work: holding it would block unrelated reference access,
+            // and the pending-completion path below must reacquire this same mutex to apply the result conditionally.
             drop(state);
+
             if let Some((generation, completion)) = pending {
                 let result = completion.r#await();
                 let mut state = self.lock_holder_state()?;
-                Self::apply_completion(&mut state, generation, result);
+                Self::apply_pending_completion(&mut state, generation, result);
             } else {
                 for lease in read_leases {
                     match lease.r#await() {
@@ -263,58 +329,7 @@ impl<V: Value> Reference<V> {
         }
     }
 
-    // TODO(eaplatanios): Review from here onward.
-
-    /// Returns a clone of the currently stored value, which is an immutable snapshot for a valid reference referent.
-    pub fn read(&self) -> Result<V, ReferenceError> {
-        let state = self.lock_ready_state(false)?;
-        let ReferenceState::Ready { value, .. } = &*state else {
-            unreachable!("`lock_ready_state` yields only ready states")
-        };
-        self.reconstruct_local(value)
-    }
-
-    /// Atomically replaces the stored value without reconstructing or returning the previous handle-local value.
-    ///
-    /// The replacement must have exactly the declared referent type. A rejected replacement leaves the reference
-    /// unchanged. Reference-state errors such as freezing, poisoning, or an active transaction take precedence over a
-    /// replacement-type error, because the reference must first admit the mutation before its replacement is validated.
-    pub fn write(&self, replacement: V) -> Result<(), ReferenceError> {
-        let mut state = self.lock_ready_state(true)?;
-        let ReferenceState::Ready { value: current, generation, .. } = &mut *state else {
-            unreachable!("lock_ready_state yields only ready states")
-        };
-        let stored_replacement = self.prepare_stored(replacement)?;
-        Self::commit_ready(current, generation, stored_replacement)
-    }
-
-    /// Atomically replaces the stored value and returns the previous referent value.
-    ///
-    /// The replacement must have exactly the declared referent type. A rejected replacement leaves the reference
-    /// unchanged. Reference-state errors such as freezing, poisoning, or an active transaction take precedence over a
-    /// replacement-type error, because the reference must first admit the mutation before its replacement is validated.
-    pub fn swap(&self, replacement: V) -> Result<V, ReferenceError> {
-        let mut state = self.lock_ready_state(true)?;
-        let ReferenceState::Ready { value: current, generation, .. } = &mut *state else {
-            unreachable!("lock_ready_state yields only ready states")
-        };
-        let stored_replacement = self.prepare_stored(replacement)?;
-        let old = self.reconstruct_local(current)?;
-        Self::commit_ready(current, generation, stored_replacement)?;
-        Ok(old)
-    }
-
-    /// Consumes this reference's current value and invalidates every handle in its alias family.
-    pub fn freeze(&self) -> Result<V, ReferenceError> {
-        let mut state = self.lock_ready_state(true)?;
-        let ReferenceState::Ready { value, .. } = &*state else {
-            unreachable!("lock_ready_state yields only ready states")
-        };
-        let value = self.reconstruct_local(value)?;
-        *state = ReferenceState::Frozen;
-        Ok(value)
-    }
-
+    // TODO(eaplatanios): Review this function.
     /// Atomically computes and installs an updated value while retaining the old value on every failure.
     ///
     /// This crate-visible primitive keeps value-family-specific update logic (such as array addition) outside the
@@ -324,6 +339,7 @@ impl<V: Value> Reference<V> {
         self.update_locked_with_result(|current| Ok((update(current)?, ())))
     }
 
+    // TODO(eaplatanios): Review this function.
     /// Atomically maps this handle's current value to a replacement and an operation result.
     ///
     /// Both handle-local reconstruction directions complete before the shared state is committed, so every failure
@@ -337,13 +353,17 @@ impl<V: Value> Reference<V> {
         let ReferenceState::Ready { value: current, generation, .. } = &mut *state else {
             unreachable!("lock_ready_state yields only ready states")
         };
-        let local = self.reconstruct_local(current).map_err(ProgramError::custom)?;
+        let local = current
+            .rename_type_identities(&self.handle.root_to_handle)
+            .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })
+            .map_err(ProgramError::custom)?;
         let (updated, result) = update(&local)?;
-        let stored = self.prepare_stored(updated).map_err(ProgramError::custom)?;
-        Self::commit_ready(current, generation, stored).map_err(ProgramError::custom)?;
+        let stored = self.prepare_replacement(updated).map_err(ProgramError::custom)?;
+        Self::commit_replacement(current, generation, stored).map_err(ProgramError::custom)?;
         Ok(result)
     }
 
+    // TODO(eaplatanios): Review this function.
     /// Returns a handle-local identity-renamed view of this same reference allocation.
     pub(crate) fn rename_type_identities(
         &self,
@@ -370,16 +390,15 @@ impl<V: Value> Reference<V> {
         let inverse_step =
             V::Type::derive_identity_renaming(std::slice::from_ref(&renamed_type), std::slice::from_ref(current_type))?;
         let root_type = &self.handle.holder.root_type;
-        let root_to_handle = Self::compose_renamings(
-            &self.handle.root_to_handle,
-            renaming,
-            root_type.identities().map(|(_, identity)| identity),
-        )?;
-        let handle_to_root = Self::compose_renamings(
-            &inverse_step,
-            &self.handle.handle_to_root,
-            renamed_type.identities().map(|(_, identity)| identity),
-        )?;
+        let mut root_to_handle = TypeIdentityRenaming::new();
+        for (_, identity) in root_type.identities() {
+            root_to_handle.insert(identity.clone(), renaming.rename(&self.handle.root_to_handle.rename(identity)))?;
+        }
+        let mut handle_to_root = TypeIdentityRenaming::new();
+        for (_, identity) in renamed_type.identities() {
+            handle_to_root
+                .insert(identity.clone(), self.handle.handle_to_root.rename(&inverse_step.rename(identity)))?;
+        }
         if root_type.rename_identities(&root_to_handle)? != renamed_type
             || renamed_type.rename_identities(&handle_to_root)? != *root_type
         {
@@ -397,8 +416,12 @@ impl<V: Value> Reference<V> {
         })
     }
 
-    /// Applies `result` only when `generation` remains the shared state's current generation.
-    fn apply_completion(
+    /// Resolves the pending value for `generation` using its backend completion result. If `state` is still `Pending`
+    /// at `generation`, a successful result makes its value and read leases `Ready`, while a failed result replaces it
+    /// with terminal `Poisoned` state carrying the backend failure reason. If the state is no longer pending at that
+    /// generation, this function leaves it unchanged and returns `false`. This prevents a stale completion from
+    /// overwriting newer reference state.
+    fn apply_pending_completion(
         state: &mut ReferenceState<V>,
         generation: ReferenceGeneration,
         result: Result<(), Arc<str>>,
@@ -408,8 +431,8 @@ impl<V: Value> Reference<V> {
         }
         match result {
             Ok(()) => {
-                // The placeholder is unobservable: the state mutex is held and `*state` is rewritten immediately in
-                // both directions below, so no other thread can see the transient `Frozen`.
+                // The placeholder is unobservable. The state mutex is held and `*state` is rewritten immediately
+                // in both directions below, so no other thread can see the transient `Frozen`.
                 let previous = std::mem::replace(state, ReferenceState::Frozen);
                 let ReferenceState::Pending { value, generation, read_leases, .. } = previous else {
                     unreachable!("completion generation was validated as pending")
@@ -421,41 +444,43 @@ impl<V: Value> Reference<V> {
         true
     }
 
-    /// Composes two simultaneous identity mappings over the provided source identities.
-    fn compose_renamings<'a>(
-        first: &TypeIdentityRenaming<<V::Type as Type>::Identity>,
-        second: &TypeIdentityRenaming<<V::Type as Type>::Identity>,
-        sources: impl Iterator<Item = &'a <V::Type as Type>::Identity>,
-    ) -> Result<TypeIdentityRenaming<<V::Type as Type>::Identity>, TypeError>
-    where
-        <V::Type as Type>::Identity: 'a,
-    {
-        let mut result = TypeIdentityRenaming::new();
-        for source in sources {
-            result.insert(source.clone(), second.rename(&first.rename(source)))?;
-        }
-        Ok(result)
-    }
+    /// Validates a handle-local replacement value and converts it to the shared root representation. The input must
+    /// exactly match this [`Reference`]'s referent type. After applying the handle-to-root identity mapping, the
+    /// converted value must exactly match the reference allocation's root referent type. Both checks finish before
+    /// any reference state is changed, so callers may safely commit or install the returned value.
+    fn prepare_replacement(&self, value: V) -> Result<V, ReferenceError> {
+        // `Typed::r#type` may return a `Cow` that borrows its value. Keeping that borrow inside this closure lets each
+        // validation finish before the corresponding value is moved into identity renaming or returned to the caller.
+        let validate_type = |value: &V, expected: &V::Type| -> Result<(), ReferenceError> {
+            let actual = value.r#type();
+            if actual.as_ref() == expected {
+                return Ok(());
+            }
+            Err(ReferenceError::ReferentTypeMismatch { expected: expected.to_string(), actual: actual.to_string() })
+        };
 
-    /// Reconstructs one root-stored value in this handle's type-identity namespace.
-    fn reconstruct_local(&self, value: &V) -> Result<V, ReferenceError> {
-        value
-            .rename_type_identities(&self.handle.root_to_handle)
-            .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })
-    }
+        // Reject the replacement in the handle's public type-identity namespace before translating it for storage.
+        validate_type(&value, self.handle.r#type.referent())?;
 
-    /// Validates and reconstructs one handle-local value for storage in the shared root representation.
-    fn prepare_stored(&self, value: V) -> Result<V, ReferenceError> {
-        self.validate_referent_type(&value)?;
+        // Every alias stores values in the reference allocation's root identity namespace. This mapping converts the
+        // handle-local replacement into that shared representation.
         let stored = value
             .rename_type_identities(&self.handle.handle_to_root)
             .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() })?;
-        self.validate_root_type(&stored)?;
+
+        // Identity renaming is implemented by the value family, so verify that its result exactly matches the root
+        // referent type before allowing the value to reach shared state.
+        validate_type(&stored, &self.handle.holder.root_type)?;
+
         Ok(stored)
     }
 
-    /// Commits one prepared replacement and advances the ready reference generation.
-    fn commit_ready(
+    /// Installs a prepared replacement into an already-locked `Ready` state and advances its [`ReferenceGeneration`].
+    /// The next generation is computed before either field is changed. If the generation space is exhausted, this
+    /// function returns [`ReferenceError::GenerationExhausted`] and leaves both `current` and `generation` unchanged.
+    /// `replacement` must already have been validated and converted to the shared root representation by
+    /// [`Self::prepare_replacement`].
+    fn commit_replacement(
         current: &mut V,
         generation: &mut ReferenceGeneration,
         replacement: V,
@@ -465,35 +490,13 @@ impl<V: Value> Reference<V> {
         *generation = next_generation;
         Ok(())
     }
-
-    /// Validates that `value` preserves this reference's exact declared referent type.
-    fn validate_referent_type(&self, value: &V) -> Result<(), ReferenceError> {
-        let actual = value.r#type();
-        if actual.as_ref() == self.handle.r#type.referent() {
-            return Ok(());
-        }
-        Err(ReferenceError::ReferentTypeMismatch {
-            expected: self.handle.r#type.referent().to_string(),
-            actual: actual.to_string(),
-        })
-    }
-
-    /// Validates the exact value type stored behind every handle-local mapping.
-    fn validate_root_type(&self, value: &V) -> Result<(), ReferenceError> {
-        let actual = value.r#type();
-        let root_type = &self.handle.holder.root_type;
-        if actual.as_ref() == root_type {
-            return Ok(());
-        }
-        Err(ReferenceError::ReferentTypeMismatch { expected: root_type.to_string(), actual: actual.to_string() })
-    }
 }
 
-// Exact clones share one immutable handle and its type-identity mappings, so cloning is a single reference-count
-// increment.
 impl<V: Value> Clone for Reference<V> {
     #[inline]
     fn clone(&self) -> Self {
+        // Exact clones share one immutable handle and its type-identity mappings, so cloning is a single
+        // reference-count increment.
         Self { handle: Arc::clone(&self.handle) }
     }
 }
@@ -509,12 +512,13 @@ impl<V: Value> Debug for Reference<V> {
     }
 }
 
-// `Display` deliberately renders only the handle-local type: the Value rendering contract requires deterministic
-// output (renderings back diagnostics, rendered-program tests, and the debug-assertions transform-cache determinism
-// recheck), so the process-local holder address must not leak here. Runtime identity remains visible through `Debug`.
 impl<V: Value> Display for Reference<V> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // `ReferenceType::fmt` supplies the `ref<...>` wrapper. `Display` deliberately renders only that handle-local
+        // type because the `Value` rendering contract requires deterministic outputs (that is because this rendering
+        // backs diagnostics, rendered-program tests, and the debug-assertions transform-cache determinism checks), so
+        // the process-local holder address must not leak here. Runtime identity remains visible through `Debug`.
         Display::fmt(&self.handle.r#type, formatter)
     }
 }
@@ -543,6 +547,8 @@ impl<V: Value> Typed for Reference<V> {
         Cow::Borrowed(&self.handle.r#type)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Immutable handle-local type and identity mappings shared by exact clones of one [`Reference`].
 ///
@@ -660,9 +666,9 @@ impl<V: Value> ReferenceGuard<'_, V> {
     /// Returns a handle-local immutable snapshot without extracting the shared reference state.
     pub fn snapshot(&self) -> Result<V, ReferenceError> {
         match &*self.state {
-            ReferenceState::Ready { value, .. } | ReferenceState::Pending { value, .. } => {
-                self.reference.reconstruct_local(value)
-            }
+            ReferenceState::Ready { value, .. } | ReferenceState::Pending { value, .. } => value
+                .rename_type_identities(&self.reference.handle.root_to_handle)
+                .map_err(|error| ReferenceError::ValueReconstruction { message: error.to_string() }),
             ReferenceState::Frozen => Err(ReferenceError::Frozen),
             ReferenceState::Poisoned(reason) => Err(ReferenceError::ExecutionPoisoned { reason: reason.to_string() }),
             ReferenceState::Taken { .. } => Err(ReferenceError::TransactionInProgress),
@@ -817,7 +823,7 @@ impl<V: Value> ReferenceGuard<'_, V> {
     /// reconciliation that value accesses perform through `lock_ready_state`.
     #[cfg(test)]
     fn complete(&mut self, generation: ReferenceGeneration, result: Result<(), Arc<str>>) -> bool {
-        Reference::<V>::apply_completion(&mut self.state, generation, result)
+        Reference::<V>::apply_pending_completion(&mut self.state, generation, result)
     }
 
     /// Extracts the handle-local current value for a potentially donating backend invocation.
@@ -840,7 +846,7 @@ impl<V: Value> ReferenceGuard<'_, V> {
 
     /// Converts and validates a prospective replacement without changing the shared reference state.
     pub fn prepare_replacement(&self, value: V) -> Result<ReferenceReplacement<V>, ReferenceError> {
-        let stored = self.reference.prepare_stored(value)?;
+        let stored = self.reference.prepare_replacement(value)?;
         Ok(ReferenceReplacement { holder: Arc::downgrade(&self.reference.handle.holder), value: stored })
     }
 
