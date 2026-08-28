@@ -2941,15 +2941,14 @@ impl<'c> XlaDomain<'c> {
                     }
                     continue;
                 }
-                let observed_generations =
-                    guards.iter().map(ReferenceGuard::current_generation).collect::<Result<Vec<_>, _>>()?;
+                let observations = guards.iter().map(ReferenceGuard::observe).collect::<Result<Vec<_>, _>>()?;
                 let logical_arguments = arguments.as_ref().unwrap();
                 let mut execution_arguments = logical_arguments.clone();
                 for (_, &logical_input_index) in program.reference_states.iter().zip(&reference_state_input_indices) {
                     let ArrayIrValue::Reference(reference) = &logical_arguments[logical_input_index] else {
                         unreachable!("reference bindings were validated before holder acquisition")
                     };
-                    let snapshot = guards[guard_indices[&reference.id()]].snapshot()?;
+                    let snapshot = observations[guard_indices[&reference.id()]].snapshot().clone();
                     if snapshot.mesh() != program.mesh {
                         return Err(XlaDomainError::UnsupportedReferenceAbi {
                             reason: format!(
@@ -2974,9 +2973,14 @@ impl<'c> XlaDomain<'c> {
                     .iter()
                     .map(|(_, reference)| reference.lock_root())
                     .collect::<Result<Vec<ReferenceGuard<'_, Array<'c>>>, ProgramError>>()?;
-                let current_generations =
-                    guards.iter().map(ReferenceGuard::current_generation).collect::<Result<Vec<_>, _>>()?;
-                if current_generations != observed_generations {
+                let mut observations_are_current = true;
+                for (guard, observation) in guards.iter().zip(&observations) {
+                    if !guard.is_current(observation)? {
+                        observations_are_current = false;
+                        break;
+                    }
+                }
+                if !observations_are_current {
                     continue;
                 }
                 let read_leases = mutated_slots
@@ -2995,7 +2999,11 @@ impl<'c> XlaDomain<'c> {
                     continue;
                 }
 
-                let dependencies = guards.iter().filter_map(ReferenceGuard::dependency).collect::<Vec<_>>();
+                // Current observations still describe these snapshots. A pending observation may have become ready at
+                // the same generation; retaining its now-completed dependency is harmless and keeps one coherent
+                // value-generation-dependency tuple throughout the retry attempt.
+                let dependencies =
+                    observations.iter().filter_map(|observation| observation.dependency().cloned()).collect::<Vec<_>>();
                 for guard_index in &read_only_guard_indices {
                     guards[*guard_index].validate_read_lease_publication()?;
                 }
@@ -3007,7 +3015,7 @@ impl<'c> XlaDomain<'c> {
                             .map(|generation| (*guard_index, *logical_output_index, generation))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                // Generation validation under the ordered guards commits this attempt. Dropping the original logical
+                // Observation validation under the ordered guards commits this attempt. Dropping the original logical
                 // arguments here releases only retry ownership, allowing ordinary inputs to remain donatable.
                 drop(arguments.take());
                 // Nothing has been submitted or published yet, so a failed projection simply releases the guards.
@@ -9095,7 +9103,7 @@ mod tests {
 
         let unique = ArrayReference::new(f32_scalar(&client, &mesh, 1.0));
         let mut unique_guard = unique.lock_root().unwrap();
-        let mut inputs = vec![unique_guard.snapshot().unwrap()];
+        let mut inputs = vec![unique_guard.observe().unwrap().snapshot().clone()];
         drop(Array::into_execute_arguments_with_donation(inputs.clone(), &[device_id], &[true]).unwrap());
         inputs[0] = unique_guard.take().unwrap();
         let arguments = Array::into_execute_arguments_with_donation(inputs, &[device_id], &[true]).unwrap();
@@ -9106,7 +9114,7 @@ mod tests {
         let retained = shared_value.clone();
         let shared = ArrayReference::new(shared_value);
         let mut shared_guard = shared.lock_root().unwrap();
-        let mut inputs = vec![shared_guard.snapshot().unwrap()];
+        let mut inputs = vec![shared_guard.observe().unwrap().snapshot().clone()];
         drop(Array::into_execute_arguments_with_donation(inputs.clone(), &[device_id], &[true]).unwrap());
         inputs[0] = shared_guard.take().unwrap();
         let arguments = Array::into_execute_arguments_with_donation(inputs, &[device_id], &[true]).unwrap();

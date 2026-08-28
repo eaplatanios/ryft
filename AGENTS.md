@@ -320,6 +320,8 @@ update this file so that they do not need to remind you again in the future.
 - When editing rustdoc prose, reflow the surrounding paragraph toward the 120-column limit where the text naturally
   allows it; avoid leaving documentation lines arbitrarily short unless they are lists, code blocks, tables, links, or
   readability-driven sentence breaks.
+- In documentation strings, use "function" for callable APIs, including methods, rather than distinguishing methods
+  from free functions in prose.
 
 ## Testing Guidelines
 

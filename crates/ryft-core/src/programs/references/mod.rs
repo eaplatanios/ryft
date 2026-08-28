@@ -64,9 +64,9 @@
 //! The implementation is split by responsibility:
 //!
 //! - `types.rs` defines the structural [`ReferenceType`] and its cross-occurrence refinements.
-//! - `values.rs` defines the eager [`Reference`] value, backend-neutral completion dependencies, and synchronized
-//!   state machine for each reference allocation, including identity, generations, guards, read leases, pending
-//!   completion, and terminal poisoning.
+//! - `values.rs` defines the eager [`Reference`] value, coherent backend [`ReferenceObservation`]s, backend-neutral
+//!   completion dependencies, and the synchronized state machine for each reference allocation, including identity,
+//!   generations, guards, read leases, pending completion, and terminal poisoning.
 //! - `semantics.rs` defines the operation-local [`ReferenceOperationSemantics`] descriptor, access modes, and
 //!   root/alias classifications.
 //! - `operations.rs` defines the six generic primitives and their value-level capabilities: allocation
@@ -204,7 +204,7 @@ pub use semantics::{
 pub use types::{ReferenceType, ReferenceTypeRefinements};
 pub use values::{
     Reference, ReferenceCompletion, ReferenceCompletionBackend, ReferenceGeneration, ReferenceGuard, ReferenceId,
-    ReferenceReplacement,
+    ReferenceObservation, ReferenceReplacement,
 };
 
 #[cfg(test)]
