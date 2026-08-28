@@ -886,24 +886,21 @@ impl<'g, V: Value> ReadyOrPendingReferenceGuard<'g, V> {
     }
 }
 
-// TODO(eaplatanios): Review this block.
-/// Exclusive access to a [`Reference`] whose value is `Ready` and has no active read leases.
-///
-/// [`ReadyOrPendingReferenceGuard::wait_until_ready`] creates this guard after awaiting all work that could prevent safe
-/// synchronous extraction. Its only state-changing function is [`Self::take`], which removes the value and returns the
-/// owning [`TakenReferenceGuard`] that must replace or poison it.
+/// Provides exclusive access to a [`Reference`] that is in the `Ready` state and thus has no active read leases.
+/// [`ReadyOrPendingReferenceGuard::wait_until_ready`] creates this guard after awaiting all work that could prevent
+/// safe synchronous extraction. Its only state-changing function is [`Self::take`], which removes the value and returns
+/// the owning [`TakenReferenceGuard`] that must replace or poison it.
 pub struct ReadyReferenceGuard<'g, V: Value> {
     /// Underlying [`ReferenceGuard`].
     guard: ReferenceGuard<'g, V>,
 }
 
-// TODO(eaplatanios): Review this block.
 impl<'g, V: Value> ReadyReferenceGuard<'g, V> {
-    /// Removes the ready value and returns it together with the only guard that can resolve the resulting `Taken` state.
-    ///
-    /// The value is converted to this handle's type identities before the state changes. The next generation is also
-    /// computed first, so either failure leaves the reference `Ready`. After this function succeeds, the returned
-    /// [`TakenReferenceGuard`] must be replaced or poisoned; dropping it poisons the reference automatically.
+    /// Removes the ready value of the underlying [`Reference`] and returns it together with the only guard that can
+    /// resolve the resulting `Taken` state (i.e., a [`TakenReferenceGuard`]). The value is converted to this handle's
+    /// type identities before the state changes. The next generation is also computed first, so either failure leaves
+    /// the reference in the `Ready` state. After this function succeeds, the returned [`TakenReferenceGuard`] must be
+    /// replaced or poisoned. Dropping the returned [`TakenReferenceGuard`] poisons the reference automatically.
     ///
     /// # Errors
     ///
@@ -928,9 +925,7 @@ impl<'g, V: Value> ReadyReferenceGuard<'g, V> {
     }
 }
 
-// TODO(eaplatanios): Review this block.
 /// Exclusive ownership of a [`Reference`] whose value has been removed and must be replaced or poisoned.
-///
 /// [`ReadyReferenceGuard::take`] creates this guard for synchronous extraction. Asynchronous replacement transactions
 /// own the same typestate internally after submission. [`Self::replace`] restores a ready value, while [`Self::poison`]
 /// records why no replacement can be provided. Dropping the guard performs the same terminal transition with a generic
@@ -941,13 +936,11 @@ pub struct TakenReferenceGuard<'g, V: Value> {
     guard: Option<ReferenceGuard<'g, V>>,
 }
 
-// TODO(eaplatanios): Review this block.
 impl<'g, V: Value> TakenReferenceGuard<'g, V> {
-    /// Stores a synchronous replacement and changes the reference from `Taken` to `Ready`.
-    ///
-    /// This function consumes the taken guard, making a second replacement or poisoning transition impossible. If the
-    /// replacement has the wrong type or cannot be converted to shared storage, the reference is poisoned with that
-    /// validation error before the error is returned.
+    /// Stores a synchronous replacement and changes the reference state from `Taken` to `Ready`. This function consumes
+    /// this [`TakenReferenceGuard`], making a second replacement or poisoning transition impossible. If the replacement
+    /// has the wrong type or cannot be converted to shared storage, the reference is poisoned with that validation
+    /// error before the error is returned.
     ///
     /// # Parameters
     ///
@@ -977,7 +970,7 @@ impl<'g, V: Value> TakenReferenceGuard<'g, V> {
         Ok(ReadyReferenceGuard { guard: self.guard.take().unwrap() })
     }
 
-    /// Permanently poisons the taken reference because no valid replacement can be provided.
+    /// Permanently poisons the taken [`Reference`] because no valid replacement can be provided.
     ///
     /// # Parameters
     ///
