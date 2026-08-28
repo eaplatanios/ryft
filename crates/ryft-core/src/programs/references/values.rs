@@ -676,8 +676,7 @@ enum ReferenceState<V: Value> {
     Frozen,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
+// TODO(eaplatanios): Review this block.
 /// Backend-facing exclusive access to one [`Reference`] allocation.
 ///
 /// Unlike ordinary [`Reference`] access, this guard exposes unresolved `Pending` state without waiting. Backends use
@@ -743,6 +742,7 @@ pub struct ReferenceGuard<'a, V: Value> {
     state: MutexGuard<'a, ReferenceState<V>>,
 }
 
+// TODO(eaplatanios): Review this block.
 impl<V: Value> ReferenceGuard<'_, V> {
     // Observation and retry coordination.
 
@@ -802,6 +802,7 @@ impl<V: Value> ReferenceGuard<'_, V> {
             ReferenceState::Taken { .. } => Err(ReferenceError::TransactionInProgress),
         }
     }
+
     /// Prunes completed read leases and returns clones of those that remain pending.
     ///
     /// Both successful and failed terminal leases are removed because neither can still access the value. Returns an
@@ -1095,16 +1096,17 @@ impl<V: Value> ReferenceObservation<V> {
     }
 }
 
-/// Cloneable backend-neutral token for work that reads or replaces a reference value.
-///
-/// A token has one immutable terminal result: success or a backend-owned failure reason. It can be polled with
-/// [`Self::is_ready`], waited on with [`Self::r#await`], and combined in dependency order with [`Self::join`].
+/// Cloneable backend-neutral token for work that reads or replaces a [`Reference`] value. A token has one immutable
+/// terminal result: success or a backend-owned failure reason. It can be polled with [`Self::is_ready`], waited on with
+/// [`Self::r#await`], and combined in dependency order with [`Self::join`].
 #[derive(Clone)]
 pub struct ReferenceCompletion {
-    /// One backend completion or a core-owned flattened join.
+    /// Private representation kept behind this public wrapper so callers cannot construct or match its variants and
+    /// bypass [`Self::join`]'s normalization.
     storage: ReferenceCompletionStorage,
 }
 
+// TODO(eaplatanios): Review this block.
 impl ReferenceCompletion {
     /// Wraps a backend completion in a cloneable type-erased token.
     pub fn new(backend: impl ReferenceCompletionBackend) -> Self {
@@ -1173,24 +1175,24 @@ impl Debug for ReferenceCompletion {
     }
 }
 
-/// Internal representation of one primitive completion or a flattened join.
-///
-/// Keeping this enum private ensures joined tokens remain flat and preserve their original input order.
+/// Private representation of one primitive [`ReferenceCompletion`] or a flattened join. This is separate from the
+/// public [`ReferenceCompletion`] because keeping the enum private prevents callers from constructing nested joins
+/// directly, ensuring every joined completion passes through [`ReferenceCompletion::join`], which flattens nested
+/// joins, removes completed successes, and preserves the original input order.
 #[derive(Clone)]
 enum ReferenceCompletionStorage {
-    /// One backend completion.
+    /// Wraps a [`ReferenceCompletionBackend`].
     Backend(Arc<dyn ReferenceCompletionBackend>),
 
-    /// Ordered primitive completions flattened from one or more joins.
+    /// Ordered list of [`ReferenceCompletion`]s flattened from one or more joins.
     Joined(Arc<JoinedReferenceCompletion>),
 }
 
-/// Backend implementation stored behind a type-erased [`ReferenceCompletion`].
-///
-/// [`Self::is_ready`] may return `Ok(false)` before completion. Once either function observes success or failure, that
-/// terminal result must never change, and both functions must agree on it. [`ReferenceCompletion::join`] relies on this
-/// contract when it discards completed successes.
-pub trait ReferenceCompletionBackend: Send + Sync + 'static {
+/// Backend implementation stored behind a type-erased [`ReferenceCompletion`]. [`Self::is_ready`] may return
+/// `Ok(false)` before completion. Once either function observes success or failure, that terminal result must never
+/// change, and both functions must agree on it. [`ReferenceCompletion::join`] relies on this contract when it discards
+/// completed successes.
+pub trait ReferenceCompletionBackend: 'static + Send + Sync {
     /// Blocks until the represented work completes and returns its terminal result.
     fn r#await(&self) -> Result<(), Arc<str>>;
 
@@ -1198,29 +1200,31 @@ pub trait ReferenceCompletionBackend: Send + Sync + 'static {
     fn is_ready(&self) -> Result<bool, Arc<str>>;
 }
 
-/// Completion backend with an immediately available terminal result.
+/// [`ReferenceCompletion`] backend with an immediately available terminal result.
 struct ReadyReferenceCompletion(Result<(), Arc<str>>);
 
 impl ReferenceCompletionBackend for ReadyReferenceCompletion {
+    #[inline]
     fn r#await(&self) -> Result<(), Arc<str>> {
         self.0.clone()
     }
 
+    #[inline]
     fn is_ready(&self) -> Result<bool, Arc<str>> {
         self.0.clone().map(|_| true)
     }
 }
 
-/// Flattened ordered join created by [`ReferenceCompletion::join`].
+/// Flattened and ordered [`ReferenceCompletion`] join created by [`ReferenceCompletion::join`].
 struct JoinedReferenceCompletion {
-    /// Flat, input-ordered primitive completions.
+    /// Flat, input-ordered primitive [`ReferenceCompletion`]s.
     completions: Vec<ReferenceCompletion>,
 }
 
 impl ReferenceCompletionBackend for JoinedReferenceCompletion {
     fn r#await(&self) -> Result<(), Arc<str>> {
-        // A joined token represents completion of every member, so a failure does not permit an early return. Retain
-        // the first failure while continuing to wait for the remaining dependencies.
+        // A joined token represents completion of every member, so a failure does not permit an early return.
+        // Retain the first failure while continuing to wait for the remaining dependencies.
         let mut result = Ok(());
         for completion in &self.completions {
             if let Err(error) = completion.r#await()
@@ -1233,8 +1237,8 @@ impl ReferenceCompletionBackend for JoinedReferenceCompletion {
     }
 
     fn is_ready(&self) -> Result<bool, Arc<str>> {
-        // A known failure is not yet the join's terminal result while a later member remains pending. Once every member
-        // is terminal, report the first failure in the original order.
+        // A known failure is not yet the join's terminal result while a later member remains pending.
+        // Once every member is terminal, report the first failure in the original order.
         let mut result = Ok(true);
         for completion in &self.completions {
             match completion.is_ready() {
@@ -1248,16 +1252,14 @@ impl ReferenceCompletionBackend for JoinedReferenceCompletion {
     }
 }
 
-/// Type-checked replacement prepared for one reference allocation.
-///
-/// [`ReferenceGuard::prepare_replacement`] converts a handle-local value to the allocation's canonical type identities
-/// and records which allocation it belongs to. Installation verifies that identity before moving the value into shared
-/// state, preventing a multi-reference transaction from exchanging two otherwise type-compatible replacements.
+/// Type-checked value replacement prepared for one [`Reference`] allocation. [`ReferenceGuard::prepare_replacement`]
+/// converts a handle-local value to the allocation's canonical type identities and records which allocation it belongs
+/// to. Installation verifies that identity before moving the value into shared state, preventing a multi-reference
+/// transaction from exchanging two otherwise type-compatible replacements.
 pub struct ReferenceReplacement<V: Value> {
-    /// Weak pointer identifying the allocation for which this replacement was prepared.
-    ///
-    /// Keeping the weak control block alive prevents its address from being reused while this replacement exists, so
-    /// pointer equality remains a stable allocation-identity check even after the last strong handle is dropped.
+    /// Weak pointer identifying the allocation for which this [`ReferenceReplacement`] was prepared. Keeping the weak
+    /// control block alive prevents its address from being reused while this replacement exists, so pointer equality
+    /// remains a stable allocation-identity check even after the last strong handle is dropped.
     holder: Weak<ReferenceHolder<V>>,
 
     /// Value using the reference allocation's canonical type identities.
