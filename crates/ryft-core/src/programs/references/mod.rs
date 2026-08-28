@@ -148,14 +148,6 @@ pub enum ReferenceError {
     #[error("reference is frozen")]
     Frozen,
 
-    /// A guarded transaction attempted an operation incompatible with an extraction or active execution lease.
-    #[error("reference has a conflicting transaction or execution lease")]
-    TransactionInProgress,
-
-    /// A replacement transaction was applied to another allocation or no longer matches the claimed generation.
-    #[error("reference replacement transaction does not match the current reference transaction")]
-    ReplacementTransactionMismatch,
-
     /// The shared reference state exhausted its monotonically increasing mutation generation space.
     #[error("reference mutation generation is exhausted")]
     GenerationExhausted,
@@ -201,8 +193,9 @@ pub use semantics::{
 };
 pub use types::{ReferenceType, ReferenceTypeRefinements};
 pub use values::{
-    Reference, ReferenceCompletion, ReferenceCompletionBackend, ReferenceGeneration, ReferenceGuard, ReferenceId,
-    ReferenceObservation, ReferenceReplacementTransaction, ValidatedPendingReplacementTransaction,
+    PreparedReferenceReplacement, ReadyReferenceGuard, Reference, ReferenceCompletion, ReferenceCompletionBackend,
+    ReferenceGeneration, ReferenceGuard, ReferenceId, ReferenceObservation, ReferenceReplacementPreparation,
+    ReferenceReplacementTransaction, TakenReferenceGuard, ValidatedPendingReplacementTransaction,
 };
 
 #[cfg(test)]
@@ -225,11 +218,6 @@ mod tests {
                 "reference value reconstruction failed: unbound identity",
             ),
             (ReferenceError::Frozen, "reference is frozen"),
-            (ReferenceError::TransactionInProgress, "reference has a conflicting transaction or execution lease"),
-            (
-                ReferenceError::ReplacementTransactionMismatch,
-                "reference replacement transaction does not match the current reference transaction",
-            ),
             (ReferenceError::GenerationExhausted, "reference mutation generation is exhausted"),
             (ReferenceError::Poisoned, "reference state mutex is poisoned"),
             (

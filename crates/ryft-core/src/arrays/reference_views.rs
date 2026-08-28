@@ -696,7 +696,7 @@ mod tests {
 
     use crate::arrays::arrays::Array;
     use crate::arrays::types::data::DataType;
-    use crate::programs::ReferenceCompletion;
+    use crate::programs::{ReferenceCompletion, ReferenceReplacementPreparation};
 
     use super::*;
 
@@ -899,9 +899,11 @@ mod tests {
     #[test]
     fn test_array_reference_view_derivation_is_pure_structural_composition() {
         let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]));
-        let mut guard = root.lock_root().unwrap();
-        let generation = guard.next_replacement_generation().unwrap();
-        let _transaction = guard.begin_replacement(generation, ReferenceCompletion::ready(Ok(())));
+        let guard = root.lock_root().unwrap();
+        let ReferenceReplacementPreparation::Prepared(prepared) = guard.prepare_replacement().unwrap() else {
+            panic!("new reference unexpectedly has active read leases")
+        };
+        let transaction = prepared.begin(ReferenceCompletion::ready(Ok(())));
 
         // A derived handle is pure structural metadata over a live reference, so composing one must never resolve its
         // submitted work. The reference is parked in its `Taken` state, where every value access is unavailable behind
@@ -912,8 +914,7 @@ mod tests {
 
         // Poisoning the submitted mutation is terminal for the alias family, but further derivation remains structural
         // composition. The resulting handle reports the reference failure only when it attempts to access state.
-        guard.poison("submission failed");
-        drop(guard);
+        transaction.poison("submission failed");
         let poisoned = ReferenceError::ExecutionPoisoned { reason: "submission failed".to_string() };
         assert_eq!(root.read().unwrap_err().downcast_custom::<ReferenceError>(), Some(&poisoned));
         let composed = derived.with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: 0 }).unwrap();

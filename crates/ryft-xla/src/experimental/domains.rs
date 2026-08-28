@@ -20,10 +20,10 @@ use ryft_core::{
     InterpretationDriver, Layout, LogicalMesh, LoweringRequest, Memory, MeshAxis, MeshAxisType, ONE_OPERATION_NAME,
     Operation, Parameterized, Placeholder, ProgramError, Provenance, ProvenanceScope, ReductionKind,
     ReferenceCompletion, ReferenceCompletionBackend, ReferenceDischargeResult, ReferenceExecution, ReferenceGuard,
-    ReferenceId, ReferenceSource, ReferenceStateBinding, ScatterReductionKind, Shape, Sharding, ShardingDimension,
-    StageRequest, StagedFunction, StatefulCompilationDomain, StaticShape, StridedLayout, Tile, TileDimension,
-    TiledLayout, Type, TypeError, TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME, Zero,
-    ZeroOperationProvider,
+    ReferenceId, ReferenceReplacementPreparation, ReferenceSource, ReferenceStateBinding, ScatterReductionKind, Shape,
+    Sharding, ShardingDimension, StageRequest, StagedFunction, StatefulCompilationDomain, StaticShape, StridedLayout,
+    Tile, TileDimension, TiledLayout, Type, TypeError, TypeRefinements, Typed, ValueProjection, ZERO_OPERATION_NAME,
+    Zero, ZeroOperationProvider,
 };
 #[cfg(test)]
 use ryft_core::{Array as CpuArray, ProjectedContext};
@@ -2786,6 +2786,19 @@ impl<'c> XlaDomain<'c> {
         Ok((output, fence))
     }
 
+    /// Locks one stateful reference while preserving reference lifecycle errors as [`XlaDomainError::Reference`].
+    fn lock_stateful_reference<'g>(
+        reference: &'g ArrayReference<Array<'c>>,
+    ) -> Result<ReferenceGuard<'g, Array<'c>>, XlaDomainError> {
+        reference.lock_root().map_err(|error| {
+            if let Some(reference_error) = error.downcast_custom::<ryft_core::ReferenceError>().cloned() {
+                XlaDomainError::Reference(reference_error)
+            } else {
+                XlaDomainError::Tracing(error)
+            }
+        })
+    }
+
     /// Submits one stateful request, publishes its dependencies, and commits hidden final states without waiting for
     /// device completion when the logical boundary is static.
     fn execute_stateful_request_async<Request>(
@@ -2900,7 +2913,6 @@ impl<'c> XlaDomain<'c> {
                 bindings.iter().enumerate().map(|(index, (id, _))| (*id, index)).collect::<BTreeMap<_, _>>();
 
             let mut mutated_slots = Vec::new();
-            let mut read_only_guard_indices = Vec::new();
             for (state, &logical_input_index) in program.reference_states.iter().zip(&reference_state_input_indices) {
                 let ArrayIrValue::Reference(reference) = &arguments[logical_input_index] else {
                     unreachable!("reference bindings were validated before holder acquisition")
@@ -2908,11 +2920,10 @@ impl<'c> XlaDomain<'c> {
                 let guard_index = guard_indices[&reference.id()];
                 if let Some(logical_output_index) = state.final_state_output_index() {
                     mutated_slots.push((guard_index, logical_output_index));
-                } else {
-                    read_only_guard_indices.push(guard_index);
                 }
             }
             mutated_slots.sort_by_key(|(guard_index, _)| *guard_index);
+            let mutated_outputs = mutated_slots.iter().copied().collect::<BTreeMap<_, _>>();
             let mut arguments = Some(arguments);
 
             let donation_overrides = program
@@ -2921,26 +2932,18 @@ impl<'c> XlaDomain<'c> {
                 .zip(&reference_state_input_indices)
                 .map(|(_, &logical_input_index)| (logical_input_index, false))
                 .collect::<Vec<_>>();
-            let (execution, input_refinements, mutated, publication, replacement_transactions, mut guards) = 'snapshot: loop {
-                let mut guards = bindings
+            let (
+                execution,
+                input_refinements,
+                publication,
+                replacement_transactions,
+                read_only_guards,
+                prepared_replacements,
+            ) = 'snapshot: loop {
+                let guards = bindings
                     .iter()
-                    .map(|(_, reference)| reference.lock_root())
-                    .collect::<Result<Vec<ReferenceGuard<'_, Array<'c>>>, ProgramError>>()?;
-                let read_leases = mutated_slots
-                    .iter()
-                    .flat_map(|(guard_index, _)| guards[*guard_index].active_read_leases())
-                    .collect::<Vec<_>>();
-                if !read_leases.is_empty() {
-                    drop(guards);
-                    for lease in read_leases {
-                        match lease.r#await() {
-                            Ok(()) | Err(_) => {
-                                // A completed read lease releases its input snapshot regardless of execution outcome.
-                            }
-                        }
-                    }
-                    continue;
-                }
+                    .map(|(_, reference)| Self::lock_stateful_reference(reference))
+                    .collect::<Result<Vec<ReferenceGuard<'_, Array<'c>>>, XlaDomainError>>()?;
                 let observations = guards.iter().map(ReferenceGuard::observe).collect::<Result<Vec<_>, _>>()?;
                 let logical_arguments = arguments.as_ref().unwrap();
                 let mut execution_arguments = logical_arguments.clone();
@@ -2969,26 +2972,31 @@ impl<'c> XlaDomain<'c> {
                 let prepared_execution =
                     self.prepare_compiled_execution(program, arrays, donation_overrides.as_slice())?;
 
-                let mut guards = bindings
+                let guards = bindings
                     .iter()
-                    .map(|(_, reference)| reference.lock_root())
-                    .collect::<Result<Vec<ReferenceGuard<'_, Array<'c>>>, ProgramError>>()?;
-                let mut observations_are_current = true;
-                for (guard, observation) in guards.iter().zip(&observations) {
-                    if !observation.is_current(guard)? {
-                        observations_are_current = false;
-                        break;
-                    }
-                }
-                if !observations_are_current {
+                    .map(|(_, reference)| Self::lock_stateful_reference(reference))
+                    .collect::<Result<Vec<ReferenceGuard<'_, Array<'c>>>, XlaDomainError>>()?;
+                if !guards.iter().zip(&observations).all(|(guard, observation)| observation.is_current(guard)) {
                     continue;
                 }
-                let read_leases = mutated_slots
-                    .iter()
-                    .flat_map(|(guard_index, _)| guards[*guard_index].active_read_leases())
-                    .collect::<Vec<_>>();
+                let mut read_only_guards = Vec::with_capacity(bindings.len() - mutated_slots.len());
+                let mut prepared_replacements = Vec::with_capacity(mutated_slots.len());
+                let mut read_leases = Vec::new();
+                for (guard_index, guard) in guards.into_iter().enumerate() {
+                    if let Some(&logical_output_index) = mutated_outputs.get(&guard_index) {
+                        match guard.prepare_replacement()? {
+                            ReferenceReplacementPreparation::Prepared(prepared) => {
+                                prepared_replacements.push((logical_output_index, prepared));
+                            }
+                            ReferenceReplacementPreparation::Waiting(mut leases) => read_leases.append(&mut leases),
+                        }
+                    } else {
+                        read_only_guards.push(guard);
+                    }
+                }
                 if !read_leases.is_empty() {
-                    drop(guards);
+                    drop(prepared_replacements);
+                    drop(read_only_guards);
                     for lease in read_leases {
                         match lease.r#await() {
                             Ok(()) | Err(_) => {
@@ -3004,26 +3012,16 @@ impl<'c> XlaDomain<'c> {
                 // value-generation-dependency tuple throughout the retry attempt.
                 let dependencies =
                     observations.iter().filter_map(|observation| observation.dependency().cloned()).collect::<Vec<_>>();
-                for guard_index in &read_only_guard_indices {
-                    guards[*guard_index].validate_read_lease_publication()?;
-                }
-                let mutated = mutated_slots
-                    .iter()
-                    .map(|(guard_index, logical_output_index)| {
-                        guards[*guard_index]
-                            .next_replacement_generation()
-                            .map(|generation| (*guard_index, *logical_output_index, generation))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
                 // Observation validation under the ordered guards commits this attempt. Dropping the original logical
                 // arguments here releases only retry ownership, allowing ordinary inputs to remain donatable.
                 drop(arguments.take());
                 // Nothing has been submitted or published yet, so a failed projection simply releases the guards.
                 let (execution_arguments, input_refinements, physical_output_count) =
                     prepared_execution.into_arguments().map_err(XlaDomainError::from)?;
-                let guard_storage = RefCell::new(guards);
+                let read_only_guard_storage = RefCell::new(read_only_guards);
+                let prepared_replacement_storage = RefCell::new(prepared_replacements);
                 let publication: RefCell<Option<ReferenceCompletion>> = RefCell::new(None);
-                let replacement_transactions = RefCell::new(Vec::with_capacity(mutated.len()));
+                let replacement_transactions = RefCell::new(Vec::with_capacity(mutated_slots.len()));
                 let execution =
                     execute_pjrt_buffers(&program.executable, execution_arguments, physical_output_count, |fence| {
                         let mut completions = dependencies.clone();
@@ -3033,27 +3031,29 @@ impl<'c> XlaDomain<'c> {
                             completions.push(injected);
                         }
                         let completion = ReferenceCompletion::joined(completions);
-                        let mut guards = guard_storage.borrow_mut();
-                        for guard_index in &read_only_guard_indices {
-                            guards[*guard_index].publish_read_lease_unchecked(completion.clone());
+                        for guard in read_only_guard_storage.borrow_mut().iter_mut() {
+                            guard.publish_read_lease(completion.clone());
                         }
                         let mut transactions = replacement_transactions.borrow_mut();
-                        for (guard_index, _, generation) in &mutated {
-                            transactions.push(guards[*guard_index].begin_replacement(*generation, completion.clone()));
+                        for (logical_output_index, prepared) in
+                            std::mem::take(&mut *prepared_replacement_storage.borrow_mut())
+                        {
+                            transactions.push((logical_output_index, prepared.begin(completion.clone())));
                         }
                         *publication.borrow_mut() = Some(completion);
                     });
                 break 'snapshot (
                     execution,
                     input_refinements,
-                    mutated,
                     publication.into_inner(),
                     replacement_transactions.into_inner(),
-                    guard_storage.into_inner(),
+                    read_only_guard_storage.into_inner(),
+                    prepared_replacement_storage.into_inner(),
                 );
             };
             let Some(completion) = publication else {
-                drop(guards);
+                drop(prepared_replacements);
+                drop(read_only_guards);
                 return match execution {
                     Err(error) => Ok(ReferenceExecution::ready(Err(error))),
                     Ok(_) => unreachable!("successful PJRT submission must publish reference state"),
@@ -3063,16 +3063,17 @@ impl<'c> XlaDomain<'c> {
                 Ok(execution) => execution,
                 Err(error) => {
                     let reason = error.to_string();
-                    for (guard_index, _, _) in &mutated {
-                        guards[*guard_index].poison(reason.clone());
+                    for (_, transaction) in replacement_transactions {
+                        transaction.poison(reason.clone());
                     }
-                    drop(guards);
+                    drop(read_only_guards);
                     return Ok(ReferenceExecution::pending(Err(error), completion, xla_reference_completion_error));
                 }
             };
             let (physical_outputs, fence) = execution.into_parts();
             let mut physical_outputs = physical_outputs.into_iter().map(Some).collect::<Vec<_>>();
-            let replacement_commit = (|| -> Result<(), XlaDomainError> {
+            debug_assert!(prepared_replacements.is_empty());
+            let replacements = (|| -> Result<Vec<_>, XlaDomainError> {
                 #[cfg(test)]
                 if take_stateful_failure_injection(StatefulFailureInjection::BeforeHiddenReplacementCommit) {
                     return Err(XlaDomainError::InvalidCompilationOptions {
@@ -3089,9 +3090,15 @@ impl<'c> XlaDomain<'c> {
                 let mut hidden_outputs = (program.public_output_count..program.output_types.len())
                     .zip(hidden_outputs)
                     .collect::<BTreeMap<_, _>>();
-                let replacements = mutated
+                if replacement_transactions.len() != mutated_slots.len() {
+                    return Err(ProgramError::MalformedProgram(
+                        "submitted reference replacement count does not match mutated reference count".to_string(),
+                    )
+                    .into());
+                }
+                let replacements = replacement_transactions
                     .iter()
-                    .map(|(_, logical_output_index, _)| {
+                    .map(|(logical_output_index, _)| {
                         hidden_outputs.remove(logical_output_index).ok_or_else(|| {
                             ProgramError::MalformedProgram("hidden state output was claimed twice".to_string())
                         })
@@ -3103,55 +3110,49 @@ impl<'c> XlaDomain<'c> {
                     )
                     .into());
                 }
-                if replacement_transactions.len() != mutated.len() {
-                    return Err(ProgramError::MalformedProgram(
-                        "submitted reference replacement count does not match mutated reference count".to_string(),
-                    )
-                    .into());
-                }
-                let mut replacements_by_guard_index = BTreeMap::new();
-                for ((guard_index, _, _), (transaction, replacement)) in
-                    mutated.iter().zip(replacement_transactions.into_iter().zip(replacements))
-                {
-                    let previous = replacements_by_guard_index.insert(*guard_index, (transaction, replacement));
-                    if previous.is_some() {
-                        return Err(ProgramError::MalformedProgram(
-                            "mutated reference guard was claimed twice".to_string(),
-                        )
-                        .into());
-                    }
-                }
-                if replacements_by_guard_index.keys().any(|guard_index| *guard_index >= guards.len()) {
-                    return Err(ProgramError::MalformedProgram(
-                        "mutated reference guard index is out of range".to_string(),
-                    )
-                    .into());
-                }
-                let mut validated_replacements = Vec::with_capacity(mutated.len());
-                for (guard_index, guard) in guards.iter_mut().enumerate() {
-                    if let Some((transaction, replacement)) = replacements_by_guard_index.remove(&guard_index) {
-                        validated_replacements.push(transaction.validate(guard, replacement)?);
-                    }
-                }
-                debug_assert!(replacements_by_guard_index.is_empty());
-                for replacement in validated_replacements {
-                    replacement.commit();
-                }
-                Ok(())
+                Ok(replacements)
             })();
-            if let Err(error) = replacement_commit {
-                let reason = error.to_string();
-                for (guard_index, _, _) in &mutated {
-                    guards[*guard_index].poison(reason.clone());
+            let replacements = match replacements {
+                Ok(replacements) => replacements,
+                Err(error) => {
+                    let reason = error.to_string();
+                    for (_, transaction) in replacement_transactions {
+                        transaction.poison(reason.clone());
+                    }
+                    drop(read_only_guards);
+                    return Ok(ReferenceExecution::pending(Err(error), completion, xla_reference_completion_error));
                 }
-                drop(guards);
-                return Ok(ReferenceExecution::pending(Err(error), completion, xla_reference_completion_error));
+            };
+            let mut submitted_replacements = replacement_transactions.into_iter().zip(replacements);
+            let mut validated_replacements = Vec::with_capacity(mutated_slots.len());
+            while let Some(((_, transaction), replacement)) = submitted_replacements.next() {
+                match transaction.validate(replacement) {
+                    Ok(replacement) => validated_replacements.push(replacement),
+                    Err(error) => {
+                        let reason = error.to_string();
+                        for replacement in validated_replacements {
+                            replacement.poison(reason.clone());
+                        }
+                        for ((_, transaction), _) in submitted_replacements {
+                            transaction.poison(reason.clone());
+                        }
+                        drop(read_only_guards);
+                        return Ok(ReferenceExecution::pending(
+                            Err(error.into()),
+                            completion,
+                            xla_reference_completion_error,
+                        ));
+                    }
+                }
             }
+            let committed_replacement_guards =
+                validated_replacements.into_iter().map(|replacement| replacement.commit()).collect::<Vec<_>>();
             // Mutated hidden outputs are statically shaped under the current ABI, so neither buffer logical-shape
             // queries nor runtime-extent materialization can wait for device execution during replacement commit.
             // Release every reference guard before public reconstruction, where dynamic outputs may require either
             // wait.
-            drop(guards);
+            drop(committed_replacement_guards);
+            drop(read_only_guards);
 
             let public_result = (|| -> Result<_, XlaDomainError> {
                 #[cfg(test)]
@@ -9133,24 +9134,26 @@ mod tests {
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
 
         let unique = ArrayReference::new(f32_scalar(&client, &mesh, 1.0));
-        let mut unique_guard = unique.lock_root().unwrap();
+        let unique_guard = unique.lock_root().unwrap();
         let mut inputs = vec![unique_guard.observe().unwrap().snapshot().clone()];
         drop(Array::into_execute_arguments_with_donation(inputs.clone(), &[device_id], &[true]).unwrap());
-        inputs[0] = unique_guard.take().unwrap();
+        let (value, unique_taken) = unique_guard.wait_until_ready().unwrap().take().unwrap();
+        inputs[0] = value;
         let arguments = Array::into_execute_arguments_with_donation(inputs, &[device_id], &[true]).unwrap();
         assert!(arguments.inputs_by_device()[0][0].donatable);
-        unique_guard.poison("test transaction consumed unique input");
+        unique_taken.poison("test transaction consumed unique input");
 
         let shared_value = f32_scalar(&client, &mesh, 2.0);
         let retained = shared_value.clone();
         let shared = ArrayReference::new(shared_value);
-        let mut shared_guard = shared.lock_root().unwrap();
+        let shared_guard = shared.lock_root().unwrap();
         let mut inputs = vec![shared_guard.observe().unwrap().snapshot().clone()];
         drop(Array::into_execute_arguments_with_donation(inputs.clone(), &[device_id], &[true]).unwrap());
-        inputs[0] = shared_guard.take().unwrap();
+        let (value, shared_taken) = shared_guard.wait_until_ready().unwrap().take().unwrap();
+        inputs[0] = value;
         let arguments = Array::into_execute_arguments_with_donation(inputs, &[device_id], &[true]).unwrap();
         assert!(!arguments.inputs_by_device()[0][0].donatable);
-        shared_guard.poison("test transaction consumed shared input");
+        shared_taken.poison("test transaction consumed shared input");
         assert_eq!(read_f32s(&client, &retained), vec![2.0]);
     }
 
