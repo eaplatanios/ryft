@@ -83,9 +83,11 @@ impl ReferenceGeneration {
 /// `Ready` exposes a completed immutable snapshot. `Taken` contains no accessible value: the value was either returned
 /// by [`ReferenceGuard::take`] or removed after an asynchronous mutation was submitted. The [`ReferenceGuard`] that
 /// made this transition keeps the shared state locked and must replace the missing value or mark the reference
-/// `Poisoned` before it is released. Committing an asynchronous replacement changes the state to `Pending`, where
-/// the new value remains inaccessible until its cumulative [`ReferenceCompletion`] succeeds. Generations ensure that
-/// completion of an older execution cannot affect a newer mutation. `Frozen` and `Poisoned` are terminal states.
+/// `Poisoned` before it is released. Committing an asynchronous replacement changes the state to `Pending`, which
+/// stores the replacement together with its cumulative [`ReferenceCompletion`]. Ordinary value access waits for that
+/// completion without holding the state lock, then changes the state to `Ready` on success or `Poisoned` on failure.
+/// Generations ensure that completion of an older execution cannot affect a newer mutation. `Frozen` and `Poisoned` are
+/// terminal states.
 ///
 /// Read-only asynchronous executions do not enter a separate state. They publish completion leases on `Ready` or
 /// `Pending`. A mutation waits for those leases before it may remove the value, preventing donated storage from racing
@@ -794,7 +796,7 @@ impl<V: Value> ReferenceGuard<'_, V> {
             ReferenceState::Ready { read_leases, .. } | ReferenceState::Pending { read_leases, .. } => read_leases,
             _ => return Vec::new(),
         };
-        // A terminal failure matters to the invocation that owns the lease, but it no longer pins this reference's
+        // A terminal failure matters to the invocation that submitted the lease, but it no longer pins this reference's
         // value. Retain only executions that can still be reading the snapshot.
         read_leases.retain(|lease| matches!(lease.is_ready(), Ok(false)));
         read_leases.clone()
@@ -970,15 +972,17 @@ impl<V: Value> ReferenceGuard<'_, V> {
         Ok(())
     }
 
-    // Failure handling.
-
-    /// Changes `Taken` state to terminal `Poisoned` state when no valid replacement can be provided.
-    ///
+    /// Changes from the `Taken` state to the terminal `Poisoned` state when no valid replacement can be provided.
     /// Call this after [`Self::take`] or [`Self::begin_replacement`] if the backend cannot produce or validate a
     /// replacement. Later access reports `reason` through [`ReferenceError::ExecutionPoisoned`]. This function is
     /// infallible so cleanup cannot replace the original failure with another error. It has no effect unless the
     /// reference state is `Taken`.
-    pub fn poison(&mut self, reason: impl Into<Arc<str>>) {
+    ///
+    /// # Parameters
+    ///
+    ///   - `reason`: Failure description reported by later attempts to access the underlying [`Reference`].
+    #[inline]
+    pub fn poison<R: Into<Arc<str>>>(&mut self, reason: R) {
         if matches!(*self.state, ReferenceState::Taken { .. }) {
             *self.state = ReferenceState::Poisoned(reason.into());
         }
@@ -1316,10 +1320,10 @@ pub struct ValidatedPendingReplacementTransaction<'g, 'r, V: Value> {
 }
 
 impl<V: Value> ValidatedPendingReplacementTransaction<'_, '_, V> {
-    /// Stores the validated replacement and changes its [`Reference`] from `Taken` to `Pending`. This function is
-    /// infallible because validation established every precondition while exclusively borrowing the guard. The stored
-    /// completion eventually changes the replacement to `Ready` or marks the reference `Poisoned` if backend execution
-    /// fails.
+    /// Stores the validated replacement and changes its [`Reference`] state from `Taken` to `Pending`. This function is
+    /// infallible because validation established every precondition while exclusively borrowing the [`ReferenceGuard`].
+    /// After the stored completion resolves, ordinary reference access reconciles `Pending` to `Ready` on success or
+    /// `Poisoned` on backend failure.
     #[inline]
     pub fn commit(self) {
         let Self { guard, generation, value, completion } = self;
