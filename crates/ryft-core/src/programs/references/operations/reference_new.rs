@@ -126,11 +126,11 @@ where
                 output_types[0],
             ))
         })?;
-        if context.selects_allocation(driver.instruction(), 0) {
+        if context.selects_internal(driver.instruction(), 0) {
             return Ok(vec![context.allocate_discharged(r#type, initial)?]);
         }
 
-        // An unselected allocation site survives, so the operation is replayed and its result is the destination
+        // An unselected allocation target survives, so the operation is replayed and its result is the destination
         // reference bound to that allocation.
         let mut outputs = context.parent().bind(*self, Vec::new(), std::slice::from_ref(&initial))?;
         check_count!("output", outputs, 1, ProgramError);
@@ -247,8 +247,8 @@ mod tests {
 
     #[test]
     fn test_reference_primitive_discharge_preserves_an_unselected_allocation() {
-        // The allocation rule consults its own replay position against the selection, so an unselected allocation
-        // site is replayed rather than turned into threaded state, and its allocated reference survives in the
+        // The allocation rule consults its own replay position against the targets, so an unselected allocation
+        // target is replayed rather than turned into threaded state, and its allocated reference survives in the
         // destination.
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let initial = builder.add_input(TestType::Value(REFERENT));
@@ -279,11 +279,11 @@ mod tests {
             in (%3)"},
         );
 
-        // Selecting that same site is the everything-selected case, so it must agree with full discharge exactly.
-        let sites = source.reference_discharge_sites(0).unwrap();
+        // Selecting that same target is the everything-selected case, so it must agree with full discharge exactly.
+        let targets = source.reference_discharge_targets(0).unwrap();
         let selected = source
             .clone()
-            .partially_discharge_references_with_policy::<TestReferenceDischarge>(0, sites.as_slice())
+            .partially_discharge_references_with_policy::<TestReferenceDischarge>(0, targets.as_slice())
             .unwrap()
             .try_into_full()
             .unwrap();

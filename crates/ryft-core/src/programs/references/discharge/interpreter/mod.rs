@@ -27,7 +27,7 @@ use crate::programs::types::{Type, Typed};
 use super::super::types::ReferenceType;
 use super::policies::{ReferenceAccumulationPolicy, ReferenceDischargePolicy};
 use super::results::ReferenceSource;
-use super::selection::{ReferenceDischargeSelection, ReferenceDischargeSite};
+use super::targets::{ReferenceDischargeTarget, ReferenceDischargeTargets};
 
 // TODO(eaplatanios): Review this module.
 
@@ -35,8 +35,8 @@ use super::selection::{ReferenceDischargeSelection, ReferenceDischargeSite};
 ///
 /// Handles are minted by [`ReferenceDischargeContext`] as allocations enter its environment, so they are interpreter
 /// identities rather than source-program coordinates: they exist only for the duration of one discharge and are
-/// meaningful only against the environment that produced them. Pre-transform identity for caller-facing selection is
-/// [`ReferenceDischargeSite`] instead.
+/// meaningful only against the environment that produced them. Pre-transform identity for caller-facing targets is
+/// [`ReferenceDischargeTarget`] instead.
 ///
 /// Each handle records which environment minted it, so a handle from an unrelated discharge is reported rather than
 /// silently addressing whichever allocation happens to occupy the same position. That is also what isolates a structured
@@ -475,10 +475,10 @@ pub struct ReferenceDischargeContext<C: Domain, P: ReferenceDischargePolicy<C>> 
     /// capture prefix discharges under the same scope; a region fork rebuilds the scope in its own allocation terms.
     captures: ReferenceCaptureScope<C::Constant>,
 
-    /// Reference sites this discharge normalizes into immutable state. Every allocation the selection omits is preserved,
-    /// and the selection is shared unchanged by every clone and by every region fork, because a site names a source
+    /// Reference targets this discharge normalizes into immutable state. Every allocation they omit is preserved, and
+    /// the targets are shared unchanged by every clone and by every region fork, because a target names a source
     /// coordinate that means the same thing wherever the replay reaches it.
-    selection: ReferenceDischargeSelection,
+    targets: ReferenceDischargeTargets,
 }
 
 impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> {
@@ -488,17 +488,17 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     /// The capture scope is populated afterwards rather than here, because the allocations it binds are minted by this very
     /// context as its boundary is threaded. Partial discharge is requested through
     /// The [`partial-discharge entry point`](crate::Program::partially_discharge_references_with_policy) must be used
-    /// instead of constructing a context, so that a selection is always validated against the program whose
+    /// instead of constructing a context, so that the targets are always validated against the program whose
     /// coordinates it names.
     #[inline]
     pub fn new(parent: C) -> Self {
-        Self::new_selecting(parent, ReferenceDischargeSelection::everything())
+        Self::new_with_targets(parent, ReferenceDischargeTargets::everything())
     }
 
     /// Creates a discharge context with an empty allocation environment and an empty capture scope over the provided
-    /// destination context, discharging exactly the references `selection` names.
+    /// destination context, discharging exactly the references named by `targets`.
     #[inline]
-    pub(super) fn new_selecting(parent: C, selection: ReferenceDischargeSelection) -> Self {
+    pub(super) fn new_with_targets(parent: C, targets: ReferenceDischargeTargets) -> Self {
         Self {
             parent,
             environment: Rc::new(RefCell::new(ReferenceDischargeEnvironment {
@@ -506,7 +506,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
                 allocations: Vec::new(),
             })),
             captures: ReferenceCaptureScope::default(),
-            selection,
+            targets,
         }
     }
 
@@ -515,10 +515,10 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     ///
     /// An application that did not come from a replayed instruction — a region-free rule invocation through
     /// [`EmptyRegionDriver`](crate::programs::EmptyRegionDriver) — has no source coordinate and is always
-    /// discharged: no [`ReferenceDischargeSite`] can name it, so declining it would express nothing about the
+    /// discharged: no [`ReferenceDischargeTarget`] can name it, so declining it would express nothing about the
     /// caller's choice.
     ///
-    /// This is the only selection question a rule ever asks, which is why it is the only one exposed. Whether an
+    /// This is the only target query a rule ever makes, which is why it is the only one exposed. Whether an
     /// *entry-boundary* allocation was selected is decided once, by the program-level entry point that threads the boundary,
     /// and no rule is in a position to ask it.
     ///
@@ -527,16 +527,16 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     ///   - `instruction`: Replay position of the application, from [`ReferenceDischargeDriver::instruction`].
     ///   - `output_index`: Output position at which the application defines the fresh allocation.
     #[inline]
-    pub fn selects_allocation(&self, instruction: Option<InstructionId>, output_index: usize) -> bool {
+    pub fn selects_internal(&self, instruction: Option<InstructionId>, output_index: usize) -> bool {
         instruction.is_none_or(|instruction| {
-            self.selection.selects(ReferenceDischargeSite::Allocation { instruction, output_index })
+            self.targets.selects(ReferenceDischargeTarget::Internal { instruction, output_index })
         })
     }
 
     /// Returns whether one entry-boundary allocation was selected for discharge.
     #[inline]
     pub(super) fn selects_external(&self, source: ReferenceSource) -> bool {
-        self.selection.selects(ReferenceDischargeSite::External(source))
+        self.targets.selects(ReferenceDischargeTarget::External(source))
     }
 
     /// Returns the destination context that owns the discharged values.
@@ -564,7 +564,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
             parent: self.parent.clone(),
             environment: Rc::clone(&self.environment),
             captures,
-            selection: self.selection.clone(),
+            targets: self.targets.clone(),
         }
     }
 
@@ -1046,7 +1046,7 @@ impl<C: Clone + Domain, P: ReferenceDischargePolicy<C>> Clone for ReferenceDisch
             parent: self.parent.clone(),
             environment: Rc::clone(&self.environment),
             captures: self.captures.clone(),
-            selection: self.selection.clone(),
+            targets: self.targets.clone(),
         }
     }
 }

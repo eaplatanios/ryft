@@ -25,7 +25,7 @@ use ryft_core::{
     Context, Domain, EagerContext, Effect, Effects, ExternalReferenceBinding, InterpretableOperation,
     InterpretationDriver, NoIdentity, Operation, OutputRegionProvenance, Parameter, Placeholder, Program,
     ProgramBuilder, ProgramError, RecursiveReferenceDischargeDriver, ReferenceAccessMode, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeSite, ReferenceDischargeValue,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeTarget, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceInput, ReferenceOperationSemantics, ReferenceOutput,
     ReferenceRegionDischargeBoundary, ReferenceRegionStateInsertion, ReferenceSource, ReferenceType, RegionInterface,
     RegionSlot, Trace, Tracer, TracingContext, Type, TypeError, Typed, Value, discharge_reference_free_operation,
@@ -374,7 +374,7 @@ where
             Self::ReferenceNew => {
                 check_count!("input", inputs, 1, ProgramError);
                 let initial = inputs[0].expect_ordinary("an initial state")?.clone();
-                if context.selects_allocation(driver.instruction(), 0) {
+                if context.selects_internal(driver.instruction(), 0) {
                     return Ok(vec![context.allocate_discharged(ReferenceType::new(RegisterType), initial)?]);
                 }
                 let mut outputs = context.parent().bind(*self, Vec::new(), std::slice::from_ref(&initial))?;
@@ -671,16 +671,16 @@ fn test_downstream_partial_discharge_preserves_the_allocations_it_was_not_asked_
         .build::<Vec<RegisterValue>, Vec<RegisterValue>>(vec![replaced], vec![Placeholder; 3], vec![Placeholder])
         .unwrap();
 
-    let sites = source.reference_discharge_sites(0).unwrap();
+    let targets = source.reference_discharge_targets(0).unwrap();
     assert_eq!(
-        sites,
+        targets,
         vec![
-            ReferenceDischargeSite::External(ReferenceSource::Input { index: 0 }),
-            ReferenceDischargeSite::External(ReferenceSource::Input { index: 1 }),
+            ReferenceDischargeTarget::External(ReferenceSource::Input { index: 0 }),
+            ReferenceDischargeTarget::External(ReferenceSource::Input { index: 1 }),
         ],
     );
     let discharged = source
-        .partially_discharge_references_with_policy::<RegisterReferenceDischarge>(0, &sites[..1])
+        .partially_discharge_references_with_policy::<RegisterReferenceDischarge>(0, &targets[..1])
         .unwrap();
 
     // The selected allocation became state at its own boundary position and publishes its final state as a hidden output;
@@ -750,10 +750,10 @@ fn test_downstream_structured_rule_discharges_through_the_region_boundary_api() 
 }
 
 #[test]
-fn test_downstream_partial_selection_reaches_an_allocation_inside_a_structured_region() {
-    // The allocation site sits inside the callee region, so whether it discharges is decided by the replay coordinate
-    // the downstream rule's driver hands to `selects_allocation` inside the fork. An empty selection must preserve
-    // the allocation inside the rebuilt region, and selecting the enumerated site must discharge it completely —
+fn test_downstream_partial_targets_reach_an_internal_allocation_inside_a_structured_region() {
+    // The allocation target sits inside the callee region, so whether it discharges is decided by the replay coordinate
+    // the downstream rule's driver hands to `selects_internal` inside the fork. An empty target list must preserve
+    // the allocation inside the rebuilt region, and selecting the enumerated target must discharge it completely —
     // which is exactly the behavior a driver without a real `instruction()` coordinate would silently break.
     let mut callee = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
     let initial = callee.add_input(RegisterIrType::Register(RegisterType));
@@ -791,10 +791,10 @@ fn test_downstream_partial_selection_reaches_an_allocation_inside_a_structured_r
             in (%1)"},
     );
 
-    let sites = source.reference_discharge_sites(0).unwrap();
-    assert_eq!(sites.len(), 1);
+    let targets = source.reference_discharge_targets(0).unwrap();
+    assert_eq!(targets.len(), 1);
     let full = source
-        .partially_discharge_references_with_policy::<RegisterReferenceDischarge>(0, sites.as_slice())
+        .partially_discharge_references_with_policy::<RegisterReferenceDischarge>(0, targets.as_slice())
         .unwrap()
         .try_into_full()
         .unwrap();

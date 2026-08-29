@@ -175,7 +175,7 @@ pub use programs::{
     ReferenceAddUpdateOperation, ReferenceAliasKind, ReferenceAllocationHandle, ReferenceCompletion,
     ReferenceCompletionBackend, ReferenceDischarge, ReferenceDischargeContext, ReferenceDischargeDriver,
     ReferenceDischargePolicy, ReferenceDischargeReference, ReferenceDischargeRegionDestination,
-    ReferenceDischargeResult, ReferenceDischargeSite, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation,
     ReferenceError, ReferenceFreeze, ReferenceFreezeOperation, ReferenceGeneration, ReferenceId, ReferenceInput,
     ReferenceNew, ReferenceNewOperation, ReferenceObservation, ReferenceOperationSemantics, ReferenceOutput,
     ReferenceRead, ReferenceReadOperation, ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork,

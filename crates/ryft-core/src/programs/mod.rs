@@ -155,7 +155,7 @@ pub use references::{
     ReferenceAccessMode, ReferenceAccumulationPolicy, ReferenceAddUpdate, ReferenceAddUpdateOperation,
     ReferenceAliasKind, ReferenceAllocationHandle, ReferenceCompletion, ReferenceCompletionBackend, ReferenceDischarge,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeReference,
-    ReferenceDischargeRegionDestination, ReferenceDischargeResult, ReferenceDischargeSite, ReferenceDischargeValue,
+    ReferenceDischargeRegionDestination, ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceError, ReferenceFreeze, ReferenceFreezeOperation, ReferenceGeneration,
     ReferenceId, ReferenceInput, ReferenceNew, ReferenceNewOperation, ReferenceObservation,
     ReferenceOperationSemantics, ReferenceOutput, ReferenceRead, ReferenceReadOperation,

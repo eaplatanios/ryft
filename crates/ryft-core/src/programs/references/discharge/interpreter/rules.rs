@@ -263,12 +263,12 @@ pub trait ReferenceDischargeDriver<C: Domain, P: ReferenceDischargePolicy<C>>:
     /// Returns the source coordinate of the operation application being discharged, or [`None`] when the application
     /// did not come from a replayed instruction.
     ///
-    /// An allocation rule needs its own site to decide whether the caller selected it for discharge, so replaying a
+    /// An allocation rule needs its own target to decide whether the caller selected it for discharge, so replaying a
     /// region through [`discharge_region`](Self::discharge_region) must supply the coordinate of every instruction it
     /// replays. Returning [`None`] declares the allocation unnameable by any
-    /// [`ReferenceDischargeSite`](crate::programs::references::ReferenceDischargeSite) and therefore *always
+    /// [`ReferenceDischargeTarget`](crate::programs::references::ReferenceDischargeTarget) and therefore *always
     /// discharged*, silently ignoring
-    /// the caller's partial selection. This method is deliberately required
+    /// the caller's partial-discharge targets. This function is deliberately required
     /// rather than defaulted: a replaying driver that forgot to forward its coordinate would otherwise disable
     /// partial discharge for its regions without any diagnostic.
     fn instruction(&self) -> Option<InstructionId>;
@@ -377,7 +377,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeDriver<C, P> f
 /// Access rules see only *discharged* allocations. When partial discharge preserves an allocation, the dispatch path replays every
 /// region-free, access-only application over it verbatim through [`discharge_preserved_access`] before rule dispatch,
 /// so an access rule never needs a preserved branch of its own. The exceptions own their preserved handling because
-/// their outputs mint or derive handles: an allocation rule consults its replay position against the selection, and a
+/// their outputs mint or derive handles: an allocation rule consults its replay position against the targets, and a
 /// view rule derives through [`ReferenceDischargeContext::derive`], which replays the view over a preserved parent's
 /// destination value.
 ///
@@ -616,7 +616,7 @@ mod tests {
         assert_eq!(context.live_allocations(), Vec::new());
 
         // Replaying through the driver supplies every instruction's own source coordinate, which is what makes the
-        // allocation selectable by a partial-discharge site.
+        // allocation selectable by a partial-discharge target.
         let observed = OBSERVED_ALLOCATION_POSITIONS.with_borrow(Vec::clone);
         assert_eq!(observed.len(), 1);
         assert!(observed[0].is_some());

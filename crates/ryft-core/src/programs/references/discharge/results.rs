@@ -52,7 +52,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeResult<V, O> {
     }
 }
 
-/// Program produced by *partial* reference discharge, in which only the caller-selected reference sites became
+/// Program produced by *partial* reference discharge, in which only the caller-selected reference targets became
 /// explicit immutable state and every unselected allocation survives as a well-typed reference value.
 ///
 /// The discharged part of the boundary obeys exactly the invariants of [`ReferenceDischargeResult`]: discharged
@@ -62,7 +62,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeResult<V, O> {
 /// nor hidden outputs; they simply remain reference-typed values inside the program, and their accesses replay
 /// verbatim.
 ///
-/// "Every site was selected" is a statement about the request, not a proof about the produced program.
+/// "Every target was selected" is a statement about the request, not a proof about the produced program.
 /// [`try_into_full`](Self::try_into_full) therefore inspects the complete program before constructing a
 /// [`ReferenceDischargeResult`].
 #[derive(Debug)]

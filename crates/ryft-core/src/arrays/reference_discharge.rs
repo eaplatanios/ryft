@@ -106,16 +106,16 @@
 //!
 //! # Partial Discharge
 //!
-//! A caller that wants only *some* of a program's state made explicit names the sites to discharge and leaves the
+//! A caller that wants only *some* of a program's state made explicit names the targets to discharge and leaves the
 //! rest alone. That is the shape the kernel pipeline needs: discharge the pipeline's own state, keep the references a
-//! kernel body still accesses. Sites are enumerated from the program itself, so a caller selects by pointing at what
-//! it can see rather than by reconstructing interpreter identities, and every allocation the selection omits survives in
+//! kernel body still accesses. Targets are enumerated from the program itself, so a caller selects by pointing at what
+//! it can see rather than by reconstructing interpreter identities, and every allocation the targets omit survives in
 //! the rewritten program as an ordinary reference whose accesses replay verbatim.
 //!
 //! ```
 //! use ryft_core::{
 //!     Array, ArrayIrOperation, ArrayIrValue, ArrayType, DataType, ReferenceFreezeOperation, ReferenceNewOperation,
-//!     Placeholder, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceDischargeSite, ReferenceReadOperation,
+//!     Placeholder, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceDischargeTarget, ReferenceReadOperation,
 //! };
 //!
 //! // Two independent allocations: one accumulates and is frozen, the other is only read.
@@ -135,17 +135,17 @@
 //!
 //! // Both allocations are selectable, and discharging only one of them leaves the other a live reference — so the
 //! // mixed result is not reference-free and refuses to convert into the full contract.
-//! let sites = program.reference_discharge_sites(0)?;
-//! assert_eq!(sites.len(), 2);
-//! let partial = program.clone().partially_discharge_references(0, &sites[..1])?;
+//! let targets = program.reference_discharge_targets(0)?;
+//! assert_eq!(targets.len(), 2);
+//! let partial = program.clone().partially_discharge_references(0, &targets[..1])?;
 //! assert_eq!(partial.external_states(), &[]);
-//! assert_eq!(partial.program().reference_discharge_sites(0)?.len(), 1);
+//! assert_eq!(partial.program().reference_discharge_targets(0)?.len(), 1);
 //! assert!(partial.try_into_full().is_err());
 //!
 //! // Selecting everything discharges every allocation, and the same proof then succeeds.
-//! let full = program.partially_discharge_references(0, &sites)?.try_into_full()?;
+//! let full = program.partially_discharge_references(0, &targets)?.try_into_full()?;
 //! assert_eq!(full.output_count(), 2);
-//! assert_eq!(full.program().reference_discharge_sites(0)?, Vec::new());
+//! assert_eq!(full.program().reference_discharge_targets(0)?, Vec::new());
 //! # Ok::<(), ryft_core::ProgramError>(())
 //! ```
 //!
@@ -175,7 +175,7 @@ use crate::operations::{AddOperation, ReshapeOperation, SliceOperation, UpdateSl
 use crate::parameters::Parameterized;
 use crate::programs::{
     PartialReferenceDischargeResult, Program, ProgramError, ReferenceAccumulationPolicy, ReferenceDischarge,
-    ReferenceDischargePolicy, ReferenceDischargeResult, ReferenceDischargeSite, ReferenceDischargeableOperation,
+    ReferenceDischargePolicy, ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeableOperation,
     ReferenceType, Typed, Value,
 };
 use crate::tracing::TracingContext;
@@ -199,7 +199,7 @@ where
     V: Value<Type = ArrayIrType>,
     O: ArrayReferenceViewOperation + ReferenceDischargeableOperation<TracingContext<V, O>, ArrayReferenceDischarge>,
 {
-    /// Discharges the selected array reference sites and preserves every other one, returning the mixed program
+    /// Discharges the selected array reference targets and preserves every other one, returning the mixed program
     /// together with the external-state bindings of the allocations that became state.
     ///
     /// This is the array universe's form of [`Program::partially_discharge_references_with_policy`], which documents
@@ -220,15 +220,15 @@ where
     /// # Parameters
     ///
     ///   - `capture_count`: Number of leading flat inputs that originated in the source program's capture table.
-    ///   - `sites`: Reference sites to discharge, enumerated from this same program through
-    ///     [`Program::reference_discharge_sites`]. Every other allocation is preserved.
+    ///   - `targets`: Reference targets to discharge, enumerated from this same program through
+    ///     [`Program::reference_discharge_targets`]. Every other allocation is preserved.
     #[inline]
     pub fn partially_discharge_references(
         self,
         capture_count: usize,
-        sites: &[ReferenceDischargeSite],
+        targets: &[ReferenceDischargeTarget],
     ) -> Result<PartialReferenceDischargeResult<V, O>, ProgramError> {
-        self.partially_discharge_references_with_policy::<ArrayReferenceDischarge>(capture_count, sites)
+        self.partially_discharge_references_with_policy::<ArrayReferenceDischarge>(capture_count, targets)
     }
 }
 
@@ -1374,15 +1374,15 @@ mod tests {
 
         // Both allocations are selectable in their own right, and the pipeline's is the only one selected.
         let entry = source.entry_region_ref().id();
-        let sites = source.reference_discharge_sites(0).unwrap();
+        let targets = source.reference_discharge_targets(0).unwrap();
         assert_eq!(
-            sites,
+            targets,
             vec![
-                ReferenceDischargeSite::Allocation { instruction: InstructionId::new(entry, 0), output_index: 0 },
-                ReferenceDischargeSite::Allocation { instruction: InstructionId::new(entry, 1), output_index: 0 },
+                ReferenceDischargeTarget::Internal { instruction: InstructionId::new(entry, 0), output_index: 0 },
+                ReferenceDischargeTarget::Internal { instruction: InstructionId::new(entry, 1), output_index: 0 },
             ],
         );
-        let discharged = source.clone().partially_discharge_references(0, &sites[..1]).unwrap();
+        let discharged = source.clone().partially_discharge_references(0, &targets[..1]).unwrap();
 
         // The selected allocation disappeared into threaded array state, while the unselected one, its view, its swap,
         // and its freeze all survive as the reference operations the source performed. Neither allocation is caller-owned,
@@ -1418,8 +1418,12 @@ mod tests {
         );
 
         // Selecting both allocations is the everything-selected case, so it must agree with full discharge exactly.
-        let selected =
-            source.clone().partially_discharge_references(0, sites.as_slice()).unwrap().try_into_full().unwrap();
+        let selected = source
+            .clone()
+            .partially_discharge_references(0, targets.as_slice())
+            .unwrap()
+            .try_into_full()
+            .unwrap();
         assert_eq!(selected.program().to_string(), source.discharge_references(0).unwrap().program().to_string());
     }
 
@@ -1479,8 +1483,8 @@ mod tests {
             )
             .unwrap();
 
-        let sites = source.reference_discharge_sites(0).unwrap();
-        let discharged = source.clone().partially_discharge_references(0, &sites[..1]).unwrap();
+        let targets = source.reference_discharge_targets(0).unwrap();
+        let discharged = source.clone().partially_discharge_references(0, &targets[..1]).unwrap();
         assert_eq!(discharged.output_count(), 3);
         assert_eq!(discharged.external_states(), &[]);
         assert_eq!(
@@ -1571,8 +1575,8 @@ mod tests {
             )
             .unwrap();
 
-        let sites = source.reference_discharge_sites(0).unwrap();
-        let discharged = source.clone().partially_discharge_references(0, &sites[..1]).unwrap();
+        let targets = source.reference_discharge_targets(0).unwrap();
+        let discharged = source.clone().partially_discharge_references(0, &targets[..1]).unwrap();
         assert_eq!(discharged.output_count(), 3);
         assert_eq!(discharged.external_states(), &[]);
         assert_eq!(
@@ -1676,8 +1680,8 @@ mod tests {
             )
             .unwrap();
 
-        let sites = source.reference_discharge_sites(0).unwrap();
-        let discharged = source.clone().partially_discharge_references(0, &sites[..1]).unwrap();
+        let targets = source.reference_discharge_targets(0).unwrap();
+        let discharged = source.clone().partially_discharge_references(0, &targets[..1]).unwrap();
         assert_eq!(discharged.output_count(), 2);
         assert_eq!(discharged.external_states(), &[]);
         assert_eq!(
@@ -1774,10 +1778,14 @@ mod tests {
         assert_eq!(preserved.external_states(), &[]);
         assert_eq!(preserved.program().to_string(), source.to_string());
 
-        // Selecting the one site instead is full discharge, which is the other extreme of the same rewrite.
-        let sites = source.reference_discharge_sites(0).unwrap();
-        let discharged =
-            source.clone().partially_discharge_references(0, sites.as_slice()).unwrap().try_into_full().unwrap();
+        // Selecting the one target instead is full discharge, which is the other extreme of the same rewrite.
+        let targets = source.reference_discharge_targets(0).unwrap();
+        let discharged = source
+            .clone()
+            .partially_discharge_references(0, targets.as_slice())
+            .unwrap()
+            .try_into_full()
+            .unwrap();
         assert_eq!(discharged.program().to_string(), source.discharge_references(0).unwrap().program().to_string());
     }
 
@@ -1841,8 +1849,8 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![total, remaining], vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
 
-        let sites = source.reference_discharge_sites(0).unwrap();
-        let discharged = source.clone().partially_discharge_references(0, &sites[..1]).unwrap();
+        let targets = source.reference_discharge_targets(0).unwrap();
+        let discharged = source.clone().partially_discharge_references(0, &targets[..1]).unwrap();
         assert_eq!(discharged.output_count(), 2);
         assert_eq!(discharged.external_states(), &[]);
         assert_eq!(
@@ -1930,8 +1938,8 @@ mod tests {
             )
             .unwrap();
 
-        let sites = source.reference_discharge_sites(0).unwrap();
-        let discharged = source.clone().partially_discharge_references(0, &sites[..1]).unwrap();
+        let targets = source.reference_discharge_targets(0).unwrap();
+        let discharged = source.clone().partially_discharge_references(0, &targets[..1]).unwrap();
         assert_eq!(discharged.output_count(), 3);
         assert_eq!(discharged.external_states(), &[]);
         assert_eq!(
@@ -2937,7 +2945,7 @@ mod tests {
         }
 
         // The callee mutates the allocation it receives and returns only the old snapshot, so its declared boundary hides
-        // the final state that the call site needs after discharge.
+        // the final state that the call target needs after discharge.
         let mut callee_builder = ProgramBuilder::<TestValue, CallingOperation>::new();
         let reference = callee_builder.add_input(ReferenceType::new(scalar_type()).into());
         let replacement = callee_builder.add_input(scalar_type().into());

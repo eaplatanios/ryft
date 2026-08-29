@@ -176,7 +176,7 @@ pub use discharge::{
     ExternalReferenceBinding, PartialReferenceDischargeResult, RecursiveReferenceDischargeDriver,
     ReferenceAccumulationPolicy, ReferenceAllocationHandle, ReferenceDischarge, ReferenceDischargeContext,
     ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeReference,
-    ReferenceDischargeRegionDestination, ReferenceDischargeResult, ReferenceDischargeSite, ReferenceDischargeValue,
+    ReferenceDischargeRegionDestination, ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork,
     ReferenceRegionStateInsertion, ReferenceRegionSummary, ReferenceSource, ReferenceStateWidening,
     discharge_positional_region_operation, discharge_preserved_access, discharge_reference_free_operation,

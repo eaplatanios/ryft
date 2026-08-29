@@ -234,12 +234,12 @@ where
     let destination = Destination::<C>::new();
     let builder = destination.builder().clone();
     let (output_ids, output_allocations, mutated_allocations) = {
-        // The fork inherits its caller's selection, because a site names a source coordinate that means the same thing
+        // The fork inherits its caller's targets, because a target names a source coordinate that means the same thing
         // wherever the replay reaches it: an unselected allocation inside a rebuilt region survives there exactly as
         // it would have in the caller's own body.
-        let fork = ReferenceDischargeContext::<Destination<C>, P>::new_selecting(
+        let fork = ReferenceDischargeContext::<Destination<C>, P>::new_with_targets(
             destination.clone(),
-            context.selection.clone(),
+            context.targets.clone(),
         );
 
         let mut declared_allocations = BTreeSet::new();

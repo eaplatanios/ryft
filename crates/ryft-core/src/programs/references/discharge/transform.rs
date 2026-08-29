@@ -20,7 +20,7 @@ use super::policies::ReferenceDischargePolicy;
 use super::results::{
     ExternalReferenceBinding, PartialReferenceDischargeResult, ReferenceDischargeResult, ReferenceSource,
 };
-use super::selection::{ReferenceDischargeSelection, ReferenceDischargeSite};
+use super::targets::{ReferenceDischargeTarget, ReferenceDischargeTargets};
 
 /// Program-level capability for normalizing references into explicit immutable state.
 ///
@@ -128,7 +128,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
         self.discharge_references_with_capture_seam::<P>(
             capture_count,
             |_| None,
-            ReferenceDischargeSelection::everything(),
+            ReferenceDischargeTargets::everything(),
         )?
         .try_into_full()
     }
@@ -147,7 +147,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// This is what a kernel pipeline needs — normalize the pipeline's own state into explicit carries while the
     /// references a kernel body addresses stay references — and it is the reason the result envelope is
     /// [`PartialReferenceDischargeResult`], which proves nothing about reference freedom. A caller that expects the
-    /// selection to have covered everything asks for the proof explicitly through
+    /// targets to have covered everything asks for the proof explicitly through
     /// [`try_into_full`](PartialReferenceDischargeResult::try_into_full).
     ///
     /// A preserved reference crosses a structured operation's region boundary the same way it crosses anything else: as the
@@ -171,12 +171,12 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     ///   - `capture_count`: Number of leading flat inputs that originated in the source program's capture table, used
     ///     to split the entry boundary into [`ReferenceSource::Capture`] and [`ReferenceSource::Input`]
     ///     positions.
-    ///   - `sites`: Reference sites to discharge, enumerated from this same program through
-    ///     [`reference_discharge_sites`](Self::reference_discharge_sites). Every other allocation is preserved.
+    ///   - `targets`: Reference targets to discharge, enumerated from this same program through
+    ///     [`reference_discharge_targets`](Self::reference_discharge_targets). Every other allocation is preserved.
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::MalformedProgram`] when `sites` does not validate against this program, when a rule
+    /// Returns [`ProgramError::MalformedProgram`] when `targets` does not validate against this program, when a rule
     /// synthesizes a preserved reference onto a rebuilt region's added state positions, and otherwise for every reason
     /// [`discharge_references_with_policy`](Self::discharge_references_with_policy) documents — with one deliberate
     /// exception. Consuming a *discharged* external allocation is still rejected, because a
@@ -186,17 +186,17 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     pub fn partially_discharge_references_with_policy<P>(
         self,
         capture_count: usize,
-        sites: &[ReferenceDischargeSite],
+        targets: &[ReferenceDischargeTarget],
     ) -> Result<PartialReferenceDischargeResult<V, O>, ProgramError>
     where
         P: ReferenceDischargePolicy<TracingContext<V, O>>,
         O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
     {
-        self.validate_reference_discharge_sites(capture_count, sites)?;
+        self.validate_reference_discharge_targets(capture_count, targets)?;
         self.discharge_references_with_capture_seam::<P>(
             capture_count,
             |_| None,
-            ReferenceDischargeSelection::from_sites(sites),
+            ReferenceDischargeTargets::from_targets(targets),
         )
     }
 
@@ -239,7 +239,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
         self.discharge_references_with_capture_seam::<P>(
             capture_count,
             CaptureConstant::capture_index,
-            ReferenceDischargeSelection::everything(),
+            ReferenceDischargeTargets::everything(),
         )?
         .try_into_full()
     }
@@ -258,7 +258,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     ///
     ///   - `capture_count`: Number of leading flat inputs that originated in the source program's capture table.
     ///   - `capture_index`: Seam reporting the capture position a stored constant names.
-    ///   - `selection`: Reference sites to discharge; every allocation the selection omits is preserved.
+    ///   - `targets`: Reference targets to discharge; every allocation they omit is preserved.
     ///
     /// # Errors
     ///
@@ -267,7 +267,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
         self,
         capture_count: usize,
         capture_index: fn(&V) -> Option<usize>,
-        selection: ReferenceDischargeSelection,
+        targets: ReferenceDischargeTargets,
     ) -> Result<PartialReferenceDischargeResult<V, O>, ProgramError>
     where
         P: ReferenceDischargePolicy<TracingContext<V, O>>,
@@ -298,7 +298,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
             let destination = TracingContext::<V, O>::new();
             let builder = destination.builder().clone();
             let context =
-                ReferenceDischargeContext::<TracingContext<V, O>, P>::new_selecting(destination.clone(), selection);
+                ReferenceDischargeContext::<TracingContext<V, O>, P>::new_with_targets(destination.clone(), targets);
             let mut inputs = Vec::with_capacity(input_count);
             let mut discharged_allocations = Vec::new();
             let mut capture_allocations = vec![None; capture_count];
@@ -458,15 +458,15 @@ mod tests {
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![observed], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
 
-        let sites = source.reference_discharge_sites(0).unwrap();
+        let targets = source.reference_discharge_targets(0).unwrap();
         assert_eq!(
-            sites,
+            targets,
             vec![
-                ReferenceDischargeSite::External(ReferenceSource::Input { index: 0 }),
-                ReferenceDischargeSite::External(ReferenceSource::Input { index: 1 }),
+                ReferenceDischargeTarget::External(ReferenceSource::Input { index: 0 }),
+                ReferenceDischargeTarget::External(ReferenceSource::Input { index: 1 }),
             ],
         );
-        let discharged = source.partially_discharge_references_with_policy::<ListReferenceDischarge>(0, &sites[..1]);
+        let discharged = source.partially_discharge_references_with_policy::<ListReferenceDischarge>(0, &targets[..1]);
         let discharged = discharged.unwrap();
 
         // The selected allocation became an ordinary state input at its own boundary position and publishes its final state
@@ -500,7 +500,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_reference_discharge_preserves_an_unselected_allocation_site() {
+    fn test_partial_reference_discharge_preserves_an_unselected_internal_target() {
         // An interior allocation is selectable in its own right, so a program can normalize its pipeline state while
         // the allocation a kernel body addresses is allocated, viewed, accessed, and consumed as a reference throughout.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
@@ -537,17 +537,17 @@ mod tests {
 
         // Selecting the allocation instead discharges it, which is the everything-selected case and therefore has to
         // agree with full discharge exactly.
-        let sites = source.reference_discharge_sites(0).unwrap();
+        let targets = source.reference_discharge_targets(0).unwrap();
         assert_eq!(
-            sites,
-            vec![ReferenceDischargeSite::Allocation {
+            targets,
+            vec![ReferenceDischargeTarget::Internal {
                 instruction: InstructionId::new(source.entry_region_ref().id(), 0),
                 output_index: 0,
             }],
         );
         let selected = source
             .clone()
-            .partially_discharge_references_with_policy::<ListReferenceDischarge>(0, sites.as_slice());
+            .partially_discharge_references_with_policy::<ListReferenceDischarge>(0, targets.as_slice());
         let selected = selected.unwrap().try_into_full().unwrap();
         let full = source.discharge_references_with_policy::<ListReferenceDischarge>(0).unwrap();
         assert_eq!(selected.program().to_string(), full.program().to_string());
@@ -634,9 +634,10 @@ mod tests {
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![observed], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        let sites = source.reference_discharge_sites(0).unwrap();
-        let discharged =
-            source.partially_discharge_references_with_policy::<ListReferenceDischarge>(0, &sites[..1]).unwrap();
+        let targets = source.reference_discharge_targets(0).unwrap();
+        let discharged = source
+            .partially_discharge_references_with_policy::<ListReferenceDischarge>(0, &targets[..1])
+            .unwrap();
 
         // The selected allocation's entering state occupies its own operand position and its successor is appended as a
         // published output; the preserved reference's operand position still carries a reference, and the rebuilt callee
@@ -665,8 +666,8 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_reference_discharge_validates_its_selection_against_the_program() {
-        // The selection is checked before anything is replayed, so a site this program does not expose is reported
+    fn test_partial_reference_discharge_validates_its_targets_against_the_program() {
+        // The targets are checked before anything is replayed, so a target this program does not expose is reported
         // against the program rather than surfacing later as an allocation that never appeared.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let external = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
@@ -679,11 +680,11 @@ mod tests {
             source
                 .partially_discharge_references_with_policy::<ListReferenceDischarge>(
                     0,
-                    &[ReferenceDischargeSite::External(ReferenceSource::Input { index: 3 })],
+                    &[ReferenceDischargeTarget::External(ReferenceSource::Input { index: 3 })],
                 )
                 .unwrap_err(),
             ProgramError::MalformedProgram(
-                "reference discharge selection names external input 3, which is not a selectable site in this program"
+                "reference discharge targets include external input 3, which is not selectable in this program"
                     .to_string(),
             ),
         );
