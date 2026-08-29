@@ -45,7 +45,7 @@
 //!
 //! Representative supported compositions are shown below. The transforms themselves reject reference operations
 //! outright ("must be discharged before differentiation/batching"). First call
-//! [`ReferenceDischarge::discharge_local_references`], then use the ordinary transform: [`Program::jvp`] or
+//! [`Program::discharge_local_references`], then use the ordinary transform: [`Program::jvp`] or
 //! [`Program::linearize`] for forward mode, [`Pullback`](crate::Pullback) obtained from the linearization for reverse
 //! mode, [`Program::batched_with_threaded_extent`](crate::Program::batched_with_threaded_extent) for batching,
 //! [`Program::partially_evaluate`] for partial evaluation, and
@@ -76,7 +76,7 @@
 //! ```
 //! use ryft_core::{
 //!     Array, ArrayIrOperation, ArrayIrValue, ArrayType, DataType, ReferenceFreezeOperation, ReferenceNewOperation,
-//!     Placeholder, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceDischarge,
+//!     Placeholder, ProgramBuilder, ReferenceAddUpdateOperation,
 //! };
 //!
 //! let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
@@ -174,23 +174,56 @@ use crate::macros::check_count;
 use crate::operations::{AddOperation, ReshapeOperation, SliceOperation, UpdateSliceOperation};
 use crate::parameters::Parameterized;
 use crate::programs::{
-    PartialReferenceDischargeResult, Program, ProgramError, ReferenceAccumulationPolicy, ReferenceDischarge,
-    ReferenceDischargePolicy, ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeableOperation,
-    Typed, Value,
+    PartialReferenceDischargeResult, Program, ProgramError, ReferenceAccumulationPolicy, ReferenceDischargePolicy,
+    ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeableOperation, Typed, Value,
 };
 use crate::tracing::TracingContext;
 
-impl<V, O> ReferenceDischarge for Program<V, O, Vec<V>, Vec<V>>
+impl<V, O> Program<V, O, Vec<V>, Vec<V>>
 where
     V: Value<Type = ArrayIrType>,
     O: ArrayReferenceViewOperation + ReferenceDischargeableOperation<TracingContext<V, O>, ArrayReferenceDischarge>,
 {
-    type Value = V;
-    type Operation = O;
-
+    /// Discharges every array reference and returns the reference-free program together with its external-state
+    /// bindings.
+    ///
+    /// This is the array universe's policy-selecting entry point. It applies [`ArrayReferenceDischarge`] and therefore
+    /// avoids requiring callers to name the policy used to lower array reference views.
+    ///
+    /// # Parameters
+    ///
+    ///   - `capture_count`: Number of leading flat inputs that originated in the source program's capture table.
     #[inline]
-    fn discharge_references(self, capture_count: usize) -> Result<ReferenceDischargeResult<V, O>, ProgramError> {
+    pub fn discharge_references(self, capture_count: usize) -> Result<ReferenceDischargeResult<V, O>, ProgramError> {
         self.discharge_references_with_policy::<ArrayReferenceDischarge>(capture_count)
+    }
+
+    /// Discharges every local array reference for `transform` and rejects caller-owned external allocations.
+    ///
+    /// A successful result contains no reference types or unresolved ordered reference state. Because local
+    /// allocations require no state to cross the caller boundary, the returned program preserves the source program's
+    /// public input and output boundary.
+    ///
+    /// # Parameters
+    ///
+    ///   - `capture_count`: Number of leading flat inputs that originated in the source program's capture table.
+    ///   - `transform`: Name used in diagnostics when caller-owned state prevents the transform.
+    pub fn discharge_local_references(
+        self,
+        capture_count: usize,
+        transform: &'static str,
+    ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> {
+        let discharged = self.discharge_references(capture_count)?;
+        if let Some(state) = discharged.external_states().first() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "{transform} supports only local references, but the program uses external `{}`",
+                    state.source(),
+                ),
+            });
+        }
+        let (program, _, _, _) = discharged.into_parts();
+        Ok(program)
     }
 }
 
@@ -203,7 +236,7 @@ where
     /// together with the external-state bindings of the allocations that became state.
     ///
     /// This is the array universe's form of [`Program::partially_discharge_references_with_policy`], which documents
-    /// the rewrite; [`ReferenceDischarge::discharge_references`] is its everything-selected case. A preserved array
+    /// the rewrite; [`Program::discharge_references`] is its everything-selected case. A preserved array
     /// allocation keeps its reference-typed boundary position or its `reference_new` instruction, every access to it replays
     /// verbatim, and a view derived from it replays its `reference_index` or `reference_slice` step, so the surviving
     /// half of the program still denotes the same coordinates. Selected allocations thread as immutable array state exactly

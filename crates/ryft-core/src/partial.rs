@@ -1967,8 +1967,8 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::{
         AtomId, Concretizable, Effects, ProgramBuilder, ProgramError, ReferenceAddUpdate, ReferenceAddUpdateOperation,
-        ReferenceDischarge, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
-        ReferenceType, RegionInterface, RegionSlot,
+        ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceType, RegionInterface,
+        RegionSlot,
     };
 
     use super::*;

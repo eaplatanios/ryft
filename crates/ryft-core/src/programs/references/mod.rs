@@ -75,9 +75,9 @@
 //!   ([`ReferenceWrite`]), swapping ([`ReferenceSwap`]), ordered additive updates ([`ReferenceAddUpdate`]), and
 //!   consuming finalization ([`ReferenceFreeze`]). Each primitive module also owns its type inference, effects, eager
 //!   interpretation, discharge rule, and unit tests.
-//! - `discharge/` implements [`ReferenceDischarge`]: an interpreter-style transform that replaces selected mutable
-//!   allocations with explicitly threaded immutable values. Its policy, context, driver, and operation-rule contracts
-//!   keep the transform open to non-array value families and to third-party operations.
+//! - `discharge/` implements an interpreter-style transform that replaces selected mutable allocations with explicitly
+//!   threaded immutable values. Its policy, context, driver, and operation-rule contracts keep the transform open to
+//!   non-array value families and to third-party operations.
 //!
 //! Structured operations own their reference boundary rewrites. For example, condition, while, and scan operations
 //! decide how immutable state is added to their branch or loop boundaries; the discharge driver supplies isolated
@@ -92,8 +92,8 @@
 //! operations into explicit state dataflow. A local allocation disappears entirely after that rewrite. An external
 //! allocation becomes an ordinary state input and, when mutated, a hidden final-state output described by a
 //! [`ExternalReferenceBinding`]; the backend's stateful invocation surface snapshots and publishes those values through
-//! the caller's reference. [`ReferenceDischarge`] exposes the value-level entry point for this rewrite; the discharge
-//! module documentation contains a concrete before-and-after example.
+//! the caller's reference. [`Program::discharge_references_with_policy`] exposes the generic program-level entry point
+//! for this rewrite; the discharge module documentation contains a concrete before-and-after example.
 //!
 //! [`PartialReferenceDischargeResult`] supports the kernel use case in which selected implementation-owned allocations
 //! become immutable state while other references deliberately remain in the program. A full
@@ -174,12 +174,12 @@ mod values;
 
 pub use discharge::{
     ExternalReferenceBinding, PartialReferenceDischargeResult, RecursiveReferenceDischargeDriver,
-    ReferenceAccumulationPolicy, ReferenceAllocationHandle, ReferenceDischarge, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeReference,
-    ReferenceDischargeRegionDestination, ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork,
-    ReferenceRegionStateInsertion, ReferenceRegionSummary, ReferenceSource, ReferenceStateWidening,
-    discharge_positional_region_operation, discharge_preserved_access, discharge_reference_free_operation,
+    ReferenceAccumulationPolicy, ReferenceAllocationHandle, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePolicy, ReferenceDischargeReference, ReferenceDischargeRegionDestination,
+    ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork, ReferenceRegionStateInsertion,
+    ReferenceRegionSummary, ReferenceSource, ReferenceStateWidening, discharge_positional_region_operation,
+    discharge_preserved_access, discharge_reference_free_operation,
 };
 pub use operations::{
     REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME,

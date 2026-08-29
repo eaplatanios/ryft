@@ -153,7 +153,7 @@ pub use references::{
     REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME,
     ReadyOrPendingReferenceGuard, ReadyReferenceGuard, RecursiveReferenceDischargeDriver, Reference,
     ReferenceAccessMode, ReferenceAccumulationPolicy, ReferenceAddUpdate, ReferenceAddUpdateOperation,
-    ReferenceAliasKind, ReferenceAllocationHandle, ReferenceCompletion, ReferenceCompletionBackend, ReferenceDischarge,
+    ReferenceAliasKind, ReferenceAllocationHandle, ReferenceCompletion, ReferenceCompletionBackend,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeReference,
     ReferenceDischargeRegionDestination, ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceError, ReferenceFreeze, ReferenceFreezeOperation, ReferenceGeneration,

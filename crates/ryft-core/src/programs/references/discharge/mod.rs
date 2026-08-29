@@ -55,7 +55,7 @@
 //! other allocations remain references. The full entry point returns a [`ReferenceDischargeResult`], whose program is
 //! proven reference-free. The partial entry point returns a [`PartialReferenceDischargeResult`], which describes only
 //! the discharged references and can be converted into a full result after proving that no references remain. Generic
-//! transforms that accept only local references use [`ReferenceDischarge::discharge_local_references`].
+//! array transforms that accept only local references use [`Program::discharge_local_references`].
 //!
 //! A reference universe participates by implementing [`ReferenceDischargePolicy`] and, when supported,
 //! [`ReferenceAccumulationPolicy`]. Each operation implements [`ReferenceDischargeableOperation`] to rewrite its own
@@ -162,14 +162,12 @@ pub use results::{
     ExternalReferenceBinding, PartialReferenceDischargeResult, ReferenceDischargeResult, ReferenceSource,
 };
 pub use targets::ReferenceDischargeTarget;
-pub use transform::ReferenceDischarge;
 
 #[cfg(test)]
 pub(crate) mod tests {
     use std::borrow::Cow;
-    use std::cell::{Cell, RefCell};
+    use std::cell::RefCell;
     use std::fmt::Display;
-    use std::rc::Rc;
 
     use crate::contexts::{Context, Domain, EagerContext};
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -970,18 +968,6 @@ pub(crate) mod tests {
         }
     }
 
-    #[derive(Copy, Clone)]
-    pub(crate) enum TestDischargeMode {
-        Local,
-        External,
-        Malformed,
-    }
-
-    pub(crate) struct TestDischargeProvider {
-        pub(crate) calls: Rc<Cell<usize>>,
-        pub(crate) mode: TestDischargeMode,
-    }
-
     /// Builds a reference-free test program with the requested flat boundary arities.
     pub(crate) fn boundary_program(
         input_count: usize,
@@ -995,33 +981,6 @@ pub(crate) mod tests {
             .map(|index| builder.add_constant(CaptureReference::new(index, TestType::Value(index as u8))))
             .collect::<Vec<_>>();
         builder.build(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count]).unwrap()
-    }
-
-    impl ReferenceDischarge for TestDischargeProvider {
-        type Value = TestValue;
-        type Operation = TestOperation;
-
-        fn discharge_references(
-            self,
-            _capture_count: usize,
-        ) -> Result<ReferenceDischargeResult<Self::Value, Self::Operation>, ProgramError> {
-            self.calls.set(self.calls.get() + 1);
-            match self.mode {
-                TestDischargeMode::Local => {
-                    PartialReferenceDischargeResult::new(boundary_program(0, 0), 0, 0, Vec::new())?.try_into_full()
-                }
-                TestDischargeMode::External => PartialReferenceDischargeResult::new(
-                    boundary_program(1, 0),
-                    0,
-                    0,
-                    vec![ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None)],
-                )?
-                .try_into_full(),
-                TestDischargeMode::Malformed => Err(ProgramError::MalformedProgram(
-                    "reference discharge final states end at output 0 but discharged output count is 1".to_string(),
-                )),
-            }
-        }
     }
 
     // Capture seam for the prototype universe, which has no capture constants of its own: a reference-typed constant

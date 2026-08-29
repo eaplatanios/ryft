@@ -8,7 +8,6 @@ use crate::parameters::Placeholder;
 use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
-use crate::programs::types::Typed;
 use crate::programs::values::Value;
 use crate::tracing::TracingContext;
 
@@ -23,59 +22,6 @@ use super::results::{
     ExternalReferenceBinding, PartialReferenceDischargeResult, ReferenceDischargeResult, ReferenceSource,
 };
 use super::targets::{ReferenceDischargeTarget, ReferenceDischargeTargets};
-
-/// Program-level capability for normalizing references into explicit immutable state.
-///
-/// An implementation names its universe's [`ReferenceDischargePolicy`] and otherwise only forwards to the interpreter
-/// entry point [`Program::discharge_references_with_policy`]. Generic transforms reach discharge through
-/// [`discharge_local_references`](Self::discharge_local_references) and therefore neither name a policy nor inspect
-/// family-specific alias metadata. The associated value and operation types identify the returned flat [`Program`]
-/// universe; implementations cannot substitute another result representation.
-pub trait ReferenceDischarge: Sized {
-    /// Value family of the discharged program.
-    type Value: Value;
-
-    /// Operation family of the discharged program.
-    type Operation: Operation<Type = <Self::Value as Typed>::Type>;
-
-    /// Discharges every reference and returns the reference-free program plus its logical external-state bindings.
-    ///
-    /// # Parameters
-    ///
-    ///   - `capture_count`: Number of leading flat inputs that originated in the source program's capture table.
-    fn discharge_references(
-        self,
-        capture_count: usize,
-    ) -> Result<ReferenceDischargeResult<Self::Value, Self::Operation>, ProgramError>;
-
-    /// Discharges local references for `transform`, rejecting every caller-owned external allocation.
-    ///
-    /// The full-discharge implementation must prove that the result contains neither reference types nor unresolved
-    /// ordered reference state. The checked result envelope ensures that an external-state-free result has no hidden
-    /// output suffix, so this default returns the same program family with an unchanged public boundary.
-    ///
-    /// # Parameters
-    ///
-    ///   - `capture_count`: Number of leading flat inputs that originated in the source program's capture table.
-    ///   - `transform`: Name used in diagnostics when caller-owned state prevents the transform.
-    fn discharge_local_references(
-        self,
-        capture_count: usize,
-        transform: &'static str,
-    ) -> Result<Program<Self::Value, Self::Operation, Vec<Self::Value>, Vec<Self::Value>>, ProgramError> {
-        let discharged = self.discharge_references(capture_count)?;
-        if let Some(state) = discharged.external_states().first() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "{transform} supports only local references, but the program uses external `{}`",
-                    state.source(),
-                ),
-            });
-        }
-        let (program, _, _, _) = discharged.into_parts();
-        Ok(program)
-    }
-}
 
 impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// Discharges every reference this program touches by interpreting it in a [`ReferenceDischargeContext`] over a
@@ -403,10 +349,6 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::Cell;
-
-    use std::rc::Rc;
-
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
@@ -422,36 +364,6 @@ mod tests {
     use crate::programs::references::types::ReferenceType;
 
     use super::*;
-
-    #[test]
-    fn test_reference_discharge_local_references_calls_full_discharge_once_and_preserves_failure_precedence() {
-        let calls = Rc::new(Cell::new(0));
-        let local = TestDischargeProvider { calls: calls.clone(), mode: TestDischargeMode::Local };
-        let local = local.discharge_local_references(0, "test transform").unwrap();
-        assert_eq!(local.input_count(), 0);
-        assert_eq!(local.output_count(), 0);
-        assert_eq!(calls.get(), 1);
-
-        let external = TestDischargeProvider { calls: calls.clone(), mode: TestDischargeMode::External };
-        assert_eq!(
-            external.discharge_local_references(0, "test transform").unwrap_err(),
-            ProgramError::UnsupportedOperation {
-                message: "test transform supports only local references, but the program uses external \
-                          `input 0`"
-                    .to_string(),
-            },
-        );
-        assert_eq!(calls.get(), 2);
-
-        let malformed = TestDischargeProvider { calls: calls.clone(), mode: TestDischargeMode::Malformed };
-        assert_eq!(
-            malformed.discharge_local_references(0, "test transform").unwrap_err(),
-            ProgramError::MalformedProgram(
-                "reference discharge final states end at output 0 but discharged output count is 1".to_string(),
-            ),
-        );
-        assert_eq!(calls.get(), 3);
-    }
 
     #[test]
     fn test_partial_reference_discharge_preserves_unselected_external_allocations() {

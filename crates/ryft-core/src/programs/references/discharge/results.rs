@@ -391,53 +391,63 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::parameters::Placeholder;
-    use crate::programs::ProgramError;
-
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::effects::{Effect, Effects};
-
     use crate::programs::operations::Operation;
-
-    use crate::programs::references::discharge::tests::*;
+    use crate::programs::references::discharge::tests::{TestType, TestValue, boundary_program, reference_type};
     use crate::programs::references::semantics::{ReferenceAccessMode, ReferenceInput, ReferenceOperationSemantics};
-
     use crate::programs::regions::RegionInterface;
     use crate::programs::types::TypeError;
 
     use super::*;
 
     #[test]
-    fn test_reference_discharge_results_validate_boundaries() {
+    fn test_reference_discharge_result_accessors_and_into_parts() {
         let bindings = vec![
             ExternalReferenceBinding::new(ReferenceSource::Capture { index: 0 }, Some(1)),
-            ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(2)),
+            ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None),
         ];
-        let result = PartialReferenceDischargeResult::new(boundary_program(2, 3), 1, 1, bindings.clone())
+        let result = PartialReferenceDischargeResult::new(boundary_program(2, 2), 1, 1, bindings.clone())
             .unwrap()
             .try_into_full()
             .unwrap();
         assert_eq!(result.program().input_count(), 2);
-        assert_eq!(result.program().output_count(), 3);
+        assert_eq!(result.program().output_count(), 2);
         assert_eq!(result.capture_count(), 1);
         assert_eq!(result.output_count(), 1);
         assert_eq!(result.external_states(), bindings);
 
-        assert_eq!(ReferenceSource::Capture { index: 0 }.flat_input_index(1), Ok(0));
-        assert_eq!(ReferenceSource::Input { index: 2 }.flat_input_index(1), Ok(3));
-        assert_eq!(
-            ReferenceSource::Capture { index: 1 }.flat_input_index(1),
-            Err(ProgramError::MalformedProgram(
-                "reference source capture 1 lies outside the capture prefix of length 1".to_string(),
-            )),
-        );
-        assert_eq!(
-            ReferenceSource::Input { index: usize::MAX }.flat_input_index(1),
-            Err(ProgramError::MalformedProgram(format!(
-                "reference source input {} overflows the flat boundary after 1 captures",
-                usize::MAX,
-            ))),
-        );
+        let (program, capture_count, output_count, external_states) = result.into_parts();
+        assert_eq!(program.input_count(), 2);
+        assert_eq!(program.output_count(), 2);
+        assert_eq!(capture_count, 1);
+        assert_eq!(output_count, 1);
+        assert_eq!(external_states, bindings);
+    }
 
+    #[test]
+    fn test_partial_reference_discharge_result_accessors_and_into_parts() {
+        let bindings = vec![
+            ExternalReferenceBinding::new(ReferenceSource::Capture { index: 0 }, Some(1)),
+            ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None),
+        ];
+        let result = PartialReferenceDischargeResult::new(boundary_program(2, 2), 1, 1, bindings.clone()).unwrap();
+        assert_eq!(result.program().input_count(), 2);
+        assert_eq!(result.program().output_count(), 2);
+        assert_eq!(result.capture_count(), 1);
+        assert_eq!(result.output_count(), 1);
+        assert_eq!(result.external_states(), bindings);
+
+        let (program, capture_count, output_count, external_states) = result.into_parts();
+        assert_eq!(program.input_count(), 2);
+        assert_eq!(program.output_count(), 2);
+        assert_eq!(capture_count, 1);
+        assert_eq!(output_count, 1);
+        assert_eq!(external_states, bindings);
+    }
+
+    #[test]
+    fn test_partial_reference_discharge_result_new_rejects_invalid_boundary_counts() {
         assert_eq!(
             PartialReferenceDischargeResult::new(boundary_program(0, 0), 1, 0, Vec::new()).unwrap_err(),
             ProgramError::MalformedProgram(
@@ -449,6 +459,22 @@ mod tests {
             PartialReferenceDischargeResult::new(boundary_program(0, 1), 0, 2, Vec::new()).unwrap_err(),
             ProgramError::MalformedProgram(
                 "reference discharge reports 2 public outputs but discharged output count is 1".to_string(),
+            ),
+        );
+    }
+
+    #[test]
+    fn test_partial_reference_discharge_result_new_rejects_invalid_external_sources() {
+        assert_eq!(
+            PartialReferenceDischargeResult::new(
+                boundary_program(2, 0),
+                1,
+                0,
+                vec![ExternalReferenceBinding::new(ReferenceSource::Capture { index: 1 }, None)],
+            )
+            .unwrap_err(),
+            ProgramError::MalformedProgram(
+                "reference source capture 1 lies outside the capture prefix of length 1".to_string(),
             ),
         );
         assert_eq!(
@@ -463,69 +489,76 @@ mod tests {
                 "reference discharge state for `input 0` names input 0 but discharged input count is 0".to_string(),
             ),
         );
-        assert_eq!(
-            PartialReferenceDischargeResult::new(boundary_program(1, 1), 0, 0, Vec::new()).unwrap_err(),
-            ProgramError::MalformedProgram(
-                "reference discharge final states end at output 0 but discharged output count is 1".to_string(),
-            ),
-        );
-        for sources in [
-            [ReferenceSource::Capture { index: 0 }, ReferenceSource::Capture { index: 0 }],
-            [ReferenceSource::Input { index: 0 }, ReferenceSource::Capture { index: 0 }],
-        ] {
-            let bindings = sources
-                .into_iter()
-                .enumerate()
-                .map(|(_, source)| ExternalReferenceBinding::new(source, None))
-                .collect();
-            assert_eq!(
-                PartialReferenceDischargeResult::new(boundary_program(2, 0), 1, 0, bindings).unwrap_err(),
-                ProgramError::MalformedProgram(format!(
-                    "reference discharge state source `{}` does not follow source `{}` in canonical boundary order",
-                    sources[1], sources[0],
-                )),
-            );
-        }
-    }
 
-    #[test]
-    fn test_partial_reference_discharge_result_reports_only_discharged_bindings() {
-        // The partial envelope keeps the canonical discharged boundary of the full envelope, so its accessors report
-        // the discharged bindings and the public-output prefix that precedes their hidden final-state suffix.
-        let bindings = vec![
-            ExternalReferenceBinding::new(ReferenceSource::Capture { index: 0 }, Some(1)),
-            ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None),
+        let duplicate = vec![
+            ExternalReferenceBinding::new(ReferenceSource::Capture { index: 0 }, None),
+            ExternalReferenceBinding::new(ReferenceSource::Capture { index: 0 }, None),
         ];
-        let result = PartialReferenceDischargeResult::new(boundary_program(2, 2), 1, 1, bindings.clone()).unwrap();
-        assert_eq!(result.program().input_count(), 2);
-        assert_eq!(result.program().output_count(), 2);
-        assert_eq!(result.capture_count(), 1);
-        assert_eq!(result.output_count(), 1);
-        assert_eq!(result.external_states(), bindings);
-        let (program, capture_count, output_count, external_states) = result.into_parts();
-        assert_eq!(program.input_count(), 2);
-        assert_eq!(program.output_count(), 2);
-        assert_eq!(capture_count, 1);
-        assert_eq!(output_count, 1);
-        assert_eq!(external_states, bindings);
-
-        // The shared boundary validation applies to the partial envelope exactly as it does to the full one.
         assert_eq!(
-            PartialReferenceDischargeResult::new(boundary_program(0, 1), 0, 2, Vec::new()).unwrap_err(),
+            PartialReferenceDischargeResult::new(boundary_program(2, 0), 1, 0, duplicate).unwrap_err(),
             ProgramError::MalformedProgram(
-                "reference discharge reports 2 public outputs but discharged output count is 1".to_string(),
+                "reference discharge state source `capture 0` does not follow source `capture 0` in canonical boundary \
+                 order"
+                    .to_string(),
             ),
         );
+
+        let decreasing = vec![
+            ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None),
+            ExternalReferenceBinding::new(ReferenceSource::Capture { index: 0 }, None),
+        ];
+        assert_eq!(
+            PartialReferenceDischargeResult::new(boundary_program(2, 0), 1, 0, decreasing).unwrap_err(),
+            ProgramError::MalformedProgram(
+                "reference discharge state source `capture 0` does not follow source `input 0` in canonical boundary \
+                 order"
+                    .to_string(),
+            ),
+        );
+    }
+
+    #[test]
+    fn test_partial_reference_discharge_result_new_rejects_invalid_hidden_outputs() {
+        // A program output not covered by the public prefix or a mutated binding is an unaccounted hidden output.
         assert_eq!(
             PartialReferenceDischargeResult::new(boundary_program(1, 1), 0, 0, Vec::new()).unwrap_err(),
             ProgramError::MalformedProgram(
                 "reference discharge final states end at output 0 but discharged output count is 1".to_string(),
             ),
         );
+
+        // A mutated binding cannot append a hidden output after the program's complete output boundary.
+        assert_eq!(
+            PartialReferenceDischargeResult::new(
+                boundary_program(1, 1),
+                0,
+                1,
+                vec![ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
+            )
+            .unwrap_err(),
+            ProgramError::MalformedProgram(
+                "reference discharge final states end at output 2 but discharged output count is 1".to_string(),
+            ),
+        );
+
+        // Mutated bindings tile the hidden suffix exactly in binding order; they cannot name a public output.
+        assert_eq!(
+            PartialReferenceDischargeResult::new(
+                boundary_program(1, 2),
+                0,
+                1,
+                vec![ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(0))],
+            )
+            .unwrap_err(),
+            ProgramError::MalformedProgram(
+                "reference discharge final-state output 0 for `input 0` does not match expected hidden output 1"
+                    .to_string(),
+            ),
+        );
     }
 
     #[test]
-    fn test_partial_reference_discharge_result_try_into_full_proves_reference_freedom() {
+    fn test_partial_reference_discharge_result_try_into_full_enforces_reference_freedom() {
         // Operation family that separates the two facts the reference-freedom proof must distinguish: an unrelated
         // ordered-state operation that discharge never touches, and a retained reference operation that it must
         // reject even though its boundary types are ordinary.
@@ -611,6 +644,78 @@ mod tests {
                  cannot form a full discharge"
                     .to_string(),
             ),
+        );
+    }
+
+    #[test]
+    fn test_external_reference_binding_accessors_and_serialization() {
+        let read_only = ExternalReferenceBinding::new(ReferenceSource::Capture { index: 0 }, None);
+        let mutated = ExternalReferenceBinding::new(ReferenceSource::Input { index: 2 }, Some(3));
+
+        assert_eq!(read_only.source(), ReferenceSource::Capture { index: 0 });
+        assert!(!read_only.is_mutated());
+        assert_eq!(read_only.output_index(), None);
+        assert_eq!(mutated.source(), ReferenceSource::Input { index: 2 });
+        assert!(mutated.is_mutated());
+        assert_eq!(mutated.output_index(), Some(3));
+        assert_ne!(read_only, mutated);
+        assert_eq!(
+            format!("{mutated:?}"),
+            "ExternalReferenceBinding { source: Input { index: 2 }, output_index: Some(3) }",
+        );
+        assert_eq!(
+            serde_json::to_string(&[read_only, mutated]).unwrap(),
+            r#"[{"source":{"capture":{"index":0}},"output_index":null},{"source":{"input":{"index":2}},"output_index":3}]"#,
+        );
+    }
+
+    #[test]
+    fn test_reference_source_flat_input_index_round_trips() {
+        for (flat_input_index, capture_count, source) in [
+            (0, 2, ReferenceSource::Capture { index: 0 }),
+            (1, 2, ReferenceSource::Capture { index: 1 }),
+            (2, 2, ReferenceSource::Input { index: 0 }),
+            (4, 2, ReferenceSource::Input { index: 2 }),
+        ] {
+            assert_eq!(ReferenceSource::from_flat_input_index(flat_input_index, capture_count), source);
+            assert_eq!(source.flat_input_index(capture_count), Ok(flat_input_index));
+        }
+    }
+
+    #[test]
+    fn test_reference_source_flat_input_index_rejects_invalid_sources() {
+        assert_eq!(
+            ReferenceSource::Capture { index: 1 }.flat_input_index(1),
+            Err(ProgramError::MalformedProgram(
+                "reference source capture 1 lies outside the capture prefix of length 1".to_string(),
+            )),
+        );
+        assert_eq!(
+            ReferenceSource::Input { index: usize::MAX }.flat_input_index(1),
+            Err(ProgramError::MalformedProgram(format!(
+                "reference source input {} overflows the flat boundary after 1 captures",
+                usize::MAX,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_reference_source_ordering_rendering_and_serialization() {
+        let first_capture = ReferenceSource::Capture { index: 0 };
+        let second_capture = ReferenceSource::Capture { index: 1 };
+        let first_input = ReferenceSource::Input { index: 0 };
+        let second_input = ReferenceSource::Input { index: 1 };
+
+        assert!(first_capture < second_capture);
+        assert!(second_capture < first_input);
+        assert!(first_input < second_input);
+        assert_eq!(first_capture.to_string(), "capture 0");
+        assert_eq!(second_input.to_string(), "input 1");
+        assert_eq!(format!("{first_capture:?}"), "Capture { index: 0 }");
+        assert_eq!(format!("{second_input:?}"), "Input { index: 1 }");
+        assert_eq!(
+            serde_json::to_string(&[first_capture, second_input]).unwrap(),
+            r#"[{"capture":{"index":0}},{"input":{"index":1}}]"#,
         );
     }
 }

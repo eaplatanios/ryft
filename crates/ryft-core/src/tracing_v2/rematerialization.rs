@@ -43,7 +43,7 @@ use std::marker::PhantomData;
 
 use thiserror::Error;
 
-use crate::arrays::{ArrayType, Memory};
+use crate::arrays::{ArrayIrType, ArrayReferenceDischarge, ArrayReferenceViewOperation, ArrayType, Memory};
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
     ProgramBatchingOutputAxesPolicy,
@@ -60,7 +60,8 @@ use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{
     Atom, AtomId, InstructionId, Operation, OperationFormatter, Program, ProgramBuilder, ProgramError,
-    ReferenceDischarge, Region, RegionId, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueId,
+    ReferenceDischargeableOperation, Region, RegionId, RegionInterface, RegionSlot, Type, TypeError, Typed, Value,
+    ValueId,
 };
 use crate::tracing::{DomainTracer, Trace, TracingContext};
 
@@ -1978,9 +1979,8 @@ where
 
 impl<V, O> Program<V, O, Vec<V>, Vec<V>>
 where
-    V: Value,
-    O: Operation<Type = V::Type>,
-    Self: ReferenceDischarge<Value = V, Operation = O>,
+    V: Value<Type = ArrayIrType>,
+    O: ArrayReferenceViewOperation + ReferenceDischargeableOperation<TracingContext<V, O>, ArrayReferenceDischarge>,
 {
     /// Builds a rematerialized flat-vector function after discharging every local reference into immutable state.
     /// External reference inputs and reference captures are rejected because rematerialization has no caller-visible

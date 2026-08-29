@@ -2394,8 +2394,8 @@ mod tests {
     };
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::{
-        Concretizable, Operation, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceDischarge,
-        ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceType, RegionId,
+        Concretizable, Operation, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceFreezeOperation,
+        ReferenceNewOperation, ReferenceReadOperation, ReferenceType, RegionId,
     };
     use crate::tests::test_condition_program;
     use crate::tracing::{NestedTracingContext, Trace};

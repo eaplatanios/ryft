@@ -2488,8 +2488,8 @@ where
     ///
     /// Reference operations have no batching rules, so a program that still carries reference state is rejected by
     /// the first reference operation the transform reaches. Discharge local reference state first through
-    /// [`ReferenceDischarge::discharge_local_references`](crate::ReferenceDischarge::discharge_local_references) with
-    /// the `"batching"` consumer label, which also rejects external or captured reference roots (batching one shared
+    /// [`Program::discharge_local_references`] with the `"batching"` consumer label, which also rejects external or
+    /// captured reference roots (batching one shared
     /// mutable reference across batch items has no defined semantics). Ordinary non-reference captures remain valid
     /// and keep their boundary positions.
     ///
@@ -3723,8 +3723,8 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::{
         EmptyRegionDriver, ProgramBuilder, ProgramRenderingMode, Provenance, ProvenanceScope,
-        ReferenceAddUpdateOperation, ReferenceDischarge, ReferenceFreezeOperation, ReferenceNewOperation,
-        ReferenceReadOperation, ReferenceType,
+        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
+        ReferenceType,
     };
     use crate::specialization::SpecializationCacheStatistics;
     use crate::tests::test_condition_program;
