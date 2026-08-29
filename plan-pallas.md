@@ -201,6 +201,12 @@ Read/write effects remain inside the kernel operation; updated outputs make muta
 boundary. Kernel-internal references cannot be returned, captured by ordinary regions, serialized as constants, or
 stored in composite program values.
 
+Kernel calls and their typed body regions remain part of Ryft's ordinary `Program` IR. Full and partial reference
+discharge are strictly Program-to-Program transformations: references selected for discharge become explicit state in
+the rewritten `Program`, while kernel references selected for preservation remain reference-typed values in that same
+program. Backend-specific MLIR, source, binary, and executable artifacts arise only during later lowering and cannot
+serve as alternate reference-discharge result types.
+
 Read-only operands contain their entering values and produce no updated result. Read-write operands initially contain
 their entering values and publish an updated result. A write-only result starts uninitialized: the verifier must prove
 that every published element is definitely initialized on every successful completion path, or the caller must provide

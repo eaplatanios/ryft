@@ -92,7 +92,7 @@
 //! )?;
 //!
 //! let discharged = program.discharge_references(0)?;
-//! assert_eq!(discharged.public_output_count(), 1);
+//! assert_eq!(discharged.output_count(), 1);
 //! assert_eq!(discharged.external_states(), &[]);
 //! assert_eq!(
 //!     discharged.program().interpret(vec![
@@ -144,7 +144,7 @@
 //!
 //! // Selecting everything discharges every allocation, and the same proof then succeeds.
 //! let full = program.partially_discharge_references(0, &sites)?.try_into_full()?;
-//! assert_eq!(full.public_output_count(), 2);
+//! assert_eq!(full.output_count(), 2);
 //! assert_eq!(full.program().reference_discharge_sites(0)?, Vec::new());
 //! # Ok::<(), ryft_core::ProgramError>(())
 //! ```
@@ -185,10 +185,11 @@ where
     V: Value<Type = ArrayIrType>,
     O: ArrayReferenceViewOperation + ReferenceDischargeableOperation<TracingContext<V, O>, ArrayReferenceDischarge>,
 {
-    type DischargedProgram = Self;
+    type Value = V;
+    type Operation = O;
 
     #[inline]
-    fn discharge_references(self, capture_count: usize) -> Result<ReferenceDischargeResult<Self>, ProgramError> {
+    fn discharge_references(self, capture_count: usize) -> Result<ReferenceDischargeResult<V, O>, ProgramError> {
         self.discharge_references_with_policy::<ArrayReferenceDischarge>(capture_count)
     }
 }
@@ -212,7 +213,7 @@ where
     /// A preserved reference crosses a condition, loop, scan, or call boundary as the reference it already is, at its own
     /// declared operand position, so the rewritten operation threads discharged state and surviving references side by
     /// side; only the discharged half widens. A preserved reference may also be consumed, which full discharge rejects for
-    /// a caller-owned allocation: the payload keeps the `reference_freeze`, so the caller passes its reference to that
+    /// a caller-owned allocation: the program keeps the `reference_freeze`, so the caller passes its reference to that
     /// operation instead of to a state binding. A capture-lifted program has no partial form, and keeps using
     /// [`Program::discharge_references_with_lifted_captures`].
     ///
@@ -226,7 +227,7 @@ where
         self,
         capture_count: usize,
         sites: &[ReferenceDischargeSite],
-    ) -> Result<PartialReferenceDischargeResult<Self>, ProgramError> {
+    ) -> Result<PartialReferenceDischargeResult<V, O>, ProgramError> {
         self.partially_discharge_references_with_policy::<ArrayReferenceDischarge>(capture_count, sites)
     }
 }
@@ -251,7 +252,7 @@ where
     pub fn discharge_references_with_lifted_captures(
         self,
         capture_count: usize,
-    ) -> Result<ReferenceDischargeResult<Program<V, O, Vec<V>, Vec<V>>>, ProgramError> {
+    ) -> Result<ReferenceDischargeResult<V, O>, ProgramError> {
         self.discharge_references_with_lifted_captures_and_policy::<ArrayReferenceDischarge>(capture_count)
     }
 }
@@ -269,9 +270,7 @@ where
     /// The returned logical metadata continues to identify capture slots separately from inputs. Concrete
     /// capture values remain owned by this [`ClosedProgram`]; discharge never embeds their mutable contents into the
     /// derived program.
-    pub fn discharge_references(
-        &self,
-    ) -> Result<ReferenceDischargeResult<Program<V, O, Vec<V>, Vec<V>>>, ProgramError> {
+    pub fn discharge_references(&self) -> Result<ReferenceDischargeResult<V, O>, ProgramError> {
         let capture_count = self.captures().len();
         let program = self.to_program_with_lifted_captures()?;
         program.discharge_references_with_lifted_captures(capture_count)
@@ -548,7 +547,7 @@ mod tests {
         // A local allocation leaves no external state behind, so the discharged boundary is exactly the source boundary,
         // and the rewritten program reproduces the eager reference execution.
         let discharged = source.discharge_references(0).unwrap();
-        assert_eq!(discharged.public_output_count(), 3);
+        assert_eq!(discharged.output_count(), 3);
         assert_eq!(discharged.external_states(), &[]);
         assert_eq!(discharged.program().interpret(inputs), Ok(expected));
 
@@ -570,7 +569,7 @@ mod tests {
         // The capture prefix splits the entry boundary, bindings follow that boundary rather than access order, and
         // only the mutated allocation receives a hidden final-state output after the public prefix.
         let discharged = source.discharge_references(1).unwrap();
-        assert_eq!(discharged.public_output_count(), 2);
+        assert_eq!(discharged.output_count(), 2);
         assert_eq!(
             discharged.external_states(),
             &[
@@ -645,7 +644,7 @@ mod tests {
                     %2:f32[] = add %0 %1
                 in (%2)"},
         );
-        assert_eq!(discharged.public_output_count(), 1);
+        assert_eq!(discharged.output_count(), 1);
         assert_eq!(discharged.external_states(), &[]);
         assert_eq!(discharged.program().interpret(vec![scalar(1.0)]), Ok(vec![scalar(3.0)]));
     }
@@ -915,7 +914,7 @@ mod tests {
 
         let discharged = source.discharge_references(0).unwrap();
         assert_eq!(discharged.program().to_string(), source_rendering);
-        assert_eq!(discharged.public_output_count(), 1);
+        assert_eq!(discharged.output_count(), 1);
         assert_eq!(discharged.external_states(), &[]);
         assert_eq!(discharged.program().interpret(vec![scalar(3.0)]), Ok(vec![scalar(6.0)]));
     }
@@ -963,7 +962,7 @@ mod tests {
                 let %3:f32[] = add %1 %2
                 in (%0, %1, %3)"},
         );
-        assert_eq!(discharged.public_output_count(), 3);
+        assert_eq!(discharged.output_count(), 3);
         assert_eq!(discharged.external_states(), &[]);
         assert_eq!(discharged.program().effects(), Effects::PURE);
     }
@@ -1307,7 +1306,7 @@ mod tests {
             serde_json::to_string(discharged.external_states()).unwrap(),
             serde_json::to_string(repeated.external_states()).unwrap(),
         );
-        assert_eq!(discharged.public_output_count(), 2);
+        assert_eq!(discharged.output_count(), 2);
 
         // Metadata follows entry-boundary order rather than access order, and only the swapped first allocation receives a
         // hidden final-state output after the public prefix.
@@ -1388,7 +1387,7 @@ mod tests {
         // The selected allocation disappeared into threaded array state, while the unselected one, its view, its swap,
         // and its freeze all survive as the reference operations the source performed. Neither allocation is caller-owned,
         // so the mixed program reports no external state and keeps exactly its source boundary.
-        assert_eq!(discharged.public_output_count(), 3);
+        assert_eq!(discharged.output_count(), 3);
         assert_eq!(discharged.external_states(), &[]);
         assert_eq!(
             discharged.program().to_string(),
@@ -1408,12 +1407,12 @@ mod tests {
         assert_eq!(source.clone().interpret(inputs.clone()), Ok(expected.clone()));
         assert_eq!(discharged.program().interpret(inputs), Ok(expected));
 
-        // The mixed payload proves nothing about reference freedom, and asking for the proof reports the surviving
+        // The mixed program proves nothing about reference freedom, and asking for the proof reports the surviving
         // references instead of converting.
         assert_eq!(
             discharged.try_into_full().unwrap_err(),
             ProgramError::MalformedProgram(
-                "reference discharge payload still contains a reference-typed value and cannot form a full discharge"
+                "reference discharge program still contains a reference-typed value and cannot form a full discharge"
                     .to_string(),
             ),
         );
@@ -1482,7 +1481,7 @@ mod tests {
 
         let sites = source.reference_discharge_sites(0).unwrap();
         let discharged = source.clone().partially_discharge_references(0, &sites[..1]).unwrap();
-        assert_eq!(discharged.public_output_count(), 3);
+        assert_eq!(discharged.output_count(), 3);
         assert_eq!(discharged.external_states(), &[]);
         assert_eq!(
             discharged.program().to_string(),
@@ -1574,7 +1573,7 @@ mod tests {
 
         let sites = source.reference_discharge_sites(0).unwrap();
         let discharged = source.clone().partially_discharge_references(0, &sites[..1]).unwrap();
-        assert_eq!(discharged.public_output_count(), 3);
+        assert_eq!(discharged.output_count(), 3);
         assert_eq!(discharged.external_states(), &[]);
         assert_eq!(
             discharged.program().to_string(),
@@ -1679,7 +1678,7 @@ mod tests {
 
         let sites = source.reference_discharge_sites(0).unwrap();
         let discharged = source.clone().partially_discharge_references(0, &sites[..1]).unwrap();
-        assert_eq!(discharged.public_output_count(), 2);
+        assert_eq!(discharged.output_count(), 2);
         assert_eq!(discharged.external_states(), &[]);
         assert_eq!(
             discharged.program().to_string(),
@@ -1771,7 +1770,7 @@ mod tests {
             .unwrap();
 
         let preserved = source.clone().partially_discharge_references(0, &[]).unwrap();
-        assert_eq!(preserved.public_output_count(), 2);
+        assert_eq!(preserved.output_count(), 2);
         assert_eq!(preserved.external_states(), &[]);
         assert_eq!(preserved.program().to_string(), source.to_string());
 
@@ -1844,7 +1843,7 @@ mod tests {
 
         let sites = source.reference_discharge_sites(0).unwrap();
         let discharged = source.clone().partially_discharge_references(0, &sites[..1]).unwrap();
-        assert_eq!(discharged.public_output_count(), 2);
+        assert_eq!(discharged.output_count(), 2);
         assert_eq!(discharged.external_states(), &[]);
         assert_eq!(
             discharged.program().to_string(),
@@ -1933,7 +1932,7 @@ mod tests {
 
         let sites = source.reference_discharge_sites(0).unwrap();
         let discharged = source.clone().partially_discharge_references(0, &sites[..1]).unwrap();
-        assert_eq!(discharged.public_output_count(), 3);
+        assert_eq!(discharged.output_count(), 3);
         assert_eq!(discharged.external_states(), &[]);
         assert_eq!(
             discharged.program().to_string(),
@@ -2067,7 +2066,7 @@ mod tests {
                 ]
                 in (%3, %4)"},
         );
-        assert_eq!(discharged.public_output_count(), 1);
+        assert_eq!(discharged.output_count(), 1);
         assert_eq!(discharged.external_states()[0].output_index(), Some(1));
 
         // The true branch writes and then reads, so both the public snapshot and final state are the replacement.
@@ -2147,7 +2146,7 @@ mod tests {
         // Both branches write a different allocation, so both allocations cross the boundary; the appended final-state outputs
         // follow parent entry-boundary order rather than the order in which either branch happens to access them.
         let discharged = source.discharge_references(0).unwrap();
-        assert_eq!(discharged.public_output_count(), 2);
+        assert_eq!(discharged.output_count(), 2);
         assert_eq!(discharged.external_states().len(), 2);
         assert_eq!(discharged.external_states()[0].source(), ReferenceSource::Input { index: 1 });
         assert_eq!(discharged.external_states()[0].output_index(), Some(2));
@@ -2538,7 +2537,7 @@ mod tests {
                 ]
                 in (%1, %2, %1)"},
         );
-        assert_eq!(discharged.public_output_count(), 2);
+        assert_eq!(discharged.output_count(), 2);
         assert_eq!(discharged.external_states()[0].output_index(), Some(2));
         let scan = discharged.program().entry_region_ref().instructions()[0].operation();
         let TestOperation::Scan(scan) = scan else {
@@ -2608,7 +2607,7 @@ mod tests {
                 ]
                 in (%3, %4)"},
         );
-        assert_eq!(discharged.public_output_count(), 1);
+        assert_eq!(discharged.output_count(), 1);
         assert_eq!(discharged.external_states()[0].source(), ReferenceSource::Capture { index: 0 });
         assert_eq!(discharged.external_states()[0].source().flat_input_index(discharged.capture_count()), Ok(0));
         assert_eq!(discharged.external_states()[0].output_index(), Some(1));
@@ -2668,7 +2667,7 @@ mod tests {
             .unwrap();
 
         let discharged = source.discharge_references(0).unwrap();
-        assert_eq!(discharged.public_output_count(), 1);
+        assert_eq!(discharged.output_count(), 1);
         assert_eq!(discharged.program().output_types().len(), 1);
         assert_eq!(
             discharged.external_states(),
@@ -2728,7 +2727,7 @@ mod tests {
                 ]
                 in (%2)"},
         );
-        assert_eq!(discharged.public_output_count(), 1);
+        assert_eq!(discharged.output_count(), 1);
         assert_eq!(discharged.program().output_types().len(), 1);
         assert_eq!(discharged.external_states().len(), 1);
         assert!(!discharged.external_states()[0].is_mutated());
@@ -3032,7 +3031,7 @@ mod tests {
         let closed = ClosedProgram::new(program, vec![ArrayIrValue::Reference(reference)]).unwrap();
 
         let discharged = closed.discharge_references().unwrap();
-        assert_eq!(discharged.public_output_count(), 1);
+        assert_eq!(discharged.output_count(), 1);
         assert_eq!(
             discharged.external_states(),
             &[ExternalReferenceBinding::new(ReferenceSource::Capture { index: 0 }, None)],
@@ -3091,7 +3090,7 @@ mod tests {
         let closed = ClosedProgram::new(program, vec![ArrayIrValue::Reference(reference), boolean(true)]).unwrap();
 
         let discharged = closed.discharge_references().unwrap();
-        assert_eq!(discharged.public_output_count(), 1);
+        assert_eq!(discharged.output_count(), 1);
         assert_eq!(discharged.external_states().len(), 1);
         assert_eq!(discharged.external_states()[0].source(), ReferenceSource::Capture { index: 0 });
         assert!(!discharged.external_states()[0].is_mutated());
@@ -3204,7 +3203,7 @@ mod tests {
         .unwrap();
 
         let discharged = closed.discharge_references().unwrap();
-        assert_eq!(discharged.public_output_count(), 1);
+        assert_eq!(discharged.output_count(), 1);
         assert_eq!(discharged.external_states().len(), 1);
         assert_eq!(discharged.external_states()[0].source(), ReferenceSource::Capture { index: 0 });
         assert_eq!(discharged.external_states()[0].source().flat_input_index(discharged.capture_count()), Ok(0));

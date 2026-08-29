@@ -8,6 +8,7 @@ use crate::parameters::Placeholder;
 use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
+use crate::programs::types::Typed;
 use crate::programs::values::Value;
 use crate::tracing::TracingContext;
 
@@ -17,8 +18,7 @@ use super::interpreter::{
 };
 use super::policies::ReferenceDischargePolicy;
 use super::results::{
-    ExternalReferenceBinding, PartialReferenceDischargeResult, ReferenceDischargePayload, ReferenceDischargeResult,
-    ReferenceSource,
+    ExternalReferenceBinding, PartialReferenceDischargeResult, ReferenceDischargeResult, ReferenceSource,
 };
 use super::selection::{ReferenceDischargeSelection, ReferenceDischargeSite};
 
@@ -27,10 +27,14 @@ use super::selection::{ReferenceDischargeSelection, ReferenceDischargeSite};
 /// An implementation names its universe's [`ReferenceDischargePolicy`] and otherwise only forwards to the interpreter
 /// entry point [`Program::discharge_references_with_policy`]. Generic transforms reach discharge through
 /// [`discharge_local_references`](Self::discharge_local_references) and therefore neither name a policy nor inspect
-/// family-specific alias metadata.
+/// family-specific alias metadata. The associated value and operation types identify the returned flat [`Program`]
+/// universe; implementations cannot substitute another result representation.
 pub trait ReferenceDischarge: Sized {
-    /// Reference-free program payload produced by this implementation.
-    type DischargedProgram: ReferenceDischargePayload;
+    /// Value family of the discharged program.
+    type Value: Value;
+
+    /// Operation family of the discharged program.
+    type Operation: Operation<Type = <Self::Value as Typed>::Type>;
 
     /// Discharges every reference and returns the reference-free program plus its logical external-state bindings.
     ///
@@ -40,7 +44,7 @@ pub trait ReferenceDischarge: Sized {
     fn discharge_references(
         self,
         capture_count: usize,
-    ) -> Result<ReferenceDischargeResult<Self::DischargedProgram>, ProgramError>;
+    ) -> Result<ReferenceDischargeResult<Self::Value, Self::Operation>, ProgramError>;
 
     /// Discharges local references for `transform`, rejecting every caller-owned external allocation.
     ///
@@ -56,7 +60,7 @@ pub trait ReferenceDischarge: Sized {
         self,
         capture_count: usize,
         transform: &'static str,
-    ) -> Result<Self::DischargedProgram, ProgramError> {
+    ) -> Result<Program<Self::Value, Self::Operation, Vec<Self::Value>, Vec<Self::Value>>, ProgramError> {
         let discharged = self.discharge_references(capture_count)?;
         if let Some(state) = discharged.external_states().first() {
             return Err(ProgramError::UnsupportedOperation {
@@ -96,7 +100,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// [`interpret_in_context`](Self::interpret_in_context), because that is the path that threads each instruction's
     /// source coordinate into the rules, which is what makes an entry-region allocation identifiable.
     ///
-    /// The rewritten payload is proven reference-free rather than assumed to be: the replay assembles a
+    /// The rewritten program is proven reference-free rather than assumed to be: the replay assembles a
     /// [`PartialReferenceDischargeResult`] and converts it through
     /// [`try_into_full`](PartialReferenceDischargeResult::try_into_full), so a rule that returned a reference-touching
     /// operation is reported here instead of surviving into a result whose contract says it cannot exist.
@@ -111,12 +115,12 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     ///
     /// Returns [`ProgramError::MalformedProgram`] when `capture_count` exceeds the program's input count, when an
     /// output still denotes a reference, when the program consumes an external allocation, whose state belongs to the
-    /// caller, or when the rewritten payload fails the reference-freedom proof. Rule-level failures, including a
+    /// caller, or when the rewritten program fails the reference-freedom proof. Rule-level failures, including a
     /// use-after-consume and an access to an unbound allocation, propagate from the replay itself.
     pub fn discharge_references_with_policy<P>(
         self,
         capture_count: usize,
-    ) -> Result<ReferenceDischargeResult<Self>, ProgramError>
+    ) -> Result<ReferenceDischargeResult<V, O>, ProgramError>
     where
         P: ReferenceDischargePolicy<TracingContext<V, O>>,
         O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
@@ -138,7 +142,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// reference-typed boundary position or its allocating instruction, every access to it replays verbatim as the
     /// reference operation the source performed, and a view derived from it replays its view operation too, so the
     /// rewritten program still denotes the same coordinates. Preserved references contribute no state input, no hidden
-    /// final-state output, and no [`ExternalReferenceBinding`]: the payload's own boundary is where the caller sees them.
+    /// final-state output, and no [`ExternalReferenceBinding`]: the program's own boundary is where the caller sees them.
     ///
     /// This is what a kernel pipeline needs — normalize the pipeline's own state into explicit carries while the
     /// references a kernel body addresses stay references — and it is the reason the result envelope is
@@ -155,7 +159,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// Where a structured operation *declares* a reference-typed output — a loop carry, say — the rewritten operation
     /// still produces one, and it is deliberately left unused: the caller keeps the handle it already holds, because
     /// both denote the same allocation and one destination value per allocation is enough. A later full discharge of the same
-    /// payload collapses that position into an ordinary state carry.
+    /// program collapses that position into an ordinary state carry.
     ///
     /// A *capture-lifted* program has no partial form: this entry point recognizes no capture constant, so a
     /// reference-typed one is rejected where it is lifted, and
@@ -177,13 +181,13 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// [`discharge_references_with_policy`](Self::discharge_references_with_policy) documents — with one deliberate
     /// exception. Consuming a *discharged* external allocation is still rejected, because a
     /// [`ExternalReferenceBinding`] cannot express a caller-owned reference that no longer denotes live state; consuming
-    /// a *preserved* one is accepted, because the payload retains the consuming operation and the caller passes its
+    /// a *preserved* one is accepted, because the program retains the consuming operation and the caller passes its
     /// reference handle to that operation directly.
     pub fn partially_discharge_references_with_policy<P>(
         self,
         capture_count: usize,
         sites: &[ReferenceDischargeSite],
-    ) -> Result<PartialReferenceDischargeResult<Self>, ProgramError>
+    ) -> Result<PartialReferenceDischargeResult<V, O>, ProgramError>
     where
         P: ReferenceDischargePolicy<TracingContext<V, O>>,
         O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
@@ -226,7 +230,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     pub fn discharge_references_with_lifted_captures_and_policy<P>(
         self,
         capture_count: usize,
-    ) -> Result<ReferenceDischargeResult<Self>, ProgramError>
+    ) -> Result<ReferenceDischargeResult<V, O>, ProgramError>
     where
         V: CaptureConstant,
         P: ReferenceDischargePolicy<TracingContext<V, O>>,
@@ -264,7 +268,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
         capture_count: usize,
         capture_index: fn(&V) -> Option<usize>,
         selection: ReferenceDischargeSelection,
-    ) -> Result<PartialReferenceDischargeResult<Self>, ProgramError>
+    ) -> Result<PartialReferenceDischargeResult<V, O>, ProgramError>
     where
         P: ReferenceDischargePolicy<TracingContext<V, O>>,
         O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
@@ -276,7 +280,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
                 "reference discharge requests {capture_count} captures but the program has {input_count} inputs",
             )));
         }
-        let public_output_count = self.output_count();
+        let output_count = self.output_count();
 
         // A program that touches no reference anywhere is already its own discharge, so it is returned untouched
         // rather than replayed into a fresh trace. This is not only cheaper on the two transform adapters that
@@ -284,7 +288,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
         // the region transform cache its regions carry, all for a rewrite that has nothing to rewrite.
         let entry = self.entry_region_ref();
         if !region_closure_touches_references(entry) {
-            return PartialReferenceDischargeResult::new(self, capture_count, public_output_count, Vec::new());
+            return PartialReferenceDischargeResult::new(self, capture_count, output_count, Vec::new());
         }
 
         // The block scopes the destination context, the discharge context, and every carrier, because recovering the
@@ -378,10 +382,11 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
             (builder, output_ids, external_states)
         };
 
-        let output_count = output_ids.len();
+        let complete_output_count = output_ids.len();
         let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-        let program = builder.build(output_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?;
-        PartialReferenceDischargeResult::new(program, capture_count, public_output_count, external_states)
+        let program =
+            builder.build(output_ids, vec![Placeholder; input_count], vec![Placeholder; complete_output_count])?;
+        PartialReferenceDischargeResult::new(program, capture_count, output_count, external_states)
     }
 }
 
@@ -411,26 +416,28 @@ mod tests {
     fn test_reference_discharge_local_references_calls_full_discharge_once_and_preserves_failure_precedence() {
         let calls = Rc::new(Cell::new(0));
         let local = TestDischargeProvider { calls: calls.clone(), mode: TestDischargeMode::Local };
-        assert_eq!(local.discharge_local_references(0, "test transform"), Ok(TestPayload::new(7, 0, 0)));
+        let local = local.discharge_local_references(0, "test transform").unwrap();
+        assert_eq!(local.input_count(), 0);
+        assert_eq!(local.output_count(), 0);
         assert_eq!(calls.get(), 1);
 
         let external = TestDischargeProvider { calls: calls.clone(), mode: TestDischargeMode::External };
         assert_eq!(
-            external.discharge_local_references(0, "test transform"),
-            Err(ProgramError::UnsupportedOperation {
+            external.discharge_local_references(0, "test transform").unwrap_err(),
+            ProgramError::UnsupportedOperation {
                 message: "test transform supports only local references, but the program uses external \
                           `input 0`"
                     .to_string(),
-            }),
+            },
         );
         assert_eq!(calls.get(), 2);
 
         let malformed = TestDischargeProvider { calls: calls.clone(), mode: TestDischargeMode::Malformed };
         assert_eq!(
-            malformed.discharge_local_references(0, "test transform"),
-            Err(ProgramError::MalformedProgram(
+            malformed.discharge_local_references(0, "test transform").unwrap_err(),
+            ProgramError::MalformedProgram(
                 "reference discharge final states end at output 0 but discharged output count is 1".to_string(),
-            )),
+            ),
         );
         assert_eq!(calls.get(), 3);
     }
@@ -464,7 +471,7 @@ mod tests {
 
         // The selected allocation became an ordinary state input at its own boundary position and publishes its final state
         // as a hidden output; the preserved reference kept its reference type, so it binds nothing at all.
-        assert_eq!(discharged.public_output_count(), 1);
+        assert_eq!(discharged.output_count(), 1);
         assert_eq!(
             discharged.external_states(),
             &[ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
@@ -486,7 +493,7 @@ mod tests {
         assert_eq!(
             discharged.try_into_full().unwrap_err(),
             ProgramError::MalformedProgram(
-                "reference discharge payload still contains a reference-typed value and cannot form a full discharge"
+                "reference discharge program still contains a reference-typed value and cannot form a full discharge"
                     .to_string(),
             ),
         );
@@ -515,7 +522,7 @@ mod tests {
         // the chain at the access.
         let discharged = source.clone().partially_discharge_references_with_policy::<ListReferenceDischarge>(0, &[]);
         let discharged = discharged.unwrap();
-        assert_eq!(discharged.public_output_count(), 1);
+        assert_eq!(discharged.output_count(), 1);
         assert_eq!(discharged.external_states(), &[]);
         assert_eq!(
             discharged.program().to_string(),
@@ -550,7 +557,7 @@ mod tests {
     fn test_partial_reference_discharge_lets_a_program_consume_a_preserved_external_allocation() {
         // Full discharge rejects a program that consumes a caller-owned allocation, because a `ExternalReferenceBinding`
         // cannot describe reference state that no longer exists. A preserved reference has no binding to describe: the
-        // payload keeps the consuming operation, and the caller passes its reference to that operation directly, so partial
+        // program keeps the consuming operation, and the caller passes its reference to that operation directly, so partial
         // discharge accepts what full discharge cannot express.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let external = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
@@ -634,7 +641,7 @@ mod tests {
         // The selected allocation's entering state occupies its own operand position and its successor is appended as a
         // published output; the preserved reference's operand position still carries a reference, and the rebuilt callee
         // performs the read on it exactly as the source did.
-        assert_eq!(discharged.public_output_count(), 1);
+        assert_eq!(discharged.output_count(), 1);
         assert_eq!(
             discharged.external_states(),
             &[ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],

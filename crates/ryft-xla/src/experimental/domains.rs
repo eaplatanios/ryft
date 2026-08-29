@@ -1408,7 +1408,7 @@ pub struct XlaLoweredProgram {
     output_types: Arc<[ArrayType]>,
 
     /// Number of leading logical outputs exposed through the structured public function result.
-    public_output_count: usize,
+    output_count: usize,
 
     /// Logical external reference-state binding recipes in canonical source order.
     ///
@@ -1463,7 +1463,7 @@ impl XlaLoweredProgram {
     /// executable ABI but excluding the hidden final-state output suffix appended by reference discharge.
     #[inline]
     pub fn output_types(&self) -> &[ArrayType] {
-        &self.output_types[..self.public_output_count]
+        &self.output_types[..self.output_count]
     }
 
     /// Returns the device mesh this lowering targets.
@@ -1603,7 +1603,7 @@ struct XlaPersistentKeyV6<'a> {
     output_mapping: Vec<Option<u64>>,
     input_dimensions: Vec<PersistentBoundaryDimensionV5>,
     output_dimensions: Vec<PersistentBoundaryDimensionV5>,
-    public_output_count: u64,
+    output_count: u64,
     reference_states: Vec<PersistentReferenceStateV6>,
     requires_assertion_handler: bool,
     donation_flags: &'a [bool],
@@ -1628,7 +1628,7 @@ struct XlaPersistentExecutableMetadataV6 {
     output_mapping: Vec<Option<u64>>,
     input_dimensions: Vec<PersistentBoundaryDimensionV5>,
     output_dimensions: Vec<PersistentBoundaryDimensionV5>,
-    public_output_count: u64,
+    output_count: u64,
     reference_states: Vec<PersistentReferenceStateV6>,
     requires_assertion_handler: bool,
     donation_flags: Vec<bool>,
@@ -2267,7 +2267,7 @@ pub struct XlaCompiledProgram<'c> {
     executable: Arc<LoadedExecutable<'c>>,
     input_types: Arc<[ArrayType]>,
     output_types: Arc<[ArrayType]>,
-    public_output_count: usize,
+    output_count: usize,
     reference_states: Arc<[ExternalReferenceBinding]>,
     signature: XlaExecutableSignature,
     requires_assertion_handler: bool,
@@ -2289,7 +2289,7 @@ pub struct XlaCompiledProgram<'c> {
 struct XlaInvocationMetadata<'a> {
     input_types: &'a [ArrayType],
     output_types: &'a [ArrayType],
-    public_output_count: usize,
+    output_count: usize,
     reference_states: &'a [ExternalReferenceBinding],
     signature: &'a XlaExecutableSignature,
     donation_flags: &'a [bool],
@@ -2304,7 +2304,7 @@ impl<'a, 'c> From<&'a XlaCompiledProgram<'c>> for XlaInvocationMetadata<'a> {
         Self {
             input_types: &program.input_types,
             output_types: &program.output_types,
-            public_output_count: program.public_output_count,
+            output_count: program.output_count,
             reference_states: &program.reference_states,
             signature: &program.signature,
             donation_flags: &program.donation_flags,
@@ -2321,7 +2321,7 @@ impl<'a> From<&'a XlaLoweredProgram> for XlaInvocationMetadata<'a> {
         Self {
             input_types: &program.input_types,
             output_types: &program.output_types,
-            public_output_count: program.public_output_count,
+            output_count: program.output_count,
             reference_states: &program.reference_states,
             signature: &program.signature,
             donation_flags: &program.donation_flags,
@@ -2352,8 +2352,8 @@ fn incompatible_xla_invocation_field(
         != canonical_boundary_types(other.input_types, other.output_types)
     {
         Some("boundary types")
-    } else if current.public_output_count != other.public_output_count {
-        Some("public output count")
+    } else if current.output_count != other.output_count {
+        Some("output count")
     } else if current.reference_states != other.reference_states {
         Some("reference-state signature")
     } else if current.signature != other.signature {
@@ -2398,7 +2398,7 @@ impl<'c> XlaCompiledProgram<'c> {
     /// leaves but excluding the hidden final-state output suffix appended by reference discharge.
     #[inline]
     pub fn output_types(&self) -> &[ArrayType] {
-        &self.output_types[..self.public_output_count]
+        &self.output_types[..self.output_count]
     }
 
     /// Returns whether this executable requires a stateful reference invocation boundary.
@@ -3086,11 +3086,10 @@ impl<'c> XlaDomain<'c> {
                     program,
                     &mut physical_outputs,
                     fence.clone(),
-                    program.public_output_count..program.output_types.len(),
+                    program.output_count..program.output_types.len(),
                 )?;
-                let mut hidden_outputs = (program.public_output_count..program.output_types.len())
-                    .zip(hidden_outputs)
-                    .collect::<BTreeMap<_, _>>();
+                let mut hidden_outputs =
+                    (program.output_count..program.output_types.len()).zip(hidden_outputs).collect::<BTreeMap<_, _>>();
                 if replacement_transactions.len() != mutated_slots.len() {
                     return Err(ProgramError::MalformedProgram(
                         "submitted reference replacement count does not match mutated reference count".to_string(),
@@ -3167,7 +3166,7 @@ impl<'c> XlaDomain<'c> {
                     program,
                     &mut physical_outputs,
                     fence,
-                    0..program.public_output_count,
+                    0..program.output_count,
                 )?;
                 validate_compiled_output_refinements(
                     program,
@@ -3241,7 +3240,7 @@ impl<'c> XlaDomain<'c> {
     /// Lowers one validated reference-discharge artifact through the ordinary array-only XLA path.
     fn lower_discharged_xla_program(
         &self,
-        discharged: &ReferenceDischargeResult<FlatXlaProgram>,
+        discharged: &ReferenceDischargeResult<XlaConstant, XlaOperation>,
         options: &XlaOptions,
     ) -> Result<XlaLoweredProgram, XlaDomainError> {
         // The backend verifier remains independent from core discharge and runs before boundary projection,
@@ -3256,7 +3255,7 @@ impl<'c> XlaDomain<'c> {
         self.lower_verified_reference_free_xla_program(
             discharged.program(),
             discharged.capture_count(),
-            discharged.public_output_count(),
+            discharged.output_count(),
             discharged.external_states(),
             options,
         )
@@ -3267,7 +3266,7 @@ impl<'c> XlaDomain<'c> {
         &self,
         program: &FlatXlaProgram,
         capture_count: usize,
-        public_output_count: usize,
+        output_count: usize,
         reference_states: &[ExternalReferenceBinding],
         options: &XlaOptions,
     ) -> Result<XlaLoweredProgram, XlaDomainError> {
@@ -3278,9 +3277,9 @@ impl<'c> XlaDomain<'c> {
             .into());
         }
         validate_data_dependent_compilation(program)?;
-        if public_output_count > program.output_count() {
+        if output_count > program.output_count() {
             return Err(ProgramError::MalformedProgram(format!(
-                "public output count {public_output_count} exceeds the discharged output count {}",
+                "output count {output_count} exceeds the complete discharged output count {}",
                 program.output_count(),
             ))
             .into());
@@ -3339,7 +3338,7 @@ impl<'c> XlaDomain<'c> {
         }
         let hidden_output_indices =
             reference_states.iter().filter_map(ExternalReferenceBinding::output_index).collect::<Vec<_>>();
-        if hidden_output_indices != (public_output_count..program.output_count()).collect::<Vec<_>>() {
+        if hidden_output_indices != (output_count..program.output_count()).collect::<Vec<_>>() {
             return Err(ProgramError::MalformedProgram(
                 "hidden discharged outputs must be covered exactly once by mutated external state".to_string(),
             )
@@ -3390,7 +3389,7 @@ impl<'c> XlaDomain<'c> {
         }
         let program_output_types = program.output_types();
         let public_output_types = apply_signature_shardings(
-            program_output_types[..public_output_count].to_vec(),
+            program_output_types[..output_count].to_vec(),
             options.out_shardings.as_deref(),
             "out",
         )?;
@@ -3426,7 +3425,7 @@ impl<'c> XlaDomain<'c> {
             .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProgramError::from)?;
-        for logical_output_index in public_output_count..program.output_count() {
+        for logical_output_index in output_count..program.output_count() {
             let (_, &logical_input_index) = reference_states
                 .iter()
                 .zip(&reference_state_input_indices)
@@ -3442,7 +3441,7 @@ impl<'c> XlaDomain<'c> {
                     .iter()
                     .enumerate()
                     .map(|(logical_output_index, array_type)| {
-                        if logical_output_index < public_output_count {
+                        if logical_output_index < output_count {
                             array_type.sharding().cloned().unwrap_or_else(|| {
                                 Sharding::replicated(options.mesh.logical_mesh().clone(), array_type.shape().rank())
                             })
@@ -3527,7 +3526,7 @@ impl<'c> XlaDomain<'c> {
             compilation_options,
             input_types: effective_input_types.into(),
             output_types: output_types.into(),
-            public_output_count,
+            output_count,
             reference_states: reference_states.into(),
             signature,
             requires_assertion_handler,
@@ -3554,7 +3553,7 @@ impl<'c> XlaDomain<'c> {
             output_mapping: persistent_mapping(program.signature.output_mapping())?,
             input_dimensions: persistent_input_dimensions(&program.signature),
             output_dimensions: persistent_output_dimensions(&program.signature),
-            public_output_count: program.public_output_count as u64,
+            output_count: program.output_count as u64,
             reference_states: persistent_reference_states(&program.reference_states, program.capture_count)?,
             requires_assertion_handler: program.requires_assertion_handler,
             donation_flags: &program.donation_flags,
@@ -3589,7 +3588,7 @@ impl<'c> XlaDomain<'c> {
             executable: Arc::new(executable),
             input_types: Arc::clone(&program.input_types),
             output_types: Arc::clone(&program.output_types),
-            public_output_count: program.public_output_count,
+            output_count: program.output_count,
             reference_states: Arc::clone(&program.reference_states),
             signature: program.signature.clone(),
             requires_assertion_handler: program.requires_assertion_handler,
@@ -3662,7 +3661,7 @@ impl<'c> XlaDomain<'c> {
             output_mapping: persistent_mapping(program.signature.output_mapping())?,
             input_dimensions: persistent_input_dimensions(&program.signature),
             output_dimensions: persistent_output_dimensions(&program.signature),
-            public_output_count: program.public_output_count as u64,
+            output_count: program.output_count as u64,
             reference_states: persistent_reference_states(&program.reference_states, program.capture_count)?,
             requires_assertion_handler: program.requires_assertion_handler,
             donation_flags: program.donation_flags.to_vec(),
@@ -3733,7 +3732,7 @@ impl<'c> XlaDomain<'c> {
 
         let mesh = DeviceMesh::try_from(metadata.mesh)?;
         let capture_count = checked_usize(metadata.capture_count)?;
-        let public_output_count = checked_usize(metadata.public_output_count)?;
+        let output_count = checked_usize(metadata.output_count)?;
         let reference_states = decode_persistent_reference_states(metadata.reference_states, capture_count)?;
         if !reference_states.is_empty() && !is_fully_addressable_single_process_mesh(self.client()?, &mesh)? {
             return Err(persistent_error("reference-state mesh is not fully addressable by this process"));
@@ -3747,8 +3746,8 @@ impl<'c> XlaDomain<'c> {
             return Ok(None);
         }
         let (input_types, output_types) = metadata.signature.decode()?;
-        if public_output_count > output_types.len() {
-            return Err(persistent_error("reference-state metadata has an invalid public output count"));
+        if output_count > output_types.len() {
+            return Err(persistent_error("reference-state metadata has an invalid output count"));
         }
         if capture_count > input_types.len() || metadata.donation_flags.len() != input_types.len() - capture_count {
             return Err(persistent_error("capture or donation metadata has an invalid arity"));
@@ -3764,7 +3763,7 @@ impl<'c> XlaDomain<'c> {
         }
         let hidden_output_indices =
             reference_states.iter().filter_map(ExternalReferenceBinding::output_index).collect::<Vec<_>>();
-        if hidden_output_indices != (public_output_count..output_types.len()).collect::<Vec<_>>() {
+        if hidden_output_indices != (output_count..output_types.len()).collect::<Vec<_>>() {
             return Err(persistent_error("reference-state metadata does not cover the hidden output suffix"));
         }
         for (state, &expected_input_index) in reference_states.iter().zip(&reference_state_input_indices) {
@@ -3892,7 +3891,7 @@ impl<'c> XlaDomain<'c> {
             executable: Arc::new(executable),
             input_types: input_types.into(),
             output_types: output_types.into(),
-            public_output_count,
+            output_count,
             reference_states: reference_states.into(),
             signature,
             requires_assertion_handler: metadata.requires_assertion_handler,
@@ -5847,7 +5846,7 @@ mod tests {
         let current = XlaInvocationMetadata {
             input_types: &[],
             output_types: &[],
-            public_output_count: 0,
+            output_count: 0,
             reference_states: &[],
             signature: &signature,
             donation_flags: &[false],
@@ -5863,11 +5862,11 @@ mod tests {
             Err(XlaDomainError::InvalidCompilationOptions { reason })
                 if reason == "replacement executable has incompatible donation flags",
         ));
-        let replacement = XlaInvocationMetadata { public_output_count: 1, ..current };
+        let replacement = XlaInvocationMetadata { output_count: 1, ..current };
         assert!(matches!(
             validate_xla_replacement_metadata(current, replacement),
             Err(XlaDomainError::InvalidCompilationOptions { reason })
-                if reason == "replacement executable has incompatible public output count",
+                if reason == "replacement executable has incompatible output count",
         ));
         let state = ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None);
         let replacement = XlaInvocationMetadata { reference_states: std::slice::from_ref(&state), ..current };
@@ -9081,7 +9080,7 @@ mod tests {
             output_mapping: Vec::new(),
             input_dimensions: Vec::new(),
             output_dimensions: Vec::new(),
-            public_output_count: 0,
+            output_count: 0,
             reference_states: Vec::new(),
             requires_assertion_handler: false,
             donation_flags: Vec::new(),
@@ -10282,7 +10281,7 @@ mod tests {
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let lowered = domain.lower_xla_program(&program, 0, &XlaOptions::new(mesh)).unwrap();
-        assert_eq!(lowered.public_output_count, 1);
+        assert_eq!(lowered.output_count, 1);
         assert_eq!(lowered.reference_states.len(), 1);
         assert_eq!(lowered.reference_states[0].source().flat_input_index(lowered.capture_count).unwrap(), 0);
         assert_eq!(lowered.reference_states[0].output_index(), None);
@@ -10317,7 +10316,7 @@ mod tests {
         let compiled = domain.compile_xla_program(&lowered).unwrap();
         let bytes = domain.serialize_xla_program(&compiled).unwrap().unwrap();
         let restored = domain.deserialize_xla_program(bytes.as_slice()).unwrap().unwrap();
-        assert_eq!(compiled.public_output_count, 1);
+        assert_eq!(compiled.output_count, 1);
         assert_eq!(compiled.reference_states.len(), 2);
         assert_eq!(compiled.reference_states[0].source(), ReferenceSource::Capture { index: 0 });
         assert_eq!(compiled.reference_states[0].source().flat_input_index(compiled.capture_count).unwrap(), 0);
@@ -10325,7 +10324,7 @@ mod tests {
         assert_eq!(compiled.reference_states[1].source(), ReferenceSource::Input { index: 0 });
         assert_eq!(compiled.reference_states[1].source().flat_input_index(compiled.capture_count).unwrap(), 1);
         assert_eq!(compiled.reference_states[1].output_index(), None);
-        assert_eq!(restored.public_output_count, compiled.public_output_count);
+        assert_eq!(restored.output_count, compiled.output_count);
         assert_eq!(restored.reference_states, compiled.reference_states);
         let outputs = domain
             .execute_xla_program(&restored, vec![f32_scalar(&client, &mesh, 1.0), f32_scalar(&client, &mesh, 2.0)])
@@ -10369,15 +10368,15 @@ mod tests {
                 if reason == "reference-state source does not match its logical input",
         ));
 
-        // A public output count beyond the decoded output arity cannot name a hidden final-state suffix at all.
-        let mut invalid_public_outputs: XlaPersistentExecutableMetadataV6 =
+        // An output count beyond the decoded complete output arity cannot name a hidden final-state suffix at all.
+        let mut invalid_outputs: XlaPersistentExecutableMetadataV6 =
             serde_json::from_slice(&bytes[header_size..metadata_end]).unwrap();
-        invalid_public_outputs.public_output_count = 3;
-        let corrupted = corrupt(invalid_public_outputs);
+        invalid_outputs.output_count = 3;
+        let corrupted = corrupt(invalid_outputs);
         assert!(matches!(
             domain.deserialize_xla_program(corrupted.as_slice()),
             Err(XlaDomainError::InvalidPersistentExecutable { reason })
-                if reason == "reference-state metadata has an invalid public output count",
+                if reason == "reference-state metadata has an invalid output count",
         ));
 
         // Dropping one expected argument sharding leaves the persisted list shorter than the physical boundary, so
@@ -10553,7 +10552,7 @@ mod tests {
         assert_eq!(restored.input_types[0].shape().to_string(), state_type.shape().to_string());
         assert_eq!(restored.input_types[0].sharding(), state_type.sharding());
         assert_eq!(restored.input_types[0].memory(), state_type.memory());
-        assert_eq!(restored.public_output_count, 1);
+        assert_eq!(restored.output_count, 1);
         assert_eq!(
             restored.reference_states.as_ref(),
             &[ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None)],

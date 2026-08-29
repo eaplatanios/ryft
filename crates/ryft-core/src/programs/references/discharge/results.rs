@@ -1,6 +1,5 @@
 use std::fmt::Display;
 
-use crate::parameters::Parameterized;
 use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
@@ -9,58 +8,22 @@ use crate::programs::values::Value;
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Reference-free program payload and logical external-state metadata produced by reference discharge.
+/// Reference-free program and logical external-state metadata produced by reference discharge.
 ///
 /// A full result is a [`PartialReferenceDischargeResult`] plus the reference-freedom proof, which is exactly how it
 /// is represented: [`PartialReferenceDischargeResult::try_into_full`] carries out the proof and wraps the partial
-/// result unchanged.
+/// result unchanged. Reference discharge is always Program-to-Program, so this result owns a flat [`Program`] rather
+/// than an open-ended backend or provider payload.
 #[derive(Debug)]
-pub struct ReferenceDischargeResult<P: ReferenceDischargePayload> {
+pub struct ReferenceDischargeResult<V: Value, O: Operation<Type = V::Type>> {
     /// Proven reference-free partial result.
-    partial: PartialReferenceDischargeResult<P>,
+    partial: PartialReferenceDischargeResult<V, O>,
 }
 
-impl<P: ReferenceDischargePayload> ReferenceDischargeResult<P> {
-    /// Creates a full discharge result after invoking the payload provider's reference-freedom proof.
-    ///
-    /// [`ReferenceDischargePayload::validate_reference_free`] proves the payload property, and this constructor then
-    /// validates the discharged boundary layout. For [`Program`] payloads the implementation performs the same
-    /// closure-wide scan as [`PartialReferenceDischargeResult::try_into_full`], so this entry point cannot bypass it.
-    ///
-    /// # Parameters
-    ///
-    ///   - `program`: Discharged program payload validated through its provider implementation.
-    ///   - `capture_count`: Number of leading inputs originating in the source program's capture table.
-    ///   - `public_output_count`: Number of public outputs preceding hidden final-state outputs.
-    ///   - `external_states`: Logical external-state bindings in canonical entry-boundary order.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::MalformedProgram`] when the payload retains references or when the counts and bindings
-    /// are not arithmetically consistent with one canonical discharged boundary: strict canonical source ordering,
-    /// in-range flat positions, and exact hidden-suffix coverage. The constructor cannot prove *semantic* identity —
-    /// that each named source is the state the payload actually threads at that position remains the provider's
-    /// obligation, exactly as with any positional ABI.
-    pub fn from_provider_payload(
-        program: P,
-        capture_count: usize,
-        public_output_count: usize,
-        external_states: Vec<ExternalReferenceBinding>,
-    ) -> Result<Self, ProgramError> {
-        program.validate_reference_free()?;
-        Ok(Self {
-            partial: PartialReferenceDischargeResult::new(
-                program,
-                capture_count,
-                public_output_count,
-                external_states,
-            )?,
-        })
-    }
-
-    /// Returns the reference-free program payload.
+impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeResult<V, O> {
+    /// Returns the reference-free program.
     #[inline]
-    pub const fn program(&self) -> &P {
+    pub const fn program(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
         self.partial.program()
     }
 
@@ -70,10 +33,10 @@ impl<P: ReferenceDischargePayload> ReferenceDischargeResult<P> {
         self.partial.capture_count()
     }
 
-    /// Returns the number of public outputs at the front of the program payload's output boundary.
+    /// Returns the number of public outputs at the front of the program's output boundary.
     #[inline]
-    pub const fn public_output_count(&self) -> usize {
-        self.partial.public_output_count()
+    pub const fn output_count(&self) -> usize {
+        self.partial.output_count()
     }
 
     /// Returns external reference binding recipes in canonical entry-boundary order.
@@ -82,56 +45,54 @@ impl<P: ReferenceDischargePayload> ReferenceDischargeResult<P> {
         self.partial.external_states()
     }
 
-    /// Consumes this result and returns its payload, capture count, public-output prefix, and external-state bindings.
+    /// Consumes this result and returns its program, capture count, public-output prefix, and external-state bindings.
     #[inline]
-    pub fn into_parts(self) -> (P, usize, usize, Vec<ExternalReferenceBinding>) {
+    pub fn into_parts(self) -> (Program<V, O, Vec<V>, Vec<V>>, usize, usize, Vec<ExternalReferenceBinding>) {
         self.partial.into_parts()
     }
 }
 
-/// Program payload produced by *partial* reference discharge, in which only the caller-selected reference sites became
+/// Program produced by *partial* reference discharge, in which only the caller-selected reference sites became
 /// explicit immutable state and every unselected allocation survives as a well-typed reference value.
 ///
 /// The discharged part of the boundary obeys exactly the invariants of [`ReferenceDischargeResult`]: discharged
 /// external allocations are reported as [`ExternalReferenceBinding`]s in canonical entry-boundary order, and the
 /// mutated subset of those bindings tiles the hidden output suffix that follows the public outputs. Discharged local
 /// allocations leave no binding, because no caller owns their state. Preserved references contribute neither bindings
-/// nor hidden outputs; they simply remain reference-typed values inside the payload, and their accesses replay
+/// nor hidden outputs; they simply remain reference-typed values inside the program, and their accesses replay
 /// verbatim.
 ///
-/// There is deliberately no blanket conversion into [`ReferenceDischargeResult`]: "every site was selected" is a
-/// statement about the request, not a proof about the produced payload, and a malformed provider could satisfy it
-/// while still emitting references. [`try_into_full`](Self::try_into_full) therefore exists only for
-/// [`Program`] payloads, where the reference-freedom proof can actually be carried out. Providers of other payload
-/// families encode their equivalent proof through [`ReferenceDischargePayload`].
+/// "Every site was selected" is a statement about the request, not a proof about the produced program.
+/// [`try_into_full`](Self::try_into_full) therefore inspects the complete program before constructing a
+/// [`ReferenceDischargeResult`].
 #[derive(Debug)]
-pub struct PartialReferenceDischargeResult<P: ReferenceDischargePayload> {
-    /// Program payload whose public outputs form a prefix of its complete outputs.
-    program: P,
+pub struct PartialReferenceDischargeResult<V: Value, O: Operation<Type = V::Type>> {
+    /// Program whose public outputs form a prefix of its complete outputs.
+    program: Program<V, O, Vec<V>, Vec<V>>,
 
     /// Number of leading program inputs originating in the source program's capture table.
     capture_count: usize,
 
     /// Number of public output leaves before hidden final-state outputs.
-    public_output_count: usize,
+    output_count: usize,
 
     /// Discharged external reference binding recipes in canonical entry-boundary order.
     external_states: Vec<ExternalReferenceBinding>,
 }
 
-impl<P: ReferenceDischargePayload> PartialReferenceDischargeResult<P> {
+impl<V: Value, O: Operation<Type = V::Type>> PartialReferenceDischargeResult<V, O> {
     /// Creates a checked partial reference discharge result.
     ///
     /// The external-state bindings describe the *discharged* allocations only and must satisfy the same canonical
-    /// boundary invariants as [`ReferenceDischargeResult::from_provider_payload`]: they must name valid discharged
-    /// inputs in canonical source order, and their final-state output indices, omitting read-only bindings, must
-    /// exactly cover the hidden output suffix in binding order.
+    /// boundary invariants as [`ReferenceDischargeResult`]: they must name valid discharged inputs in canonical source
+    /// order, and their final-state output indices, omitting read-only bindings, must exactly cover the hidden output
+    /// suffix in binding order.
     ///
     /// # Parameters
     ///
-    ///   - `program`: Mixed discharged program payload.
+    ///   - `program`: Partially discharged program.
     ///   - `capture_count`: Number of leading inputs originating in the source program's capture table.
-    ///   - `public_output_count`: Number of public outputs preceding hidden final-state outputs.
+    ///   - `output_count`: Number of public outputs preceding hidden final-state outputs.
     ///   - `external_states`: Logical external-reference bindings for the discharged references, in canonical
     ///     entry-boundary order.
     ///
@@ -140,24 +101,71 @@ impl<P: ReferenceDischargePayload> PartialReferenceDischargeResult<P> {
     /// Returns [`ProgramError::MalformedProgram`] when the counts and bindings do not describe one canonical
     /// discharged boundary.
     pub fn new(
-        program: P,
+        program: Program<V, O, Vec<V>, Vec<V>>,
         capture_count: usize,
-        public_output_count: usize,
+        output_count: usize,
         external_states: Vec<ExternalReferenceBinding>,
     ) -> Result<Self, ProgramError> {
-        validate_discharged_boundary(
-            capture_count,
-            program.input_count(),
-            program.output_count(),
-            public_output_count,
-            external_states.as_slice(),
-        )?;
-        Ok(Self { program, capture_count, public_output_count, external_states })
+        let total_input_count = program.input_count();
+        let total_output_count = program.output_count();
+        if capture_count > total_input_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "reference discharge reports {capture_count} captures but discharged input count is \
+                 {total_input_count}",
+            )));
+        }
+        if output_count > total_output_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "reference discharge reports {output_count} public outputs but discharged output count is \
+                 {total_output_count}",
+            )));
+        }
+        for state in &external_states {
+            let input_index = state.source().flat_input_index(capture_count)?;
+            if input_index >= total_input_count {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "reference discharge state for `{}` names input {input_index} but discharged input count is \
+                     {total_input_count}",
+                    state.source(),
+                )));
+            }
+        }
+        for adjacent_states in external_states.windows(2) {
+            let previous_source = adjacent_states[0].source();
+            let source = adjacent_states[1].source();
+            if source <= previous_source {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "reference discharge state source `{source}` does not follow source `{previous_source}` in \
+                     canonical boundary order",
+                )));
+            }
+        }
+        let mut expected_output_index = output_count;
+        for state in external_states.iter().filter(|state| state.is_mutated()) {
+            let output_index = state.output_index().unwrap();
+            if output_index != expected_output_index {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "reference discharge final-state output {output_index} for `{}` does not match expected hidden \
+                     output {expected_output_index}",
+                    state.source(),
+                )));
+            }
+            expected_output_index = expected_output_index.checked_add(1).ok_or_else(|| {
+                ProgramError::MalformedProgram("reference discharge hidden output index overflows `usize`".to_string())
+            })?;
+        }
+        if expected_output_index != total_output_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "reference discharge final states end at output {expected_output_index} but discharged output count is \
+                 {total_output_count}",
+            )));
+        }
+        Ok(Self { program, capture_count, output_count, external_states })
     }
 
-    /// Returns the mixed program payload.
+    /// Returns the partially discharged program.
     #[inline]
-    pub const fn program(&self) -> &P {
+    pub const fn program(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
         &self.program
     }
 
@@ -167,10 +175,10 @@ impl<P: ReferenceDischargePayload> PartialReferenceDischargeResult<P> {
         self.capture_count
     }
 
-    /// Returns the number of public outputs at the front of the program payload's output boundary.
+    /// Returns the number of public outputs at the front of the program's output boundary.
     #[inline]
-    pub const fn public_output_count(&self) -> usize {
-        self.public_output_count
+    pub const fn output_count(&self) -> usize {
+        self.output_count
     }
 
     /// Returns the binding recipes of the discharged external reference allocations, in canonical entry-boundary order.
@@ -180,25 +188,17 @@ impl<P: ReferenceDischargePayload> PartialReferenceDischargeResult<P> {
         self.external_states.as_slice()
     }
 
-    /// Consumes this result and returns its payload, capture count, public-output prefix, and external-state bindings.
+    /// Consumes this result and returns its program, capture count, public-output prefix, and external-state bindings.
     #[inline]
-    pub fn into_parts(self) -> (P, usize, usize, Vec<ExternalReferenceBinding>) {
-        let Self { program, capture_count, public_output_count, external_states } = self;
-        (program, capture_count, public_output_count, external_states)
+    pub fn into_parts(self) -> (Program<V, O, Vec<V>, Vec<V>>, usize, usize, Vec<ExternalReferenceBinding>) {
+        let Self { program, capture_count, output_count, external_states } = self;
+        (program, capture_count, output_count, external_states)
     }
-}
 
-impl<V, O, Input, Output> PartialReferenceDischargeResult<Program<V, O, Input, Output>>
-where
-    V: Value,
-    O: Operation<Type = V::Type>,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-{
     /// Proves that this partial result is in fact reference-free and converts it into a
     /// [`ReferenceDischargeResult`].
     ///
-    /// The proof inspects the complete attached region closure of the payload, dormant transformation rule regions
+    /// The proof inspects the complete attached region closure of the program, dormant transformation rule regions
     /// included, and requires that no atom carries a reference type and that no operation declares nonempty
     /// [`ReferenceOperationSemantics`](crate::ReferenceOperationSemantics). Because every boundary position and every
     /// stored constant is itself an atom, the first check covers input types, output types, and constants alike.
@@ -210,57 +210,13 @@ where
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::MalformedProgram`] when the payload still contains a reference-typed atom or an
+    /// Returns [`ProgramError::MalformedProgram`] when the program still contains a reference-typed atom or an
     /// operation with nonempty reference semantics.
-    pub fn try_into_full(self) -> Result<ReferenceDischargeResult<Program<V, O, Input, Output>>, ProgramError> {
-        self.program.validate_reference_free()?;
-        Ok(ReferenceDischargeResult { partial: self })
-    }
-}
-
-/// Boundary-inspection and reference-freedom-validation capability for reference discharge payloads.
-///
-/// Both partial and full discharge results use the reported entry-boundary arities to validate their external reference
-/// bindings. A payload may implement this trait while still containing references: the implementation of
-/// [`Self::validate_reference_free`] must inspect the complete payload and return an error until no reference-typed
-/// value or nonempty reference semantics remains. Full discharge invokes that validation before constructing its
-/// result.
-///
-/// These are provider contracts for downstream payload families. Rust's coherence rules prevent a downstream crate
-/// from replacing the checked implementation for [`Program`].
-pub trait ReferenceDischargePayload {
-    /// Returns the number of inputs in this payload's entry boundary.
-    fn input_count(&self) -> usize;
-
-    /// Returns the number of outputs in this payload's entry boundary.
-    fn output_count(&self) -> usize;
-
-    /// Validates that this complete payload is reference-free.
-    fn validate_reference_free(&self) -> Result<(), ProgramError>;
-}
-
-impl<V, O, Input, Output> ReferenceDischargePayload for Program<V, O, Input, Output>
-where
-    V: Value,
-    O: Operation<Type = V::Type>,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-{
-    #[inline]
-    fn input_count(&self) -> usize {
-        self.entry_region_ref().input_ids().len()
-    }
-
-    #[inline]
-    fn output_count(&self) -> usize {
-        self.entry_region_ref().output_ids().len()
-    }
-
-    fn validate_reference_free(&self) -> Result<(), ProgramError> {
-        let entry = self.entry_region_ref();
+    pub fn try_into_full(self) -> Result<ReferenceDischargeResult<V, O>, ProgramError> {
+        let entry = self.program.entry_region_ref();
         if entry.contains_atom_type_in_closure(Type::is_reference) {
             return Err(ProgramError::MalformedProgram(
-                "reference discharge payload still contains a reference-typed value and cannot form a full discharge"
+                "reference discharge program still contains a reference-typed value and cannot form a full discharge"
                     .to_string(),
             ));
         }
@@ -272,12 +228,12 @@ where
             .min_by_key(|(instruction_id, _)| *instruction_id)
         {
             return Err(ProgramError::MalformedProgram(format!(
-                "reference discharge payload retains reference operation `{}` at `{instruction_id}` and cannot form \
+                "reference discharge program retains reference operation `{}` at `{instruction_id}` and cannot form \
                  a full discharge",
                 instruction.operation().name(),
             )));
         }
-        Ok(())
+        Ok(ReferenceDischargeResult { partial: self })
     }
 }
 
@@ -419,83 +375,13 @@ impl ReferenceSource {
 }
 
 impl Display for ReferenceSource {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Capture { index } => write!(formatter, "capture {index}"),
             Self::Input { index } => write!(formatter, "input {index}"),
         }
     }
-}
-
-/// Validates that a discharged program boundary and its external-state bindings describe one canonical discharged
-/// shape, shared by the full and partial result envelopes.
-///
-/// # Parameters
-///
-///   - `capture_count`: Number of leading inputs originating in the source program's capture table.
-///   - `total_input_count`: Number of inputs in the discharged payload.
-///   - `total_output_count`: Number of outputs in the discharged payload.
-///   - `public_output_count`: Number of public outputs preceding hidden final-state outputs.
-///   - `external_states`: External-state bindings in canonical entry-boundary order.
-fn validate_discharged_boundary(
-    capture_count: usize,
-    total_input_count: usize,
-    total_output_count: usize,
-    public_output_count: usize,
-    external_states: &[ExternalReferenceBinding],
-) -> Result<(), ProgramError> {
-    if capture_count > total_input_count {
-        return Err(ProgramError::MalformedProgram(format!(
-            "reference discharge reports {capture_count} captures but discharged input count is {total_input_count}",
-        )));
-    }
-    if public_output_count > total_output_count {
-        return Err(ProgramError::MalformedProgram(format!(
-            "reference discharge reports {public_output_count} public outputs but discharged output count is \
-             {total_output_count}",
-        )));
-    }
-    for state in external_states {
-        let input_index = state.source().flat_input_index(capture_count)?;
-        if input_index >= total_input_count {
-            return Err(ProgramError::MalformedProgram(format!(
-                "reference discharge state for `{}` names input {input_index} but discharged input count is \
-                 {total_input_count}",
-                state.source(),
-            )));
-        }
-    }
-    for adjacent_states in external_states.windows(2) {
-        let previous_source = adjacent_states[0].source();
-        let source = adjacent_states[1].source();
-        if source <= previous_source {
-            return Err(ProgramError::MalformedProgram(format!(
-                "reference discharge state source `{source}` does not follow source `{previous_source}` in canonical \
-                 boundary order",
-            )));
-        }
-    }
-    let mut expected_output_index = public_output_count;
-    for state in external_states.iter().filter(|state| state.is_mutated()) {
-        let output_index = state.output_index().unwrap();
-        if output_index != expected_output_index {
-            return Err(ProgramError::MalformedProgram(format!(
-                "reference discharge final-state output {output_index} for `{}` does not match expected hidden output \
-                 {expected_output_index}",
-                state.source(),
-            )));
-        }
-        expected_output_index = expected_output_index.checked_add(1).ok_or_else(|| {
-            ProgramError::MalformedProgram("reference discharge hidden output index overflows `usize`".to_string())
-        })?;
-    }
-    if expected_output_index != total_output_count {
-        return Err(ProgramError::MalformedProgram(format!(
-            "reference discharge final states end at output {expected_output_index} but discharged output count is \
-             {total_output_count}",
-        )));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -521,17 +407,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_reference_discharge_result_validates_boundaries() {
+    fn test_reference_discharge_results_validate_boundaries() {
         let bindings = vec![
             ExternalReferenceBinding::new(ReferenceSource::Capture { index: 0 }, Some(1)),
             ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(2)),
         ];
-        let result =
-            ReferenceDischargeResult::from_provider_payload(TestPayload::new("program", 2, 3), 1, 1, bindings.clone())
-                .unwrap();
-        assert_eq!(result.program().value, "program");
+        let result = PartialReferenceDischargeResult::new(boundary_program(2, 3), 1, 1, bindings.clone())
+            .unwrap()
+            .try_into_full()
+            .unwrap();
+        assert_eq!(result.program().input_count(), 2);
+        assert_eq!(result.program().output_count(), 3);
         assert_eq!(result.capture_count(), 1);
-        assert_eq!(result.public_output_count(), 1);
+        assert_eq!(result.output_count(), 1);
         assert_eq!(result.external_states(), bindings);
 
         assert_eq!(ReferenceSource::Capture { index: 0 }.flat_input_index(1), Ok(0));
@@ -551,21 +439,21 @@ mod tests {
         );
 
         assert_eq!(
-            ReferenceDischargeResult::from_provider_payload(TestPayload::new((), 0, 0), 1, 0, Vec::new()).unwrap_err(),
+            PartialReferenceDischargeResult::new(boundary_program(0, 0), 1, 0, Vec::new()).unwrap_err(),
             ProgramError::MalformedProgram(
                 "reference discharge reports 1 captures but discharged input count is 0".to_string(),
             ),
         );
 
         assert_eq!(
-            ReferenceDischargeResult::from_provider_payload(TestPayload::new((), 0, 1), 0, 2, Vec::new()).unwrap_err(),
+            PartialReferenceDischargeResult::new(boundary_program(0, 1), 0, 2, Vec::new()).unwrap_err(),
             ProgramError::MalformedProgram(
                 "reference discharge reports 2 public outputs but discharged output count is 1".to_string(),
             ),
         );
         assert_eq!(
-            ReferenceDischargeResult::from_provider_payload(
-                TestPayload::new((), 0, 0),
+            PartialReferenceDischargeResult::new(
+                boundary_program(0, 0),
                 0,
                 0,
                 vec![ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None)],
@@ -576,18 +464,10 @@ mod tests {
             ),
         );
         assert_eq!(
-            ReferenceDischargeResult::from_provider_payload(TestPayload::new((), 1, 1), 0, 0, Vec::new()).unwrap_err(),
+            PartialReferenceDischargeResult::new(boundary_program(1, 1), 0, 0, Vec::new()).unwrap_err(),
             ProgramError::MalformedProgram(
                 "reference discharge final states end at output 0 but discharged output count is 1".to_string(),
             ),
-        );
-        assert_eq!(
-            ReferenceDischargeResult::from_provider_payload(TestPayload::new((), 0, usize::MAX), 0, 0, Vec::new(),)
-                .unwrap_err(),
-            ProgramError::MalformedProgram(format!(
-                "reference discharge final states end at output 0 but discharged output count is {}",
-                usize::MAX,
-            )),
         );
         for sources in [
             [ReferenceSource::Capture { index: 0 }, ReferenceSource::Capture { index: 0 }],
@@ -599,8 +479,7 @@ mod tests {
                 .map(|(_, source)| ExternalReferenceBinding::new(source, None))
                 .collect();
             assert_eq!(
-                ReferenceDischargeResult::from_provider_payload(TestPayload::new((), 2, 0), 1, 0, bindings)
-                    .unwrap_err(),
+                PartialReferenceDischargeResult::new(boundary_program(2, 0), 1, 0, bindings).unwrap_err(),
                 ProgramError::MalformedProgram(format!(
                     "reference discharge state source `{}` does not follow source `{}` in canonical boundary order",
                     sources[1], sources[0],
@@ -617,23 +496,28 @@ mod tests {
             ExternalReferenceBinding::new(ReferenceSource::Capture { index: 0 }, Some(1)),
             ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None),
         ];
-        let result =
-            PartialReferenceDischargeResult::new(TestPayload::new("program", 2, 2), 1, 1, bindings.clone()).unwrap();
-        assert_eq!(result.program().value, "program");
+        let result = PartialReferenceDischargeResult::new(boundary_program(2, 2), 1, 1, bindings.clone()).unwrap();
+        assert_eq!(result.program().input_count(), 2);
+        assert_eq!(result.program().output_count(), 2);
         assert_eq!(result.capture_count(), 1);
-        assert_eq!(result.public_output_count(), 1);
+        assert_eq!(result.output_count(), 1);
         assert_eq!(result.external_states(), bindings);
-        assert_eq!(result.into_parts(), (TestPayload::new("program", 2, 2), 1, 1, bindings));
+        let (program, capture_count, output_count, external_states) = result.into_parts();
+        assert_eq!(program.input_count(), 2);
+        assert_eq!(program.output_count(), 2);
+        assert_eq!(capture_count, 1);
+        assert_eq!(output_count, 1);
+        assert_eq!(external_states, bindings);
 
         // The shared boundary validation applies to the partial envelope exactly as it does to the full one.
         assert_eq!(
-            PartialReferenceDischargeResult::new(TestPayload::new((), 0, 1), 0, 2, Vec::new()).unwrap_err(),
+            PartialReferenceDischargeResult::new(boundary_program(0, 1), 0, 2, Vec::new()).unwrap_err(),
             ProgramError::MalformedProgram(
                 "reference discharge reports 2 public outputs but discharged output count is 1".to_string(),
             ),
         );
         assert_eq!(
-            PartialReferenceDischargeResult::new(TestPayload::new((), 1, 1), 0, 0, Vec::new()).unwrap_err(),
+            PartialReferenceDischargeResult::new(boundary_program(1, 1), 0, 0, Vec::new()).unwrap_err(),
             ProgramError::MalformedProgram(
                 "reference discharge final states end at output 0 but discharged output count is 1".to_string(),
             ),
@@ -705,27 +589,14 @@ mod tests {
         // Discharge normalizes references and nothing else, so an unrelated ordered-state operation is proof-neutral
         // and its program converts into the reference-free envelope unchanged.
         let discharged = partial(program(&[ProofOperation::OrderedIo], TestType::Value(0))).try_into_full().unwrap();
-        assert_eq!(discharged.public_output_count(), 1);
+        assert_eq!(discharged.output_count(), 1);
         assert!(discharged.program().effects().contains(Effect::OrderedIo));
 
         // A surviving reference-typed value is disqualifying wherever it appears, including on the boundary.
         assert_eq!(
-            ReferenceDischargeResult::from_provider_payload(
-                program(&[ProofOperation::OrderedIo], reference_type(0)),
-                0,
-                1,
-                Vec::new(),
-            )
-            .unwrap_err(),
-            ProgramError::MalformedProgram(
-                "reference discharge payload still contains a reference-typed value and cannot form a full discharge"
-                    .to_string(),
-            ),
-        );
-        assert_eq!(
             partial(program(&[ProofOperation::OrderedIo], reference_type(0))).try_into_full().unwrap_err(),
             ProgramError::MalformedProgram(
-                "reference discharge payload still contains a reference-typed value and cannot form a full discharge"
+                "reference discharge program still contains a reference-typed value and cannot form a full discharge"
                     .to_string(),
             ),
         );
@@ -736,7 +607,7 @@ mod tests {
                 .try_into_full()
                 .unwrap_err(),
             ProgramError::MalformedProgram(
-                "reference discharge payload retains reference operation `test.retained_reference` at `^0[1]` and \
+                "reference discharge program retains reference operation `test.retained_reference` at `^0[1]` and \
                  cannot form a full discharge"
                     .to_string(),
             ),

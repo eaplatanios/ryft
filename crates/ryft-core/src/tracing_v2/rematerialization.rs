@@ -1980,7 +1980,7 @@ impl<V, O> Program<V, O, Vec<V>, Vec<V>>
 where
     V: Value,
     O: Operation<Type = V::Type>,
-    Self: ReferenceDischarge<DischargedProgram = Self>,
+    Self: ReferenceDischarge<Value = V, Operation = O>,
 {
     /// Builds a rematerialized flat-vector function after discharging every local reference into immutable state.
     /// External reference inputs and reference captures are rejected because rematerialization has no caller-visible

@@ -1627,7 +1627,7 @@ mod tests {
         // The one external root is written, so it enters as state at its own boundary position and publishes its
         // final state as the single hidden output after the public prefix, while the local root's allocation,
         // accumulation, and consumption become ordinary array SSA.
-        assert_eq!(discharged.public_output_count(), 1);
+        assert_eq!(discharged.output_count(), 1);
         assert_eq!(
             discharged.external_states(),
             &[ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
@@ -2410,7 +2410,7 @@ mod tests {
             .unwrap();
 
         let discharged = program.discharge_references(0).unwrap();
-        assert_eq!(discharged.public_output_count(), 2);
+        assert_eq!(discharged.output_count(), 2);
         assert_eq!(discharged.program().output_count(), 4);
         assert_eq!(discharged.external_states().len(), 2);
         assert_eq!(discharged.external_states()[0].source(), ReferenceSource::Input { index: 0 });
@@ -2474,7 +2474,7 @@ mod tests {
             .unwrap();
 
         let discharged = program.discharge_references_with_lifted_captures(0).unwrap();
-        assert_eq!(discharged.public_output_count(), 1);
+        assert_eq!(discharged.output_count(), 1);
         assert_eq!(discharged.program().output_count(), 2);
         assert_eq!(discharged.external_states().len(), 2);
         assert_eq!(discharged.external_states()[0].source(), ReferenceSource::Input { index: 0 });
@@ -2510,7 +2510,7 @@ mod tests {
         // root as the caller's public reference input instead of synthesizing a second state slot for it. Reading
         // through the forwarded result is not a mutation, so no final-state output is appended.
         let discharged = program.discharge_references(0).unwrap();
-        assert_eq!(discharged.public_output_count(), 1);
+        assert_eq!(discharged.output_count(), 1);
         assert_eq!(discharged.program().output_count(), 1);
         assert_eq!(discharged.external_states().len(), 1);
         assert_eq!(discharged.external_states()[0].source(), ReferenceSource::Input { index: 0 });
@@ -2603,7 +2603,7 @@ mod tests {
         // Threading the captured reference state through the scan widens the carry list of the rebuilt `XlaOperation`
         // scan payload and leaves its capture environment intact.
         let discharged = program.discharge_references_with_lifted_captures(1).unwrap();
-        assert_eq!(discharged.public_output_count(), 2);
+        assert_eq!(discharged.output_count(), 2);
         assert_eq!(discharged.external_states().len(), 1);
         assert_eq!(discharged.external_states()[0].source(), ReferenceSource::Capture { index: 0 });
         assert!(!discharged.external_states()[0].is_mutated());

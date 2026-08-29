@@ -4928,7 +4928,7 @@ mod tests {
         // The carry survives inside the loop, but the *entry* boundary is a different question: nothing writes the
         // allocation, so it publishes no hidden final-state output and its caller's holder is left alone. Symmetry is a
         // property of the loop's own boundaries, not a claim that the loop wrote what it carried.
-        assert_eq!(discharged.public_output_count(), 1);
+        assert_eq!(discharged.output_count(), 1);
         assert_eq!(discharged.program().output_types().len(), 1);
         assert_eq!(discharged.external_states().len(), 1);
         assert!(!discharged.external_states()[0].is_mutated());

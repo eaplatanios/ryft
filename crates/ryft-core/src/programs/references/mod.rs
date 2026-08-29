@@ -175,7 +175,7 @@ mod values;
 pub use discharge::{
     ExternalReferenceBinding, PartialReferenceDischargeResult, RecursiveReferenceDischargeDriver,
     ReferenceAccumulationPolicy, ReferenceAllocationHandle, ReferenceDischarge, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePayload, ReferenceDischargePolicy, ReferenceDischargeReference,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeReference,
     ReferenceDischargeRegionDestination, ReferenceDischargeResult, ReferenceDischargeSite, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork,
     ReferenceRegionStateInsertion, ReferenceRegionSummary, ReferenceSource, ReferenceStateWidening,

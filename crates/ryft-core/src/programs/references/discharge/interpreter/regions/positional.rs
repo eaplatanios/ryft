@@ -343,7 +343,7 @@ mod tests {
             .unwrap();
 
         let discharged = source.discharge_references_with_policy::<ListReferenceDischarge>(0).unwrap();
-        assert_eq!(discharged.public_output_count(), 2);
+        assert_eq!(discharged.output_count(), 2);
         assert_eq!(discharged.external_states(), &[]);
         assert_eq!(
             discharged.program().to_string(),

@@ -584,7 +584,7 @@ fn test_downstream_program_level_discharge_threads_external_state_through_the_en
     // type, the public outputs are exactly the source outputs, and only the written allocation appends a hidden final-state
     // output after them.
     let discharged = source.discharge_references_with_policy::<RegisterReferenceDischarge>(1).unwrap();
-    assert_eq!(discharged.public_output_count(), 2);
+    assert_eq!(discharged.output_count(), 2);
     assert_eq!(
         discharged.external_states(),
         &[
@@ -685,7 +685,7 @@ fn test_downstream_partial_discharge_preserves_the_allocations_it_was_not_asked_
 
     // The selected allocation became state at its own boundary position and publishes its final state as a hidden output;
     // the preserved reference kept its reference type and reports no binding, and both of its accesses replayed verbatim.
-    assert_eq!(discharged.public_output_count(), 1);
+    assert_eq!(discharged.output_count(), 1);
     assert_eq!(
         discharged.external_states(),
         &[ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
@@ -730,7 +730,7 @@ fn test_downstream_structured_rule_discharges_through_the_region_boundary_api() 
         .unwrap();
 
     let discharged = source.discharge_references_with_policy::<RegisterReferenceDischarge>(0).unwrap();
-    assert_eq!(discharged.public_output_count(), 1);
+    assert_eq!(discharged.output_count(), 1);
     assert_eq!(
         discharged.external_states(),
         &[ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],

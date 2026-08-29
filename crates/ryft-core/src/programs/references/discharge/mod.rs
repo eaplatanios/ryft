@@ -52,7 +52,7 @@
 //! eliminate every reference, or
 //! [`Program::partially_discharge_references_with_policy`](crate::Program::partially_discharge_references_with_policy)
 //! when selected allocations should become explicit state while
-//! other allocations remain references. The full entry point returns a [`ReferenceDischargeResult`], whose payload is
+//! other allocations remain references. The full entry point returns a [`ReferenceDischargeResult`], whose program is
 //! proven reference-free. The partial entry point returns a [`PartialReferenceDischargeResult`], which describes only
 //! the discharged references and can be converted into a full result after proving that no references remain. Generic
 //! transforms that accept only local references use [`ReferenceDischarge::discharge_local_references`].
@@ -65,12 +65,12 @@
 //!
 //! # Full and Partial Discharge
 //!
-//! [`ReferenceDischargeResult`] is the full-discharge contract. Its payload is proven reference-free across the
+//! [`ReferenceDischargeResult`] is the full-discharge contract. Its program is proven reference-free across the
 //! complete attached-region closure, its public outputs form a prefix of its complete outputs, and the remaining
 //! suffix contains exactly the final states of mutated external allocations in canonical boundary order.
 //!
 //! [`PartialReferenceDischargeResult`] permits selected allocations to become immutable state while unselected references
-//! and their operations remain in the payload. Callers select external references or allocation sites through
+//! and their operations remain in the program. Callers select external references or allocation sites through
 //! [`ReferenceDischargeSite`]. This is useful when normalizing a pipeline's internal state while deliberately
 //! preserving references that a kernel will lower to target memory operations. Conversion from a partial result to a
 //! full result performs a closure-wide proof that no reference type or reference operation remains.
@@ -159,8 +159,7 @@ pub use interpreter::{
 };
 pub use policies::{ReferenceAccumulationPolicy, ReferenceDischargePolicy};
 pub use results::{
-    ExternalReferenceBinding, PartialReferenceDischargeResult, ReferenceDischargePayload, ReferenceDischargeResult,
-    ReferenceSource,
+    ExternalReferenceBinding, PartialReferenceDischargeResult, ReferenceDischargeResult, ReferenceSource,
 };
 pub use selection::ReferenceDischargeSite;
 pub use transform::ReferenceDischarge;
@@ -176,13 +175,15 @@ pub(crate) mod tests {
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::check_count;
     use crate::operations::Add;
-    use crate::parameters::Parameter;
+    use crate::parameters::{Parameter, Placeholder};
     use crate::programs::ProgramError;
 
+    use crate::programs::builders::ProgramBuilder;
     use crate::programs::effects::{Effect, Effects};
     use crate::programs::identities::NoIdentity;
     use crate::programs::instructions::InstructionId;
     use crate::programs::operations::Operation;
+    use crate::programs::programs::Program;
 
     use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionSlot};
     use crate::programs::types::{Type, TypeError, Typed};
@@ -987,54 +988,44 @@ pub(crate) mod tests {
         pub(crate) mode: TestDischargeMode,
     }
 
-    #[derive(Debug, PartialEq, Eq)]
-    pub(crate) struct TestPayload<T> {
-        pub(crate) value: T,
-        pub(crate) input_count: usize,
-        pub(crate) output_count: usize,
-    }
-
-    impl<T> TestPayload<T> {
-        pub(crate) fn new(value: T, input_count: usize, output_count: usize) -> Self {
-            Self { value, input_count, output_count }
+    /// Builds a reference-free test program with the requested flat boundary arities.
+    pub(crate) fn boundary_program(
+        input_count: usize,
+        output_count: usize,
+    ) -> Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>> {
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        for index in 0..input_count {
+            builder.add_input(TestType::Value(index as u8));
         }
-    }
-
-    impl<T> ReferenceDischargePayload for TestPayload<T> {
-        fn input_count(&self) -> usize {
-            self.input_count
-        }
-
-        fn output_count(&self) -> usize {
-            self.output_count
-        }
-
-        fn validate_reference_free(&self) -> Result<(), ProgramError> {
-            Ok(())
-        }
+        let outputs = (0..output_count)
+            .map(|index| builder.add_constant(CaptureReference::new(index, TestType::Value(index as u8))))
+            .collect::<Vec<_>>();
+        builder.build(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count]).unwrap()
     }
 
     impl ReferenceDischarge for TestDischargeProvider {
-        type DischargedProgram = TestPayload<usize>;
+        type Value = TestValue;
+        type Operation = TestOperation;
 
         fn discharge_references(
             self,
             _capture_count: usize,
-        ) -> Result<ReferenceDischargeResult<Self::DischargedProgram>, ProgramError> {
+        ) -> Result<ReferenceDischargeResult<Self::Value, Self::Operation>, ProgramError> {
             self.calls.set(self.calls.get() + 1);
             match self.mode {
                 TestDischargeMode::Local => {
-                    ReferenceDischargeResult::from_provider_payload(TestPayload::new(7, 0, 0), 0, 0, Vec::new())
+                    PartialReferenceDischargeResult::new(boundary_program(0, 0), 0, 0, Vec::new())?.try_into_full()
                 }
-                TestDischargeMode::External => ReferenceDischargeResult::from_provider_payload(
-                    TestPayload::new(7, 1, 0),
+                TestDischargeMode::External => PartialReferenceDischargeResult::new(
+                    boundary_program(1, 0),
                     0,
                     0,
                     vec![ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None)],
-                ),
-                TestDischargeMode::Malformed => {
-                    ReferenceDischargeResult::from_provider_payload(TestPayload::new(7, 0, 1), 0, 0, Vec::new())
-                }
+                )?
+                .try_into_full(),
+                TestDischargeMode::Malformed => Err(ProgramError::MalformedProgram(
+                    "reference discharge final states end at output 0 but discharged output count is 1".to_string(),
+                )),
             }
         }
     }
