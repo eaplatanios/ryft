@@ -107,10 +107,10 @@ where
 impl<T, U, C, P> ReferenceDischargeableOperation<C, P> for ReferenceSwapOperation<T, U>
 where
     T: Type,
-    U: Type,
+    U: From<T> + From<ReferenceType<T>> + Type,
     ReferenceSwapOperation<T, U>: Operation<Type = U>,
     C: Context<Type = U, Operation: From<ReferenceSwapOperation<T, U>>>,
-    P: ReferenceDischargePolicy<C>,
+    P: ReferenceDischargePolicy<C, Referent = T>,
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
         &self,
@@ -126,7 +126,7 @@ where
         // replacement to fit inside the selected coordinates would otherwise perform a silent partial write, so the
         // rule re-derives the operand relationship its own inference already states.
         validate_operand_types(self, inputs)?;
-        Ok(vec![ReferenceDischargeValue::Ordinary(context.replace(reference, replacement)?)])
+        Ok(vec![ReferenceDischargeValue::Ordinary(context.swap(reference, replacement)?)])
     }
 }
 

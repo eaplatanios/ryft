@@ -396,14 +396,17 @@ where
     }
 }
 
-impl<C: Domain, P: ReferenceDischargePolicy<C>> Typed for ReferenceDischargeValue<C, P> {
+impl<C: Domain, P: ReferenceDischargePolicy<C>> Typed for ReferenceDischargeValue<C, P>
+where
+    C::Type: From<ReferenceType<P::Referent>>,
+{
     type Type = C::Type;
 
     #[inline]
     fn r#type(&self) -> Cow<'_, C::Type> {
         match self {
             Self::Ordinary(value) => value.r#type(),
-            Self::Reference(reference) => Cow::Owned(P::lift_reference_type(reference.r#type().clone())),
+            Self::Reference(reference) => Cow::Owned(C::Type::from(reference.r#type().clone())),
         }
     }
 }
@@ -572,8 +575,8 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     ///
     /// # Parameters
     ///
-    ///   - `r#type`: Reference type of the fresh allocation, normally derived from the allocating operation's inferred
-    ///     output type through [`ReferenceDischargePolicy::project_reference_type`].
+    ///   - `r#type`: Reference type of the fresh allocation, normally recovered from the allocating operation's
+    ///     inferred output type through the destination type universe's borrowed [`TryFrom`] conversion.
     ///   - `initial`: Destination value that becomes the allocation's initial immutable state.
     ///
     /// # Errors
@@ -583,7 +586,10 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         &self,
         r#type: ReferenceType<P::Referent>,
         initial: C::Value,
-    ) -> Result<ReferenceDischargeValue<C, P>, ProgramError> {
+    ) -> Result<ReferenceDischargeValue<C, P>, ProgramError>
+    where
+        C::Type: From<P::Referent>,
+    {
         validate_discharged_value_type::<C, P>(&initial, &r#type)?;
         Ok(self.bind_allocation_value(
             r#type,
@@ -606,7 +612,10 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         &self,
         r#type: ReferenceType<P::Referent>,
         reference: C::Value,
-    ) -> Result<ReferenceDischargeValue<C, P>, ProgramError> {
+    ) -> Result<ReferenceDischargeValue<C, P>, ProgramError>
+    where
+        for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t C::Type>,
+    {
         validate_preserved_value::<C, P>(&reference, &r#type)?;
         Ok(self.bind_allocation_value(
             r#type,
@@ -642,7 +651,10 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         alias: P::Alias,
         r#type: ReferenceType<P::Referent>,
         derive_preserved: impl FnOnce(&C::Value) -> Result<C::Value, ProgramError>,
-    ) -> Result<ReferenceDischargeValue<C, P>, ProgramError> {
+    ) -> Result<ReferenceDischargeValue<C, P>, ProgramError>
+    where
+        for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t C::Type>,
+    {
         let allocation = reference.allocation();
         self.validate_live_allocation(allocation)?;
         let binding = match &reference.binding {
@@ -693,7 +705,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
 
     /// Replaces the immutable state of one discharged reference and records that the allocation was mutated.
     ///
-    /// The context's own write, replace, and accumulate services use this for the successor they just computed, and
+    /// The context's own write, swap, and accumulate services use this for the successor they just computed, and
     /// the positional rewrite uses it for the appended final-state outputs it publishes. A structured rule merges a
     /// boundary's returned state through [`merge_boundary_state`](Self::merge_boundary_state) instead, because a
     /// symmetric boundary returns a successor state for allocations it never wrote and the mutation flag decides whether
@@ -707,11 +719,10 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     /// # Errors
     ///
     /// Returns [`ProgramError::MalformedProgram`] when the allocation is not live or was preserved rather than discharged.
-    fn set_discharged_state(
-        &self,
-        allocation: ReferenceAllocationHandle,
-        current: C::Value,
-    ) -> Result<(), ProgramError> {
+    fn set_discharged_state(&self, allocation: ReferenceAllocationHandle, current: C::Value) -> Result<(), ProgramError>
+    where
+        C::Type: From<P::Referent>,
+    {
         self.replace_discharged_state(allocation, current, true)
     }
 
@@ -738,7 +749,10 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         allocation: ReferenceAllocationHandle,
         current: C::Value,
         mutated: bool,
-    ) -> Result<(), ProgramError> {
+    ) -> Result<(), ProgramError>
+    where
+        C::Type: From<P::Referent>,
+    {
         self.replace_discharged_state(allocation, current, mutated)
     }
 
@@ -798,7 +812,10 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         &self,
         reference: &ReferenceDischargeReference<C, P>,
         replacement: C::Value,
-    ) -> Result<(), ProgramError> {
+    ) -> Result<(), ProgramError>
+    where
+        C::Type: From<P::Referent>,
+    {
         let allocation = reference.allocation();
         let current = self.discharged_state(allocation)?;
         let successor = P::write(&self.parent, &current, replacement, reference.alias())?;
@@ -816,14 +833,17 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     ///
     /// Returns [`ProgramError::MalformedProgram`] when the allocation is not live or was preserved, and propagates the
     /// policy's error when the alias cannot be applied.
-    pub fn replace(
+    pub fn swap(
         &self,
         reference: &ReferenceDischargeReference<C, P>,
         replacement: C::Value,
-    ) -> Result<C::Value, ProgramError> {
+    ) -> Result<C::Value, ProgramError>
+    where
+        C::Type: From<P::Referent>,
+    {
         let allocation = reference.allocation();
         let current = self.discharged_state(allocation)?;
-        let (previous, successor) = P::replace(&self.parent, &current, replacement, reference.alias())?;
+        let (previous, successor) = P::swap(&self.parent, &current, replacement, reference.alias())?;
         self.set_discharged_state(allocation, successor)?;
         Ok(previous)
     }
@@ -845,6 +865,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         update: C::Value,
     ) -> Result<(), ProgramError>
     where
+        C::Type: From<P::Referent>,
         P: ReferenceAccumulationPolicy<C>,
     {
         let allocation = reference.allocation();
@@ -981,7 +1002,10 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         &self,
         allocation: ReferenceAllocationHandle,
         current: &C::Value,
-    ) -> Result<(), ProgramError> {
+    ) -> Result<(), ProgramError>
+    where
+        C::Type: From<P::Referent>,
+    {
         let r#type = self.allocation_reference_type(allocation)?;
         validate_discharged_value_type::<C, P>(current, &r#type)
     }
@@ -1021,7 +1045,10 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         allocation: ReferenceAllocationHandle,
         current: C::Value,
         mutated: bool,
-    ) -> Result<(), ProgramError> {
+    ) -> Result<(), ProgramError>
+    where
+        C::Type: From<P::Referent>,
+    {
         self.validate_discharged_state_type(allocation, &current)?;
         let mut environment = self.environment.borrow_mut();
         environment.slot(allocation)?;
@@ -1166,7 +1193,7 @@ mod tests {
         let view = view.expect_reference("the derived view").unwrap().clone();
         assert_eq!(view.allocation(), allocation);
         assert_eq!(context.read(&view), Ok(ListIrValue::List(vec![2, 3])));
-        assert_eq!(context.replace(&view, ListIrValue::List(vec![20, 30])), Ok(ListIrValue::List(vec![2, 3])));
+        assert_eq!(context.swap(&view, ListIrValue::List(vec![20, 30])), Ok(ListIrValue::List(vec![2, 3])));
         assert_eq!(context.read(&reference), Ok(ListIrValue::List(vec![1, 20, 30, 4])));
         assert_eq!(context.is_mutated(allocation), Ok(true));
         assert_eq!(context.accumulate(&view, ListIrValue::List(vec![1, 1])), Ok(()));

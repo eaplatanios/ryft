@@ -418,6 +418,29 @@ pub(crate) mod tests {
 
     impl Parameter for ListIrType {}
 
+    impl From<ListType> for ListIrType {
+        fn from(r#type: ListType) -> Self {
+            Self::List(r#type)
+        }
+    }
+
+    impl From<ReferenceType<ListType>> for ListIrType {
+        fn from(r#type: ReferenceType<ListType>) -> Self {
+            Self::Reference(r#type)
+        }
+    }
+
+    impl<'t> TryFrom<&'t ListIrType> for &'t ReferenceType<ListType> {
+        type Error = TypeError;
+
+        fn try_from(r#type: &'t ListIrType) -> Result<Self, Self::Error> {
+            match r#type {
+                ListIrType::Reference(r#type) => Ok(r#type),
+                ListIrType::List(_) => Err(TypeError::invalid("expected reference type but got list type")),
+            }
+        }
+    }
+
     impl Type for ListIrType {
         type Identity = NoIdentity;
         type Refinements = ();
@@ -522,8 +545,6 @@ pub(crate) mod tests {
         pub(crate) length: usize,
     }
 
-    impl Parameter for ListAlias {}
-
     // Binds one single-result prototype operation into a destination. Routing the alias mechanics through the
     // operation family is what keeps this universe's policy independent of whether its destination executes the work
     // or stages it, which one policy implementation must be for a rebuilt region to be traced at all.
@@ -554,21 +575,6 @@ pub(crate) mod tests {
             ListAlias { offset: 0, length: referent.length }
         }
 
-        fn lift_reference_type(r#type: ReferenceType<ListType>) -> ListIrType {
-            ListIrType::Reference(r#type)
-        }
-
-        fn lift_referent_type(referent: ListType) -> ListIrType {
-            ListIrType::List(referent)
-        }
-
-        fn project_reference_type(r#type: &ListIrType) -> Option<ReferenceType<ListType>> {
-            match r#type {
-                ListIrType::Reference(reference) => Some(reference.clone()),
-                ListIrType::List(_) => None,
-            }
-        }
-
         fn read(context: &C, current: &C::Value, alias: &ListAlias) -> Result<C::Value, ProgramError> {
             bind_list(context, ListOperation::Select { offset: alias.offset, length: alias.length }, &[current.clone()])
         }
@@ -580,18 +586,6 @@ pub(crate) mod tests {
             alias: &ListAlias,
         ) -> Result<C::Value, ProgramError> {
             bind_list(context, ListOperation::Splice { offset: alias.offset }, &[current.clone(), replacement])
-        }
-
-        fn replace(
-            context: &C,
-            current: &C::Value,
-            replacement: C::Value,
-            alias: &ListAlias,
-        ) -> Result<(C::Value, C::Value), ProgramError> {
-            let previous = Self::read(context, current, alias)?;
-            let successor =
-                bind_list(context, ListOperation::Splice { offset: alias.offset }, &[current.clone(), replacement])?;
-            Ok((previous, successor))
         }
     }
 
@@ -903,13 +897,13 @@ pub(crate) mod tests {
                     let initial = inputs[0].expect_ordinary("an initial state")?.clone();
                     let initial_type = initial.r#type().into_owned();
                     let output_type = self.infer_output_types(std::slice::from_ref(&initial_type), &[])?.remove(0);
-                    let r#type =
-                        <ListReferenceDischarge as ReferenceDischargePolicy<C>>::project_reference_type(&output_type)
-                            .ok_or_else(|| {
+                    let r#type = <&ReferenceType<ListType>>::try_from(&output_type)
+                        .map_err(|_| {
                             ProgramError::MalformedProgram(
                                 "`list.reference_new` produced a non-reference type".to_string(),
                             )
-                        })?;
+                        })?
+                        .clone();
                     if context.selects_internal(driver.instruction(), 0) {
                         return Ok(vec![context.allocate_discharged(r#type, initial)?]);
                     }
@@ -952,7 +946,7 @@ pub(crate) mod tests {
                     check_count!("input", inputs, 2, ProgramError);
                     let reference = inputs[0].expect_reference("a reference to replace")?;
                     let replacement = inputs[1].expect_ordinary("a replacement value")?.clone();
-                    Ok(vec![ReferenceDischargeValue::Ordinary(context.replace(reference, replacement)?)])
+                    Ok(vec![ReferenceDischargeValue::Ordinary(context.swap(reference, replacement)?)])
                 }
                 Self::AddUpdate => {
                     check_count!("input", inputs, 2, ProgramError);

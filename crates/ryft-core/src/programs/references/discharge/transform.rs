@@ -12,6 +12,8 @@ use crate::programs::types::Typed;
 use crate::programs::values::Value;
 use crate::tracing::TracingContext;
 
+use crate::programs::references::types::ReferenceType;
+
 use super::interpreter::{
     RecursiveReferenceDischargeDriver, ReferenceCaptureScope, ReferenceDischargeContext, ReferenceDischargeDriver,
     ReferenceDischargeValue, ReferenceDischargeableOperation, region_closure_touches_references,
@@ -124,6 +126,8 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     where
         P: ReferenceDischargePolicy<TracingContext<V, O>>,
         O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
+        V::Type: From<P::Referent> + From<ReferenceType<P::Referent>>,
+        for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
     {
         self.discharge_references_with_capture_seam::<P>(
             capture_count,
@@ -191,6 +195,8 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     where
         P: ReferenceDischargePolicy<TracingContext<V, O>>,
         O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
+        V::Type: From<P::Referent> + From<ReferenceType<P::Referent>>,
+        for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
     {
         self.validate_reference_discharge_targets(capture_count, targets)?;
         self.discharge_references_with_capture_seam::<P>(
@@ -235,6 +241,8 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
         V: CaptureConstant,
         P: ReferenceDischargePolicy<TracingContext<V, O>>,
         O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
+        V::Type: From<P::Referent> + From<ReferenceType<P::Referent>>,
+        for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
     {
         self.discharge_references_with_capture_seam::<P>(
             capture_count,
@@ -272,6 +280,8 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     where
         P: ReferenceDischargePolicy<TracingContext<V, O>>,
         O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
+        V::Type: From<P::Referent> + From<ReferenceType<P::Referent>>,
+        for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
     {
         let input_types = self.input_types();
         let input_count = input_types.len();
@@ -303,14 +313,15 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
             let mut discharged_allocations = Vec::new();
             let mut capture_allocations = vec![None; capture_count];
             for (input_index, input_type) in input_types.into_iter().enumerate() {
-                let Some(reference_type) = P::project_reference_type(&input_type) else {
+                let Ok(reference_type) = <&ReferenceType<P::Referent>>::try_from(&input_type) else {
                     inputs.push(ReferenceDischargeValue::Ordinary(destination.input(input_type)));
                     continue;
                 };
+                let reference_type = reference_type.clone();
                 let source = ReferenceSource::from_flat_input_index(input_index, capture_count);
                 let selected = context.selects_external(source);
                 let carrier = if selected {
-                    let state = destination.input(P::lift_referent_type(reference_type.referent().clone()));
+                    let state = destination.input(V::Type::from(reference_type.referent().clone()));
                     context.allocate_discharged(reference_type, state)?
                 } else {
                     // An unselected external allocation keeps its reference-typed boundary position exactly as the source

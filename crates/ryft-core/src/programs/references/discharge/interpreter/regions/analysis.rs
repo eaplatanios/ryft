@@ -636,7 +636,10 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         threaded: &BTreeSet<ReferenceAllocationHandle>,
         allocation: ReferenceAllocationHandle,
         output: C::Value,
-    ) -> Result<(), ProgramError> {
+    ) -> Result<(), ProgramError>
+    where
+        C::Type: From<P::Referent>,
+    {
         if threaded.contains(&allocation) {
             self.merge_discharged_state(allocation, output, summary.is_mutated(allocation))?;
         }

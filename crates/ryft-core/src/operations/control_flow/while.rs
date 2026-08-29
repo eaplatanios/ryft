@@ -940,6 +940,7 @@ where
     T: Type,
     WhileOperation<T>: Operation<Type = C::Type>,
     C: Context<Operation: From<WhileOperation<T>>>,
+    C::Type: From<P::Referent>,
     P: ReferenceDischargePolicy<C>,
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(

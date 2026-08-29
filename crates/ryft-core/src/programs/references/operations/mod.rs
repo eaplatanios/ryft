@@ -13,6 +13,7 @@ use crate::programs::operations::Operation;
 use crate::programs::types::{Type, Typed};
 
 use super::discharge::{ReferenceDischargePolicy, ReferenceDischargeValue};
+use super::types::ReferenceType;
 
 macro_rules! define_reference_primitive_payload {
     // Defines one type-indexed zero-sized payload without deriving unnecessary bounds on its phantom type parameters.
@@ -105,6 +106,7 @@ fn validate_operand_types<U: Type, C, P, O>(
 ) -> Result<(), ProgramError>
 where
     C: Domain<Type = U>,
+    U: From<ReferenceType<P::Referent>>,
     P: ReferenceDischargePolicy<C>,
     O: Operation<Type = U>,
 {
@@ -345,7 +347,13 @@ pub(crate) mod tests {
 
         fn try_from(r#type: &'t TestType) -> Result<Self, Self::Error> {
             match r#type {
-                TestType::Reference(r#type) => Ok(r#type),
+                // This sentinel deliberately violates the otherwise canonical embedding/projection round trip. It
+                // lets the allocation-discharge test pin its malformed-inference diagnostic without inventing a
+                // second policy-level type conversion seam solely for tests.
+                TestType::Reference(r#type) if r#type.referent() != &NON_PROJECTING_REFERENT => Ok(r#type),
+                TestType::Reference(_) => {
+                    Err(TypeError::invalid("the non-projecting test reference is deliberately not recognized"))
+                }
                 TestType::Value(_) => Err(TypeError::invalid("expected reference type but got value type")),
             }
         }
@@ -829,7 +837,7 @@ pub(crate) mod tests {
     impl<C, P> ReferenceDischargeableOperation<C, P> for TestOperation
     where
         C: Context<Type = TestType, Operation = TestOperation>,
-        P: ReferenceAccumulationPolicy<C>,
+        P: ReferenceAccumulationPolicy<C, Referent = TestReferent>,
     {
         fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
             &self,
@@ -908,8 +916,6 @@ pub(crate) mod tests {
     #[derive(Copy, Clone, Debug, PartialEq)]
     pub(crate) struct TestAlias;
 
-    impl Parameter for TestAlias {}
-
     /// Reference discharge policy of the discharge-rule test universe.
     #[derive(Copy, Clone, Debug)]
     pub(crate) struct TestReferenceDischarge;
@@ -927,21 +933,6 @@ pub(crate) mod tests {
             TestAlias
         }
 
-        fn lift_reference_type(r#type: ReferenceType<TestReferent>) -> TestType {
-            TestType::Reference(r#type)
-        }
-
-        fn lift_referent_type(referent: TestReferent) -> TestType {
-            TestType::Value(referent)
-        }
-
-        fn project_reference_type(r#type: &TestType) -> Option<ReferenceType<TestReferent>> {
-            match r#type {
-                TestType::Reference(reference) => Some(reference.clone()),
-                TestType::Value(_) => None,
-            }
-        }
-
         fn read(_context: &C, current: &C::Value, _alias: &TestAlias) -> Result<C::Value, ProgramError> {
             Ok(current.clone())
         }
@@ -953,15 +944,6 @@ pub(crate) mod tests {
             _alias: &TestAlias,
         ) -> Result<C::Value, ProgramError> {
             Ok(replacement)
-        }
-
-        fn replace(
-            _context: &C,
-            current: &C::Value,
-            replacement: C::Value,
-            _alias: &TestAlias,
-        ) -> Result<(C::Value, C::Value), ProgramError> {
-            Ok((current.clone(), replacement))
         }
     }
 
@@ -994,21 +976,6 @@ pub(crate) mod tests {
             TestAlias
         }
 
-        fn lift_reference_type(r#type: ReferenceType<TestReferent>) -> TestType {
-            TestType::Reference(r#type)
-        }
-
-        fn lift_referent_type(referent: TestReferent) -> TestType {
-            TestType::Value(referent)
-        }
-
-        fn project_reference_type(r#type: &TestType) -> Option<ReferenceType<TestReferent>> {
-            match r#type {
-                TestType::Reference(reference) => Some(reference.clone()),
-                TestType::Value(_) => None,
-            }
-        }
-
         fn read(_context: &C, current: &C::Value, _alias: &TestAlias) -> Result<C::Value, ProgramError> {
             Ok(current.clone())
         }
@@ -1022,13 +989,13 @@ pub(crate) mod tests {
             Ok(replacement)
         }
 
-        fn replace(
+        fn swap(
             _context: &C,
             _current: &C::Value,
             _replacement: C::Value,
             _alias: &TestAlias,
         ) -> Result<(C::Value, C::Value), ProgramError> {
-            Err(ProgramError::MalformedProgram("write-only discharge policy must not replace".to_string()))
+            Err(ProgramError::MalformedProgram("write-only discharge policy must not swap".to_string()))
         }
     }
 
@@ -1037,6 +1004,9 @@ pub(crate) mod tests {
 
     /// Referent every discharge-rule test allocates its allocation over.
     pub(crate) const REFERENT: TestReferent = TestReferent::new(7, 16);
+
+    /// Referent whose canonical reference projection deliberately fails to exercise the allocation diagnostic.
+    pub(crate) const NON_PROJECTING_REFERENT: TestReferent = TestReferent::new(7, u8::MAX);
 
     /// Allocates a reference containing `payload` through the allocation discharge rule.
     ///
@@ -1056,56 +1026,6 @@ pub(crate) mod tests {
     {
         let structure = <P as Parameterized<P>>::parameter_structure(&parameter);
         assert_eq!(<P as Parameterized<P>>::from_parameters(structure, [parameter]), Ok(parameter));
-    }
-
-    /// Policy whose projection deliberately disagrees with the reference primitives' own inference, which is the only
-    /// way an allocation can infer a type the policy does not recognize as a reference.
-    #[derive(Copy, Clone, Debug)]
-    pub(crate) struct NonProjectingReferenceDischarge;
-
-    impl<C: Context<Type = TestType, Operation: From<TestOperation>>> ReferenceDischargePolicy<C>
-        for NonProjectingReferenceDischarge
-    {
-        type Referent = TestReferent;
-        type Alias = TestAlias;
-
-        fn storage_alias(_referent: &TestReferent) -> TestAlias {
-            TestAlias
-        }
-
-        fn lift_reference_type(r#type: ReferenceType<TestReferent>) -> TestType {
-            TestType::Reference(r#type)
-        }
-
-        fn lift_referent_type(referent: TestReferent) -> TestType {
-            TestType::Value(referent)
-        }
-
-        fn project_reference_type(_type: &TestType) -> Option<ReferenceType<TestReferent>> {
-            None
-        }
-
-        fn read(_context: &C, current: &C::Value, _alias: &TestAlias) -> Result<C::Value, ProgramError> {
-            Ok(current.clone())
-        }
-
-        fn write(
-            _context: &C,
-            _current: &C::Value,
-            replacement: C::Value,
-            _alias: &TestAlias,
-        ) -> Result<C::Value, ProgramError> {
-            Ok(replacement)
-        }
-
-        fn replace(
-            _context: &C,
-            current: &C::Value,
-            replacement: C::Value,
-            _alias: &TestAlias,
-        ) -> Result<(C::Value, C::Value), ProgramError> {
-            Ok((current.clone(), replacement))
-        }
     }
 
     #[test]

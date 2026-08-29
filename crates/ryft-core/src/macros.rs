@@ -4618,15 +4618,14 @@ mod tests {
         ElementwiseOperation, ExpOperation, MulOperation, Neg, NegOperation, Reduce, ReductionKind, SinOperation, Sub,
         SubOperation, TransposeOperation, ZeroOperation,
     };
-    use crate::parameters::{Parameter, Placeholder};
+    use crate::parameters::Parameter;
     use crate::partial::{
         PartialEvaluationContext, PartialEvaluationValue, PartialTracer, PartialValue, PartiallyEvaluatableOperation,
     };
     use crate::programs::{
-        EmptyRegionDriver, MaybeZero, Operation, OperationProvider, ProgramBuilder, ProgramError,
-        RecursiveReferenceDischargeDriver, ReferenceDischargeContext, ReferenceDischargePolicy,
-        ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceType, Type, TypeError, TypeIdentityRenaming,
-        Typed, ValueProjection,
+        EmptyRegionDriver, MaybeZero, Operation, OperationProvider, ProgramError, ReferenceDischargeContext,
+        ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceType, Type,
+        TypeError, TypeIdentityRenaming, Typed, ValueProjection,
     };
     use crate::tracing::{Tracer, TracingContext};
 
@@ -5998,13 +5997,10 @@ mod tests {
 
     #[test]
     fn test_impl_reference_free_dischargeable_operation() {
-        // The array universe has no reference-typed spelling, so this fixture policy classifies every destination
-        // type as ordinary and serves whole-value reads and replacements. That is all the generated rule needs: it
-        // only ever mints the one live handle whose rejection is under test.
+        // The array universe has no reference-typed spelling, which is valid here because the generated rule only
+        // replays ordinary operands and rejects every live reference handle before inspecting its type.
         #[derive(Copy, Clone, Debug, PartialEq)]
         struct WholeArray;
-
-        impl Parameter for WholeArray {}
 
         #[derive(Copy, Clone, Debug)]
         struct TestArrayReferenceDischarge;
@@ -6015,18 +6011,6 @@ mod tests {
 
             fn storage_alias(_referent: &ArrayType) -> WholeArray {
                 WholeArray
-            }
-
-            fn lift_reference_type(r#type: ReferenceType<ArrayType>) -> ArrayType {
-                r#type.referent().clone()
-            }
-
-            fn lift_referent_type(referent: ArrayType) -> ArrayType {
-                referent
-            }
-
-            fn project_reference_type(_type: &ArrayType) -> Option<ReferenceType<ArrayType>> {
-                None
             }
 
             fn read(_context: &C, current: &C::Value, _alias: &WholeArray) -> Result<C::Value, ProgramError> {
@@ -6040,15 +6024,6 @@ mod tests {
                 _alias: &WholeArray,
             ) -> Result<C::Value, ProgramError> {
                 Ok(replacement)
-            }
-
-            fn replace(
-                _context: &C,
-                current: &C::Value,
-                replacement: C::Value,
-                _alias: &WholeArray,
-            ) -> Result<(C::Value, C::Value), ProgramError> {
-                Ok((current.clone(), replacement))
             }
         }
 
@@ -6066,23 +6041,9 @@ mod tests {
             Ok(vec![ReferenceDischargeValue::Ordinary(Array::scalar(-2.0f32))]),
         );
 
-        // A region-carrying application replays its regions verbatim, so an operation that declares none rejects the
-        // attachment through its own contract rather than through the shared rule.
-        let mut builder = ProgramBuilder::<Array, TestUnaryOperation<ArrayType>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F32));
-        let regions =
-            [builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap()];
-        let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
-        assert_eq!(
-            operation.discharge_references(&context, &driver, &inputs),
-            Err(ProgramError::MalformedProgram(
-                "operation `test_unary` declares no region slots but 1 regions were attached".to_string(),
-            )),
-        );
-
-        // An operand that is a live reference handle is rejected too, because a reference-touching operation owns its
-        // own rewrite. The handle's own rendering is spliced into the expected diagnostic because a root environment
-        // identity is minted process-globally and is therefore not stable across runs.
+        // An operand that is a live reference handle is rejected too, because a reference-touching operation owns
+        // its own rewrite. The handle's own rendering is spliced into the expected diagnostic because a top-level
+        // environment identity is minted process-globally and is therefore not stable across runs.
         let reference = context
             .allocate_discharged(ReferenceType::new(ArrayType::scalar(DataType::F32)), Array::scalar(1.0f32))
             .unwrap();

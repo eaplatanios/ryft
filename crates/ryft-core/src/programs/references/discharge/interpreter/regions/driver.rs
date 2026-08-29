@@ -11,6 +11,8 @@ use crate::programs::regions::{RegionDriver, RegionRef, RegionReplayMappings, Re
 use crate::programs::types::Typed;
 use crate::programs::values::Value;
 
+use crate::programs::references::types::ReferenceType;
+
 use super::super::super::policies::ReferenceDischargePolicy;
 use super::super::rules::{ReferenceDischargeDriver, replay_preserved_access};
 use super::super::{
@@ -83,6 +85,9 @@ where
             ReferenceDischargeRegionDestination<C>,
             Referent = <P as ReferenceDischargePolicy<C>>::Referent,
         >,
+    C::Type: From<<P as ReferenceDischargePolicy<C>>::Referent>
+        + From<ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>>,
+    for<'t> &'t ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>: TryFrom<&'t C::Type>,
     D: RegionDriver<C::Constant, C::Operation>,
 {
     #[inline]
@@ -137,6 +142,9 @@ where
             ReferenceDischargeRegionDestination<C>,
             Referent = <P as ReferenceDischargePolicy<C>>::Referent,
         >,
+    C::Type: From<<P as ReferenceDischargePolicy<C>>::Referent>
+        + From<ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>>,
+    for<'t> &'t ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>: TryFrom<&'t C::Type>,
 {
     let mappings = RegionReplayMappings::new();
     let mut instruction_index = 0;
@@ -192,6 +200,10 @@ where
             ReferenceDischargeRegionDestination<C>,
             Referent = <P as ReferenceDischargePolicy<C>>::Referent,
         >,
+    C::Type: From<ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>>,
+    <ReferenceDischargeRegionDestination<C> as crate::contexts::Domain>::Type: From<<P as ReferenceDischargePolicy<C>>::Referent>
+        + From<ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>>,
+    for<'t> &'t ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>: TryFrom<&'t C::Type>,
 {
     type Destination<C> = ReferenceDischargeRegionDestination<C>;
 
@@ -266,9 +278,9 @@ where
                 let r#type = context.allocation_reference_type(allocation)?;
                 let discharged = context.allocation_is_discharged(allocation)?;
                 let input_type = if discharged {
-                    <P as ReferenceDischargePolicy<Destination<C>>>::lift_referent_type(r#type.referent().clone())
+                    <Destination<C> as crate::contexts::Domain>::Type::from(r#type.referent().clone())
                 } else {
-                    <P as ReferenceDischargePolicy<Destination<C>>>::lift_reference_type(r#type.clone())
+                    <Destination<C> as crate::contexts::Domain>::Type::from(r#type.clone())
                 };
                 let input = destination.input(input_type);
                 if let Some(forked) = caller_to_fork.get(&allocation).copied() {
@@ -301,7 +313,7 @@ where
             let source_type = &source_input_types[position];
             declared.push(match allocation {
                 None => {
-                    if <P as ReferenceDischargePolicy<C>>::project_reference_type(source_type).is_some() {
+                    if <&ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>>::try_from(source_type).is_ok() {
                         return Err(ProgramError::MalformedProgram(format!(
                             "reference discharge declares reference input {position} of region `{}` without an allocation",
                             region.id(),
@@ -310,8 +322,8 @@ where
                     ReferenceDischargeValue::Ordinary(destination.input(source_type.clone()))
                 }
                 Some(allocation) => {
-                    let Some(source_reference_type) =
-                        <P as ReferenceDischargePolicy<C>>::project_reference_type(source_type)
+                    let Ok(source_reference_type) =
+                        <&ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>>::try_from(source_type)
                     else {
                         return Err(ProgramError::MalformedProgram(format!(
                             "reference discharge assigns {allocation} to ordinary input {position} of region `{}`",
@@ -319,7 +331,7 @@ where
                         )));
                     };
                     let allocation_type = context.allocation_reference_type(*allocation)?;
-                    if allocation_type != source_reference_type {
+                    if &allocation_type != source_reference_type {
                         return Err(ProgramError::MalformedProgram(format!(
                             "reference discharge assigns {allocation} of type `{allocation_type}` to input {position} of region \
                              `{}` with reference type `{source_reference_type}`",
@@ -464,8 +476,12 @@ where
 fn lift_constant<C: Context, P: ReferenceDischargePolicy<C>>(
     context: &ReferenceDischargeContext<C, P>,
     constant: C::Constant,
-) -> Result<ReferenceDischargeValue<C, P>, ProgramError> {
-    if let Some(r#type) = P::project_reference_type(constant.r#type().as_ref()) {
+) -> Result<ReferenceDischargeValue<C, P>, ProgramError>
+where
+    for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t C::Type>,
+{
+    let constant_type = constant.r#type();
+    if let Ok(r#type) = <&ReferenceType<P::Referent>>::try_from(constant_type.as_ref()) {
         let Some(allocation) = context.captures().resolve(&constant) else {
             return Err(ProgramError::MalformedProgram(format!(
                 "reference discharge cannot lift a constant of reference type `{type}`; a reference enters a program \
@@ -476,7 +492,7 @@ fn lift_constant<C: Context, P: ReferenceDischargePolicy<C>>(
         // A capture constant names the complete stored value its position binds, so a narrower declared type would silently
         // widen to the allocation's own value where the constant is used.
         let bound = context.allocation_reference_type(allocation)?;
-        if r#type != bound {
+        if r#type != &bound {
             return Err(ProgramError::MalformedProgram(format!(
                 "reference discharge resolved a capture constant of reference type `{type}` to {allocation}, which carries \
                  the reference type `{bound}`",

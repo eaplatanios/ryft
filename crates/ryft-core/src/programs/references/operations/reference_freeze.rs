@@ -138,7 +138,7 @@ where
     U: Type,
     ReferenceFreezeOperation<T, U>: Operation<Type = U>,
     C: Context<Type = U, Operation: From<ReferenceFreezeOperation<T, U>>>,
-    P: ReferenceDischargePolicy<C>,
+    P: ReferenceDischargePolicy<C, Referent = T>,
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
         &self,

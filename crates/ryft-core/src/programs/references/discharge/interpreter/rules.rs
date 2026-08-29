@@ -112,7 +112,9 @@ pub(super) fn replay_preserved_access<C, P>(
 ) -> Result<Option<Vec<ReferenceDischargeValue<C, P>>>, ProgramError>
 where
     C: Context,
+    C::Type: From<ReferenceType<P::Referent>>,
     P: ReferenceDischargePolicy<C>,
+    for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t C::Type>,
 {
     let semantics = operation.reference_semantics();
     if semantics.inputs().is_empty() || !semantics.outputs().is_empty() {
@@ -177,6 +179,7 @@ where
     C: Context<Operation: From<O>>,
     P: ReferenceDischargePolicy<C>,
     O: Clone + Operation<Type = C::Type>,
+    for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t C::Type>,
 {
     let values = inputs
         .iter()
@@ -201,7 +204,8 @@ where
         .into_iter()
         .enumerate()
         .map(|(output_index, output)| {
-            if let Some(r#type) = P::project_reference_type(output.r#type().as_ref()) {
+            let output_type = output.r#type();
+            if let Ok(r#type) = <&ReferenceType<P::Referent>>::try_from(output_type.as_ref()) {
                 return Err(ProgramError::MalformedProgram(format!(
                     "reference discharge replayed `{}` over a preserved reference, but its output {output_index} is the \
                      reference `{type}`; an operation that derives a reference owns that allocation and needs a reference \
@@ -223,13 +227,17 @@ where
 pub(super) fn validate_preserved_value<C: Domain, P: ReferenceDischargePolicy<C>>(
     value: &C::Value,
     r#type: &ReferenceType<P::Referent>,
-) -> Result<(), ProgramError> {
-    match P::project_reference_type(value.r#type().as_ref()) {
-        Some(actual) if &actual == r#type => Ok(()),
-        Some(actual) => Err(ProgramError::MalformedProgram(format!(
+) -> Result<(), ProgramError>
+where
+    for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t C::Type>,
+{
+    let value_type = value.r#type();
+    match <&ReferenceType<P::Referent>>::try_from(value_type.as_ref()) {
+        Ok(actual) if actual == r#type => Ok(()),
+        Ok(actual) => Err(ProgramError::MalformedProgram(format!(
             "reference discharge preserved an allocation as `{actual}` but its handle exposes `{type}`",
         ))),
-        None => Err(ProgramError::MalformedProgram(format!(
+        Err(_) => Err(ProgramError::MalformedProgram(format!(
             "reference discharge preserved an allocation as `{}`, which is not a reference type",
             value.r#type(),
         ))),
@@ -240,8 +248,11 @@ pub(super) fn validate_preserved_value<C: Domain, P: ReferenceDischargePolicy<C>
 pub(super) fn validate_discharged_value_type<C: Domain, P: ReferenceDischargePolicy<C>>(
     value: &C::Value,
     r#type: &ReferenceType<P::Referent>,
-) -> Result<(), ProgramError> {
-    let expected = P::lift_referent_type(r#type.referent().clone());
+) -> Result<(), ProgramError>
+where
+    C::Type: From<P::Referent>,
+{
+    let expected = C::Type::from(r#type.referent().clone());
     if value.r#type().as_ref() != &expected {
         return Err(ProgramError::MalformedProgram(format!(
             "reference discharge state has type `{}` but allocation `{}` requires `{expected}`",

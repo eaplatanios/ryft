@@ -102,10 +102,11 @@ where
 impl<T, U, C, P> ReferenceDischargeableOperation<C, P> for ReferenceNewOperation<T, U>
 where
     T: Type,
-    U: Type,
+    U: From<T> + From<ReferenceType<T>> + Type,
     ReferenceNewOperation<T, U>: Operation<Type = U>,
     C: Context<Type = U, Operation: From<ReferenceNewOperation<T, U>>>,
-    P: ReferenceDischargePolicy<C>,
+    P: ReferenceDischargePolicy<C, Referent = T>,
+    for<'t> &'t ReferenceType<T>: TryFrom<&'t U>,
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
         &self,
@@ -120,12 +121,13 @@ where
         // initializer, so the rewrite never re-derives a referent that the type system already settled.
         let output_types = self.infer_output_types(&[initial.r#type().into_owned()], &[])?;
         check_count!("output", output_types, 1, ProgramError);
-        let r#type = P::project_reference_type(&output_types[0]).ok_or_else(|| {
+        let r#type = <&ReferenceType<P::Referent>>::try_from(&output_types[0]).map_err(|_| {
             ProgramError::MalformedProgram(format!(
                 "`{REFERENCE_NEW_OPERATION_NAME}` inferred the non-reference output type `{}`",
                 output_types[0],
             ))
         })?;
+        let r#type = r#type.clone();
         if context.selects_internal(driver.instruction(), 0) {
             return Ok(vec![context.allocate_discharged(r#type, initial)?]);
         }
@@ -232,15 +234,14 @@ mod tests {
             ))),
         );
 
-        // The rule reads its fresh allocation's reference type back out of its own inferred output type, so a policy
-        // whose projection disagrees with that inference cannot silently allocate an unclassifiable allocation.
-        let disagreeing =
-            ReferenceDischargeContext::<TestDestination, NonProjectingReferenceDischarge>::new(TestDestination::new());
-        let initial = ReferenceDischargeValue::Ordinary(TestValue::new(REFERENT, 4));
+        // The rule reads its fresh allocation's reference type back out of its own inferred output type. A deliberately
+        // inconsistent canonical conversion therefore cannot silently allocate an unclassifiable allocation.
+        let disagreeing = TestDischargeContext::new(TestDestination::new());
+        let initial = ReferenceDischargeValue::Ordinary(TestValue::new(NON_PROJECTING_REFERENT, 4));
         assert_eq!(
             New::new().discharge_references(&disagreeing, &EmptyRegionDriver, std::slice::from_ref(&initial)),
             Err(ProgramError::MalformedProgram(
-                "`reference_new` inferred the non-reference output type `ref<value<i7,p16>>`".to_string(),
+                "`reference_new` inferred the non-reference output type `ref<value<i7,p255>>`".to_string(),
             )),
         );
     }

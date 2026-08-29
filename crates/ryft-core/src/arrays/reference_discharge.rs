@@ -176,7 +176,7 @@ use crate::parameters::Parameterized;
 use crate::programs::{
     PartialReferenceDischargeResult, Program, ProgramError, ReferenceAccumulationPolicy, ReferenceDischarge,
     ReferenceDischargePolicy, ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeableOperation,
-    ReferenceType, Typed, Value,
+    Typed, Value,
 };
 use crate::tracing::TracingContext;
 
@@ -303,21 +303,6 @@ where
         ArrayReferenceView::root()
     }
 
-    fn lift_reference_type(r#type: ReferenceType<ArrayType>) -> ArrayIrType {
-        ArrayIrType::Reference(r#type)
-    }
-
-    fn lift_referent_type(referent: ArrayType) -> ArrayIrType {
-        ArrayIrType::Array(referent)
-    }
-
-    fn project_reference_type(r#type: &ArrayIrType) -> Option<ReferenceType<ArrayType>> {
-        match r#type {
-            ArrayIrType::Reference(reference) => Some(reference.clone()),
-            ArrayIrType::Array(_) | ArrayIrType::Dimension(_) => None,
-        }
-    }
-
     fn read(context: &C, current: &C::Value, alias: &ArrayReferenceView) -> Result<C::Value, ProgramError> {
         let mut intermediates = alias.intermediates_in(&mut DestinationViewCarrier(context), current.clone())?;
 
@@ -335,7 +320,7 @@ where
         alias.write_in(&mut DestinationViewCarrier(context), current.clone(), replacement)
     }
 
-    fn replace(
+    fn swap(
         context: &C,
         current: &C::Value,
         replacement: C::Value,
@@ -801,8 +786,7 @@ mod tests {
         let stage = |inputs: Vec<Tracer<TracingContext<TestValue, TestOperation>>>| {
             let context = inputs[0].context().clone();
             let read = ArrayReferenceDischarge::read(&context, &inputs[0], &alias)?;
-            let (previous, replaced) =
-                ArrayReferenceDischarge::replace(&context, &inputs[0], inputs[1].clone(), &alias)?;
+            let (previous, replaced) = ArrayReferenceDischarge::swap(&context, &inputs[0], inputs[1].clone(), &alias)?;
             let accumulated = ArrayReferenceDischarge::accumulate(&context, &replaced, inputs[1].clone(), &alias)?;
             Ok(vec![read, previous, replaced, accumulated])
         };
@@ -839,29 +823,14 @@ mod tests {
                 in (%4, %7, %10, %17)"},
         );
 
-        // The lift and projection pair round-trips a reference type through the composite universe and classifies an
-        // ordinary array type as not a reference, and the storage alias selects the complete referent.
+        // Canonical conversions round-trip a reference type through the composite universe and reject an ordinary
+        // array type as a reference, and the storage alias selects the complete referent.
         let reference_type = ReferenceType::new(matrix_type.clone());
-        let lifted = <ArrayReferenceDischarge as ReferenceDischargePolicy<TestDestination>>::lift_reference_type(
-            reference_type.clone(),
-        );
+        let lifted = ArrayIrType::from(reference_type.clone());
         assert_eq!(lifted, ArrayIrType::Reference(reference_type.clone()));
-        assert_eq!(
-            <ArrayReferenceDischarge as ReferenceDischargePolicy<TestDestination>>::project_reference_type(&lifted),
-            Some(reference_type),
-        );
-        assert_eq!(
-            <ArrayReferenceDischarge as ReferenceDischargePolicy<TestDestination>>::lift_referent_type(
-                matrix_type.clone(),
-            ),
-            ArrayIrType::Array(matrix_type.clone()),
-        );
-        assert_eq!(
-            <ArrayReferenceDischarge as ReferenceDischargePolicy<TestDestination>>::project_reference_type(
-                &ArrayIrType::Array(matrix_type.clone()),
-            ),
-            None,
-        );
+        assert_eq!(<&ReferenceType<ArrayType>>::try_from(&lifted), Ok(&reference_type));
+        assert_eq!(ArrayIrType::from(matrix_type.clone()), ArrayIrType::Array(matrix_type.clone()));
+        assert!(<&ReferenceType<ArrayType>>::try_from(&ArrayIrType::Array(matrix_type.clone())).is_err());
         assert!(
             <ArrayReferenceDischarge as ReferenceDischargePolicy<TestDestination>>::storage_alias(&matrix_type)
                 .is_root(),
@@ -2911,7 +2880,7 @@ mod tests {
         impl<C, P> ReferenceDischargeableOperation<C, P> for CallingOperation
         where
             C: Context<Type = ArrayIrType, Operation = CallingOperation>,
-            P: ReferenceAccumulationPolicy<C>,
+            P: ReferenceAccumulationPolicy<C, Referent = ArrayType>,
         {
             fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
                 &self,

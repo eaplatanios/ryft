@@ -843,6 +843,7 @@ where
     F: Value,
     ConditionOperation<F>: Operation<Type = C::Type>,
     C: Context<Operation: From<ConditionOperation<F>>>,
+    C::Type: From<P::Referent>,
     P: ReferenceDischargePolicy<C>,
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(

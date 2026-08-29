@@ -10,7 +10,7 @@
 //! the in-crate tests: together they pin both ends of the alias contract. It is also deliberately non-accumulating,
 //! which makes it the standing proof of the policy's per-access capability granularity: it implements
 //! [`ReferenceDischargePolicy`] and not [`ReferenceAccumulationPolicy`](ryft_core::ReferenceAccumulationPolicy), and
-//! still discharges every program that reads and replaces. Only a program containing `reference_add_update` would
+//! still discharges every program that reads, writes, or swaps. Only a program containing `reference_add_update` would
 //! fail to discharge for it, and it would fail at compile time, scoped to exactly that operation.
 
 use std::borrow::Cow;
@@ -93,6 +93,29 @@ impl Display for RegisterIrType {
 
 impl Parameter for RegisterIrType {}
 
+impl From<RegisterType> for RegisterIrType {
+    fn from(r#type: RegisterType) -> Self {
+        Self::Register(r#type)
+    }
+}
+
+impl From<ReferenceType<RegisterType>> for RegisterIrType {
+    fn from(r#type: ReferenceType<RegisterType>) -> Self {
+        Self::Reference(r#type)
+    }
+}
+
+impl<'t> TryFrom<&'t RegisterIrType> for &'t ReferenceType<RegisterType> {
+    type Error = TypeError;
+
+    fn try_from(r#type: &'t RegisterIrType) -> Result<Self, Self::Error> {
+        match r#type {
+            RegisterIrType::Reference(r#type) => Ok(r#type),
+            RegisterIrType::Register(_) => Err(TypeError::invalid("expected reference type but got register type")),
+        }
+    }
+}
+
 impl Type for RegisterIrType {
     type Identity = NoIdentity;
     type Refinements = ();
@@ -156,15 +179,13 @@ impl Value for RegisterValue {
 #[derive(Copy, Clone, Debug, PartialEq)]
 struct WholeRegister;
 
-impl Parameter for WholeRegister {}
-
 /// Reference discharge policy of the downstream universe.
 #[derive(Copy, Clone, Debug)]
 struct RegisterReferenceDischarge;
 
 // The policy is generic over the destination value rather than pinned to `RegisterValue`, which is what lets one
 // implementation serve an eager destination and a staging destination alike. A view-less universe needs no
-// destination capability at all for reads and replacements, and this one declines accumulation entirely by not
+// destination capability at all for reads, writes, and swaps, and this one declines accumulation entirely by not
 // implementing `ReferenceAccumulationPolicy`.
 impl<C: Domain<Type = RegisterIrType>> ReferenceDischargePolicy<C> for RegisterReferenceDischarge {
     type Referent = RegisterType;
@@ -172,21 +193,6 @@ impl<C: Domain<Type = RegisterIrType>> ReferenceDischargePolicy<C> for RegisterR
 
     fn storage_alias(_referent: &RegisterType) -> WholeRegister {
         WholeRegister
-    }
-
-    fn lift_reference_type(r#type: ReferenceType<RegisterType>) -> RegisterIrType {
-        RegisterIrType::Reference(r#type)
-    }
-
-    fn lift_referent_type(referent: RegisterType) -> RegisterIrType {
-        RegisterIrType::Register(referent)
-    }
-
-    fn project_reference_type(r#type: &RegisterIrType) -> Option<ReferenceType<RegisterType>> {
-        match r#type {
-            RegisterIrType::Reference(reference) => Some(reference.clone()),
-            RegisterIrType::Register(_) => None,
-        }
     }
 
     fn read(_context: &C, current: &C::Value, _alias: &WholeRegister) -> Result<C::Value, ProgramError> {
@@ -200,15 +206,6 @@ impl<C: Domain<Type = RegisterIrType>> ReferenceDischargePolicy<C> for RegisterR
         _alias: &WholeRegister,
     ) -> Result<C::Value, ProgramError> {
         Ok(replacement)
-    }
-
-    fn replace(
-        _context: &C,
-        current: &C::Value,
-        replacement: C::Value,
-        _alias: &WholeRegister,
-    ) -> Result<(C::Value, C::Value), ProgramError> {
-        Ok((current.clone(), replacement))
     }
 }
 
@@ -397,7 +394,7 @@ where
                 check_count!("input", inputs, 2, ProgramError);
                 let reference = inputs[0].expect_reference("a reference to replace")?;
                 let replacement = inputs[1].expect_ordinary("a replacement value")?.clone();
-                Ok(vec![ReferenceDischargeValue::Ordinary(context.replace(reference, replacement)?)])
+                Ok(vec![ReferenceDischargeValue::Ordinary(context.swap(reference, replacement)?)])
             }
             Self::Freeze => {
                 check_count!("input", inputs, 1, ProgramError);

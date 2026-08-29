@@ -108,10 +108,10 @@ where
 impl<T, U, C, P> ReferenceDischargeableOperation<C, P> for ReferenceWriteOperation<T, U>
 where
     T: Type,
-    U: Type,
+    U: From<T> + From<ReferenceType<T>> + Type,
     ReferenceWriteOperation<T, U>: Operation<Type = U>,
     C: Context<Type = U, Operation: From<ReferenceWriteOperation<T, U>>>,
-    P: ReferenceDischargePolicy<C>,
+    P: ReferenceDischargePolicy<C, Referent = T>,
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
         &self,
@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn test_reference_write_operation_reference_discharge() {
         // A policy with no accumulation capability replaces state through `write`, produces no old-value result, and
-        // marks the allocation mutated. Its `replace` path is an error, making accidental swap dispatch visible.
+        // marks the allocation mutated. Its `swap` path is an error, making accidental swap dispatch visible.
         let context =
             ReferenceDischargeContext::<TestDestination, WriteOnlyReferenceDischarge>::new(TestDestination::new());
         let initial = TestValue::new(REFERENT, 4);

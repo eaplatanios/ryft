@@ -114,10 +114,10 @@ where
 impl<T, U, C, P> ReferenceDischargeableOperation<C, P> for ReferenceAddUpdateOperation<T, U>
 where
     T: Type,
-    U: Type,
+    U: From<T> + From<ReferenceType<T>> + Type,
     ReferenceAddUpdateOperation<T, U>: Operation<Type = U>,
     C: Context<Type = U, Operation: From<ReferenceAddUpdateOperation<T, U>>>,
-    P: ReferenceAccumulationPolicy<C>,
+    P: ReferenceAccumulationPolicy<C, Referent = T>,
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
         &self,

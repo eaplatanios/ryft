@@ -56,6 +56,7 @@ pub fn discharge_positional_region_operation<C, P, O, D>(
 ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError>
 where
     C: Context<Operation: From<O>>,
+    C::Type: From<P::Referent>,
     P: ReferenceDischargePolicy<C>,
     O: Clone + Operation<Type = C::Type>,
     D: ReferenceDischargeDriver<C, P>,

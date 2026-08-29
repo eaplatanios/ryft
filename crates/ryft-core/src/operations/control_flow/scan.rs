@@ -1706,6 +1706,7 @@ where
     Capture: Value,
     ScanOperation<Capture>: Operation<Type = C::Type>,
     C: Context<Operation: From<ScanOperation<Capture>>>,
+    C::Type: From<P::Referent>,
     P: ReferenceDischargePolicy<C>,
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
