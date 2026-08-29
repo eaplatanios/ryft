@@ -4,6 +4,17 @@ use crate::contexts::Domain;
 use crate::programs::ProgramError;
 use crate::programs::types::Type;
 
+/// [`Type`] capability selecting the canonical [`ReferenceDischargePolicy`] used by reference discharge entry points.
+///
+/// This is a discharge-owned extension of [`Type`] rather than part of the core type contract. It lets generic
+/// [`Program`](crate::Program) functions select the reference policy of each program universe without requiring
+/// callers to name that policy or relying on overlapping implementations distinguished only by the program's type
+/// family.
+pub trait ReferenceDischargeableType: Type {
+    /// Canonical [`ReferenceDischargePolicy`] of this type universe.
+    type Policy: Copy + Clone + Debug;
+}
+
 /// Defines how one reference type family reads and updates immutable state during reference discharge.
 ///
 /// Reference discharge replaces mutable references with explicitly threaded immutable values. This policy supplies

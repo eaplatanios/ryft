@@ -4905,7 +4905,7 @@ mod tests {
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![final_counter], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let discharged = source.discharge_references_with_policy::<ArrayReferenceDischarge>(0).unwrap();
+        let discharged = source.discharge_references(0).unwrap();
         assert_eq!(
             discharged.program().to_string(),
             indoc! {"

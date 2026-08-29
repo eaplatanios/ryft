@@ -490,7 +490,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     ///
     /// The capture scope is populated afterwards rather than here, because the allocations it binds are minted by this very
     /// context as its boundary is threaded. Partial discharge is requested through
-    /// The [`partial-discharge entry point`](crate::Program::partially_discharge_references_with_policy) must be used
+    /// The [`partial-discharge entry point`](crate::Program::partially_discharge_references) must be used
     /// instead of constructing a context, so that the targets are always validated against the program whose
     /// coordinates it names.
     #[inline]

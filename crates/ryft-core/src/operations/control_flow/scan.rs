@@ -3083,8 +3083,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReferenceDischarge, DataType, DimensionBounds,
-        DimensionType, DimensionVariable, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
+        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionType,
+        DimensionVariable, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
     };
     use crate::batching::{BatchingTracer, batch};
     use crate::captures::CaptureReference;
@@ -5264,7 +5264,7 @@ mod tests {
             ],
         );
 
-        let discharged = source.discharge_references_with_policy::<ArrayReferenceDischarge>(0).unwrap();
+        let discharged = source.discharge_references(0).unwrap();
         assert_eq!(
             discharged.program().to_string(),
             indoc! {"

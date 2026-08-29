@@ -92,8 +92,8 @@
 //! operations into explicit state dataflow. A local allocation disappears entirely after that rewrite. An external
 //! allocation becomes an ordinary state input and, when mutated, a hidden final-state output described by a
 //! [`ExternalReferenceBinding`]; the backend's stateful invocation surface snapshots and publishes those values through
-//! the caller's reference. [`Program::discharge_references_with_policy`] exposes the generic program-level entry point
-//! for this rewrite; the discharge module documentation contains a concrete before-and-after example.
+//! the caller's reference. [`Program::discharge_references`] exposes the generic program-level entry point for this
+//! rewrite; the discharge module documentation contains a concrete before-and-after example.
 //!
 //! [`PartialReferenceDischargeResult`] supports the kernel use case in which selected implementation-owned allocations
 //! become immutable state while other references deliberately remain in the program. A full
@@ -177,9 +177,9 @@ pub use discharge::{
     ReferenceAccumulationPolicy, ReferenceAllocationHandle, ReferenceDischargeContext, ReferenceDischargeDriver,
     ReferenceDischargePolicy, ReferenceDischargeReference, ReferenceDischargeRegionDestination,
     ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork, ReferenceRegionStateInsertion,
-    ReferenceRegionSummary, ReferenceSource, ReferenceStateWidening, discharge_positional_region_operation,
-    discharge_preserved_access, discharge_reference_free_operation,
+    ReferenceDischargeableType, ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork,
+    ReferenceRegionStateInsertion, ReferenceRegionSummary, ReferenceSource, ReferenceStateWidening,
+    discharge_positional_region_operation, discharge_preserved_access, discharge_reference_free_operation,
 };
 pub use operations::{
     REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME,

@@ -1,7 +1,7 @@
 //! Downstream compile proof for the reference discharge extension surface.
 //!
 //! Everything in this file is written from the position of a backend crate outside `ryft-core`: a reference universe
-//! of its own, a [`ReferenceDischargePolicy`] for that universe, and per-operation
+//! of its own, a [`ReferenceDischargePolicy`] selected through [`ReferenceDischargeableType`], and per-operation
 //! [`ReferenceDischargeableOperation`] rules, all reaching `ryft-core` only through its public API. Because an
 //! integration test is a separate crate, the compiler itself enforces the property this file exists to establish,
 //! namely that a third-party reference universe can be discharged without any private `ryft-core` item.
@@ -26,9 +26,10 @@ use ryft_core::{
     InterpretationDriver, NoIdentity, Operation, OutputRegionProvenance, Parameter, Placeholder, Program,
     ProgramBuilder, ProgramError, RecursiveReferenceDischargeDriver, ReferenceAccessMode, ReferenceDischargeContext,
     ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeTarget, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceInput, ReferenceOperationSemantics, ReferenceOutput,
-    ReferenceRegionDischargeBoundary, ReferenceRegionStateInsertion, ReferenceSource, ReferenceType, RegionInterface,
-    RegionSlot, Trace, Tracer, TracingContext, Type, TypeError, Typed, Value, discharge_reference_free_operation,
+    ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceInput, ReferenceOperationSemantics,
+    ReferenceOutput, ReferenceRegionDischargeBoundary, ReferenceRegionStateInsertion, ReferenceSource, ReferenceType,
+    RegionInterface, RegionSlot, Trace, Tracer, TracingContext, Type, TypeError, Typed, Value,
+    discharge_reference_free_operation,
 };
 
 /// Destination universe of the downstream programs. Its dispatch domain is the constant-only eager context, which is
@@ -182,6 +183,10 @@ struct WholeRegister;
 /// Reference discharge policy of the downstream universe.
 #[derive(Copy, Clone, Debug)]
 struct RegisterReferenceDischarge;
+
+impl ReferenceDischargeableType for RegisterIrType {
+    type Policy = RegisterReferenceDischarge;
+}
 
 // The policy is generic over the destination value rather than pinned to `RegisterValue`, which is what lets one
 // implementation serve an eager destination and a staging destination alike. A view-less universe needs no
@@ -557,7 +562,7 @@ fn test_downstream_reference_universe_discharges_into_a_staged_program() {
 
 #[test]
 fn test_downstream_program_level_discharge_threads_external_state_through_the_entry_boundary() {
-    // `Program::discharge_references_with_policy` is the program-level entry point, and it is universe-generic: this
+    // `Program::discharge_references` is the program-level entry point, and it is universe-generic: this
     // exercises it over the downstream universe, so nothing about the array universe can be load-bearing for it.
     // `f(counter, other, replacement) = replaced`, where `counter` is written and `other` is only read.
     let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
@@ -580,7 +585,7 @@ fn test_downstream_program_level_discharge_threads_external_state_through_the_en
     // Each reference input keeps its boundary position and becomes an ordinary input carrying the referent's lifted
     // type, the public outputs are exactly the source outputs, and only the written allocation appends a hidden final-state
     // output after them.
-    let discharged = source.discharge_references_with_policy::<RegisterReferenceDischarge>(1).unwrap();
+    let discharged = source.discharge_references(1).unwrap();
     assert_eq!(discharged.output_count(), 2);
     assert_eq!(
         discharged.external_states(),
@@ -605,7 +610,7 @@ fn test_downstream_program_level_discharge_threads_external_state_through_the_en
         .build::<Vec<RegisterValue>, Vec<RegisterValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
         .unwrap();
     assert_eq!(
-        source.discharge_references_with_policy::<RegisterReferenceDischarge>(0).unwrap_err(),
+        source.discharge_references(0).unwrap_err(),
         ProgramError::MalformedProgram(
             "reference discharge consumed external input 0, whose state must remain owned by the caller".to_string(),
         ),
@@ -676,9 +681,7 @@ fn test_downstream_partial_discharge_preserves_the_allocations_it_was_not_asked_
             ReferenceDischargeTarget::External(ReferenceSource::Input { index: 1 }),
         ],
     );
-    let discharged = source
-        .partially_discharge_references_with_policy::<RegisterReferenceDischarge>(0, &targets[..1])
-        .unwrap();
+    let discharged = source.partially_discharge_references(0, &targets[..1]).unwrap();
 
     // The selected allocation became state at its own boundary position and publishes its final state as a hidden output;
     // the preserved reference kept its reference type and reports no binding, and both of its accesses replayed verbatim.
@@ -726,7 +729,7 @@ fn test_downstream_structured_rule_discharges_through_the_region_boundary_api() 
         .build::<Vec<RegisterValue>, Vec<RegisterValue>>(vec![result], vec![Placeholder; 2], vec![Placeholder])
         .unwrap();
 
-    let discharged = source.discharge_references_with_policy::<RegisterReferenceDischarge>(0).unwrap();
+    let discharged = source.discharge_references(0).unwrap();
     assert_eq!(discharged.output_count(), 1);
     assert_eq!(
         discharged.external_states(),
@@ -768,10 +771,7 @@ fn test_downstream_partial_targets_reach_an_internal_allocation_inside_a_structu
         .build::<Vec<RegisterValue>, Vec<RegisterValue>>(vec![result], vec![Placeholder], vec![Placeholder])
         .unwrap();
 
-    let preserved = source
-        .clone()
-        .partially_discharge_references_with_policy::<RegisterReferenceDischarge>(0, &[])
-        .unwrap();
+    let preserved = source.clone().partially_discharge_references(0, &[]).unwrap();
     assert_eq!(preserved.external_states(), &[]);
     assert_eq!(
         preserved.program().to_string(),
@@ -790,11 +790,7 @@ fn test_downstream_partial_targets_reach_an_internal_allocation_inside_a_structu
 
     let targets = source.reference_discharge_targets(0).unwrap();
     assert_eq!(targets.len(), 1);
-    let full = source
-        .partially_discharge_references_with_policy::<RegisterReferenceDischarge>(0, targets.as_slice())
-        .unwrap()
-        .try_into_full()
-        .unwrap();
+    let full = source.partially_discharge_references(0, targets.as_slice()).unwrap().try_into_full().unwrap();
     assert_eq!(
         full.program().to_string(),
         indoc! {"

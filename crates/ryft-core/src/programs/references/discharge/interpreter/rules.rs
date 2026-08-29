@@ -574,7 +574,7 @@ mod tests {
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![observed], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        let preserved = source.partially_discharge_references_with_policy::<ListReferenceDischarge>(0, &[]).unwrap();
+        let preserved = source.partially_discharge_references(0, &[]).unwrap();
         let rendered = std::fmt::from_fn(|formatter| {
             preserved.program().render(formatter, 0, ProgramRenderingMode::WithProvenance)
         })

@@ -225,7 +225,7 @@ mod tests {
 
         // Full discharge turns the shared allocation into state. The public snapshot and hidden final-state output both
         // observe the write, proving that the duplicate boundary position did not mint an independent fork allocation.
-        let discharged = source.clone().discharge_references_with_policy::<ListReferenceDischarge>(0).unwrap();
+        let discharged = source.clone().discharge_references(0).unwrap();
         assert_eq!(
             discharged.program().interpret(vec![ListIrValue::List(vec![1, 2])]),
             Ok(vec![ListIrValue::List(vec![7, 8]), ListIrValue::List(vec![7, 8])]),
@@ -233,7 +233,7 @@ mod tests {
 
         // Partial discharge preserves the same alias as a reference. Both declared positions remain present in the
         // callee boundary, but its second input is unused and both accesses replay through the first canonical value.
-        let preserved = source.partially_discharge_references_with_policy::<ListReferenceDischarge>(0, &[]).unwrap();
+        let preserved = source.partially_discharge_references(0, &[]).unwrap();
         assert_eq!(
             preserved.program().to_string(),
             indoc! {"
@@ -343,7 +343,7 @@ mod tests {
             )
             .unwrap();
 
-        let discharged = source.discharge_references_with_policy::<ListReferenceDischarge>(0).unwrap();
+        let discharged = source.discharge_references(0).unwrap();
         assert_eq!(discharged.output_count(), 2);
         assert_eq!(discharged.external_states(), &[]);
         assert_eq!(

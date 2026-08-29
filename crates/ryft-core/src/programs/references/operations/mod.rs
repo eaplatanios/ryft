@@ -203,7 +203,7 @@ pub(crate) mod tests {
     use crate::programs::identities::{TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming};
     use crate::programs::references::discharge::{
         ReferenceAccumulationPolicy, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargeReference,
-        ReferenceDischargeableOperation, discharge_reference_free_operation,
+        ReferenceDischargeableOperation, ReferenceDischargeableType, discharge_reference_free_operation,
     };
     use crate::programs::references::semantics::ReferenceOperationSemantics;
     use crate::programs::references::types::ReferenceType;
@@ -920,6 +920,10 @@ pub(crate) mod tests {
     #[derive(Copy, Clone, Debug)]
     pub(crate) struct TestReferenceDischarge;
 
+    impl ReferenceDischargeableType for TestType {
+        type Policy = TestReferenceDischarge;
+    }
+
     // The policy leaves the destination value generic, which is what lets one implementation serve both the eager and
     // the staging destination: a view-less universe needs no destination capability at all to read or replace, and it
     // reaches its sum by binding this family's addition rather than by requiring value-level arithmetic.
@@ -1061,7 +1065,7 @@ pub(crate) mod tests {
             )
             .unwrap();
 
-        let preserved = source.partially_discharge_references_with_policy::<TestReferenceDischarge>(0, &[]).unwrap();
+        let preserved = source.partially_discharge_references(0, &[]).unwrap();
         assert_eq!(preserved.output_count(), 3);
         assert_eq!(preserved.external_states(), &[]);
         assert_eq!(

@@ -1,13 +1,15 @@
 //! Backend-neutral discharge of array references and their views into explicit immutable array state.
 //!
-//! [`Program::discharge_references`] rewrites the reference state of an array-IR program into ordinary array SSA
+//! [`Program::discharge_references`](crate::Program::discharge_references) rewrites the reference state of an array-IR
+//! program into ordinary array SSA
 //! values by interpreting it under [`ArrayReferenceDischarge`], this universe's [`ReferenceDischargePolicy`]. Index
 //! and static unit-stride slice views lower through canonical slice, reshape, and update-slice operations.
 //! Conditions, loops, scans, and calls widen their own boundaries with explicit immutable allocation state; derived views
 //! must be recreated inside each attached region. The result keeps the original public outputs as a prefix and
 //! appends one hidden final-state output for every mutated external allocation.
 //!
-//! An operation without a [`ReferenceDischargeableOperation`] rule of its own conservatively rejects reference state
+//! An operation without a [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation) rule of its own
+//! conservatively rejects reference state
 //! anywhere in its attached-region closures — including state that is allocated, mutated, and consumed entirely
 //! inside the region. Today that covers `shard_map`, rematerialization, linear-call, and custom-derivative carriers,
 //! for each of which threading state through the region has no defined meaning rather than merely being
@@ -45,10 +47,11 @@
 //!
 //! Representative supported compositions are shown below. The transforms themselves reject reference operations
 //! outright ("must be discharged before differentiation/batching"). First call
-//! [`Program::discharge_local_references`], then use the ordinary transform: [`Program::jvp`] or
-//! [`Program::linearize`] for forward mode, [`Pullback`](crate::Pullback) obtained from the linearization for reverse
+//! [`Program::discharge_local_references`](crate::Program::discharge_local_references), then use the ordinary transform:
+//! [`Program::jvp`](crate::Program::jvp) or [`Program::linearize`](crate::Program::linearize) for forward mode,
+//! [`Pullback`](crate::Pullback) obtained from the linearization for reverse
 //! mode, [`Program::batched_with_threaded_extent`](crate::Program::batched_with_threaded_extent) for batching,
-//! [`Program::partially_evaluate`] for partial evaluation, and
+//! [`Program::partially_evaluate`](crate::Program::partially_evaluate) for partial evaluation, and
 //! [`Program::rematerialize_with_local_references`](crate::Program::rematerialize_with_local_references) for
 //! rematerialization, which composes the discharge itself.
 //!
@@ -156,7 +159,8 @@
 //! # Discharge Policy
 //!
 //! [`ArrayReferenceDischarge`] is this universe's [`ReferenceDischargePolicy`], and it is what
-//! [`Program::discharge_references_with_policy`] threads: its referent is an [`ArrayType`]-typed array and its alias
+//! [`Program::discharge_references`](crate::Program::discharge_references) threads: its referent is an
+//! [`ArrayType`]-typed array and its alias
 //! is the composed [`ArrayReferenceView`] mapping an allocation to one handle's coordinates. Staged and eager reference
 //! semantics cannot drift apart, because both reach their coordinates through the one [`ArrayReferenceView`]
 //! traversal — the eager handles through a value carrier, the policy through a destination-context carrier.
@@ -168,147 +172,12 @@ use crate::arrays::reference_views::{ArrayReferenceView, ViewReadCarrier, ViewWr
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::Shape;
 use crate::arrays::types::ir::ArrayIrType;
-use crate::captures::{CaptureConstant, ClosedProgram};
 use crate::contexts::Context;
 use crate::macros::check_count;
 use crate::operations::{AddOperation, ReshapeOperation, SliceOperation, UpdateSliceOperation};
-use crate::parameters::Parameterized;
 use crate::programs::{
-    PartialReferenceDischargeResult, Program, ProgramError, ReferenceAccumulationPolicy, ReferenceDischargePolicy,
-    ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeableOperation, Typed, Value,
+    ProgramError, ReferenceAccumulationPolicy, ReferenceDischargePolicy, ReferenceDischargeableType, Typed,
 };
-use crate::tracing::TracingContext;
-
-impl<V, O> Program<V, O, Vec<V>, Vec<V>>
-where
-    V: Value<Type = ArrayIrType>,
-    O: ArrayReferenceViewOperation + ReferenceDischargeableOperation<TracingContext<V, O>, ArrayReferenceDischarge>,
-{
-    /// Discharges every array reference and returns the reference-free program together with its external-state
-    /// bindings.
-    ///
-    /// This is the array universe's policy-selecting entry point. It applies [`ArrayReferenceDischarge`] and therefore
-    /// avoids requiring callers to name the policy used to lower array reference views.
-    ///
-    /// # Parameters
-    ///
-    ///   - `capture_count`: Number of leading flat inputs that originated in the source program's capture table.
-    #[inline]
-    pub fn discharge_references(self, capture_count: usize) -> Result<ReferenceDischargeResult<V, O>, ProgramError> {
-        self.discharge_references_with_policy::<ArrayReferenceDischarge>(capture_count)
-    }
-
-    /// Discharges every local array reference for `transform` and rejects caller-owned external allocations.
-    ///
-    /// A successful result contains no reference types or unresolved ordered reference state. Because local
-    /// allocations require no state to cross the caller boundary, the returned program preserves the source program's
-    /// public input and output boundary.
-    ///
-    /// # Parameters
-    ///
-    ///   - `capture_count`: Number of leading flat inputs that originated in the source program's capture table.
-    ///   - `transform`: Name used in diagnostics when caller-owned state prevents the transform.
-    pub fn discharge_local_references(
-        self,
-        capture_count: usize,
-        transform: &'static str,
-    ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> {
-        let discharged = self.discharge_references(capture_count)?;
-        if let Some(state) = discharged.external_states().first() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "{transform} supports only local references, but the program uses external `{}`",
-                    state.source(),
-                ),
-            });
-        }
-        let (program, _, _, _) = discharged.into_parts();
-        Ok(program)
-    }
-}
-
-impl<V, O> Program<V, O, Vec<V>, Vec<V>>
-where
-    V: Value<Type = ArrayIrType>,
-    O: ArrayReferenceViewOperation + ReferenceDischargeableOperation<TracingContext<V, O>, ArrayReferenceDischarge>,
-{
-    /// Discharges the selected array reference targets and preserves every other one, returning the mixed program
-    /// together with the external-state bindings of the allocations that became state.
-    ///
-    /// This is the array universe's form of [`Program::partially_discharge_references_with_policy`], which documents
-    /// the rewrite; [`Program::discharge_references`] is its everything-selected case. A preserved array
-    /// allocation keeps its reference-typed boundary position or its `reference_new` instruction, every access to it replays
-    /// verbatim, and a view derived from it replays its `reference_index` or `reference_slice` step, so the surviving
-    /// half of the program still denotes the same coordinates. Selected allocations thread as immutable array state exactly
-    /// as in full discharge, including the canonical slice, reshape, and update-slice reconstruction their views
-    /// lower to.
-    ///
-    /// A preserved reference crosses a condition, loop, scan, or call boundary as the reference it already is, at its own
-    /// declared operand position, so the rewritten operation threads discharged state and surviving references side by
-    /// side; only the discharged half widens. A preserved reference may also be consumed, which full discharge rejects for
-    /// a caller-owned allocation: the program keeps the `reference_freeze`, so the caller passes its reference to that
-    /// operation instead of to a state binding. A capture-lifted program has no partial form, and keeps using
-    /// [`Program::discharge_references_with_lifted_captures`].
-    ///
-    /// # Parameters
-    ///
-    ///   - `capture_count`: Number of leading flat inputs that originated in the source program's capture table.
-    ///   - `targets`: Reference targets to discharge, enumerated from this same program through
-    ///     [`Program::reference_discharge_targets`]. Every other allocation is preserved.
-    #[inline]
-    pub fn partially_discharge_references(
-        self,
-        capture_count: usize,
-        targets: &[ReferenceDischargeTarget],
-    ) -> Result<PartialReferenceDischargeResult<V, O>, ProgramError> {
-        self.partially_discharge_references_with_policy::<ArrayReferenceDischarge>(capture_count, targets)
-    }
-}
-
-impl<V, O> Program<V, O, Vec<V>, Vec<V>>
-where
-    V: CaptureConstant<Type = ArrayIrType>,
-    O: ArrayReferenceViewOperation + ReferenceDischargeableOperation<TracingContext<V, O>, ArrayReferenceDischarge>,
-{
-    /// Consumes a program whose captures were lifted into its leading inputs while attached regions may still contain
-    /// capture-reference constants naming that prefix.
-    ///
-    /// This is the program-level form of [`ClosedProgram::discharge_references`]. Capture constants resolve against
-    /// the lifted entry prefix, or against the nested capture prefix of an enclosing call, through the discharge
-    /// context's capture scope; discharge then threads their immutable array state across every enclosing
-    /// structured boundary.
-    ///
-    /// # Parameters
-    ///
-    ///   - `capture_count`: Number of leading flat inputs that originated in the source program's capture table.
-    #[inline]
-    pub fn discharge_references_with_lifted_captures(
-        self,
-        capture_count: usize,
-    ) -> Result<ReferenceDischargeResult<V, O>, ProgramError> {
-        self.discharge_references_with_lifted_captures_and_policy::<ArrayReferenceDischarge>(capture_count)
-    }
-}
-
-impl<Capture, V, O, Input, Output> ClosedProgram<Capture, V, O, Input, Output>
-where
-    Capture: Value<Type = ArrayIrType>,
-    V: CaptureConstant<Type = ArrayIrType>,
-    O: ArrayReferenceViewOperation + ReferenceDischargeableOperation<TracingContext<V, O>, ArrayReferenceDischarge>,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
-{
-    /// Lifts this closed program's captures and discharges every reachable array reference.
-    ///
-    /// The returned logical metadata continues to identify capture slots separately from inputs. Concrete
-    /// capture values remain owned by this [`ClosedProgram`]; discharge never embeds their mutable contents into the
-    /// derived program.
-    pub fn discharge_references(&self) -> Result<ReferenceDischargeResult<V, O>, ProgramError> {
-        let capture_count = self.captures().len();
-        let program = self.to_program_with_lifted_captures()?;
-        program.discharge_references_with_lifted_captures(capture_count)
-    }
-}
 
 /// [`ReferenceDischargePolicy`] of the array reference universe.
 ///
@@ -324,6 +193,10 @@ where
 /// them through the destination operation family's own construction seam.
 #[derive(Copy, Clone, Debug)]
 pub struct ArrayReferenceDischarge;
+
+impl ReferenceDischargeableType for ArrayIrType {
+    type Policy = ArrayReferenceDischarge;
+}
 
 impl<C: Context<Type = ArrayIrType>> ReferenceDischargePolicy<C> for ArrayReferenceDischarge
 where
@@ -461,18 +334,18 @@ mod tests {
     use crate::arrays::reference_views::{ArrayReference, ArrayReferenceView, ArrayReferenceViewTransform};
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
-    use crate::captures::CaptureReference;
+    use crate::captures::{CaptureReference, ClosedProgram};
     use crate::contexts::EagerContext;
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::{ConditionOperation, ScanOperation, WhileOperation};
     use crate::parameters::Placeholder;
     use crate::programs::{
-        Effects, ExternalReferenceBinding, Instruction, InstructionId, Operation, OutputRegionProvenance,
+        Effects, ExternalReferenceBinding, Instruction, InstructionId, Operation, OutputRegionProvenance, Program,
         ProgramBuilder, ReferenceAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver,
-        ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceNewOperation,
-        ReferenceOperationSemantics, ReferenceReadOperation, ReferenceSource, ReferenceSwapOperation, ReferenceType,
-        ReferenceWriteOperation, RegionInterface, RegionSlot, TypeError, discharge_positional_region_operation,
-        discharge_reference_free_operation,
+        ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceFreezeOperation,
+        ReferenceNewOperation, ReferenceOperationSemantics, ReferenceReadOperation, ReferenceSource,
+        ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, RegionInterface, RegionSlot, TypeError,
+        discharge_positional_region_operation, discharge_reference_free_operation,
     };
     use crate::tracing::{Trace, Tracer, TracingContext};
 
@@ -691,7 +564,7 @@ mod tests {
             .unwrap();
         // The minted allocation identity is process-local, so the assertion pins the diagnostic up to that coordinate.
         assert!(matches!(
-            source.discharge_references_with_policy::<ArrayReferenceDischarge>(0),
+            source.discharge_references(0),
             Err(ProgramError::MalformedProgram(message))
                 if message.starts_with("reference discharge accessed consumed reference allocation "),
         ));
@@ -723,7 +596,7 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert!(matches!(
-            source.discharge_references_with_policy::<ArrayReferenceDischarge>(0),
+            source.discharge_references(0),
             Err(ProgramError::MalformedProgram(message)) if message.ends_with(
                 "through the derived view `ref<f32[2]>`; consumption yields the complete stored value, whose referent is \
                  `f32[4]`",
@@ -766,7 +639,7 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![selected], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         assert!(matches!(
-            source.discharge_references_with_policy::<ArrayReferenceDischarge>(0),
+            source.discharge_references(0),
             Err(ProgramError::MalformedProgram(message)) if message.ends_with(
                 "across a region boundary, which carries the complete stored value `ref<f32[4]>`; derive the view inside the \
                  region instead",
@@ -783,7 +656,7 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
-            source.discharge_references_with_policy::<ArrayReferenceDischarge>(0).unwrap_err(),
+            source.discharge_references(0).unwrap_err(),
             ProgramError::MalformedProgram(
                 "reference discharge consumed external input 0, whose state must remain owned by the caller"
                     .to_string(),
@@ -797,7 +670,7 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![input], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
-            source.discharge_references_with_policy::<ArrayReferenceDischarge>(2).unwrap_err(),
+            source.discharge_references(2).unwrap_err(),
             ProgramError::MalformedProgram(
                 "reference discharge requests 2 captures but the program has 1 inputs".to_string(),
             ),
@@ -2288,7 +2161,7 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            source.discharge_references_with_policy::<ArrayReferenceDischarge>(0),
+            source.discharge_references(0),
             Err(ProgramError::MalformedProgram(message))
                 if message.ends_with("whose caller did not thread that allocation"),
         ));

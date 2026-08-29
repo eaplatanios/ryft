@@ -47,20 +47,19 @@
 //!
 //! # Using Reference Discharge
 //!
-//! Callers normally invoke
-//! [`Program::discharge_references_with_policy`](crate::Program::discharge_references_with_policy) to
-//! eliminate every reference, or
-//! [`Program::partially_discharge_references_with_policy`](crate::Program::partially_discharge_references_with_policy)
-//! when selected allocations should become explicit state while
+//! Callers normally invoke [`Program::discharge_references`](crate::Program::discharge_references) to eliminate every
+//! reference, or [`Program::partially_discharge_references`](crate::Program::partially_discharge_references) when
+//! selected allocations should become explicit state while
 //! other allocations remain references. The full entry point returns a [`ReferenceDischargeResult`], whose program is
 //! proven reference-free. The partial entry point returns a [`PartialReferenceDischargeResult`], which describes only
 //! the discharged references and can be converted into a full result after proving that no references remain. Generic
 //! array transforms that accept only local references use [`Program::discharge_local_references`].
 //!
-//! A reference universe participates by implementing [`ReferenceDischargePolicy`] and, when supported,
-//! [`ReferenceAccumulationPolicy`]. Each operation implements [`ReferenceDischargeableOperation`] to rewrite its own
-//! reference effects. Region-free operations can delegate to [`discharge_reference_free_operation`]; structured
-//! operations use [`ReferenceDischargeDriver`], [`ReferenceRegionSummary`], and
+//! A reference universe participates by implementing [`ReferenceDischargePolicy`], selecting that policy through
+//! [`ReferenceDischargeableType`], and, when supported, implementing [`ReferenceAccumulationPolicy`]. Each operation
+//! implements [`ReferenceDischargeableOperation`] to rewrite its own reference effects. Region-free operations can
+//! delegate to [`discharge_reference_free_operation`]; structured operations use [`ReferenceDischargeDriver`],
+//! [`ReferenceRegionSummary`], and
 //! [`ReferenceRegionDischargeBoundary`] to rebuild attached regions with the necessary state positions.
 //!
 //! # Full and Partial Discharge
@@ -157,7 +156,7 @@ pub use interpreter::{
     ReferenceRegionStateInsertion, ReferenceRegionSummary, ReferenceStateWidening,
     discharge_positional_region_operation, discharge_preserved_access, discharge_reference_free_operation,
 };
-pub use policies::{ReferenceAccumulationPolicy, ReferenceDischargePolicy};
+pub use policies::{ReferenceAccumulationPolicy, ReferenceDischargePolicy, ReferenceDischargeableType};
 pub use results::{
     ExternalReferenceBinding, PartialReferenceDischargeResult, ReferenceDischargeResult, ReferenceSource,
 };
@@ -559,6 +558,10 @@ pub(crate) mod tests {
     /// Reference discharge policy of the prototype universe.
     #[derive(Copy, Clone, Debug)]
     pub(crate) struct ListReferenceDischarge;
+
+    impl ReferenceDischargeableType for ListIrType {
+        type Policy = ListReferenceDischarge;
+    }
 
     // The policy leaves the destination value generic and reaches its alias mechanics through the operation family,
     // which is what one implementation must do to serve both the eager destination this universe's own tests use and

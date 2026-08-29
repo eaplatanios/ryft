@@ -266,8 +266,7 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![frozen], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        let preserved =
-            source.clone().partially_discharge_references_with_policy::<TestReferenceDischarge>(0, &[]).unwrap();
+        let preserved = source.clone().partially_discharge_references(0, &[]).unwrap();
         assert_eq!(preserved.output_count(), 1);
         assert_eq!(preserved.external_states(), &[]);
         assert_eq!(
@@ -284,11 +283,11 @@ mod tests {
         let targets = source.reference_discharge_targets(0).unwrap();
         let selected = source
             .clone()
-            .partially_discharge_references_with_policy::<TestReferenceDischarge>(0, targets.as_slice())
+            .partially_discharge_references(0, targets.as_slice())
             .unwrap()
             .try_into_full()
             .unwrap();
-        let full = source.discharge_references_with_policy::<TestReferenceDischarge>(0).unwrap();
+        let full = source.discharge_references(0).unwrap();
         assert_eq!(selected.program().to_string(), full.program().to_string());
         assert_eq!(
             full.program().to_string(),

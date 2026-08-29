@@ -1409,9 +1409,8 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::arrays::{
-        Array, ArrayBatch, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReferenceDischarge, DataType,
-        Dimension, DimensionBounds, DimensionType, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape,
-        Sharding, ShardingDimension,
+        Array, ArrayBatch, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds,
+        DimensionType, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
     use crate::captures::CaptureReference;
@@ -2579,7 +2578,7 @@ mod tests {
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![value], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let discharged = source.discharge_references_with_policy::<ArrayReferenceDischarge>(0).unwrap();
+        let discharged = source.discharge_references(0).unwrap();
         assert_eq!(
             discharged.program().to_string(),
             indoc! {"
@@ -2639,7 +2638,7 @@ mod tests {
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![value], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
-        let discharged = source.discharge_references_with_policy::<ArrayReferenceDischarge>(0).unwrap();
+        let discharged = source.discharge_references(0).unwrap();
         assert_eq!(
             discharged.program().to_string(),
             indoc! {"
@@ -2702,7 +2701,7 @@ mod tests {
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![value], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
-        let discharged = source.discharge_references_with_policy::<ArrayReferenceDischarge>(0).unwrap();
+        let discharged = source.discharge_references(0).unwrap();
         assert_eq!(discharged.output_count(), 1);
         assert_eq!(discharged.external_states().len(), 2);
         assert_eq!(discharged.external_states()[0].output_index(), None);

@@ -43,7 +43,7 @@ use std::marker::PhantomData;
 
 use thiserror::Error;
 
-use crate::arrays::{ArrayIrType, ArrayReferenceDischarge, ArrayReferenceViewOperation, ArrayType, Memory};
+use crate::arrays::{ArrayType, Memory};
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
     ProgramBatchingOutputAxesPolicy,
@@ -60,8 +60,8 @@ use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{
     Atom, AtomId, InstructionId, Operation, OperationFormatter, Program, ProgramBuilder, ProgramError,
-    ReferenceDischargeableOperation, Region, RegionId, RegionInterface, RegionSlot, Type, TypeError, Typed, Value,
-    ValueId,
+    ReferenceDischargePolicy, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceType, Region,
+    RegionId, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueId,
 };
 use crate::tracing::{DomainTracer, Trace, TracingContext};
 
@@ -1979,8 +1979,25 @@ where
 
 impl<V, O> Program<V, O, Vec<V>, Vec<V>>
 where
-    V: Value<Type = ArrayIrType>,
-    O: ArrayReferenceViewOperation + ReferenceDischargeableOperation<TracingContext<V, O>, ArrayReferenceDischarge>,
+    V: Value,
+    V::Type: ReferenceDischargeableType,
+    <V::Type as ReferenceDischargeableType>::Policy: ReferenceDischargePolicy<TracingContext<V, O>>,
+    O: Operation<Type = V::Type>
+        + ReferenceDischargeableOperation<TracingContext<V, O>, <V::Type as ReferenceDischargeableType>::Policy>,
+    V::Type: From<
+            <<V::Type as ReferenceDischargeableType>::Policy as ReferenceDischargePolicy<
+                TracingContext<V, O>,
+            >>::Referent,
+        > + From<
+            ReferenceType<
+                <<V::Type as ReferenceDischargeableType>::Policy as ReferenceDischargePolicy<
+                    TracingContext<V, O>,
+                >>::Referent,
+            >,
+        >,
+    for<'t> &'t ReferenceType<
+        <<V::Type as ReferenceDischargeableType>::Policy as ReferenceDischargePolicy<TracingContext<V, O>>>::Referent,
+    >: TryFrom<&'t V::Type>,
 {
     /// Builds a rematerialized flat-vector function after discharging every local reference into immutable state.
     /// External reference inputs and reference captures are rejected because rematerialization has no caller-visible
