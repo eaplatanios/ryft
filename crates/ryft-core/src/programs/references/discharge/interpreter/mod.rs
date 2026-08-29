@@ -106,12 +106,12 @@ enum ReferenceAllocationState<V> {
 /// declares one through [`Operation::region_capture_input_count`].
 ///
 /// Recognizing a capture is a *constant-family* question, and the interpreter deliberately serves families that are
-/// not capture-bearing at all, so the seam is a function pointer supplied by the entry point that knows the family
+/// not capture-bearing at all, so the resolver is a function pointer supplied by the entry point that knows the family
 /// rather than a [`CaptureConstant`] bound on the whole architecture. The [`Default`] scope recognizes nothing and
 /// binds nothing, which is exactly the behavior of a program that has no captures.
 pub(super) struct ReferenceCaptureScope<Constant> {
     /// Capture position a constant names, or [`None`] when it is an ordinary constant of its family.
-    capture_index: fn(&Constant) -> Option<usize>,
+    capture_index_of: fn(&Constant) -> Option<usize>,
 
     /// Allocation each capture position binds, or [`None`] when that position carries an ordinary value rather than a
     /// reference. A capture position past the end of this list binds nothing.
@@ -123,14 +123,14 @@ impl<Constant> ReferenceCaptureScope<Constant> {
     ///
     /// # Parameters
     ///
-    ///   - `capture_index`: Seam reporting the capture position a constant of this family names.
+    ///   - `capture_index_of`: Function reporting the capture position a constant of this family names.
     ///   - `allocations`: Allocation each capture position binds, in capture order.
     #[inline]
     pub(super) fn new(
-        capture_index: fn(&Constant) -> Option<usize>,
+        capture_index_of: fn(&Constant) -> Option<usize>,
         allocations: Vec<Option<ReferenceAllocationHandle>>,
     ) -> Self {
-        Self { capture_index, allocations: allocations.into() }
+        Self { capture_index_of, allocations: allocations.into() }
     }
 
     /// Returns the allocation each capture position binds, in capture order.
@@ -144,28 +144,28 @@ impl<Constant> ReferenceCaptureScope<Constant> {
     /// reference-typed one that no scope resolves is rejected where it is lifted.
     #[inline]
     fn resolve(&self, constant: &Constant) -> Option<ReferenceAllocationHandle> {
-        (self.capture_index)(constant).and_then(|index| self.allocations.get(index).copied().flatten())
+        (self.capture_index_of)(constant).and_then(|index| self.allocations.get(index).copied().flatten())
     }
 
-    /// Returns this scope's seam over a different set of bound allocations, which is how a nested region's scope and a
+    /// Returns this scope's resolver over a different set of bound allocations, which is how a nested region's scope and a
     /// region fork's remapped scope are built without restating the constant family's recognition rule.
     #[inline]
     fn with_allocations(&self, allocations: Vec<Option<ReferenceAllocationHandle>>) -> Self {
-        Self { capture_index: self.capture_index, allocations: allocations.into() }
+        Self { capture_index_of: self.capture_index_of, allocations: allocations.into() }
     }
 }
 
 impl<Constant> Default for ReferenceCaptureScope<Constant> {
     #[inline]
     fn default() -> Self {
-        Self { capture_index: |_| None, allocations: Rc::from([]) }
+        Self { capture_index_of: |_| None, allocations: Rc::from([]) }
     }
 }
 
 impl<Constant> Clone for ReferenceCaptureScope<Constant> {
     #[inline]
     fn clone(&self) -> Self {
-        Self { capture_index: self.capture_index, allocations: Rc::clone(&self.allocations) }
+        Self { capture_index_of: self.capture_index_of, allocations: Rc::clone(&self.allocations) }
     }
 }
 

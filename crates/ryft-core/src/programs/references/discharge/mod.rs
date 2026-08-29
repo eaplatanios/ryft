@@ -52,8 +52,9 @@
 //! selected allocations should become explicit state while
 //! other allocations remain references. The full entry point returns a [`ReferenceDischargeResult`], whose program is
 //! proven reference-free. The partial entry point returns a [`PartialReferenceDischargeResult`], which describes only
-//! the discharged references and can be converted into a full result after proving that no references remain. Generic
-//! array transforms that accept only local references use [`Program::discharge_local_references`].
+//! the discharged references and can be converted into a full result after proving that no references remain. A
+//! caller that needs a bare program with no caller-owned reference bindings converts a full result through
+//! [`ReferenceDischargeResult::into_program_without_external_references`].
 //!
 //! A reference universe participates by implementing [`ReferenceDischargePolicy`], selecting that policy through
 //! [`ReferenceDischargeableType`], and, when supported, implementing [`ReferenceAccumulationPolicy`]. Each operation

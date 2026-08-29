@@ -599,14 +599,16 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         Ok(threaded)
     }
 
-    /// Computes the symmetric widening facts one structured rule needs from a region summary: the threaded allocations, the
-    /// subset entering as added state because no declared position already carries them, and the subset whose
-    /// successor states the rebuilt regions must publish.
+    /// Computes the symmetric widening facts one structured rule needs from a region summary: the discharged
+    /// allocations threaded as state, every reached allocation gaining an added boundary position because no declared
+    /// position already carries it, and the discharged subset whose successor states the rebuilt regions must publish.
+    /// An added preserved allocation crosses as the destination reference it already denotes rather than as state.
     ///
     /// # Parameters
     ///
     ///   - `summary`: Summary of the closures the rewritten operation attaches, in caller-allocation terms.
-    ///   - `declared`: Allocations already crossing at declared boundary positions, which therefore need no added state.
+    ///   - `declared`: Allocations already crossing at declared boundary positions, which therefore need no added
+    ///     position.
     ///   - `operation`: Name of the operation being rewritten, used in the diagnostic.
     ///
     /// # Errors
@@ -619,7 +621,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         operation: &str,
     ) -> Result<ReferenceStateWidening, ProgramError> {
         let threaded = self.threaded_state_allocations(summary, operation)?;
-        let entering = threaded.difference(declared).copied().collect();
+        let entering = summary.reached().filter(|allocation| !declared.contains(allocation)).collect();
         let published = threaded.iter().copied().filter(|allocation| summary.is_mutated(*allocation)).collect();
         Ok(ReferenceStateWidening { threaded, entering, published })
     }
@@ -665,6 +667,16 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
                 Ok(value.clone())
             }
         }
+    }
+
+    /// Returns the destination value one live allocation contributes to a rewritten boundary: its current immutable
+    /// state when discharged, or its destination reference when preserved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when `allocation` is not live in this environment.
+    pub fn allocation_value(&self, allocation: ReferenceAllocationHandle) -> Result<C::Value, ProgramError> {
+        self.operand_value(&self.allocation_handle(allocation)?)
     }
 }
 
@@ -967,7 +979,7 @@ mod tests {
         );
 
         // The rebuilt region therefore receives the allocation's entering state and hands it to its own callee.
-        let regions = [program];
+        let regions = [program.clone()];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let boundary = ReferenceRegionDischargeBoundary::new(
             &ListOperation::Call,
@@ -990,5 +1002,35 @@ mod tests {
                 in (%2)"},
         );
         assert_eq!(fork.mutated_allocations, []);
+
+        // The same reached capture remains an entering boundary allocation when partial discharge preserves it. It
+        // leaves the state-threaded and published sets empty because it crosses as its destination reference instead.
+        let preserved_context = ListDischargeContext::new(ListDestination::new());
+        let preserved = preserved_context
+            .bind_preserved(
+                ReferenceType::new(ListType { length: 2 }),
+                ListIrValue::Reference(ReferenceType::new(ListType { length: 2 })),
+            )
+            .unwrap();
+        let preserved_allocation =
+            preserved.expect_reference("the preserved captured allocation").unwrap().allocation();
+        let preserved_context = preserved_context.with_captures(ReferenceCaptureScope::new(
+            list_capture_position,
+            vec![None, None, Some(preserved_allocation)],
+        ));
+        let preserved_summary = preserved_context
+            .region_summary(
+                &SingleModeRegionOperation(ReferenceAccessMode::Write),
+                0,
+                program.entry_region_ref(),
+                &[None],
+            )
+            .unwrap();
+        let widening = preserved_context
+            .state_widening(&preserved_summary, &BTreeSet::new(), "test.single_mode_region")
+            .unwrap();
+        assert_eq!(widening.threaded(), &BTreeSet::new());
+        assert_eq!(widening.entering(), &[preserved_allocation]);
+        assert_eq!(widening.published(), &[]);
     }
 }

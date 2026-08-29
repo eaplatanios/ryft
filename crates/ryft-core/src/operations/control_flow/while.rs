@@ -933,8 +933,10 @@ where
 // the condition's. The one asymmetry is forced by the operation's own contract — the condition returns only a
 // predicate, so it receives the entering state and publishes none, which is also why a mutating condition is rejected
 // rather than widened. A carry that partial reference discharge *preserved* keeps its declared position on every one
-// of those boundaries and widens nothing at all: it enters as the reference the caller already holds, its accesses
-// replay inside the regions as the operations the source performed, and it publishes no successor.
+// of those boundaries and widens nothing at all. A preserved allocation reached only through an inherited capture
+// gains a reference-typed carry so the rebuilt regions can bind that capture; in either case it enters as the reference
+// the caller already holds, its accesses replay as the operations the source performed, and it publishes no state
+// successor.
 impl<T, C, P> ReferenceDischargeableOperation<C, P> for WhileOperation<T>
 where
     T: Type,
@@ -966,8 +968,8 @@ where
 
         // An allocation the body returns is threaded even if the body never accesses it, so that a boundary the loop's fixed
         // point requires is reported as a broken fixed point rather than as a reference the rebuilt body cannot
-        // resolve. The widening excludes the carries that survive as references: those occupy their declared carry
-        // positions as the references they already are.
+        // resolve. A preserved reference already in the carry list stays at its declared position; one reached only
+        // through a capture gains a reference-typed carry rather than a state carry.
         let carried = carries.iter().copied().flatten().collect::<BTreeSet<_>>();
         let widening = context.state_widening(&summary, &carried, name)?;
         let entering = widening.entering().to_vec();
@@ -1015,7 +1017,7 @@ where
             operands.push(context.operand_value(input)?);
         }
         for allocation in &entering {
-            operands.push(context.discharged_state(*allocation)?);
+            operands.push(context.allocation_value(*allocation)?);
         }
         let outputs = context.parent().bind(
             *self,

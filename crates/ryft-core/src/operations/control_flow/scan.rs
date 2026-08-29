@@ -1700,7 +1700,9 @@ where
 // Everything after the prefix is a stacked operand or a per-iteration slice of one and is therefore never a reference.
 // Like `while`, a scan applies no read-only pruning, because a carry position exists in both boundaries or in neither.
 // A carry that partial reference discharge *preserved* stays a declared carry: it keeps its position and its reference
-// type on both boundaries, its accesses replay inside the body, and it publishes no successor.
+// type on both boundaries, its accesses replay inside the body, and it publishes no successor. A preserved allocation
+// reached only through an inherited capture gains the same kind of reference-typed carry so the rebuilt body can bind
+// that capture without turning it into state.
 impl<Capture, C, P> ReferenceDischargeableOperation<C, P> for ScanOperation<Capture>
 where
     Capture: Value,
@@ -1746,8 +1748,8 @@ where
 
         // An allocation the body returns is threaded even if the body never accesses it, so that a boundary the loop's fixed
         // point requires is reported as a broken fixed point rather than as a reference the rebuilt body cannot
-        // resolve. The widening excludes the carries that survive as references: those occupy their declared carry
-        // positions as the references they already are.
+        // resolve. A preserved reference already in the carry list stays at its declared position; one reached only
+        // through a capture gains a reference-typed carry rather than a state carry.
         let carried = carries.iter().copied().flatten().collect::<BTreeSet<_>>();
         let widening = context.state_widening(&summary, &carried, name)?;
         let entering = widening.entering().to_vec();
@@ -1784,7 +1786,7 @@ where
             operands.push(context.operand_value(input)?);
         }
         for allocation in &entering {
-            operands.push(context.discharged_state(*allocation)?);
+            operands.push(context.allocation_value(*allocation)?);
         }
         for (position, input) in stacked_operands.iter().enumerate() {
             operands.push(

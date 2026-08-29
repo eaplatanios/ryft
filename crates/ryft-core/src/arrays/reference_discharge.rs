@@ -47,7 +47,9 @@
 //!
 //! Representative supported compositions are shown below. The transforms themselves reject reference operations
 //! outright ("must be discharged before differentiation/batching"). First call
-//! [`Program::discharge_local_references`](crate::Program::discharge_local_references), then use the ordinary transform:
+//! [`Program::discharge_references`](crate::Program::discharge_references), convert the result through
+//! [`crate::ReferenceDischargeResult::into_program_without_external_references`],
+//! and then use the ordinary transform:
 //! [`Program::jvp`](crate::Program::jvp) or [`Program::linearize`](crate::Program::linearize) for forward mode,
 //! [`Pullback`](crate::Pullback) obtained from the linearization for reverse
 //! mode, [`Program::batched_with_threaded_extent`](crate::Program::batched_with_threaded_extent) for batching,
@@ -63,12 +65,17 @@
 //! scan(inputs) { |input| state.add_update(input); read(state) }
 //!     -> explicit immutable state carries at every attached-region boundary
 //!
-//! let program = program.discharge_local_references(capture_count, "differentiation")?;
+//! let program = program
+//!     .discharge_references(capture_count)?
+//!     .into_program_without_external_references()?;
 //! program.jvp()?                                  // state = reference_new(x); state.add_update(x); freeze(state)
 //! program.linearize()?.pullback()
 //!     -> discharge local state -> differentiate the reference-free program
 //!
-//! program.discharge_local_references(capture_count, "batching")?.batched_with_threaded_extent(...)
+//! program
+//!     .discharge_references(capture_count)?
+//!     .into_program_without_external_references()?
+//!     .batched_with_threaded_extent(...)
 //!     -> discharge local state -> batch independent immutable state-passing programs
 //! ```
 //!
@@ -1841,7 +1848,7 @@ mod tests {
     }
 
     #[test]
-    fn test_array_reference_discharge_local_references() {
+    fn test_array_reference_discharge_converts_only_without_external_references() {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = builder.add_input(ReferenceType::new(scalar_type()).into());
         let output =
@@ -1850,19 +1857,24 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        // The shared local-only gate names the requesting transform together with the caller-owned boundary source.
         // Public arguments and captures are both external: neither boundary supplies the runtime ownership needed for
-        // final-state write-back.
+        // final-state write-back after the binding metadata has been discarded.
         assert!(matches!(
-            external.clone().discharge_local_references(0, "differentiation"),
+            external
+                .clone()
+                .discharge_references(0)
+                .unwrap()
+                .into_program_without_external_references(),
             Err(ProgramError::UnsupportedOperation { message })
-                if message == "differentiation supports only local references, but the program uses external \
-                    `input 0`",
+                if message == "reference discharge cannot discard the binding for external `input 0`",
         ));
         assert!(matches!(
-            external.discharge_local_references(1, "batching"),
+            external
+                .discharge_references(1)
+                .unwrap()
+                .into_program_without_external_references(),
             Err(ProgramError::UnsupportedOperation { message })
-                if message == "batching supports only local references, but the program uses external `capture 0`",
+                if message == "reference discharge cannot discard the binding for external `capture 0`",
         ));
 
         // A program that allocates every allocation itself passes the gate with its boundary unchanged, because hidden
@@ -1880,7 +1892,7 @@ mod tests {
         let local = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let discharged = local.discharge_local_references(0, "rematerialization").unwrap();
+        let discharged = local.discharge_references(0).unwrap().into_program_without_external_references().unwrap();
         assert_eq!(discharged.output_count(), 1);
         assert!(discharged.effects().is_pure());
         assert_eq!(discharged.interpret(vec![scalar(3.0)]), Ok(vec![scalar(6.0)]));

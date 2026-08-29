@@ -123,19 +123,19 @@ where
         let source_input_types = region.input_types();
         let source_input_count = source_input_types.len();
         let source_output_count = region.output_ids().len();
-        if boundary.state_input_insertion() > source_input_count {
+        if boundary.input_insertion() > source_input_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "reference discharge inserts region state inputs at {} but region `{}` declares {source_input_count} \
              inputs",
-                boundary.state_input_insertion(),
+                boundary.input_insertion(),
                 region.id(),
             )));
         }
-        if boundary.state_output_insertion() > source_output_count {
+        if boundary.output_insertion() > source_output_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "reference discharge inserts region state outputs at {} but region `{}` declares {source_output_count} \
              outputs",
-                boundary.state_output_insertion(),
+                boundary.output_insertion(),
                 region.id(),
             )));
         }
@@ -144,11 +144,11 @@ where
         // operation declares, so a state input placed before the end of it would silently renumber the captures the
         // rebound operation still names.
         let capture_input_count = boundary.capture_input_count().unwrap_or(0);
-        if boundary.state_input_insertion() < capture_input_count {
+        if boundary.input_insertion() < capture_input_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "reference discharge inserts region state inputs at {} but region `{}` declares a capture prefix of \
              {capture_input_count}",
-                boundary.state_input_insertion(),
+                boundary.input_insertion(),
                 region.id(),
             )));
         }
@@ -214,7 +214,7 @@ where
             // allocation occupies an added position only when an inherited capture is returned without a declared operand.
             let mut declared = Vec::with_capacity(source_input_count);
             for position in 0..=source_input_count {
-                if position == boundary.state_input_insertion() {
+                if position == boundary.input_insertion() {
                     for allocation in boundary.added_input_allocations() {
                         thread(*allocation)?;
                     }
@@ -286,19 +286,18 @@ where
             let outputs = discharge_region_instructions(&fork, region, declared)?;
             check_count!("output", outputs, source_output_count, ProgramError);
 
-            let mut output_ids =
-                Vec::with_capacity(source_output_count + boundary.added_state_output_allocations().len());
+            let mut output_ids = Vec::with_capacity(source_output_count + boundary.added_output_allocations().len());
             let mut output_allocations = Vec::with_capacity(source_output_count);
             for position in 0..=source_output_count {
-                if position == boundary.state_output_insertion() {
-                    for allocation in boundary.added_state_output_allocations() {
+                if position == boundary.output_insertion() {
+                    for allocation in boundary.added_output_allocations() {
                         let forked = caller_to_fork.get(allocation).copied().ok_or_else(|| {
                             ProgramError::MalformedProgram(format!(
                                 "reference discharge publishes {allocation} from region `{}` without threading it in",
                                 region.id(),
                             ))
                         })?;
-                        output_ids.push(fork.discharged_state(forked)?.atom_id()?);
+                        output_ids.push(fork.allocation_value(forked)?.atom_id()?);
                     }
                 }
                 let Some(output) = outputs.get(position) else {

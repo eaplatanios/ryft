@@ -45,6 +45,28 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeResult<V, O> {
         self.partial.external_states()
     }
 
+    /// Consumes this result and returns its program after verifying that the source program used no caller-owned
+    /// references.
+    ///
+    /// A full discharge is always reference-free, but it may still depend on immutable state supplied for an external
+    /// reference and may publish that reference's final state through a hidden output. A bare [`Program`] cannot
+    /// describe how a caller should supply and recover that state, so this conversion accepts only results whose
+    /// external binding list is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::UnsupportedOperation`] identifying the first caller-owned reference when this result
+    /// contains any external binding.
+    pub fn into_program_without_external_references(self) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> {
+        if let Some(binding) = self.external_states().first() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!("reference discharge cannot discard the binding for external `{}`", binding.source(),),
+            });
+        }
+        let (program, _, _, _) = self.into_parts();
+        Ok(program)
+    }
+
     /// Consumes this result and returns its program, capture count, public-output prefix, and external-state bindings.
     #[inline]
     pub fn into_parts(self) -> (Program<V, O, Vec<V>, Vec<V>>, usize, usize, Vec<ExternalReferenceBinding>) {
@@ -426,6 +448,33 @@ mod tests {
         assert_eq!(capture_count, 1);
         assert_eq!(output_count, 1);
         assert_eq!(external_states, bindings);
+    }
+
+    #[test]
+    fn test_reference_discharge_result_converts_only_without_external_references() {
+        let local = PartialReferenceDischargeResult::new(boundary_program(1, 1), 0, 1, Vec::new())
+            .unwrap()
+            .try_into_full()
+            .unwrap();
+        let program = local.into_program_without_external_references().unwrap();
+        assert_eq!(program.input_count(), 1);
+        assert_eq!(program.output_count(), 1);
+
+        let external = PartialReferenceDischargeResult::new(
+            boundary_program(1, 1),
+            0,
+            1,
+            vec![ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None)],
+        )
+        .unwrap()
+        .try_into_full()
+        .unwrap();
+        assert_eq!(
+            external.into_program_without_external_references().unwrap_err(),
+            ProgramError::UnsupportedOperation {
+                message: "reference discharge cannot discard the binding for external `input 0`".to_string(),
+            },
+        );
     }
 
     #[test]

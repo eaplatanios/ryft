@@ -2901,7 +2901,9 @@ mod tests {
         // Discharge turns the scan's mutated reference into an ordinary carry before partial evaluation runs, so an
         // unknown boundary residualizes the whole three-iteration loop as a pure reference-free program.
         let evaluation = source
-            .discharge_local_references(0, "partial evaluation")
+            .discharge_references(0)
+            .unwrap()
+            .into_program_without_external_references()
             .unwrap()
             .partially_evaluate(&[PartialValue::Unknown(array_type.into())])
             .unwrap();

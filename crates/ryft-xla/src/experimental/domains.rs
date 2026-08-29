@@ -3233,7 +3233,7 @@ impl<'c> XlaDomain<'c> {
         // Discharge the exact lifted program so attached-region capture references resolve against the same lexical
         // capture prefixes used during staging. Programs that actually contain references are cloned because
         // discharge consumes and rewrites them; the reference-free identity path above remains borrowed.
-        let discharged = program.clone().discharge_references_with_lifted_captures(capture_count)?;
+        let discharged = program.clone().discharge_references_in_capture_lifted_program(capture_count)?;
         self.lower_discharged_xla_program(&discharged, options)
     }
 

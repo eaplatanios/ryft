@@ -2487,11 +2487,11 @@ where
     /// axis is unnamed, mirroring the homogeneous entry, whose public batching contract has no named-axis parameter.
     ///
     /// Reference operations have no batching rules, so a program that still carries reference state is rejected by
-    /// the first reference operation the transform reaches. Discharge local reference state first through
-    /// [`Program::discharge_local_references`] with the `"batching"` consumer label, which also rejects external or
-    /// captured reference roots (batching one shared
-    /// mutable reference across batch items has no defined semantics). Ordinary non-reference captures remain valid
-    /// and keep their boundary positions.
+    /// the first reference operation the transform reaches. Discharge references first through
+    /// [`Program::discharge_references`], then call
+    /// [`crate::ReferenceDischargeResult::into_program_without_external_references`],
+    /// which rejects external or captured reference roots (batching one shared mutable reference across batch items has
+    /// no defined semantics). Ordinary non-reference captures remain valid and keep their boundary positions.
     ///
     /// # Parameters
     ///
@@ -5790,7 +5790,9 @@ mod tests {
         let axis_extent = DimensionValue::constant(2).unwrap();
         let extent_type = axis_extent.r#type().into_owned();
         let batched = program
-            .discharge_local_references(0, "batching")
+            .discharge_references(0)
+            .unwrap()
+            .into_program_without_external_references()
             .unwrap()
             .batched_with_threaded_extent(
                 extent_type,
@@ -5824,7 +5826,9 @@ mod tests {
         // both discharged branch states while the batched program stays pure and reference-free.
         let axis_extent = DimensionValue::constant(2).unwrap();
         let batched = program
-            .discharge_local_references(0, "batching")
+            .discharge_references(0)
+            .unwrap()
+            .into_program_without_external_references()
             .unwrap()
             .batched_with_threaded_extent(
                 axis_extent.r#type().into_owned(),

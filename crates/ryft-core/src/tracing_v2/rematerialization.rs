@@ -2024,7 +2024,7 @@ where
     where
         D: Context<Type = V::Type, Constant = V, Operation = O>,
     {
-        let program = self.discharge_local_references(capture_count, "rematerialization")?;
+        let program = self.discharge_references(capture_count)?.into_program_without_external_references()?;
         Ok(rematerialize(move |inputs: Vec<DomainTracer<D>>| {
             // `Rematerialize::call` rejects empty inputs before this body runs, so the context is always recoverable.
             let context = inputs.first().unwrap().context().clone();
@@ -4324,12 +4324,11 @@ mod tests {
             )
             .unwrap();
 
-        // External holders require runtime state plumbing that rematerialization does not own.
+        // Caller-owned references require runtime state plumbing that rematerialization does not own.
         assert!(matches!(
             external.rematerialize_with_local_references::<ReferenceTestContext>(0),
             Err(ProgramError::UnsupportedOperation { message })
-                if message == "rematerialization supports only local references, but the program uses external \
-                    `input 0`",
+                if message == "reference discharge cannot discard the binding for external `input 0`",
         ));
     }
 

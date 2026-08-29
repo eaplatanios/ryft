@@ -884,6 +884,7 @@ where
     JitCallOperation<T>: Operation<Type = C::Type>,
     C: Context<Operation: From<JitCallOperation<T>>>,
     P: ReferenceDischargePolicy<C>,
+    C::Type: From<P::Referent>,
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
         &self,
@@ -1352,7 +1353,7 @@ mod tests {
         DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, DynamicBroadcastOperation, Effects,
         EmptyRegionDriver, ExternalReferenceBinding, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation,
         Operation, OutputRegionProvenance, PartialValue, Placeholder, ProgramBuilder, ProgramError,
-        ReferenceAddUpdateOperation, ReferenceDischarge, ReferenceFreezeOperation, ReferenceNewOperation,
+        ReferenceAddUpdateOperation, ReferenceDischargeTarget, ReferenceFreezeOperation, ReferenceNewOperation,
         ReferenceReadOperation, ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation,
         RegionDriver, RegionInterface, RegionRef, RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape,
         Sharding, ShardingDimension, StagingContext, Tracer, TracingContext, TranspositionDriver, TypeError,
@@ -2473,7 +2474,7 @@ mod tests {
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![snapshot], vec![Placeholder; 4], vec![Placeholder])
             .unwrap();
 
-        let discharged = program.discharge_references_with_lifted_captures(0).unwrap();
+        let discharged = program.discharge_references_in_capture_lifted_program(0).unwrap();
         assert_eq!(discharged.output_count(), 1);
         assert_eq!(discharged.program().output_count(), 2);
         assert_eq!(discharged.external_states().len(), 2);
@@ -2600,9 +2601,31 @@ mod tests {
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
 
-        // Threading the captured reference state through the scan widens the carry list of the rebuilt `XlaOperation`
-        // scan payload and leaves its capture environment intact.
-        let discharged = program.discharge_references_with_lifted_captures(1).unwrap();
+        let targets = program.reference_discharge_targets(1).unwrap();
+        assert_eq!(targets, vec![ReferenceDischargeTarget::External(ReferenceSource::Capture { index: 0 })],);
+
+        // The partial capture-aware entry point resolves the body's capture constant even when its allocation is
+        // preserved. The scan retains its reference access and gains a reference-typed carry that binds the rebuilt
+        // body's capture without turning it into state.
+        let preserved = program.clone().partially_discharge_references_in_capture_lifted_program(1, &[]).unwrap();
+        assert!(preserved.external_states().is_empty());
+        assert!(preserved.program().entry_region_ref().contains_references_in_closure());
+        let XlaOperation::Scan(scan) = preserved.program().entry_region_ref().instructions()[0].operation() else {
+            panic!("expected a partially discharged scan operation");
+        };
+        assert_eq!(scan.carry_count(), 2);
+
+        // Selecting the captured allocation through the partial entry point agrees exactly with full capture-aware
+        // discharge. Threading its state widens the carry list while leaving the scan's capture metadata intact.
+        let selected = program
+            .clone()
+            .partially_discharge_references_in_capture_lifted_program(1, targets.as_slice())
+            .unwrap()
+            .try_into_full()
+            .unwrap();
+        let discharged = program.discharge_references_in_capture_lifted_program(1).unwrap();
+        assert_eq!(selected.program().to_string(), discharged.program().to_string());
+        assert_eq!(selected.external_states(), discharged.external_states());
         assert_eq!(discharged.output_count(), 2);
         assert_eq!(discharged.external_states().len(), 1);
         assert_eq!(discharged.external_states()[0].source(), ReferenceSource::Capture { index: 0 });

@@ -2916,8 +2916,21 @@ mod tests {
 
         // Forward mode, linearization, and transposition all consume the discharged program, so every derived
         // program must be pure and reference-free even though the source threads state through both branches.
-        let jvp = source.clone().discharge_local_references(0, "differentiation").unwrap().jvp().unwrap();
-        let linearization = source.discharge_local_references(0, "differentiation").unwrap().linearize().unwrap();
+        let jvp = source
+            .clone()
+            .discharge_references(0)
+            .unwrap()
+            .into_program_without_external_references()
+            .unwrap()
+            .jvp()
+            .unwrap();
+        let linearization = source
+            .discharge_references(0)
+            .unwrap()
+            .into_program_without_external_references()
+            .unwrap()
+            .linearize()
+            .unwrap();
         let pullback = linearization.pullback().unwrap();
         for program in [&jvp, linearization.primal(), linearization.tangent(), &pullback] {
             assert!(!program.entry_region_ref().contains_atom_type_in_closure(Type::is_reference));
@@ -3022,8 +3035,21 @@ mod tests {
 
         // The loop's mutated state becomes an ordinary carry, so the derived programs are pure and reference-free
         // and reverse mode remains available through the bounded loop.
-        let jvp = source.clone().discharge_local_references(0, "differentiation").unwrap().jvp().unwrap();
-        let linearization = source.discharge_local_references(0, "differentiation").unwrap().linearize().unwrap();
+        let jvp = source
+            .clone()
+            .discharge_references(0)
+            .unwrap()
+            .into_program_without_external_references()
+            .unwrap()
+            .jvp()
+            .unwrap();
+        let linearization = source
+            .discharge_references(0)
+            .unwrap()
+            .into_program_without_external_references()
+            .unwrap()
+            .linearize()
+            .unwrap();
         let pullback = linearization.pullback().unwrap();
         for program in [&jvp, linearization.primal(), linearization.tangent(), &pullback] {
             assert!(!program.entry_region_ref().contains_atom_type_in_closure(Type::is_reference));

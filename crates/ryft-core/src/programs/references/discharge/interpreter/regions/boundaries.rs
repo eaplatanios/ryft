@@ -20,8 +20,11 @@ use super::super::ReferenceAllocationHandle;
 /// this universe's operations discharge into it finite.
 pub type ReferenceDischargeRegionDestination<C> = TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>;
 
-/// One group of state positions a rebuilt region gains: the allocations crossing there and the source-boundary position at
-/// which they are inserted.
+/// One group of reference-related positions a rebuilt region gains: the allocations crossing there and the source
+/// boundary position at which they are inserted.
+///
+/// A discharged allocation crosses as immutable state, while a preserved allocation crosses as its destination
+/// reference.
 ///
 /// Grouping the allocations with their insertion position keeps a boundary request's input and output groups from being
 /// transposable: the two groups have the same shape, and passing them positionally compiled silently when swapped.
@@ -35,7 +38,7 @@ pub struct ReferenceRegionStateInsertion {
 }
 
 impl ReferenceRegionStateInsertion {
-    /// Creates a state-position group inserting `allocations` at `position`.
+    /// Creates a boundary-position group inserting `allocations` at `position`.
     #[inline]
     pub fn new(allocations: Vec<ReferenceAllocationHandle>, position: usize) -> Self {
         Self { allocations, position }
@@ -45,15 +48,18 @@ impl ReferenceRegionStateInsertion {
 /// Symmetric widening facts one structured rule derives from a region summary through
 /// [`state_widening`](crate::programs::references::ReferenceDischargeContext::state_widening).
 ///
-/// The three sets state one algorithm every symmetric structured rewrite shares: the *threaded* allocations cross the
-/// rebuilt boundary as immutable state, the *entering* subset gains added positions because no declared position
-/// already carries it, and the *published* subset is what the rebuilt regions must report as mutated.
+/// The three sets state one algorithm every symmetric structured rewrite shares: the *threaded* allocations are the
+/// discharged references crossing as immutable state, the *entering* allocations gain added positions because no
+/// declared position already carries them, and the *published* allocations are the discharged references whose final
+/// states the rebuilt regions must return. An entering preserved reference crosses in its added position as a
+/// reference, so it belongs to neither the threaded nor the published set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReferenceStateWidening {
     /// Every discharged reference the region closures reach, in canonical allocation order.
     pub(super) threaded: BTreeSet<ReferenceAllocationHandle>,
 
-    /// Threaded allocations gaining added state positions, in canonical allocation order.
+    /// Reached allocations gaining added boundary positions, in canonical allocation order. Discharged allocations
+    /// cross as state and preserved allocations cross as references.
     pub(super) entering: Vec<ReferenceAllocationHandle>,
 
     /// Threaded allocations some closure mutates, in canonical allocation order.
@@ -67,7 +73,7 @@ impl ReferenceStateWidening {
         &self.threaded
     }
 
-    /// Returns the threaded allocations gaining added state positions, in canonical allocation order.
+    /// Returns the reached allocations gaining added boundary positions, in canonical allocation order.
     #[inline]
     pub fn entering(&self) -> &[ReferenceAllocationHandle] {
         self.entering.as_slice()
@@ -84,8 +90,8 @@ impl ReferenceStateWidening {
 ///
 /// The rule owns the mapping from its own operands onto a region's declared inputs, because that mapping is part of
 /// what the operation *is*. It therefore describes the declared input boundary itself, in region order, and names
-/// separately the threaded state the rebuilt region gains: which allocations enter, which allocations it must publish, and where
-/// each group is inserted.
+/// separately the reference-related positions the rebuilt region gains: which allocations enter, which allocations it
+/// must publish, and where each group is inserted.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReferenceRegionDischargeBoundary {
     /// Allocation entering at each declared source-region input position, or [`None`] for an ordinary value.
@@ -99,20 +105,21 @@ pub struct ReferenceRegionDischargeBoundary {
     /// Discharged references enter as immutable state; preserved references enter as their destination reference value.
     added_input_allocations: Vec<ReferenceAllocationHandle>,
 
-    /// Position in the source region's input boundary at which the added state inputs are inserted.
-    state_input_insertion: usize,
+    /// Position in the source region's input boundary at which the added inputs are inserted.
+    input_insertion: usize,
 
-    /// Allocations whose final state the rebuilt region publishes as added outputs, in canonical allocation order.
-    added_state_output_allocations: Vec<ReferenceAllocationHandle>,
+    /// Allocations the rebuilt region publishes as added outputs, in canonical allocation order. Discharged
+    /// allocations publish final state and preserved allocations publish their destination references.
+    added_output_allocations: Vec<ReferenceAllocationHandle>,
 
-    /// Position in the source region's output boundary at which the added state outputs are inserted.
-    state_output_insertion: usize,
+    /// Position in the source region's output boundary at which the added outputs are inserted.
+    output_insertion: usize,
 }
 
 impl ReferenceRegionDischargeBoundary {
     /// Creates a rebuilt-region boundary request.
     ///
-    /// Added state is described separately from the declared positions because only the declared positions are
+    /// Added positions are described separately from the declared positions because only the declared positions are
     /// replayed: an added input exists in the rebuilt region's destination boundary and in the caller's operand list,
     /// but the source region's body never named it and therefore cannot consume it.
     ///
@@ -127,35 +134,35 @@ impl ReferenceRegionDischargeBoundary {
     ///     [`region_capture_input_count`](Operation::region_capture_input_count) states the region's own leading
     ///     capture prefix.
     ///   - `region_index`: Position of the region among that operation's attached regions.
-    ///   - `declared_input_allocations`: Allocation entering at each declared boundary position, or [`None`] for an ordinary value.
-    ///     Reference positions must come from
-    ///     [`operand_allocation`](crate::programs::references::ReferenceDischargeContext::operand_allocation), which validates that
-    ///     each operand carries the complete stored value rather than a derived view. Its length must equal the source region's
-    ///     input count, because every declared position is rebuilt.
+    ///   - `declared_input_allocations`: Allocation entering at each declared boundary position, or [`None`] for an
+    ///     ordinary value. Reference positions must come from
+    ///     [`operand_allocation`](crate::programs::references::ReferenceDischargeContext::operand_allocation), which
+    ///     validates that each operand carries the complete stored value rather than a derived view. Its length must
+    ///     equal the source region's input count, because every declared position is rebuilt.
     ///   - `added_inputs`: Allocations whose entering state or preserved reference the rebuilt region receives as added
     ///     inputs, grouped with the source input position receiving them.
-    ///   - `added_state_outputs`: Allocations whose final state the rebuilt region publishes as added outputs, grouped with
-    ///     the source output position receiving them.
+    ///   - `added_outputs`: Allocations the rebuilt region publishes as added outputs, grouped with the source output
+    ///     position receiving them. Discharged allocations publish state and preserved allocations publish references.
     #[inline]
     pub fn new<O: Operation>(
         operation: &O,
         region_index: usize,
         declared_input_allocations: Vec<Option<ReferenceAllocationHandle>>,
         added_inputs: ReferenceRegionStateInsertion,
-        added_state_outputs: ReferenceRegionStateInsertion,
+        added_outputs: ReferenceRegionStateInsertion,
     ) -> Self {
         Self {
             declared_input_allocations,
             capture_input_count: operation.region_capture_input_count(region_index),
             added_input_allocations: added_inputs.allocations,
-            state_input_insertion: added_inputs.position,
-            added_state_output_allocations: added_state_outputs.allocations,
-            state_output_insertion: added_state_outputs.position,
+            input_insertion: added_inputs.position,
+            added_output_allocations: added_outputs.allocations,
+            output_insertion: added_outputs.position,
         }
     }
 
-    /// Creates a rebuilt-region boundary request whose added inputs and added state outputs are the same allocations at the
-    /// same position, which is the symmetric loop-carry shape `while` bodies and `scan` bodies thread.
+    /// Creates a rebuilt-region boundary request whose added inputs and outputs are the same allocations at the same
+    /// position, which is the symmetric loop-carry shape `while` bodies and `scan` bodies thread.
     #[inline]
     pub fn symmetric<O: Operation>(
         operation: &O,
@@ -184,22 +191,22 @@ impl ReferenceRegionDischargeBoundary {
         self.added_input_allocations.as_slice()
     }
 
-    /// Returns the source input position at which the added state inputs are inserted.
+    /// Returns the source input position at which the added inputs are inserted.
     #[inline]
-    pub(super) const fn state_input_insertion(&self) -> usize {
-        self.state_input_insertion
+    pub(super) const fn input_insertion(&self) -> usize {
+        self.input_insertion
     }
 
-    /// Returns the allocations whose final state the rebuilt region publishes as added outputs.
+    /// Returns the allocations the rebuilt region publishes as added outputs.
     #[inline]
-    pub(super) fn added_state_output_allocations(&self) -> &[ReferenceAllocationHandle] {
-        self.added_state_output_allocations.as_slice()
+    pub(super) fn added_output_allocations(&self) -> &[ReferenceAllocationHandle] {
+        self.added_output_allocations.as_slice()
     }
 
-    /// Returns the source output position at which the added state outputs are inserted.
+    /// Returns the source output position at which the added outputs are inserted.
     #[inline]
-    pub(super) const fn state_output_insertion(&self) -> usize {
-        self.state_output_insertion
+    pub(super) const fn output_insertion(&self) -> usize {
+        self.output_insertion
     }
 }
 

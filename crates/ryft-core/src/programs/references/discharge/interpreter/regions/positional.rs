@@ -96,18 +96,14 @@ where
         ProgramError::MalformedProgram(format!("operation `{name}` forwards its operands but attaches no regions"))
     })?;
 
-    // A region that returns a discharged reference already publishes its final state at that output position, so only a
-    // mutated state allocation absent from the declared outputs needs an appended output. The added input set also includes
-    // a returned preserved reference absent from the operands: its inherited capture must be rebound in the rebuilt region
-    // even though it contributes no state.
+    // A region that returns a discharged reference already publishes its final state at that output position, so only
+    // a mutated state allocation absent from the declared outputs needs an appended output. Every reached allocation
+    // absent from the operands gains an input: discharged captures cross as state, while preserved captures cross as
+    // their destination references so the rebuilt region can bind its inherited capture scope.
     let represented = summary.output_allocations().iter().copied().flatten().collect::<BTreeSet<_>>();
     let threaded = context.threaded_state_allocations(&summary, name)?;
     let operand_allocations = forwarded_allocations.iter().copied().flatten().collect::<BTreeSet<_>>();
-    let entering = threaded
-        .union(&represented)
-        .filter(|allocation| !operand_allocations.contains(allocation))
-        .copied()
-        .collect::<Vec<_>>();
+    let entering = summary.reached().filter(|allocation| !operand_allocations.contains(allocation)).collect::<Vec<_>>();
     let leaving = threaded
         .difference(&represented)
         .copied()
@@ -143,8 +139,7 @@ where
         operands.push(context.operand_value(input)?);
     }
     for allocation in &entering {
-        let carrier = context.allocation_handle(*allocation)?;
-        operands.push(context.operand_value(&carrier)?);
+        operands.push(context.allocation_value(*allocation)?);
     }
     let outputs = context.parent().bind(operation.clone(), regions, operands.as_slice())?;
     check_count!("output", outputs, source_output_count + leaving.len(), ProgramError);
