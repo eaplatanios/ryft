@@ -15,7 +15,7 @@ use crate::programs::references::types::ReferenceType;
 
 use super::interpreter::{
     RecursiveReferenceDischargeDriver, ReferenceCaptureScope, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, region_closure_touches_references,
+    ReferenceDischargeValue, ReferenceDischargeableOperation,
 };
 use super::policies::{ReferenceDischargePolicy, ReferenceDischargeableType};
 use super::results::{
@@ -344,7 +344,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
         // discharge unconditionally: re-tracing would also renumber its atoms, drop its dead constants, and abandon
         // the region transform cache its regions carry, all for a rewrite that has nothing to rewrite.
         let entry = self.entry_region_ref();
-        if !region_closure_touches_references(entry) {
+        if !entry.contains_references_in_closure() {
             return PartialReferenceDischargeResult::new(self, capture_count, output_count, Vec::new());
         }
 

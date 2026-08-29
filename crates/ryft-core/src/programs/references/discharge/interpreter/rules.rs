@@ -3,8 +3,7 @@ use crate::programs::ProgramError;
 use crate::programs::instructions::InstructionId;
 use crate::programs::operations::Operation;
 use crate::programs::regions::{EmptyRegionDriver, RegionDriver, RegionRef};
-use crate::programs::types::{Type, Typed};
-use crate::programs::values::Value;
+use crate::programs::types::Typed;
 
 use super::super::policies::ReferenceDischargePolicy;
 use super::regions::{ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork};
@@ -57,7 +56,7 @@ where
 {
     if driver.region_count() != 0 {
         let touches_references = inputs.iter().any(|input| matches!(input, ReferenceDischargeValue::Reference(_)))
-            || driver.regions().any(region_closure_touches_references);
+            || driver.regions().any(RegionRef::contains_references_in_closure);
         if touches_references {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!("`{}` carries reference state but has no reference discharge rule", operation.name()),
@@ -76,69 +75,6 @@ where
         .collect::<Result<Vec<_>, _>>()?;
     let outputs = context.parent().bind(operation.clone(), regions, values.as_slice())?;
     Ok(outputs.into_iter().map(ReferenceDischargeValue::Ordinary).collect())
-}
-
-/// Returns whether `region` or any attached descendant contains a reference type or reference operation.
-pub(in crate::programs::references::discharge) fn region_closure_touches_references<
-    V: Value,
-    O: Operation<Type = V::Type>,
->(
-    region: RegionRef<'_, V, O>,
-) -> bool {
-    region.contains_atom_type_in_closure(Type::is_reference)
-        || region
-            .instructions_in_closure()
-            .any(|(_, instruction)| !instruction.operation().reference_semantics().is_empty())
-}
-
-/// Replays one region-free, access-only application verbatim when every reference operand it accesses is preserved,
-/// or returns [`None`] to hand the application to its own discharge rule.
-///
-/// This is the dispatch half of the preserved/discharged split: an operation whose reference semantics declare
-/// accessed inputs and no reference outputs performs no rewrite over preserved references — its honest rewrite is itself,
-/// replayed through the destination — so the replay is owned by the dispatch path and rules see only discharged
-/// accesses. Operations that declare reference outputs (allocations and view derivations) keep their own preserved
-/// handling, because their outputs mint or derive handles. An application whose accessed reference operands mix
-/// preserved and discharged references still reaches its rule, which rejects it exactly as it would have rejected the
-/// discharged half before this dispatch existed.
-///
-/// The operation's own inference is re-derived before the replay so that an operand-relationship mismatch is
-/// reported with the same diagnostic a discharged access produces. Consuming accesses additionally unbind their
-/// consumed allocations after the replay so the environment stops handing them out.
-pub(super) fn replay_preserved_access<C, P>(
-    operation: &C::Operation,
-    context: &ReferenceDischargeContext<C, P>,
-    inputs: &[ReferenceDischargeValue<C, P>],
-) -> Result<Option<Vec<ReferenceDischargeValue<C, P>>>, ProgramError>
-where
-    C: Context,
-    C::Type: From<ReferenceType<P::Referent>>,
-    P: ReferenceDischargePolicy<C>,
-    for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t C::Type>,
-{
-    let semantics = operation.reference_semantics();
-    if semantics.inputs().is_empty() || !semantics.outputs().is_empty() {
-        return Ok(None);
-    }
-    let mut consumed = Vec::new();
-    for access in semantics.inputs() {
-        let Some(ReferenceDischargeValue::Reference(reference)) = inputs.get(access.input_index()) else {
-            return Ok(None);
-        };
-        if reference.preserved().is_none() {
-            return Ok(None);
-        }
-        if access.mode().is_consuming() {
-            consumed.push(reference);
-        }
-    }
-    let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-    operation.infer_output_types(input_types.as_slice(), &[])?;
-    let outputs = discharge_preserved_access(operation, context, inputs)?;
-    for reference in consumed {
-        context.unbind_preserved(reference)?;
-    }
-    Ok(Some(outputs))
 }
 
 /// Replays one access to a *preserved* allocation verbatim into the destination.

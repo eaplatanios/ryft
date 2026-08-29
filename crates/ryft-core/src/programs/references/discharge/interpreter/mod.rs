@@ -6,7 +6,6 @@ pub use regions::{
     ReferenceRegionDischargeFork, ReferenceRegionStateInsertion, ReferenceRegionSummary, ReferenceStateWidening,
     discharge_positional_region_operation,
 };
-pub(super) use rules::region_closure_touches_references;
 pub use rules::{
     ReferenceDischargeDriver, ReferenceDischargeableOperation, discharge_preserved_access,
     discharge_reference_free_operation,

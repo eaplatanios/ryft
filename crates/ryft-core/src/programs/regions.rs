@@ -1573,7 +1573,10 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_macros::Parameter;
 
-    use crate::arrays::{Array, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape};
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrValue, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable,
+        Shape,
+    };
     use crate::contexts::EagerContext;
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::ProgramError;
@@ -1581,6 +1584,7 @@ mod tests {
     use crate::programs::effects::Effect;
     use crate::programs::identities::TypeIdentity;
     use crate::programs::programs::Program;
+    use crate::programs::references::ReferenceType;
     use crate::tests::TestRegionOperation;
 
     use super::*;
@@ -2024,6 +2028,26 @@ mod tests {
         assert_eq!(interface.input_types(), &[ArrayType::scalar(DataType::F64)]);
         assert_eq!(interface.output_types(), &[ArrayType::scalar(DataType::F64)]);
         assert_eq!(interface.effects(), Effects::PURE);
+
+        // Closure-wide atom queries inspect the root and its reused descendant, accept both atoms and their types,
+        // and return false when no matching type or reference occurs anywhere in that closure.
+        assert!(region.contains_atom_in_closure(|atom| atom.r#type().as_ref() == &ArrayType::scalar(DataType::F64)));
+        assert!(!region.contains_atom_in_closure(|atom| atom.r#type().as_ref() == &ArrayType::scalar(DataType::F32)));
+        assert!(region.contains_atom_type_in_closure(|r#type| r#type == &ArrayType::scalar(DataType::F64)));
+        assert!(!region.contains_atom_type_in_closure(|r#type| r#type == &ArrayType::scalar(DataType::F32)));
+        assert!(!region.contains_references_in_closure());
+
+        // The reference-specific query recognizes reference types independently of whether the region contains
+        // a reference operation, which also covers reference-typed boundaries and constants.
+        let reference_region = Region::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(
+            vec![Atom::Variable(ReferenceType::new(ArrayType::scalar(DataType::F64)).into())],
+            vec![AtomId::new(0)],
+            vec![AtomId::new(0)],
+            Vec::new(),
+        );
+        let reference_arena = RegionArena::from_regions(vec![reference_region]).unwrap();
+        let reference_region = RegionRef::new(&reference_arena, RegionId::new(0)).unwrap();
+        assert!(reference_region.contains_references_in_closure());
     }
 
     #[test]
