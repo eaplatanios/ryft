@@ -127,7 +127,7 @@ impl<A: Value<Type = ArrayType>> Value for ArrayIrValue<A> {
                 return Err(ProgramError::UnsupportedOperation {
                     message: format!(
                         "program replay cannot bind external reference `{}`; use a stateful compilation domain",
-                        ReferenceSource::from_input_index(input_index, 0),
+                        ReferenceSource::from_flat_input_index(input_index, 0),
                     ),
                 });
             }

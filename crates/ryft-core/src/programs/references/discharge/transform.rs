@@ -17,8 +17,8 @@ use super::interpreter::{
 };
 use super::policies::ReferenceDischargePolicy;
 use super::results::{
-    PartialReferenceDischargeResult, ReferenceDischargePayload, ReferenceDischargeResult, ReferenceSource,
-    ReferenceStateBinding,
+    ExternalReferenceBinding, PartialReferenceDischargeResult, ReferenceDischargePayload, ReferenceDischargeResult,
+    ReferenceSource,
 };
 use super::selection::{ReferenceDischargeSelection, ReferenceDischargeSite};
 
@@ -138,7 +138,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// reference-typed boundary position or its allocating instruction, every access to it replays verbatim as the
     /// reference operation the source performed, and a view derived from it replays its view operation too, so the
     /// rewritten program still denotes the same coordinates. Preserved references contribute no state input, no hidden
-    /// final-state output, and no [`ReferenceStateBinding`]: the payload's own boundary is where the caller sees them.
+    /// final-state output, and no [`ExternalReferenceBinding`]: the payload's own boundary is where the caller sees them.
     ///
     /// This is what a kernel pipeline needs — normalize the pipeline's own state into explicit carries while the
     /// references a kernel body addresses stay references — and it is the reason the result envelope is
@@ -176,7 +176,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// synthesizes a preserved reference onto a rebuilt region's added state positions, and otherwise for every reason
     /// [`discharge_references_with_policy`](Self::discharge_references_with_policy) documents — with one deliberate
     /// exception. Consuming a *discharged* external allocation is still rejected, because a
-    /// [`ReferenceStateBinding`] cannot express a caller-owned reference that no longer denotes live state; consuming
+    /// [`ExternalReferenceBinding`] cannot express a caller-owned reference that no longer denotes live state; consuming
     /// a *preserved* one is accepted, because the payload retains the consuming operation and the caller passes its
     /// reference handle to that operation directly.
     pub fn partially_discharge_references_with_policy<P>(
@@ -303,7 +303,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
                     inputs.push(ReferenceDischargeValue::Ordinary(destination.input(input_type)));
                     continue;
                 };
-                let source = ReferenceSource::from_input_index(input_index, capture_count);
+                let source = ReferenceSource::from_flat_input_index(input_index, capture_count);
                 let selected = context.selects_external(source);
                 let carrier = if selected {
                     let state = destination.input(P::lift_referent_type(reference_type.referent().clone()));
@@ -367,13 +367,13 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
                         "reference discharge consumed external {source}, whose state must remain owned by the caller",
                     )));
                 }
-                let final_state_output_index = if context.is_mutated(allocation)? {
+                let output_index = if context.is_mutated(allocation)? {
                     output_ids.push(context.discharged_state(allocation)?.atom_id()?);
                     Some(output_ids.len() - 1)
                 } else {
                     None
                 };
-                external_states.push(ReferenceStateBinding::new(source, final_state_output_index));
+                external_states.push(ExternalReferenceBinding::new(source, output_index));
             }
             (builder, output_ids, external_states)
         };
@@ -467,7 +467,7 @@ mod tests {
         assert_eq!(discharged.public_output_count(), 1);
         assert_eq!(
             discharged.external_states(),
-            &[ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
+            &[ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
         );
         assert_eq!(
             discharged.program().to_string(),
@@ -548,7 +548,7 @@ mod tests {
 
     #[test]
     fn test_partial_reference_discharge_lets_a_program_consume_a_preserved_external_allocation() {
-        // Full discharge rejects a program that consumes a caller-owned allocation, because a `ReferenceStateBinding`
+        // Full discharge rejects a program that consumes a caller-owned allocation, because a `ExternalReferenceBinding`
         // cannot describe reference state that no longer exists. A preserved reference has no binding to describe: the
         // payload keeps the consuming operation, and the caller passes its reference to that operation directly, so partial
         // discharge accepts what full discharge cannot express.
@@ -637,7 +637,7 @@ mod tests {
         assert_eq!(discharged.public_output_count(), 1);
         assert_eq!(
             discharged.external_states(),
-            &[ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
+            &[ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
         );
         assert_eq!(
             discharged.program().to_string(),

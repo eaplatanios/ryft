@@ -1,10 +1,10 @@
 //! Contains machinery related to _reference discharge_, which is the process of rewriting mutable reference state into
 //! explicit immutable dataflow. Specifically, a program containing reference operations is not ordinary functional
-//! Single Static Assignment (SSA) dataflow. A read operation depends on the latest write operation to the same allocation
-//! even though that dependency is represented by a reference handle rather than by an SSA operand carrying the current
-//! value. Many transforms and backends require the dependency to be explicit. Reference discharge makes it explicit by
-//! replaying the program while replacing each selected allocation with an immutable state value that is threaded from one
-//! access to the next.
+//! Single Static Assignment (SSA) dataflow. A read operation depends on the latest write operation to the same
+//! allocation even though that dependency is represented by a reference handle rather than by an SSA operand carrying
+//! the current value. Many transforms and backends require the dependency to be explicit. Reference discharge makes it
+//! explicit by replaying the program while replacing each selected allocation with an immutable state value that is
+//! threaded from one access to the next.
 //!
 //! # Example
 //!
@@ -30,18 +30,18 @@
 //! ```
 //!
 //! The exact rewritten program may simplify aliases such as `%state0`, but the semantic relationship is the same:
-//! replacement returns the previous state and produces a successor state, while every subsequent access consumes
-//! that successor. The reference is an implementation detail of the source program and no reference survives in the
-//! full result.
+//! replacement returns the previous state and produces a successor state, while every subsequent access consumes that
+//! successor. The reference is an implementation detail of the source program, and no reference survives in the full
+//! result.
 //!
-//! An external reference follows the same rewrite but its state crosses the program boundary. Its reference-typed
-//! input becomes an ordinary input carrying the entering referent. If the program mutates the reference, its final
-//! state is appended after the public outputs as a hidden output. [`ReferenceStateBinding`] records which capture or public
+//! An external reference follows the same rewrite but its state crosses the program boundary. Its reference-typed input
+//! becomes an ordinary input carrying the entering referent. If the program mutates the reference, its final state is
+//! appended after the public outputs as a hidden output. [`ExternalReferenceBinding`] records which capture or public
 //! argument owns that state and which hidden output must replace the caller's reference value. Its discharged input
-//! position follows from that logical source and the result's capture count. A read-only external reference has no hidden
-//! output.
+//! position follows from that logical source and the result's capture count. A read-only external reference has no
+//! hidden output.
 //!
-//! Discharge rewrites a program; it does not itself lock eager reference state or execute a backend. The stateful
+//! Discharge rewrites a program. It does not itself lock eager reference state or execute a backend. The stateful
 //! compilation surface uses the result's binding metadata together with the runtime reference protocol after
 //! compilation.
 //!
@@ -159,8 +159,8 @@ pub use interpreter::{
 };
 pub use policies::{ReferenceAccumulationPolicy, ReferenceDischargePolicy};
 pub use results::{
-    PartialReferenceDischargeResult, ReferenceDischargePayload, ReferenceDischargeResult, ReferenceSource,
-    ReferenceStateBinding,
+    ExternalReferenceBinding, PartialReferenceDischargeResult, ReferenceDischargePayload, ReferenceDischargeResult,
+    ReferenceSource,
 };
 pub use selection::ReferenceDischargeSite;
 pub use transform::ReferenceDischarge;
@@ -1030,7 +1030,7 @@ pub(crate) mod tests {
                     TestPayload::new(7, 1, 0),
                     0,
                     0,
-                    vec![ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, None)],
+                    vec![ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None)],
                 ),
                 TestDischargeMode::Malformed => {
                     ReferenceDischargeResult::from_provider_payload(TestPayload::new(7, 0, 1), 0, 0, Vec::new())

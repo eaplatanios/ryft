@@ -1350,12 +1350,12 @@ mod tests {
         CaptureReference, CapturingContext, ConditionOperation, Context, CustomJvpOperation, CustomVjpOperation,
         DataType, DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation,
         DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, DynamicBroadcastOperation, Effects,
-        EmptyRegionDriver, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation, Operation,
-        OutputRegionProvenance, PartialValue, Placeholder, ProgramBuilder, ProgramError, ReferenceAddUpdateOperation,
-        ReferenceDischarge, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSource,
-        ReferenceStateBinding, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, RegionDriver,
-        RegionInterface, RegionRef, RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape, Sharding,
-        ShardingDimension, StagingContext, Tracer, TracingContext, TranspositionDriver, TypeError,
+        EmptyRegionDriver, ExternalReferenceBinding, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation,
+        Operation, OutputRegionProvenance, PartialValue, Placeholder, ProgramBuilder, ProgramError,
+        ReferenceAddUpdateOperation, ReferenceDischarge, ReferenceFreezeOperation, ReferenceNewOperation,
+        ReferenceReadOperation, ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation,
+        RegionDriver, RegionInterface, RegionRef, RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape,
+        Sharding, ShardingDimension, StagingContext, Tracer, TracingContext, TranspositionDriver, TypeError,
         TypeIdentityRenaming, Typed, Value, ValueProjection, WhileOperation, ZeroOperation,
     };
 
@@ -1630,7 +1630,7 @@ mod tests {
         assert_eq!(discharged.public_output_count(), 1);
         assert_eq!(
             discharged.external_states(),
-            &[ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
+            &[ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
         );
         assert_eq!(
             discharged.program().to_string(),
@@ -2415,10 +2415,10 @@ mod tests {
         assert_eq!(discharged.external_states().len(), 2);
         assert_eq!(discharged.external_states()[0].source(), ReferenceSource::Input { index: 0 });
         assert!(discharged.external_states()[0].is_mutated());
-        assert_eq!(discharged.external_states()[0].final_state_output_index(), Some(2));
+        assert_eq!(discharged.external_states()[0].output_index(), Some(2));
         assert_eq!(discharged.external_states()[1].source(), ReferenceSource::Input { index: 2 });
         assert!(discharged.external_states()[1].is_mutated());
-        assert_eq!(discharged.external_states()[1].final_state_output_index(), Some(3));
+        assert_eq!(discharged.external_states()[1].output_index(), Some(3));
     }
 
     #[test]
@@ -2479,10 +2479,10 @@ mod tests {
         assert_eq!(discharged.external_states().len(), 2);
         assert_eq!(discharged.external_states()[0].source(), ReferenceSource::Input { index: 0 });
         assert!(!discharged.external_states()[0].is_mutated());
-        assert_eq!(discharged.external_states()[0].final_state_output_index(), None);
+        assert_eq!(discharged.external_states()[0].output_index(), None);
         assert_eq!(discharged.external_states()[1].source(), ReferenceSource::Input { index: 1 });
         assert!(discharged.external_states()[1].is_mutated());
-        assert_eq!(discharged.external_states()[1].final_state_output_index(), Some(1));
+        assert_eq!(discharged.external_states()[1].output_index(), Some(1));
     }
 
     #[test]
@@ -2515,7 +2515,7 @@ mod tests {
         assert_eq!(discharged.external_states().len(), 1);
         assert_eq!(discharged.external_states()[0].source(), ReferenceSource::Input { index: 0 });
         assert!(!discharged.external_states()[0].is_mutated());
-        assert_eq!(discharged.external_states()[0].final_state_output_index(), None);
+        assert_eq!(discharged.external_states()[0].output_index(), None);
     }
 
     #[test]

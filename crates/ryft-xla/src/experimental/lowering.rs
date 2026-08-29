@@ -28,11 +28,11 @@ use ryft_core::{
     ComparisonDirection, ConstantOperation, ConvertElementTypeOperation, CosOperation, DataType, Dimension,
     DimensionOperation, DimensionRequirementOperation, DimensionRequirementPredicate, DimensionType, DimensionValue,
     DivOperation, DomainTracingContext, DotDimensionNumbers, DotOperation, Effect, Effects, ErfOperation, ExpOperation,
-    FloorOperation, GATHER_OPERATION_NAME, GatherOperation, GatherScatterMode, Instruction, IotaOperation, Layout,
-    Log1pOperation, LogAddExpOperation, LogOperation, LogicalMesh, LogisticOperation, MAX_DIMENSION_EXTENT,
-    MaxOperation, Memory, MeshAxisType, MinOperation, MulOperation, NegOperation, Operation, PadOperation,
-    ParallelReduceOperation, ParallelReductionKind, Parameterized, PowOperation, Program, ProgramError, ProjectedValue,
-    Provenance, REMATERIALIZE_OPERATION_NAME, RaggedDotMode, RaggedDotOperation, ReductionKind, ReferenceStateBinding,
+    ExternalReferenceBinding, FloorOperation, GATHER_OPERATION_NAME, GatherOperation, GatherScatterMode, Instruction,
+    IotaOperation, Layout, Log1pOperation, LogAddExpOperation, LogOperation, LogicalMesh, LogisticOperation,
+    MAX_DIMENSION_EXTENT, MaxOperation, Memory, MeshAxisType, MinOperation, MulOperation, NegOperation, Operation,
+    PadOperation, ParallelReduceOperation, ParallelReductionKind, Parameterized, PowOperation, Program, ProgramError,
+    ProjectedValue, Provenance, REMATERIALIZE_OPERATION_NAME, RaggedDotMode, RaggedDotOperation, ReductionKind,
     RegionId, RegionRef, RemOperation, ReshapeOperation, RoundOperation, RsqrtOperation, SCAN_OPERATION_NAME,
     SCATTER_OPERATION_NAME, ScaledDotOperation, ScanOperation, ScatterOperation, ScatterReductionKind, Shape, Sharding,
     ShardingDimension, ShardingError, SignOperation, SinOperation, SliceOperation, SqrtOperation, SubOperation,
@@ -4951,7 +4951,7 @@ pub(crate) fn lower_mlir_module_for_program_with_reference_state<'o, Input, Outp
     arg_shardings: Option<&[Sharding]>,
     result_shardings: Option<&[Sharding]>,
     target_platform: Option<&str>,
-    reference_states: &[ReferenceStateBinding],
+    reference_states: &[ExternalReferenceBinding],
     ragged_dot_lowering_strategy: RaggedDotLoweringStrategy,
 ) -> Result<LoweredXlaModule, LoweringError>
 where
@@ -5014,7 +5014,7 @@ where
             signature.input_mapping()[logical_input_index].ok_or_else(|| LoweringError::InvalidReferenceStateAbi {
                 message: format!("logical state input {logical_input_index} is erased from the executable boundary"),
             })?;
-        if let Some(logical_output_index) = state.final_state_output_index() {
+        if let Some(logical_output_index) = state.output_index() {
             let output_type = global_output_types.get(logical_output_index).ok_or_else(|| {
                 LoweringError::InvalidReferenceStateAbi {
                     message: format!("logical output index {logical_output_index} is out of range"),
@@ -10455,8 +10455,8 @@ mod tests {
         ];
         let result_shardings = vec![Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap()];
         let states = [
-            ReferenceStateBinding::new(ReferenceSource::Input { index: 1 }, Some(0)),
-            ReferenceStateBinding::new(ReferenceSource::Input { index: 2 }, None),
+            ExternalReferenceBinding::new(ReferenceSource::Input { index: 1 }, Some(0)),
+            ExternalReferenceBinding::new(ReferenceSource::Input { index: 2 }, None),
         ];
 
         let lowered = lower_mlir_module_for_program_with_reference_state(
@@ -10496,7 +10496,7 @@ mod tests {
             .replace("@SIGNATURE@", expected_signature),
         );
 
-        let invalid_state = ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, None);
+        let invalid_state = ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None);
         assert!(matches!(
             lower_mlir_module_for_program_with_reference_state(
                 &program,
@@ -10567,7 +10567,7 @@ mod tests {
         let mut builder = crate::experimental::ops::XlaProgramBuilder::new();
         let state = builder.add_input(ArrayIrType::Array(state_type.clone()));
         let program: FlatXlaProgram = builder.build(vec![state], vec![Placeholder], vec![Placeholder]).unwrap();
-        let reference_state = ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, Some(0));
+        let reference_state = ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(0));
 
         assert!(matches!(
             lower_mlir_module_for_program_with_reference_state(

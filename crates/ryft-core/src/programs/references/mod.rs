@@ -58,7 +58,7 @@
 //! family, which is why consuming through a narrowing view is rejected. Allocations also split by provenance: a *local*
 //! allocation is created inside the program and disappears entirely after discharge, while an *external* allocation
 //! denotes caller-owned state entering through an input or capture ([`ReferenceSource`]) and is what a
-//! [`ReferenceStateBinding`] describes to the backend.
+//! [`ExternalReferenceBinding`] describes to the backend.
 //!
 //! # Module Structure
 //!
@@ -91,7 +91,7 @@
 //! Before a staged program reaches a backend that accepts only ordinary immutable values, discharge rewrites those
 //! operations into explicit state dataflow. A local allocation disappears entirely after that rewrite. An external
 //! allocation becomes an ordinary state input and, when mutated, a hidden final-state output described by a
-//! [`ReferenceStateBinding`]; the backend's stateful invocation surface snapshots and publishes those values through
+//! [`ExternalReferenceBinding`]; the backend's stateful invocation surface snapshots and publishes those values through
 //! the caller's reference. [`ReferenceDischarge`] exposes the value-level entry point for this rewrite; the discharge
 //! module documentation contains a concrete before-and-after example.
 //!
@@ -173,14 +173,13 @@ mod types;
 mod values;
 
 pub use discharge::{
-    PartialReferenceDischargeResult, RecursiveReferenceDischargeDriver, ReferenceAccumulationPolicy,
-    ReferenceAllocationHandle, ReferenceDischarge, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePayload, ReferenceDischargePolicy, ReferenceDischargeReference,
+    ExternalReferenceBinding, PartialReferenceDischargeResult, RecursiveReferenceDischargeDriver,
+    ReferenceAccumulationPolicy, ReferenceAllocationHandle, ReferenceDischarge, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePayload, ReferenceDischargePolicy, ReferenceDischargeReference,
     ReferenceDischargeRegionDestination, ReferenceDischargeResult, ReferenceDischargeSite, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork,
-    ReferenceRegionStateInsertion, ReferenceRegionSummary, ReferenceSource, ReferenceStateBinding,
-    ReferenceStateWidening, discharge_positional_region_operation, discharge_preserved_access,
-    discharge_reference_free_operation,
+    ReferenceRegionStateInsertion, ReferenceRegionSummary, ReferenceSource, ReferenceStateWidening,
+    discharge_positional_region_operation, discharge_preserved_access, discharge_reference_free_operation,
 };
 pub use operations::{
     REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME,

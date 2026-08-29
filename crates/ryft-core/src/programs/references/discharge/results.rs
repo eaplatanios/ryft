@@ -1,7 +1,5 @@
 use std::fmt::Display;
 
-// TODO(eaplatanios): Review this module.
-
 use crate::parameters::Parameterized;
 use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
@@ -9,149 +7,7 @@ use crate::programs::programs::Program;
 use crate::programs::types::Type;
 use crate::programs::values::Value;
 
-/// Invocation source of one external reference allocation.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ReferenceSource {
-    /// Capture lifted into the entry boundary before input arguments.
-    Capture {
-        /// Zero-based capture position in the lifted capture prefix.
-        index: usize,
-    },
-
-    /// Reference input argument after the lifted capture prefix.
-    Input {
-        /// Zero-based input position, excluding lifted captures.
-        index: usize,
-    },
-}
-
-impl ReferenceSource {
-    /// Returns the entry-boundary source of one flat input position, splitting the boundary at the lifted capture
-    /// prefix.
-    ///
-    /// # Parameters
-    ///
-    ///   - `input_index`: Flat entry input position.
-    ///   - `capture_count`: Number of leading flat inputs that originated in the program's capture table.
-    #[inline]
-    pub const fn from_input_index(input_index: usize, capture_count: usize) -> Self {
-        if input_index < capture_count {
-            Self::Capture { index: input_index }
-        } else {
-            Self::Input { index: input_index - capture_count }
-        }
-    }
-
-    /// Resolves this logical source to its flat discharged entry-boundary position.
-    ///
-    /// # Parameters
-    ///
-    ///   - `capture_count`: Number of leading flat inputs originating in the source program's capture table.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::MalformedProgram`] when a capture lies outside the capture prefix or when adding the
-    /// prefix to an input position overflows `usize`.
-    pub fn flat_input_index(self, capture_count: usize) -> Result<usize, ProgramError> {
-        match self {
-            Self::Capture { index } if index < capture_count => Ok(index),
-            Self::Capture { index } => Err(ProgramError::MalformedProgram(format!(
-                "reference source capture {index} lies outside the capture prefix of length {capture_count}",
-            ))),
-            Self::Input { index } => capture_count.checked_add(index).ok_or_else(|| {
-                ProgramError::MalformedProgram(format!(
-                    "reference source input {index} overflows the flat boundary after {capture_count} captures",
-                ))
-            }),
-        }
-    }
-}
-
-impl Display for ReferenceSource {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Capture { index } => write!(formatter, "capture {index}"),
-            Self::Input { index } => write!(formatter, "input {index}"),
-        }
-    }
-}
-
-/// Logical binding recipe for one external reference allocation in a discharged program.
-///
-/// The [`serde::Serialize`] implementation exposes the canonical in-memory shape for diagnostics and snapshots and is
-/// deliberately distinct from the stable XLA persistence schema, which keeps its own versioned representation
-/// (including a redundant validated flat-input coordinate) independent of this type's evolution.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
-pub struct ReferenceStateBinding {
-    /// Capture or input argument supplying the eager reference handle.
-    source: ReferenceSource,
-
-    /// Hidden output position containing final state, or [`None`] for a read-only allocation.
-    final_state_output_index: Option<usize>,
-}
-
-impl ReferenceStateBinding {
-    /// Creates one logical external-state binding.
-    ///
-    /// # Parameters
-    ///
-    ///   - `source`: Capture or input supplying the eager reference handle.
-    ///   - `final_state_output_index`: Hidden output containing the final state, or [`None`] for a read-only allocation.
-    pub const fn new(source: ReferenceSource, final_state_output_index: Option<usize>) -> Self {
-        Self { source, final_state_output_index }
-    }
-
-    /// Returns the capture or input argument supplying the eager reference handle.
-    pub const fn source(&self) -> ReferenceSource {
-        self.source
-    }
-
-    /// Returns whether this external state is mutated.
-    pub const fn is_mutated(&self) -> bool {
-        self.final_state_output_index.is_some()
-    }
-
-    /// Returns the hidden final-state output position, if any.
-    pub const fn final_state_output_index(&self) -> Option<usize> {
-        self.final_state_output_index
-    }
-}
-
-/// Shared payload and logical external-state metadata of a reference discharge result.
-#[derive(Debug)]
-struct ReferenceDischargeEnvelope<P> {
-    /// Program payload whose public outputs form a prefix of its complete outputs.
-    program: P,
-
-    /// Number of leading program inputs originating in the source program's capture table.
-    capture_count: usize,
-
-    /// Number of public output leaves before hidden final-state outputs.
-    public_output_count: usize,
-
-    /// Discharged external reference binding recipes in canonical entry-boundary order.
-    external_states: Vec<ReferenceStateBinding>,
-}
-
-impl<P: ReferenceDischargePayload> ReferenceDischargeEnvelope<P> {
-    /// Creates an envelope after validating its discharged boundary layout.
-    fn new(
-        program: P,
-        capture_count: usize,
-        public_output_count: usize,
-        external_states: Vec<ReferenceStateBinding>,
-    ) -> Result<Self, ProgramError> {
-        validate_discharged_boundary(
-            capture_count,
-            program.input_count(),
-            program.output_count(),
-            public_output_count,
-            external_states.as_slice(),
-        )?;
-        Ok(Self { program, capture_count, public_output_count, external_states })
-    }
-}
+// TODO(eaplatanios): Review from here onwards.
 
 /// Reference-free program payload and logical external-state metadata produced by reference discharge.
 ///
@@ -159,26 +15,9 @@ impl<P: ReferenceDischargePayload> ReferenceDischargeEnvelope<P> {
 /// is represented: [`PartialReferenceDischargeResult::try_into_full`] carries out the proof and wraps the partial
 /// result unchanged.
 #[derive(Debug)]
-pub struct ReferenceDischargeResult<P> {
+pub struct ReferenceDischargeResult<P: ReferenceDischargePayload> {
     /// Proven reference-free partial result.
     partial: PartialReferenceDischargeResult<P>,
-}
-
-/// Provider-owned proof boundary for payload families returned by full reference discharge.
-///
-/// Implementations report their own entry-boundary arities and must inspect every value and operation in the payload's
-/// complete attached-region closure, returning success only when no reference-typed value or nonempty reference
-/// semantics remains. These are provider contracts for downstream payload families. Rust's coherence rules prevent a
-/// downstream crate from replacing the checked implementation for [`Program`].
-pub trait ReferenceDischargePayload {
-    /// Returns the number of inputs in this payload's entry boundary.
-    fn input_count(&self) -> usize;
-
-    /// Returns the number of outputs in this payload's entry boundary.
-    fn output_count(&self) -> usize;
-
-    /// Validates that this complete payload is reference-free.
-    fn validate_reference_free(&self) -> Result<(), ProgramError>;
 }
 
 impl<P: ReferenceDischargePayload> ReferenceDischargeResult<P> {
@@ -206,7 +45,7 @@ impl<P: ReferenceDischargePayload> ReferenceDischargeResult<P> {
         program: P,
         capture_count: usize,
         public_output_count: usize,
-        external_states: Vec<ReferenceStateBinding>,
+        external_states: Vec<ExternalReferenceBinding>,
     ) -> Result<Self, ProgramError> {
         program.validate_reference_free()?;
         Ok(Self {
@@ -218,9 +57,7 @@ impl<P: ReferenceDischargePayload> ReferenceDischargeResult<P> {
             )?,
         })
     }
-}
 
-impl<P> ReferenceDischargeResult<P> {
     /// Returns the reference-free program payload.
     #[inline]
     pub const fn program(&self) -> &P {
@@ -241,13 +78,13 @@ impl<P> ReferenceDischargeResult<P> {
 
     /// Returns external reference binding recipes in canonical entry-boundary order.
     #[inline]
-    pub fn external_states(&self) -> &[ReferenceStateBinding] {
+    pub fn external_states(&self) -> &[ExternalReferenceBinding] {
         self.partial.external_states()
     }
 
     /// Consumes this result and returns its payload, capture count, public-output prefix, and external-state bindings.
     #[inline]
-    pub fn into_parts(self) -> (P, usize, usize, Vec<ReferenceStateBinding>) {
+    pub fn into_parts(self) -> (P, usize, usize, Vec<ExternalReferenceBinding>) {
         self.partial.into_parts()
     }
 }
@@ -256,8 +93,8 @@ impl<P> ReferenceDischargeResult<P> {
 /// explicit immutable state and every unselected allocation survives as a well-typed reference value.
 ///
 /// The discharged part of the boundary obeys exactly the invariants of [`ReferenceDischargeResult`]: discharged
-/// external allocations are reported as [`ReferenceStateBinding`]s in canonical entry-boundary order, and the mutated
-/// subset of those bindings tiles the hidden output suffix that follows the public outputs. Discharged local
+/// external allocations are reported as [`ExternalReferenceBinding`]s in canonical entry-boundary order, and the
+/// mutated subset of those bindings tiles the hidden output suffix that follows the public outputs. Discharged local
 /// allocations leave no binding, because no caller owns their state. Preserved references contribute neither bindings
 /// nor hidden outputs; they simply remain reference-typed values inside the payload, and their accesses replay
 /// verbatim.
@@ -268,26 +105,35 @@ impl<P> ReferenceDischargeResult<P> {
 /// [`Program`] payloads, where the reference-freedom proof can actually be carried out. Providers of other payload
 /// families encode their equivalent proof through [`ReferenceDischargePayload`].
 #[derive(Debug)]
-pub struct PartialReferenceDischargeResult<P> {
-    /// Shared checked result envelope.
-    envelope: ReferenceDischargeEnvelope<P>,
+pub struct PartialReferenceDischargeResult<P: ReferenceDischargePayload> {
+    /// Program payload whose public outputs form a prefix of its complete outputs.
+    program: P,
+
+    /// Number of leading program inputs originating in the source program's capture table.
+    capture_count: usize,
+
+    /// Number of public output leaves before hidden final-state outputs.
+    public_output_count: usize,
+
+    /// Discharged external reference binding recipes in canonical entry-boundary order.
+    external_states: Vec<ExternalReferenceBinding>,
 }
 
 impl<P: ReferenceDischargePayload> PartialReferenceDischargeResult<P> {
     /// Creates a checked partial reference discharge result.
     ///
-    /// The external-state bindings describe the *discharged* allocations only and must satisfy the same canonical boundary
-    /// invariants as [`ReferenceDischargeResult::from_provider_payload`]: they must name valid discharged inputs in
-    /// canonical source order, and their final-state output indices, omitting read-only bindings, must exactly cover
-    /// the hidden output suffix in binding order.
+    /// The external-state bindings describe the *discharged* allocations only and must satisfy the same canonical
+    /// boundary invariants as [`ReferenceDischargeResult::from_provider_payload`]: they must name valid discharged
+    /// inputs in canonical source order, and their final-state output indices, omitting read-only bindings, must
+    /// exactly cover the hidden output suffix in binding order.
     ///
     /// # Parameters
     ///
     ///   - `program`: Mixed discharged program payload.
     ///   - `capture_count`: Number of leading inputs originating in the source program's capture table.
     ///   - `public_output_count`: Number of public outputs preceding hidden final-state outputs.
-    ///   - `external_states`: Logical external-state bindings for the discharged references, in canonical entry-boundary
-    ///     order.
+    ///   - `external_states`: Logical external-reference bindings for the discharged references, in canonical
+    ///     entry-boundary order.
     ///
     /// # Errors
     ///
@@ -297,44 +143,47 @@ impl<P: ReferenceDischargePayload> PartialReferenceDischargeResult<P> {
         program: P,
         capture_count: usize,
         public_output_count: usize,
-        external_states: Vec<ReferenceStateBinding>,
+        external_states: Vec<ExternalReferenceBinding>,
     ) -> Result<Self, ProgramError> {
-        Ok(Self {
-            envelope: ReferenceDischargeEnvelope::new(program, capture_count, public_output_count, external_states)?,
-        })
+        validate_discharged_boundary(
+            capture_count,
+            program.input_count(),
+            program.output_count(),
+            public_output_count,
+            external_states.as_slice(),
+        )?;
+        Ok(Self { program, capture_count, public_output_count, external_states })
     }
-}
 
-impl<P> PartialReferenceDischargeResult<P> {
     /// Returns the mixed program payload.
     #[inline]
     pub const fn program(&self) -> &P {
-        &self.envelope.program
+        &self.program
     }
 
     /// Returns the number of leading inputs originating in the source program's capture table.
     #[inline]
     pub const fn capture_count(&self) -> usize {
-        self.envelope.capture_count
+        self.capture_count
     }
 
     /// Returns the number of public outputs at the front of the program payload's output boundary.
     #[inline]
     pub const fn public_output_count(&self) -> usize {
-        self.envelope.public_output_count
+        self.public_output_count
     }
 
     /// Returns the binding recipes of the discharged external reference allocations, in canonical entry-boundary order.
     /// Preserved references are deliberately absent: they were never turned into state and so have nothing to bind.
     #[inline]
-    pub fn external_states(&self) -> &[ReferenceStateBinding] {
-        self.envelope.external_states.as_slice()
+    pub fn external_states(&self) -> &[ExternalReferenceBinding] {
+        self.external_states.as_slice()
     }
 
     /// Consumes this result and returns its payload, capture count, public-output prefix, and external-state bindings.
     #[inline]
-    pub fn into_parts(self) -> (P, usize, usize, Vec<ReferenceStateBinding>) {
-        let ReferenceDischargeEnvelope { program, capture_count, public_output_count, external_states } = self.envelope;
+    pub fn into_parts(self) -> (P, usize, usize, Vec<ExternalReferenceBinding>) {
+        let Self { program, capture_count, public_output_count, external_states } = self;
         (program, capture_count, public_output_count, external_states)
     }
 }
@@ -364,9 +213,30 @@ where
     /// Returns [`ProgramError::MalformedProgram`] when the payload still contains a reference-typed atom or an
     /// operation with nonempty reference semantics.
     pub fn try_into_full(self) -> Result<ReferenceDischargeResult<Program<V, O, Input, Output>>, ProgramError> {
-        self.envelope.program.validate_reference_free()?;
+        self.program.validate_reference_free()?;
         Ok(ReferenceDischargeResult { partial: self })
     }
+}
+
+/// Boundary-inspection and reference-freedom-validation capability for reference discharge payloads.
+///
+/// Both partial and full discharge results use the reported entry-boundary arities to validate their external reference
+/// bindings. A payload may implement this trait while still containing references: the implementation of
+/// [`Self::validate_reference_free`] must inspect the complete payload and return an error until no reference-typed
+/// value or nonempty reference semantics remains. Full discharge invokes that validation before constructing its
+/// result.
+///
+/// These are provider contracts for downstream payload families. Rust's coherence rules prevent a downstream crate
+/// from replacing the checked implementation for [`Program`].
+pub trait ReferenceDischargePayload {
+    /// Returns the number of inputs in this payload's entry boundary.
+    fn input_count(&self) -> usize;
+
+    /// Returns the number of outputs in this payload's entry boundary.
+    fn output_count(&self) -> usize;
+
+    /// Validates that this complete payload is reference-free.
+    fn validate_reference_free(&self) -> Result<(), ProgramError>;
 }
 
 impl<V, O, Input, Output> ReferenceDischargePayload for Program<V, O, Input, Output>
@@ -411,6 +281,152 @@ where
     }
 }
 
+/// Metadata connecting one caller-owned [`Reference`] to its explicit inputs and outputs after discharge.
+///
+/// Reference discharge turns implicit access to a reference into ordinary value flow that a reference-free backend
+/// can execute. For example, consider a source function that takes parameter state by reference, updates it, and
+/// returns a public result:
+///
+/// ```text
+/// train_step(parameters: Reference<Array>, batch: Array) -> Array
+/// ```
+///
+/// Its discharged boundary has the following conceptual shape:
+///
+/// ```text
+/// train_step(parameters: Array, batch: Array) -> (result: Array, updated_parameters: Array)
+/// ```
+///
+/// [`Self::source`] identifies where the caller supplied the original reference. Before execution, the stateful
+/// invocation layer reads the reference's current value into that discharged input. The `updated_parameters` value is
+/// a synthetic writeback output: it is part of the complete discharged boundary, but the invocation layer consumes it
+/// instead of returning it as part of the source function's public result. It installs that value back into the
+/// caller's reference after execution.
+///
+/// In this example there is one public output, so [`Self::output_index`] is `Some(1)`: the absolute index of
+/// `updated_parameters` in the complete output list `[result, updated_parameters]`. A reference that the function only
+/// reads needs no writeback output and therefore has an output index of [`None`].
+///
+/// The [`serde::Serialize`] implementation exposes the canonical in-memory shape for diagnostics and snapshots and is
+/// deliberately distinct from the stable XLA persistence schema, which keeps its own versioned representation
+/// (including a redundant validated flat-input coordinate) independent of this type's evolution.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
+pub struct ExternalReferenceBinding {
+    /// Capture or public input through which the caller supplies the reference.
+    source: ReferenceSource,
+
+    /// Absolute complete-output index containing the final reference value, or [`None`] for a read-only reference.
+    output_index: Option<usize>,
+}
+
+impl ExternalReferenceBinding {
+    /// Creates a discharged-program boundary binding for one external reference.
+    ///
+    /// # Parameters
+    ///
+    ///   - `source`: Capture or public input through which the caller supplies the reference.
+    ///   - `output_index`: Absolute complete-output index containing the final reference value, or [`None`] when the
+    ///     program only reads the reference.
+    pub const fn new(source: ReferenceSource, output_index: Option<usize>) -> Self {
+        Self { source, output_index }
+    }
+
+    /// Returns the capture or public input through which the caller supplies the reference.
+    pub const fn source(&self) -> ReferenceSource {
+        self.source
+    }
+
+    /// Returns whether the program may mutate this external reference.
+    pub const fn is_mutated(&self) -> bool {
+        self.output_index.is_some()
+    }
+
+    /// Returns the absolute complete-output index containing the final reference value, if one must be written back.
+    pub const fn output_index(&self) -> Option<usize> {
+        self.output_index
+    }
+}
+
+/// Source of a [`Reference`] that is external to a [`Program`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReferenceSource {
+    /// Reference to a capture lifted into the entry boundary before input arguments.
+    Capture {
+        /// Zero-based capture position in the lifted capture prefix.
+        index: usize,
+    },
+
+    /// Reference input argument after the lifted capture prefix.
+    Input {
+        /// Zero-based input position, excluding lifted captures.
+        index: usize,
+    },
+}
+
+impl ReferenceSource {
+    /// Returns the logical source occupying one position in a program's flat entry input boundary.
+    ///
+    /// Capture lifting forms one flat input list in canonical `[captures..., inputs...]` order: the first
+    /// `capture_count` positions correspond to the source program's capture table, and every remaining position
+    /// corresponds to a public input. This function classifies `flat_input_index` relative to that split and expresses
+    /// public input positions without the leading capture prefix.
+    ///
+    /// This function cannot validate that `flat_input_index` is within the complete input boundary because it receives
+    /// only the capture-prefix length; callers enumerating a program boundary must supply one of that program's valid
+    /// input positions.
+    ///
+    /// # Parameters
+    ///
+    ///   - `flat_input_index`: Zero-based position in the complete flat `[captures..., inputs...]` entry boundary.
+    ///   - `capture_count`: Number of leading boundary positions originating in the source program's capture table.
+    #[inline]
+    pub const fn from_flat_input_index(flat_input_index: usize, capture_count: usize) -> Self {
+        if flat_input_index < capture_count {
+            Self::Capture { index: flat_input_index }
+        } else {
+            Self::Input { index: flat_input_index - capture_count }
+        }
+    }
+
+    /// Returns this logical source's position in the program's flat entry input boundary.
+    ///
+    /// Capture lifting forms one flat input list in canonical `[captures..., inputs...]` order. A capture's logical
+    /// index is therefore already its flat position, while a public input's logical index is offset by
+    /// `capture_count`, the length of the leading capture prefix.
+    ///
+    /// # Parameters
+    ///
+    ///   - `capture_count`: Number of leading boundary positions originating in the source program's capture table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when a capture index lies outside the leading capture prefix or when
+    /// offsetting a public input index by that prefix overflows `usize`.
+    pub fn flat_input_index(self, capture_count: usize) -> Result<usize, ProgramError> {
+        match self {
+            Self::Capture { index } if index < capture_count => Ok(index),
+            Self::Capture { index } => Err(ProgramError::MalformedProgram(format!(
+                "reference source capture {index} lies outside the capture prefix of length {capture_count}",
+            ))),
+            Self::Input { index } => capture_count.checked_add(index).ok_or_else(|| {
+                ProgramError::MalformedProgram(format!(
+                    "reference source input {index} overflows the flat boundary after {capture_count} captures",
+                ))
+            }),
+        }
+    }
+}
+
+impl Display for ReferenceSource {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Capture { index } => write!(formatter, "capture {index}"),
+            Self::Input { index } => write!(formatter, "input {index}"),
+        }
+    }
+}
+
 /// Validates that a discharged program boundary and its external-state bindings describe one canonical discharged
 /// shape, shared by the full and partial result envelopes.
 ///
@@ -426,7 +442,7 @@ fn validate_discharged_boundary(
     total_input_count: usize,
     total_output_count: usize,
     public_output_count: usize,
-    external_states: &[ReferenceStateBinding],
+    external_states: &[ExternalReferenceBinding],
 ) -> Result<(), ProgramError> {
     if capture_count > total_input_count {
         return Err(ProgramError::MalformedProgram(format!(
@@ -461,7 +477,7 @@ fn validate_discharged_boundary(
     }
     let mut expected_output_index = public_output_count;
     for state in external_states.iter().filter(|state| state.is_mutated()) {
-        let output_index = state.final_state_output_index().unwrap();
+        let output_index = state.output_index().unwrap();
         if output_index != expected_output_index {
             return Err(ProgramError::MalformedProgram(format!(
                 "reference discharge final-state output {output_index} for `{}` does not match expected hidden output \
@@ -507,8 +523,8 @@ mod tests {
     #[test]
     fn test_reference_discharge_result_validates_boundaries() {
         let bindings = vec![
-            ReferenceStateBinding::new(ReferenceSource::Capture { index: 0 }, Some(1)),
-            ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, Some(2)),
+            ExternalReferenceBinding::new(ReferenceSource::Capture { index: 0 }, Some(1)),
+            ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(2)),
         ];
         let result =
             ReferenceDischargeResult::from_provider_payload(TestPayload::new("program", 2, 3), 1, 1, bindings.clone())
@@ -552,7 +568,7 @@ mod tests {
                 TestPayload::new((), 0, 0),
                 0,
                 0,
-                vec![ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, None)],
+                vec![ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None)],
             )
             .unwrap_err(),
             ProgramError::MalformedProgram(
@@ -580,7 +596,7 @@ mod tests {
             let bindings = sources
                 .into_iter()
                 .enumerate()
-                .map(|(_, source)| ReferenceStateBinding::new(source, None))
+                .map(|(_, source)| ExternalReferenceBinding::new(source, None))
                 .collect();
             assert_eq!(
                 ReferenceDischargeResult::from_provider_payload(TestPayload::new((), 2, 0), 1, 0, bindings)
@@ -598,8 +614,8 @@ mod tests {
         // The partial envelope keeps the canonical discharged boundary of the full envelope, so its accessors report
         // the discharged bindings and the public-output prefix that precedes their hidden final-state suffix.
         let bindings = vec![
-            ReferenceStateBinding::new(ReferenceSource::Capture { index: 0 }, Some(1)),
-            ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, None),
+            ExternalReferenceBinding::new(ReferenceSource::Capture { index: 0 }, Some(1)),
+            ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None),
         ];
         let result =
             PartialReferenceDischargeResult::new(TestPayload::new("program", 2, 2), 1, 1, bindings.clone()).unwrap();

@@ -22,13 +22,13 @@ use pretty_assertions::assert_eq;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    Context, Domain, EagerContext, Effect, Effects, InterpretableOperation, InterpretationDriver, NoIdentity,
-    Operation, OutputRegionProvenance, Parameter, Placeholder, Program, ProgramBuilder, ProgramError,
-    RecursiveReferenceDischargeDriver, ReferenceAccessMode, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeSite, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceInput, ReferenceOperationSemantics, ReferenceOutput, ReferenceRegionDischargeBoundary,
-    ReferenceRegionStateInsertion, ReferenceSource, ReferenceStateBinding, ReferenceType, RegionInterface, RegionSlot,
-    Trace, Tracer, TracingContext, Type, TypeError, Typed, Value, discharge_reference_free_operation,
+    Context, Domain, EagerContext, Effect, Effects, ExternalReferenceBinding, InterpretableOperation,
+    InterpretationDriver, NoIdentity, Operation, OutputRegionProvenance, Parameter, Placeholder, Program,
+    ProgramBuilder, ProgramError, RecursiveReferenceDischargeDriver, ReferenceAccessMode, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeSite, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, ReferenceInput, ReferenceOperationSemantics, ReferenceOutput,
+    ReferenceRegionDischargeBoundary, ReferenceRegionStateInsertion, ReferenceSource, ReferenceType, RegionInterface,
+    RegionSlot, Trace, Tracer, TracingContext, Type, TypeError, Typed, Value, discharge_reference_free_operation,
 };
 
 /// Destination universe of the downstream programs. Its dispatch domain is the constant-only eager context, which is
@@ -588,8 +588,8 @@ fn test_downstream_program_level_discharge_threads_external_state_through_the_en
     assert_eq!(
         discharged.external_states(),
         &[
-            ReferenceStateBinding::new(ReferenceSource::Capture { index: 0 }, Some(2)),
-            ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, None),
+            ExternalReferenceBinding::new(ReferenceSource::Capture { index: 0 }, Some(2)),
+            ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None),
         ],
     );
     assert_eq!(
@@ -688,7 +688,7 @@ fn test_downstream_partial_discharge_preserves_the_allocations_it_was_not_asked_
     assert_eq!(discharged.public_output_count(), 1);
     assert_eq!(
         discharged.external_states(),
-        &[ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
+        &[ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
     );
     assert_eq!(
         discharged.program().to_string(),
@@ -733,7 +733,7 @@ fn test_downstream_structured_rule_discharges_through_the_region_boundary_api() 
     assert_eq!(discharged.public_output_count(), 1);
     assert_eq!(
         discharged.external_states(),
-        &[ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
+        &[ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
     );
     assert_eq!(
         discharged.program().to_string(),

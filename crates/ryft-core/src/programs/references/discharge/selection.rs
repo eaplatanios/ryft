@@ -133,7 +133,7 @@ where
             .enumerate()
             .filter(|(_, input)| entry.atoms()[input.index()].r#type().is_reference())
             .map(|(input_index, _)| {
-                ReferenceDischargeSite::External(ReferenceSource::from_input_index(input_index, capture_count))
+                ReferenceDischargeSite::External(ReferenceSource::from_flat_input_index(input_index, capture_count))
             })
             .collect::<Vec<_>>();
         let mut allocations = entry

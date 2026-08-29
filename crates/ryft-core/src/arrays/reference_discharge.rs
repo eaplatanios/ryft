@@ -450,10 +450,10 @@ mod tests {
     use crate::operations::{ConditionOperation, ScanOperation, WhileOperation};
     use crate::parameters::Placeholder;
     use crate::programs::{
-        Effects, Instruction, InstructionId, Operation, OutputRegionProvenance, ProgramBuilder,
-        ReferenceAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargeValue,
-        ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceOperationSemantics,
-        ReferenceReadOperation, ReferenceSource, ReferenceStateBinding, ReferenceSwapOperation, ReferenceType,
+        Effects, ExternalReferenceBinding, Instruction, InstructionId, Operation, OutputRegionProvenance,
+        ProgramBuilder, ReferenceAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver,
+        ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceNewOperation,
+        ReferenceOperationSemantics, ReferenceReadOperation, ReferenceSource, ReferenceSwapOperation, ReferenceType,
         ReferenceWriteOperation, RegionInterface, RegionSlot, TypeError, discharge_positional_region_operation,
         discharge_reference_free_operation,
     };
@@ -574,8 +574,8 @@ mod tests {
         assert_eq!(
             discharged.external_states(),
             &[
-                ReferenceStateBinding::new(ReferenceSource::Capture { index: 0 }, Some(2)),
-                ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, None),
+                ExternalReferenceBinding::new(ReferenceSource::Capture { index: 0 }, Some(2)),
+                ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None),
             ],
         );
         assert_eq!(
@@ -595,7 +595,7 @@ mod tests {
         assert_eq!(discharged.program().output_types().len(), 1);
         assert_eq!(
             discharged.external_states(),
-            &[ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, None)],
+            &[ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None)],
         );
 
         // A reference-free program is its own discharge and is returned untouched.
@@ -1314,22 +1314,22 @@ mod tests {
         assert_eq!(
             discharged.external_states(),
             &[
-                ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, Some(2)),
-                ReferenceStateBinding::new(ReferenceSource::Input { index: 1 }, None),
+                ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(2)),
+                ExternalReferenceBinding::new(ReferenceSource::Input { index: 1 }, None),
             ],
         );
         assert_eq!(
             serde_json::to_string(discharged.external_states()).unwrap(),
             concat!(
-                r#"[{"source":{"input":{"index":0}},"final_state_output_index":2},"#,
-                r#"{"source":{"input":{"index":1}},"final_state_output_index":null}]"#,
+                r#"[{"source":{"input":{"index":0}},"output_index":2},"#,
+                r#"{"source":{"input":{"index":1}},"output_index":null}]"#,
             ),
         );
         assert_eq!(
             format!("{:?}", discharged.external_states()),
             concat!(
-                "[ReferenceStateBinding { source: Input { index: 0 }, final_state_output_index: Some(2) }, ",
-                "ReferenceStateBinding { source: Input { index: 1 }, final_state_output_index: None }]",
+                "[ExternalReferenceBinding { source: Input { index: 0 }, output_index: Some(2) }, ",
+                "ExternalReferenceBinding { source: Input { index: 1 }, output_index: None }]",
             ),
         );
         assert_eq!(
@@ -2068,7 +2068,7 @@ mod tests {
                 in (%3, %4)"},
         );
         assert_eq!(discharged.public_output_count(), 1);
-        assert_eq!(discharged.external_states()[0].final_state_output_index(), Some(1));
+        assert_eq!(discharged.external_states()[0].output_index(), Some(1));
 
         // The true branch writes and then reads, so both the public snapshot and final state are the replacement.
         assert_eq!(
@@ -2150,9 +2150,9 @@ mod tests {
         assert_eq!(discharged.public_output_count(), 2);
         assert_eq!(discharged.external_states().len(), 2);
         assert_eq!(discharged.external_states()[0].source(), ReferenceSource::Input { index: 1 });
-        assert_eq!(discharged.external_states()[0].final_state_output_index(), Some(2));
+        assert_eq!(discharged.external_states()[0].output_index(), Some(2));
         assert_eq!(discharged.external_states()[1].source(), ReferenceSource::Input { index: 2 });
-        assert_eq!(discharged.external_states()[1].final_state_output_index(), Some(3));
+        assert_eq!(discharged.external_states()[1].output_index(), Some(3));
 
         // The true branch swaps only the second allocation, leaving the first allocation's final state at its entering value.
         let inputs = vec![boolean(true), scalar(10.0), scalar(20.0), scalar(11.0), scalar(22.0)];
@@ -2539,7 +2539,7 @@ mod tests {
                 in (%1, %2, %1)"},
         );
         assert_eq!(discharged.public_output_count(), 2);
-        assert_eq!(discharged.external_states()[0].final_state_output_index(), Some(2));
+        assert_eq!(discharged.external_states()[0].output_index(), Some(2));
         let scan = discharged.program().entry_region_ref().instructions()[0].operation();
         let TestOperation::Scan(scan) = scan else {
             panic!("expected discharged scan operation");
@@ -2611,7 +2611,7 @@ mod tests {
         assert_eq!(discharged.public_output_count(), 1);
         assert_eq!(discharged.external_states()[0].source(), ReferenceSource::Capture { index: 0 });
         assert_eq!(discharged.external_states()[0].source().flat_input_index(discharged.capture_count()), Ok(0));
-        assert_eq!(discharged.external_states()[0].final_state_output_index(), Some(1));
+        assert_eq!(discharged.external_states()[0].output_index(), Some(1));
         let CaptureOperation::Scan(scan) = discharged.program().entry_region_ref().instructions()[0].operation() else {
             panic!("expected discharged scan operation");
         };
@@ -2672,7 +2672,7 @@ mod tests {
         assert_eq!(discharged.program().output_types().len(), 1);
         assert_eq!(
             discharged.external_states(),
-            &[ReferenceStateBinding::new(ReferenceSource::Input { index: 0 }, None)],
+            &[ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None)],
         );
         assert_eq!(discharged.program().interpret(vec![scalar(3.0), scalar(0.0)]), Ok(vec![scalar(3.0)]));
     }
@@ -2732,7 +2732,7 @@ mod tests {
         assert_eq!(discharged.program().output_types().len(), 1);
         assert_eq!(discharged.external_states().len(), 1);
         assert!(!discharged.external_states()[0].is_mutated());
-        assert_eq!(discharged.external_states()[0].final_state_output_index(), None);
+        assert_eq!(discharged.external_states()[0].output_index(), None);
         assert_eq!(discharged.program().interpret(vec![boolean(true), scalar(4.0)]), Ok(vec![scalar(4.0)]));
         assert_eq!(discharged.program().interpret(vec![boolean(false), scalar(4.0)]), Ok(vec![scalar(4.0)]));
     }
@@ -2773,7 +2773,7 @@ mod tests {
             .unwrap();
 
         let discharged = source.discharge_references(0).unwrap();
-        assert_eq!(discharged.external_states()[0].final_state_output_index(), Some(2));
+        assert_eq!(discharged.external_states()[0].output_index(), Some(2));
         assert_eq!(
             discharged.program().interpret(vec![scalar(2.0)]),
             Ok(vec![scalar(2.0), vector(Vec::new()), scalar(2.0)]),
@@ -3035,11 +3035,11 @@ mod tests {
         assert_eq!(discharged.public_output_count(), 1);
         assert_eq!(
             discharged.external_states(),
-            &[ReferenceStateBinding::new(ReferenceSource::Capture { index: 0 }, None)],
+            &[ExternalReferenceBinding::new(ReferenceSource::Capture { index: 0 }, None)],
         );
         assert_eq!(
             serde_json::to_string(discharged.external_states()).unwrap(),
-            r#"[{"source":{"capture":{"index":0}},"final_state_output_index":null}]"#,
+            r#"[{"source":{"capture":{"index":0}},"output_index":null}]"#,
         );
         assert_eq!(
             discharged.program().input_types(),
@@ -3127,7 +3127,7 @@ mod tests {
                 .unwrap();
         let discharged = closed.discharge_references().unwrap();
         assert!(!discharged.external_states()[0].is_mutated());
-        assert_eq!(discharged.external_states()[0].final_state_output_index(), None);
+        assert_eq!(discharged.external_states()[0].output_index(), None);
         assert!(matches!(
             discharged.program().entry_region_ref().instructions()[0].operation(),
             CaptureOperation::While(_),
@@ -3158,7 +3158,7 @@ mod tests {
         let closed = ClosedProgram::new(scan_program, vec![ArrayIrValue::Reference(concrete_reference)]).unwrap();
         let discharged = closed.discharge_references().unwrap();
         assert!(!discharged.external_states()[0].is_mutated());
-        assert_eq!(discharged.external_states()[0].final_state_output_index(), None);
+        assert_eq!(discharged.external_states()[0].output_index(), None);
         assert_eq!(discharged.program().output_types(), vec![vector(vec![0.0, 0.0]).r#type().into_owned()]);
         let scan = discharged.program().entry_region_ref().instructions()[0].operation();
         let CaptureOperation::Scan(scan) = scan else {
@@ -3209,7 +3209,7 @@ mod tests {
         assert_eq!(discharged.external_states()[0].source(), ReferenceSource::Capture { index: 0 });
         assert_eq!(discharged.external_states()[0].source().flat_input_index(discharged.capture_count()), Ok(0));
         assert!(discharged.external_states()[0].is_mutated());
-        assert_eq!(discharged.external_states()[0].final_state_output_index(), Some(1));
+        assert_eq!(discharged.external_states()[0].output_index(), Some(1));
         assert_eq!(
             discharged.program().to_string(),
             indoc! {"

@@ -4932,7 +4932,7 @@ mod tests {
         assert_eq!(discharged.program().output_types().len(), 1);
         assert_eq!(discharged.external_states().len(), 1);
         assert!(!discharged.external_states()[0].is_mutated());
-        assert_eq!(discharged.external_states()[0].final_state_output_index(), None);
+        assert_eq!(discharged.external_states()[0].output_index(), None);
         assert_eq!(
             discharged
                 .program()
