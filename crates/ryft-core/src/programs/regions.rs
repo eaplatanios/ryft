@@ -926,6 +926,17 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
         self.contains_atom_in_closure(|atom| predicate(atom.r#type().as_ref()))
     }
 
+    /// Returns whether this [`Region`]'s complete attached region closure contains a reference-typed [`Atom`] or an
+    /// [`Operation`] with nonempty reference semantics. Every attached region is traversed regardless of
+    /// [`RegionRole`], and shared descendants are visited once.
+    #[inline]
+    pub fn contains_references_in_closure(self) -> bool {
+        self.contains_atom_type_in_closure(Type::is_reference)
+            || self
+                .instructions_in_closure()
+                .any(|(_, instruction)| !instruction.operation().reference_semantics().is_empty())
+    }
+
     /// Returns whether `predicate` holds for any [`Region`] in this root's complete attached region closure, applying
     /// it at most once to each visited region and short-circuiting at the first match.
     fn any_region_in_closure<F: FnMut(Self) -> bool>(self, mut predicate: F) -> bool {
