@@ -387,6 +387,7 @@ impl Display for ReferenceSource {
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+    use std::collections::HashMap;
 
     use pretty_assertions::assert_eq;
 
@@ -394,7 +395,9 @@ mod tests {
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::effects::{Effect, Effects};
     use crate::programs::operations::Operation;
-    use crate::programs::references::discharge::tests::{TestType, TestValue, boundary_program, reference_type};
+    use crate::programs::references::discharge::tests::{
+        TestOperation, TestType, TestValue, boundary_program, reference_type,
+    };
     use crate::programs::references::semantics::{ReferenceAccessMode, ReferenceInput, ReferenceOperationSemantics};
     use crate::programs::regions::RegionInterface;
     use crate::programs::types::TypeError;
@@ -648,6 +651,39 @@ mod tests {
     }
 
     #[test]
+    fn test_partial_reference_discharge_result_try_into_full_checks_the_attached_region_closure() {
+        // The entry boundary is reference-free, but its attached callee allocates and consumes a local reference.
+        // Inspecting only the entry region would therefore accept this program incorrectly.
+        let mut callee_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let initial = callee_builder.add_input(TestType::Value(0));
+        let allocation = callee_builder
+            .add_instruction(TestOperation::NewAllocation, Vec::new(), vec![initial], None)
+            .unwrap()[0];
+        let value =
+            callee_builder.add_instruction(TestOperation::Consume, Vec::new(), vec![allocation], None).unwrap()[0];
+        let callee = callee_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![value], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let initial = builder.add_input(TestType::Value(0));
+        let callee = builder.import_program(callee);
+        let value = builder.add_instruction(TestOperation::Call, vec![callee], vec![initial], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![value], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let partial = PartialReferenceDischargeResult::new(program, 0, 1, Vec::new()).unwrap();
+
+        assert_eq!(
+            partial.try_into_full().unwrap_err(),
+            ProgramError::MalformedProgram(
+                "reference discharge program still contains a reference-typed value and cannot form a full discharge"
+                    .to_string(),
+            ),
+        );
+    }
+
+    #[test]
     fn test_external_reference_binding_accessors_and_serialization() {
         let read_only = ExternalReferenceBinding::new(ReferenceSource::Capture { index: 0 }, None);
         let mutated = ExternalReferenceBinding::new(ReferenceSource::Input { index: 2 }, Some(3));
@@ -658,7 +694,11 @@ mod tests {
         assert_eq!(mutated.source(), ReferenceSource::Input { index: 2 });
         assert!(mutated.is_mutated());
         assert_eq!(mutated.output_index(), Some(3));
+        assert_eq!(read_only, read_only);
         assert_ne!(read_only, mutated);
+        let bindings = HashMap::from([(read_only, "read-only"), (mutated, "mutated")]);
+        assert_eq!(bindings.get(&read_only), Some(&"read-only"));
+        assert_eq!(bindings.get(&mutated), Some(&"mutated"));
         assert_eq!(
             format!("{mutated:?}"),
             "ExternalReferenceBinding { source: Input { index: 2 }, output_index: Some(3) }",
@@ -672,6 +712,7 @@ mod tests {
     #[test]
     fn test_reference_source_flat_input_index_round_trips() {
         for (flat_input_index, capture_count, source) in [
+            (0, 0, ReferenceSource::Input { index: 0 }),
             (0, 2, ReferenceSource::Capture { index: 0 }),
             (1, 2, ReferenceSource::Capture { index: 1 }),
             (2, 2, ReferenceSource::Input { index: 0 }),
