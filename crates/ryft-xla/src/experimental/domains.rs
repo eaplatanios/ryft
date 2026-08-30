@@ -3256,7 +3256,7 @@ impl<'c> XlaDomain<'c> {
             discharged.program(),
             discharged.capture_count(),
             discharged.output_count(),
-            discharged.external_states(),
+            discharged.external_reference_bindings(),
             options,
         )
     }

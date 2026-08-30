@@ -2598,9 +2598,9 @@ mod tests {
         );
         assert_eq!(discharged.output_count(), 1);
         assert_eq!(discharged.program().output_types().len(), 1);
-        assert_eq!(discharged.external_states().len(), 1);
-        assert!(!discharged.external_states()[0].is_mutated());
-        assert_eq!(discharged.external_states()[0].output_index(), None);
+        assert_eq!(discharged.external_reference_bindings().len(), 1);
+        assert!(!discharged.external_reference_bindings()[0].is_mutated());
+        assert_eq!(discharged.external_reference_bindings()[0].output_index(), None);
 
         // A root one branch mutates is published instead. Exactly one output is appended, and both branches receive
         // the identical widened boundary even though only the true branch writes: the reading branch republishes the
@@ -2657,7 +2657,7 @@ mod tests {
                 in (%2, %3)"},
         );
         assert_eq!(discharged.output_count(), 1);
-        assert_eq!(discharged.external_states()[0].output_index(), Some(1));
+        assert_eq!(discharged.external_reference_bindings()[0].output_index(), Some(1));
 
         // Pruning is decided per root rather than for the operation as a whole. Two roots enter as operands and both
         // branches reach both of them, but only the second is ever written, so only the second gains an appended
@@ -2703,9 +2703,9 @@ mod tests {
             .unwrap();
         let discharged = source.discharge_references(0).unwrap();
         assert_eq!(discharged.output_count(), 1);
-        assert_eq!(discharged.external_states().len(), 2);
-        assert_eq!(discharged.external_states()[0].output_index(), None);
-        assert_eq!(discharged.external_states()[1].output_index(), Some(1));
+        assert_eq!(discharged.external_reference_bindings().len(), 2);
+        assert_eq!(discharged.external_reference_bindings()[0].output_index(), None);
+        assert_eq!(discharged.external_reference_bindings()[1].output_index(), Some(1));
 
         // The true branch reports the first root's state and accumulates into the second; the false branch reports the
         // second root's state and writes nothing, so its appended final state is the value that entered.

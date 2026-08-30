@@ -1067,7 +1067,7 @@ pub(crate) mod tests {
 
         let preserved = source.partially_discharge_references(0, &[]).unwrap();
         assert_eq!(preserved.output_count(), 3);
-        assert_eq!(preserved.external_states(), &[]);
+        assert_eq!(preserved.external_reference_bindings(), &[]);
         assert_eq!(
             preserved.program().to_string(),
             indoc! {"

@@ -340,7 +340,7 @@ mod tests {
 
         let discharged = source.discharge_references(0).unwrap();
         assert_eq!(discharged.output_count(), 2);
-        assert_eq!(discharged.external_states(), &[]);
+        assert_eq!(discharged.external_reference_bindings(), &[]);
         assert_eq!(
             discharged.program().to_string(),
             indoc! {"

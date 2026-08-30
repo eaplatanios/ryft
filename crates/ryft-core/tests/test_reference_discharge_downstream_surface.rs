@@ -25,11 +25,11 @@ use ryft_core::{
     Context, Domain, EagerContext, Effect, Effects, ExternalReferenceBinding, InterpretableOperation,
     InterpretationDriver, NoIdentity, Operation, OutputRegionProvenance, Parameter, Placeholder, Program,
     ProgramBuilder, ProgramError, RecursiveReferenceDischargeDriver, ReferenceAccessMode, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeTarget, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceInput, ReferenceOperationSemantics,
-    ReferenceOutput, ReferenceRegionDischargeBoundary, ReferenceRegionStateInsertion, ReferenceSource, ReferenceType,
-    RegionInterface, RegionSlot, Trace, Tracer, TracingContext, Type, TypeError, Typed, Value,
-    discharge_reference_free_operation,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeResult, ReferenceDischargeTarget,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceInput,
+    ReferenceOperationSemantics, ReferenceOutput, ReferenceRegionDischargeBoundary, ReferenceRegionStateInsertion,
+    ReferenceSource, ReferenceType, RegionInterface, RegionSlot, Trace, Tracer, TracingContext, Type, TypeError, Typed,
+    Value, discharge_reference_free_operation,
 };
 
 /// Destination universe of the downstream programs. Its dispatch domain is the constant-only eager context, which is
@@ -588,7 +588,7 @@ fn test_downstream_program_level_discharge_threads_external_state_through_the_en
     let discharged = source.discharge_references(1).unwrap();
     assert_eq!(discharged.output_count(), 2);
     assert_eq!(
-        discharged.external_states(),
+        discharged.external_reference_bindings(),
         &[
             ExternalReferenceBinding::new(ReferenceSource::Capture { index: 0 }, Some(2)),
             ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None),
@@ -687,7 +687,7 @@ fn test_downstream_partial_discharge_preserves_the_allocations_it_was_not_asked_
     // the preserved reference kept its reference type and reports no binding, and both of its accesses replayed verbatim.
     assert_eq!(discharged.output_count(), 1);
     assert_eq!(
-        discharged.external_states(),
+        discharged.external_reference_bindings(),
         &[ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
     );
     assert_eq!(
@@ -732,7 +732,7 @@ fn test_downstream_structured_rule_discharges_through_the_region_boundary_api() 
     let discharged = source.discharge_references(0).unwrap();
     assert_eq!(discharged.output_count(), 1);
     assert_eq!(
-        discharged.external_states(),
+        discharged.external_reference_bindings(),
         &[ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
     );
     assert_eq!(
@@ -772,7 +772,7 @@ fn test_downstream_partial_targets_reach_an_internal_allocation_inside_a_structu
         .unwrap();
 
     let preserved = source.clone().partially_discharge_references(0, &[]).unwrap();
-    assert_eq!(preserved.external_states(), &[]);
+    assert_eq!(preserved.external_reference_bindings(), &[]);
     assert_eq!(
         preserved.program().to_string(),
         indoc! {"
@@ -790,7 +790,9 @@ fn test_downstream_partial_targets_reach_an_internal_allocation_inside_a_structu
 
     let targets = source.reference_discharge_targets(0).unwrap();
     assert_eq!(targets.len(), 1);
-    let full = source.partially_discharge_references(0, targets.as_slice()).unwrap().try_into_full().unwrap();
+    let full =
+        ReferenceDischargeResult::try_from(source.partially_discharge_references(0, targets.as_slice()).unwrap())
+            .unwrap();
     assert_eq!(
         full.program().to_string(),
         indoc! {"

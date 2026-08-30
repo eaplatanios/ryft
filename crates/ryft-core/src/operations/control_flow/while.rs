@@ -4933,9 +4933,9 @@ mod tests {
         // property of the loop's own boundaries, not a claim that the loop wrote what it carried.
         assert_eq!(discharged.output_count(), 1);
         assert_eq!(discharged.program().output_types().len(), 1);
-        assert_eq!(discharged.external_states().len(), 1);
-        assert!(!discharged.external_states()[0].is_mutated());
-        assert_eq!(discharged.external_states()[0].output_index(), None);
+        assert_eq!(discharged.external_reference_bindings().len(), 1);
+        assert!(!discharged.external_reference_bindings()[0].is_mutated());
+        assert_eq!(discharged.external_reference_bindings()[0].output_index(), None);
         assert_eq!(
             discharged
                 .program()

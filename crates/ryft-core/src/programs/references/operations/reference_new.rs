@@ -157,6 +157,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::identities::TypeIdentityPosition;
+    use crate::programs::references::discharge::ReferenceDischargeResult;
     use crate::programs::references::operations::tests::*;
     use crate::programs::regions::EmptyRegionDriver;
 
@@ -268,7 +269,7 @@ mod tests {
 
         let preserved = source.clone().partially_discharge_references(0, &[]).unwrap();
         assert_eq!(preserved.output_count(), 1);
-        assert_eq!(preserved.external_states(), &[]);
+        assert_eq!(preserved.external_reference_bindings(), &[]);
         assert_eq!(
             preserved.program().to_string(),
             indoc! {"
@@ -281,12 +282,10 @@ mod tests {
 
         // Selecting that same target is the everything-selected case, so it must agree with full discharge exactly.
         let targets = source.reference_discharge_targets(0).unwrap();
-        let selected = source
-            .clone()
-            .partially_discharge_references(0, targets.as_slice())
-            .unwrap()
-            .try_into_full()
-            .unwrap();
+        let selected = ReferenceDischargeResult::try_from(
+            source.clone().partially_discharge_references(0, targets.as_slice()).unwrap(),
+        )
+        .unwrap();
         let full = source.discharge_references(0).unwrap();
         assert_eq!(selected.program().to_string(), full.program().to_string());
         assert_eq!(

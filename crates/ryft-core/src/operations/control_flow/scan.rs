@@ -5292,7 +5292,7 @@ mod tests {
         // The allocation is local to the program, so nothing crosses the entry boundary and the rewritten program must
         // reproduce the eager reference execution output for output.
         assert_eq!(discharged.output_count(), 3);
-        assert_eq!(discharged.external_states(), &[]);
+        assert_eq!(discharged.external_reference_bindings(), &[]);
         assert_eq!(discharged.program().interpret(inputs), Ok(expected));
     }
 }

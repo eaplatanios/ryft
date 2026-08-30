@@ -1353,11 +1353,12 @@ mod tests {
         DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, DynamicBroadcastOperation, Effects,
         EmptyRegionDriver, ExternalReferenceBinding, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation,
         Operation, OutputRegionProvenance, PartialValue, Placeholder, ProgramBuilder, ProgramError,
-        ReferenceAddUpdateOperation, ReferenceDischargeTarget, ReferenceFreezeOperation, ReferenceNewOperation,
-        ReferenceReadOperation, ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation,
-        RegionDriver, RegionInterface, RegionRef, RematerializeOperation, ResidualZeroProvider, ScanOperation, Shape,
-        Sharding, ShardingDimension, StagingContext, Tracer, TracingContext, TranspositionDriver, TypeError,
-        TypeIdentityRenaming, Typed, Value, ValueProjection, WhileOperation, ZeroOperation,
+        ReferenceAddUpdateOperation, ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceFreezeOperation,
+        ReferenceNewOperation, ReferenceReadOperation, ReferenceSource, ReferenceSwapOperation, ReferenceType,
+        ReferenceWriteOperation, RegionDriver, RegionInterface, RegionRef, RematerializeOperation,
+        ResidualZeroProvider, ScanOperation, Shape, Sharding, ShardingDimension, StagingContext, Tracer,
+        TracingContext, TranspositionDriver, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+        WhileOperation, ZeroOperation,
     };
 
     use crate::Array;
@@ -1630,7 +1631,7 @@ mod tests {
         // accumulation, and consumption become ordinary array SSA.
         assert_eq!(discharged.output_count(), 1);
         assert_eq!(
-            discharged.external_states(),
+            discharged.external_reference_bindings(),
             &[ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
         );
         assert_eq!(
@@ -2413,13 +2414,13 @@ mod tests {
         let discharged = program.discharge_references(0).unwrap();
         assert_eq!(discharged.output_count(), 2);
         assert_eq!(discharged.program().output_count(), 4);
-        assert_eq!(discharged.external_states().len(), 2);
-        assert_eq!(discharged.external_states()[0].source(), ReferenceSource::Input { index: 0 });
-        assert!(discharged.external_states()[0].is_mutated());
-        assert_eq!(discharged.external_states()[0].output_index(), Some(2));
-        assert_eq!(discharged.external_states()[1].source(), ReferenceSource::Input { index: 2 });
-        assert!(discharged.external_states()[1].is_mutated());
-        assert_eq!(discharged.external_states()[1].output_index(), Some(3));
+        assert_eq!(discharged.external_reference_bindings().len(), 2);
+        assert_eq!(discharged.external_reference_bindings()[0].source(), ReferenceSource::Input { index: 0 });
+        assert!(discharged.external_reference_bindings()[0].is_mutated());
+        assert_eq!(discharged.external_reference_bindings()[0].output_index(), Some(2));
+        assert_eq!(discharged.external_reference_bindings()[1].source(), ReferenceSource::Input { index: 2 });
+        assert!(discharged.external_reference_bindings()[1].is_mutated());
+        assert_eq!(discharged.external_reference_bindings()[1].output_index(), Some(3));
     }
 
     #[test]
@@ -2477,13 +2478,13 @@ mod tests {
         let discharged = program.discharge_references_in_capture_lifted_program(0).unwrap();
         assert_eq!(discharged.output_count(), 1);
         assert_eq!(discharged.program().output_count(), 2);
-        assert_eq!(discharged.external_states().len(), 2);
-        assert_eq!(discharged.external_states()[0].source(), ReferenceSource::Input { index: 0 });
-        assert!(!discharged.external_states()[0].is_mutated());
-        assert_eq!(discharged.external_states()[0].output_index(), None);
-        assert_eq!(discharged.external_states()[1].source(), ReferenceSource::Input { index: 1 });
-        assert!(discharged.external_states()[1].is_mutated());
-        assert_eq!(discharged.external_states()[1].output_index(), Some(1));
+        assert_eq!(discharged.external_reference_bindings().len(), 2);
+        assert_eq!(discharged.external_reference_bindings()[0].source(), ReferenceSource::Input { index: 0 });
+        assert!(!discharged.external_reference_bindings()[0].is_mutated());
+        assert_eq!(discharged.external_reference_bindings()[0].output_index(), None);
+        assert_eq!(discharged.external_reference_bindings()[1].source(), ReferenceSource::Input { index: 1 });
+        assert!(discharged.external_reference_bindings()[1].is_mutated());
+        assert_eq!(discharged.external_reference_bindings()[1].output_index(), Some(1));
     }
 
     #[test]
@@ -2513,10 +2514,10 @@ mod tests {
         let discharged = program.discharge_references(0).unwrap();
         assert_eq!(discharged.output_count(), 1);
         assert_eq!(discharged.program().output_count(), 1);
-        assert_eq!(discharged.external_states().len(), 1);
-        assert_eq!(discharged.external_states()[0].source(), ReferenceSource::Input { index: 0 });
-        assert!(!discharged.external_states()[0].is_mutated());
-        assert_eq!(discharged.external_states()[0].output_index(), None);
+        assert_eq!(discharged.external_reference_bindings().len(), 1);
+        assert_eq!(discharged.external_reference_bindings()[0].source(), ReferenceSource::Input { index: 0 });
+        assert!(!discharged.external_reference_bindings()[0].is_mutated());
+        assert_eq!(discharged.external_reference_bindings()[0].output_index(), None);
     }
 
     #[test]
@@ -2557,7 +2558,7 @@ mod tests {
         // The callee's local root is allocated, mutated, and consumed inside the call, so widening the boundary
         // leaves no external state behind and the rewritten call is the entry region's only instruction.
         let discharged = source.discharge_references(0).unwrap();
-        assert_eq!(discharged.external_states(), &[]);
+        assert_eq!(discharged.external_reference_bindings(), &[]);
         assert_eq!(discharged.program().output_types().len(), 2);
         assert_eq!(discharged.program().entry_region_ref().instructions().len(), 1);
     }
@@ -2608,7 +2609,7 @@ mod tests {
         // preserved. The scan retains its reference access and gains a reference-typed carry that binds the rebuilt
         // body's capture without turning it into state.
         let preserved = program.clone().partially_discharge_references_in_capture_lifted_program(1, &[]).unwrap();
-        assert!(preserved.external_states().is_empty());
+        assert!(preserved.external_reference_bindings().is_empty());
         assert!(preserved.program().entry_region_ref().contains_references_in_closure());
         let XlaOperation::Scan(scan) = preserved.program().entry_region_ref().instructions()[0].operation() else {
             panic!("expected a partially discharged scan operation");
@@ -2617,19 +2618,20 @@ mod tests {
 
         // Selecting the captured allocation through the partial entry point agrees exactly with full capture-aware
         // discharge. Threading its state widens the carry list while leaving the scan's capture metadata intact.
-        let selected = program
-            .clone()
-            .partially_discharge_references_in_capture_lifted_program(1, targets.as_slice())
-            .unwrap()
-            .try_into_full()
-            .unwrap();
+        let selected = ReferenceDischargeResult::try_from(
+            program
+                .clone()
+                .partially_discharge_references_in_capture_lifted_program(1, targets.as_slice())
+                .unwrap(),
+        )
+        .unwrap();
         let discharged = program.discharge_references_in_capture_lifted_program(1).unwrap();
         assert_eq!(selected.program().to_string(), discharged.program().to_string());
-        assert_eq!(selected.external_states(), discharged.external_states());
+        assert_eq!(selected.external_reference_bindings(), discharged.external_reference_bindings());
         assert_eq!(discharged.output_count(), 2);
-        assert_eq!(discharged.external_states().len(), 1);
-        assert_eq!(discharged.external_states()[0].source(), ReferenceSource::Capture { index: 0 });
-        assert!(!discharged.external_states()[0].is_mutated());
+        assert_eq!(discharged.external_reference_bindings().len(), 1);
+        assert_eq!(discharged.external_reference_bindings()[0].source(), ReferenceSource::Capture { index: 0 });
+        assert!(!discharged.external_reference_bindings()[0].is_mutated());
         let XlaOperation::Scan(scan) = discharged.program().entry_region_ref().instructions()[0].operation() else {
             panic!("expected a discharged scan operation");
         };

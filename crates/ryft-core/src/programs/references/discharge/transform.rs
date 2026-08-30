@@ -28,7 +28,7 @@ type CanonicalReferenceDischargePolicy<T> = <T as ReferenceDischargeableType>::P
 
 impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// Discharges every reference this program touches by interpreting it in a [`ReferenceDischargeContext`] over a
-    /// fresh trace of its own universe, returning the reference-free program together with its logical external-state
+    /// fresh trace of its own universe, returning the reference-free program together with its external-reference
     /// bindings.
     ///
     /// This is the entry point production discharge runs through, and it owns the whole reference language: the
@@ -52,9 +52,9 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// source coordinate into the rules, which is what makes an entry-region allocation identifiable.
     ///
     /// The rewritten program is proven reference-free rather than assumed to be: the replay assembles a
-    /// [`PartialReferenceDischargeResult`] and converts it through
-    /// [`try_into_full`](PartialReferenceDischargeResult::try_into_full), so a rule that returned a reference-touching
-    /// operation is reported here instead of surviving into a result whose contract says it cannot exist.
+    /// [`PartialReferenceDischargeResult`] and converts it through [`ReferenceDischargeResult::try_from`], so a rule
+    /// that returned a reference-touching operation is reported here instead of surviving into a result whose contract
+    /// says it cannot exist.
     ///
     /// # Parameters
     ///
@@ -94,12 +94,13 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
             <CanonicalReferenceDischargePolicy<V::Type> as ReferenceDischargePolicy<TracingContext<V, O>>>::Referent,
         >: TryFrom<&'t V::Type>,
     {
-        self.discharge_references_helper::<CanonicalReferenceDischargePolicy<V::Type>>(
-            capture_count,
-            |_| None,
-            ReferenceDischargeTargets::everything(),
-        )?
-        .try_into_full()
+        ReferenceDischargeResult::try_from(
+            self.discharge_references_helper::<CanonicalReferenceDischargePolicy<V::Type>>(
+                capture_count,
+                |_| None,
+                ReferenceDischargeTargets::everything(),
+            )?,
+        )
     }
 
     /// Discharges every reference a *capture-lifted* program touches, resolving the capture-scoped reference
@@ -154,16 +155,17 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
             <CanonicalReferenceDischargePolicy<V::Type> as ReferenceDischargePolicy<TracingContext<V, O>>>::Referent,
         >: TryFrom<&'t V::Type>,
     {
-        self.discharge_references_helper::<CanonicalReferenceDischargePolicy<V::Type>>(
-            capture_count,
-            CaptureConstant::capture_index,
-            ReferenceDischargeTargets::everything(),
-        )?
-        .try_into_full()
+        ReferenceDischargeResult::try_from(
+            self.discharge_references_helper::<CanonicalReferenceDischargePolicy<V::Type>>(
+                capture_count,
+                CaptureConstant::capture_index,
+                ReferenceDischargeTargets::everything(),
+            )?,
+        )
     }
 
     /// Discharges the references the caller *selected* and preserves every other one, returning the mixed program
-    /// together with the logical external-state bindings of the allocations that became state.
+    /// together with the external-reference bindings of the allocations that became state.
     ///
     /// This is the same rewrite [`discharge_references`](Self::discharge_references) performs;
     /// full discharge is exactly its everything-selected case, and the two share one body. A selected allocation threads as
@@ -176,8 +178,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// This is what a kernel pipeline needs — normalize the pipeline's own state into explicit carries while the
     /// references a kernel body addresses stay references — and it is the reason the result envelope is
     /// [`PartialReferenceDischargeResult`], which proves nothing about reference freedom. A caller that expects the
-    /// targets to have covered everything asks for the proof explicitly through
-    /// [`try_into_full`](PartialReferenceDischargeResult::try_into_full).
+    /// targets to have covered everything asks for the proof explicitly through [`ReferenceDischargeResult::try_from`].
     ///
     /// A preserved reference crosses a structured operation's region boundary as the reference it already is. When the
     /// source declares a boundary position for it, the rewritten operation keeps that position. When an attached
@@ -354,7 +355,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
         // The block scopes the destination context, the discharge context, and every carrier, because recovering the
         // traced program below requires unique ownership of the shared builder and therefore that every other handle
         // to it has been released.
-        let (builder, output_ids, external_states) = {
+        let (builder, output_ids, external_reference_bindings) = {
             let destination = TracingContext::<V, O>::new();
             let builder = destination.builder().clone();
             let context =
@@ -425,7 +426,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
             // which is what keeps a read-only program's boundary identical to its source boundary. A preserved
             // external allocation binds nothing at all: it never became state, so there is no state for a caller to supply
             // or to write back.
-            let mut external_states = Vec::with_capacity(discharged_allocations.len());
+            let mut external_reference_bindings = Vec::with_capacity(discharged_allocations.len());
             for (source, allocation) in discharged_allocations {
                 if context.validate_live_allocation(allocation).is_err() {
                     return Err(ProgramError::MalformedProgram(format!(
@@ -438,16 +439,16 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
                 } else {
                     None
                 };
-                external_states.push(ExternalReferenceBinding::new(source, output_index));
+                external_reference_bindings.push(ExternalReferenceBinding::new(source, output_index));
             }
-            (builder, output_ids, external_states)
+            (builder, output_ids, external_reference_bindings)
         };
 
         let complete_output_count = output_ids.len();
         let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
         let program =
             builder.build(output_ids, vec![Placeholder; input_count], vec![Placeholder; complete_output_count])?;
-        PartialReferenceDischargeResult::new(program, capture_count, output_count, external_states)
+        PartialReferenceDischargeResult::new(program, capture_count, output_count, external_reference_bindings)
     }
 }
 
@@ -540,7 +541,7 @@ mod tests {
         // as a hidden output; the preserved reference kept its reference type, so it binds nothing at all.
         assert_eq!(discharged.output_count(), 1);
         assert_eq!(
-            discharged.external_states(),
+            discharged.external_reference_bindings(),
             &[ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
         );
         assert_eq!(
@@ -558,7 +559,7 @@ mod tests {
         // The result deliberately proves nothing about reference freedom, and asking for the proof reports the
         // surviving reference rather than converting.
         assert_eq!(
-            discharged.try_into_full().unwrap_err(),
+            ReferenceDischargeResult::try_from(discharged).unwrap_err(),
             ProgramError::MalformedProgram(
                 "reference discharge program still contains a reference-typed value and cannot form a full discharge"
                     .to_string(),
@@ -590,7 +591,7 @@ mod tests {
         let discharged = source.clone().partially_discharge_references(0, &[]);
         let discharged = discharged.unwrap();
         assert_eq!(discharged.output_count(), 1);
-        assert_eq!(discharged.external_states(), &[]);
+        assert_eq!(discharged.external_reference_bindings(), &[]);
         assert_eq!(
             discharged.program().to_string(),
             indoc! {"
@@ -613,7 +614,7 @@ mod tests {
             }],
         );
         let selected = source.clone().partially_discharge_references(0, targets.as_slice());
-        let selected = selected.unwrap().try_into_full().unwrap();
+        let selected = ReferenceDischargeResult::try_from(selected.unwrap()).unwrap();
         let full = source.discharge_references(0).unwrap();
         assert_eq!(selected.program().to_string(), full.program().to_string());
     }
@@ -632,7 +633,7 @@ mod tests {
             .unwrap();
 
         let preserved = source.clone().partially_discharge_references(0, &[]).unwrap();
-        assert_eq!(preserved.external_states(), &[]);
+        assert_eq!(preserved.external_reference_bindings(), &[]);
         assert_eq!(
             preserved.program().to_string(),
             indoc! {"
@@ -706,7 +707,7 @@ mod tests {
         // performs the read on it exactly as the source did.
         assert_eq!(discharged.output_count(), 1);
         assert_eq!(
-            discharged.external_states(),
+            discharged.external_reference_bindings(),
             &[ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
         );
         assert_eq!(
