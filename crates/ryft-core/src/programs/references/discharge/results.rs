@@ -123,6 +123,38 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeResult<V, O> {
     }
 }
 
+impl<V: Value, O: Operation<Type = V::Type>> TryFrom<PartialReferenceDischargeResult<V, O>>
+    for ReferenceDischargeResult<V, O>
+{
+    type Error = ProgramError;
+
+    fn try_from(partial: PartialReferenceDischargeResult<V, O>) -> Result<Self, Self::Error> {
+        let entry = partial.program.entry_region_ref();
+        if entry.contains_atom_type_in_closure(Type::is_reference) {
+            return Err(ProgramError::MalformedProgram(
+                "reference discharge program still contains a reference-typed value and cannot form a full discharge"
+                    .to_string(),
+            ));
+        }
+
+        // The closure traversal visits regions in an unspecified order, so the reported occurrence is the smallest
+        // coordinate rather than the first one encountered, keeping the diagnostic reproducible.
+        if let Some((instruction_id, instruction)) = entry
+            .instructions_in_closure()
+            .filter(|(_, instruction)| !instruction.operation().reference_semantics().is_empty())
+            .min_by_key(|(instruction_id, _)| *instruction_id)
+        {
+            return Err(ProgramError::MalformedProgram(format!(
+                "reference discharge program retains reference operation `{}` at `{}` and cannot form a full discharge",
+                instruction.operation().name(),
+                instruction_id,
+            )));
+        }
+
+        Ok(Self { partial })
+    }
+}
+
 /// [`Program`] produced by _partial_ reference discharge, in which only the caller-selected reference targets became
 /// explicit immutable state and every unselected allocation survives as a well-typed reference value. The discharged
 /// part of the boundary obeys exactly the invariants of [`ReferenceDischargeResult`]: discharged external allocations
@@ -145,19 +177,16 @@ pub struct PartialReferenceDischargeResult<V: Value, O: Operation<Type = V::Type
     external_reference_bindings: Vec<ExternalReferenceBinding>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<V: Value, O: Operation<Type = V::Type>> PartialReferenceDischargeResult<V, O> {
-    /// Creates a checked partial reference discharge result.
-    ///
-    /// The external-reference bindings describe the *discharged* allocations only and must satisfy the same canonical
-    /// boundary invariants as [`ReferenceDischargeResult`]: they must name valid discharged inputs in canonical source
-    /// order, and their final-state output indices, omitting read-only bindings, must exactly cover the hidden output
-    /// suffix in binding order.
+    /// Creates a new [`PartialReferenceDischargeResult`]. The provided external reference bindings
+    /// describe the discharged allocations only and must satisfy the same canonical boundary invariants as
+    /// [`ReferenceDischargeResult`] (i.e., they must name valid discharged inputs in canonical source order, and their
+    /// final state output indices, omitting read-only bindings, must exactly cover the hidden output suffix in binding
+    /// order).
     ///
     /// # Parameters
     ///
-    ///   - `program`: Partially discharged program.
+    ///   - `program`: Partially discharged [`Program`].
     ///   - `capture_count`: Number of leading inputs originating in the source program's capture table.
     ///   - `output_count`: Number of public outputs preceding hidden final-state outputs.
     ///   - `external_reference_bindings`: Logical bindings for the discharged external references, in canonical
@@ -191,9 +220,10 @@ impl<V: Value, O: Operation<Type = V::Type>> PartialReferenceDischargeResult<V, 
             let input_index = binding.source().flat_input_index(capture_count)?;
             if input_index >= total_input_count {
                 return Err(ProgramError::MalformedProgram(format!(
-                    "reference discharge state for `{}` names input {input_index} but discharged input count is \
-                     {total_input_count}",
+                    "reference discharge state for `{}` names input {} but discharged input count is {}",
                     binding.source(),
+                    input_index,
+                    total_input_count,
                 )));
             }
         }
@@ -212,9 +242,10 @@ impl<V: Value, O: Operation<Type = V::Type>> PartialReferenceDischargeResult<V, 
             let output_index = binding.output_index().unwrap();
             if output_index != expected_output_index {
                 return Err(ProgramError::MalformedProgram(format!(
-                    "reference discharge final-state output {output_index} for `{}` does not match expected hidden \
-                     output {expected_output_index}",
+                    "reference discharge final-state output {} for `{}` does not match expected hidden output {}",
+                    output_index,
                     binding.source(),
+                    expected_output_index,
                 )));
             }
             expected_output_index = expected_output_index.checked_add(1).ok_or_else(|| {
@@ -230,55 +261,48 @@ impl<V: Value, O: Operation<Type = V::Type>> PartialReferenceDischargeResult<V, 
         Ok(Self { program, capture_count, output_count, external_reference_bindings })
     }
 
-    /// Returns the partially discharged program.
-    ///
-    /// Unlike [`ReferenceDischargeResult::program`], this program may still contain reference-typed values and
-    /// operations for allocations that the caller did not select for discharge. Use [`TryFrom`] to prove that it is
-    /// reference-free and convert it into a full result.
+    /// Returns the underlying partially discharged [`Program`]. Unlike [`ReferenceDischargeResult::program`], this
+    /// program may still contain reference-typed values and operations for allocations that the caller did not select
+    /// for discharge.
     #[inline]
     pub const fn program(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
         &self.program
     }
 
-    /// Returns the number of leading program inputs lifted from the source program's capture table.
-    ///
-    /// The boundary uses `[captures..., inputs...]` order, and this count is the split point between the two groups. It
-    /// counts all lifted captures, including ordinary captures and preserved reference captures that do not appear in
-    /// [`Self::external_reference_bindings`]. For example, a count of `1` gives
-    /// `[capture 0 | input 0, input 1, ...]`.
+    /// Returns the number of leading [`Program`] inputs lifted from the source program's capture table. The boundary
+    /// uses `[captures..., inputs...]` order, and this count is the split point between the two groups. It counts all
+    /// lifted captures, including ordinary captures and preserved reference captures that do not appear in
+    /// [`Self::external_reference_bindings`]. For example, a count of `1` gives `[capture 0 | input 0, input 1, ...]`.
     #[inline]
     pub const fn capture_count(&self) -> usize {
         self.capture_count
     }
 
-    /// Returns the number of public outputs at the front of the program's complete output boundary.
-    ///
-    /// Public outputs occupy `[0, output_count)`. Hidden final-state outputs for mutated, discharged external references
-    /// follow in [`Self::external_reference_bindings`] order after read-only bindings are omitted. Preserved references
-    /// remain reference-typed values and add no hidden output. For example, an `output_count` of `1` gives
+    /// Returns the number of public outputs at the front of the [`Program`]'s complete output boundary. Public outputs
+    /// occupy `[0, output_count)`. Hidden final state outputs for mutated, discharged external references follow in
+    /// [`Self::external_reference_bindings`] order after read-only bindings are omitted. Preserved references remain
+    /// reference-typed values and add no hidden output. For example, an `output_count` of `1` gives
     /// `[output 0 | hidden final states...]`.
     #[inline]
     pub const fn output_count(&self) -> usize {
         self.output_count
     }
 
-    /// Returns the bindings for external references selected and successfully discharged by the partial transform.
-    ///
-    /// Bindings use the same canonical source ordering and input/output interpretation as
+    /// Returns the bindings for external references selected and successfully discharged by the partial reference
+    /// discharge transform. Bindings use the same canonical source ordering and input/output interpretation as
     /// [`ReferenceDischargeResult::external_reference_bindings`]. The difference is completeness: an external reference
     /// omitted from this slice may still survive as a reference-typed value because it was not selected. Local
     /// allocations never appear, and preserved external references contribute neither a binding nor a hidden output.
-    ///
     /// For example, with inputs `[capture 0 | input 0]`, selecting only `input 0` produces a binding for
-    /// [`ReferenceSource::Input`] index `0`; an unselected reference in `capture 0` remains in the program and does not
-    /// produce a binding.
+    /// [`ReferenceSource::Input`] index `0`; an unselected reference in `capture 0` remains in the program
+    /// and does not produce a binding.
     #[inline]
     pub fn external_reference_bindings(&self) -> &[ExternalReferenceBinding] {
         self.external_reference_bindings.as_slice()
     }
 
-    /// Consumes this result and returns its program, capture count, public-output count, and external-reference bindings,
-    /// in that order.
+    /// Consumes this [`PartialReferenceDischargeResult`] and returns its underlying [`Program`], capture count,
+    /// public output count, and external reference bindings, in that order.
     #[inline]
     pub fn into_parts(self) -> (Program<V, O, Vec<V>, Vec<V>>, usize, usize, Vec<ExternalReferenceBinding>) {
         let Self { program, capture_count, output_count, external_reference_bindings } = self;
@@ -286,41 +310,10 @@ impl<V: Value, O: Operation<Type = V::Type>> PartialReferenceDischargeResult<V, 
     }
 }
 
-impl<V: Value, O: Operation<Type = V::Type>> TryFrom<PartialReferenceDischargeResult<V, O>>
-    for ReferenceDischargeResult<V, O>
-{
-    type Error = ProgramError;
-
-    fn try_from(partial: PartialReferenceDischargeResult<V, O>) -> Result<Self, Self::Error> {
-        let entry = partial.program.entry_region_ref();
-        if entry.contains_atom_type_in_closure(Type::is_reference) {
-            return Err(ProgramError::MalformedProgram(
-                "reference discharge program still contains a reference-typed value and cannot form a full discharge"
-                    .to_string(),
-            ));
-        }
-        // The closure traversal visits regions in an unspecified order, so the reported occurrence is the smallest
-        // coordinate rather than the first one encountered, keeping the diagnostic reproducible.
-        if let Some((instruction_id, instruction)) = entry
-            .instructions_in_closure()
-            .filter(|(_, instruction)| !instruction.operation().reference_semantics().is_empty())
-            .min_by_key(|(instruction_id, _)| *instruction_id)
-        {
-            return Err(ProgramError::MalformedProgram(format!(
-                "reference discharge program retains reference operation `{}` at `{instruction_id}` and cannot form \
-                 a full discharge",
-                instruction.operation().name(),
-            )));
-        }
-        Ok(Self { partial })
-    }
-}
-
-/// Metadata connecting one caller-owned [`Reference`] to its explicit inputs and outputs after discharge.
-///
-/// Reference discharge turns implicit access to a reference into ordinary value flow that a reference-free backend
-/// can execute. For example, consider a source function that takes parameter state by reference, updates it, and
-/// returns a public result:
+/// Metadata connecting one caller-owned [`Reference`] to its explicit inputs and outputs after reference discharge.
+/// Reference discharge turns implicit access to a reference into ordinary value flow that a reference-free backend can
+/// execute. For example, consider a source function that takes parameter state by reference, updates it, and returns a
+/// public result:
 ///
 /// ```text
 /// train_step(parameters: Reference<Array>, batch: Array) -> Array
@@ -333,18 +326,14 @@ impl<V: Value, O: Operation<Type = V::Type>> TryFrom<PartialReferenceDischargeRe
 /// ```
 ///
 /// [`Self::source`] identifies where the caller supplied the original reference. Before execution, the stateful
-/// invocation layer reads the reference's current value into that discharged input. The `updated_parameters` value is
-/// a synthetic writeback output: it is part of the complete discharged boundary, but the invocation layer consumes it
-/// instead of returning it as part of the source function's public result. It installs that value back into the
-/// caller's reference after execution.
+/// invocation layer reads the reference's current value into that discharged input. The `updated_parameters` value
+/// is a synthetic writeback output (i.e., it is part of the complete discharged boundary, but the invocation layer
+/// consumes it instead of returning it as part of the source function's public result). It "installs" that value back
+/// into the caller's reference after execution.
 ///
 /// In this example there is one public output, so [`Self::output_index`] is `Some(1)`: the absolute index of
 /// `updated_parameters` in the complete output list `[result, updated_parameters]`. A reference that the function only
 /// reads needs no writeback output and therefore has an output index of [`None`].
-///
-/// The [`serde::Serialize`] implementation exposes the canonical in-memory shape for diagnostics and snapshots and is
-/// deliberately distinct from the stable XLA persistence schema, which keeps its own versioned representation
-/// (including a redundant validated flat-input coordinate) independent of this type's evolution.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct ExternalReferenceBinding {
     /// Capture or public input through which the caller supplies the reference.
@@ -355,13 +344,13 @@ pub struct ExternalReferenceBinding {
 }
 
 impl ExternalReferenceBinding {
-    /// Creates a discharged-program boundary binding for one external reference.
+    /// Creates a new [`ExternalReferenceBinding`].
     ///
     /// # Parameters
     ///
     ///   - `source`: Capture or public input through which the caller supplies the reference.
-    ///   - `output_index`: Absolute complete-output index containing the final reference value, or [`None`] when the
-    ///     program only reads the reference.
+    ///   - `output_index`: Absolute complete-output index containing the final reference value,
+    ///     or [`None`] when the program only reads the reference.
     pub const fn new(source: ReferenceSource, output_index: Option<usize>) -> Self {
         Self { source, output_index }
     }
@@ -371,7 +360,7 @@ impl ExternalReferenceBinding {
         self.source
     }
 
-    /// Returns whether the program may mutate this external reference.
+    /// Returns whether the corresponding [`Program`] may mutate this external reference.
     pub const fn is_mutated(&self) -> bool {
         self.output_index.is_some()
     }
@@ -398,6 +387,8 @@ pub enum ReferenceSource {
         index: usize,
     },
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl ReferenceSource {
     /// Returns the logical source occupying one position in a program's flat entry input boundary.
