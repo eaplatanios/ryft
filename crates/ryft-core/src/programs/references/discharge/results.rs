@@ -59,8 +59,6 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeResult<V, O> {
         self.partial.output_count()
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Returns the bindings between caller-owned references and the discharged [`Program`] boundary. Bindings appear
     /// in canonical entry-boundary order: captures first, then public inputs, with each group ordered by its logical
     /// index. Each binding's [`ExternalReferenceBinding::source`] identifies the program input that receives the
@@ -84,12 +82,11 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeResult<V, O> {
         self.partial.external_reference_bindings()
     }
 
-    /// Consumes this result and returns its program when execution requires no caller-owned reference state.
-    ///
-    /// A full discharge is reference-free, but that alone does not make its metadata discardable. Even a read-only
-    /// external reference needs a binding so the caller can provide its initial value. A mutated external reference
-    /// additionally needs a binding for its hidden final-state output. This conversion therefore accepts only an empty
-    /// [`Self::external_reference_bindings`] slice.
+    /// Consumes this [`ReferenceDischargeResult`] and returns its [`Program`] when execution requires no caller-owned
+    /// reference state. A full discharge is reference-free, but that alone does not make its metadata discardable. Even
+    /// a read-only external reference needs a binding so the caller can provide its initial value. A mutated external
+    /// reference additionally needs a binding for its hidden final-state output. This conversion therefore accepts only
+    /// an empty [`Self::external_reference_bindings`] slice.
     ///
     /// An empty binding slice also guarantees that there are no hidden external final-state outputs, so
     /// [`Self::output_count`] equals the returned program's complete output count. [`Self::capture_count`] may still be
@@ -118,26 +115,21 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeResult<V, O> {
         Ok(program)
     }
 
-    /// Consumes this result and returns its program, capture count, public-output count, and external-reference bindings,
-    /// in that order.
+    /// Consumes this [`ReferenceDischargeResult`] and returns its underlying [`Program`], capture count, public output
+    /// count, and external reference bindings, in that order.
     #[inline]
     pub fn into_parts(self) -> (Program<V, O, Vec<V>, Vec<V>>, usize, usize, Vec<ExternalReferenceBinding>) {
         self.partial.into_parts()
     }
 }
 
-/// Program produced by *partial* reference discharge, in which only the caller-selected reference targets became
-/// explicit immutable state and every unselected allocation survives as a well-typed reference value.
-///
-/// The discharged part of the boundary obeys exactly the invariants of [`ReferenceDischargeResult`]: discharged
-/// external allocations are reported as [`ExternalReferenceBinding`]s in canonical entry-boundary order, and the
-/// mutated subset of those bindings tiles the hidden output suffix that follows the public outputs. Discharged local
-/// allocations leave no binding, because no caller owns their state. Preserved references contribute neither bindings
-/// nor hidden outputs; they simply remain reference-typed values inside the program, and their accesses replay
-/// verbatim.
-///
-/// "Every target was selected" is a statement about the request, not a proof about the produced program. Converting
-/// through [`TryFrom`] therefore inspects the complete program before constructing a [`ReferenceDischargeResult`].
+/// [`Program`] produced by _partial_ reference discharge, in which only the caller-selected reference targets became
+/// explicit immutable state and every unselected allocation survives as a well-typed reference value. The discharged
+/// part of the boundary obeys exactly the invariants of [`ReferenceDischargeResult`]: discharged external allocations
+/// are reported as [`ExternalReferenceBinding`]s in canonical entry-boundary order, and the mutated subset of those
+/// bindings tiles the hidden output suffix that follows the public outputs. Discharged local allocations leave no
+/// binding, because no caller owns their state. Preserved references contribute neither bindings nor hidden outputs;
+/// they simply remain reference-typed values inside the program, and their accesses replay verbatim.
 #[derive(Debug)]
 pub struct PartialReferenceDischargeResult<V: Value, O: Operation<Type = V::Type>> {
     /// Refer to [`Self::program`].
@@ -152,6 +144,8 @@ pub struct PartialReferenceDischargeResult<V: Value, O: Operation<Type = V::Type
     /// Refer to [`Self::external_reference_bindings`].
     external_reference_bindings: Vec<ExternalReferenceBinding>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<V: Value, O: Operation<Type = V::Type>> PartialReferenceDischargeResult<V, O> {
     /// Creates a checked partial reference discharge result.
