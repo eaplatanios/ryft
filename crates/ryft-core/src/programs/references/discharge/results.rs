@@ -382,19 +382,16 @@ pub enum ReferenceSource {
     },
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl ReferenceSource {
-    /// Returns the logical source occupying one position in a program's flat entry input boundary.
-    ///
-    /// Capture lifting forms one flat input list in canonical `[captures..., inputs...]` order: the first
-    /// `capture_count` positions correspond to the source program's capture table, and every remaining position
-    /// corresponds to a public input. This function classifies `flat_input_index` relative to that split and expresses
-    /// public input positions without the leading capture prefix.
+    /// Returns the logical source occupying one position in a [`Program`]'s flat entry input boundary. Capture lifting
+    /// forms one flat input list in canonical `[captures..., inputs...]` order: the first `capture_count` positions
+    /// correspond to the source program's capture table, and every remaining position corresponds to a public input.
+    /// This function classifies `flat_input_index` relative to that split and expresses public input positions without
+    /// the leading capture prefix.
     ///
     /// This function cannot validate that `flat_input_index` is within the complete input boundary because it receives
-    /// only the capture-prefix length; callers enumerating a program boundary must supply one of that program's valid
-    /// input positions.
+    /// only the capture-prefix length. Callers enumerating a program boundary must thus supply one of that program's
+    /// valid input positions.
     ///
     /// # Parameters
     ///
@@ -408,11 +405,10 @@ impl ReferenceSource {
         }
     }
 
-    /// Returns this logical source's position in the program's flat entry input boundary.
-    ///
-    /// Capture lifting forms one flat input list in canonical `[captures..., inputs...]` order. A capture's logical
-    /// index is therefore already its flat position, while a public input's logical index is offset by
-    /// `capture_count`, the length of the leading capture prefix.
+    /// Returns this logical source's position in the [`Program`]'s flat entry input boundary. Capture lifting forms one
+    /// flat input list in canonical `[captures..., inputs...]` order. A capture's logical index is therefore already
+    /// its flat position, while a public input's logical index is offset by `capture_count`, the length of the leading
+    /// capture prefix.
     ///
     /// # Parameters
     ///
@@ -654,8 +650,8 @@ mod tests {
     #[test]
     fn test_reference_discharge_result_try_from_enforces_reference_freedom() {
         // Operation family that separates the two facts the reference-freedom proof must distinguish: an unrelated
-        // ordered-state operation that discharge never touches, and a retained reference operation that it must
-        // reject even though its boundary types are ordinary.
+        // ordered-state operation that discharge never touches, and a retained reference operation that it must reject
+        // even though its boundary types are ordinary.
         #[derive(Copy, Clone, Debug)]
         enum ProofOperation {
             OrderedIo,
