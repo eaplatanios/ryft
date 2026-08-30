@@ -21,7 +21,6 @@ impl<T: Type> Copy for ZeroLikeOperation<T> {}
 
 impl<T: Type> ZeroLikeOperation<T> {
     /// Constructs a new [`ZeroLikeOperation`].
-    #[inline]
     pub const fn new() -> Self {
         Self(PhantomData)
     }

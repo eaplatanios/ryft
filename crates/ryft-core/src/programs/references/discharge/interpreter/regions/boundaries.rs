@@ -180,7 +180,6 @@ impl ReferenceRegionDischargeBoundary {
     }
 
     /// Returns the region's own leading capture prefix, or [`None`] when it inherits its caller's capture scope.
-    #[inline]
     pub(super) const fn capture_input_count(&self) -> Option<usize> {
         self.capture_input_count
     }
@@ -192,7 +191,6 @@ impl ReferenceRegionDischargeBoundary {
     }
 
     /// Returns the source input position at which the added inputs are inserted.
-    #[inline]
     pub(super) const fn input_insertion(&self) -> usize {
         self.input_insertion
     }
@@ -204,7 +202,6 @@ impl ReferenceRegionDischargeBoundary {
     }
 
     /// Returns the source output position at which the added outputs are inserted.
-    #[inline]
     pub(super) const fn output_insertion(&self) -> usize {
         self.output_insertion
     }

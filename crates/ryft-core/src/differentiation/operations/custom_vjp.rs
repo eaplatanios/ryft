@@ -89,7 +89,6 @@ impl<T: DifferentiableType> Default for CustomVjpOperation<T> {
 impl<T: DifferentiableType> CustomVjpOperation<T> {
     /// Creates a custom-VJP call operation whose attached regions operate on `T` values and whose operands are all
     /// differentiated.
-    #[inline]
     pub const fn new() -> Self {
         Self { non_differentiated_count: 0, marker: PhantomData }
     }

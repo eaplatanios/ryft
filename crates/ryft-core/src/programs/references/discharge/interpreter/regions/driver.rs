@@ -44,7 +44,6 @@ impl<'r, D> RecursiveReferenceDischargeDriver<'r, D> {
     ///   - `driver`: Application-scoped [`RegionDriver`] exposing the attached regions.
     ///   - `instruction`: Source coordinate of the application, or [`None`] for an application that replays no
     ///     instruction.
-    #[inline]
     pub const fn new(driver: &'r D, instruction: Option<InstructionId>) -> Self {
         Self { driver, instruction }
     }

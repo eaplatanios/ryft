@@ -322,13 +322,11 @@ pub enum PartialEvaluationInput<V> {
 
 impl<V> PartialEvaluationInput<V> {
     /// Returns `true` if this [`PartialEvaluationInput`] is [`Self::Known`].
-    #[inline]
     pub const fn is_known(&self) -> bool {
         matches!(self, Self::Known(_))
     }
 
     /// Returns `true` if this [`PartialEvaluationInput`] is [`Self::Unknown`].
-    #[inline]
     pub const fn is_unknown(&self) -> bool {
         matches!(self, Self::Unknown(_))
     }
@@ -351,13 +349,11 @@ pub enum PartialEvaluationOutput<V> {
 
 impl<V> PartialEvaluationOutput<V> {
     /// Returns `true` if this [`PartialEvaluationOutput`] is [`Self::Known`].
-    #[inline]
     pub const fn is_known(&self) -> bool {
         matches!(self, Self::Known(_))
     }
 
     /// Returns `true` if this [`PartialEvaluationOutput`] is [`Self::Unknown`].
-    #[inline]
     pub const fn is_unknown(&self) -> bool {
         matches!(self, Self::Unknown(_))
     }

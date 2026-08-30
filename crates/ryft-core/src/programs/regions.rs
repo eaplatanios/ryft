@@ -1050,13 +1050,11 @@ pub struct RegionSlot {
 
 impl RegionSlot {
     /// Creates a [`RegionSlot`] for a [`Region`] that may execute during ordinary interpretation.
-    #[inline]
     pub const fn computation(name: &'static str) -> Self {
         Self { name, role: RegionRole::Computation }
     }
 
     /// Creates a [`RegionSlot`] for a [`Region`] that represents a dormant transformation rule.
-    #[inline]
     pub const fn rule(name: &'static str) -> Self {
         Self { name, role: RegionRole::Rule }
     }
@@ -1192,7 +1190,6 @@ pub struct EagerInterpretationValidation {
 
 impl EagerInterpretationValidation {
     /// Creates a new [`EagerInterpretationValidation`].
-    #[inline]
     pub(crate) const fn new() -> Self {
         Self { _private: () }
     }

@@ -223,32 +223,27 @@ pub struct ReferenceDischargeReference<C: Domain, P: ReferenceDischargePolicy<C>
 
 impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeReference<C, P> {
     /// Returns the identity of the allocation this handle denotes.
-    #[inline]
     pub const fn allocation(&self) -> ReferenceAllocationHandle {
         self.allocation
     }
 
     /// Returns whether this handle denotes the complete stored value rather than a derived view.
-    #[inline]
     const fn denotes_complete_value(&self) -> bool {
         self.denotes_complete_value
     }
 
     /// Returns the composed view chain from the allocation to this handle.
-    #[inline]
     pub const fn alias(&self) -> &P::Alias {
         &self.alias
     }
 
     /// Returns the reference type this exact handle exposes.
-    #[inline]
     pub const fn r#type(&self) -> &ReferenceType<P::Referent> {
         &self.r#type
     }
 
     /// Returns the exact destination reference value of a preserved handle, or [`None`] when the allocation was
     /// discharged.
-    #[inline]
     pub const fn preserved(&self) -> Option<&C::Value> {
         match &self.binding {
             ReferenceDischargeBinding::Discharged => None,
@@ -542,13 +537,11 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     }
 
     /// Returns the destination context that owns the discharged values.
-    #[inline]
     pub const fn parent(&self) -> &C {
         &self.parent
     }
 
     /// Returns the capture scope this context discharges under.
-    #[inline]
     const fn captures(&self) -> &ReferenceCaptureScope<C::Constant> {
         &self.captures
     }

@@ -21,7 +21,6 @@ pub struct ReferenceDischargeResult<V: Value, O: Operation<Type = V::Type>> {
 
 impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeResult<V, O> {
     /// Returns the underlying [`Reference`](crate::Reference)-free [`Program`].
-    #[inline]
     pub const fn program(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
         self.partial.program()
     }
@@ -38,7 +37,6 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeResult<V, O> {
     /// [capture 0, capture 1 | input 0, input 1, ...]
     ///                       ^ capture_count
     /// ```
-    #[inline]
     pub const fn capture_count(&self) -> usize {
         self.partial.capture_count()
     }
@@ -54,7 +52,6 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeResult<V, O> {
     /// [output 0, output 1 | final external state]
     ///                     ^ output_count
     /// ```
-    #[inline]
     pub const fn output_count(&self) -> usize {
         self.partial.output_count()
     }
@@ -264,7 +261,6 @@ impl<V: Value, O: Operation<Type = V::Type>> PartialReferenceDischargeResult<V, 
     /// Returns the underlying partially discharged [`Program`]. Unlike [`ReferenceDischargeResult::program`], this
     /// program may still contain reference-typed values and operations for allocations that the caller did not select
     /// for discharge.
-    #[inline]
     pub const fn program(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
         &self.program
     }
@@ -273,7 +269,6 @@ impl<V: Value, O: Operation<Type = V::Type>> PartialReferenceDischargeResult<V, 
     /// uses `[captures..., inputs...]` order, and this count is the split point between the two groups. It counts all
     /// lifted captures, including ordinary captures and preserved reference captures that do not appear in
     /// [`Self::external_reference_bindings`]. For example, a count of `1` gives `[capture 0 | input 0, input 1, ...]`.
-    #[inline]
     pub const fn capture_count(&self) -> usize {
         self.capture_count
     }
@@ -283,7 +278,6 @@ impl<V: Value, O: Operation<Type = V::Type>> PartialReferenceDischargeResult<V, 
     /// [`Self::external_reference_bindings`] order after read-only bindings are omitted. Preserved references remain
     /// reference-typed values and add no hidden output. For example, an `output_count` of `1` gives
     /// `[output 0 | hidden final states...]`.
-    #[inline]
     pub const fn output_count(&self) -> usize {
         self.output_count
     }
@@ -406,7 +400,6 @@ impl ReferenceSource {
     ///
     ///   - `flat_input_index`: Zero-based position in the complete flat `[captures..., inputs...]` entry boundary.
     ///   - `capture_count`: Number of leading boundary positions originating in the source program's capture table.
-    #[inline]
     pub const fn from_flat_input_index(flat_input_index: usize, capture_count: usize) -> Self {
         if flat_input_index < capture_count {
             Self::Capture { index: flat_input_index }

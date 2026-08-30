@@ -124,25 +124,21 @@ impl DimensionBounds {
     }
 
     /// Creates a new [`DimensionBounds`] instance with the provided lower bound and no finite upper bound.
-    #[inline]
     pub const fn at_least(lower: usize) -> Self {
         Self { lower, upper: None }
     }
 
     /// Creates a new [`DimensionBounds`] instance admitting every non-negative extent.
-    #[inline]
     pub const fn unbounded() -> Self {
         Self::at_least(0)
     }
 
     /// Returns the inclusive lower bound of this [`DimensionBounds`] instance.
-    #[inline]
     pub const fn lower(&self) -> usize {
         self.lower
     }
 
     /// Returns the exclusive upper bound of this [`DimensionBounds`] instance.
-    #[inline]
     pub const fn upper(&self) -> Option<usize> {
         self.upper
     }

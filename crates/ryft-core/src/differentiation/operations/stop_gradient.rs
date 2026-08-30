@@ -27,7 +27,6 @@ pub struct StopGradientOperation<T: Type>(PhantomData<fn() -> T>);
 
 impl<T: Type> StopGradientOperation<T> {
     /// Constructs a new [`StopGradientOperation`] for the `T` type universe.
-    #[inline]
     pub const fn new() -> Self {
         Self(PhantomData)
     }

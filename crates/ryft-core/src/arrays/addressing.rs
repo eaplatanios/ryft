@@ -582,25 +582,21 @@ impl ArraySliceAxis {
     ///   - `start`: first selected logical coordinate.
     ///   - `size`: number of selected logical coordinates.
     ///   - `stride`: distance between consecutive selected logical coordinates.
-    #[inline]
     pub const fn new(start: usize, size: usize, stride: usize) -> Self {
         Self { start, size, stride }
     }
 
     /// Returns the first selected logical coordinate.
-    #[inline]
     pub const fn start(self) -> usize {
         self.start
     }
 
     /// Returns the number of selected logical coordinates.
-    #[inline]
     pub const fn size(self) -> usize {
         self.size
     }
 
     /// Returns the distance between consecutive selected logical coordinates.
-    #[inline]
     pub const fn stride(self) -> usize {
         self.stride
     }

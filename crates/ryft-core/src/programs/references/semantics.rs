@@ -32,7 +32,6 @@ pub enum ReferenceAccessMode {
 
 impl ReferenceAccessMode {
     /// Returns whether this [`ReferenceAccessMode`] consumes the complete reference allocation.
-    #[inline]
     pub const fn is_consuming(self) -> bool {
         match self {
             Self::Read | Self::Write | Self::ReadWrite | Self::Accumulate => false,
@@ -85,19 +84,16 @@ pub struct ReferenceInput {
 
 impl ReferenceInput {
     /// Creates a new [`ReferenceInput`].
-    #[inline]
     pub const fn new(input_index: usize, mode: ReferenceAccessMode) -> Self {
         Self { input_index, mode }
     }
 
     /// Returns the index of the [`Operation`](crate::Operation) input being accessed.
-    #[inline]
     pub const fn input_index(self) -> usize {
         self.input_index
     }
 
     /// Returns the [`ReferenceAccessMode`] of this [`ReferenceInput`].
-    #[inline]
     pub const fn mode(self) -> ReferenceAccessMode {
         self.mode
     }
@@ -135,7 +131,6 @@ pub enum ReferenceOutput {
 
 impl ReferenceOutput {
     /// Returns the index of the [`Operation`](crate::Operation) output this [`ReferenceOutput`] corresponds to.
-    #[inline]
     pub const fn output_index(self) -> usize {
         match self {
             Self::Allocation { output_index } | Self::Alias { output_index, .. } => output_index,

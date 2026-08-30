@@ -316,7 +316,6 @@ impl ZeroSpaceBoundaryRole {
     }
 
     /// Returns the concise description of this [`ZeroSpaceBoundaryRole`] to be used in diagnostics.
-    #[inline]
     const fn as_str(self) -> &'static str {
         match self {
             Self::InputCotangent => "input cotangent boundary",

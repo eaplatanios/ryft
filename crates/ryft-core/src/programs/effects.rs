@@ -35,7 +35,6 @@ impl Effect {
     const ALL: [Effect; 4] = [Effect::OrderedAssertion, Effect::OrderedIo, Effect::UnorderedIo, Effect::OrderedState];
 
     /// Returns the bit representing this [`Effect`] class inside an [`Effects`] set.
-    #[inline]
     const fn bit(self) -> u8 {
         match self {
             Effect::OrderedAssertion => 1 << 0,
@@ -47,7 +46,6 @@ impl Effect {
 
     /// Returns `true` if the execution order of this [`Effect`] class relative to other effects of the same class is
     /// observable and must be preserved.
-    #[inline]
     pub const fn is_ordered(self) -> bool {
         match self {
             Effect::OrderedState | Effect::OrderedAssertion | Effect::OrderedIo => true,
@@ -85,31 +83,26 @@ impl Effects {
     pub const PURE: Effects = Effects { bits: 0 };
 
     /// Returns the [`Effects`] set containing only `effect`.
-    #[inline]
     pub const fn single(effect: Effect) -> Effects {
         Effects { bits: effect.bit() }
     }
 
     /// Returns the union of this [`Effects`] set and `other`.
-    #[inline]
     pub const fn union(self, other: Effects) -> Effects {
         Effects { bits: self.bits | other.bits }
     }
 
     /// Returns `true` if this [`Effects`] set is empty (i.e., if it is equal to [`Effects::PURE`]).
-    #[inline]
     pub const fn is_pure(self) -> bool {
         self.bits == 0
     }
 
     /// Returns `true` if this [`Effects`] set contains `effect`.
-    #[inline]
     pub const fn contains(self, effect: Effect) -> bool {
         self.bits & effect.bit() != 0
     }
 
     /// Returns `true` if this [`Effects`] set contains any [`Effect`] class whose execution order is observable.
-    #[inline]
     pub const fn is_ordered(self) -> bool {
         let mut index = 0;
         while index < Effect::ALL.len() {

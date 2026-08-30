@@ -150,13 +150,11 @@ pub struct ReferenceIndexOperation {
 
 impl ReferenceIndexOperation {
     /// Creates a new reference index operation.
-    #[inline]
     pub const fn new(axis: usize, index: usize) -> Self {
         Self { axis, index }
     }
 
     /// Returns this operation's allocation-preserving view transform.
-    #[inline]
     pub const fn transform(&self) -> ArrayReferenceViewTransform {
         ArrayReferenceViewTransform::Index { axis: self.axis, index: self.index }
     }

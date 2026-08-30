@@ -70,7 +70,6 @@ pub(super) struct ReferenceDischargeTargets {
 
 impl ReferenceDischargeTargets {
     /// Returns the targets full discharge runs under, which select every reference.
-    #[inline]
     pub(super) const fn everything() -> Self {
         Self { targets: None }
     }

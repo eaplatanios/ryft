@@ -269,7 +269,6 @@ pub struct ArrayReferenceView {
 
 impl ArrayReferenceView {
     /// Returns an identity view of a root reference.
-    #[inline]
     pub const fn root() -> Self {
         Self { transforms: Vec::new() }
     }

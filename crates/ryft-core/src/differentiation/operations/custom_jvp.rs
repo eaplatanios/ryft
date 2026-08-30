@@ -75,7 +75,6 @@ pub struct CustomJvpOperation<T: DifferentiableType> {
 impl<T: DifferentiableType> CustomJvpOperation<T> {
     /// Creates a new [`CustomJvpOperation`] whose attached regions operate on `T` values and whose operands are all
     /// participating in the differentiation transform.
-    #[inline]
     pub const fn new() -> Self {
         Self { non_differentiated_count: 0, marker: PhantomData }
     }

@@ -32,7 +32,6 @@ impl<T: Type> Copy for SelectOperation<T> {}
 
 impl<T: Type> SelectOperation<T> {
     /// Constructs a select operation for the `T` type universe.
-    #[inline]
     pub const fn new() -> Self {
         Self(PhantomData)
     }

@@ -1334,44 +1334,37 @@ static DATA_TYPE_PROMOTION_LEAST_UPPER_BOUNDS: [[Option<DataType>; DataType::COU
 
 impl DataType {
     /// Returns `true` if this [`DataType`] represents an effect-ordering token (i.e., if it is [`DataType::Token`]).
-    #[inline]
     pub const fn is_token(self) -> bool {
         matches!(self, Self::Token)
     }
 
     /// Returns `true` if this [`DataType`] represents the zero-information differential space
     /// (i.e., if it is [`DataType::Zero`]).
-    #[inline]
     pub const fn is_zero(self) -> bool {
         matches!(self, Self::Zero)
     }
 
     /// Returns `true` if this [`DataType`] represents Boolean values (i.e., if it is [`DataType::Boolean`]).
-    #[inline]
     pub const fn is_boolean(self) -> bool {
         matches!(self, Self::Boolean)
     }
 
     /// Returns `true` if this [`DataType`] represents a signed integer.
-    #[inline]
     pub const fn is_signed(self) -> bool {
         matches!(self, Self::I1 | Self::I2 | Self::I4 | Self::I8 | Self::I16 | Self::I32 | Self::I64)
     }
 
     /// Returns `true` if this [`DataType`] represents an unsigned integer.
-    #[inline]
     pub const fn is_unsigned(self) -> bool {
         matches!(self, Self::U1 | Self::U2 | Self::U4 | Self::U8 | Self::U16 | Self::U32 | Self::U64)
     }
 
     /// Returns `true` if this [`DataType`] represents a signed or unsigned integer.
-    #[inline]
     pub const fn is_integer(self) -> bool {
         self.is_signed() || self.is_unsigned()
     }
 
     /// Returns `true` if this [`DataType`] represents a real floating-point value.
-    #[inline]
     pub const fn is_floating_point(self) -> bool {
         matches!(
             self,
@@ -1394,21 +1387,18 @@ impl DataType {
     }
 
     /// Returns `true` if this [`DataType`] represents a complex value.
-    #[inline]
     pub const fn is_complex(self) -> bool {
         matches!(self, Self::C64 | Self::C128)
     }
 
     /// Returns `true` if this [`DataType`] represents a real numeric value. This includes integer and floating-point
     /// types, but excludes [`DataType::Token`], [`DataType::Zero`], [`DataType::Boolean`], and complex types.
-    #[inline]
     pub const fn is_real(self) -> bool {
         self.is_integer() || self.is_floating_point()
     }
 
     /// Returns `true` if this [`DataType`] represents a numeric value. This includes integer, floating-point, and
     /// complex types, but excludes [`DataType::Token`], [`DataType::Zero`], and [`DataType::Boolean`].
-    #[inline]
     pub const fn is_numeric(self) -> bool {
         self.is_real() || self.is_complex()
     }

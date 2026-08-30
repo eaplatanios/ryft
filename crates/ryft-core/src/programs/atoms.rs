@@ -32,13 +32,11 @@ pub enum MaybeZero<V: Typed> {
 
 impl<V: Typed> MaybeZero<V> {
     /// Returns `true` if this is a [`MaybeZero::Zero`].
-    #[inline]
     pub const fn is_zero(&self) -> bool {
         matches!(self, Self::Zero(_))
     }
 
     /// Returns the value stored in this [`MaybeZero`], if it is a [`MaybeZero::Value`], and [`None`] otherwise.
-    #[inline]
     pub const fn as_value(&self) -> Option<&V> {
         match self {
             Self::Zero(_) => None,

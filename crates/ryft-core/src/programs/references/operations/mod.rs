@@ -25,7 +25,6 @@ macro_rules! define_reference_primitive_payload {
 
         impl<T: $crate::programs::Type, U: $crate::programs::Type> $operation<T, U> {
             #[doc = concat!("Creates a new [`", stringify!($operation), "`].")]
-            #[inline]
             pub const fn new() -> Self {
                 Self(std::marker::PhantomData)
             }

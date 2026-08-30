@@ -804,7 +804,6 @@ macro_rules! define_elementwise_operation {
 
         impl<__T: $crate::Type> $operation<__T> {
             #[doc = ::std::concat!("Creates a new [`", ::std::stringify!($operation), "`].")]
-            #[inline]
             pub const fn new() -> Self {
                 Self(::std::marker::PhantomData)
             }

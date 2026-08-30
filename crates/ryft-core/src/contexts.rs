@@ -311,7 +311,6 @@ pub struct EagerContext<V: Value, O: Operation<Type = V::Type> = ConstantOperati
 
 impl<V: Value, O: Operation<Type = V::Type>> EagerContext<V, O> {
     /// Creates a new [`EagerContext`].
-    #[inline]
     pub const fn new() -> Self {
         Self { marker: PhantomData }
     }
@@ -442,7 +441,6 @@ pub struct ProjectedContext<C: Domain, T: Type> {
 
 impl<C: Domain, T: Type> ProjectedContext<C, T> {
     /// Creates a [`ProjectedContext`] view of `parent`.
-    #[inline]
     pub const fn new(parent: C) -> Self {
         Self { parent, marker: PhantomData }
     }
