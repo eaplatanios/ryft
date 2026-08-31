@@ -39,27 +39,27 @@ pub trait ReferenceDischargePolicy<C: Domain> {
     /// referent is total.
     fn storage_alias(referent: &Self::Referent) -> Self::Alias;
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Applies `alias` to one immutable state value and returns the selected value.
+    /// Returns the value that a [`Reference`](crate::Reference) with `alias` reads from `current`. If `alias` describes
+    /// a view into the stored value (e.g., a slice of an array), this function returns only that view. Otherwise, it
+    /// returns the complete stored value.
     ///
     /// # Parameters
     ///
-    ///   - `context`: Destination context that owns `current` and any work this application performs.
-    ///   - `current`: Current immutable state of the complete stored value.
-    ///   - `alias`: Composed view chain selecting the coordinates to read.
+    ///   - `context`: Destination domain in which any values or operations needed for the read are created.
+    ///   - `current`: Complete value currently stored for the reference.
+    ///   - `alias`: Describes whether the reference reads all of `current` or a view into it.
     fn read(context: &C, current: &C::Value, alias: &Self::Alias) -> Result<C::Value, ProgramError>;
 
-    /// Replaces the coordinates that `alias` selects and returns the successor state of the complete stored value
-    /// without observing the previous selection.
+    /// Returns the complete value that should be stored after a reference with `alias` writes `replacement`. If `alias`
+    /// describes a view into the stored value (e.g., a slice of an array), this function replaces only that view and
+    /// preserves the rest of `current`.
     ///
     /// # Parameters
     ///
-    ///   - `context`: Destination context that owns `current` and any work this application performs.
-    ///   - `current`: Current immutable state of the complete stored value. A view implementation may consult it only to
-    ///     preserve coordinates outside the selected logical handle.
-    ///   - `replacement`: Value written into the selected coordinates.
-    ///   - `alias`: Composed view chain selecting the coordinates to replace.
+    ///   - `context`: Destination domain in which any values or operations needed for the write are created.
+    ///   - `current`: Complete value currently stored for the reference.
+    ///   - `replacement`: New value to write through the reference.
+    ///   - `alias`: Describes whether the reference writes all of `current` or a view into it.
     fn write(
         context: &C,
         current: &C::Value,
@@ -67,17 +67,20 @@ pub trait ReferenceDischargePolicy<C: Domain> {
         alias: &Self::Alias,
     ) -> Result<C::Value, ProgramError>;
 
-    /// Replaces the part selected by `alias` and returns both its previous value and the complete successor state.
+    /// Replaces the value of a reference with `replacement` and returns `(previous, updated)`. `previous` is the value
+    /// read through the reference before the swap. `updated` is the complete value that should be stored afterward. If
+    /// `alias` describes a view into the stored value (e.g., a slice of an array), `updated` preserves the parts of
+    /// `current` outside that view.
     ///
-    /// The default implementation reads the selected value and then writes the replacement. Policies may override it
-    /// when their storage representation can perform both operations more efficiently together.
+    /// The default implementation calls [`Self::read`] followed by [`Self::write`]. Policies may override it when they
+    /// can compute both results more efficiently together.
     ///
     /// # Parameters
     ///
-    ///   - `context`: Destination context that owns `current` and any work this application performs.
-    ///   - `current`: Current immutable state of the complete stored value.
-    ///   - `replacement`: Value written into the selected coordinates.
-    ///   - `alias`: Composed view chain selecting the coordinates to replace.
+    ///   - `context`: Destination domain in which any values or operations needed for the swap are created.
+    ///   - `current`: Complete value currently stored for the reference.
+    ///   - `replacement`: New value to swap into the reference.
+    ///   - `alias`: Describes whether the reference swaps all of `current` or a view into it.
     fn swap(
         context: &C,
         current: &C::Value,
@@ -90,6 +93,8 @@ pub trait ReferenceDischargePolicy<C: Domain> {
     }
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 /// Defines additive updates for reference families that support them.
 ///
 /// This contract is separate because accumulation is optional and its destination requirements are family-specific.
@@ -97,15 +102,16 @@ pub trait ReferenceDischargePolicy<C: Domain> {
 /// `reference_add_update` operation fails at compile time. An implementation may instead reject selected updates with
 /// [`ProgramError::UnsupportedOperation`] when support depends on the particular reference.
 pub trait ReferenceAccumulationPolicy<C: Domain>: ReferenceDischargePolicy<C> {
-    /// Accumulates `update` into the coordinates that `alias` selects and returns the successor state of the complete
-    /// stored value.
+    /// Returns the complete value that should be stored after adding `update` to a reference with `alias`. If `alias`
+    /// describes a view into the stored value (e.g., a slice of an array), this function updates only that view and
+    /// preserves the rest of `current`.
     ///
     /// # Parameters
     ///
-    ///   - `context`: Destination context that owns `current` and any work this application performs.
-    ///   - `current`: Current immutable state of the complete stored value.
-    ///   - `update`: Value added into the selected coordinates.
-    ///   - `alias`: Composed view chain selecting the coordinates to accumulate into.
+    ///   - `context`: Destination domain in which any values or operations needed for the update are created.
+    ///   - `current`: Complete value currently stored for the reference.
+    ///   - `update`: Value to add through the reference.
+    ///   - `alias`: Describes whether the reference updates all of `current` or a view into it.
     fn accumulate(
         context: &C,
         current: &C::Value,
