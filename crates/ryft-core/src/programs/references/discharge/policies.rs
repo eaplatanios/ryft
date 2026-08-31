@@ -45,7 +45,7 @@ pub trait ReferenceDischargePolicy<C: Domain> {
     ///
     /// # Parameters
     ///
-    ///   - `context`: Destination domain in which any values or operations needed for the read are created.
+    ///   - `context`: Destination context in which any values or operations needed for the read are created.
     ///   - `current`: Complete value currently stored for the reference.
     ///   - `alias`: Describes whether the reference reads all of `current` or a view into it.
     fn read(context: &C, current: &C::Value, alias: &Self::Alias) -> Result<C::Value, ProgramError>;
@@ -56,7 +56,7 @@ pub trait ReferenceDischargePolicy<C: Domain> {
     ///
     /// # Parameters
     ///
-    ///   - `context`: Destination domain in which any values or operations needed for the write are created.
+    ///   - `context`: Destination context in which any values or operations needed for the write are created.
     ///   - `current`: Complete value currently stored for the reference.
     ///   - `replacement`: New value to write through the reference.
     ///   - `alias`: Describes whether the reference writes all of `current` or a view into it.
@@ -77,7 +77,7 @@ pub trait ReferenceDischargePolicy<C: Domain> {
     ///
     /// # Parameters
     ///
-    ///   - `context`: Destination domain in which any values or operations needed for the swap are created.
+    ///   - `context`: Destination context in which any values or operations needed for the swap are created.
     ///   - `current`: Complete value currently stored for the reference.
     ///   - `replacement`: New value to swap into the reference.
     ///   - `alias`: Describes whether the reference swaps all of `current` or a view into it.
@@ -93,12 +93,9 @@ pub trait ReferenceDischargePolicy<C: Domain> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Defines additive updates for reference families that support them.
-///
-/// This contract is separate because accumulation is optional and its destination requirements are family-specific.
-/// A family without this implementation can still discharge reads, writes, and swaps; attempting to discharge a
+/// Trait that defines additive updates for [`ReferenceType`](crate::ReferenceType) families that support them. This
+/// contract is separate because accumulation is optional and its destination requirements are family-specific. A family
+/// without this implementation can still discharge read, write, and swap operations. However, attempting to discharge a
 /// `reference_add_update` operation fails at compile time. An implementation may instead reject selected updates with
 /// [`ProgramError::UnsupportedOperation`] when support depends on the particular reference.
 pub trait ReferenceAccumulationPolicy<C: Domain>: ReferenceDischargePolicy<C> {
@@ -108,7 +105,7 @@ pub trait ReferenceAccumulationPolicy<C: Domain>: ReferenceDischargePolicy<C> {
     ///
     /// # Parameters
     ///
-    ///   - `context`: Destination domain in which any values or operations needed for the update are created.
+    ///   - `context`: Destination context in which any values or operations needed for the update are created.
     ///   - `current`: Complete value currently stored for the reference.
     ///   - `update`: Value to add through the reference.
     ///   - `alias`: Describes whether the reference updates all of `current` or a view into it.
@@ -122,15 +119,12 @@ pub trait ReferenceAccumulationPolicy<C: Domain>: ReferenceDischargePolicy<C> {
 
 #[cfg(test)]
 mod tests {
-
     use pretty_assertions::assert_eq;
 
     use crate::programs::ProgramError;
-
     use crate::programs::references::discharge::tests::*;
-
     use crate::programs::references::types::ReferenceType;
-
+    
     use super::*;
 
     #[test]
