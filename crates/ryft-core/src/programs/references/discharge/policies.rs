@@ -5,7 +5,6 @@ use crate::programs::ProgramError;
 use crate::programs::types::Type;
 
 /// [`Type`] capability selecting the canonical [`ReferenceDischargePolicy`] used by reference discharge entry points.
-///
 /// This is a discharge-owned extension of [`Type`] rather than part of the core type contract. It lets generic
 /// [`Program`](crate::Program) functions select the reference policy of each program universe without requiring
 /// callers to name that policy or relying on overlapping implementations distinguished only by the program's type
@@ -15,34 +14,32 @@ pub trait ReferenceDischargeableType: Type {
     type Policy: Copy + Clone + Debug;
 }
 
-/// Defines how one reference type family reads and updates immutable state during reference discharge.
-///
-/// Reference discharge replaces mutable references with explicitly threaded immutable values. This policy supplies
-/// the family-specific pieces of that rewrite: the referent type, the metadata describing which part of a complete
-/// value a reference denotes, and the functions that apply that metadata. Discharge paths that cross a type boundary
-/// require the destination universe to embed referent and reference types through [`From`] and recognize reference
-/// types through borrowed [`TryFrom`]. Those are the same canonical conversions reference-operation type inference
-/// uses; the policy defines no parallel conversion seam.
+/// Trait that defines how a [`ReferenceType`](crate::ReferenceType) family reads and updates immutable state during
+/// reference discharge. Reference discharge replaces mutable references with explicitly threaded immutable values.
+/// This policy supplies the family-specific pieces of that rewrite like the referent type, the metadata describing
+/// which part of a complete value a reference denotes, and the functions that apply that metadata. Discharge paths
+/// that cross a type boundary require the destination universe to embed referent and reference types through [`From`]
+/// conversions and recognize reference types through borrowed [`TryFrom`] conversions. Those are the same canonical
+/// conversions reference-operation type inference uses; the policy defines no parallel conversion seam.
 ///
 /// `C` is the destination [`Domain`] into which discharge writes. Implementations should normally remain generic over
-/// compatible destination domains so the same policy can serve eager and tracing contexts. Ordered accumulation is
+/// compatible destination domains so that the same policy can serve eager and tracing contexts. Ordered accumulation is
 /// intentionally separate in [`ReferenceAccumulationPolicy`] because not every reference family supports it.
 pub trait ReferenceDischargePolicy<C: Domain> {
-    /// Referent type system of this reference family.
+    /// Referent [`Type`] family of this reference family.
     type Referent: Type;
 
-    /// Metadata describing which part of a complete stored value a reference denotes.
-    ///
-    /// A reference family with no views can use a unit-like alias whose application is the identity.
+    /// Metadata describing which part of a complete stored value a [`Reference`](crate::Reference) denotes.
+    /// A reference family with no views can use a unit-like alias whose application is the identity function.
     type Alias: Clone + Debug;
 
-    /// Returns the storage alias for a complete value with the provided referent type.
-    ///
-    /// Allocation and entry-boundary binding assign this alias to each new complete-value handle.
-    ///
-    /// This is infallible by design. Validating a referent type is type inference's job, and deriving the identity
-    /// alias of an already-valid referent is total.
+    /// Returns the storage alias for a complete value with the provided referent [`Type`]. Allocation and
+    /// entry-boundary binding assign this alias to each new complete-value handle. This is infallible by design.
+    /// Validating a referent type is type inference's job, and deriving the identity alias of an already-valid
+    /// referent is total.
     fn storage_alias(referent: &Self::Referent) -> Self::Alias;
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Applies `alias` to one immutable state value and returns the selected value.
     ///

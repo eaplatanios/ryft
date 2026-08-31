@@ -8,20 +8,18 @@ use crate::parameters::{Parameterized, Placeholder};
 use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
-use crate::programs::values::Value;
-use crate::tracing::TracingContext;
-
-use crate::programs::references::types::ReferenceType;
-
-use super::interpreter::{
+use crate::programs::references::discharge::interpreter::{
     RecursiveReferenceDischargeDriver, ReferenceCaptureScope, ReferenceDischargeContext, ReferenceDischargeDriver,
     ReferenceDischargeValue, ReferenceDischargeableOperation,
 };
-use super::policies::{ReferenceDischargePolicy, ReferenceDischargeableType};
-use super::results::{
+use crate::programs::references::discharge::policies::{ReferenceDischargePolicy, ReferenceDischargeableType};
+use crate::programs::references::discharge::results::{
     ExternalReferenceBinding, PartialReferenceDischargeResult, ReferenceDischargeResult, ReferenceSource,
 };
-use super::targets::{ReferenceDischargeTarget, ReferenceDischargeTargets};
+use crate::programs::references::discharge::targets::{ReferenceDischargeTarget, ReferenceDischargeTargets};
+use crate::programs::references::types::ReferenceType;
+use crate::programs::values::Value;
+use crate::tracing::TracingContext;
 
 /// Canonical reference discharge policy selected by `T`'s type universe.
 type CanonicalReferenceDischargePolicy<T> = <T as ReferenceDischargeableType>::Policy;
