@@ -238,12 +238,8 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
             <CanonicalReferenceDischargePolicy<V::Type> as ReferenceDischargePolicy<TracingContext<V, O>>>::Referent,
         >: TryFrom<&'t V::Type>,
     {
-        self.validate_reference_discharge_targets(capture_count, targets)?;
-        self.discharge_references_helper::<CanonicalReferenceDischargePolicy<V::Type>>(
-            capture_count,
-            |_| None,
-            ReferenceDischargeTargets::from_targets(targets),
-        )
+        let targets = ReferenceDischargeTargets::from_targets(&self, capture_count, targets)?;
+        self.discharge_references_helper::<CanonicalReferenceDischargePolicy<V::Type>>(capture_count, |_| None, targets)
     }
 
     /// Discharges the selected references of a *capture-lifted* program and preserves every other reference.
@@ -294,11 +290,11 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
             <CanonicalReferenceDischargePolicy<V::Type> as ReferenceDischargePolicy<TracingContext<V, O>>>::Referent,
         >: TryFrom<&'t V::Type>,
     {
-        self.validate_reference_discharge_targets(capture_count, targets)?;
+        let targets = ReferenceDischargeTargets::from_targets(&self, capture_count, targets)?;
         self.discharge_references_helper::<CanonicalReferenceDischargePolicy<V::Type>>(
             capture_count,
             CaptureConstant::capture_index,
-            ReferenceDischargeTargets::from_targets(targets),
+            targets,
         )
     }
 

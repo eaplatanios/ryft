@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Display;
 use std::rc::Rc;
 
@@ -66,10 +66,81 @@ impl ReferenceDischargeTargets {
         Self { targets: None }
     }
 
-    /// Returns exactly `targets`, preserving every reference that they do not name.
-    #[inline]
-    pub(crate) fn from_targets(targets: &[ReferenceDischargeTarget]) -> Self {
-        Self { targets: Some(Rc::new(targets.iter().copied().collect())) }
+    /// Validates `targets` against `program` and returns a selection that discharges exactly those targets. Every
+    /// target must name a reference-typed entry position or a reference allocation defined by an instruction in
+    /// `program`, and each target may appear only once. Every reference not named by the resulting selection is
+    /// preserved.
+    ///
+    /// # Parameters
+    ///
+    ///   - `program`: Program whose reference allocations the targets select.
+    ///   - `capture_count`: Number of leading flat inputs that originated in the program's capture table.
+    ///   - `targets`: Targets selected for discharge, in caller-chosen order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] naming the offending target when a target is duplicated, names an
+    /// out-of-range or non-reference entry position, names an instruction that the program does not contain, names an
+    /// operation that defines no reference allocation, or names an output position that is not an allocation. It also
+    /// returns an error when `capture_count` exceeds the program's input count.
+    pub(crate) fn from_targets<
+        V: Value,
+        O: Operation<Type = V::Type>,
+        Input: Parameterized<V>,
+        Output: Parameterized<V>,
+    >(
+        program: &Program<V, O, Input, Output>,
+        capture_count: usize,
+        targets: &[ReferenceDischargeTarget],
+    ) -> Result<Self, ProgramError> {
+        let entry = program.entry_region_ref();
+        let input_ids = entry.input_ids();
+        if capture_count > input_ids.len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "reference discharge target validation requests {} captures but the program has {} inputs",
+                capture_count,
+                input_ids.len(),
+            )));
+        }
+
+        let mut selected = BTreeSet::new();
+        for target in targets {
+            if !selected.insert(*target) {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "reference discharge targets contain {target} more than once",
+                )));
+            }
+        }
+
+        // Only the named instructions are resolved, so validating a small target set does not pay for the reference
+        // semantics of every instruction in the closure.
+        let instructions = entry.instructions_in_closure().collect::<HashMap<_, _>>();
+        for target in targets {
+            let invalid_target = || {
+                ProgramError::MalformedProgram(format!(
+                    "reference discharge targets include {target}, which is not selectable in this program",
+                ))
+            };
+            match target {
+                ReferenceDischargeTarget::External(source) => {
+                    let input_index = source.flat_input_index(capture_count).map_err(|_| invalid_target())?;
+                    let input = input_ids.get(input_index).ok_or_else(invalid_target)?;
+                    if !entry.atoms()[input.index()].r#type().is_reference() {
+                        return Err(invalid_target());
+                    }
+                }
+                ReferenceDischargeTarget::Internal { instruction, output_index } => {
+                    let instruction = instructions.get(instruction).ok_or_else(invalid_target)?;
+                    let output_indices =
+                        instruction.operation().reference_semantics().allocation_output_indices().collect::<Vec<_>>();
+                    if !output_indices.contains(output_index) {
+                        return Err(invalid_target());
+                    }
+                }
+            }
+        }
+
+        Ok(Self { targets: Some(Rc::new(selected)) })
     }
 
     /// Returns `true` if `target` is selected for discharge by this [`ReferenceDischargeTargets`] set.
@@ -154,76 +225,6 @@ where
         targets.append(&mut allocations);
         Ok(targets)
     }
-
-    /// Validates caller-provided partial reference discharge targets against this program.
-    ///
-    /// Every named target must exist in this program, must name a reference-typed entry position or a genuine
-    /// reference-allocating output, and must appear at most once. Duplication is checked across the complete target set
-    /// first, because a repeated target is ambiguous whatever it names.
-    ///
-    /// # Parameters
-    ///
-    ///   - `capture_count`: Number of leading flat inputs that originated in the program's capture table.
-    ///   - `targets`: Targets selected for discharge, in caller-chosen order.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::MalformedProgram`] naming the offending target when a target is duplicated, names an
-    /// out-of-range or non-reference entry position, names an instruction that this program does not contain, names
-    /// an operation that defines no reference allocation, or names an output position of an allocating operation that
-    /// is not itself an allocation.
-    pub(crate) fn validate_reference_discharge_targets(
-        &self,
-        capture_count: usize,
-        targets: &[ReferenceDischargeTarget],
-    ) -> Result<(), ProgramError> {
-        let entry = self.entry_region_ref();
-        let input_ids = entry.input_ids();
-        if capture_count > input_ids.len() {
-            return Err(ProgramError::MalformedProgram(format!(
-                "reference discharge target validation requests {capture_count} captures but the program has {} inputs",
-                input_ids.len(),
-            )));
-        }
-        let mut seen = HashSet::with_capacity(targets.len());
-        for target in targets {
-            if !seen.insert(*target) {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "reference discharge targets contain {target} more than once",
-                )));
-            }
-        }
-
-        // Only the named instructions are resolved, so validating a small target set does not pay for the reference
-        // semantics of every instruction in the closure.
-        let instructions = entry.instructions_in_closure().collect::<HashMap<_, _>>();
-        for target in targets {
-            let invalid_target = || {
-                ProgramError::MalformedProgram(format!(
-                    "reference discharge targets include {target}, which is not selectable in this program",
-                ))
-            };
-            match target {
-                ReferenceDischargeTarget::External(source) => {
-                    let input_index = source.flat_input_index(capture_count).map_err(|_| invalid_target())?;
-                    let input = input_ids.get(input_index).ok_or_else(invalid_target)?;
-                    if !entry.atoms()[input.index()].r#type().is_reference() {
-                        return Err(invalid_target());
-                    }
-                }
-                ReferenceDischargeTarget::Internal { instruction, output_index } => {
-                    let instruction = instructions.get(instruction).ok_or_else(invalid_target)?;
-                    let operation = instruction.operation();
-                    let output_indices =
-                        operation.reference_semantics().allocation_output_indices().collect::<Vec<_>>();
-                    if !output_indices.contains(output_index) {
-                        return Err(invalid_target());
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
 }
 
 #[cfg(test)]
@@ -285,7 +286,7 @@ mod tests {
 
     #[test]
     fn test_reference_discharge_targets_select_everything_or_only_requested_targets() {
-        let program = boundary_program(0, 0);
+        let program = target_validation_program();
         let external = ReferenceDischargeTarget::External(ReferenceSource::Input { index: 0 });
         let internal =
             ReferenceDischargeTarget::Internal { instruction: InstructionId::new(program.entry(), 0), output_index: 0 };
@@ -294,7 +295,7 @@ mod tests {
         assert!(everything.selects(external));
         assert!(everything.selects(internal));
 
-        let selected = ReferenceDischargeTargets::from_targets(&[external, external]);
+        let selected = ReferenceDischargeTargets::from_targets(&program, 0, &[external]).unwrap();
         assert_eq!(selected.targets.as_ref().unwrap().len(), 1);
         assert!(selected.selects(external));
         assert!(!selected.selects(internal));
@@ -302,7 +303,7 @@ mod tests {
         assert!(cloned.selects(external));
         assert!(!cloned.selects(internal));
 
-        let empty = ReferenceDischargeTargets::from_targets(&[]);
+        let empty = ReferenceDischargeTargets::from_targets(&program, 0, &[]).unwrap();
         assert!(!empty.selects(external));
         assert!(!empty.selects(internal));
     }
@@ -404,129 +405,148 @@ mod tests {
     }
 
     #[test]
-    fn test_program_validate_reference_discharge_targets_accepts_empty_and_reordered_valid_sets() {
+    fn test_reference_discharge_targets_construction_accepts_empty_and_reordered_valid_sets() {
         let program = target_validation_program();
         let external = ReferenceDischargeTarget::External(ReferenceSource::Input { index: 0 });
         let internal =
             ReferenceDischargeTarget::Internal { instruction: InstructionId::new(program.entry(), 0), output_index: 0 };
 
-        assert_eq!(program.validate_reference_discharge_targets(0, &[]), Ok(()));
-        assert_eq!(program.validate_reference_discharge_targets(0, &[internal, external]), Ok(()));
+        let empty = ReferenceDischargeTargets::from_targets(&program, 0, &[]).unwrap();
+        assert_eq!(empty.targets.as_ref().unwrap().len(), 0);
+
+        let reordered = ReferenceDischargeTargets::from_targets(&program, 0, &[internal, external]).unwrap();
+        assert_eq!(reordered.targets.as_ref().unwrap().len(), 2);
+        assert!(reordered.selects(external));
+        assert!(reordered.selects(internal));
     }
 
     #[test]
-    fn test_program_validate_reference_discharge_targets_rejects_invalid_set_shape() {
+    fn test_reference_discharge_targets_construction_rejects_invalid_set_shape() {
         let program = target_validation_program();
         let entry = program.entry();
         let allocation =
             ReferenceDischargeTarget::Internal { instruction: InstructionId::new(entry, 0), output_index: 0 };
 
         assert_eq!(
-            program.validate_reference_discharge_targets(3, &[]),
-            Err(ProgramError::MalformedProgram(
+            ReferenceDischargeTargets::from_targets(&program, 3, &[]).unwrap_err(),
+            ProgramError::MalformedProgram(
                 "reference discharge target validation requests 3 captures but the program has 2 inputs".to_string(),
-            )),
+            ),
         );
         assert_eq!(
-            program.validate_reference_discharge_targets(0, &[allocation, allocation]),
-            Err(ProgramError::MalformedProgram(
+            ReferenceDischargeTargets::from_targets(&program, 0, &[allocation, allocation]).unwrap_err(),
+            ProgramError::MalformedProgram(
                 "reference discharge targets contain internal allocation at `^0[0]` output 0 more than once"
                     .to_string(),
-            )),
+            ),
         );
 
         // Duplicate detection runs before kind validation because repetition is ambiguous regardless of what is named.
         let invalid = ReferenceDischargeTarget::External(ReferenceSource::Input { index: 7 });
         assert_eq!(
-            program.validate_reference_discharge_targets(0, &[invalid, invalid]),
-            Err(ProgramError::MalformedProgram(
+            ReferenceDischargeTargets::from_targets(&program, 0, &[invalid, invalid]).unwrap_err(),
+            ProgramError::MalformedProgram(
                 "reference discharge targets contain external input 7 more than once".to_string(),
-            )),
+            ),
         );
     }
 
     #[test]
-    fn test_program_validate_reference_discharge_targets_rejects_invalid_external_targets() {
+    fn test_reference_discharge_targets_construction_rejects_invalid_external_targets() {
         let program = target_validation_program();
 
         assert_eq!(
-            program.validate_reference_discharge_targets(
+            ReferenceDischargeTargets::from_targets(
+                &program,
                 0,
                 &[ReferenceDischargeTarget::External(ReferenceSource::Capture { index: 0 })],
-            ),
-            Err(ProgramError::MalformedProgram(
+            )
+            .unwrap_err(),
+            ProgramError::MalformedProgram(
                 "reference discharge targets include external capture 0, which is not selectable in this program"
                     .to_string(),
-            )),
+            ),
         );
         assert_eq!(
-            program.validate_reference_discharge_targets(
+            ReferenceDischargeTargets::from_targets(
+                &program,
                 0,
                 &[ReferenceDischargeTarget::External(ReferenceSource::Input { index: 2 })],
-            ),
-            Err(ProgramError::MalformedProgram(
+            )
+            .unwrap_err(),
+            ProgramError::MalformedProgram(
                 "reference discharge targets include external input 2, which is not selectable in this program"
                     .to_string(),
-            )),
+            ),
         );
         assert_eq!(
-            program.validate_reference_discharge_targets(
+            ReferenceDischargeTargets::from_targets(
+                &program,
                 0,
                 &[ReferenceDischargeTarget::External(ReferenceSource::Input { index: 1 })],
-            ),
-            Err(ProgramError::MalformedProgram(
+            )
+            .unwrap_err(),
+            ProgramError::MalformedProgram(
                 "reference discharge targets include external input 1, which is not selectable in this program"
                     .to_string(),
-            )),
+            ),
         );
         assert_eq!(
-            program.validate_reference_discharge_targets(
+            ReferenceDischargeTargets::from_targets(
+                &program,
                 0,
                 &[ReferenceDischargeTarget::External(ReferenceSource::Input { index: usize::MAX })],
-            ),
-            Err(ProgramError::MalformedProgram(format!(
+            )
+            .unwrap_err(),
+            ProgramError::MalformedProgram(format!(
                 "reference discharge targets include external input {}, which is not selectable in this program",
                 usize::MAX,
-            ))),
+            )),
         );
     }
 
     #[test]
-    fn test_program_validate_reference_discharge_targets_rejects_invalid_internal_targets() {
+    fn test_reference_discharge_targets_construction_rejects_invalid_internal_targets() {
         let program = target_validation_program();
         let entry = program.entry();
         assert_eq!(
-            program.validate_reference_discharge_targets(
+            ReferenceDischargeTargets::from_targets(
+                &program,
                 0,
                 &[ReferenceDischargeTarget::Internal { instruction: InstructionId::new(entry, 7), output_index: 0 }],
-            ),
-            Err(ProgramError::MalformedProgram(
+            )
+            .unwrap_err(),
+            ProgramError::MalformedProgram(
                 "reference discharge targets include internal allocation at `^0[7]` output 0, which is not selectable \
                  in this program"
                     .to_string(),
-            )),
+            ),
         );
         assert_eq!(
-            program.validate_reference_discharge_targets(
+            ReferenceDischargeTargets::from_targets(
+                &program,
                 0,
                 &[ReferenceDischargeTarget::Internal { instruction: InstructionId::new(entry, 1), output_index: 0 }],
-            ),
-            Err(ProgramError::MalformedProgram(
+            )
+            .unwrap_err(),
+            ProgramError::MalformedProgram(
                 "reference discharge targets include internal allocation at `^0[1]` output 0, which is not selectable \
                  in this program"
                     .to_string(),
-            )),
+            ),
         );
         assert_eq!(
-            program.validate_reference_discharge_targets(
+            ReferenceDischargeTargets::from_targets(
+                &program,
                 0,
                 &[ReferenceDischargeTarget::Internal { instruction: InstructionId::new(entry, 0), output_index: 1 }],
-            ),
-            Err(ProgramError::MalformedProgram(
+            )
+            .unwrap_err(),
+            ProgramError::MalformedProgram(
                 "reference discharge targets include internal allocation at `^0[0]` output 1, which is not selectable \
                  in this program"
                     .to_string(),
-            )),
+            ),
         );
     }
 }
