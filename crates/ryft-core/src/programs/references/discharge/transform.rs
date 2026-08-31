@@ -1,7 +1,5 @@
 use std::rc::Rc;
 
-// TODO(eaplatanios): Review this module.
-
 use crate::captures::{CaptureConstant, ClosedProgram};
 use crate::contexts::StagingContext;
 use crate::parameters::{Parameterized, Placeholder};
@@ -21,8 +19,7 @@ use crate::programs::references::types::ReferenceType;
 use crate::programs::values::Value;
 use crate::tracing::TracingContext;
 
-/// Canonical reference discharge policy selected by `T`'s type universe.
-type CanonicalReferenceDischargePolicy<T> = <T as ReferenceDischargeableType>::Policy;
+// TODO(eaplatanios): Review this module.
 
 impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// Discharges every reference this program touches by interpreting it in a [`ReferenceDischargeContext`] over a
@@ -66,39 +63,21 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// output still denotes a reference, when the program consumes an external allocation, whose state belongs to the
     /// caller, or when the rewritten program fails the reference-freedom proof. Rule-level failures, including a
     /// use-after-consume and an access to an unbound allocation, propagate from the replay itself.
-    pub fn discharge_references(
+    #[inline]
+    pub fn discharge_references<P: ReferenceDischargePolicy<TracingContext<V, O>>>(
         self,
         capture_count: usize,
     ) -> Result<ReferenceDischargeResult<V, O>, ProgramError>
     where
-        V::Type: ReferenceDischargeableType,
-        CanonicalReferenceDischargePolicy<V::Type>: ReferenceDischargePolicy<TracingContext<V, O>>,
-        O: ReferenceDischargeableOperation<
-                TracingContext<V, O>,
-                CanonicalReferenceDischargePolicy<V::Type>,
-            >,
-        V::Type: From<
-                <CanonicalReferenceDischargePolicy<V::Type> as ReferenceDischargePolicy<
-                    TracingContext<V, O>,
-                >>::Referent,
-            > + From<
-                ReferenceType<
-                    <CanonicalReferenceDischargePolicy<V::Type> as ReferenceDischargePolicy<
-                        TracingContext<V, O>,
-                    >>::Referent,
-                >,
-            >,
-        for<'t> &'t ReferenceType<
-            <CanonicalReferenceDischargePolicy<V::Type> as ReferenceDischargePolicy<TracingContext<V, O>>>::Referent,
-        >: TryFrom<&'t V::Type>,
+        V::Type: From<P::Referent> + From<ReferenceType<P::Referent>> + ReferenceDischargeableType<Policy = P>,
+        O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
+        for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
     {
-        ReferenceDischargeResult::try_from(
-            self.discharge_references_helper::<CanonicalReferenceDischargePolicy<V::Type>>(
-                capture_count,
-                |_| None,
-                ReferenceDischargeTargets::everything(),
-            )?,
-        )
+        ReferenceDischargeResult::try_from(self.discharge_references_helper::<P>(
+            capture_count,
+            |_| None,
+            ReferenceDischargeTargets::everything(),
+        )?)
     }
 
     /// Discharges every reference a *capture-lifted* program touches, resolving the capture-scoped reference
@@ -126,40 +105,22 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     ///
     /// Returns the same errors as [`discharge_references`](Self::discharge_references), and additionally reports a
     /// capture constant whose declared reference type disagrees with the allocation its position binds.
-    pub fn discharge_references_in_capture_lifted_program(
+    #[inline]
+    pub fn discharge_references_in_capture_lifted_program<P: ReferenceDischargePolicy<TracingContext<V, O>>>(
         self,
         capture_count: usize,
     ) -> Result<ReferenceDischargeResult<V, O>, ProgramError>
     where
         V: CaptureConstant,
-        V::Type: ReferenceDischargeableType,
-        CanonicalReferenceDischargePolicy<V::Type>: ReferenceDischargePolicy<TracingContext<V, O>>,
-        O: ReferenceDischargeableOperation<
-                TracingContext<V, O>,
-                CanonicalReferenceDischargePolicy<V::Type>,
-            >,
-        V::Type: From<
-                <CanonicalReferenceDischargePolicy<V::Type> as ReferenceDischargePolicy<
-                    TracingContext<V, O>,
-                >>::Referent,
-            > + From<
-                ReferenceType<
-                    <CanonicalReferenceDischargePolicy<V::Type> as ReferenceDischargePolicy<
-                        TracingContext<V, O>,
-                    >>::Referent,
-                >,
-            >,
-        for<'t> &'t ReferenceType<
-            <CanonicalReferenceDischargePolicy<V::Type> as ReferenceDischargePolicy<TracingContext<V, O>>>::Referent,
-        >: TryFrom<&'t V::Type>,
+        V::Type: From<P::Referent> + From<ReferenceType<P::Referent>> + ReferenceDischargeableType<Policy = P>,
+        O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
+        for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
     {
-        ReferenceDischargeResult::try_from(
-            self.discharge_references_helper::<CanonicalReferenceDischargePolicy<V::Type>>(
-                capture_count,
-                CaptureConstant::capture_index,
-                ReferenceDischargeTargets::everything(),
-            )?,
-        )
+        ReferenceDischargeResult::try_from(self.discharge_references_helper::<P>(
+            capture_count,
+            CaptureConstant::capture_index,
+            ReferenceDischargeTargets::everything(),
+        )?)
     }
 
     /// Discharges the references the caller *selected* and preserves every other one, returning the mixed program
@@ -209,35 +170,19 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// [`ExternalReferenceBinding`] cannot express a caller-owned reference that no longer denotes live state; consuming
     /// a *preserved* one is accepted, because the program retains the consuming operation and the caller passes its
     /// reference handle to that operation directly.
-    pub fn partially_discharge_references(
+    #[inline]
+    pub fn partially_discharge_references<P: ReferenceDischargePolicy<TracingContext<V, O>>>(
         self,
         capture_count: usize,
         targets: &[ReferenceDischargeTarget],
     ) -> Result<PartialReferenceDischargeResult<V, O>, ProgramError>
     where
-        V::Type: ReferenceDischargeableType,
-        CanonicalReferenceDischargePolicy<V::Type>: ReferenceDischargePolicy<TracingContext<V, O>>,
-        O: ReferenceDischargeableOperation<
-                TracingContext<V, O>,
-                CanonicalReferenceDischargePolicy<V::Type>,
-            >,
-        V::Type: From<
-                <CanonicalReferenceDischargePolicy<V::Type> as ReferenceDischargePolicy<
-                    TracingContext<V, O>,
-                >>::Referent,
-            > + From<
-                ReferenceType<
-                    <CanonicalReferenceDischargePolicy<V::Type> as ReferenceDischargePolicy<
-                        TracingContext<V, O>,
-                    >>::Referent,
-                >,
-            >,
-        for<'t> &'t ReferenceType<
-            <CanonicalReferenceDischargePolicy<V::Type> as ReferenceDischargePolicy<TracingContext<V, O>>>::Referent,
-        >: TryFrom<&'t V::Type>,
+        V::Type: From<P::Referent> + From<ReferenceType<P::Referent>> + ReferenceDischargeableType<Policy = P>,
+        O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
+        for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
     {
         let targets = ReferenceDischargeTargets::from_targets(&self, capture_count, targets)?;
-        self.discharge_references_helper::<CanonicalReferenceDischargePolicy<V::Type>>(capture_count, |_| None, targets)
+        self.discharge_references_helper::<P>(capture_count, |_| None, targets)
     }
 
     /// Discharges the selected references of a *capture-lifted* program and preserves every other reference.
@@ -260,40 +205,20 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// Returns the same errors as [`partially_discharge_references`](Self::partially_discharge_references), and
     /// additionally reports a capture constant whose declared reference type disagrees with the allocation its
     /// position binds.
-    pub fn partially_discharge_references_in_capture_lifted_program(
+    #[inline]
+    pub fn partially_discharge_references_in_capture_lifted_program<P: ReferenceDischargePolicy<TracingContext<V, O>>>(
         self,
         capture_count: usize,
         targets: &[ReferenceDischargeTarget],
     ) -> Result<PartialReferenceDischargeResult<V, O>, ProgramError>
     where
         V: CaptureConstant,
-        V::Type: ReferenceDischargeableType,
-        CanonicalReferenceDischargePolicy<V::Type>: ReferenceDischargePolicy<TracingContext<V, O>>,
-        O: ReferenceDischargeableOperation<
-                TracingContext<V, O>,
-                CanonicalReferenceDischargePolicy<V::Type>,
-            >,
-        V::Type: From<
-                <CanonicalReferenceDischargePolicy<V::Type> as ReferenceDischargePolicy<
-                    TracingContext<V, O>,
-                >>::Referent,
-            > + From<
-                ReferenceType<
-                    <CanonicalReferenceDischargePolicy<V::Type> as ReferenceDischargePolicy<
-                        TracingContext<V, O>,
-                    >>::Referent,
-                >,
-            >,
-        for<'t> &'t ReferenceType<
-            <CanonicalReferenceDischargePolicy<V::Type> as ReferenceDischargePolicy<TracingContext<V, O>>>::Referent,
-        >: TryFrom<&'t V::Type>,
+        V::Type: From<P::Referent> + From<ReferenceType<P::Referent>> + ReferenceDischargeableType<Policy = P>,
+        O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
+        for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
     {
         let targets = ReferenceDischargeTargets::from_targets(&self, capture_count, targets)?;
-        self.discharge_references_helper::<CanonicalReferenceDischargePolicy<V::Type>>(
-            capture_count,
-            CaptureConstant::capture_index,
-            targets,
-        )
+        self.discharge_references_helper::<P>(capture_count, CaptureConstant::capture_index, targets)
     }
 
     /// Discharges one target selection while resolving stored capture constants through `capture_index_of`.
@@ -316,14 +241,13 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// # Errors
     ///
     /// Returns the errors the public entry points document, which is every error the replay can raise.
-    fn discharge_references_helper<P>(
+    fn discharge_references_helper<P: ReferenceDischargePolicy<TracingContext<V, O>>>(
         self,
         capture_count: usize,
         capture_index_of: fn(&V) -> Option<usize>,
         targets: ReferenceDischargeTargets,
     ) -> Result<PartialReferenceDischargeResult<V, O>, ProgramError>
     where
-        P: ReferenceDischargePolicy<TracingContext<V, O>>,
         O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
         V::Type: From<P::Referent> + From<ReferenceType<P::Referent>>,
         for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
@@ -446,43 +370,31 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     }
 }
 
-impl<Capture, V, O, Input, Output> ClosedProgram<Capture, V, O, Input, Output>
-where
+impl<
     Capture: Value,
     V: CaptureConstant<Type = Capture::Type>,
-    O: Operation<Type = Capture::Type>
-        + ReferenceDischargeableOperation<
-            TracingContext<V, O>,
-            CanonicalReferenceDischargePolicy<Capture::Type>,
-        >,
+    O: Operation<Type = Capture::Type>,
     Input: Parameterized<V>,
     Output: Parameterized<V>,
-    Capture::Type: ReferenceDischargeableType,
-    CanonicalReferenceDischargePolicy<Capture::Type>: ReferenceDischargePolicy<TracingContext<V, O>>,
-    Capture::Type: From<
-            <CanonicalReferenceDischargePolicy<Capture::Type> as ReferenceDischargePolicy<
-                TracingContext<V, O>,
-            >>::Referent,
-        > + From<
-            ReferenceType<
-                <CanonicalReferenceDischargePolicy<Capture::Type> as ReferenceDischargePolicy<
-                    TracingContext<V, O>,
-                >>::Referent,
-            >,
-        >,
-    for<'t> &'t ReferenceType<
-        <CanonicalReferenceDischargePolicy<Capture::Type> as ReferenceDischargePolicy<TracingContext<V, O>>>::Referent,
-    >: TryFrom<&'t Capture::Type>,
+> ClosedProgram<Capture, V, O, Input, Output>
 {
     /// Lifts this closed program's captures and discharges every reachable reference.
     ///
     /// The returned logical metadata continues to identify capture slots separately from inputs. Concrete capture
     /// values remain owned by this [`ClosedProgram`]; discharge never embeds their mutable contents into the derived
     /// program.
-    pub fn discharge_references(&self) -> Result<ReferenceDischargeResult<V, O>, ProgramError> {
+    #[inline]
+    pub fn discharge_references<P: ReferenceDischargePolicy<TracingContext<V, O>>>(
+        &self,
+    ) -> Result<ReferenceDischargeResult<V, O>, ProgramError>
+    where
+        Capture::Type: From<P::Referent> + From<ReferenceType<P::Referent>> + ReferenceDischargeableType<Policy = P>,
+        O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
+        for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t Capture::Type>,
+    {
         let capture_count = self.captures().len();
         let program = self.to_program_with_lifted_captures()?;
-        program.discharge_references_in_capture_lifted_program(capture_count)
+        program.discharge_references_in_capture_lifted_program::<P>(capture_count)
     }
 }
 

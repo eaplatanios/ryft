@@ -1977,28 +1977,7 @@ where
     }
 }
 
-impl<V, O> Program<V, O, Vec<V>, Vec<V>>
-where
-    V: Value,
-    V::Type: ReferenceDischargeableType,
-    <V::Type as ReferenceDischargeableType>::Policy: ReferenceDischargePolicy<TracingContext<V, O>>,
-    O: Operation<Type = V::Type>
-        + ReferenceDischargeableOperation<TracingContext<V, O>, <V::Type as ReferenceDischargeableType>::Policy>,
-    V::Type: From<
-            <<V::Type as ReferenceDischargeableType>::Policy as ReferenceDischargePolicy<
-                TracingContext<V, O>,
-            >>::Referent,
-        > + From<
-            ReferenceType<
-                <<V::Type as ReferenceDischargeableType>::Policy as ReferenceDischargePolicy<
-                    TracingContext<V, O>,
-                >>::Referent,
-            >,
-        >,
-    for<'t> &'t ReferenceType<
-        <<V::Type as ReferenceDischargeableType>::Policy as ReferenceDischargePolicy<TracingContext<V, O>>>::Referent,
-    >: TryFrom<&'t V::Type>,
-{
+impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// Builds a rematerialized flat-vector function after discharging every local reference into immutable state.
     /// External reference inputs and reference captures are rejected because rematerialization has no caller-visible
     /// state write-back contract; ordinary non-reference captures remain valid. The returned wrapper delegates
@@ -2009,7 +1988,7 @@ where
     /// # Parameters
     ///
     ///   - `capture_count`: Number of leading flat inputs lifted from the source capture table.
-    pub fn rematerialize_with_local_references<D>(
+    pub fn rematerialize_with_local_references<D, P>(
         self,
         capture_count: usize,
     ) -> Result<
@@ -2023,8 +2002,12 @@ where
     >
     where
         D: Context<Type = V::Type, Constant = V, Operation = O>,
+        P: ReferenceDischargePolicy<TracingContext<V, O>>,
+        V::Type: From<P::Referent> + From<ReferenceType<P::Referent>> + ReferenceDischargeableType<Policy = P>,
+        O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
+        for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
     {
-        let program = self.discharge_references(capture_count)?.into_program_without_external_references()?;
+        let program = self.discharge_references::<P>(capture_count)?.into_program_without_external_references()?;
         Ok(rematerialize(move |inputs: Vec<DomainTracer<D>>| {
             // `Rematerialize::call` rejects empty inputs before this body runs, so the context is always recoverable.
             let context = inputs.first().unwrap().context().clone();
@@ -4246,7 +4229,7 @@ mod tests {
                 if message == "program carries unresolved state and must be discharged before differentiation",
         ));
 
-        let rematerialized = source.rematerialize_with_local_references::<ReferenceTestContext>(0).unwrap();
+        let rematerialized = source.rematerialize_with_local_references::<ReferenceTestContext, _>(0).unwrap();
         let wrong_context = TracingContext::<ReferenceTestValue, ReferenceTestOperation>::new();
         let wrong_input = wrong_context.input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
         assert!(matches!(
@@ -4326,7 +4309,7 @@ mod tests {
 
         // Caller-owned references require runtime state plumbing that rematerialization does not own.
         assert!(matches!(
-            external.rematerialize_with_local_references::<ReferenceTestContext>(0),
+            external.rematerialize_with_local_references::<ReferenceTestContext, _>(0),
             Err(ProgramError::UnsupportedOperation { message })
                 if message == "reference discharge cannot discard the binding for external `input 0`",
         ));
