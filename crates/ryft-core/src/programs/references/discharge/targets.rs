@@ -50,38 +50,36 @@ impl Display for ReferenceDischargeTarget {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Reference targets one discharge normalizes into immutable state, with every unselected allocation preserved.
-///
-/// Selecting everything is deliberately a state of its own rather than a set listing every target. A program's targets
-/// are enumerated from its own arena while the requested targets are caller-supplied, so full discharge — exactly the
-/// everything-selected case of the one rewrite — must be expressible without naming anything, and an allocation that
-/// no target *can* name, such as one bound directly rather than replayed, must still be discharged by it.
+/// Selection of reference allocations to discharge (i.e., a collection of [`ReferenceDischargeTarget`]s). A partial
+/// discharge stores the set of [`ReferenceDischargeTarget`]s selected by the caller and preserves every other
+/// allocation. A full discharge instead uses a distinct "everything" state because it must also discharge allocations
+/// that callers cannot name with a target, such as allocations bound directly during replay.
 #[derive(Clone, Debug)]
-pub(super) struct ReferenceDischargeTargets {
+pub(crate) struct ReferenceDischargeTargets {
     /// Selected targets, or [`None`] when every target is selected.
     targets: Option<Rc<BTreeSet<ReferenceDischargeTarget>>>,
 }
 
 impl ReferenceDischargeTargets {
-    /// Returns the targets full discharge runs under, which select every reference.
-    pub(super) const fn everything() -> Self {
+    /// Returns the [`ReferenceDischargeTargets`] that full discharge runs under, which select every reference.
+    pub(crate) const fn everything() -> Self {
         Self { targets: None }
     }
 
-    /// Returns exactly `targets`, preserving every allocation they do not name.
+    /// Returns exactly `targets`, preserving every reference that they do not name.
     #[inline]
-    pub(super) fn from_targets(targets: &[ReferenceDischargeTarget]) -> Self {
+    pub(crate) fn from_targets(targets: &[ReferenceDischargeTarget]) -> Self {
         Self { targets: Some(Rc::new(targets.iter().copied().collect())) }
     }
 
-    /// Returns whether `target` is selected for discharge.
+    /// Returns `true` if `target` is selected for discharge by this [`ReferenceDischargeTargets`] set.
     #[inline]
-    pub(super) fn selects(&self, target: ReferenceDischargeTarget) -> bool {
+    pub(crate) fn selects(&self, target: ReferenceDischargeTarget) -> bool {
         self.targets.as_ref().is_none_or(|targets| targets.contains(&target))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<V, O, Input, Output> Program<V, O, Input, Output>
 where
