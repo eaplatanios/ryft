@@ -4972,7 +4972,7 @@ mod tests {
             EagerContext::new(),
         );
         let reference = context.allocate_discharged(reference_type, TestValue::Array(Array::scalar(0.0_f32))).unwrap();
-        let allocation = reference.expect_reference("the loop-carried allocation").unwrap().allocation();
+        let allocation = reference.expect_reference("the loop-carried allocation").unwrap().allocation_id();
         assert_eq!(
             context.region_summary(
                 &WhileOperation::<ArrayIrType>::new(),

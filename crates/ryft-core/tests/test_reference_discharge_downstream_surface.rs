@@ -639,7 +639,7 @@ fn test_downstream_region_summary_exposes_exact_access_modes() {
 
     let context = RegisterDischargeContext::new(RegisterDestination::new());
     let reference = context.allocate_discharged(ReferenceType::new(RegisterType), RegisterValue(1)).unwrap();
-    let allocation = reference.expect_reference("a downstream allocation").unwrap().allocation();
+    let allocation = reference.expect_reference("a downstream allocation").unwrap().allocation_id();
     let summary = context
         .region_summary(&RegisterOperation::Call, 0, region.entry_region_ref(), &[Some(allocation), None])
         .unwrap();
@@ -808,13 +808,13 @@ fn test_downstream_partial_targets_reach_an_internal_allocation_inside_a_structu
 }
 
 #[test]
-fn test_downstream_reference_handles_cannot_be_fabricated() {
+fn test_downstream_reference_discharge_identities_cannot_be_fabricated() {
     // The tests above establish that the discharge surface is reachable from outside `ryft-core`. This is the
-    // matching negative proof: a handle's checked construction cannot be bypassed from that same position, so a
-    // third-party rule can read allocation identity, alias, derived type, and preserved value but can invent none of them.
-    // The two cases are separate files because their rejections belong to different compiler passes, and only the
-    // earlier one is reported when they share a file.
+    // matching negative proof: neither a handle nor its allocation ID can be fabricated from that same position, and
+    // their private representations cannot be read directly. The cases are separate so each privacy contract produces
+    // its own compiler diagnostic.
     let test_cases = trybuild::TestCases::new();
-    test_cases.compile_fail("tests/reference_discharge/error_reference_handle_fabrication.rs");
-    test_cases.compile_fail("tests/reference_discharge/error_reference_handle_private_fields.rs");
+    test_cases.compile_fail("tests/reference_discharge/error_reference_discharge_allocation_id_fabrication.rs");
+    test_cases.compile_fail("tests/reference_discharge/error_reference_discharge_reference_fabrication.rs");
+    test_cases.compile_fail("tests/reference_discharge/error_reference_discharge_reference_private_fields.rs");
 }
