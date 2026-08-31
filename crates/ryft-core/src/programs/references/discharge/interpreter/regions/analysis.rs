@@ -13,7 +13,7 @@ use crate::programs::values::Value;
 
 use super::super::super::policies::ReferenceDischargePolicy;
 use super::super::{
-    ReferenceAllocationHandle, ReferenceCaptureScope, ReferenceDischargeBinding, ReferenceDischargeContext,
+    ReferenceCaptureScope, ReferenceDischargeAllocationId, ReferenceDischargeBinding, ReferenceDischargeContext,
     ReferenceDischargeValue,
 };
 use super::boundaries::ReferenceStateWidening;
@@ -78,36 +78,39 @@ impl ReferenceAccessModes {
 pub struct ReferenceRegionSummary {
     /// Every caller allocation the closure must be able to resolve while replaying, whether or not it is semantically
     /// accessed.
-    reached: BTreeSet<ReferenceAllocationHandle>,
+    reached: BTreeSet<ReferenceDischargeAllocationId>,
 
     /// Every caller allocation the closure accesses, mapped to its exact non-consuming access modes.
-    accesses: BTreeMap<ReferenceAllocationHandle, ReferenceAccessModes>,
+    accesses: BTreeMap<ReferenceDischargeAllocationId, ReferenceAccessModes>,
 
     /// Caller allocation each *declared* region output denotes, or [`None`] where the output is an ordinary value.
-    pub(super) output_allocations: Vec<Option<ReferenceAllocationHandle>>,
+    pub(super) output_allocations: Vec<Option<ReferenceDischargeAllocationId>>,
 }
 
 impl ReferenceRegionSummary {
     /// Returns every caller allocation the closure must be able to resolve, in canonical allocation order.
     #[inline]
-    pub(super) fn reached(&self) -> impl Iterator<Item = ReferenceAllocationHandle> + '_ {
+    pub(super) fn reached(&self) -> impl Iterator<Item = ReferenceDischargeAllocationId> + '_ {
         self.reached.iter().copied()
     }
 
     /// Returns every caller allocation the closure accesses, in canonical allocation order.
     #[inline]
-    pub fn accessed(&self) -> impl Iterator<Item = ReferenceAllocationHandle> + '_ {
+    pub fn accessed(&self) -> impl Iterator<Item = ReferenceDischargeAllocationId> + '_ {
         self.accesses.keys().copied()
     }
 
     /// Returns the exact access modes recorded for `allocation`, in semantic order.
-    pub fn access_modes(&self, allocation: ReferenceAllocationHandle) -> impl Iterator<Item = ReferenceAccessMode> {
+    pub fn access_modes(
+        &self,
+        allocation: ReferenceDischargeAllocationId,
+    ) -> impl Iterator<Item = ReferenceAccessMode> {
         self.accesses.get(&allocation).copied().unwrap_or_default().iter()
     }
 
     /// Returns whether `mode` is among the closure's recorded access modes for `allocation`.
     #[inline]
-    pub fn has_access(&self, allocation: ReferenceAllocationHandle, mode: ReferenceAccessMode) -> bool {
+    pub fn has_access(&self, allocation: ReferenceDischargeAllocationId, mode: ReferenceAccessMode) -> bool {
         self.access_modes(allocation).any(|recorded| recorded == mode)
     }
 
@@ -117,7 +120,7 @@ impl ReferenceRegionSummary {
     /// A region that returns an allocation already publishes that allocation's final state at its own output position, so a rule
     /// that widens the boundary must not publish it a second time.
     #[inline]
-    pub fn output_allocations(&self) -> &[Option<ReferenceAllocationHandle>] {
+    pub fn output_allocations(&self) -> &[Option<ReferenceDischargeAllocationId>] {
         self.output_allocations.as_slice()
     }
 
@@ -129,7 +132,7 @@ impl ReferenceRegionSummary {
     /// iterations. Discharge therefore threads and publishes a hidden final state for every such allocation; at runtime that
     /// state is simply unchanged when the mutating path does not execute.
     #[inline]
-    pub fn is_mutated(&self, allocation: ReferenceAllocationHandle) -> bool {
+    pub fn is_mutated(&self, allocation: ReferenceDischargeAllocationId) -> bool {
         self.access_modes(allocation).any(|mode| {
             matches!(
                 mode,
@@ -172,7 +175,7 @@ impl ReferenceRegionSummary {
     ///   - `operation`: Name of the accessing operation, used in the consumption diagnostic.
     pub(super) fn record(
         &mut self,
-        allocation: ReferenceAllocationHandle,
+        allocation: ReferenceDischargeAllocationId,
         mode: ReferenceAccessMode,
         operation: &str,
     ) -> Result<(), ProgramError> {
@@ -211,7 +214,7 @@ impl ReferenceRegionSummary {
 /// Returns [`ProgramError::MalformedProgram`] when the declared capture prefix is longer than the region's boundary.
 pub(super) fn nested_capture_scope<Constant>(
     capture_input_count: Option<usize>,
-    inputs: &[Option<ReferenceAllocationHandle>],
+    inputs: &[Option<ReferenceDischargeAllocationId>],
     inherited: &ReferenceCaptureScope<Constant>,
     region: RegionId,
 ) -> Result<ReferenceCaptureScope<Constant>, ProgramError> {
@@ -256,13 +259,13 @@ pub(super) fn nested_capture_scope<Constant>(
 /// access mode its closure performs, or when the closure consumes a caller allocation.
 fn summarize_region_closure<V: Value, O: Operation<Type = V::Type>>(
     region: RegionRef<'_, V, O>,
-    inputs: &[Option<ReferenceAllocationHandle>],
+    inputs: &[Option<ReferenceDischargeAllocationId>],
     captures: &ReferenceCaptureScope<V>,
     summary: &mut ReferenceRegionSummary,
-) -> Result<Vec<Option<ReferenceAllocationHandle>>, ProgramError> {
+) -> Result<Vec<Option<ReferenceDischargeAllocationId>>, ProgramError> {
     check_count!("input", inputs, region.input_ids().len(), ProgramError);
     let is_reference = |atom: AtomId| region.atoms()[atom.index()].r#type().is_reference();
-    let mut allocations = HashMap::<AtomId, Option<ReferenceAllocationHandle>>::new();
+    let mut allocations = HashMap::<AtomId, Option<ReferenceDischargeAllocationId>>::new();
     for (input, allocation) in region.input_ids().iter().copied().zip(inputs) {
         if is_reference(input) {
             allocations.insert(input, *allocation);
@@ -304,17 +307,18 @@ fn summarize_region_closure<V: Value, O: Operation<Type = V::Type>>(
     // its boundary nor through its capture scope. The environment has no allocation for it, so the summary reports it here
     // rather than dropping the access and letting the replay fail later for a reason that no longer names the
     // operation that performed it.
-    let resolve = |allocations: &HashMap<AtomId, Option<ReferenceAllocationHandle>>, atom: AtomId, operation: &str| {
-        match allocations.get(&atom) {
-            Some(allocation) => Ok(*allocation),
-            None if is_reference(atom) => Err(ProgramError::MalformedProgram(format!(
-                "operation `{operation}` reaches a reference that entered region `{}` neither through its boundary \
+    let resolve =
+        |allocations: &HashMap<AtomId, Option<ReferenceDischargeAllocationId>>, atom: AtomId, operation: &str| {
+            match allocations.get(&atom) {
+                Some(allocation) => Ok(*allocation),
+                None if is_reference(atom) => Err(ProgramError::MalformedProgram(format!(
+                    "operation `{operation}` reaches a reference that entered region `{}` neither through its boundary \
                  nor through its capture scope",
-                region.id(),
-            ))),
-            None => Ok(None),
-        }
-    };
+                    region.id(),
+                ))),
+                None => Ok(None),
+            }
+        };
     for instruction in region.instructions() {
         let operation = instruction.operation();
         let semantics = operation.reference_semantics();
@@ -437,8 +441,8 @@ fn validate_region_accesses<O: Operation>(
 fn forwarded_output_allocation<O: Operation>(
     operation: &O,
     output_index: usize,
-    attached_output_allocations: &[Vec<Option<ReferenceAllocationHandle>>],
-) -> Result<Option<ReferenceAllocationHandle>, ProgramError> {
+    attached_output_allocations: &[Vec<Option<ReferenceDischargeAllocationId>>],
+) -> Result<Option<ReferenceDischargeAllocationId>, ProgramError> {
     let provenance = operation.output_region_provenance(output_index);
     if provenance.is_empty() {
         return Err(ProgramError::MalformedProgram(format!(
@@ -507,7 +511,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         operation: &O,
         region_index: usize,
         region: RegionRef<'_, C::Constant, C::Operation>,
-        inputs: &[Option<ReferenceAllocationHandle>],
+        inputs: &[Option<ReferenceDischargeAllocationId>],
     ) -> Result<ReferenceRegionSummary, ProgramError> {
         let captures = nested_capture_scope(
             operation.region_capture_input_count(region_index),
@@ -545,11 +549,11 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         &self,
         operand: &ReferenceDischargeValue<C, P>,
         operation: &str,
-    ) -> Result<Option<ReferenceAllocationHandle>, ProgramError> {
+    ) -> Result<Option<ReferenceDischargeAllocationId>, ProgramError> {
         let ReferenceDischargeValue::Reference(reference) = operand else {
             return Ok(None);
         };
-        let allocation = reference.allocation();
+        let allocation = reference.allocation_id();
         let whole = self.allocation_reference_type(allocation)?;
         if !reference.denotes_complete_value() {
             return Err(ProgramError::MalformedProgram(format!(
@@ -587,7 +591,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         &self,
         summary: &ReferenceRegionSummary,
         operation: &str,
-    ) -> Result<BTreeSet<ReferenceAllocationHandle>, ProgramError> {
+    ) -> Result<BTreeSet<ReferenceDischargeAllocationId>, ProgramError> {
         let mut threaded = BTreeSet::new();
         for allocation in summary.reached() {
             if self.allocation_is_discharged(allocation).map_err(|error| {
@@ -617,7 +621,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     pub fn state_widening(
         &self,
         summary: &ReferenceRegionSummary,
-        declared: &BTreeSet<ReferenceAllocationHandle>,
+        declared: &BTreeSet<ReferenceDischargeAllocationId>,
         operation: &str,
     ) -> Result<ReferenceStateWidening, ProgramError> {
         let threaded = self.threaded_state_allocations(summary, operation)?;
@@ -635,8 +639,8 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     pub fn merge_boundary_state(
         &self,
         summary: &ReferenceRegionSummary,
-        threaded: &BTreeSet<ReferenceAllocationHandle>,
-        allocation: ReferenceAllocationHandle,
+        threaded: &BTreeSet<ReferenceDischargeAllocationId>,
+        allocation: ReferenceDischargeAllocationId,
         output: C::Value,
     ) -> Result<(), ProgramError>
     where
@@ -661,9 +665,9 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
             ReferenceDischargeValue::Ordinary(value) => return Ok(value.clone()),
         };
         match &reference.binding {
-            ReferenceDischargeBinding::Discharged => self.discharged_state(reference.allocation()),
+            ReferenceDischargeBinding::Discharged => self.discharged_state(reference.allocation_id()),
             ReferenceDischargeBinding::Preserved { reference: value } => {
-                self.validate_live_allocation(reference.allocation())?;
+                self.validate_live_allocation(reference.allocation_id())?;
                 Ok(value.clone())
             }
         }
@@ -675,7 +679,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     /// # Errors
     ///
     /// Returns [`ProgramError::MalformedProgram`] when `allocation` is not live in this environment.
-    pub fn allocation_value(&self, allocation: ReferenceAllocationHandle) -> Result<C::Value, ProgramError> {
+    pub fn allocation_value(&self, allocation: ReferenceDischargeAllocationId) -> Result<C::Value, ProgramError> {
         self.operand_value(&self.allocation_handle(allocation)?)
     }
 }
@@ -711,7 +715,7 @@ mod tests {
         let allocated = context
             .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
-        let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation();
+        let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation_id();
         let mut left = ReferenceRegionSummary::default();
         left.record(allocation, ReferenceAccessMode::Read, "list.read").unwrap();
         left.record(allocation, ReferenceAccessMode::ReadWrite, "list.swap").unwrap();
@@ -741,7 +745,7 @@ mod tests {
         let allocated = context
             .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
-        let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation();
+        let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation_id();
         let modes = [
             ReferenceAccessMode::Read,
             ReferenceAccessMode::Write,
@@ -882,7 +886,7 @@ mod tests {
         let allocated = context
             .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
-        let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation();
+        let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation_id();
         let summary = context
             .region_summary(&ListOperation::Call, 0, program.entry_region_ref(), &[Some(allocation), None])
             .unwrap();
@@ -919,7 +923,7 @@ mod tests {
         let allocated = context
             .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
-        let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation();
+        let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation_id();
         assert_eq!(
             context.region_summary(&ListOperation::Call, 0, program.entry_region_ref(), &[Some(allocation)]),
             Err(ProgramError::MalformedProgram(format!(
@@ -956,7 +960,7 @@ mod tests {
         let allocated = context
             .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
-        let allocation = allocated.expect_reference("the captured allocation").unwrap().allocation();
+        let allocation = allocated.expect_reference("the captured allocation").unwrap().allocation_id();
         let context = context
             .with_captures(ReferenceCaptureScope::new(list_capture_position, vec![None, None, Some(allocation)]));
 
@@ -970,7 +974,7 @@ mod tests {
                 &[None],
             )
             .unwrap();
-        assert_eq!(summary.accessed().collect::<Vec<_>>(), Vec::<ReferenceAllocationHandle>::new());
+        assert_eq!(summary.accessed().collect::<Vec<_>>(), Vec::<ReferenceDischargeAllocationId>::new());
         assert_eq!(summary.access_modes(allocation).collect::<Vec<_>>(), Vec::<ReferenceAccessMode>::new());
         assert!(!summary.is_mutated(allocation));
         assert_eq!(
@@ -1013,7 +1017,7 @@ mod tests {
             )
             .unwrap();
         let preserved_allocation =
-            preserved.expect_reference("the preserved captured allocation").unwrap().allocation();
+            preserved.expect_reference("the preserved captured allocation").unwrap().allocation_id();
         let preserved_context = preserved_context.with_captures(ReferenceCaptureScope::new(
             list_capture_position,
             vec![None, None, Some(preserved_allocation)],

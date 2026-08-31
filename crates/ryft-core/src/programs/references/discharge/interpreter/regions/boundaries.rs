@@ -7,7 +7,7 @@ use crate::programs::programs::Program;
 use crate::programs::values::Value;
 use crate::tracing::TracingContext;
 
-use super::super::ReferenceAllocationHandle;
+use super::super::ReferenceDischargeAllocationId;
 
 // TODO(eaplatanios): Review this module.
 
@@ -31,7 +31,7 @@ pub type ReferenceDischargeRegionDestination<C> = TracingContext<<C as Domain>::
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReferenceRegionStateInsertion {
     /// Allocations crossing at this group's positions, in canonical allocation order.
-    allocations: Vec<ReferenceAllocationHandle>,
+    allocations: Vec<ReferenceDischargeAllocationId>,
 
     /// Position in the source region's boundary at which the group is inserted.
     position: usize,
@@ -40,7 +40,7 @@ pub struct ReferenceRegionStateInsertion {
 impl ReferenceRegionStateInsertion {
     /// Creates a boundary-position group inserting `allocations` at `position`.
     #[inline]
-    pub fn new(allocations: Vec<ReferenceAllocationHandle>, position: usize) -> Self {
+    pub fn new(allocations: Vec<ReferenceDischargeAllocationId>, position: usize) -> Self {
         Self { allocations, position }
     }
 }
@@ -56,32 +56,32 @@ impl ReferenceRegionStateInsertion {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReferenceStateWidening {
     /// Every discharged reference the region closures reach, in canonical allocation order.
-    pub(super) threaded: BTreeSet<ReferenceAllocationHandle>,
+    pub(super) threaded: BTreeSet<ReferenceDischargeAllocationId>,
 
     /// Reached allocations gaining added boundary positions, in canonical allocation order. Discharged allocations
     /// cross as state and preserved allocations cross as references.
-    pub(super) entering: Vec<ReferenceAllocationHandle>,
+    pub(super) entering: Vec<ReferenceDischargeAllocationId>,
 
     /// Threaded allocations some closure mutates, in canonical allocation order.
-    pub(super) published: Vec<ReferenceAllocationHandle>,
+    pub(super) published: Vec<ReferenceDischargeAllocationId>,
 }
 
 impl ReferenceStateWidening {
     /// Returns every discharged reference the region closures reach, in canonical allocation order.
     #[inline]
-    pub fn threaded(&self) -> &BTreeSet<ReferenceAllocationHandle> {
+    pub fn threaded(&self) -> &BTreeSet<ReferenceDischargeAllocationId> {
         &self.threaded
     }
 
     /// Returns the reached allocations gaining added boundary positions, in canonical allocation order.
     #[inline]
-    pub fn entering(&self) -> &[ReferenceAllocationHandle] {
+    pub fn entering(&self) -> &[ReferenceDischargeAllocationId] {
         self.entering.as_slice()
     }
 
     /// Returns the threaded allocations some closure mutates, in canonical allocation order.
     #[inline]
-    pub fn published(&self) -> &[ReferenceAllocationHandle] {
+    pub fn published(&self) -> &[ReferenceDischargeAllocationId] {
         self.published.as_slice()
     }
 }
@@ -95,7 +95,7 @@ impl ReferenceStateWidening {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReferenceRegionDischargeBoundary {
     /// Allocation entering at each declared source-region input position, or [`None`] for an ordinary value.
-    declared_input_allocations: Vec<Option<ReferenceAllocationHandle>>,
+    declared_input_allocations: Vec<Option<ReferenceDischargeAllocationId>>,
 
     /// Length of the region's own leading capture prefix, from [`Operation::region_capture_input_count`], or [`None`]
     /// when the region inherits the capture scope of the region its operation is applied in.
@@ -103,14 +103,14 @@ pub struct ReferenceRegionDischargeBoundary {
 
     /// Allocations whose entering carrier the rebuilt region receives as added inputs, in canonical allocation order.
     /// Discharged references enter as immutable state; preserved references enter as their destination reference value.
-    added_input_allocations: Vec<ReferenceAllocationHandle>,
+    added_input_allocations: Vec<ReferenceDischargeAllocationId>,
 
     /// Position in the source region's input boundary at which the added inputs are inserted.
     input_insertion: usize,
 
     /// Allocations the rebuilt region publishes as added outputs, in canonical allocation order. Discharged
     /// allocations publish final state and preserved allocations publish their destination references.
-    added_output_allocations: Vec<ReferenceAllocationHandle>,
+    added_output_allocations: Vec<ReferenceDischargeAllocationId>,
 
     /// Position in the source region's output boundary at which the added outputs are inserted.
     output_insertion: usize,
@@ -147,7 +147,7 @@ impl ReferenceRegionDischargeBoundary {
     pub fn new<O: Operation>(
         operation: &O,
         region_index: usize,
-        declared_input_allocations: Vec<Option<ReferenceAllocationHandle>>,
+        declared_input_allocations: Vec<Option<ReferenceDischargeAllocationId>>,
         added_inputs: ReferenceRegionStateInsertion,
         added_outputs: ReferenceRegionStateInsertion,
     ) -> Self {
@@ -167,7 +167,7 @@ impl ReferenceRegionDischargeBoundary {
     pub fn symmetric<O: Operation>(
         operation: &O,
         region_index: usize,
-        declared_input_allocations: Vec<Option<ReferenceAllocationHandle>>,
+        declared_input_allocations: Vec<Option<ReferenceDischargeAllocationId>>,
         state: ReferenceRegionStateInsertion,
     ) -> Self {
         Self::new(operation, region_index, declared_input_allocations, state.clone(), state)
@@ -175,7 +175,7 @@ impl ReferenceRegionDischargeBoundary {
 
     /// Returns the allocation entering at each declared boundary position, or [`None`] for an ordinary value.
     #[inline]
-    pub(super) fn declared_input_allocations(&self) -> &[Option<ReferenceAllocationHandle>] {
+    pub(super) fn declared_input_allocations(&self) -> &[Option<ReferenceDischargeAllocationId>] {
         self.declared_input_allocations.as_slice()
     }
 
@@ -186,7 +186,7 @@ impl ReferenceRegionDischargeBoundary {
 
     /// Returns the allocations whose entering state or preserved reference the rebuilt region receives as added inputs.
     #[inline]
-    pub(super) fn added_input_allocations(&self) -> &[ReferenceAllocationHandle] {
+    pub(super) fn added_input_allocations(&self) -> &[ReferenceDischargeAllocationId] {
         self.added_input_allocations.as_slice()
     }
 
@@ -197,7 +197,7 @@ impl ReferenceRegionDischargeBoundary {
 
     /// Returns the allocations the rebuilt region publishes as added outputs.
     #[inline]
-    pub(super) fn added_output_allocations(&self) -> &[ReferenceAllocationHandle] {
+    pub(super) fn added_output_allocations(&self) -> &[ReferenceDischargeAllocationId] {
         self.added_output_allocations.as_slice()
     }
 
@@ -221,16 +221,16 @@ pub struct ReferenceRegionDischargeFork<V: Value, O: Operation<Type = V::Type>> 
     pub(super) program: Program<V, O, Vec<V>, Vec<V>>,
 
     /// Allocation each *declared* region output denotes, or [`None`] for an ordinary output, in region-boundary order.
-    pub(super) output_allocations: Vec<Option<ReferenceAllocationHandle>>,
+    pub(super) output_allocations: Vec<Option<ReferenceDischargeAllocationId>>,
 
     /// Threaded allocations the region's closure mutated, in canonical allocation order.
-    pub(super) mutated_allocations: Vec<ReferenceAllocationHandle>,
+    pub(super) mutated_allocations: Vec<ReferenceDischargeAllocationId>,
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> ReferenceRegionDischargeFork<V, O> {
     /// Returns the allocation each declared region output denotes, or [`None`] where the output is an ordinary value.
     #[inline]
-    pub fn output_allocations(&self) -> &[Option<ReferenceAllocationHandle>] {
+    pub fn output_allocations(&self) -> &[Option<ReferenceDischargeAllocationId>] {
         self.output_allocations.as_slice()
     }
 
@@ -260,7 +260,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceRegionDischargeFork<V, O> 
     /// Returns [`ProgramError::MalformedProgram`] when this region's declared outputs denote different allocations.
     pub fn validate_predicted_output_allocations(
         &self,
-        expected: &[Option<ReferenceAllocationHandle>],
+        expected: &[Option<ReferenceDischargeAllocationId>],
         operation: &str,
     ) -> Result<(), ProgramError> {
         if self.output_allocations != expected {
@@ -289,7 +289,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceRegionDischargeFork<V, O> 
     /// contain.
     pub fn validate_predicted_mutations(
         &self,
-        published: &[ReferenceAllocationHandle],
+        published: &[ReferenceDischargeAllocationId],
         operation: &str,
     ) -> Result<(), ProgramError> {
         for allocation in &self.mutated_allocations {
@@ -346,7 +346,7 @@ mod tests {
         let allocated = context
             .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
-        let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation();
+        let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation_id();
         let regions = [program];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let boundary = ReferenceRegionDischargeBoundary::new(

@@ -34,7 +34,7 @@
 //!   [`reference_new`](ReferenceNewOperation) mints one. Eagerly, the allocation is the reference allocation whose
 //!   synchronized state every [`Reference`] clone shares; in operation semantics, it is the identity that
 //!   [`ReferenceOutput::Allocation`] introduces and [`ReferenceOutput::Alias`] preserves; during discharge, it is the
-//!   unit of state threading, named by a [`ReferenceAllocationHandle`].
+//!   unit of state threading, named by a [`ReferenceDischargeAllocationId`].
 //! - The **referent** is the structural type of the value a handle exposes, written `ref<T>` as [`ReferenceType`].
 //!   The allocation has its own referent — the type of the complete stored value — and a view's handle-local referent may
 //!   be narrower.
@@ -174,7 +174,7 @@ mod values;
 
 pub use discharge::{
     ExternalReferenceBinding, PartialReferenceDischargeResult, RecursiveReferenceDischargeDriver,
-    ReferenceAccumulationPolicy, ReferenceAllocationHandle, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceAccumulationPolicy, ReferenceDischargeAllocationId, ReferenceDischargeContext, ReferenceDischargeDriver,
     ReferenceDischargePolicy, ReferenceDischargeReference, ReferenceDischargeRegionDestination,
     ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation,
     ReferenceDischargeableType, ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork,

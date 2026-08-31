@@ -208,7 +208,7 @@ mod tests {
         ];
         assert_eq!(Write::new().discharge_references(&context, &EmptyRegionDriver, inputs.as_slice()), Ok(Vec::new()),);
         assert_eq!(context.read(&reference), Ok(TestValue::new(REFERENT, 9)));
-        assert_eq!(context.is_mutated(reference.allocation()), Ok(true));
+        assert_eq!(context.is_mutated(reference.allocation_id()), Ok(true));
 
         // Exact operand inference runs before mutation, so a rejected replacement leaves the allocation unchanged.
         let invalid = vec![

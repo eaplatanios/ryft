@@ -219,7 +219,7 @@ mod tests {
             Freeze::new().discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&handle)),
             Err(ProgramError::MalformedProgram(format!(
                 "reference discharge accessed consumed {}",
-                reference.allocation(),
+                reference.allocation_id(),
             ))),
         );
     }

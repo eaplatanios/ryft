@@ -260,7 +260,7 @@ mod tests {
         let allocated = context
             .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
-        let allocation = allocated.expect_reference("the capture-scoped allocation").unwrap().allocation();
+        let allocation = allocated.expect_reference("the capture-scoped allocation").unwrap().allocation_id();
         let context = context
             .with_captures(ReferenceCaptureScope::new(list_capture_position, vec![None, None, Some(allocation)]));
         let regions = [program];
@@ -269,7 +269,7 @@ mod tests {
         let results = discharge_positional_region_operation(&ListOperation::Call, &context, &driver, &[], 0).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(
-            results[0].expect_reference("the returned capture-scoped allocation").unwrap().allocation(),
+            results[0].expect_reference("the returned capture-scoped allocation").unwrap().allocation_id(),
             allocation
         );
         assert_eq!(
@@ -291,7 +291,7 @@ mod tests {
         let context = ListDischargeContext::new(ListDestination::new());
         let destination_reference = ListIrValue::Reference(reference_type.clone());
         let preserved = context.bind_preserved(reference_type, destination_reference.clone()).unwrap();
-        let allocation = preserved.expect_reference("the preserved capture-scoped allocation").unwrap().allocation();
+        let allocation = preserved.expect_reference("the preserved capture-scoped allocation").unwrap().allocation_id();
         let context = context
             .with_captures(ReferenceCaptureScope::new(list_capture_position, vec![None, None, Some(allocation)]));
         let regions = [program];
@@ -300,7 +300,7 @@ mod tests {
         let results = discharge_positional_region_operation(&ListOperation::Call, &context, &driver, &[], 0).unwrap();
         assert_eq!(results.len(), 1);
         let returned = results[0].expect_reference("the returned preserved capture-scoped allocation").unwrap();
-        assert_eq!(returned.allocation(), allocation);
+        assert_eq!(returned.allocation_id(), allocation);
         assert_eq!(returned.preserved(), Some(&destination_reference));
         assert_eq!(context.operand_value(&results[0]), Ok(destination_reference));
     }

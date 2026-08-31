@@ -755,7 +755,7 @@ mod tests {
             .unwrap();
         assert_eq!(sliced.len(), 1);
         let sliced = sliced[0].expect_reference("the derived slice").unwrap().clone();
-        assert_eq!(sliced.allocation(), allocation.allocation());
+        assert_eq!(sliced.allocation_id(), allocation.allocation_id());
         assert_eq!(sliced.r#type(), &ReferenceType::new(ArrayType::new_static(DataType::F32, [2, 2])));
         assert_eq!(sliced.preserved(), None);
 
@@ -765,7 +765,7 @@ mod tests {
             .discharge_references(&context, &EmptyRegionDriver, &[ReferenceDischargeValue::Reference(sliced.clone())])
             .unwrap();
         let indexed = indexed[0].expect_reference("the derived index").unwrap().clone();
-        assert_eq!(indexed.allocation(), allocation.allocation());
+        assert_eq!(indexed.allocation_id(), allocation.allocation_id());
         assert_eq!(indexed.r#type(), &ReferenceType::new(ArrayType::new_static(DataType::F32, [2])));
         assert_eq!(
             indexed.alias(),
@@ -819,13 +819,13 @@ mod tests {
                 ))),
             )
             .unwrap();
-        let preserved_allocation = preserved.expect_reference("the preserved allocation").unwrap().allocation();
+        let preserved_allocation = preserved.expect_reference("the preserved allocation").unwrap().allocation_id();
         let derived = ReferenceIndexOperation::new(0, 0)
             .discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&preserved))
             .unwrap();
         assert_eq!(derived.len(), 1);
         let derived = derived[0].expect_reference("the derived preserved view").unwrap().clone();
-        assert_eq!(derived.allocation(), preserved_allocation);
+        assert_eq!(derived.allocation_id(), preserved_allocation);
         assert_eq!(derived.r#type(), &ReferenceType::new(ArrayType::new_static(DataType::F32, [3])));
         assert_eq!(
             derived.alias(),

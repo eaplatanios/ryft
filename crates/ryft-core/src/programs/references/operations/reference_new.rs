@@ -218,12 +218,12 @@ mod tests {
         // type is the one this operation's own inference derives, exposed through the storage alias of a complete
         // value.
         let (context, reference) = allocated_allocation(4);
-        assert_eq!(context.live_allocations(), vec![reference.allocation()]);
+        assert_eq!(context.live_allocations(), vec![reference.allocation_id()]);
         assert_eq!(reference.r#type(), &ReferenceType::new(REFERENT));
         assert_eq!(reference.alias(), &TestAlias);
         assert_eq!(reference.preserved(), None);
-        assert_eq!(context.discharged_state(reference.allocation()), Ok(TestValue::new(REFERENT, 4)));
-        assert_eq!(context.is_mutated(reference.allocation()), Ok(false));
+        assert_eq!(context.discharged_state(reference.allocation_id()), Ok(TestValue::new(REFERENT, 4)));
+        assert_eq!(context.is_mutated(reference.allocation_id()), Ok(false));
 
         // A reference operand is not an initial state, and the diagnostic says which operand the rule expected.
         let context = TestDischargeContext::new(TestDestination::new());

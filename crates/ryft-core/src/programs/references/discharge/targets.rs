@@ -2,40 +2,35 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Display;
 use std::rc::Rc;
 
-// TODO(eaplatanios): Review this module.
-
 use crate::parameters::Parameterized;
 use crate::programs::ProgramError;
 use crate::programs::instructions::InstructionId;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
+use crate::programs::references::discharge::results::ReferenceSource;
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
 
-use super::results::ReferenceSource;
-
-/// One caller-selectable reference target for partial reference discharge.
+/// A caller-selectable [`Reference`](crate::Reference) target for partial reference discharge. A target needs an
+/// identity that exists in the _source_ [`Program`], before any replay begins, so it cannot reuse the environment's
+/// [`ReferenceDischargeAllocationId`](crate::ReferenceDischargeAllocationId)s. In particular, a nested region's formal
+/// reference input is invocation-parameterized (the region may be invoked from several call sites) and so it names no
+/// single caller-owned reference and is deliberately not selectable. Targets resolve internally to allocations once
+/// discharge starts.
 ///
-/// A target needs an identity that exists in the *source* program, before any replay begins, so it cannot reuse the
-/// environment's [`ReferenceAllocationHandle`](crate::programs::references::ReferenceAllocationHandle)s. In particular, a nested
-/// region's formal reference input is invocation-parameterized — the region may be invoked from several call sites —
-/// so it names no single caller-owned reference and is deliberately not selectable. Targets resolve internally to
-/// allocations once discharge starts.
-///
-/// Targets are arena-relative in exactly the sense that every other reference artifact is: their coordinates are
-/// meaningful only against the program they were enumerated from. Target validation rejects every kind mismatch, and
-/// the arena-relativity contract carries the rest, because a coordinate taken from a different arena that happens to
+/// Targets are arena-relative in exactly the sense that every other reference artifact is (i.e., their coordinates are
+/// meaningful only against the program they were enumerated from). Target validation rejects every kind mismatch, and
+/// the arena-relativity contract carries the rest because a coordinate taken from a different arena that happens to
 /// name a valid allocation here is indistinguishable in principle.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[non_exhaustive]
 pub enum ReferenceDischargeTarget {
     /// Entry-boundary allocation supplied by the caller as a lifted capture or a public reference argument.
     External(ReferenceSource),
 
-    /// Interior allocation target, identified by the allocating instruction and the output position that defines the
-    /// fresh allocation.
+    /// Interior allocation target, identified by the allocating [`Instruction`](crate::Instruction) and the output
+    /// position that defines the fresh allocation.
     Internal {
-        /// Allocating instruction.
+        /// Allocating [`Instruction`](crate::Instruction).
         instruction: InstructionId,
 
         /// Output position defining the fresh allocation.
@@ -43,9 +38,8 @@ pub enum ReferenceDischargeTarget {
     },
 }
 
-// Targets exist to be named in diagnostics, so the rendering backticks the arena coordinate it embeds. That keeps every
-// message that interpolates a whole target consistent with the reference-target diagnostics, which backtick coordinates.
 impl Display for ReferenceDischargeTarget {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::External(source) => write!(formatter, "external {source}"),
@@ -55,6 +49,8 @@ impl Display for ReferenceDischargeTarget {
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Reference targets one discharge normalizes into immutable state, with every unselected allocation preserved.
 ///

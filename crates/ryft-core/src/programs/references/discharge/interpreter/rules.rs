@@ -123,14 +123,14 @@ where
             ReferenceDischargeValue::Ordinary(value) => Ok(value.clone()),
             ReferenceDischargeValue::Reference(reference) => match reference.preserved() {
                 Some(value) => {
-                    context.validate_live_allocation(reference.allocation())?;
+                    context.validate_live_allocation(reference.allocation_id())?;
                     Ok(value.clone())
                 }
                 None => Err(ProgramError::MalformedProgram(format!(
                     "reference discharge cannot replay `{}` over discharged {}, which has no destination reference \
                      value",
                     operation.name(),
-                    reference.allocation(),
+                    reference.allocation_id(),
                 ))),
             },
         })
@@ -410,7 +410,7 @@ mod tests {
 
         let reference_type = ReferenceType::new(ListType { length: 2 });
         let allocated = context.allocate_discharged(reference_type, ListIrValue::List(vec![1, 2])).unwrap();
-        let allocation = allocated.expect_reference("the allocated allocation").unwrap().allocation();
+        let allocation = allocated.expect_reference("the allocated allocation").unwrap().allocation_id();
         assert_eq!(
             discharge_reference_free_operation(&ListOperation::Add, &context, &EmptyRegionDriver, &[allocated, rhs]),
             Err(ProgramError::MalformedProgram(format!(
@@ -624,7 +624,7 @@ mod tests {
         let context = ListDischargeContext::new(ListDestination::new());
         let discharged =
             context.allocate_discharged(ReferenceType::new(referent), ListIrValue::List(vec![1, 2])).unwrap();
-        let discharged_allocation = discharged.expect_reference("the discharged reference").unwrap().allocation();
+        let discharged_allocation = discharged.expect_reference("the discharged reference").unwrap().allocation_id();
         assert_eq!(
             discharge_preserved_access(&ListOperation::Read, &context, std::slice::from_ref(&discharged)),
             Err(ProgramError::MalformedProgram(format!(

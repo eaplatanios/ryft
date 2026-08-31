@@ -103,9 +103,9 @@
 //! # Allocation Identities and Boundaries
 //!
 //! [`ReferenceDischargeTarget`] is a source-program coordinate used before replay to select an external reference or a
-//! locally allocated reference. [`ReferenceAllocationHandle`] is different: it is a temporary identity minted inside one
-//! live discharge environment. Handles from isolated region forks cannot address parent allocations, and fork results
-//! carry sealed programs and context-free summaries rather than child-context values.
+//! locally allocated reference. [`ReferenceDischargeAllocationId`] is different: it is a temporary identity minted
+//! inside one live discharge environment. IDs from isolated region forks cannot address parent allocations, and fork
+//! results carry sealed programs and context-free summaries rather than child-context values.
 //!
 //! Structured rules use [`ReferenceRegionDischargeBoundary`] to describe their declared inputs plus the discharged
 //! allocations that must enter and leave a rebuilt region. Read-only allocations are pruned where the operation's boundary permits
@@ -129,8 +129,9 @@
 //!   [`ReferenceSource`].
 //! - A **discharge target** is a stable source-program coordinate used to select an external reference or internal
 //!   allocation for partial discharge, represented by [`ReferenceDischargeTarget`].
-//! - An **allocation identity** is the temporary [`ReferenceAllocationHandle`] by which one running interpreter identifies
-//!   a reference allocation. It is not a source-program coordinate and cannot cross between isolated environments.
+//! - An **allocation identity** is the temporary [`ReferenceDischargeAllocationId`] by which one running interpreter
+//!   identifies a reference allocation. It is not a source-program coordinate and cannot cross between isolated
+//!   environments.
 //! - A **discharged reference** is represented by its current immutable state. A **preserved reference** remains
 //!   represented by a reference value and its reference operations are replayed rather than rewritten.
 //! - A **carrier** is a [`ReferenceDischargeValue`]: either an ordinary destination value or a temporary reference
@@ -151,10 +152,10 @@ mod targets;
 mod transform;
 
 pub use interpreter::{
-    RecursiveReferenceDischargeDriver, ReferenceAllocationHandle, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargeReference, ReferenceDischargeRegionDestination, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork,
-    ReferenceRegionStateInsertion, ReferenceRegionSummary, ReferenceStateWidening,
+    RecursiveReferenceDischargeDriver, ReferenceDischargeAllocationId, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargeReference, ReferenceDischargeRegionDestination,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceRegionDischargeBoundary,
+    ReferenceRegionDischargeFork, ReferenceRegionStateInsertion, ReferenceRegionSummary, ReferenceStateWidening,
     discharge_positional_region_operation, discharge_preserved_access, discharge_reference_free_operation,
 };
 pub use policies::{ReferenceAccumulationPolicy, ReferenceDischargePolicy, ReferenceDischargeableType};

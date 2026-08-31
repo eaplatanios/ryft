@@ -1,0 +1,13 @@
+error[E0451]: fields `index` and `environment` of struct `ReferenceDischargeAllocationId` are private
+  --> tests/reference_discharge/error_reference_discharge_allocation_id_fabrication.rs:10:38
+   |
+10 |     ReferenceDischargeAllocationId { index: 0, environment: unreachable!() }
+   |                                      ^^^^^     ^^^^^^^^^^^ private field
+   |                                      |
+   |                                      private field
+
+error: type `references::discharge::interpreter::ReferenceDischargeEnvironmentId` is private
+  --> tests/reference_discharge/error_reference_discharge_allocation_id_fabrication.rs:10:61
+   |
+10 |     ReferenceDischargeAllocationId { index: 0, environment: unreachable!() }
+   |                                                             ^^^^^^^^^^^^^^ private type

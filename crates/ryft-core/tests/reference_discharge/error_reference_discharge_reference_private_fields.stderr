@@ -1,0 +1,10 @@
+error[E0616]: field `allocation_id` of struct `ReferenceDischargeReference` is private
+  --> tests/reference_discharge/error_reference_discharge_reference_private_fields.rs:13:15
+   |
+13 |     reference.allocation_id
+   |               ^^^^^^^^^^^^^ private field
+   |
+help: a method `allocation_id` also exists, call it with parentheses
+   |
+13 |     reference.allocation_id()
+   |                            ++

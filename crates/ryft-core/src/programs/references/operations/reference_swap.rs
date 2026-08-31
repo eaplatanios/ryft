@@ -211,7 +211,7 @@ mod tests {
             Ok(vec![ReferenceDischargeValue::Ordinary(TestValue::new(REFERENT, 4))]),
         );
         assert_eq!(context.read(&reference), Ok(TestValue::new(REFERENT, 9)));
-        assert_eq!(context.is_mutated(reference.allocation()), Ok(true));
+        assert_eq!(context.is_mutated(reference.allocation_id()), Ok(true));
 
         // The replacement itself must be an ordinary value rather than a second reference handle.
         let handles =

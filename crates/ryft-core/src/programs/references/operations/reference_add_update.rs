@@ -218,7 +218,7 @@ mod tests {
             Ok(Vec::new()),
         );
         assert_eq!(context.read(&reference), Ok(TestValue::new(REFERENT, 13)));
-        assert_eq!(context.is_mutated(reference.allocation()), Ok(true));
+        assert_eq!(context.is_mutated(reference.allocation_id()), Ok(true));
 
         // An update whose sum with the referent would not itself be the referent is rejected by this operation's own
         // inference before the universe accumulates anything, so the allocation keeps its previous state.

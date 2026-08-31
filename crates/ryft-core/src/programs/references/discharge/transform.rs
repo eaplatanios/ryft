@@ -379,7 +379,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
                     // declared it, so the caller still supplies the reference and every access to it replays verbatim.
                     context.bind_preserved(reference_type, destination.input(input_type))?
                 };
-                let allocation = carrier.expect_reference("an entry-boundary reference allocation")?.allocation();
+                let allocation = carrier.expect_reference("an entry-boundary reference allocation")?.allocation_id();
                 if selected {
                     discharged_allocations.push((source, allocation));
                 }
@@ -408,7 +408,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
                     // is a use of it like any other, so its liveness is resolved against the environment rather than
                     // taken from the handle, which is what reports an allocation the program already consumed.
                     ReferenceDischargeValue::Reference(reference) => {
-                        context.validate_live_allocation(reference.allocation())?;
+                        context.validate_live_allocation(reference.allocation_id())?;
                         reference
                             .preserved()
                             .ok_or_else(|| {

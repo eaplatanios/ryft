@@ -171,7 +171,7 @@ mod tests {
             Read::new().discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&handle)),
             Ok(vec![ReferenceDischargeValue::Ordinary(TestValue::new(REFERENT, 4))]),
         );
-        assert_eq!(context.is_mutated(reference.allocation()), Ok(false));
+        assert_eq!(context.is_mutated(reference.allocation_id()), Ok(false));
 
         // An ordinary operand denotes no allocation, so the rule reports what it expected instead of reading a value.
         let pure: TestDischargeValue = ReferenceDischargeValue::Ordinary(TestValue::new(REFERENT, 4));
