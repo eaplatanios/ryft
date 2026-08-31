@@ -13,9 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added native bindings for converting XProf `XSpace` traces into XLA feedback-directed optimization profiles and
   aggregating multiple instruction profiles at a configurable percentile.
 - Added support for Linux AArch64.
-- Added C++ bindings for the `affine`, `arith`, `builtin`, `gpu`, `llvm`, `mosaic_gpu`, `mosaic_tpu`, `nvgpu`, `shape`,
-  `sparse_tensor`, `transform`, and Triton `tt` MLIR dialects.
+- Added C++ bindings for the `affine`, `arith`, `bufferization`, `builtin`, `complex`, `gpu`, `llvm`, `mosaic_gpu`,
+  `mosaic_tpu`, `nvgpu`, `shape`, `sparse_tensor`, `transform`, Triton `tt`, and `ub` MLIR dialects.
 - Added the `mps` feature for loading the `jax-mps` PJRT plugin on macOS AArch64.
+- Added Mosaic GPU type ID and serde-pass bindings, versioned bytecode/resource constants, CUDA-only `mosaic_gpu_v2`
+  runtime registration, upstream Complex attribute bindings, and a source-owned UB poison attribute C API bridge.
 
 ### Changed
 

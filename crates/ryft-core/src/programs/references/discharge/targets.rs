@@ -150,35 +150,27 @@ impl ReferenceDischargeTargets {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-impl<V, O, Input, Output> Program<V, O, Input, Output>
-where
-    V: Value,
-    O: Operation<Type = V::Type>,
-    Input: Parameterized<V>,
-    Output: Parameterized<V>,
+impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Parameterized<V>>
+    Program<V, O, Input, Output>
 {
-    /// Returns every [`ReferenceDischargeTarget`] this program exposes to partial reference discharge, in canonical
-    /// order: the entry-boundary externals in boundary order, followed by the interior allocations ordered by their
-    /// arena coordinates.
+    /// Returns every [`ReferenceDischargeTarget`] that this [`Program`] exposes to partial reference discharge, in a
+    /// canonical ordering with the entry-boundary externals in boundary order, followed by the interior allocations
+    /// ordered by their arena coordinates. This is a deliberately lightweight query. It reads only the entry boundary
+    /// types and the generic [`Operation::reference_semantics`] over the attached [`Region`](crate::Region) closure,
+    /// so it does not run the discharge rewrite or construct its environments, and callers can enumerate selectable
+    /// targets without paying for either. Allocations inside nested regions are included because every allocating
+    /// [`Instruction`](crate::Instruction) defines a concrete local reference wherever it occurs.
     ///
-    /// This is a deliberately lightweight query. It reads only the entry boundary types and the generic
-    /// [`Operation::reference_semantics`] hook over the attached region closure, so it does not run the discharge
-    /// rewrite or construct its environments, and callers can enumerate selectable targets without paying for either.
-    /// Allocations inside nested regions are included because every allocating instruction defines a concrete local
-    /// reference wherever it occurs.
-    ///
-    /// One class of enumerated target is inert: an allocation inside a closure that no operation ever replays, such as
-    /// the dormant derivative rule region of a `custom_jvp`. Discharge rejects such a program outright, whichever way
-    /// the target is selected, because how a reference boundary widens there has no defined meaning. The enumeration
-    /// reports the target anyway rather than second-guessing the region roles, so that it stays a structural query.
+    /// One class of enumerated targets is inert: an allocation inside a closure that no operation ever replays, such
+    /// as the dormant derivative rule region of a [`CustomJvpOperation`](crate::CustomJvpOperation). Discharge rejects
+    /// such a program outright, whichever way the target is selected, because how a reference boundary widens there has
+    /// no defined meaning. The enumeration reports the target anyway rather than second-guessing the region roles, so
+    /// that it stays a structural query.
     ///
     /// # Parameters
     ///
     ///   - `capture_count`: Number of leading flat inputs that originated in the program's capture table, used to
-    ///     split the entry boundary into [`ReferenceSource::Capture`] and [`ReferenceSource::Input`]
-    ///     positions.
+    ///     split the entry boundary into [`ReferenceSource::Capture`] and [`ReferenceSource::Input`] positions.
     ///
     /// # Errors
     ///
@@ -191,10 +183,12 @@ where
         let input_ids = entry.input_ids();
         if capture_count > input_ids.len() {
             return Err(ProgramError::MalformedProgram(format!(
-                "reference discharge target enumeration requests {capture_count} captures but the program has {} inputs",
+                "reference discharge target enumeration requests {} captures but the program has {} inputs",
+                capture_count,
                 input_ids.len(),
             )));
         }
+
         let mut targets = input_ids
             .iter()
             .enumerate()
@@ -203,6 +197,7 @@ where
                 ReferenceDischargeTarget::External(ReferenceSource::from_flat_input_index(input_index, capture_count))
             })
             .collect::<Vec<_>>();
+
         let mut allocations = entry
             .instructions_in_closure()
             .flat_map(|(instruction_id, instruction)| {
@@ -242,7 +237,7 @@ mod tests {
 
     use super::*;
 
-    fn target_validation_program() -> Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>> {
+    fn test_target_validation_program() -> Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>> {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let public = builder.add_input(reference_type(0));
         let initial = builder.add_input(TestType::Value(0));
@@ -286,7 +281,7 @@ mod tests {
 
     #[test]
     fn test_reference_discharge_targets_select_everything_or_only_requested_targets() {
-        let program = target_validation_program();
+        let program = test_target_validation_program();
         let external = ReferenceDischargeTarget::External(ReferenceSource::Input { index: 0 });
         let internal =
             ReferenceDischargeTarget::Internal { instruction: InstructionId::new(program.entry(), 0), output_index: 0 };
@@ -375,8 +370,8 @@ mod tests {
             )
             .unwrap();
 
-        // Closure traversal order is unspecified, so internal targets must be sorted by arena coordinate. Importing
-        // the same region at two call sites must not duplicate the allocation it contains.
+        // Closure traversal order is unspecified, so internal targets must be sorted by arena coordinate.
+        // Importing the same region at two call sites must not duplicate the allocation it contains.
         assert_eq!(
             program.reference_discharge_targets(0),
             Ok(vec![
@@ -406,7 +401,7 @@ mod tests {
 
     #[test]
     fn test_reference_discharge_targets_construction_accepts_empty_and_reordered_valid_sets() {
-        let program = target_validation_program();
+        let program = test_target_validation_program();
         let external = ReferenceDischargeTarget::External(ReferenceSource::Input { index: 0 });
         let internal =
             ReferenceDischargeTarget::Internal { instruction: InstructionId::new(program.entry(), 0), output_index: 0 };
@@ -422,7 +417,7 @@ mod tests {
 
     #[test]
     fn test_reference_discharge_targets_construction_rejects_invalid_set_shape() {
-        let program = target_validation_program();
+        let program = test_target_validation_program();
         let entry = program.entry();
         let allocation =
             ReferenceDischargeTarget::Internal { instruction: InstructionId::new(entry, 0), output_index: 0 };
@@ -453,7 +448,7 @@ mod tests {
 
     #[test]
     fn test_reference_discharge_targets_construction_rejects_invalid_external_targets() {
-        let program = target_validation_program();
+        let program = test_target_validation_program();
 
         assert_eq!(
             ReferenceDischargeTargets::from_targets(
@@ -507,7 +502,7 @@ mod tests {
 
     #[test]
     fn test_reference_discharge_targets_construction_rejects_invalid_internal_targets() {
-        let program = target_validation_program();
+        let program = test_target_validation_program();
         let entry = program.entry();
         assert_eq!(
             ReferenceDischargeTargets::from_targets(
