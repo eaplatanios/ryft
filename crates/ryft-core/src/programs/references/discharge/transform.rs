@@ -19,50 +19,37 @@ use crate::programs::references::types::ReferenceType;
 use crate::programs::values::Value;
 use crate::tracing::TracingContext;
 
-// TODO(eaplatanios): Review this module.
-
 impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
-    /// Discharges every reference this program touches by interpreting it in a [`ReferenceDischargeContext`] over a
-    /// fresh trace of its own universe, returning the reference-free program together with its external-reference
-    /// bindings.
+    /// Rewrites every [`Reference`](crate::Reference) in this [`Program`] as explicit immutable state and returns the
+    /// resulting reference-free program together with bindings for its external references.
     ///
-    /// This is the entry point production discharge runs through, and it owns the whole reference language: the
-    /// primitives rewrite themselves, and a region-carrying operation either discharges through its own
-    /// [`ReferenceDischargeableOperation`] rule — widening its boundaries with the state its regions touch — or, when
-    /// nothing in its attached closure touches a reference, replays those regions verbatim. What survives as a
-    /// rejection is a region closure that does touch a reference behind an operation with no rule of its own, and a
-    /// reference that reaches a region neither through a boundary nor through a capture scope. A universe whose
-    /// programs name their caller's references through capture constants uses
-    /// [the capture-aware entry point](Self::discharge_references_in_capture_lifted_program) instead, which is
-    /// the same rewrite under a populated capture scope.
+    /// A reference-typed input keeps its position but becomes an ordinary input carrying the reference's initial state.
+    /// Local reference allocations disappear. The source program's public outputs remain first and in the same order;
+    /// the final state of each mutated external reference is appended as a hidden output in entry-boundary order.
+    /// A read-only external reference adds no hidden output.
     ///
-    /// Each source input keeps its position. A reference-typed input becomes an ordinary input carrying the referent's
-    /// lifted type, which is the entering immutable state of the allocation that input denotes; every other input is
-    /// replayed unchanged. The public outputs are exactly the source outputs, in order, and the final state of each
-    /// *mutated* external allocation is appended after them as a hidden output in entry-boundary order. An allocation that the
-    /// program only reads contributes no hidden output, so a read-only program keeps its original boundary exactly.
+    /// Each operation defines how its reference effects are rewritten through [`ReferenceDischargeableOperation`].
+    /// A structured operation must also thread through the reference state used by its attached
+    /// [`Region`](crate::Region)s; a structured operation whose complete region closure is reference-free is replayed
+    /// unchanged. The returned [`ReferenceDischargeResult`] proves that no reference type or reference operation
+    /// remains anywhere in the rewritten region closure.
     ///
-    /// The replay runs through [`ReferenceDischargeDriver::discharge_region`] rather than through
-    /// [`interpret_in_context`](Self::interpret_in_context), because that is the path that threads each instruction's
-    /// source coordinate into the rules, which is what makes an entry-region allocation identifiable.
-    ///
-    /// The rewritten program is proven reference-free rather than assumed to be: the replay assembles a
-    /// [`PartialReferenceDischargeResult`] and converts it through [`ReferenceDischargeResult::try_from`], so a rule
-    /// that returned a reference-touching operation is reported here instead of surviving into a result whose contract
-    /// says it cannot exist.
+    /// Use [`discharge_references_in_capture_lifted_program`](Self::discharge_references_in_capture_lifted_program)
+    /// instead when the program was produced by lifting a [`ClosedProgram`]'s captures and attached regions may refer
+    /// to those captures through capture constants.
     ///
     /// # Parameters
     ///
     ///   - `capture_count`: Number of leading flat inputs that originated in the source program's capture table, used
-    ///     to split the entry boundary into [`ReferenceSource::Capture`] and [`ReferenceSource::Input`]
-    ///     positions.
+    ///     to split the entry boundary into [`ReferenceSource::Capture`] and [`ReferenceSource::Input`] positions.
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::MalformedProgram`] when `capture_count` exceeds the program's input count, when an
-    /// output still denotes a reference, when the program consumes an external allocation, whose state belongs to the
-    /// caller, or when the rewritten program fails the reference-freedom proof. Rule-level failures, including a
-    /// use-after-consume and an access to an unbound allocation, propagate from the replay itself.
+    /// Returns [`ProgramError::MalformedProgram`] when `capture_count` exceeds the input count, when an external
+    /// reference is consumed, when a reference reaches a region without a boundary or capture binding, when a
+    /// structured operation has no rule for its reference-using regions, or when the rewritten program is not fully
+    /// reference-free. Errors reported by individual operation rules, including use after consumption and access to
+    /// an unbound reference, propagate unchanged.
     #[inline]
     pub fn discharge_references<P: ReferenceDischargePolicy<TracingContext<V, O>>>(
         self,
@@ -80,31 +67,27 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
         )?)
     }
 
-    /// Discharges every reference a *capture-lifted* program touches, resolving the capture-scoped reference
-    /// constants its attached regions name their caller's references through.
+    /// Rewrites every [`Reference`](crate::Reference) in a capture-lifted [`Program`] as explicit immutable state and
+    /// returns a proven reference-free result.
     ///
-    /// A capture-lifted program is one whose captures have been turned into a leading input prefix by
-    /// [`ClosedProgram::to_program_with_lifted_captures`](crate::ClosedProgram::to_program_with_lifted_captures).
-    /// Lifting rewrites the entry boundary, but an attached region keeps naming the same captures through
-    /// [`CaptureReference`](crate::CaptureReference) constants, and those constants denote the very allocations the
-    /// lifted prefix binds. This entry point therefore differs from
-    /// [`discharge_references`](Self::discharge_references) in exactly one respect: it seeds the entry capture scope
-    /// from that prefix, so a reference-typed capture constant resolves to the allocation its position already binds
-    /// instead of being rejected as belonging to no allocation.
+    /// A capture-lifted program has the captures of a [`ClosedProgram`] represented by a leading input prefix. Attached
+    /// [`Region`](crate::Region)s may still name those captures through capture constants. This function resolves each
+    /// reference-typed capture constant to the external reference bound at the corresponding prefix position.
     ///
-    /// Everything else — the boundary rewrite, the hidden final-state outputs, and the reference-freedom proof — is
-    /// identical, and a program with no capture-scoped reference constant discharges to exactly the same result
-    /// through either entry point.
+    /// Apart from that capture resolution, this function has the same boundary rewrite, hidden final-state outputs,
+    /// and reference-freedom guarantee as [`discharge_references`](Self::discharge_references). The two functions
+    /// produce the same result when no attached region uses a reference-typed capture constant.
     ///
     /// # Parameters
     ///
-    ///   - `capture_count`: Length of the lifted capture prefix, which is both the split between
-    ///     [`ReferenceSource::Capture`] and [`ReferenceSource::Input`] positions and the capture scope's own length.
+    ///   - `capture_count`: Number of inputs in the lifted capture prefix. It determines both the capture scope and the
+    ///     split between [`ReferenceSource::Capture`] and [`ReferenceSource::Input`] positions.
     ///
     /// # Errors
     ///
-    /// Returns the same errors as [`discharge_references`](Self::discharge_references), and additionally reports a
-    /// capture constant whose declared reference type disagrees with the allocation its position binds.
+    /// Returns the same errors as [`discharge_references`](Self::discharge_references). It also returns
+    /// [`ProgramError::MalformedProgram`] when a capture constant's reference type disagrees with the external
+    /// reference bound at its capture position.
     #[inline]
     pub fn discharge_references_in_capture_lifted_program<P: ReferenceDischargePolicy<TracingContext<V, O>>>(
         self,
@@ -123,53 +106,40 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
         )?)
     }
 
-    /// Discharges the references the caller *selected* and preserves every other one, returning the mixed program
-    /// together with the external-reference bindings of the allocations that became state.
+    /// Rewrites the selected/targeted [`Reference`](crate::Reference)s as explicit immutable state while preserving
+    /// every unselected reference.
     ///
-    /// This is the same rewrite [`discharge_references`](Self::discharge_references) performs;
-    /// full discharge is exactly its everything-selected case, and the two share one body. A selected allocation threads as
-    /// immutable state in every respect described there. An unselected allocation instead *survives*: it keeps its
-    /// reference-typed boundary position or its allocating instruction, every access to it replays verbatim as the
-    /// reference operation the source performed, and a view derived from it replays its view operation too, so the
-    /// rewritten program still denotes the same coordinates. Preserved references contribute no state input, no hidden
-    /// final-state output, and no [`ExternalReferenceBinding`]: the program's own boundary is where the caller sees them.
+    /// The selected references follow the same rewrite as [`discharge_references`](Self::discharge_references). An
+    /// unselected reference keeps its reference-typed boundary position or allocation operation, and its accesses and
+    /// derived views are replayed unchanged. It contributes no [`ExternalReferenceBinding`] or hidden final-state
+    /// output because it never becomes explicit state.
     ///
-    /// This is what a kernel pipeline needs — normalize the pipeline's own state into explicit carries while the
-    /// references a kernel body addresses stay references — and it is the reason the result envelope is
-    /// [`PartialReferenceDischargeResult`], which proves nothing about reference freedom. A caller that expects the
-    /// targets to have covered everything asks for the proof explicitly through [`ReferenceDischargeResult::try_from`].
+    /// Preserved references can cross structured-[`Region`](crate::Region) boundaries beside discharged state. A
+    /// declared reference position remains a reference position; when an attached region reaches a preserved reference
+    /// only through an inherited capture, the rewrite adds a reference-typed position to keep the rebuilt region
+    /// self-contained.
     ///
-    /// A preserved reference crosses a structured operation's region boundary as the reference it already is. When the
-    /// source declares a boundary position for it, the rewritten operation keeps that position. When an attached
-    /// region reaches it only through an inherited capture, the rewrite adds a reference-typed boundary position so
-    /// the rebuilt region remains self-contained. Either way it occupies no state carry and publishes no successor,
-    /// so a condition, loop, scan, or call can thread discharged state and surviving references side by side.
+    /// The returned [`PartialReferenceDischargeResult`] may therefore still contain reference types and operations.
+    /// If the selected targets were expected to cover every reference, convert it through
+    /// [`ReferenceDischargeResult::try_from`] to validate and obtain the full-discharge guarantee.
     ///
-    /// Where a structured operation *declares* a reference-typed output — a loop carry, say — the rewritten operation
-    /// still produces one, and it is deliberately left unused: the caller keeps the handle it already holds, because
-    /// both denote the same allocation and one destination value per allocation is enough. A later full discharge of the same
-    /// program collapses that position into an ordinary state carry.
-    ///
-    /// A capture-lifted program instead uses
-    /// [`Self::partially_discharge_references_in_capture_lifted_program`], which performs the same target selection
-    /// under a populated capture scope.
+    /// A capture-lifted program instead uses [`Self::partially_discharge_references_in_capture_lifted_program`], which
+    /// performs the same target selection under a populated capture scope.
     ///
     /// # Parameters
     ///
-    ///   - `capture_count`: Number of leading flat inputs that originated in the source program's capture table, used
-    ///     to split the entry boundary into [`ReferenceSource::Capture`] and [`ReferenceSource::Input`]
-    ///     positions.
+    ///   - `capture_count`: Number of leading flat inputs that originated in the source program's capture table,
+    ///     used to split the entry boundary into [`ReferenceSource::Capture`] and [`ReferenceSource::Input`] positions.
     ///   - `targets`: Reference targets to discharge, enumerated from this same program through
     ///     [`reference_discharge_targets`](Self::reference_discharge_targets). Every other allocation is preserved.
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::MalformedProgram`] when `targets` does not validate against this program, and otherwise
-    /// for every reason [`discharge_references`](Self::discharge_references) documents — with one deliberate
-    /// exception. Consuming a *discharged* external allocation is still rejected, because a
-    /// [`ExternalReferenceBinding`] cannot express a caller-owned reference that no longer denotes live state; consuming
-    /// a *preserved* one is accepted, because the program retains the consuming operation and the caller passes its
-    /// reference handle to that operation directly.
+    /// Returns [`ProgramError::MalformedProgram`] when `targets` does not belong to this program or otherwise violates
+    /// the target-selection contract. It also returns the applicable errors documented by
+    /// [`discharge_references`](Self::discharge_references), except that consuming a preserved external reference is
+    /// allowed because its consuming operation remains in the rewritten program. Consuming a discharged external
+    /// reference remains invalid because its state is still owned by the caller.
     #[inline]
     pub fn partially_discharge_references<P: ReferenceDischargePolicy<TracingContext<V, O>>>(
         self,
@@ -185,26 +155,26 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
         self.discharge_references_helper::<P>(capture_count, |_| None, targets)
     }
 
-    /// Discharges the selected references of a *capture-lifted* program and preserves every other reference.
+    /// Rewrites the selected/targeted [`Reference`](crate::Reference)s of a capture-lifted [`Program`] as explicit
+    /// immutable state and preserves every unselected reference.
     ///
-    /// A capture-lifted program is one whose captures have been turned into a leading input prefix by
-    /// [`ClosedProgram::to_program_with_lifted_captures`](crate::ClosedProgram::to_program_with_lifted_captures).
-    /// This function combines the capture resolution of
-    /// [`discharge_references_in_capture_lifted_program`](Self::discharge_references_in_capture_lifted_program) with
-    /// the target selection and partial-result contract of
-    /// [`partially_discharge_references`](Self::partially_discharge_references).
+    /// This function combines the capture-constant resolution of
+    /// [`discharge_references_in_capture_lifted_program`](Self::discharge_references_in_capture_lifted_program)
+    /// with the selection and partial-result behavior of
+    /// [`partially_discharge_references`](Self::partially_discharge_references). The lifted capture prefix
+    /// establishes the capture scope; only references named by `targets` become immutable state.
     ///
     /// # Parameters
     ///
-    ///   - `capture_count`: Length of the lifted capture prefix.
+    ///   - `capture_count`: Number of inputs in the lifted capture prefix.
     ///   - `targets`: Reference targets to discharge, enumerated from this same capture-lifted program through
     ///     [`reference_discharge_targets`](Self::reference_discharge_targets). Every other allocation is preserved.
     ///
     /// # Errors
     ///
-    /// Returns the same errors as [`partially_discharge_references`](Self::partially_discharge_references), and
-    /// additionally reports a capture constant whose declared reference type disagrees with the allocation its
-    /// position binds.
+    /// Returns the same errors as [`partially_discharge_references`](Self::partially_discharge_references). It also
+    /// returns [`ProgramError::MalformedProgram`] when a capture constant's reference type disagrees with the external
+    /// reference bound at its capture position.
     #[inline]
     pub fn partially_discharge_references_in_capture_lifted_program<P: ReferenceDischargePolicy<TracingContext<V, O>>>(
         self,
@@ -221,26 +191,20 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
         self.discharge_references_helper::<P>(capture_count, CaptureConstant::capture_index, targets)
     }
 
-    /// Discharges one target selection while resolving stored capture constants through `capture_index_of`.
-    ///
-    /// This is the shared body of the program-level entry points, and the partial rewrite is the general one: full
-    /// discharge is the everything-selected case, which is why the body always assembles the partial result and
-    /// leaves the reference-freedom proof to the caller that promised it.
-    ///
-    /// The capture-index resolver is a parameter rather than a bound because the interpreter deliberately serves
-    /// constant families that are not capture-bearing at all. It is a function pointer rather than a closure because
-    /// the only two resolvers that reach this function are "nothing is a capture" and
-    /// [`CaptureConstant::capture_index`].
+    /// Performs the shared partial-discharge rewrite for one validated target selection. `capture_index_of` resolves
+    /// reference-typed capture constants when the input is capture-lifted; ordinary programs provide a resolver that
+    /// matches no constant. The function always returns a [`PartialReferenceDischargeResult`]. Full-discharge entry
+    /// points select every reference and then validate the result through [`ReferenceDischargeResult::try_from`].
     ///
     /// # Parameters
     ///
-    ///   - `capture_count`: Number of leading flat inputs that originated in the source program's capture table.
-    ///   - `capture_index_of`: Function reporting the capture position a stored constant names.
+    ///   - `capture_count`: Number of leading inputs that originated in the source program's capture table.
+    ///   - `capture_index_of`: Function returning the capture position named by a stored constant.
     ///   - `targets`: Reference targets to discharge; every allocation they omit is preserved.
     ///
     /// # Errors
     ///
-    /// Returns the errors the public entry points document, which is every error the replay can raise.
+    /// Returns any validation or operation-rule error produced while rewriting the program.
     fn discharge_references_helper<P: ReferenceDischargePolicy<TracingContext<V, O>>>(
         self,
         capture_count: usize,
@@ -261,10 +225,10 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
         }
         let output_count = self.output_count();
 
-        // A program that touches no reference anywhere is already its own discharge, so it is returned untouched
-        // rather than replayed into a fresh trace. This is not only cheaper on the two transform adapters that
-        // discharge unconditionally: re-tracing would also renumber its atoms, drop its dead constants, and abandon
-        // the region transform cache its regions carry, all for a rewrite that has nothing to rewrite.
+        // A program that touches no reference anywhere is already its own discharge, so it is returned untouched rather
+        // than replayed into a fresh trace. This is not only cheaper on the two transform adapters that discharge
+        // unconditionally: re-tracing would also renumber its atoms, drop its dead constants, and abandon the region
+        // transform cache its regions carry, all for a rewrite that has nothing to rewrite.
         let entry = self.entry_region_ref();
         if !entry.contains_references_in_closure() {
             return PartialReferenceDischargeResult::new(self, capture_count, output_count, Vec::new());
@@ -276,8 +240,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
         let (builder, output_ids, external_reference_bindings) = {
             let destination = TracingContext::<V, O>::new();
             let builder = destination.builder().clone();
-            let context =
-                ReferenceDischargeContext::<TracingContext<V, O>, P>::new_with_targets(destination.clone(), targets);
+            let context = ReferenceDischargeContext::new_with_targets(destination.clone(), targets);
             let mut inputs = Vec::with_capacity(input_count);
             let mut discharged_allocations = Vec::new();
             let mut capture_allocations = vec![None; capture_count];
@@ -293,8 +256,9 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
                     let state = destination.input(V::Type::from(reference_type.referent().clone()));
                     context.allocate_discharged(reference_type, state)?
                 } else {
-                    // An unselected external allocation keeps its reference-typed boundary position exactly as the source
-                    // declared it, so the caller still supplies the reference and every access to it replays verbatim.
+                    // An unselected external allocation keeps its reference-typed boundary position exactly as the
+                    // source declared it, so the caller still supplies the reference, and every access to it replays
+                    // verbatim.
                     context.bind_preserved(reference_type, destination.input(input_type))?
                 };
                 let allocation = carrier.expect_reference("an entry-boundary reference allocation")?.allocation_id();
@@ -307,8 +271,8 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
                 inputs.push(carrier);
             }
 
-            // The capture scope can only be established once the prefix has minted its allocations, and it is what lets a
-            // nested region resolve the caller references it names through capture constants rather than through its
+            // The capture scope can only be established once the prefix has minted its allocations, and it is what lets
+            // a nested region resolve the caller references it names through capture constants rather than through its
             // own boundary.
             let context = context.with_captures(ReferenceCaptureScope::new(capture_index_of, capture_allocations));
 
@@ -320,12 +284,12 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
                 .enumerate()
                 .map(|(output_index, output)| match output {
                     ReferenceDischargeValue::Ordinary(value) => value.atom_id(),
-
-                    // A preserved reference survives in the rewritten program, so returning one returns its destination
-                    // reference value. A discharged reference has no such value, because it became state. Returning an allocation
-                    // is a use of it like any other, so its liveness is resolved against the environment rather than
-                    // taken from the handle, which is what reports an allocation the program already consumed.
                     ReferenceDischargeValue::Reference(reference) => {
+                        // A preserved reference survives in the rewritten program, so returning one returns its
+                        // destination reference value. A discharged reference has no such value, because it became
+                        // state. Returning an allocation is a use of it like any other, so its liveness is resolved
+                        // against the environment rather than taken from the handle, which is what reports an
+                        // allocation the program already consumed.
                         context.validate_live_allocation(reference.allocation_id())?;
                         reference
                             .preserved()
@@ -340,10 +304,10 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
                 })
                 .collect::<Result<Vec<_>, _>>()?;
 
-            // A mutated external allocation publishes its final state as a hidden output; a read-only one publishes nothing,
-            // which is what keeps a read-only program's boundary identical to its source boundary. A preserved
-            // external allocation binds nothing at all: it never became state, so there is no state for a caller to supply
-            // or to write back.
+            // A mutated external allocation publishes its final state as a hidden output. A read-only one publishes
+            // nothing, which is what keeps a read-only program's boundary identical to its source boundary. A preserved
+            // external allocation binds nothing at all (i.e., because it never became state, so there is no state for a
+            // caller to supply or to write back).
             let mut external_reference_bindings = Vec::with_capacity(discharged_allocations.len());
             for (source, allocation) in discharged_allocations {
                 if context.validate_live_allocation(allocation).is_err() {
@@ -370,6 +334,8 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     }
 }
 
+// TODO(eaplatanios): Review this module.
+
 impl<
     Capture: Value,
     V: CaptureConstant<Type = Capture::Type>,
@@ -378,11 +344,16 @@ impl<
     Output: Parameterized<V>,
 > ClosedProgram<Capture, V, O, Input, Output>
 {
-    /// Lifts this closed program's captures and discharges every reachable reference.
+    /// Lifts this [`ClosedProgram`]'s captures into leading inputs and rewrites every reference as explicit immutable
+    /// state.
     ///
-    /// The returned logical metadata continues to identify capture slots separately from inputs. Concrete capture
-    /// values remain owned by this [`ClosedProgram`]; discharge never embeds their mutable contents into the derived
-    /// program.
+    /// The returned [`ReferenceDischargeResult`] remains reference-free and records which leading inputs originated as
+    /// captures rather than ordinary inputs. The concrete capture values remain owned by this closed program; their
+    /// mutable contents are not embedded in the rewritten program.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors produced while lifting the captures or performing capture-aware reference discharge.
     #[inline]
     pub fn discharge_references<P: ReferenceDischargePolicy<TracingContext<V, O>>>(
         &self,
