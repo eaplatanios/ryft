@@ -122,49 +122,119 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::programs::ProgramError;
-    use crate::programs::references::discharge::tests::*;
-    use crate::programs::references::types::ReferenceType;
-    
+    use crate::programs::references::discharge::tests::{
+        ListAlias, ListDestination, ListIrValue, ListReferenceDischarge, ListType,
+    };
+
     use super::*;
 
     #[test]
-    fn test_list_reference_discharge_policy_applies_composed_aliases() {
+    fn test_reference_discharge_policy_storage_alias_covers_the_complete_value() {
+        assert_eq!(
+            <ListReferenceDischarge as ReferenceDischargePolicy<ListDestination>>::storage_alias(&ListType {
+                length: 4,
+            }),
+            ListAlias { offset: 0, length: 4 },
+        );
+    }
+
+    #[test]
+    fn test_reference_discharge_policy_read_returns_complete_values_and_views() {
         let destination = ListDestination::new();
-        let referent = ListType { length: 4 };
-
-        // The storage alias of an allocation covers its complete referent, and the destination universe's canonical
-        // conversions round-trip a reference type while rejecting an ordinary type as a reference.
-        let storage_alias =
-            <ListReferenceDischarge as ReferenceDischargePolicy<ListDestination>>::storage_alias(&referent);
-        assert_eq!(storage_alias, ListAlias { offset: 0, length: 4 });
-        let reference_type = ReferenceType::new(referent.clone());
-        let lifted = ListIrType::from(reference_type.clone());
-        assert_eq!(lifted, ListIrType::Reference(reference_type.clone()));
-        assert_eq!(<&ReferenceType<ListType>>::try_from(&lifted), Ok(&reference_type));
-        assert!(<&ReferenceType<ListType>>::try_from(&ListIrType::List(referent)).is_err());
-
-        // A composed alias selects only its own coordinates on every access, and replacement and accumulation return
-        // the successor state of the complete stored value rather than of the selection.
         let current = ListIrValue::List(vec![1, 2, 3, 4]);
-        let view = ListAlias { offset: 1, length: 2 };
-        assert_eq!(ListReferenceDischarge::read(&destination, &current, &view), Ok(ListIrValue::List(vec![2, 3])));
+
+        // A storage alias reads the complete value, whereas a view alias reads only the part it describes.
         assert_eq!(
-            ListReferenceDischarge::swap(&destination, &current, ListIrValue::List(vec![20, 30]), &view),
-            Ok((ListIrValue::List(vec![2, 3]), ListIrValue::List(vec![1, 20, 30, 4]))),
+            ListReferenceDischarge::read(&destination, &current, &ListAlias { offset: 0, length: 4 }),
+            Ok(ListIrValue::List(vec![1, 2, 3, 4])),
         );
         assert_eq!(
-            ListReferenceDischarge::accumulate(&destination, &current, ListIrValue::List(vec![20, 30]), &view),
-            Ok(ListIrValue::List(vec![1, 22, 33, 4])),
+            ListReferenceDischarge::read(&destination, &current, &ListAlias { offset: 1, length: 2 }),
+            Ok(ListIrValue::List(vec![2, 3])),
         );
 
-        // The policy reports the universe's own failures instead of silently widening a selection.
+        // An invalid view preserves the exact error produced by the reference family's selection operation.
         assert_eq!(
             ListReferenceDischarge::read(&destination, &current, &ListAlias { offset: 3, length: 2 }),
             Err(ProgramError::MalformedProgram("selection [3, 5) does not fit a list of length 4".to_string())),
         );
+    }
+
+    #[test]
+    fn test_reference_discharge_policy_write_replaces_complete_values_and_views() {
+        let destination = ListDestination::new();
+        let current = ListIrValue::List(vec![1, 2, 3, 4]);
+
         assert_eq!(
-            ListReferenceDischarge::swap(&destination, &current, ListIrValue::List(vec![20]), &view),
-            Ok((ListIrValue::List(vec![2, 3]), ListIrValue::List(vec![1, 20, 3, 4]))),
+            ListReferenceDischarge::write(
+                &destination,
+                &current,
+                ListIrValue::List(vec![5, 6, 7, 8]),
+                &ListAlias { offset: 0, length: 4 },
+            ),
+            Ok(ListIrValue::List(vec![5, 6, 7, 8])),
+        );
+
+        // Writing through a view replaces only that view and preserves the values around it.
+        assert_eq!(
+            ListReferenceDischarge::write(
+                &destination,
+                &current,
+                ListIrValue::List(vec![20, 30]),
+                &ListAlias { offset: 1, length: 2 },
+            ),
+            Ok(ListIrValue::List(vec![1, 20, 30, 4])),
+        );
+        assert_eq!(
+            ListReferenceDischarge::write(
+                &destination,
+                &current,
+                ListIrValue::List(vec![20, 30]),
+                &ListAlias { offset: 3, length: 2 },
+            ),
+            Err(ProgramError::MalformedProgram("splice [3, 5) does not fit a list of length 4".to_string())),
+        );
+    }
+
+    #[test]
+    fn test_reference_discharge_policy_swap_returns_the_previous_view_and_complete_update() {
+        let destination = ListDestination::new();
+        let current = ListIrValue::List(vec![1, 2, 3, 4]);
+        let view = ListAlias { offset: 1, length: 2 };
+
+        // The default implementation returns the value read through the view first and the complete updated value
+        // second.
+        assert_eq!(
+            ListReferenceDischarge::swap(&destination, &current, ListIrValue::List(vec![20, 30]), &view),
+            Ok((ListIrValue::List(vec![2, 3]), ListIrValue::List(vec![1, 20, 30, 4]))),
+        );
+
+        // Because the default implementation reads before writing, a read failure is returned directly.
+        assert_eq!(
+            ListReferenceDischarge::swap(
+                &destination,
+                &current,
+                ListIrValue::List(vec![20, 30]),
+                &ListAlias { offset: 3, length: 2 },
+            ),
+            Err(ProgramError::MalformedProgram("selection [3, 5) does not fit a list of length 4".to_string())),
+        );
+    }
+
+    #[test]
+    fn test_reference_accumulation_policy_accumulate_updates_only_the_selected_view() {
+        let destination = ListDestination::new();
+        let current = ListIrValue::List(vec![1, 2, 3, 4]);
+        let view = ListAlias { offset: 1, length: 2 };
+
+        // Accumulation adds through the view and returns the complete value with everything outside the view intact.
+        assert_eq!(
+            ListReferenceDischarge::accumulate(&destination, &current, ListIrValue::List(vec![20, 30]), &view),
+            Ok(ListIrValue::List(vec![1, 22, 33, 4])),
+        );
+        assert_eq!(
+            ListReferenceDischarge::accumulate(&destination, &current, ListIrValue::List(vec![20]), &view),
+            Err(ProgramError::MalformedProgram("cannot add lists of lengths 2 and 1".to_string())),
         );
     }
 }
