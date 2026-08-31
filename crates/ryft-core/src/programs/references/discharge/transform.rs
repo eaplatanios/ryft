@@ -20,6 +20,12 @@ use crate::programs::values::Value;
 use crate::tracing::TracingContext;
 
 // TODO(eaplatanios): Move `ReferenceDischargeContext` here.
+// TODO(eaplatanios): Move `ReferenceDischargeEnvironmentId` here.
+// TODO(eaplatanios): Move `ReferenceDischargeEnvironment` here.
+// TODO(eaplatanios): Move `ReferenceAllocationEntry` here.
+// TODO(eaplatanios): Move `ReferenceAllocationState` here.
+// TODO(eaplatanios): Move `ReferenceDischargeAllocationId` here. Should this be renamed to `ReferenceAllocationId`?
+// TODO(eaplatanios): Move `ReferenceCaptureScope` here.
 
 impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// Rewrites every [`Reference`](crate::Reference) in this [`Program`] as explicit immutable state and returns the
@@ -386,51 +392,101 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn test_capture_aware_reference_discharge_resolves_nested_capture_references() {
-        // The attached region names the caller-owned reference only through a capture constant. Capture lifting moves
-        // that reference into the entry input prefix while leaving the nested constant for the discharge transform to
-        // resolve through its capture scope.
+    /// Capture-constant family used by the capture-aware transform tests.
+    type ListCapture = CaptureReference<ListIrType>;
+
+    /// Closed list program used by the capture-aware transform tests.
+    type ClosedListProgram = ClosedProgram<ListIrValue, ListCapture, ListOperation, Vec<ListCapture>, Vec<ListCapture>>;
+
+    /// Builds a closed program whose attached region reads a reference solely through a capture constant.
+    fn closed_list_program_with_nested_reference_capture() -> ClosedListProgram {
         let reference_type = ReferenceType::new(ListType { length: 2 });
-        let mut callee_builder = ProgramBuilder::<CaptureReference<ListIrType>, ListOperation>::new();
+        let mut callee_builder = ProgramBuilder::<ListCapture, ListOperation>::new();
         let captured_reference =
-            callee_builder.add_constant(CaptureReference::new(0, ListIrType::Reference(reference_type.clone())));
+            callee_builder.add_constant(ListCapture::new(0, ListIrType::Reference(reference_type.clone())));
         let observed = callee_builder
             .add_instruction(ListOperation::Read, Vec::new(), vec![captured_reference], None)
             .unwrap()[0];
         let callee = callee_builder
-            .build::<Vec<CaptureReference<ListIrType>>, Vec<CaptureReference<ListIrType>>>(
-                vec![observed],
-                Vec::<Placeholder>::new(),
-                vec![Placeholder],
-            )
+            .build::<Vec<ListCapture>, Vec<ListCapture>>(vec![observed], Vec::<Placeholder>::new(), vec![Placeholder])
             .unwrap();
 
-        let mut builder = ProgramBuilder::<CaptureReference<ListIrType>, ListOperation>::new();
+        let mut builder = ProgramBuilder::<ListCapture, ListOperation>::new();
         let callee = builder.import_program(callee);
         let observed = builder.add_instruction(ListOperation::Call, vec![callee], Vec::new(), None).unwrap()[0];
         let source = builder
-            .build::<Vec<CaptureReference<ListIrType>>, Vec<CaptureReference<ListIrType>>>(
-                vec![observed],
-                Vec::<Placeholder>::new(),
-                vec![Placeholder],
-            )
+            .build::<Vec<ListCapture>, Vec<ListCapture>>(vec![observed], Vec::<Placeholder>::new(), vec![Placeholder])
             .unwrap();
-        let closed = ClosedProgram::new(source, vec![ListIrValue::Reference(reference_type)]).unwrap();
+        ClosedProgram::new(source, vec![ListIrValue::Reference(reference_type)]).unwrap()
+    }
+
+    #[test]
+    fn test_program_discharge_references() {
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let reference = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
+        let replacement = builder.add_input(ListIrType::List(ListType { length: 2 }));
+        let previous = builder
+            .add_instruction(ListOperation::Swap, Vec::new(), vec![reference, replacement], None)
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![previous], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let discharged = source.discharge_references(0).unwrap();
+        assert_eq!(discharged.capture_count(), 0);
+        assert_eq!(discharged.output_count(), 1);
+        assert_eq!(
+            discharged.external_reference_bindings(),
+            &[ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(1))],
+        );
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:list<2>, %1:list<2> .
+                let %2:list<2> = list.select %0
+                    %3:list<2> = list.splice %0 %1
+                in (%2, %3)"},
+        );
+    }
+
+    #[test]
+    fn test_program_discharge_references_rejects_consumed_external_allocations() {
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let external = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
+        let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![external], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        assert_eq!(
+            source.discharge_references(0).unwrap_err(),
+            ProgramError::MalformedProgram(
+                "reference discharge consumed external input 0, whose state must remain owned by the caller"
+                    .to_string(),
+            ),
+        );
+    }
+
+    #[test]
+    fn test_program_discharge_references_in_capture_lifted_program() {
+        // The attached region names the caller-owned reference only through a capture constant. Capture lifting moves
+        // that reference into the entry input prefix while leaving the nested constant for the discharge transform to
+        // resolve through its capture scope.
+        let closed = closed_list_program_with_nested_reference_capture();
         let lifted = closed.to_program_with_lifted_captures().unwrap();
 
         let targets = lifted.reference_discharge_targets(1).unwrap();
         assert_eq!(targets, vec![ReferenceDischargeTarget::External(ReferenceSource::Capture { index: 0 })]);
 
-        let full = lifted.clone().discharge_references_in_capture_lifted_program::<ListReferenceDischarge>(1).unwrap();
-        assert_eq!(full.capture_count(), 1);
-        assert_eq!(full.output_count(), 1);
+        let discharged = lifted.discharge_references_in_capture_lifted_program::<ListReferenceDischarge>(1).unwrap();
+        assert_eq!(discharged.capture_count(), 1);
+        assert_eq!(discharged.output_count(), 1);
         assert_eq!(
-            full.external_reference_bindings(),
+            discharged.external_reference_bindings(),
             &[ExternalReferenceBinding::new(ReferenceSource::Capture { index: 0 }, None)],
         );
         assert_eq!(
-            full.program().to_string(),
+            discharged.program().to_string(),
             indoc! {"
                 lambda %0:list<2> .
                 let %1:list<2> = list.call %0 [
@@ -442,38 +498,10 @@ mod tests {
                 ]
                 in (%1)"},
         );
-
-        // The closed-program convenience function must agree exactly with the direct capture-aware transform.
-        let closed_full = closed.discharge_references::<ListReferenceDischarge>().unwrap();
-        assert_eq!(closed_full.capture_count(), full.capture_count());
-        assert_eq!(closed_full.output_count(), full.output_count());
-        assert_eq!(closed_full.external_reference_bindings(), full.external_reference_bindings());
-        assert_eq!(closed_full.program().to_string(), full.program().to_string());
-
-        // Selecting nothing preserves the capture as a reference and explicitly threads it into the nested region.
-        let partial = lifted
-            .partially_discharge_references_in_capture_lifted_program::<ListReferenceDischarge>(1, &[])
-            .unwrap();
-        assert_eq!(partial.capture_count(), 1);
-        assert_eq!(partial.output_count(), 1);
-        assert_eq!(partial.external_reference_bindings(), &[]);
-        assert_eq!(
-            partial.program().to_string(),
-            indoc! {"
-                lambda %0:ref<list<2>> .
-                let %1:list<2> = list.call %0 [
-                    callee={
-                        lambda %0:ref<list<2>> .
-                        let %1:list<2> = list.read %0
-                        in (%1)
-                    },
-                ]
-                in (%1)"},
-        );
     }
 
     #[test]
-    fn test_partial_reference_discharge_preserves_unselected_external_allocations() {
+    fn test_program_partially_discharge_references() {
         // The kernel-pipeline shape, in a universe that mentions no arrays: one caller-owned allocation is selected
         // and becomes threaded state, while the other survives as a reference the rewritten program still accesses
         // through the very operations the source used.
@@ -530,7 +558,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_reference_discharge_preserves_an_unselected_internal_target() {
+    fn test_program_partially_discharge_references_preserves_an_unselected_internal_target() {
         // An interior allocation is selectable in its own right, so a program can normalize its pipeline state while
         // the allocation a kernel body addresses is allocated, viewed, accessed, and consumed as a reference
         // throughout.
@@ -583,11 +611,10 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_reference_discharge_allows_consuming_a_preserved_external_allocation() {
-        // Full discharge rejects a program that consumes a caller-owned allocation, because an
-        // `ExternalReferenceBinding` cannot describe reference state that no longer exists. A preserved reference has
-        // no binding to describe: the program keeps the consuming operation, and the caller passes its reference to
-        // that operation directly, so partial discharge accepts what full discharge cannot express.
+    fn test_program_partially_discharge_references_allows_consuming_a_preserved_external_allocation() {
+        // A preserved reference has no external binding to describe: the program keeps the consuming operation, and
+        // the caller passes its reference to that operation directly, so partial discharge preserves the source
+        // program's consumption.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let external = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![external], None).unwrap()[0];
@@ -595,7 +622,7 @@ mod tests {
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
             .unwrap();
 
-        let preserved = source.clone().partially_discharge_references(0, &[]).unwrap();
+        let preserved = source.partially_discharge_references(0, &[]).unwrap();
         assert_eq!(preserved.external_reference_bindings(), &[]);
         assert_eq!(
             preserved.program().to_string(),
@@ -604,14 +631,6 @@ mod tests {
                 let %1:list<2> = list.freeze %0
                 in (%1)"},
         );
-        assert_eq!(
-            source.discharge_references(0).unwrap_err(),
-            ProgramError::MalformedProgram(
-                "reference discharge consumed external input 0, whose state must remain owned by the caller"
-                    .to_string(),
-            ),
-        );
-
         // Returning the allocation afterwards is a use of it like any other, so the consumed allocation is reported at
         // the output that names it rather than published as a stale reference.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
@@ -636,7 +655,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_reference_discharge_threads_a_preserved_allocation_beside_discharged_state() {
+    fn test_program_partially_discharge_references_threads_a_preserved_allocation_beside_discharged_state() {
         // A structured boundary carries both kinds of allocation at once: a discharged carry crosses as immutable
         // state and is widened with a published successor, while a preserved carry crosses as the reference it already
         // is, at its own declared operand position, and widens nothing at all.
@@ -692,7 +711,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_reference_discharge_validates_its_targets_against_the_program() {
+    fn test_program_partially_discharge_references_validates_targets_against_the_program() {
         // The targets are checked before anything is replayed, so a target this program does not expose is reported
         // against the program rather than surfacing later as an allocation that never appeared.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
@@ -713,6 +732,59 @@ mod tests {
                 "reference discharge targets include external input 3, which is not selectable in this program"
                     .to_string(),
             ),
+        );
+    }
+
+    #[test]
+    fn test_program_partially_discharge_references_in_capture_lifted_program() {
+        // Selecting nothing preserves the capture as a reference and explicitly threads it into the nested region.
+        let closed = closed_list_program_with_nested_reference_capture();
+        let lifted = closed.to_program_with_lifted_captures().unwrap();
+        let discharged = lifted
+            .partially_discharge_references_in_capture_lifted_program::<ListReferenceDischarge>(1, &[])
+            .unwrap();
+
+        assert_eq!(discharged.capture_count(), 1);
+        assert_eq!(discharged.output_count(), 1);
+        assert_eq!(discharged.external_reference_bindings(), &[]);
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:ref<list<2>> .
+                let %1:list<2> = list.call %0 [
+                    callee={
+                        lambda %0:ref<list<2>> .
+                        let %1:list<2> = list.read %0
+                        in (%1)
+                    },
+                ]
+                in (%1)"},
+        );
+    }
+
+    #[test]
+    fn test_closed_program_discharge_references() {
+        let closed = closed_list_program_with_nested_reference_capture();
+        let discharged = closed.discharge_references::<ListReferenceDischarge>().unwrap();
+
+        assert_eq!(discharged.capture_count(), 1);
+        assert_eq!(discharged.output_count(), 1);
+        assert_eq!(
+            discharged.external_reference_bindings(),
+            &[ExternalReferenceBinding::new(ReferenceSource::Capture { index: 0 }, None)],
+        );
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:list<2> .
+                let %1:list<2> = list.call %0 [
+                    callee={
+                        lambda %0:list<2> .
+                        let %1:list<2> = list.select %0
+                        in (%1)
+                    },
+                ]
+                in (%1)"},
         );
     }
 }
