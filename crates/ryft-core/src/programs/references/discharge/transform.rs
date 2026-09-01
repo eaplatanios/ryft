@@ -2146,7 +2146,10 @@ mod tests {
     /// Closed list program used by the capture-aware transform tests.
     type ClosedListProgram = ClosedProgram<ListIrValue, ListCapture, ListOperation, Vec<ListCapture>, Vec<ListCapture>>;
 
-    fn test_target_validation_program() -> Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>> {
+    /// Builds a program exposing one external input and one internal allocation as selectable
+    /// [`ReferenceDischargeTarget`]s.
+    fn program_with_external_and_internal_reference_targets()
+    -> Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>> {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let public = builder.add_input(reference_type(0));
         let initial = builder.add_input(TestType::Value(0));
@@ -2212,7 +2215,7 @@ mod tests {
 
     #[test]
     fn test_reference_discharge_targets_select_everything_or_only_requested_targets() {
-        let program = test_target_validation_program();
+        let program = program_with_external_and_internal_reference_targets();
         let external = ReferenceDischargeTarget::External(ReferenceSource::Input { index: 0 });
         let internal =
             ReferenceDischargeTarget::Internal { instruction: InstructionId::new(program.entry(), 0), output_index: 0 };
@@ -2332,7 +2335,7 @@ mod tests {
 
     #[test]
     fn test_reference_discharge_targets_construction_accepts_empty_and_reordered_valid_sets() {
-        let program = test_target_validation_program();
+        let program = program_with_external_and_internal_reference_targets();
         let external = ReferenceDischargeTarget::External(ReferenceSource::Input { index: 0 });
         let internal =
             ReferenceDischargeTarget::Internal { instruction: InstructionId::new(program.entry(), 0), output_index: 0 };
@@ -2348,7 +2351,7 @@ mod tests {
 
     #[test]
     fn test_reference_discharge_targets_construction_rejects_invalid_set_shape() {
-        let program = test_target_validation_program();
+        let program = program_with_external_and_internal_reference_targets();
         let entry = program.entry();
         let allocation =
             ReferenceDischargeTarget::Internal { instruction: InstructionId::new(entry, 0), output_index: 0 };
@@ -2379,7 +2382,7 @@ mod tests {
 
     #[test]
     fn test_reference_discharge_targets_construction_rejects_invalid_external_targets() {
-        let program = test_target_validation_program();
+        let program = program_with_external_and_internal_reference_targets();
 
         assert_eq!(
             ReferenceDischargeTargets::from_targets(
@@ -2433,7 +2436,7 @@ mod tests {
 
     #[test]
     fn test_reference_discharge_targets_construction_rejects_invalid_internal_targets() {
-        let program = test_target_validation_program();
+        let program = program_with_external_and_internal_reference_targets();
         let entry = program.entry();
         assert_eq!(
             ReferenceDischargeTargets::from_targets(
