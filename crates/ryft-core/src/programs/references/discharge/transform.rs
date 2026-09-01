@@ -29,34 +29,6 @@ use crate::tracing::TracingContext;
 // TODO(eaplatanios): Review `ReferenceDischargeAllocationState`, `ReferenceDischargeCaptureScope`,
 //  `ReferenceDischargeReference`, and `ReferenceDischargeBinding`.
 
-/// Identity of a reference allocation inside an ongoing reference discharge transform.
-/// [`ReferenceDischargeAllocationId`]s are minted by [`ReferenceDischargeContext`] as allocations enter its
-/// environment, so they are temporary discharge identities rather than source [`Program`] locations. They exist only
-/// for the duration of one discharge transform and are meaningful only against the environment that produced them.
-/// Pre-transform identity for caller-facing targets is represented using [`ReferenceDischargeTarget`] instead.
-///
-/// Each [`ReferenceDischargeAllocationId`] records which [`ReferenceDischargeEnvironment`] minted it, so that an ID
-/// from an unrelated discharge is reported rather than silently addressing whichever allocation happens to occupy the
-/// same position. That is also what isolates a structured rule's [`Region`](crate::Region) fork: the fork mints its own
-/// environment, so a caller ID cannot address a fork allocation and a fork ID cannot address a caller allocation. The
-/// one table relating the two lives inside [`ReferenceDischargeDriver::discharge_region_program`], which reports its
-/// results in caller terms.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct ReferenceDischargeAllocationId {
-    /// ID of the [`ReferenceDischargeEnvironment`] that minted this [`ReferenceDischargeAllocationId`].
-    environment: ReferenceDischargeEnvironmentId,
-
-    /// Position of the allocation in that [`ReferenceDischargeEnvironment`].
-    index: usize,
-}
-
-impl Display for ReferenceDischargeAllocationId {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(formatter, "reference allocation {}:{}", self.environment.0, self.index)
-    }
-}
-
 /// Process-local identity of a [`ReferenceDischargeEnvironment`], shared by every clone of the
 /// [`ReferenceDischargeContext`] that owns it and distinct for every environment a structured rule's region fork
 /// mints. No caller names this identity directly. It makes [`ReferenceDischargeAllocationId`] addressable only in
@@ -73,174 +45,105 @@ impl ReferenceDischargeEnvironmentId {
     }
 }
 
-/// Live allocation environment of a reference discharge transform, shared by every clone of its
-/// [`ReferenceDischargeContext`].
-struct ReferenceDischargeEnvironment<T: Type, V> {
-    /// Unique [`ReferenceDischargeEnvironmentId`] of this [`ReferenceDischargeEnvironment`] that every
-    /// [`ReferenceDischargeAllocationId`] minted from this environment records.
-    id: ReferenceDischargeEnvironmentId,
+/// [`ReferenceDischargeContext`]-free carrier flowing through the reference discharge transform.
+/// [`ReferenceDischargeableOperation`] implementations receive and return such carrier; the context that owns the
+/// allocation environment travels separately as an explicit argument rather than being stamped onto every value.
+pub enum ReferenceDischargeValue<C: Domain, P: ReferenceDischargePolicy<C>> {
+    /// Destination value carrying no reference allocation handle and replayed as-is.
+    Value(C::Value),
 
-    /// State of every allocation minted so far, indexed by [`ReferenceDischargeAllocationId`]. A consumed allocation
-    /// keeps its position and becomes [`None`], so that a use-after-consume is reported against the exact allocation
-    /// rather than as an unknown ID.
-    allocations: Vec<Option<ReferenceDischargeAllocationEntry<T, V>>>,
+    /// Handle to a live reference allocation.
+    Reference(ReferenceDischargeReference<C, P>),
 }
 
-impl<T: Type, V> ReferenceDischargeEnvironment<T, V> {
-    /// Returns the live [`ReferenceDischargeAllocationEntry`] that `allocation` names, or [`None`] if that allocation
-    /// has been consumed.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::MalformedProgram`] when `allocation` belongs to another environment or names a position
-    /// this environment never minted.
-    fn entry(
-        &self,
-        allocation: ReferenceDischargeAllocationId,
-    ) -> Result<Option<&ReferenceDischargeAllocationEntry<T, V>>, ProgramError> {
-        if allocation.environment != self.id {
-            return Err(ProgramError::MalformedProgram(format!(
-                "reference discharge accessed {}, which belongs to an environment \
-                 other than the active `{}` environment",
-                allocation, self.id.0,
-            )));
-        }
-        Ok(self
-            .allocations
-            .get(allocation.index)
-            .ok_or_else(|| {
-                ProgramError::MalformedProgram(format!("reference discharge accessed never-bound {allocation}"))
-            })?
-            .as_ref())
-    }
-}
-
-/// Complete record of a live reference allocation during a reference discharge transform, which contains the reference
-/// type of its complete stored value and what discharge turned that allocation into. The reference type is recorded
-/// because an allocation's identity outlives every handle that denotes it. A structured rule threading an inherited
-/// allocation through a rebuilt region boundary holds only that allocation's handle, never a handle it could read a
-/// type off, so the environment is where the complete-value type has to live.
-// TODO(eaplatanios): Make private once the `discharge` module review and cleanup is completed.
-pub(crate) struct ReferenceDischargeAllocationEntry<T: Type, V> {
-    /// [`ReferenceType`] of the allocation's complete stored value. When the allocation is discharged, its referent
-    /// type is the type of the immutable state threaded through the rewritten program.
-    r#type: ReferenceType<T>,
-
-    /// Current representation of the allocation in the rewritten program (either immutable state for a discharged
-    /// allocation or a destination reference value for a preserved allocation).
-    state: ReferenceDischargeAllocationState<V>,
-}
-
-impl<T: Type, V> Typed for ReferenceDischargeAllocationEntry<T, V> {
-    type Type = ReferenceType<T>;
-
-    #[inline]
-    fn r#type(&self) -> Cow<'_, Self::Type> {
-        Cow::Borrowed(&self.r#type)
-    }
-}
-
-/// Environment entry describing what one live reference allocation became during reference discharge.
-#[derive(Debug)]
-enum ReferenceDischargeAllocationState<V> {
-    /// Allocation selected for discharge, which threads through the destination program as immutable state.
-    Discharged {
-        /// Current immutable state of the complete stored value.
-        current: V,
-
-        /// Whether any ordered write or accumulation has been applied to this allocation. Read-only allocations are pruned from
-        /// hidden outputs and from structured-operation widening, so this is the fact that pruning consults.
-        mutated: bool,
-    },
-
-    /// Allocation not selected for discharge, which survives in the destination program as a reference value. This is the
-    /// allocation's own destination reference value and is what boundary threading uses; a handle derived from it through
-    /// a view carries its own exact destination value instead.
-    Preserved {
-        /// Destination reference-typed value denoting the allocation.
-        reference: V,
-    },
-}
-
-/// Reference allocations the capture prefix of one discharge scope binds.
-///
-/// A capture-lifted program names its caller's references through constants rather than through its own boundary: the
-/// entry boundary carries the lifted capture prefix, and an attached region inside that program names the very same
-/// references through capture constants. Resolving one is therefore a property of the scope a region discharges
-/// under, not of any rule, so the scope rides on [`ReferenceDischargeContext`] beside the allocation environment and is
-/// recomputed at every region boundary — inherited by default, and replaced by a fresh prefix wherever an operation
-/// declares one through [`Operation::region_capture_input_count`].
-///
-/// Recognizing a capture is a *constant-family* question, and the interpreter deliberately serves families that are
-/// not capture-bearing at all, so the resolver is a function pointer supplied by the entry point that knows the family
-/// rather than a [`CaptureConstant`] bound on the whole architecture. The [`Default`] scope recognizes nothing and
-/// binds nothing, which is exactly the behavior of a program that has no captures.
-pub struct ReferenceDischargeCaptureScope<Constant> {
-    /// Capture position a constant names, or [`None`] when it is a non-reference constant of its family.
-    capture_index_of: fn(&Constant) -> Option<usize>,
-
-    /// Allocation each capture position binds, or [`None`] when that position carries a value rather than a
-    /// reference. A capture position past the end of this list binds nothing.
-    allocations: Rc<[Option<ReferenceDischargeAllocationId>]>,
-}
-
-impl<Constant> ReferenceDischargeCaptureScope<Constant> {
-    /// Creates a capture scope.
+impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeValue<C, P> {
+    /// Tries to borrow the value that this [`ReferenceDischargeValue`] holds, returning an error naming `expectation`
+    /// when it holds a reference instead of a value.
     ///
     /// # Parameters
     ///
-    ///   - `capture_index_of`: Function reporting the capture position a constant of this family names.
-    ///   - `allocations`: Allocation each capture position binds, in capture order.
+    ///   - `expectation`: Description of the operand the caller expected, used in the diagnostic.
     #[inline]
-    pub fn new(
-        capture_index_of: fn(&Constant) -> Option<usize>,
-        allocations: Vec<Option<ReferenceDischargeAllocationId>>,
-    ) -> Self {
-        Self { capture_index_of, allocations: allocations.into() }
+    pub fn try_as_value(&self, expectation: &str) -> Result<&C::Value, ProgramError> {
+        match self {
+            Self::Value(value) => Ok(value),
+            Self::Reference(reference) => Err(ProgramError::MalformedProgram(format!(
+                "reference discharge expected {expectation} but received {reference}",
+            ))),
+        }
     }
 
-    /// Returns the allocation each capture position binds, in capture order.
+    /// Tries to borrow the reference that this [`ReferenceDischargeValue`] holds, returning an error naming
+    /// `expectation` when it holds a value instead of a reference.
+    ///
+    /// # Parameters
+    ///
+    ///   - `expectation`: Description of the operand the caller expected, used in the diagnostic.
     #[inline]
-    pub(super) fn allocations(&self) -> &[Option<ReferenceDischargeAllocationId>] {
-        self.allocations.as_ref()
-    }
-
-    /// Returns the allocation one constant denotes, or [`None`] when the constant names no capture position or that
-    /// position binds no allocation. A constant this scope cannot resolve is a non-reference constant of its family,
-    /// and a reference-typed one that no scope resolves is rejected where it is lifted.
-    #[inline]
-    pub(super) fn resolve(&self, constant: &Constant) -> Option<ReferenceDischargeAllocationId> {
-        (self.capture_index_of)(constant).and_then(|index| self.allocations.get(index).copied().flatten())
-    }
-
-    /// Returns this scope's resolver over a different set of bound allocations, which is how a nested region's scope and a
-    /// region fork's remapped scope are built without restating the constant family's recognition rule.
-    #[inline]
-    pub(super) fn with_allocations(&self, allocations: Vec<Option<ReferenceDischargeAllocationId>>) -> Self {
-        Self { capture_index_of: self.capture_index_of, allocations: allocations.into() }
+    pub fn try_as_reference(&self, expectation: &str) -> Result<&ReferenceDischargeReference<C, P>, ProgramError> {
+        match self {
+            Self::Reference(reference) => Ok(reference),
+            Self::Value(_) => Err(ProgramError::MalformedProgram(format!(
+                "reference discharge expected {expectation} but received a value",
+            ))),
+        }
     }
 }
 
-impl<Constant> Default for ReferenceDischargeCaptureScope<Constant> {
-    #[inline]
-    fn default() -> Self {
-        Self { capture_index_of: |_| None, allocations: Rc::from([]) }
-    }
-}
-
-impl<Constant> Clone for ReferenceDischargeCaptureScope<Constant> {
+impl<C: Domain, P: ReferenceDischargePolicy<C>> Clone for ReferenceDischargeValue<C, P> {
     #[inline]
     fn clone(&self) -> Self {
-        Self { capture_index_of: self.capture_index_of, allocations: Rc::clone(&self.allocations) }
+        match self {
+            Self::Value(value) => Self::Value(value.clone()),
+            Self::Reference(reference) => Self::Reference(reference.clone()),
+        }
     }
 }
 
-impl<Constant> Debug for ReferenceDischargeCaptureScope<Constant> {
+impl<C: Domain, P: ReferenceDischargePolicy<C>> Debug for ReferenceDischargeValue<C, P> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ReferenceDischargeCaptureScope")
-            .field("allocations", &self.allocations)
-            .finish_non_exhaustive()
+        match self {
+            Self::Value(value) => formatter.debug_tuple("Value").field(value).finish(),
+            Self::Reference(reference) => formatter.debug_tuple("Reference").field(reference).finish(),
+        }
+    }
+}
+
+impl<C: Domain, P: ReferenceDischargePolicy<C>> Display for ReferenceDischargeValue<C, P> {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Value(value) => Display::fmt(value, formatter),
+            Self::Reference(reference) => Display::fmt(reference, formatter),
+        }
+    }
+}
+
+impl<C: Domain<Value: PartialEq>, P: ReferenceDischargePolicy<C, Alias: PartialEq>> PartialEq
+    for ReferenceDischargeValue<C, P>
+{
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Value(value), Self::Value(other)) => value == other,
+            (Self::Reference(reference), Self::Reference(other)) => reference == other,
+            _ => false,
+        }
+    }
+}
+
+impl<C: Domain<Type: From<ReferenceType<P::Referent>>>, P: ReferenceDischargePolicy<C>> Typed
+    for ReferenceDischargeValue<C, P>
+{
+    type Type = C::Type;
+
+    #[inline]
+    fn r#type(&self) -> Cow<'_, C::Type> {
+        match self {
+            Self::Value(value) => value.r#type(),
+            Self::Reference(reference) => Cow::Owned(C::Type::from(reference.r#type().clone())),
+        }
     }
 }
 
@@ -349,6 +252,34 @@ impl<C: Domain<Value: PartialEq>, P: ReferenceDischargePolicy<C, Alias: PartialE
     }
 }
 
+/// Identity of a reference allocation inside an ongoing reference discharge transform.
+/// [`ReferenceDischargeAllocationId`]s are minted by [`ReferenceDischargeContext`] as allocations enter its
+/// environment, so they are temporary discharge identities rather than source [`Program`] locations. They exist only
+/// for the duration of one discharge transform and are meaningful only against the environment that produced them.
+/// Pre-transform identity for caller-facing targets is represented using [`ReferenceDischargeTarget`] instead.
+///
+/// Each [`ReferenceDischargeAllocationId`] records which [`ReferenceDischargeEnvironment`] minted it, so that an ID
+/// from an unrelated discharge is reported rather than silently addressing whichever allocation happens to occupy the
+/// same position. That is also what isolates a structured rule's [`Region`](crate::Region) fork: the fork mints its own
+/// environment, so a caller ID cannot address a fork allocation and a fork ID cannot address a caller allocation. The
+/// one table relating the two lives inside [`ReferenceDischargeDriver::discharge_region_program`], which reports its
+/// results in caller terms.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ReferenceDischargeAllocationId {
+    /// ID of the [`ReferenceDischargeEnvironment`] that minted this [`ReferenceDischargeAllocationId`].
+    environment: ReferenceDischargeEnvironmentId,
+
+    /// Position of the allocation in that [`ReferenceDischargeEnvironment`].
+    index: usize,
+}
+
+impl Display for ReferenceDischargeAllocationId {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "reference allocation {}:{}", self.environment.0, self.index)
+    }
+}
+
 /// Destination fate a [`ReferenceDischargeReference`] handle carries for its allocation.
 ///
 /// The binding is fixed when the handle is constructed and always agrees with the allocation's environment state, because
@@ -368,108 +299,6 @@ pub(super) enum ReferenceDischargeBinding<V> {
         /// Exact destination reference value this handle denotes.
         reference: V,
     },
-}
-
-/// [`ReferenceDischargeContext`]-free carrier flowing through the reference discharge transform.
-/// [`ReferenceDischargeableOperation`] implementations receive and return such carrier; the context that owns the
-/// allocation environment travels separately as an explicit argument rather than being stamped onto every value.
-pub enum ReferenceDischargeValue<C: Domain, P: ReferenceDischargePolicy<C>> {
-    /// Destination value carrying no reference allocation handle and replayed as-is.
-    Value(C::Value),
-
-    /// Handle to a live reference allocation.
-    Reference(ReferenceDischargeReference<C, P>),
-}
-
-impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeValue<C, P> {
-    /// Tries to borrow the value that this [`ReferenceDischargeValue`] holds, returning an error naming `expectation`
-    /// when it holds a reference instead of a value.
-    ///
-    /// # Parameters
-    ///
-    ///   - `expectation`: Description of the operand the caller expected, used in the diagnostic.
-    #[inline]
-    pub fn try_as_value(&self, expectation: &str) -> Result<&C::Value, ProgramError> {
-        match self {
-            Self::Value(value) => Ok(value),
-            Self::Reference(reference) => Err(ProgramError::MalformedProgram(format!(
-                "reference discharge expected {expectation} but received {reference}",
-            ))),
-        }
-    }
-
-    /// Tries to borrow the reference that this [`ReferenceDischargeValue`] holds, returning an error naming
-    /// `expectation` when it holds a value instead of a reference.
-    ///
-    /// # Parameters
-    ///
-    ///   - `expectation`: Description of the operand the caller expected, used in the diagnostic.
-    #[inline]
-    pub fn try_as_reference(&self, expectation: &str) -> Result<&ReferenceDischargeReference<C, P>, ProgramError> {
-        match self {
-            Self::Reference(reference) => Ok(reference),
-            Self::Value(_) => Err(ProgramError::MalformedProgram(format!(
-                "reference discharge expected {expectation} but received a value",
-            ))),
-        }
-    }
-}
-
-impl<C: Domain, P: ReferenceDischargePolicy<C>> Clone for ReferenceDischargeValue<C, P> {
-    #[inline]
-    fn clone(&self) -> Self {
-        match self {
-            Self::Value(value) => Self::Value(value.clone()),
-            Self::Reference(reference) => Self::Reference(reference.clone()),
-        }
-    }
-}
-
-impl<C: Domain, P: ReferenceDischargePolicy<C>> Debug for ReferenceDischargeValue<C, P> {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Value(value) => formatter.debug_tuple("Value").field(value).finish(),
-            Self::Reference(reference) => formatter.debug_tuple("Reference").field(reference).finish(),
-        }
-    }
-}
-
-impl<C: Domain, P: ReferenceDischargePolicy<C>> Display for ReferenceDischargeValue<C, P> {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Value(value) => Display::fmt(value, formatter),
-            Self::Reference(reference) => Display::fmt(reference, formatter),
-        }
-    }
-}
-
-impl<C: Domain<Value: PartialEq>, P: ReferenceDischargePolicy<C, Alias: PartialEq>> PartialEq
-    for ReferenceDischargeValue<C, P>
-{
-    #[inline]
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (Self::Value(value), Self::Value(other)) => value == other,
-            (Self::Reference(reference), Self::Reference(other)) => reference == other,
-            _ => false,
-        }
-    }
-}
-
-impl<C: Domain<Type: From<ReferenceType<P::Referent>>>, P: ReferenceDischargePolicy<C>> Typed
-    for ReferenceDischargeValue<C, P>
-{
-    type Type = C::Type;
-
-    #[inline]
-    fn r#type(&self) -> Cow<'_, C::Type> {
-        match self {
-            Self::Value(value) => value.r#type(),
-            Self::Reference(reference) => Cow::Owned(C::Type::from(reference.r#type().clone())),
-        }
-    }
 }
 
 // TODO(eaplatanios): Order declarations as `ReferenceDischargeableType` -> `ReferenceDischargePolicy` ->
@@ -1112,6 +941,177 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> Debug for ReferenceDischargeCont
     }
 }
 
+/// Live allocation environment of a reference discharge transform, shared by every clone of its
+/// [`ReferenceDischargeContext`].
+struct ReferenceDischargeEnvironment<T: Type, V> {
+    /// Unique [`ReferenceDischargeEnvironmentId`] of this [`ReferenceDischargeEnvironment`] that every
+    /// [`ReferenceDischargeAllocationId`] minted from this environment records.
+    id: ReferenceDischargeEnvironmentId,
+
+    /// State of every allocation minted so far, indexed by [`ReferenceDischargeAllocationId`]. A consumed allocation
+    /// keeps its position and becomes [`None`], so that a use-after-consume is reported against the exact allocation
+    /// rather than as an unknown ID.
+    allocations: Vec<Option<ReferenceDischargeAllocationEntry<T, V>>>,
+}
+
+impl<T: Type, V> ReferenceDischargeEnvironment<T, V> {
+    /// Returns the live [`ReferenceDischargeAllocationEntry`] that `allocation` names, or [`None`] if that allocation
+    /// has been consumed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when `allocation` belongs to another environment or names a position
+    /// this environment never minted.
+    fn entry(
+        &self,
+        allocation: ReferenceDischargeAllocationId,
+    ) -> Result<Option<&ReferenceDischargeAllocationEntry<T, V>>, ProgramError> {
+        if allocation.environment != self.id {
+            return Err(ProgramError::MalformedProgram(format!(
+                "reference discharge accessed {}, which belongs to an environment \
+                 other than the active `{}` environment",
+                allocation, self.id.0,
+            )));
+        }
+        Ok(self
+            .allocations
+            .get(allocation.index)
+            .ok_or_else(|| {
+                ProgramError::MalformedProgram(format!("reference discharge accessed never-bound {allocation}"))
+            })?
+            .as_ref())
+    }
+}
+
+/// Complete record of a live reference allocation during a reference discharge transform, which contains the reference
+/// type of its complete stored value and what discharge turned that allocation into. The reference type is recorded
+/// because an allocation's identity outlives every handle that denotes it. A structured rule threading an inherited
+/// allocation through a rebuilt region boundary holds only that allocation's handle, never a handle it could read a
+/// type off, so the environment is where the complete-value type has to live.
+// TODO(eaplatanios): Make private once the `discharge` module review and cleanup is completed.
+pub(crate) struct ReferenceDischargeAllocationEntry<T: Type, V> {
+    /// [`ReferenceType`] of the allocation's complete stored value. When the allocation is discharged, its referent
+    /// type is the type of the immutable state threaded through the rewritten program.
+    r#type: ReferenceType<T>,
+
+    /// Current representation of the allocation in the rewritten program (either immutable state for a discharged
+    /// allocation or a destination reference value for a preserved allocation).
+    state: ReferenceDischargeAllocationState<V>,
+}
+
+impl<T: Type, V> Typed for ReferenceDischargeAllocationEntry<T, V> {
+    type Type = ReferenceType<T>;
+
+    #[inline]
+    fn r#type(&self) -> Cow<'_, Self::Type> {
+        Cow::Borrowed(&self.r#type)
+    }
+}
+
+/// Environment entry describing what one live reference allocation became during reference discharge.
+#[derive(Debug)]
+enum ReferenceDischargeAllocationState<V> {
+    /// Allocation selected for discharge, which threads through the destination program as immutable state.
+    Discharged {
+        /// Current immutable state of the complete stored value.
+        current: V,
+
+        /// Whether any ordered write or accumulation has been applied to this allocation. Read-only allocations are pruned from
+        /// hidden outputs and from structured-operation widening, so this is the fact that pruning consults.
+        mutated: bool,
+    },
+
+    /// Allocation not selected for discharge, which survives in the destination program as a reference value. This is the
+    /// allocation's own destination reference value and is what boundary threading uses; a handle derived from it through
+    /// a view carries its own exact destination value instead.
+    Preserved {
+        /// Destination reference-typed value denoting the allocation.
+        reference: V,
+    },
+}
+
+/// Reference allocations the capture prefix of one discharge scope binds.
+///
+/// A capture-lifted program names its caller's references through constants rather than through its own boundary: the
+/// entry boundary carries the lifted capture prefix, and an attached region inside that program names the very same
+/// references through capture constants. Resolving one is therefore a property of the scope a region discharges
+/// under, not of any rule, so the scope rides on [`ReferenceDischargeContext`] beside the allocation environment and is
+/// recomputed at every region boundary — inherited by default, and replaced by a fresh prefix wherever an operation
+/// declares one through [`Operation::region_capture_input_count`].
+///
+/// Recognizing a capture is a *constant-family* question, and the interpreter deliberately serves families that are
+/// not capture-bearing at all, so the resolver is a function pointer supplied by the entry point that knows the family
+/// rather than a [`CaptureConstant`] bound on the whole architecture. The [`Default`] scope recognizes nothing and
+/// binds nothing, which is exactly the behavior of a program that has no captures.
+pub struct ReferenceDischargeCaptureScope<Constant> {
+    /// Capture position a constant names, or [`None`] when it is a non-reference constant of its family.
+    capture_index_of: fn(&Constant) -> Option<usize>,
+
+    /// Allocation each capture position binds, or [`None`] when that position carries a value rather than a
+    /// reference. A capture position past the end of this list binds nothing.
+    allocations: Rc<[Option<ReferenceDischargeAllocationId>]>,
+}
+
+impl<Constant> ReferenceDischargeCaptureScope<Constant> {
+    /// Creates a capture scope.
+    ///
+    /// # Parameters
+    ///
+    ///   - `capture_index_of`: Function reporting the capture position a constant of this family names.
+    ///   - `allocations`: Allocation each capture position binds, in capture order.
+    #[inline]
+    pub fn new(
+        capture_index_of: fn(&Constant) -> Option<usize>,
+        allocations: Vec<Option<ReferenceDischargeAllocationId>>,
+    ) -> Self {
+        Self { capture_index_of, allocations: allocations.into() }
+    }
+
+    /// Returns the allocation each capture position binds, in capture order.
+    #[inline]
+    pub(super) fn allocations(&self) -> &[Option<ReferenceDischargeAllocationId>] {
+        self.allocations.as_ref()
+    }
+
+    /// Returns the allocation one constant denotes, or [`None`] when the constant names no capture position or that
+    /// position binds no allocation. A constant this scope cannot resolve is a non-reference constant of its family,
+    /// and a reference-typed one that no scope resolves is rejected where it is lifted.
+    #[inline]
+    pub(super) fn resolve(&self, constant: &Constant) -> Option<ReferenceDischargeAllocationId> {
+        (self.capture_index_of)(constant).and_then(|index| self.allocations.get(index).copied().flatten())
+    }
+
+    /// Returns this scope's resolver over a different set of bound allocations, which is how a nested region's scope and a
+    /// region fork's remapped scope are built without restating the constant family's recognition rule.
+    #[inline]
+    pub(super) fn with_allocations(&self, allocations: Vec<Option<ReferenceDischargeAllocationId>>) -> Self {
+        Self { capture_index_of: self.capture_index_of, allocations: allocations.into() }
+    }
+}
+
+impl<Constant> Default for ReferenceDischargeCaptureScope<Constant> {
+    #[inline]
+    fn default() -> Self {
+        Self { capture_index_of: |_| None, allocations: Rc::from([]) }
+    }
+}
+
+impl<Constant> Clone for ReferenceDischargeCaptureScope<Constant> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Self { capture_index_of: self.capture_index_of, allocations: Rc::clone(&self.allocations) }
+    }
+}
+
+impl<Constant> Debug for ReferenceDischargeCaptureScope<Constant> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ReferenceDischargeCaptureScope")
+            .field("allocations", &self.allocations)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     /// Rewrites every [`Reference`](crate::Reference) in this [`Program`] as explicit immutable state and returns the
     /// resulting reference-free program together with bindings for its external references.
@@ -1510,40 +1510,6 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_discharge_capture_scope() {
-        // A scope binds one allocation per capture position. Positions carrying a value, positions past the end of
-        // the scope, and constants that name no capture position at all all resolve to nothing, which is what leaves
-        // an unresolvable reference-typed constant to the rejection at the lift site.
-        let context = ListDischargeContext::new(ListDestination::new());
-        let allocated = context
-            .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
-            .unwrap();
-        let allocation = allocated.try_as_reference("the captured allocation").unwrap().allocation_id();
-
-        let empty = ReferenceDischargeCaptureScope::<ListIrValue>::default();
-        assert_eq!(empty.allocations(), &[]);
-        assert_eq!(empty.resolve(&ListIrValue::Reference(ReferenceType::new(ListType { length: 2 }))), None);
-
-        let scope = ReferenceDischargeCaptureScope::new(list_capture_position, vec![None, None, Some(allocation)]);
-        assert_eq!(scope.allocations(), &[None, None, Some(allocation)]);
-        assert_eq!(
-            scope.resolve(&ListIrValue::Reference(ReferenceType::new(ListType { length: 2 }))),
-            Some(allocation)
-        );
-        assert_eq!(scope.resolve(&ListIrValue::Reference(ReferenceType::new(ListType { length: 1 }))), None);
-        assert_eq!(scope.resolve(&ListIrValue::Reference(ReferenceType::new(ListType { length: 9 }))), None);
-        assert_eq!(scope.resolve(&ListIrValue::List(vec![1, 2])), None);
-
-        // Rebinding keeps the seam, which is how a nested region's scope and a fork's remapped scope are built.
-        let rebound = scope.with_allocations(vec![Some(allocation)]);
-        assert_eq!(rebound.allocations(), &[Some(allocation)]);
-        assert_eq!(
-            rebound.resolve(&ListIrValue::Reference(ReferenceType::new(ListType { length: 0 }))),
-            Some(allocation)
-        );
-    }
-
-    #[test]
     fn test_reference_discharge_value_reports_operand_kind_mismatches() {
         // A rule that receives the wrong carrier kind gets a diagnostic naming what it expected, which is what keeps
         // an open set of third-party rules diagnosable without each of them inventing its own message.
@@ -1810,6 +1776,40 @@ mod tests {
         assert_eq!(context.read(&reference), Ok(ListIrValue::List(vec![11, 12])));
         context.accumulate(&reference, ListIrValue::List(vec![1, 1])).unwrap();
         assert_eq!(clone.read(&reference), Ok(ListIrValue::List(vec![12, 13])));
+    }
+
+    #[test]
+    fn test_reference_discharge_capture_scope() {
+        // A scope binds one allocation per capture position. Positions carrying a value, positions past the end of
+        // the scope, and constants that name no capture position at all all resolve to nothing, which is what leaves
+        // an unresolvable reference-typed constant to the rejection at the lift site.
+        let context = ListDischargeContext::new(ListDestination::new());
+        let allocated = context
+            .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
+            .unwrap();
+        let allocation = allocated.try_as_reference("the captured allocation").unwrap().allocation_id();
+
+        let empty = ReferenceDischargeCaptureScope::<ListIrValue>::default();
+        assert_eq!(empty.allocations(), &[]);
+        assert_eq!(empty.resolve(&ListIrValue::Reference(ReferenceType::new(ListType { length: 2 }))), None);
+
+        let scope = ReferenceDischargeCaptureScope::new(list_capture_position, vec![None, None, Some(allocation)]);
+        assert_eq!(scope.allocations(), &[None, None, Some(allocation)]);
+        assert_eq!(
+            scope.resolve(&ListIrValue::Reference(ReferenceType::new(ListType { length: 2 }))),
+            Some(allocation)
+        );
+        assert_eq!(scope.resolve(&ListIrValue::Reference(ReferenceType::new(ListType { length: 1 }))), None);
+        assert_eq!(scope.resolve(&ListIrValue::Reference(ReferenceType::new(ListType { length: 9 }))), None);
+        assert_eq!(scope.resolve(&ListIrValue::List(vec![1, 2])), None);
+
+        // Rebinding keeps the seam, which is how a nested region's scope and a fork's remapped scope are built.
+        let rebound = scope.with_allocations(vec![Some(allocation)]);
+        assert_eq!(rebound.allocations(), &[Some(allocation)]);
+        assert_eq!(
+            rebound.resolve(&ListIrValue::Reference(ReferenceType::new(ListType { length: 0 }))),
+            Some(allocation)
+        );
     }
 
     #[test]
