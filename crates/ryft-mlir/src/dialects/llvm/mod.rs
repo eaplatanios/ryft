@@ -18,10 +18,12 @@ use crate::{Context, DialectHandle, Error};
 
 pub mod attributes;
 pub mod operations;
+pub mod passes;
 pub mod types;
 
 pub use attributes::*;
 pub use operations::*;
+pub use passes::*;
 pub use types::*;
 
 impl DialectHandle<'_, '_> {

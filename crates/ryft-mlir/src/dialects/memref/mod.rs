@@ -7,8 +7,10 @@ use ryft_xla_sys::bindings::mlirGetDialectHandle__memref__;
 use crate::{DialectHandle, Error};
 
 pub mod operations;
+pub mod passes;
 
 pub use operations::*;
+pub use passes::*;
 
 impl DialectHandle<'_, '_> {
     /// Returns a [`DialectHandle`] for the `memref` [`Dialect`](crate::Dialect).
