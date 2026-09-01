@@ -2,7 +2,7 @@ use crate::contexts::{Context, Domain};
 use crate::programs::ProgramError;
 use crate::programs::instructions::InstructionId;
 use crate::programs::operations::Operation;
-use crate::programs::references::discharge::policies::ReferenceDischargePolicy;
+use crate::programs::references::discharge::transform::ReferenceDischargePolicy;
 use crate::programs::references::discharge::transform::{ReferenceDischargeContext, ReferenceDischargeValue};
 use crate::programs::references::types::ReferenceType;
 use crate::programs::regions::{EmptyRegionDriver, RegionDriver, RegionRef};

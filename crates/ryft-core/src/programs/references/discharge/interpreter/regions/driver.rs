@@ -7,7 +7,7 @@ use crate::parameters::Placeholder;
 use crate::programs::ProgramError;
 use crate::programs::instructions::InstructionId;
 use crate::programs::operations::Operation;
-use crate::programs::references::discharge::policies::ReferenceDischargePolicy;
+use crate::programs::references::discharge::transform::ReferenceDischargePolicy;
 use crate::programs::references::discharge::transform::{
     ReferenceDischargeAllocationId, ReferenceDischargeContext, ReferenceDischargeValue,
 };

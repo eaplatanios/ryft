@@ -146,7 +146,6 @@
 // TODO(eaplatanios): Review this module.
 
 mod interpreter;
-mod policies;
 mod transform;
 
 pub use interpreter::{
@@ -155,11 +154,11 @@ pub use interpreter::{
     ReferenceRegionStateInsertion, ReferenceRegionSummary, ReferenceStateWidening,
     discharge_positional_region_operation, discharge_preserved_access, discharge_reference_free_operation,
 };
-pub use policies::{ReferenceAccumulationPolicy, ReferenceDischargePolicy, ReferenceDischargeableType};
 pub use transform::{
-    ExternalReferenceBinding, PartialReferenceDischargeResult, ReferenceDischargeAllocationId,
-    ReferenceDischargeContext, ReferenceDischargeReference, ReferenceDischargeResult, ReferenceDischargeTarget,
-    ReferenceDischargeValue, ReferenceSource,
+    ExternalReferenceBinding, PartialReferenceDischargeResult, ReferenceAccumulationPolicy,
+    ReferenceDischargeAllocationId, ReferenceDischargeContext, ReferenceDischargePolicy, ReferenceDischargeReference,
+    ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableType,
+    ReferenceSource,
 };
 
 #[cfg(test)]

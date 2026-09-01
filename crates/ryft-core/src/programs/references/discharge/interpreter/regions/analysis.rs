@@ -6,7 +6,7 @@ use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId};
 use crate::programs::instructions::Instruction;
 use crate::programs::operations::Operation;
-use crate::programs::references::discharge::policies::ReferenceDischargePolicy;
+use crate::programs::references::discharge::transform::ReferenceDischargePolicy;
 use crate::programs::references::discharge::transform::{
     ReferenceDischargeAllocationId, ReferenceDischargeBinding, ReferenceDischargeCaptureScope,
     ReferenceDischargeContext, ReferenceDischargeValue,

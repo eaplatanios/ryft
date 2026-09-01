@@ -4,7 +4,7 @@ use crate::contexts::Context;
 use crate::macros::check_count;
 use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
-use crate::programs::references::discharge::policies::ReferenceDischargePolicy;
+use crate::programs::references::discharge::transform::ReferenceDischargePolicy;
 use crate::programs::references::discharge::transform::{ReferenceDischargeContext, ReferenceDischargeValue};
 
 use super::super::rules::ReferenceDischargeDriver;
