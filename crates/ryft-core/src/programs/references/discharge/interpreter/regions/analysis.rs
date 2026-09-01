@@ -554,7 +554,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
             return Ok(None);
         };
         let allocation = reference.allocation_id();
-        let whole = self.allocation_reference_type(allocation)?;
+        let whole = self.allocation_entry(allocation)?.r#type.clone();
         if !reference.denotes_complete_value() {
             return Err(ProgramError::MalformedProgram(format!(
                 "operation `{operation}` passes the derived view `{}` of {allocation} across a region boundary, which \
@@ -647,7 +647,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         C::Type: From<P::Referent>,
     {
         if threaded.contains(&allocation) {
-            self.merge_discharged_state(allocation, output, summary.is_mutated(allocation))?;
+            self.replace_discharged_state(allocation, output, summary.is_mutated(allocation))?;
         }
         Ok(())
     }
@@ -667,7 +667,9 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         match reference.binding() {
             ReferenceDischargeBinding::Discharged => self.discharged_state(reference.allocation_id()),
             ReferenceDischargeBinding::Preserved { reference: value } => {
-                self.validate_live_allocation(reference.allocation_id())?;
+                // A preserved handle keeps its destination value after consumption, so resolve its allocation before
+                // returning that value to the rebuilt boundary.
+                self.allocation_entry(reference.allocation_id())?;
                 Ok(value.clone())
             }
         }

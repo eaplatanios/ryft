@@ -122,7 +122,9 @@ where
             ReferenceDischargeValue::Ordinary(value) => Ok(value.clone()),
             ReferenceDischargeValue::Reference(reference) => match reference.preserved() {
                 Some(value) => {
-                    context.validate_live_allocation(reference.allocation_id())?;
+                    // The handle retains its destination value after consumption, so consult the environment before
+                    // replaying it to distinguish a live preserved reference from a stale handle.
+                    context.allocation_entry(reference.allocation_id())?;
                     Ok(value.clone())
                 }
                 None => Err(ProgramError::MalformedProgram(format!(
