@@ -27,7 +27,8 @@ use crate::programs::values::Value;
 use crate::tracing::TracingContext;
 
 // TODO(eaplatanios): Order declarations as `ReferenceDischargeableType` -> `ReferenceDischargePolicy` ->
-//  `ReferenceAccumulationPolicy` -> `ReferenceDischargeDriver` -> `ReferenceDischargeContext`.
+//  `ReferenceAccumulationPolicy` -> `ReferenceDischargeDriver` -> `ReferenceDischargeableOperation` ->
+//  `ReferenceDischargeContext`.
 
 /// Active state of a reference discharge transform. Reference discharge interprets a source [`Program`] into a
 /// destination [`Program`], one [`Region`](crate::Region) at a time through a [`ReferenceDischargeDriver`]. Each
@@ -85,7 +86,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         Self {
             parent,
             environment: Rc::new(RefCell::new(ReferenceDischargeEnvironment {
-                id: ReferenceDischargeEnvironmentId::next(),
+                id: ReferenceDischargeEnvironmentId::fresh(),
                 allocations: Vec::new(),
             })),
             captures: ReferenceDischargeCaptureScope::default(),
@@ -653,9 +654,8 @@ impl<C: Clone + Domain, P: ReferenceDischargePolicy<C>> Clone for ReferenceDisch
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<C: Domain, P: ReferenceDischargePolicy<C>> Debug for ReferenceDischargeContext<C, P> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let live_allocation_count =
             self.environment.borrow().allocations.iter().filter(|allocation| allocation.is_some()).count();
@@ -666,24 +666,24 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> Debug for ReferenceDischargeCont
     }
 }
 
-/// Identity of one reference allocation inside a running reference discharge.
+/// Identity of a reference allocation inside an ongoing reference discharge transform.
+/// [`ReferenceDischargeAllocationId`]s are minted by [`ReferenceDischargeContext`] as allocations enter its
+/// environment, so they are temporary discharge identities rather than source [`Program`] locations. They exist only
+/// for the duration of one discharge transform and are meaningful only against the environment that produced them.
+/// Pre-transform identity for caller-facing targets is represented using [`ReferenceDischargeTarget`] instead.
 ///
-/// IDs are minted by [`ReferenceDischargeContext`] as allocations enter its environment, so they are temporary
-/// discharge identities rather than source program locations. They exist only for the duration of one discharge and
-/// are meaningful only against the environment that produced them. Pre-transform identity for caller-facing targets
-/// is [`ReferenceDischargeTarget`] instead.
-///
-/// Each ID records which environment minted it, so an ID from an unrelated discharge is reported rather than silently
-/// addressing whichever allocation happens to occupy the same position. That is also what isolates a structured
-/// rule's region fork: the fork mints its own environment, so a caller ID cannot address a fork allocation and a fork
-/// ID cannot address a caller allocation. The one table relating the two lives inside
-/// [`ReferenceDischargeDriver::discharge_region_program`], which reports its results in caller terms.
+/// Each [`ReferenceDischargeAllocationId`] records which [`ReferenceDischargeEnvironment`] minted it, so that an ID
+/// from an unrelated discharge is reported rather than silently addressing whichever allocation happens to occupy the
+/// same position. That is also what isolates a structured rule's [`Region`](crate::Region) fork: the fork mints its own
+/// environment, so a caller ID cannot address a fork allocation and a fork ID cannot address a caller allocation. The
+/// one table relating the two lives inside [`ReferenceDischargeDriver::discharge_region_program`], which reports its
+/// results in caller terms.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ReferenceDischargeAllocationId {
-    /// Environment that minted this ID.
+    /// ID of the [`ReferenceDischargeEnvironment`] that minted this [`ReferenceDischargeAllocationId`].
     environment: ReferenceDischargeEnvironmentId,
 
-    /// Position of the allocation in that environment.
+    /// Position of the allocation in that [`ReferenceDischargeEnvironment`].
     index: usize,
 }
 
@@ -694,24 +694,23 @@ impl Display for ReferenceDischargeAllocationId {
     }
 }
 
-/// Identity of one reference discharge allocation environment, shared by every clone of the context that owns it and
-/// distinct for every environment a structured rule's region fork mints.
-///
-/// No caller names this identity directly. It makes [`ReferenceDischargeAllocationId`] addressable only in the
-/// environment that minted it.
+/// Process-local identity of a [`ReferenceDischargeEnvironment`], shared by every clone of the
+/// [`ReferenceDischargeContext`] that owns it and distinct for every environment a structured rule's region fork
+/// mints. No caller names this identity directly. It makes [`ReferenceDischargeAllocationId`] addressable only in
+/// the environment that minted it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct ReferenceDischargeEnvironmentId(
-    /// Process-local numeric environment identity.
-    usize,
-);
+struct ReferenceDischargeEnvironmentId(usize);
 
 impl ReferenceDischargeEnvironmentId {
-    /// Returns a fresh environment identity, distinct from every identity handed out so far in this process.
-    fn next() -> Self {
+    /// Returns a fresh [`ReferenceDischargeEnvironmentId`], distinct from every [`ReferenceDischargeEnvironmentId`]
+    /// handed out so far in this process.
+    fn fresh() -> Self {
         static NEXT_ENVIRONMENT_ID: AtomicUsize = AtomicUsize::new(0);
         Self(NEXT_ENVIRONMENT_ID.fetch_add(1, Ordering::Relaxed))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Live allocation environment of one reference discharge, shared by every clone of its context.
 struct ReferenceDischargeEnvironment<T: Type, V> {
