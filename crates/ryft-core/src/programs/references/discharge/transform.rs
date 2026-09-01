@@ -25,12 +25,11 @@ use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
 use crate::tracing::TracingContext;
 
-/// A caller-selectable [`Reference`](crate::Reference) target for partial reference discharge. A target needs an
-/// identity that exists in the _source_ [`Program`], before any replay begins, so it cannot reuse the environment's
-/// [`ReferenceDischargeAllocationId`](crate::ReferenceDischargeAllocationId)s. In particular, a nested region's formal
-/// reference input is invocation-parameterized (the region may be invoked from several call sites) and so it names no
-/// single caller-owned reference and is deliberately not selectable. Targets resolve internally to allocations once
-/// discharge starts.
+/// A caller-selectable [`Reference`](crate::Reference) target for partial reference discharge. A target
+/// needs an identity that exists in the _source_ [`Program`], before any replay begins, so it cannot reuse the
+/// environment's [`ReferenceDischargeAllocationId`]s. In particular, a nested region's formal reference input is
+/// invocation-parameterized (the region may be invoked from several call sites) and so it names no single caller-owned
+/// reference and is deliberately not selectable. Targets resolve internally to allocations once discharge starts.
 ///
 /// Targets are arena-relative in exactly the sense that every other reference artifact is: their instruction and
 /// boundary identifiers are meaningful only in the program arena from which they were enumerated. Target validation
@@ -1243,7 +1242,7 @@ where
         index: usize,
         inputs: Vec<ReferenceDischargeValue<C, P>>,
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
-        discharge_region_instructions(context, self.region(index)?, inputs)
+        context.inline_region(self.region(index)?, inputs)
     }
 
     #[inline]
@@ -1426,7 +1425,7 @@ where
                 region.id(),
             )?);
 
-            let outputs = discharge_region_instructions(&fork, region, declared)?;
+            let outputs = fork.inline_region(region, declared)?;
             check_count!("output", outputs, source_output_count, ProgramError);
 
             let mut output_ids = Vec::with_capacity(source_output_count + boundary.added_output_allocations().len());
@@ -1504,126 +1503,6 @@ where
         let program = builder.build(output_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?;
         Ok(ReferenceDischargeRegionResult { program, output_allocations, mutated_allocations })
     }
-}
-
-// TODO(eaplatanios): Review this.
-/// Replays one region's instructions against the live environment of `context`, binding their rewritten work through
-/// the destination that context already owns.
-///
-/// This is the instruction replay used both by [`ReferenceDischargeDriver::inline_region`] and by isolated region
-/// rebuilding. The two paths differ only in which context they provide, not in how they discharge the instructions.
-///
-/// # Parameters
-///
-///   - `context`: Active discharge context whose environment the replay observes and mutates.
-///   - `region`: Source region being replayed.
-///   - `inputs`: Carriers supplied to the region's boundary, in boundary order.
-fn discharge_region_instructions<C, P>(
-    context: &ReferenceDischargeContext<C, P>,
-    region: RegionRef<'_, C::Constant, C::Operation>,
-    inputs: Vec<ReferenceDischargeValue<C, P>>,
-) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError>
-where
-    C: Context<
-        Operation: ReferenceDischargeableOperation<C, P>
-                       + ReferenceDischargeableOperation<ReferenceDischargeRegionDestination<C>, P>,
-    >,
-    P: ReferenceDischargePolicy<C>
-        + ReferenceDischargePolicy<
-            ReferenceDischargeRegionDestination<C>,
-            Referent = <P as ReferenceDischargePolicy<C>>::Referent,
-        >,
-    C::Type: From<<P as ReferenceDischargePolicy<C>>::Referent>
-        + From<ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>>,
-    for<'t> &'t ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>: TryFrom<&'t C::Type>,
-{
-    let mappings = RegionReplayMappings::new();
-    let mut instruction_index = 0;
-    region.interpret_with(
-        inputs,
-        |_, constant| context.lift(constant.clone()),
-        |instruction, instruction_inputs| {
-            let position = InstructionId::new(region.id(), instruction_index);
-            instruction_index += 1;
-            // Run the complete rewrite of one application — the preserved-access replay included — inside the source
-            // instruction's recorded origin, so every staged instruction records where it came from. Rules stage
-            // their rewritten work through the destination parent, which is where the provenance state lives.
-            context.parent().invoke_with_provenance_origin(instruction.provenance().clone(), || {
-                if instruction.regions().is_empty() {
-                    let operation = instruction.operation();
-                    let semantics = operation.reference_semantics();
-
-                    // A region-free operation that only accesses references can replay verbatim when every reference
-                    // it accesses is preserved. Operations that do not access references need their standard rule,
-                    // while operations that produce references need their own rule to register the resulting handles.
-                    if !semantics.inputs().is_empty() && semantics.outputs().is_empty() {
-                        let mut consumed = Vec::new();
-                        let mut accesses_only_preserved_references = true;
-                        for access in semantics.inputs() {
-                            let Some(ReferenceDischargeValue::Reference(reference)) =
-                                instruction_inputs.get(access.input_index())
-                            else {
-                                accesses_only_preserved_references = false;
-                                break;
-                            };
-                            if reference.preserved().is_none() {
-                                // Mixed preserved/discharged accesses belong to the operation's discharge rule, which
-                                // can reject or rewrite them with full knowledge of the operation's semantics.
-                                accesses_only_preserved_references = false;
-                                break;
-                            }
-                            if access.mode().is_consuming() {
-                                consumed.push(reference);
-                            }
-                        }
-
-                        if accesses_only_preserved_references {
-                            // Re-run inference over the carriers' current types before binding the unchanged operation.
-                            // This preserves the operation's own operand-relationship diagnostics instead of allowing a
-                            // destination binding failure to obscure them.
-                            let input_types =
-                                instruction_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-                            operation.infer_output_types(input_types.as_slice(), &[])?;
-
-                            // Validate every consumption before replay. In particular, a view cannot consume an
-                            // allocation even when its view has the same reference type as the complete stored value;
-                            // rejecting it after binding would leave a destination operation behind on an error path.
-                            for reference in &consumed {
-                                let allocation = reference.allocation_id();
-                                let complete_reference_type =
-                                    context.allocation_entry(allocation)?.r#type().into_owned();
-
-                                // Consumption yields and invalidates the complete stored value. A view cannot name that
-                                // transition even when it has the same reference type as the allocation.
-                                if reference.is_view() {
-                                    return Err(ProgramError::MalformedProgram(format!(
-                                        "reference discharge cannot consume {allocation} through the view `{}`; \
-                                         consumption yields the complete stored value, whose reference type is \
-                                         `{complete_reference_type}`",
-                                        reference.r#type(),
-                                    )));
-                                }
-                            }
-
-                            let outputs = discharge_preserved_access(operation, context, instruction_inputs)?;
-
-                            // Invalidate only after replay succeeds. A failed destination bind leaves every allocation
-                            // live; a successful bind removes each consumed entry so all later aliases report a
-                            // use-after-consume.
-                            for reference in consumed {
-                                let allocation = reference.allocation_id();
-                                context.take_allocation_entry(allocation)?;
-                            }
-                            return Ok(outputs);
-                        }
-                    }
-                }
-                let regions = ReplayRegionDriver::new(region, instruction.regions(), &mappings)?;
-                let driver = RecursiveReferenceDischargeDriver::new(&regions, Some(position));
-                instruction.operation().discharge_references(context, &driver, instruction_inputs)
-            })
-        },
-    )
 }
 
 // TODO(eaplatanios): Move `ReferenceDischargeableOperation` here.
@@ -1939,47 +1818,6 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         })
     }
 
-    /// Lifts a stored [`Program`] constant into a value that can flow through reference discharge. A non-reference
-    /// constant is lifted by the destination [`Context`] and wrapped as a [`ReferenceDischargeValue::Value`]. A
-    /// reference-typed constant instead names an existing capture binding. This function resolves that binding through
-    /// the active [`ReferenceDischargeCaptureScope`] and returns its [`ReferenceDischargeValue::Reference`]. It never
-    /// creates another allocation for a captured reference. A reference-typed constant that the active capture scope
-    /// does not resolve is rejected because no allocation in this context represents that reference. Allowing it to
-    /// flow as an ordinary destination value would leave an untracked reference in the discharged program.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::MalformedProgram`] when a reference-typed constant does not resolve to an allocation or
-    /// its declared reference type differs from the allocation's reference type. For a non-reference constant,
-    /// propagates any error returned by the destination [`Context::lift`] function.
-    pub fn lift(&self, constant: C::Constant) -> Result<ReferenceDischargeValue<C, P>, ProgramError>
-    where
-        C: Context,
-        for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t C::Type>,
-    {
-        let constant_type = constant.r#type();
-        if let Ok(r#type) = <&ReferenceType<P::Referent>>::try_from(constant_type.as_ref()) {
-            let Some(allocation) = self.captures.resolve(&constant) else {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "reference discharge cannot lift a constant of reference type `{type}`; a reference enters a \
-                     program through an input, a capture binding, or an allocation",
-                )));
-            };
-
-            // A capture constant names the complete stored value its position binds, so a narrower declared type would
-            // silently widen to the allocation's own value where the constant is used.
-            let bound = self.allocation_entry(allocation)?.r#type().into_owned();
-            if r#type != &bound {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "reference discharge resolved a capture constant of reference type `{type}` to {allocation},\
-                     which carries the reference type `{bound}`",
-                )));
-            }
-            return self.allocation_reference(allocation);
-        }
-        Ok(ReferenceDischargeValue::Value(self.parent.lift(constant)?))
-    }
-
     /// Binds an allocation selected for discharge and returns its unviewed reference value. The allocation is fresh to
     /// this context even when it represents a reference that already existed at the source program's entry boundary.
     /// Its `initial` value becomes the immutable state exposed by [`discharged_state`](Self::discharged_state),
@@ -2279,6 +2117,180 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         let entry = self.take_allocation_entry(allocation)?;
         let ReferenceDischargeAllocationState::Discharged { current, .. } = entry.state else { unreachable!() };
         Ok(current)
+    }
+
+    /// Lifts a stored [`Program`] constant into a value that can flow through reference discharge. A non-reference
+    /// constant is lifted by the destination [`Context`] and wrapped as a [`ReferenceDischargeValue::Value`]. A
+    /// reference-typed constant instead names an existing capture binding. This function resolves that binding through
+    /// the active [`ReferenceDischargeCaptureScope`] and returns its [`ReferenceDischargeValue::Reference`]. It never
+    /// creates another allocation for a captured reference. A reference-typed constant that the active capture scope
+    /// does not resolve is rejected because no allocation in this context represents that reference. Allowing it to
+    /// flow as an ordinary destination value would leave an untracked reference in the discharged program.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when a reference-typed constant does not resolve to an allocation or
+    /// its declared reference type differs from the allocation's reference type. For a non-reference constant,
+    /// propagates any error returned by the destination [`Context::lift`] function.
+    pub fn lift(&self, constant: C::Constant) -> Result<ReferenceDischargeValue<C, P>, ProgramError>
+    where
+        C: Context,
+        for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t C::Type>,
+    {
+        let constant_type = constant.r#type();
+        if let Ok(r#type) = <&ReferenceType<P::Referent>>::try_from(constant_type.as_ref()) {
+            let Some(allocation) = self.captures.resolve(&constant) else {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "reference discharge cannot lift a constant of reference type `{type}`; a reference enters a \
+                     program through an input, a capture binding, or an allocation",
+                )));
+            };
+
+            // A capture constant names the complete stored value its position binds, so a narrower declared type would
+            // silently widen to the allocation's own value where the constant is used.
+            let bound = self.allocation_entry(allocation)?.r#type().into_owned();
+            if r#type != &bound {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "reference discharge resolved a capture constant of reference type `{type}` to {allocation}, \
+                     which carries the reference type `{bound}`",
+                )));
+            }
+            return self.allocation_reference(allocation);
+        }
+        Ok(ReferenceDischargeValue::Value(self.parent.lift(constant)?))
+    }
+
+    /// Discharges a source [`Region`](crate::Region) directly through this context and returns its outputs. The
+    /// rewritten [`Instruction`](crate::Instruction)s are added to the destination [`Program`] this context owns,
+    /// and their reference accesses observe and update this context's allocation environment.
+    ///
+    /// This is the shared region replay functionality used both by [`ReferenceDischargeDriver::inline_region`] and
+    /// while rebuilding a region in an isolated context. Those paths differ in the context they use, but apply the
+    /// same discharge rules to the source instructions.
+    ///
+    /// # Parameters
+    ///
+    ///   - `region`: Source region to discharge.
+    ///   - `inputs`: Values supplied to the region's inputs, in region input order.
+    ///
+    /// # Errors
+    ///
+    /// Propagates errors raised while lifting the region's constants, validating preserved reference accesses, or
+    /// discharging its instructions.
+    fn inline_region(
+        &self,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        inputs: Vec<ReferenceDischargeValue<C, P>>,
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError>
+    where
+        C: Context<
+                Type: From<<P as ReferenceDischargePolicy<C>>::Referent>
+                          + From<ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>>,
+                Operation: ReferenceDischargeableOperation<C, P>
+                               + ReferenceDischargeableOperation<ReferenceDischargeRegionDestination<C>, P>,
+            >,
+        P: ReferenceDischargePolicy<C>
+            + ReferenceDischargePolicy<
+                ReferenceDischargeRegionDestination<C>,
+                Referent = <P as ReferenceDischargePolicy<C>>::Referent,
+            >,
+        for<'t> &'t ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>: TryFrom<&'t C::Type>,
+    {
+        let mappings = RegionReplayMappings::new();
+        let mut instruction_index = 0;
+        region.interpret_with(
+            inputs,
+            |_, constant| self.lift(constant.clone()),
+            |instruction, instruction_inputs| {
+                let position = InstructionId::new(region.id(), instruction_index);
+                instruction_index += 1;
+
+                // Run the complete rewrite of one application (the preserved-access replay included) inside the source
+                // instruction's recorded origin, so that every staged instruction records where it came from. Rules
+                // stage their rewritten work through the destination parent, which is where the provenance state lives.
+                self.parent().invoke_with_provenance_origin(instruction.provenance().clone(), || {
+                    if instruction.regions().is_empty() {
+                        let operation = instruction.operation();
+                        let semantics = operation.reference_semantics();
+
+                        // A region-free operation that only accesses references can replay verbatim when every
+                        // reference it accesses is preserved. Operations that do not access references need their
+                        // standard rule, while operations that produce references need their own rule to register
+                        // the resulting handles.
+                        if !semantics.inputs().is_empty() && semantics.outputs().is_empty() {
+                            let mut consumed = Vec::new();
+                            let mut accesses_only_preserved_references = true;
+                            for access in semantics.inputs() {
+                                let Some(ReferenceDischargeValue::Reference(reference)) =
+                                    instruction_inputs.get(access.input_index())
+                                else {
+                                    accesses_only_preserved_references = false;
+                                    break;
+                                };
+                                if reference.preserved().is_none() {
+                                    // Mixed preserved/discharged accesses belong to the operation's discharge rule,
+                                    // which can reject or rewrite them with full knowledge of the operation's
+                                    // semantics.
+                                    accesses_only_preserved_references = false;
+                                    break;
+                                }
+                                if access.mode().is_consuming() {
+                                    consumed.push(reference);
+                                }
+                            }
+
+                            if accesses_only_preserved_references {
+                                // Re-run inference over the carriers' current types before binding the unchanged
+                                // operation. This preserves the operation's own operand-relationship diagnostics
+                                // instead of allowing a destination binding failure to obscure them.
+                                let input_types = instruction_inputs
+                                    .iter()
+                                    .map(|input| input.r#type().into_owned())
+                                    .collect::<Vec<_>>();
+                                operation.infer_output_types(input_types.as_slice(), &[])?;
+
+                                // Validate every consumption before replay. In particular, a view cannot consume an
+                                // allocation even when its view has the same reference type as the complete stored
+                                // value; rejecting it after binding would leave a destination operation behind on an
+                                // error path.
+                                for reference in &consumed {
+                                    let allocation = reference.allocation_id();
+                                    let complete_reference_type =
+                                        self.allocation_entry(allocation)?.r#type().into_owned();
+
+                                    // Consumption yields and invalidates the complete stored value. A view cannot name
+                                    // that transition even when it has the same reference type as the allocation.
+                                    if reference.is_view() {
+                                        return Err(ProgramError::MalformedProgram(format!(
+                                            "reference discharge cannot consume {} through the view `{}`; consumption \
+                                             yields the complete stored value, whose reference type is `{}`",
+                                            allocation,
+                                            reference.r#type(),
+                                            complete_reference_type,
+                                        )));
+                                    }
+                                }
+
+                                let outputs = discharge_preserved_access(operation, self, instruction_inputs)?;
+
+                                // Invalidate only after replay succeeds. A failed destination bind leaves every
+                                // allocation live. A successful bind removes each consumed entry so all later aliases
+                                // report a use-after-consume.
+                                for reference in consumed {
+                                    let allocation = reference.allocation_id();
+                                    self.take_allocation_entry(allocation)?;
+                                }
+                                return Ok(outputs);
+                            }
+                        }
+                    }
+
+                    let regions = ReplayRegionDriver::new(region, instruction.regions(), &mappings)?;
+                    let driver = RecursiveReferenceDischargeDriver::new(&regions, Some(position));
+                    instruction.operation().discharge_references(self, &driver, instruction_inputs)
+                })
+            },
+        )
     }
 }
 
@@ -4203,95 +4215,6 @@ mod tests {
         assert_eq!(result.output_allocations(), &[None]);
     }
     #[test]
-    fn test_discharge_region_instructions_consumes_a_preserved_allocation() {
-        let reference_type = ReferenceType::new(ListType { length: 2 });
-        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
-        let input = builder.add_input(ListIrType::Reference(reference_type.clone()));
-        let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![input], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
-        let destination = TracingContext::<ListIrValue, ListOperation>::new();
-        let context = ReferenceDischargeContext::<_, ListReferenceDischarge>::new(destination.clone());
-        let destination_reference = destination.input(ListIrType::Reference(reference_type.clone()));
-        let preserved = context.bind_preserved(reference_type.clone(), destination_reference).unwrap();
-        let reference = preserved.try_as_reference("the preserved reference").unwrap();
-        let allocation = reference.allocation_id();
-
-        // A same-type view is not the reference for the allocation's complete stored value. Replaying the consuming
-        // operation therefore leaves the allocation live and reports the invalid consumption at this seam.
-        let same_type_view = context
-            .alias_reference(reference, ListAlias { offset: 0, length: 2 }, reference_type, |value| Ok(value.clone()))
-            .unwrap();
-        assert_eq!(
-            discharge_region_instructions(&context, program.entry_region_ref(), vec![same_type_view]),
-            Err(ProgramError::MalformedProgram(format!(
-                "reference discharge cannot consume {allocation} through the view `ref<list<2>>`; consumption \
-                 yields the complete stored value, whose reference type is `ref<list<2>>`",
-            ))),
-        );
-        assert_eq!(context.live_allocation_ids(), vec![allocation]);
-
-        // The original reference does denote the complete value. Once its destination operation has been staged,
-        // the allocation entry disappears so every later access is diagnosed as a use-after-consume.
-        assert!(discharge_region_instructions(&context, program.entry_region_ref(), vec![preserved]).is_ok());
-        assert!(context.live_allocation_ids().is_empty());
-        assert_eq!(
-            context.allocation_entry(allocation).err(),
-            Some(ProgramError::MalformedProgram(format!("reference discharge accessed consumed {allocation}",))),
-        );
-    }
-
-    #[test]
-    fn test_reference_discharge_context_lift() {
-        // A capture-lifted program names its caller's references through constants, and such a constant denotes the
-        // allocation that capture position already binds rather than a second allocation of its own.
-        let pair = ReferenceType::new(ListType { length: 2 });
-        let triple = ReferenceType::new(ListType { length: 3 });
-        let context = ListDischargeContext::new(ListDestination::new());
-        let allocated = context.bind_discharged(pair.clone(), ListIrValue::List(vec![1, 2])).unwrap();
-        let allocation = allocated.try_as_reference("the captured allocation").unwrap().allocation_id();
-        let scoped = context.with_captures(ReferenceDischargeCaptureScope::new(
-            list_capture_position,
-            vec![None, None, Some(allocation)],
-        ));
-
-        let lifted = scoped.lift(ListIrValue::Reference(pair.clone())).unwrap();
-        let reference = lifted.try_as_reference("the resolved capture").unwrap();
-        assert_eq!(reference.allocation_id(), allocation);
-        assert_eq!(reference.r#type(), &pair);
-        assert_eq!(scoped.live_allocation_ids(), vec![allocation]);
-
-        // A non-reference constant is unaffected by the scope and lifts through the destination as usual.
-        let value = scoped.lift(ListIrValue::List(vec![3, 4])).unwrap();
-        assert_eq!(value, ReferenceDischargeValue::Value(ListIrValue::List(vec![3, 4])));
-
-        // A capture position the scope does not bind keeps the unbound reference-constant rejection.
-        assert_eq!(
-            scoped.lift(ListIrValue::Reference(triple.clone())).err(),
-            Some(ProgramError::MalformedProgram(
-                "reference discharge cannot lift a constant of reference type `ref<list<3>>`; a reference enters a \
-                 program through an input, a capture binding, or an allocation"
-                    .to_string(),
-            )),
-        );
-
-        // A capture constant names the complete stored value its position binds, so a declared type the bound
-        // allocation does not carry is reported rather than silently widened where the constant is used.
-        let allocated = context.bind_discharged(triple, ListIrValue::List(vec![1, 2, 3])).unwrap();
-        let wider = allocated.try_as_reference("the mismatched allocation").unwrap().allocation_id();
-        let mismatched = scoped.with_captures(scoped.captures().with_allocations(vec![None, None, Some(wider)]));
-        assert_eq!(
-            mismatched.lift(ListIrValue::Reference(pair)).err(),
-            Some(ProgramError::MalformedProgram(format!(
-                "reference discharge resolved a capture constant of reference type `ref<list<2>>` to {wider}, which \
-                 carries the reference type `ref<list<3>>`",
-            ))),
-        );
-    }
-
-    #[test]
     fn test_reference_discharge_context_bind_discharged() {
         let context = ListDischargeContext::new(ListDestination::new());
         let reference_type = ReferenceType::new(ListType { length: 4 });
@@ -4488,6 +4411,95 @@ mod tests {
         assert_eq!(context.set_discharged_state(allocation, wrong_state, true), Err(error));
         assert_eq!(context.read(reference), Ok(ListIrValue::List(vec![3, 4])));
         assert_eq!(context.is_mutated(allocation), Ok(false));
+    }
+
+    #[test]
+    fn test_reference_discharge_context_lift() {
+        // A capture-lifted program names its caller's references through constants, and such a constant denotes the
+        // allocation that capture position already binds rather than a second allocation of its own.
+        let pair = ReferenceType::new(ListType { length: 2 });
+        let triple = ReferenceType::new(ListType { length: 3 });
+        let context = ListDischargeContext::new(ListDestination::new());
+        let allocated = context.bind_discharged(pair.clone(), ListIrValue::List(vec![1, 2])).unwrap();
+        let allocation = allocated.try_as_reference("the captured allocation").unwrap().allocation_id();
+        let scoped = context.with_captures(ReferenceDischargeCaptureScope::new(
+            list_capture_position,
+            vec![None, None, Some(allocation)],
+        ));
+
+        let lifted = scoped.lift(ListIrValue::Reference(pair.clone())).unwrap();
+        let reference = lifted.try_as_reference("the resolved capture").unwrap();
+        assert_eq!(reference.allocation_id(), allocation);
+        assert_eq!(reference.r#type(), &pair);
+        assert_eq!(scoped.live_allocation_ids(), vec![allocation]);
+
+        // A non-reference constant is unaffected by the scope and lifts through the destination as usual.
+        let value = scoped.lift(ListIrValue::List(vec![3, 4])).unwrap();
+        assert_eq!(value, ReferenceDischargeValue::Value(ListIrValue::List(vec![3, 4])));
+
+        // A capture position the scope does not bind keeps the unbound reference-constant rejection.
+        assert_eq!(
+            scoped.lift(ListIrValue::Reference(triple.clone())).err(),
+            Some(ProgramError::MalformedProgram(
+                "reference discharge cannot lift a constant of reference type `ref<list<3>>`; a reference enters a \
+                 program through an input, a capture binding, or an allocation"
+                    .to_string(),
+            )),
+        );
+
+        // A capture constant names the complete stored value its position binds, so a declared type the bound
+        // allocation does not carry is reported rather than silently widened where the constant is used.
+        let allocated = context.bind_discharged(triple, ListIrValue::List(vec![1, 2, 3])).unwrap();
+        let wider = allocated.try_as_reference("the mismatched allocation").unwrap().allocation_id();
+        let mismatched = scoped.with_captures(scoped.captures().with_allocations(vec![None, None, Some(wider)]));
+        assert_eq!(
+            mismatched.lift(ListIrValue::Reference(pair)).err(),
+            Some(ProgramError::MalformedProgram(format!(
+                "reference discharge resolved a capture constant of reference type `ref<list<2>>` to {wider}, which \
+                 carries the reference type `ref<list<3>>`",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_reference_discharge_context_inline_region_consumes_a_preserved_allocation() {
+        let reference_type = ReferenceType::new(ListType { length: 2 });
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let input = builder.add_input(ListIrType::Reference(reference_type.clone()));
+        let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let destination = TracingContext::<ListIrValue, ListOperation>::new();
+        let context = ReferenceDischargeContext::<_, ListReferenceDischarge>::new(destination.clone());
+        let destination_reference = destination.input(ListIrType::Reference(reference_type.clone()));
+        let preserved = context.bind_preserved(reference_type.clone(), destination_reference).unwrap();
+        let reference = preserved.try_as_reference("the preserved reference").unwrap();
+        let allocation = reference.allocation_id();
+
+        // A same-type view is not the reference for the allocation's complete stored value. Replaying the consuming
+        // operation therefore leaves the allocation live and reports the invalid consumption at this seam.
+        let same_type_view = context
+            .alias_reference(reference, ListAlias { offset: 0, length: 2 }, reference_type, |value| Ok(value.clone()))
+            .unwrap();
+        assert_eq!(
+            context.inline_region(program.entry_region_ref(), vec![same_type_view]),
+            Err(ProgramError::MalformedProgram(format!(
+                "reference discharge cannot consume {allocation} through the view `ref<list<2>>`; consumption \
+                 yields the complete stored value, whose reference type is `ref<list<2>>`",
+            ))),
+        );
+        assert_eq!(context.live_allocation_ids(), vec![allocation]);
+
+        // The original reference does denote the complete value. Once its destination operation has been staged,
+        // the allocation entry disappears so every later access is diagnosed as a use-after-consume.
+        assert!(context.inline_region(program.entry_region_ref(), vec![preserved]).is_ok());
+        assert!(context.live_allocation_ids().is_empty());
+        assert_eq!(
+            context.allocation_entry(allocation).err(),
+            Some(ProgramError::MalformedProgram(format!("reference discharge accessed consumed {allocation}",))),
+        );
     }
 
     #[test]
