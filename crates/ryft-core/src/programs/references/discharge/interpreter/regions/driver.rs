@@ -198,7 +198,7 @@ where
                 };
                 let input = destination.input(input_type);
                 if let Some(forked) = caller_to_fork.get(&allocation).copied() {
-                    return fork.allocation_handle(forked);
+                    return fork.allocation_reference(forked);
                 }
                 let carrier = if discharged {
                     fork.bind_discharged(r#type, input)?
@@ -509,7 +509,7 @@ where
                  the reference type `{bound}`",
             )));
         }
-        return context.allocation_handle(allocation);
+        return context.allocation_reference(allocation);
     }
     Ok(ReferenceDischargeValue::Ordinary(context.parent().lift(constant)?))
 }

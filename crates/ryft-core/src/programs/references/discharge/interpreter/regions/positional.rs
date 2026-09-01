@@ -163,7 +163,7 @@ where
                     .and_then(|position| forwarded.get(position).cloned());
                 results.push(match forwarded {
                     Some(forwarded) => forwarded,
-                    None => context.allocation_handle(allocation)?,
+                    None => context.allocation_reference(allocation)?,
                 });
             }
             None => results.push(ReferenceDischargeValue::Ordinary(output)),

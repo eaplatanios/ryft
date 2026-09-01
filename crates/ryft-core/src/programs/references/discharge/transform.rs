@@ -153,16 +153,15 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         self.targets.selects(ReferenceDischargeTarget::External(source))
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Returns the complete current immutable state of one live discharged allocation. Operation rules normally use
-    /// [`read`](Self::read) to observe the portion selected by a reference value. Structured-operation implementations
+    /// [`read`](Self::read) to observe the portion selected by a reference value. Structured operation implementations
     /// use this function when they must thread the allocation's complete state across a destination boundary.
     ///
     /// # Errors
     ///
     /// Returns [`ProgramError::MalformedProgram`] when `allocation` is unknown, belongs to another environment, has
     /// already been consumed, or was preserved rather than discharged.
+    #[inline]
     pub fn discharged_state(&self, allocation: ReferenceDischargeAllocationId) -> Result<C::Value, ProgramError> {
         match &self.allocation_entry(allocation)?.state {
             ReferenceDischargeAllocationState::Discharged { current, .. } => Ok(current.clone()),
@@ -172,16 +171,15 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         }
     }
 
-    /// Returns whether one live discharged allocation has been mutated during this transform.
-    ///
-    /// A direct write, swap, or accumulation marks the allocation as mutated. Structured-operation implementations
-    /// use this fact to publish only final states that the source program could have changed; read-only state need not
-    /// become a hidden output.
+    /// Returns whether one live discharged allocation has been mutated during this transform. A direct write, swap, or
+    /// accumulation marks the allocation as mutated. Structured operation implementations use this fact to publish only
+    /// final states that the source program could have changed; read-only state need not become a hidden output.
     ///
     /// # Errors
     ///
     /// Returns [`ProgramError::MalformedProgram`] when `allocation` is unknown, belongs to another environment, has
     /// already been consumed, or was preserved rather than discharged.
+    #[inline]
     pub fn is_mutated(&self, allocation: ReferenceDischargeAllocationId) -> Result<bool, ProgramError> {
         match &self.allocation_entry(allocation)?.state {
             ReferenceDischargeAllocationState::Discharged { mutated, .. } => Ok(*mutated),
@@ -191,10 +189,10 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         }
     }
 
-    /// Returns the IDs of every allocation still live in this context, in binding order.
-    ///
-    /// Consumption retains the allocation's environment slot but removes its entry, so consumed allocations are
-    /// omitted while the relative order of all remaining allocations stays stable.
+    /// Returns the [`ReferenceDischargeAllocationId`] of every allocation still live in this context, in binding order.
+    /// Consumption retains the allocation's environment slot but removes its entry, so consumed allocations are omitted
+    /// while the relative order of all remaining allocations stays stable.
+    #[inline]
     pub fn live_allocation_ids(&self) -> Vec<ReferenceDischargeAllocationId> {
         let environment = self.environment.borrow();
         environment
@@ -206,30 +204,29 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
             .collect()
     }
 
-    /// Returns whether one live allocation is discharged rather than preserved.
-    ///
-    /// This function is useful when structured-operation code has only an allocation ID and must choose whether to
-    /// thread immutable state or a destination reference value.
+    /// Returns whether one live allocation is discharged rather than preserved. This function is useful when structured
+    /// operation code has only an allocation ID and must choose whether to thread immutable state or a destination
+    /// reference value.
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::MalformedProgram`] when `allocation` is unknown, belongs to another environment, or
-    /// has already been consumed.
+    /// Returns [`ProgramError::MalformedProgram`] when `allocation` is unknown, belongs to another environment,
+    /// or has already been consumed.
+    #[inline]
     pub fn is_allocation_discharged(&self, allocation: ReferenceDischargeAllocationId) -> Result<bool, ProgramError> {
-        Ok(matches!(&self.allocation_entry(allocation)?.state, ReferenceDischargeAllocationState::Discharged { .. },))
+        Ok(matches!(&self.allocation_entry(allocation)?.state, ReferenceDischargeAllocationState::Discharged { .. }))
     }
 
-    /// Returns an unviewed reference value denoting one live allocation already bound in this context.
-    ///
-    /// This function does not bind another allocation. Region threading and capture resolution use it to reconstruct
-    /// the complete-value reference associated with an allocation ID. A preserved allocation carries the exact
-    /// destination reference originally supplied to [`bind_preserved`](Self::bind_preserved).
+    /// Returns an unviewed [`ReferenceDischargeValue`] denoting a live allocation already bound in this context. This
+    /// function does not bind another allocation. Region threading and capture resolution use it to reconstruct the
+    /// complete value reference associated with an allocation ID. A preserved allocation carries the exact destination
+    /// reference originally supplied to [`bind_preserved`](Self::bind_preserved).
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::MalformedProgram`] when `allocation` is unknown, belongs to another environment, or
-    /// has already been consumed.
-    pub fn allocation_handle(
+    /// Returns [`ProgramError::MalformedProgram`] when `allocation` is unknown, belongs to another environment,
+    /// or has already been consumed.
+    pub fn allocation_reference(
         &self,
         allocation: ReferenceDischargeAllocationId,
     ) -> Result<ReferenceDischargeValue<C, P>, ProgramError> {
@@ -253,15 +250,37 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         }))
     }
 
-    /// Binds an allocation selected for discharge and returns its unviewed reference value.
+    /// Returns an immutable borrow of one live [`ReferenceDischargeAllocationEntry`]. The returned guard keeps the
+    /// allocation environment immutably borrowed. Callers should copy or clone the fields they need and let the guard
+    /// drop before invoking any operation that may borrow the environment mutably.
     ///
-    /// The allocation is fresh to this context even when it represents a reference that already existed at the source
-    /// program's entry boundary. Its `initial` value becomes the complete immutable state observed by
-    /// [`discharged_state`](Self::discharged_state) and transformed by the reference-operation functions below.
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when `allocation` belongs to another environment, was never bound,
+    /// or has already been consumed.
+    pub(crate) fn allocation_entry(
+        &self,
+        allocation: ReferenceDischargeAllocationId,
+    ) -> Result<Ref<'_, ReferenceDischargeAllocationEntry<P::Referent, C::Value>>, ProgramError> {
+        let environment = self.environment.borrow();
+        if environment.slot(allocation)?.is_none() {
+            return Err(ProgramError::MalformedProgram(format!("reference discharge accessed consumed {allocation}")));
+        }
+        Ok(Ref::map(environment, |environment| {
+            // The check above proved that this exact slot exists and contains a live entry.
+            environment.allocations[allocation.index].as_ref().unwrap()
+        }))
+    }
+
+    /// Binds an allocation selected for discharge and returns its unviewed reference value. The allocation is fresh to
+    /// this context even when it represents a reference that already existed at the source program's entry boundary.
+    /// Its `initial` value becomes the immutable state exposed by [`discharged_state`](Self::discharged_state),
+    /// observed through [`read`](Self::read), and transformed through [`write`](Self::write), [`swap`](Self::swap),
+    /// and [`accumulate`](Self::accumulate).
     ///
     /// # Parameters
     ///
-    ///   - `r#type`: Reference type of the allocation.
+    ///   - `r#type`: [`ReferenceType`] of the allocation.
     ///   - `initial`: Destination value that becomes the allocation's initial immutable state.
     ///
     /// # Errors
@@ -289,15 +308,14 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         ))
     }
 
-    /// Binds an allocation preserved by partial discharge and returns its unviewed reference value.
-    ///
-    /// The environment retains `reference` so structured boundaries can thread the allocation, while each derived
-    /// reference retains the exact destination value produced when its view operation is replayed. A preserved
-    /// allocation never becomes discharged later in this transform.
+    /// Binds an allocation preserved by partial discharge and returns its unviewed reference value. The environment
+    /// retains `reference` so structured boundaries can thread the allocation, while each derived reference retains
+    /// the exact destination value produced when its view operation is replayed. A preserved allocation never becomes
+    /// discharged later in this transform.
     ///
     /// # Parameters
     ///
-    ///   - `r#type`: Reference type of the allocation.
+    ///   - `r#type`: [`ReferenceType`] of the allocation.
     ///   - `reference`: Destination reference-typed value denoting the allocation.
     ///
     /// # Errors
@@ -314,7 +332,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         let reference_type = reference.r#type();
         let actual = <&ReferenceType<P::Referent>>::try_from(reference_type.as_ref()).map_err(|_| {
             ProgramError::MalformedProgram(format!(
-                "reference discharge preserved an allocation as `{reference_type}`, which is not a reference type",
+                "reference discharge preserved an allocation as `{reference_type}` which is not a reference type",
             ))
         })?;
         if actual != &r#type {
@@ -328,6 +346,35 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
             ReferenceDischargeBinding::Preserved { reference },
         ))
     }
+
+    /// Inserts one validated allocation entry and returns its unviewed reference value. [`Self::bind_discharged`] and
+    /// [`Self::bind_preserved`] validate their fate-specific values before calling this shared environment primitive.
+    fn bind_allocation(
+        &self,
+        r#type: ReferenceType<P::Referent>,
+        state: ReferenceDischargeAllocationState<C::Value>,
+        binding: ReferenceDischargeBinding<C::Value>,
+    ) -> ReferenceDischargeValue<C, P> {
+        let alias = P::storage_alias(r#type.referent());
+        let allocation = {
+            // The environment owns the complete type and state even after every handle to this allocation disappears.
+            // Keep the mutable borrow scoped to inserting that record; the returned handle carries only its identity.
+            let mut environment = self.environment.borrow_mut();
+            environment
+                .allocations
+                .push(Some(ReferenceDischargeAllocationEntry { r#type: r#type.clone(), state }));
+            ReferenceDischargeAllocationId { environment: environment.id, index: environment.allocations.len() - 1 }
+        };
+        ReferenceDischargeValue::Reference(ReferenceDischargeReference {
+            allocation_id: allocation,
+            denotes_complete_value: true,
+            alias,
+            r#type,
+            binding,
+        })
+    }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Derives another reference value for the same allocation with the provided composed view and exposed type.
     ///
@@ -372,7 +419,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
                 let derived_type = derived.r#type();
                 let actual = <&ReferenceType<P::Referent>>::try_from(derived_type.as_ref()).map_err(|_| {
                     ProgramError::MalformedProgram(format!(
-                        "reference discharge preserved an allocation as `{derived_type}`, which is not a reference type",
+                        "reference discharge preserved an allocation as `{derived_type}` which is not a reference type",
                     ))
                 })?;
                 if actual != &r#type {
@@ -559,58 +606,6 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         // The type lookup above proved that this handle belongs to this environment and names a live allocation.
         self.environment.borrow_mut().allocations[allocation.index] = None;
         Ok(())
-    }
-
-    /// Returns an immutable borrow of one live allocation entry.
-    ///
-    /// The returned guard keeps the allocation environment immutably borrowed. Callers should copy or clone the fields
-    /// they need and let the guard drop before invoking any operation that may borrow the environment mutably.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::MalformedProgram`] when `allocation` belongs to another environment, was never bound,
-    /// or has already been consumed.
-    pub(crate) fn allocation_entry(
-        &self,
-        allocation: ReferenceDischargeAllocationId,
-    ) -> Result<Ref<'_, ReferenceDischargeAllocationEntry<P::Referent, C::Value>>, ProgramError> {
-        let environment = self.environment.borrow();
-        if environment.slot(allocation)?.is_none() {
-            return Err(ProgramError::MalformedProgram(format!("reference discharge accessed consumed {allocation}",)));
-        }
-        Ok(Ref::map(environment, |environment| {
-            // The check above proved that this exact slot exists and contains a live entry.
-            environment.allocations[allocation.index].as_ref().unwrap()
-        }))
-    }
-
-    /// Inserts one validated allocation entry and returns its unviewed reference value.
-    ///
-    /// [`bind_discharged`](Self::bind_discharged) and [`bind_preserved`](Self::bind_preserved) validate their
-    /// fate-specific values before calling this common environment primitive.
-    fn bind_allocation(
-        &self,
-        r#type: ReferenceType<P::Referent>,
-        state: ReferenceDischargeAllocationState<C::Value>,
-        binding: ReferenceDischargeBinding<C::Value>,
-    ) -> ReferenceDischargeValue<C, P> {
-        let alias = P::storage_alias(r#type.referent());
-        let allocation = {
-            // The environment owns the complete type and state even after every handle to this allocation disappears.
-            // Keep the mutable borrow scoped to inserting that record; the returned handle carries only its identity.
-            let mut environment = self.environment.borrow_mut();
-            environment
-                .allocations
-                .push(Some(ReferenceDischargeAllocationEntry { r#type: r#type.clone(), state }));
-            ReferenceDischargeAllocationId { environment: environment.id, index: environment.allocations.len() - 1 }
-        };
-        ReferenceDischargeValue::Reference(ReferenceDischargeReference {
-            allocation_id: allocation,
-            denotes_complete_value: true,
-            alias,
-            r#type,
-            binding,
-        })
     }
 
     /// Installs the complete current state of one live discharged allocation and merges its mutation status.
@@ -1525,7 +1520,7 @@ mod tests {
         assert_eq!(context.live_allocation_ids(), vec![allocation]);
         assert_eq!(context.is_mutated(allocation), Ok(false));
         assert_eq!(context.is_allocation_discharged(allocation), Ok(true));
-        assert_eq!(context.allocation_handle(allocation), Ok(allocated.clone()));
+        assert_eq!(context.allocation_reference(allocation), Ok(allocated.clone()));
         assert_eq!(reference.alias(), &ListAlias { offset: 0, length: 4 });
         assert_eq!(reference.r#type(), &reference_type);
         assert_eq!(reference.preserved(), None);
@@ -1617,7 +1612,7 @@ mod tests {
         assert_eq!(
             context.bind_preserved(reference_type.clone(), ListIrValue::List(vec![1, 2])),
             Err(ProgramError::MalformedProgram(
-                "reference discharge preserved an allocation as `list<2>`, which is not a reference type".to_string(),
+                "reference discharge preserved an allocation as `list<2>` which is not a reference type".to_string(),
             )),
         );
         assert_eq!(
@@ -1642,7 +1637,7 @@ mod tests {
         assert_eq!(reference.r#type(), &reference_type);
         assert_eq!(reference.preserved(), Some(&destination_reference));
         assert_eq!(context.is_allocation_discharged(allocation), Ok(false));
-        assert_eq!(context.allocation_handle(allocation), Ok(bound.clone()));
+        assert_eq!(context.allocation_reference(allocation), Ok(bound.clone()));
         assert_eq!(
             context.operand_value(&ReferenceDischargeValue::Reference(reference.clone())),
             Ok(destination_reference.clone()),
@@ -2194,7 +2189,7 @@ mod tests {
                 )
                 .unwrap_err(),
             ProgramError::MalformedProgram(
-                "reference discharge targets include external input 3, which is not selectable in this program"
+                "reference discharge targets include external input 3 which is not selectable in this program"
                     .to_string(),
             ),
         );

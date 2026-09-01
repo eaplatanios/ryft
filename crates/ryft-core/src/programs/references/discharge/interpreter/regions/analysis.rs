@@ -682,7 +682,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     ///
     /// Returns [`ProgramError::MalformedProgram`] when `allocation` is not live in this environment.
     pub fn allocation_value(&self, allocation: ReferenceDischargeAllocationId) -> Result<C::Value, ProgramError> {
-        self.operand_value(&self.allocation_handle(allocation)?)
+        self.operand_value(&self.allocation_reference(allocation)?)
     }
 }
 
