@@ -83,12 +83,7 @@ impl ReferenceDischargeTargets {
     /// out-of-range or non-reference entry position, names an instruction that the program does not contain, names an
     /// operation that defines no reference allocation, or names an output position that is not an allocation. It also
     /// returns an error when `capture_count` exceeds the program's input count.
-    pub fn from_targets<
-        V: Value,
-        O: Operation<Type = V::Type>,
-        Input: Parameterized<V>,
-        Output: Parameterized<V>,
-    >(
+    pub fn from_targets<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Parameterized<V>>(
         program: &Program<V, O, Input, Output>,
         capture_count: usize,
         targets: &[ReferenceDischargeTarget],

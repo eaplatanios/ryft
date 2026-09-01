@@ -1,24 +1,58 @@
 diff --git a/jaxlib/mosaic/dialect/gpu/BUILD b/jaxlib/mosaic/dialect/gpu/BUILD
-index c82cb8dfc8..7ea30d6152 100644
+index c82cb8dfc8..07bd4cc7b0 100644
 --- a/jaxlib/mosaic/dialect/gpu/BUILD
 +++ b/jaxlib/mosaic/dialect/gpu/BUILD
-@@ -24,6 +24,6 @@ load("@rules_cc//cc:cc_test.bzl", "cc_test")
- package(
-     default_applicable_licenses = [],
--    default_visibility = ["//jax/experimental:mosaic_gpu_users"],
-+    default_visibility = ["//visibility:public"],
- )
-
- td_library(
+@@ -31,6 +31,7 @@ td_library(
+     name = "mosaic_gpu_td_files",
+     srcs = ["mosaic_gpu.td"],
+     includes = ["."],
++    visibility = ["//visibility:public"],
+     deps = [
+         "@llvm-project//mlir:BasicPtxBuilderIntTdFiles",
+         "@llvm-project//mlir:BuiltinDialectTdFiles",
+@@ -225,6 +226,7 @@ cc_library(
+     name = "gpu_dialect_capi_objects",
+     srcs = DIALECT_CAPI_SOURCES,
+     hdrs = DIALECT_CAPI_HEADERS,
++    visibility = ["//visibility:public"],
+     deps = [
+         ":mosaic_gpu",
+         "@llvm-project//mlir:CAPIIRObjects",
 diff --git a/jaxlib/mosaic/BUILD b/jaxlib/mosaic/BUILD
-index 8f8f6999af..0e43b53468 100644
+index 8f8f6999af..dfb5a2eff7 100644
 --- a/jaxlib/mosaic/BUILD
 +++ b/jaxlib/mosaic/BUILD
-@@ -23,6 +23,4 @@ licenses(["notice"])
- package(
-     default_applicable_licenses = [],
--    default_visibility = [
--        "//jax/experimental:mosaic_users",
--    ],
-+    default_visibility = ["//visibility:public"],
- )
+@@ -264,6 +264,7 @@ cc_library(
+     name = "tpu_dialect_capi_objects",
+     srcs = TPU_CAPI_SOURCES,
+     hdrs = TPU_CAPI_HEADERS,
++    visibility = ["//visibility:public"],
+     deps = [
+         ":tpu_dialect",
+         ":tpu_inc_gen",
+diff --git a/jaxlib/mosaic/gpu/BUILD b/jaxlib/mosaic/gpu/BUILD
+index 0bcc09fb64..0ee144ddea 100644
+--- a/jaxlib/mosaic/gpu/BUILD
++++ b/jaxlib/mosaic/gpu/BUILD
+@@ -46,4 +46,5 @@ cc_library(
+     name = "mosaic_gpu_support",
++    visibility = ["//visibility:public"],
+     deps = [
+         ":custom_call",
+         ":runtime",
+@@ -233,6 +234,7 @@ cc_library(
+     name = "mlir_capi_objects",
+     srcs = CAPI_SOURCES,
+     hdrs = CAPI_HEADERS,
++    visibility = ["//visibility:public"],
+     deps = [
+         ":serde",
+         "@llvm-project//mlir:CAPIIRObjects",
+@@ -390,6 +392,7 @@ cc_test(
+     name = "custom_call_test",
+     srcs = ["custom_call_test.cc"],
+     tags = ["requires-gpu-sm90"],
++    visibility = ["//visibility:public"],
+     deps = [
+         ":mosaic_gpu_support",
+         "//testing/base/public:gunit_main",

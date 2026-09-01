@@ -47,7 +47,11 @@ impl<'o> StringRef<'o> {
 
     /// Returns the underlying bytes of this [`StringRef`].
     pub fn bytes(&self) -> &[u8] {
-        unsafe { std::slice::from_raw_parts(self.handle.data as *mut u8, self.handle.length) }
+        if self.handle.length == 0 {
+            &[]
+        } else {
+            unsafe { std::slice::from_raw_parts(self.handle.data as *mut u8, self.handle.length) }
+        }
     }
 
     /// Returns an [`str`] slice representation of the underlying string.
@@ -57,14 +61,14 @@ impl<'o> StringRef<'o> {
 }
 
 impl Display for StringRef<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str().unwrap_or("<non-utf-8 string>"))
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.as_str().unwrap_or("<non-utf-8 string>"))
     }
 }
 
 impl Debug for StringRef<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "StringRef[{self}]")
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "StringRef[{self}]")
     }
 }
 
@@ -78,13 +82,19 @@ impl Eq for StringRef<'_> {}
 
 impl Hash for StringRef<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        unsafe { std::slice::from_raw_parts(self.handle.data as *mut u8, self.handle.length).hash(state) }
+        self.bytes().hash(state)
     }
 }
 
 impl<'o> From<&'o str> for StringRef<'o> {
     fn from(value: &'o str) -> Self {
         unsafe { Self::from_c_api(MlirStringRef { data: value.as_bytes().as_ptr() as *const _, length: value.len() }) }
+    }
+}
+
+impl<'o> From<&'o [u8]> for StringRef<'o> {
+    fn from(value: &'o [u8]) -> Self {
+        unsafe { Self::from_c_api(MlirStringRef { data: value.as_ptr() as *const _, length: value.len() }) }
     }
 }
 
@@ -98,9 +108,13 @@ impl<'o> TryFrom<&StringRef<'o>> for &'o str {
     type Error = std::str::Utf8Error;
 
     fn try_from(value: &StringRef<'o>) -> Result<Self, Self::Error> {
-        unsafe {
-            let bytes = std::slice::from_raw_parts(value.handle.data as *mut u8, value.handle.length);
-            std::str::from_utf8(if bytes[bytes.len() - 1] == 0 { &bytes[..bytes.len() - 1] } else { bytes })
+        if value.handle.length == 0 {
+            Ok("")
+        } else {
+            unsafe {
+                let bytes = std::slice::from_raw_parts(value.handle.data as *mut u8, value.handle.length);
+                std::str::from_utf8(if bytes.last() == Some(&0) { &bytes[..bytes.len() - 1] } else { bytes })
+            }
         }
     }
 }
@@ -478,6 +492,9 @@ mod tests {
 
         // Test conversions.
         assert_eq!(StringRef::from("hello").bytes(), b"hello");
+        assert_eq!(StringRef::from(b"hello".as_slice()).bytes(), b"hello");
+        assert_eq!(StringRef::from([0, 255].as_slice()).bytes(), &[0, 255]);
+        assert_eq!(StringRef::from([].as_slice()).as_str().unwrap(), "");
         assert_eq!(StringRef::from(Path::new("/tmp/test.txt")).as_str().unwrap(), "/tmp/test.txt");
 
         // Test C string conversions.
