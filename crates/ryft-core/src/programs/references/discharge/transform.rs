@@ -171,6 +171,56 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         }
     }
 
+    /// Sets the complete current state of one live discharged allocation. If `mutated` is `true`, this function also
+    /// marks the allocation as mutated; passing `false` preserves its existing mutation status and never clears a prior
+    /// mutation mark. Reference operation functions pass `true`. Structured boundary code passes its access summary
+    /// because symmetric boundaries also return unchanged state for read-only allocations, which must not cause those
+    /// allocations to publish hidden final-state outputs.
+    ///
+    /// # Parameters
+    ///
+    ///   - `allocation`: Live discharged allocation whose complete state is being set.
+    ///   - `current`: New complete immutable state.
+    ///   - `mutated`: Whether this transition should mark the allocation as mutated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when `allocation` is not a live discharged allocation or `current`
+    /// does not carry its referent type.
+    pub fn set_discharged_state(
+        &self,
+        allocation: ReferenceDischargeAllocationId,
+        current: C::Value,
+        mutated: bool,
+    ) -> Result<(), ProgramError>
+    where
+        C::Type: From<P::Referent>,
+    {
+        // Validate before taking the mutable environment borrow so a type error leaves both the current state and its
+        // mutation bit unchanged.
+        let r#type = self.allocation_entry(allocation)?.r#type.clone();
+        let expected = C::Type::from(r#type.referent().clone());
+        let actual = current.r#type();
+        if actual.as_ref() != &expected {
+            return Err(ProgramError::MalformedProgram(format!(
+                "reference discharge state has type `{actual}` but allocation `{type}` requires `{expected}`",
+            )));
+        }
+        let mut environment = self.environment.borrow_mut();
+        environment.slot(allocation)?;
+        match environment.allocations[allocation.index].as_mut().map(|entry| &mut entry.state) {
+            Some(ReferenceDischargeAllocationState::Discharged { current: state, mutated: previous_mutated }) => {
+                *state = current;
+                *previous_mutated |= mutated;
+                Ok(())
+            }
+            Some(ReferenceDischargeAllocationState::Preserved { .. }) => Err(ProgramError::MalformedProgram(format!(
+                "reference discharge updated the state of preserved {allocation}",
+            ))),
+            None => Err(ProgramError::MalformedProgram(format!("reference discharge accessed consumed {allocation}"))),
+        }
+    }
+
     /// Returns whether one live discharged allocation has been mutated during this transform. A direct write, swap, or
     /// accumulation marks the allocation as mutated. Structured operation implementations use this fact to publish only
     /// final states that the source program could have changed; read-only state need not become a hidden output.
@@ -459,7 +509,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     }
 
     /// Replaces the portion that `reference` selects in a discharged allocation. The policy returns a complete
-    /// successor state, which this function installs through [`update_discharged_state`](Self::update_discharged_state)
+    /// successor state, which this function installs through [`set_discharged_state`](Self::set_discharged_state)
     /// and records as a mutation.
     ///
     /// # Parameters
@@ -482,7 +532,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         let allocation = reference.allocation_id();
         let current = self.discharged_state(allocation)?;
         let successor = P::write(&self.parent, &current, replacement, reference.alias())?;
-        self.update_discharged_state(allocation, successor, true)
+        self.set_discharged_state(allocation, successor, true)
     }
 
     /// Replaces the portion that `reference` selects and returns its previous contents. Like [`write`](Self::write),
@@ -509,7 +559,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         let allocation = reference.allocation_id();
         let current = self.discharged_state(allocation)?;
         let (previous, successor) = P::swap(&self.parent, &current, replacement, reference.alias())?;
-        self.update_discharged_state(allocation, successor, true)?;
+        self.set_discharged_state(allocation, successor, true)?;
         Ok(previous)
     }
 
@@ -537,26 +587,23 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         let allocation = reference.allocation_id();
         let current = self.discharged_state(allocation)?;
         let successor = P::accumulate(&self.parent, &current, update, reference.alias())?;
-        self.update_discharged_state(allocation, successor, true)
+        self.set_discharged_state(allocation, successor, true)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Consumes a discharged allocation and returns its complete current immutable state.
-    ///
-    /// Consumption removes the allocation's live environment entry, so every later access reports a use-after-consume.
-    /// It always yields the complete stored value and deliberately ignores aliases; only the unviewed reference value
-    /// returned when the allocation was bound can therefore name the transition. For a preserved allocation, the
-    /// destination operation performs the semantic consumption and
-    /// [`mark_preserved_consumed`](Self::mark_preserved_consumed) records the matching liveness transition.
+    /// Consumes a discharged allocation and returns its complete current immutable state. Consumption removes the
+    /// allocation's live environment entry, so every later access reports a use-after-consume. It always yields the
+    /// complete stored value and deliberately ignores aliases; only the unviewed reference value returned when the
+    /// allocation was bound can therefore name the transition. For a preserved allocation, the destination operation
+    /// performs the semantic consumption and [`mark_preserved_consumed`](Self::mark_preserved_consumed) records the
+    /// matching liveness transition.
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::MalformedProgram`] when the allocation is not live, was preserved rather than discharged, or
-    /// is named through a derived handle rather than an unviewed handle.
+    /// Returns [`ProgramError::MalformedProgram`] when the allocation is not live, was preserved rather than
+    /// discharged, or is named through a derived handle rather than an unviewed handle.
     pub fn consume(&self, reference: &ReferenceDischargeReference<C, P>) -> Result<C::Value, ProgramError> {
         let allocation = reference.allocation_id();
-        let current_type = match &self.allocation_entry(allocation)?.state {
+        let referent_type = match &self.allocation_entry(allocation)?.state {
             ReferenceDischargeAllocationState::Discharged { current, .. } => Ok(current.r#type().into_owned()),
             ReferenceDischargeAllocationState::Preserved { .. } => Err(ProgramError::MalformedProgram(format!(
                 "reference discharge requested the discharged state of preserved {allocation}",
@@ -564,18 +611,20 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         }?;
         if !reference.denotes_complete_value() {
             return Err(ProgramError::MalformedProgram(format!(
-                "reference discharge cannot consume {allocation} through the derived view `{}`; consumption yields the \
+                "reference discharge cannot consume {} through the derived view `{}`; consumption yields the \
                  complete stored value, whose referent is `{}`",
+                allocation,
                 reference.r#type(),
-                current_type,
+                referent_type,
             )));
         }
         let mut environment = self.environment.borrow_mut();
-        // The inspection above proved that this handle belongs to this environment and names a live discharged reference.
         let entry = environment.allocations[allocation.index].take().unwrap();
         let ReferenceDischargeAllocationState::Discharged { current, .. } = entry.state else { unreachable!() };
         Ok(current)
     }
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Records that a replayed destination operation consumed one preserved allocation.
     ///
@@ -608,56 +657,6 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         // The type lookup above proved that this handle belongs to this environment and names a live allocation.
         self.environment.borrow_mut().allocations[allocation.index] = None;
         Ok(())
-    }
-
-    /// Installs the complete current state of one live discharged allocation and merges its mutation status.
-    ///
-    /// Reference-operation functions pass `true`. Structured-boundary code passes its access summary because symmetric
-    /// boundaries also return unchanged state for read-only allocations, which must not cause those allocations to
-    /// publish hidden final-state outputs. Once an allocation is marked mutated, a later `false` never clears that fact.
-    ///
-    /// # Parameters
-    ///
-    ///   - `allocation`: Live discharged allocation whose complete state is being installed.
-    ///   - `current`: New complete immutable state.
-    ///   - `mutated`: Whether this transition should mark the allocation as mutated.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::MalformedProgram`] when `allocation` is not a live discharged allocation or `current`
-    /// does not carry its referent type.
-    pub fn update_discharged_state(
-        &self,
-        allocation: ReferenceDischargeAllocationId,
-        current: C::Value,
-        mutated: bool,
-    ) -> Result<(), ProgramError>
-    where
-        C::Type: From<P::Referent>,
-    {
-        // Validate before taking the mutable environment borrow so a type error leaves both the current state and its
-        // mutation bit unchanged.
-        let r#type = self.allocation_entry(allocation)?.r#type.clone();
-        let expected = C::Type::from(r#type.referent().clone());
-        let actual = current.r#type();
-        if actual.as_ref() != &expected {
-            return Err(ProgramError::MalformedProgram(format!(
-                "reference discharge state has type `{actual}` but allocation `{type}` requires `{expected}`",
-            )));
-        }
-        let mut environment = self.environment.borrow_mut();
-        environment.slot(allocation)?;
-        match environment.allocations[allocation.index].as_mut().map(|entry| &mut entry.state) {
-            Some(ReferenceDischargeAllocationState::Discharged { current: state, mutated: previous_mutated }) => {
-                *state = current;
-                *previous_mutated |= mutated;
-                Ok(())
-            }
-            Some(ReferenceDischargeAllocationState::Preserved { .. }) => Err(ProgramError::MalformedProgram(format!(
-                "reference discharge updated the state of preserved {allocation}",
-            ))),
-            None => Err(ProgramError::MalformedProgram(format!("reference discharge accessed consumed {allocation}"))),
-        }
     }
 }
 
@@ -1590,7 +1589,7 @@ mod tests {
         assert_eq!(context.live_allocation_ids(), Vec::new());
         let consumed = ProgramError::MalformedProgram(format!("reference discharge accessed consumed {allocation}"));
         assert_eq!(context.read(&reference), Err(consumed.clone()));
-        assert_eq!(context.update_discharged_state(allocation, ListIrValue::List(vec![0; 4]), true), Err(consumed),);
+        assert_eq!(context.set_discharged_state(allocation, ListIrValue::List(vec![0; 4]), true), Err(consumed),);
 
         // An allocation ID minted by an unrelated discharge is reported instead of silently addressing whichever
         // allocation occupies the same position here.
@@ -1659,7 +1658,7 @@ mod tests {
             ))),
         );
         assert_eq!(
-            context.update_discharged_state(allocation, ListIrValue::List(vec![0, 0]), true),
+            context.set_discharged_state(allocation, ListIrValue::List(vec![0, 0]), true),
             Err(ProgramError::MalformedProgram(format!(
                 "reference discharge updated the state of preserved {allocation}",
             ))),
@@ -1751,7 +1750,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_discharge_context_update_discharged_state() {
+    fn test_reference_discharge_context_set_discharged_state() {
         let context = ListDischargeContext::new(ListDestination::new());
         let reference_type = ReferenceType::new(ListType { length: 2 });
         let wrong_state = ListIrValue::List(vec![1]);
@@ -1768,13 +1767,13 @@ mod tests {
         let allocation = reference.allocation_id();
 
         // Boundary reconciliation can install a successor without marking a read-only allocation as mutated.
-        assert_eq!(context.update_discharged_state(allocation, ListIrValue::List(vec![3, 4]), false), Ok(()));
+        assert_eq!(context.set_discharged_state(allocation, ListIrValue::List(vec![3, 4]), false), Ok(()));
         assert_eq!(context.discharged_state(allocation), Ok(ListIrValue::List(vec![3, 4])));
         assert_eq!(context.is_mutated(allocation), Ok(false));
 
         // State updates validate before taking the mutable environment borrow, so failure preserves the prior state
         // and mutation bit.
-        assert_eq!(context.update_discharged_state(allocation, wrong_state, true), Err(error));
+        assert_eq!(context.set_discharged_state(allocation, wrong_state, true), Err(error));
         assert_eq!(context.read(reference), Ok(ListIrValue::List(vec![3, 4])));
         assert_eq!(context.is_mutated(allocation), Ok(false));
     }
