@@ -220,7 +220,7 @@ mod tests {
             .unwrap();
 
         // Full discharge turns the shared allocation into state. The public snapshot and hidden final-state output both
-        // observe the write, proving that the duplicate boundary position did not mint an independent fork allocation.
+        // observe the write, proving that the duplicate boundary position did not mint an independent region allocation.
         let discharged = source.clone().discharge_references(0).unwrap();
         assert_eq!(
             discharged.program().interpret(vec![ListIrValue::List(vec![1, 2])]),

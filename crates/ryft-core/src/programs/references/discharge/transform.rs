@@ -1242,8 +1242,8 @@ where
         index: usize,
         boundary: &ReferenceDischargeRegionBoundary,
     ) -> Result<ReferenceDischargeRegionResult<C::Constant, C::Operation>, ProgramError> {
-        // Rebuild the source region in a fresh trace with a fresh allocation environment. The caller and fork can
-        // communicate only through the boundary described below: neither side can accidentally retain a handle or
+        // Rebuild the source region in a fresh trace with a fresh allocation environment. The caller and rebuilt region
+        // can communicate only through the boundary described below: neither side can accidentally retain a handle or
         // value belonging to the other environment.
         let region = self.region(index)?;
         check_count!("input", boundary.declared_input_allocations(), region.input_ids().len(), ProgramError);
@@ -1280,18 +1280,19 @@ where
             )));
         }
 
-        // Every carrier, the fork's context, and the destination itself stay inside this block, because recovering the
+        // Every carrier, the region context, and the destination itself stay inside this block, because recovering the
         // rebuilt program below requires unique ownership of the destination's builder.
         let destination = ReferenceDischargeRegionDestination::<C>::new();
         let builder = destination.builder().clone();
         let (output_ids, output_allocations, mutated_allocations) = {
-            // The fork inherits its caller's targets because a target names the same source program location wherever
-            // the replay reaches it: an unselected allocation inside a rebuilt region survives there exactly as it would
-            // have in the caller's own body.
-            let fork = ReferenceDischargeContext::<ReferenceDischargeRegionDestination<C>, P>::new_with_targets(
-                destination.clone(),
-                context.targets().clone(),
-            );
+            // The region context inherits the caller's targets because a target names the same source program location
+            // wherever the replay reaches it: an unselected allocation inside a rebuilt region survives there exactly
+            // as it would have in the caller's own body.
+            let region_context =
+                ReferenceDischargeContext::<ReferenceDischargeRegionDestination<C>, P>::new_with_targets(
+                    destination.clone(),
+                    context.targets().clone(),
+                );
 
             let mut declared_allocations = BTreeSet::new();
             declared_allocations.extend(boundary.declared_input_allocations().iter().copied().flatten());
@@ -1299,19 +1300,22 @@ where
             for allocation in boundary.added_input_allocations() {
                 if declared_allocations.contains(allocation) || !added_allocations.insert(*allocation) {
                     return Err(ProgramError::MalformedProgram(format!(
-                        "reference discharge adds {allocation} to region `{}` more than once",
+                        "reference discharge adds {} to region `{}` more than once",
+                        allocation,
                         region.id(),
                     )));
                 }
             }
 
-            // Caller and fork allocations live in different environments, so explicit directional maps are the only
-            // correspondence between them. Repeated declared positions may intentionally alias one caller allocation, while
-            // synthesized state positions were already proven unique (and disjoint from the declared allocations) above. The
-            // caller-to-fork map is ordered because the mutation-reconciliation loop below iterates it fallibly, and
-            // diagnostics must not depend on hash order.
-            let mut caller_to_fork = BTreeMap::<ReferenceDischargeAllocationId, ReferenceDischargeAllocationId>::new();
-            let mut fork_to_caller = HashMap::<ReferenceDischargeAllocationId, ReferenceDischargeAllocationId>::new();
+            // Caller and rebuilt-region allocations live in different environments, so explicit directional maps are
+            // the only correspondence between them. Repeated declared positions may intentionally alias one caller
+            // allocation, while synthesized state positions were already proven unique (and disjoint from the declared
+            // allocations) above. The caller-to-region map is ordered because the mutation-reconciliation loop below
+            // iterates it fallibly, and diagnostics must not depend on hash order.
+            let mut caller_to_region_allocations =
+                BTreeMap::<ReferenceDischargeAllocationId, ReferenceDischargeAllocationId>::new();
+            let mut region_to_caller_allocations =
+                HashMap::<ReferenceDischargeAllocationId, ReferenceDischargeAllocationId>::new();
             let mut thread = |allocation: ReferenceDischargeAllocationId| -> Result<
                 ReferenceDischargeValue<ReferenceDischargeRegionDestination<C>, P>,
                 ProgramError,
@@ -1319,27 +1323,29 @@ where
                 let r#type = context.allocation_entry(allocation)?.r#type().into_owned();
                 let discharged = context.is_allocation_discharged(allocation)?;
                 let input_type = if discharged {
-                    <ReferenceDischargeRegionDestination<C> as crate::contexts::Domain>::Type::from(
-                        r#type.referent().clone(),
-                    )
+                    <ReferenceDischargeRegionDestination<C> as Domain>::Type::from(r#type.referent().clone())
                 } else {
-                    <ReferenceDischargeRegionDestination<C> as crate::contexts::Domain>::Type::from(r#type.clone())
+                    <ReferenceDischargeRegionDestination<C> as Domain>::Type::from(r#type.clone())
                 };
                 let input = destination.input(input_type);
-                if let Some(forked) = caller_to_fork.get(&allocation).copied() {
-                    return fork.allocation_reference(forked);
+                if let Some(region_allocation) = caller_to_region_allocations.get(&allocation).copied() {
+                    return region_context.allocation_reference(region_allocation);
                 }
-                let carrier =
-                    if discharged { fork.bind_discharged(r#type, input)? } else { fork.bind_preserved(r#type, input)? };
-                let forked = carrier.try_as_reference("a threaded region allocation")?.allocation_id();
-                caller_to_fork.insert(allocation, forked);
-                fork_to_caller.insert(forked, allocation);
+                let carrier = if discharged {
+                    region_context.bind_discharged(r#type, input)?
+                } else {
+                    region_context.bind_preserved(r#type, input)?
+                };
+                let region_allocation = carrier.try_as_reference("a threaded region allocation")?.allocation_id();
+                caller_to_region_allocations.insert(allocation, region_allocation);
+                region_to_caller_allocations.insert(region_allocation, allocation);
                 Ok(carrier)
             };
 
-            // Only the declared positions are replayed. An added input occupies a destination boundary position and a
-            // caller operand position, but the source region's body never named it and so cannot consume it. A preserved
-            // allocation occupies an added position only when an inherited capture is returned without a declared operand.
+            // Only the declared positions are replayed. An added input occupies a destination boundary position
+            // and a caller operand position, but the source region's body never named it and so cannot consume it.
+            // A preserved allocation occupies an added position only when an inherited capture is returned without
+            // a declared operand.
             let mut declared = Vec::with_capacity(source_input_count);
             for position in 0..=source_input_count {
                 if position == boundary.input_insertion() {
@@ -1352,79 +1358,89 @@ where
                 };
                 let source_type = &source_input_types[position];
                 declared.push(match allocation {
-                None => {
-                    if <&ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>>::try_from(source_type).is_ok() {
-                        return Err(ProgramError::MalformedProgram(format!(
-                            "reference discharge declares reference input {position} of region `{}` without an allocation",
-                            region.id(),
-                        )));
+                    None => {
+                        if <&ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>>::try_from(source_type).is_ok()
+                        {
+                            return Err(ProgramError::MalformedProgram(format!(
+                                "reference discharge declares reference input {} of region `{}` without an allocation",
+                                position,
+                                region.id(),
+                            )));
+                        }
+                        ReferenceDischargeValue::Value(destination.input(source_type.clone()))
                     }
-                    ReferenceDischargeValue::Value(destination.input(source_type.clone()))
-                }
-                Some(allocation) => {
-                    let Ok(source_reference_type) =
-                        <&ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>>::try_from(source_type)
-                    else {
-                        return Err(ProgramError::MalformedProgram(format!(
-                            "reference discharge assigns {allocation} to value input {position} of region `{}`",
-                            region.id(),
-                        )));
-                    };
-                    let allocation_type = context.allocation_entry(*allocation)?.r#type().into_owned();
-                    if &allocation_type != source_reference_type {
-                        return Err(ProgramError::MalformedProgram(format!(
-                            "reference discharge assigns {allocation} of type `{allocation_type}` to input {position} of region \
-                             `{}` with reference type `{source_reference_type}`",
-                            region.id(),
-                        )));
+                    Some(allocation) => {
+                        let Ok(source_reference_type) =
+                            <&ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>>::try_from(source_type)
+                        else {
+                            return Err(ProgramError::MalformedProgram(format!(
+                                "reference discharge assigns {} to value input {} of region `{}`",
+                                allocation,
+                                position,
+                                region.id(),
+                            )));
+                        };
+                        let allocation_type = context.allocation_entry(*allocation)?.r#type().into_owned();
+                        if &allocation_type != source_reference_type {
+                            return Err(ProgramError::MalformedProgram(format!(
+                                "reference discharge assigns {} of type `{}` to input {} of region `{}` \
+                                 with reference type `{}`",
+                                allocation,
+                                allocation_type,
+                                position,
+                                region.id(),
+                                source_reference_type,
+                            )));
+                        }
+                        thread(*allocation)?
                     }
-                    thread(*allocation)?
-                }
-            });
+                });
             }
 
-            // The rebuilt region discharges under a scope naming only fork allocations, so the isolation the fork mints
-            // holds for capture-scoped references too: a region declaring its own capture prefix reads that prefix off its
-            // threaded declared inputs, and every other region inherits the caller's scope mapped onto the fork allocations
-            // standing for its caller allocations. A caller allocation the boundary did not thread binds nothing.
-            // Discharged capture accesses and outputs enter as state, while a preserved capture-scoped output enters as its
-            // destination reference, so both states mint fork allocations before the inherited scope is established.
+            // The rebuilt region discharges under a scope naming only its own allocations, so its isolated environment
+            // also covers capture-scoped references. A region declaring its own capture prefix reads that prefix from
+            // its threaded declared inputs, while every other region inherits the caller's scope mapped onto the region
+            // allocations corresponding to its caller allocations. A caller allocation the boundary did not thread
+            // binds nothing. Discharged capture accesses and outputs enter as state, while a preserved capture-scoped
+            // output enters as its destination reference, so both representations bind region allocations before the
+            // inherited scope is established.
             let inherited = context.captures().with_allocations(
                 context
                     .captures()
                     .allocations()
                     .iter()
-                    .map(|allocation| allocation.and_then(|caller| caller_to_fork.get(&caller).copied()))
+                    .map(|allocation| allocation.and_then(|caller| caller_to_region_allocations.get(&caller).copied()))
                     .collect(),
             );
-            let fork_declared_allocations = declared
+            let declared_region_allocations = declared
                 .iter()
                 .map(|input| match input {
                     ReferenceDischargeValue::Value(_) => None,
                     ReferenceDischargeValue::Reference(reference) => Some(reference.allocation_id()),
                 })
                 .collect::<Vec<_>>();
-            let fork = fork.with_captures(inherited.nested_scope(
+            let region_context = region_context.with_captures(inherited.nested_scope(
                 boundary.capture_input_count(),
-                fork_declared_allocations.as_slice(),
+                declared_region_allocations.as_slice(),
                 region.id(),
             )?);
 
-            let outputs = fork.inline_region(region, declared)?;
+            let outputs = region_context.inline_region(region, declared)?;
             check_count!("output", outputs, source_output_count, ProgramError);
-
             let mut output_ids = Vec::with_capacity(source_output_count + boundary.added_output_allocations().len());
             let mut output_allocations = Vec::with_capacity(source_output_count);
             for position in 0..=source_output_count {
                 if position == boundary.output_insertion() {
                     for allocation in boundary.added_output_allocations() {
-                        let forked = caller_to_fork.get(allocation).copied().ok_or_else(|| {
-                            ProgramError::MalformedProgram(format!(
-                                "reference discharge publishes {allocation} from region `{}` without threading it in",
-                                region.id(),
-                            ))
-                        })?;
-                        output_ids.push(fork.allocation_value(forked)?.atom_id()?);
+                        let region_allocation =
+                            caller_to_region_allocations.get(allocation).copied().ok_or_else(|| {
+                                ProgramError::MalformedProgram(format!(
+                                    "reference discharge publishes {} from region `{}` without threading it in",
+                                    allocation,
+                                    region.id(),
+                                ))
+                            })?;
+                        output_ids.push(region_context.allocation_value(region_allocation)?.atom_id()?);
                     }
                 }
                 let Some(output) = outputs.get(position) else {
@@ -1436,14 +1452,16 @@ where
                         output_ids.push(value.atom_id()?);
                     }
                     ReferenceDischargeValue::Reference(reference) => {
-                        // A reference-typed region output publishes its allocation at that exact position — a discharged reference's
-                        // current state, a preserved reference's own reference — and the owning rule maps it back onto the
-                        // caller allocation through `output_allocations`. An allocation the caller did not thread has nowhere to be
-                        // published, which is how a region-local allocation is stopped from escaping through the boundary.
-                        let caller = fork_to_caller.get(&reference.allocation_id()).copied().ok_or_else(|| {
+                        // A reference-typed region output publishes its allocation at that exact position (i.e., a
+                        // discharged reference's current state and a preserved reference's own reference), and the
+                        // owning rule maps it back onto the caller allocation through `output_allocations`. An
+                        // allocation the caller did not thread has nowhere to be published, which is how a region-local
+                        // allocation is stopped from escaping through the boundary.
+                        let caller =
+                            region_to_caller_allocations.get(&reference.allocation_id()).copied().ok_or_else(|| {
                             ProgramError::MalformedProgram(format!(
                                 "reference discharge cannot publish {} from region `{}`, whose caller did not thread \
-                             that allocation",
+                                 that allocation",
                                 reference.allocation_id(),
                                 region.id(),
                             ))
@@ -1451,29 +1469,33 @@ where
 
                         // The boundary publishes the complete stored value, so a view cannot cross it. Whoever needs
                         // the view must create it inside the region, just as for a view passed into a region.
-                        let whole = fork.allocation_entry(reference.allocation_id())?.r#type().into_owned();
+                        let whole = region_context.allocation_entry(reference.allocation_id())?.r#type().into_owned();
                         if reference.is_view() {
                             return Err(ProgramError::MalformedProgram(format!(
-                                "reference discharge cannot publish the view `{}` of {caller} from region `{}`, \
-                             whose boundary carries the complete stored value `{whole}`",
+                                "reference discharge cannot publish the view `{}` of {} from region `{}`, \
+                                 whose boundary carries the complete stored value `{}`",
                                 reference.r#type(),
+                                caller,
                                 region.id(),
+                                whole,
                             )));
                         }
                         output_allocations.push(Some(caller));
                         output_ids.push(match reference.preserved() {
                             Some(value) => value.atom_id()?,
-                            None => fork.discharged_state(reference.allocation_id())?.atom_id()?,
+                            None => region_context.discharged_state(reference.allocation_id())?.atom_id()?,
                         });
                     }
                 }
             }
 
-            // Only threaded *state* can have been mutated. A preserved reference's writes replayed into the rebuilt region as
-            // the operations the source performed, so there is no successor state for the caller to merge.
+            // Only threaded *state* can have been mutated. A preserved reference's writes replayed into the rebuilt
+            // region as the operations the source performed, so there is no successor state for the caller to merge.
             let mut mutated_allocations = BTreeSet::new();
-            for (caller, forked) in &caller_to_fork {
-                if fork.is_allocation_discharged(*forked)? && fork.is_mutated(*forked)? {
+            for (caller, region_allocation) in &caller_to_region_allocations {
+                if region_context.is_allocation_discharged(*region_allocation)?
+                    && region_context.is_mutated(*region_allocation)?
+                {
                     mutated_allocations.insert(*caller);
                 }
             }
@@ -3928,7 +3950,7 @@ mod tests {
         );
 
         // A replay that fails leaves the caller's environment exactly as it was and yields no values at all, because
-        // the fork's result type carries none. The checked append rejects a read of a consumed family at
+        // the rebuilt region's result type carries none. The checked append rejects a read of a consumed family at
         // construction, so the failing program is assembled through the unchecked rebuild hatch.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let reference = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
@@ -3957,8 +3979,8 @@ mod tests {
     #[test]
     fn test_recursive_reference_discharge_driver_rebuild_region_rebinds_capture_scope() {
         // A region whose closure reaches a caller allocation through a capture constant declares no boundary position
-        // for it, so the rule threads it as added state. The fork rebinds the caller's scope onto the fork allocation
-        // standing for that caller allocation, which is what lets the rebuilt body resolve the very same constant
+        // for it, so the rule threads it as added state. The region context rebinds the caller's scope onto the region
+        // allocation corresponding to that caller allocation, which lets the rebuilt body resolve the same constant
         // against its own isolated environment.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let captured = builder.add_constant(ListIrValue::Reference(ReferenceType::new(ListType { length: 2 })));
@@ -4003,7 +4025,7 @@ mod tests {
         assert_eq!(result.output_allocations(), &[None]);
         assert_eq!(result.mutated_allocations, []);
 
-        // The caller environment is untouched: the fork read its own threaded copy of the state.
+        // The caller environment is untouched: the rebuilt region read its own threaded copy of the state.
         assert_eq!(context.discharged_state(allocation), Ok(ListIrValue::List(vec![1, 2])));
         assert_eq!(context.is_mutated(allocation), Ok(false));
     }
@@ -4110,8 +4132,8 @@ mod tests {
     #[test]
     fn test_recursive_reference_discharge_driver_rebuild_region_propagates_consumed_allocation() {
         // This operation deliberately violates the generic contract: its summary claims no reference access, while its
-        // discharge rule consumes the allocation. Fork sealing must report that consumed allocation instead of silently
-        // omitting it from the mutation report.
+        // discharge rule consumes the allocation. Rebuilt-region output validation must report that consumed allocation
+        // instead of silently omitting it from the mutation report.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let reference = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let frozen =
@@ -4530,7 +4552,7 @@ mod tests {
         assert_eq!(scope.resolve(&ListIrValue::Reference(ReferenceType::new(ListType { length: 9 }))), None);
         assert_eq!(scope.resolve(&ListIrValue::List(vec![1, 2])), None);
 
-        // Rebinding keeps the seam, which is how a nested region's scope and a fork's remapped scope are built.
+        // Rebinding keeps the seam, which is how a nested region's scope and a rebuilt region's remapped scope are built.
         let rebound = scope.with_allocations(vec![Some(allocation)]);
         assert_eq!(rebound.allocations(), &[Some(allocation)]);
         assert_eq!(
