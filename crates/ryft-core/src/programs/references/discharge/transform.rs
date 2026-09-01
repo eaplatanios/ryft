@@ -26,24 +26,8 @@ use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
 use crate::tracing::TracingContext;
 
-// TODO(eaplatanios): Review `ReferenceDischargeAllocationState`, `ReferenceDischargeCaptureScope`,
+// TODO(eaplatanios): Review `ReferenceDischargeCaptureScope`,
 //  `ReferenceDischargeReference`, and `ReferenceDischargeBinding`.
-
-/// Process-local identity of a [`ReferenceDischargeEnvironment`], shared by every clone of the
-/// [`ReferenceDischargeContext`] that owns it and distinct for every environment a structured rule's region fork
-/// mints. No caller names this identity directly. It makes [`ReferenceDischargeAllocationId`] addressable only in
-/// the environment that minted it.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-struct ReferenceDischargeEnvironmentId(usize);
-
-impl ReferenceDischargeEnvironmentId {
-    /// Returns a fresh [`ReferenceDischargeEnvironmentId`], distinct from every [`ReferenceDischargeEnvironmentId`]
-    /// handed out so far in this process.
-    fn fresh() -> Self {
-        static NEXT_ENVIRONMENT_ID: AtomicUsize = AtomicUsize::new(0);
-        Self(NEXT_ENVIRONMENT_ID.fetch_add(1, Ordering::Relaxed))
-    }
-}
 
 /// [`ReferenceDischargeContext`]-free carrier flowing through the reference discharge transform.
 /// [`ReferenceDischargeableOperation`] implementations receive and return such carrier; the context that owns the
@@ -941,6 +925,22 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> Debug for ReferenceDischargeCont
     }
 }
 
+/// Process-local identity of a [`ReferenceDischargeEnvironment`], shared by every clone of the
+/// [`ReferenceDischargeContext`] that owns it and distinct for every environment a structured rule's region fork
+/// mints. No caller names this identity directly. It makes [`ReferenceDischargeAllocationId`] addressable only in
+/// the environment that minted it.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+struct ReferenceDischargeEnvironmentId(usize);
+
+impl ReferenceDischargeEnvironmentId {
+    /// Returns a fresh [`ReferenceDischargeEnvironmentId`], distinct from every [`ReferenceDischargeEnvironmentId`]
+    /// handed out so far in this process.
+    fn fresh() -> Self {
+        static NEXT_ENVIRONMENT_ID: AtomicUsize = AtomicUsize::new(0);
+        Self(NEXT_ENVIRONMENT_ID.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
 /// Live allocation environment of a reference discharge transform, shared by every clone of its
 /// [`ReferenceDischargeContext`].
 struct ReferenceDischargeEnvironment<T: Type, V> {
@@ -1008,22 +1008,23 @@ impl<T: Type, V> Typed for ReferenceDischargeAllocationEntry<T, V> {
     }
 }
 
-/// Environment entry describing what one live reference allocation became during reference discharge.
+/// [`ReferenceDischargeEnvironment`] entry describing what a reference allocation became during reference discharge.
 #[derive(Debug)]
 enum ReferenceDischargeAllocationState<V> {
-    /// Allocation selected for discharge, which threads through the destination program as immutable state.
+    /// Allocation selected for discharge, which threads through the destination [`Program`] as an immutable state.
     Discharged {
         /// Current immutable state of the complete stored value.
         current: V,
 
-        /// Whether any ordered write or accumulation has been applied to this allocation. Read-only allocations are pruned from
-        /// hidden outputs and from structured-operation widening, so this is the fact that pruning consults.
+        /// Whether any ordered write or accumulation operation has been applied to this reference allocation. Read-only
+        /// allocations are pruned from hidden outputs and from structured operation widening, and this is the fact that
+        /// pruning consults.
         mutated: bool,
     },
 
-    /// Allocation not selected for discharge, which survives in the destination program as a reference value. This is the
-    /// allocation's own destination reference value and is what boundary threading uses; a handle derived from it through
-    /// a view carries its own exact destination value instead.
+    /// Allocation not selected for discharge, which survives in the destination [`Program`] as a reference value. This
+    /// is the allocation's own destination reference value and is what boundary threading uses; a handle derived from
+    /// it through a view carries its own exact destination value instead.
     Preserved {
         /// Destination reference-typed value denoting the allocation.
         reference: V,
@@ -1104,6 +1105,7 @@ impl<Constant> Clone for ReferenceDischargeCaptureScope<Constant> {
 }
 
 impl<Constant> Debug for ReferenceDischargeCaptureScope<Constant> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ReferenceDischargeCaptureScope")
