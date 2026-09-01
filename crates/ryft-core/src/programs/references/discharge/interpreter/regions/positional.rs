@@ -4,13 +4,12 @@ use crate::contexts::Context;
 use crate::macros::check_count;
 use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
-use crate::programs::references::discharge::transform::ReferenceDischargePolicy;
 use crate::programs::references::discharge::transform::{
-    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargeRegionBoundary, ReferenceDischargeValue,
+    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary,
+    ReferenceDischargeValue, ReferenceRegionStateInsertion,
 };
 
 use super::ReferenceRegionSummary;
-use super::boundaries::ReferenceRegionStateInsertion;
 
 // TODO(eaplatanios): Review this module.
 

@@ -15,31 +15,6 @@ use crate::tracing::TracingContext;
 /// this universe's operations discharge into it finite.
 pub type ReferenceDischargeRegionDestination<C> = TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>;
 
-/// One group of reference-related positions a rebuilt region gains: the allocations crossing there and the source
-/// boundary position at which they are inserted.
-///
-/// A discharged allocation crosses as immutable state, while a preserved allocation crosses as its destination
-/// reference.
-///
-/// Grouping the allocations with their insertion position keeps a boundary request's input and output groups from being
-/// transposable: the two groups have the same shape, and passing them positionally compiled silently when swapped.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ReferenceRegionStateInsertion {
-    /// Allocations crossing at this group's positions, in canonical allocation order.
-    pub(in crate::programs::references::discharge) allocations: Vec<ReferenceDischargeAllocationId>,
-
-    /// Position in the source region's boundary at which the group is inserted.
-    pub(in crate::programs::references::discharge) position: usize,
-}
-
-impl ReferenceRegionStateInsertion {
-    /// Creates a boundary-position group inserting `allocations` at `position`.
-    #[inline]
-    pub fn new(allocations: Vec<ReferenceDischargeAllocationId>, position: usize) -> Self {
-        Self { allocations, position }
-    }
-}
-
 /// Symmetric widening facts one structured rule derives from a region summary through
 /// [`state_widening`](crate::programs::references::ReferenceDischargeContext::state_widening).
 ///
