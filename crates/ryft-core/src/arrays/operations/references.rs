@@ -281,14 +281,14 @@ impl<C: Domain<Type = ArrayIrType, Value: ReferenceSlice<C::Value>>> Interpretab
 
 /// Discharges one allocation-preserving array reference view by composing `transform` onto the incoming handle's alias.
 ///
-/// A view derives a narrower handle onto the same allocation, so on a discharged allocation the rewrite is metadata only: it
-/// validates and derives the composed referent type with exactly the eager handle's arithmetic, rejecting an invalid
-/// composition before any handle exists, and then records the composed chain as the derived handle's authoritative
-/// alias. Nothing is bound into the destination, because the coordinates this handle selects are materialized at each
-/// access rather than at the view.
+/// A view creates a narrower alias of the same allocation, so on a discharged allocation the rewrite is metadata only:
+/// it validates the composed referent type with exactly the eager handle's arithmetic, rejecting an invalid composition
+/// before any handle exists, and then records the composed chain as the new handle's authoritative alias. Nothing is
+/// bound into the destination, because the portion this handle selects is materialized at each access rather than at
+/// the view.
 ///
 /// On an allocation that partial discharge *preserved*, the view is additionally replayed into the destination, and the
-/// reference it produces becomes the derived handle's own destination value, so that later accesses consume that
+/// reference it produces becomes the alias handle's own destination value, so that later accesses consume that
 /// exact value instead of re-deriving the chain and duplicating the view operations. The composed alias is recorded
 /// either way, which is what keeps one handle's view chain single-sourced whichever state its allocation is in.
 ///
@@ -322,7 +322,7 @@ where
     let reference = inputs[0].expect_reference("a reference to view")?;
     let referent = transform.output_type(reference.r#type().referent())?;
     let alias = reference.alias().with_transform_unchecked(transform);
-    Ok(vec![context.derive_reference(reference, alias, ReferenceType::new(referent), |value| {
+    Ok(vec![context.alias_reference(reference, alias, ReferenceType::new(referent), |value| {
         let mut outputs = context.parent().bind(operation.clone(), Vec::new(), std::slice::from_ref(value))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))

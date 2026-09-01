@@ -443,12 +443,35 @@ where
                             let input_types =
                                 instruction_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
                             operation.infer_output_types(input_types.as_slice(), &[])?;
+
+                            // Validate every consumption before replay. In particular, an alias cannot consume an
+                            // allocation even when its view has the same reference type as the complete stored value;
+                            // rejecting it after binding would leave a destination operation behind on an error path.
+                            for reference in &consumed {
+                                let allocation = reference.allocation_id();
+                                let complete_reference_type = context.allocation_entry(allocation)?.r#type.clone();
+
+                                // Consumption yields and invalidates the complete stored value. An alias handle cannot
+                                // name that transition, even when its view happens to have the same reference type as
+                                // the allocation, because type equality does not make it the allocation's whole value.
+                                if !reference.denotes_complete_value() {
+                                    return Err(ProgramError::MalformedProgram(format!(
+                                        "reference discharge cannot consume {allocation} through the derived view \
+                                         `{}`; consumption yields the complete stored value, whose reference type is \
+                                         `{complete_reference_type}`",
+                                        reference.r#type(),
+                                    )));
+                                }
+                            }
+
                             let outputs = discharge_preserved_access(operation, context, instruction_inputs)?;
 
-                            // A consuming access invalidates its preserved handles only after replay succeeds. This
-                            // keeps a failed destination bind from changing the discharge environment.
+                            // Invalidate only after replay succeeds. A failed destination bind leaves every allocation
+                            // live; a successful bind removes each consumed entry so all later aliases report a
+                            // use-after-consume.
                             for reference in consumed {
-                                context.mark_preserved_consumed(reference)?;
+                                let allocation = reference.allocation_id();
+                                context.take_allocation_entry(allocation)?;
                             }
                             return Ok(outputs);
                         }
@@ -542,6 +565,47 @@ mod tests {
 
     use super::*;
     use crate::programs::references::discharge::transform::ReferenceDischargeCaptureScope;
+
+    #[test]
+    fn test_discharge_region_instructions_consumes_a_preserved_allocation() {
+        let reference_type = ReferenceType::new(ListType { length: 2 });
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let input = builder.add_input(ListIrType::Reference(reference_type.clone()));
+        let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let destination = TracingContext::<ListIrValue, ListOperation>::new();
+        let context = ReferenceDischargeContext::<_, ListReferenceDischarge>::new(destination.clone());
+        let destination_reference = destination.input(ListIrType::Reference(reference_type.clone()));
+        let preserved = context.bind_preserved(reference_type.clone(), destination_reference).unwrap();
+        let reference = preserved.expect_reference("the preserved reference").unwrap();
+        let allocation = reference.allocation_id();
+
+        // A same-type view is still an alias rather than the allocation's complete stored value. Replaying the
+        // consuming operation therefore leaves the allocation live and reports the invalid consumption at this seam.
+        let same_type_view = context
+            .alias_reference(reference, ListAlias { offset: 0, length: 2 }, reference_type, |value| Ok(value.clone()))
+            .unwrap();
+        assert_eq!(
+            discharge_region_instructions(&context, program.entry_region_ref(), vec![same_type_view]),
+            Err(ProgramError::MalformedProgram(format!(
+                "reference discharge cannot consume {allocation} through the derived view `ref<list<2>>`; consumption \
+                 yields the complete stored value, whose reference type is `ref<list<2>>`",
+            ))),
+        );
+        assert_eq!(context.live_allocation_ids(), vec![allocation]);
+
+        // The original handle does denote the complete value. Once its destination operation has been staged, the
+        // allocation entry disappears so every later access is diagnosed as a use-after-consume.
+        assert!(discharge_region_instructions(&context, program.entry_region_ref(), vec![preserved]).is_ok());
+        assert!(context.live_allocation_ids().is_empty());
+        assert_eq!(
+            context.allocation_entry(allocation).err(),
+            Some(ProgramError::MalformedProgram(format!("reference discharge accessed consumed {allocation}",))),
+        );
+    }
 
     #[test]
     fn test_reference_discharge_rejects_reference_typed_constants() {

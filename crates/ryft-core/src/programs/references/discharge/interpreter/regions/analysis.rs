@@ -647,7 +647,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         C::Type: From<P::Referent>,
     {
         if threaded.contains(&allocation) {
-            self.update_discharged_state(allocation, output, summary.is_mutated(allocation))?;
+            self.set_discharged_state(allocation, output, summary.is_mutated(allocation))?;
         }
         Ok(())
     }

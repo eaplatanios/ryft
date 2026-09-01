@@ -151,7 +151,7 @@ where
     let mut results = Vec::with_capacity(source_output_count);
     for (position, output) in outputs.into_iter().enumerate() {
         if position >= source_output_count {
-            context.update_discharged_state(leaving[position - source_output_count], output, true)?;
+            context.set_discharged_state(leaving[position - source_output_count], output, true)?;
             continue;
         }
         match output_allocations[position] {

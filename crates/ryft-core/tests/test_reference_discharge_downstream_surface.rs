@@ -521,7 +521,7 @@ fn test_downstream_reference_discharge_context_environment_accessors() {
     assert_eq!(context.discharged_state(allocation), Ok(RegisterValue(1)));
     assert_eq!(context.is_mutated(allocation), Ok(false));
     assert_eq!(context.allocation_reference(allocation), Ok(bound));
-    assert_eq!(context.update_discharged_state(allocation, RegisterValue(2), true), Ok(()));
+    assert_eq!(context.set_discharged_state(allocation, RegisterValue(2), true), Ok(()));
     assert_eq!(context.discharged_state(allocation), Ok(RegisterValue(2)));
     assert_eq!(context.is_mutated(allocation), Ok(true));
 }
