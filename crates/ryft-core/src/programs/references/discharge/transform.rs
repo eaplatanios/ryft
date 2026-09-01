@@ -1162,33 +1162,25 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeDriver<C, P> f
     }
 }
 
-// TODO(eaplatanios): Review this.
-/// [`ReferenceDischargeDriver`] scoped to one [`Operation`] application. It borrows the application's complete region
-/// driver, which preserves the operation-defined ordering of owned regions, borrowed regions, and shared callees
-/// without materializing a combined region collection.
+/// [`ReferenceDischargeDriver`] scoped to one [`Operation`] application. It borrows the application's complete
+/// [`RegionDriver`], which preserves the operation-defined ordering of owned regions, borrowed regions, and shared
+/// callees without materializing a combined region collection.
 pub struct RecursiveReferenceDischargeDriver<'r, D> {
     /// Application-scoped [`RegionDriver`].
     driver: &'r D,
 
-    /// Source program location of the application, or [`None`] for an application that replays no instruction.
+    /// Source [`Program`] location of the [`Operation`] application, or [`None`] for an application
+    /// that replays no [`Instruction`](crate::Instruction).
     source_instruction_id: Option<InstructionId>,
 }
 
-// TODO(eaplatanios): Review this.
 impl<'r, D> RecursiveReferenceDischargeDriver<'r, D> {
     /// Creates a new [`RecursiveReferenceDischargeDriver`].
-    ///
-    /// # Parameters
-    ///
-    ///   - `driver`: Application-scoped [`RegionDriver`] exposing the attached regions.
-    ///   - `source_instruction_id`: Source program location of the application, or [`None`] for an application that
-    ///     replays no instruction.
     pub const fn new(driver: &'r D, source_instruction_id: Option<InstructionId>) -> Self {
         Self { driver, source_instruction_id }
     }
 }
 
-// TODO(eaplatanios): Review this.
 impl<V: Value, O: Operation<Type = V::Type>, D: RegionDriver<V, O>> RegionDriver<V, O>
     for RecursiveReferenceDischargeDriver<'_, D>
 {
@@ -1202,33 +1194,32 @@ impl<V: Value, O: Operation<Type = V::Type>, D: RegionDriver<V, O>> RegionDriver
     }
 }
 
-// TODO(eaplatanios): Review this.
-// Recursive discharge replays the attached region one instruction at a time against the live environment, so an allocation
-// created outside the region stays the same allocation inside it and the region's own allocations remain distinct.
-// Constants lift into the destination through the parent, exactly as they do at the top level.
-//
-// The nested obligation is the one this crate's other structural transforms already carry: rebuilding a region needs
-// this universe's operations to discharge into a fresh trace of the same universe as well as into the live
-// destination. The requested reference type of a threaded allocation crosses that boundary, so the two policy
-// instantiations must agree on their referent type system. Both obligations are stated here rather than on the
-// per-operation rules on purpose. A rule that stated them would make the enum dispatcher's obligation graph circular,
-// because the dispatcher's own predicate for a structured payload would then demand that the whole enum discharge
-// into the destination whose dischargeability is what the graph is trying to establish.
-impl<C, P, D> ReferenceDischargeDriver<C, P> for RecursiveReferenceDischargeDriver<'_, D>
-where
+// Recursive discharge replays the attached region one instruction at a time against the live environment, so an
+// allocation created outside the region stays the same allocation inside it and the region's own allocations remain
+// distinct. Constants lift into the destination through the parent, exactly as they do at the top level. The nested
+// obligation is the one this crate's other structural transforms already carry: rebuilding a region needs this
+// universe's operations to discharge into a fresh trace of the same universe as well as into the live destination.
+// The requested reference type of a threaded allocation crosses that boundary, so the two policy instantiations must
+// agree on their referent type system. Both obligations are stated here rather than on the per-operation rules on
+// purpose. A rule that stated them would make the enum dispatcher's obligation graph circular, because the dispatcher's
+// own predicate for a structured payload would then demand that the whole enum discharge into the destination whose
+// "dischargeability" is what the graph is trying to establish.
+impl<
     C: Context<
-        Operation: ReferenceDischargeableOperation<C, P>
-                       + ReferenceDischargeableOperation<ReferenceDischargeRegionDestination<C>, P>,
-    >,
+            Type: From<<P as ReferenceDischargePolicy<C>>::Referent>
+                      + From<ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>>,
+            Operation: ReferenceDischargeableOperation<C, P>
+                           + ReferenceDischargeableOperation<ReferenceDischargeRegionDestination<C>, P>,
+        >,
     P: ReferenceDischargePolicy<C>
         + ReferenceDischargePolicy<
             ReferenceDischargeRegionDestination<C>,
             Referent = <P as ReferenceDischargePolicy<C>>::Referent,
         >,
-    C::Type: From<<P as ReferenceDischargePolicy<C>>::Referent>
-        + From<ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>>,
-    for<'t> &'t ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>: TryFrom<&'t C::Type>,
     D: RegionDriver<C::Constant, C::Operation>,
+> ReferenceDischargeDriver<C, P> for RecursiveReferenceDischargeDriver<'_, D>
+where
+    for<'t> &'t ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>: TryFrom<&'t C::Type>,
 {
     #[inline]
     fn source_instruction_id(&self) -> Option<InstructionId> {
@@ -1245,63 +1236,59 @@ where
         context.inline_region(self.region(index)?, inputs)
     }
 
-    #[inline]
     fn rebuild_region(
         &self,
         context: &ReferenceDischargeContext<C, P>,
         index: usize,
         boundary: &ReferenceDischargeRegionBoundary,
     ) -> Result<ReferenceDischargeRegionResult<C::Constant, C::Operation>, ProgramError> {
-        let region = self.region(index)?;
-        type Destination<C> = ReferenceDischargeRegionDestination<C>;
-
         // Rebuild the source region in a fresh trace with a fresh allocation environment. The caller and fork can
         // communicate only through the boundary described below: neither side can accidentally retain a handle or
         // value belonging to the other environment.
-
+        let region = self.region(index)?;
         check_count!("input", boundary.declared_input_allocations(), region.input_ids().len(), ProgramError);
         let source_input_types = region.input_types();
         let source_input_count = source_input_types.len();
         let source_output_count = region.output_ids().len();
         if boundary.input_insertion() > source_input_count {
             return Err(ProgramError::MalformedProgram(format!(
-                "reference discharge inserts region state inputs at {} but region `{}` declares {source_input_count} \
-             inputs",
+                "reference discharge inserts region state inputs at {} but region `{}` declares {} inputs",
                 boundary.input_insertion(),
                 region.id(),
+                source_input_count,
             )));
         }
         if boundary.output_insertion() > source_output_count {
             return Err(ProgramError::MalformedProgram(format!(
-                "reference discharge inserts region state outputs at {} but region `{}` declares {source_output_count} \
-             outputs",
+                "reference discharge inserts region state outputs at {} but region `{}` declares {} outputs",
                 boundary.output_insertion(),
                 region.id(),
+                source_output_count,
             )));
         }
 
-        // Added state may not land inside the region's own capture prefix: the rebuilt region keeps the prefix length its
-        // operation declares, so a state input placed before the end of it would silently renumber the captures the
+        // Added state may not land inside the region's own capture prefix. The rebuilt region keeps the prefix length
+        // its operation declares, so a state input placed before the end of it would silently renumber the captures the
         // rebound operation still names.
         let capture_input_count = boundary.capture_input_count().unwrap_or(0);
         if boundary.input_insertion() < capture_input_count {
             return Err(ProgramError::MalformedProgram(format!(
-                "reference discharge inserts region state inputs at {} but region `{}` declares a capture prefix of \
-             {capture_input_count}",
+                "reference discharge inserts region state inputs at {} but region `{}` declares a capture prefix of {}",
                 boundary.input_insertion(),
                 region.id(),
+                capture_input_count,
             )));
         }
 
         // Every carrier, the fork's context, and the destination itself stay inside this block, because recovering the
         // rebuilt program below requires unique ownership of the destination's builder.
-        let destination = Destination::<C>::new();
+        let destination = ReferenceDischargeRegionDestination::<C>::new();
         let builder = destination.builder().clone();
         let (output_ids, output_allocations, mutated_allocations) = {
             // The fork inherits its caller's targets because a target names the same source program location wherever
             // the replay reaches it: an unselected allocation inside a rebuilt region survives there exactly as it would
             // have in the caller's own body.
-            let fork = ReferenceDischargeContext::<Destination<C>, P>::new_with_targets(
+            let fork = ReferenceDischargeContext::<ReferenceDischargeRegionDestination<C>, P>::new_with_targets(
                 destination.clone(),
                 context.targets().clone(),
             );
@@ -1325,27 +1312,25 @@ where
             // diagnostics must not depend on hash order.
             let mut caller_to_fork = BTreeMap::<ReferenceDischargeAllocationId, ReferenceDischargeAllocationId>::new();
             let mut fork_to_caller = HashMap::<ReferenceDischargeAllocationId, ReferenceDischargeAllocationId>::new();
-            let mut thread =
-            |allocation: ReferenceDischargeAllocationId| -> Result<
-                ReferenceDischargeValue<Destination<C>, P>,
+            let mut thread = |allocation: ReferenceDischargeAllocationId| -> Result<
+                ReferenceDischargeValue<ReferenceDischargeRegionDestination<C>, P>,
                 ProgramError,
             > {
                 let r#type = context.allocation_entry(allocation)?.r#type().into_owned();
                 let discharged = context.is_allocation_discharged(allocation)?;
                 let input_type = if discharged {
-                    <Destination<C> as crate::contexts::Domain>::Type::from(r#type.referent().clone())
+                    <ReferenceDischargeRegionDestination<C> as crate::contexts::Domain>::Type::from(
+                        r#type.referent().clone(),
+                    )
                 } else {
-                    <Destination<C> as crate::contexts::Domain>::Type::from(r#type.clone())
+                    <ReferenceDischargeRegionDestination<C> as crate::contexts::Domain>::Type::from(r#type.clone())
                 };
                 let input = destination.input(input_type);
                 if let Some(forked) = caller_to_fork.get(&allocation).copied() {
                     return fork.allocation_reference(forked);
                 }
-                let carrier = if discharged {
-                    fork.bind_discharged(r#type, input)?
-                } else {
-                    fork.bind_preserved(r#type, input)?
-                };
+                let carrier =
+                    if discharged { fork.bind_discharged(r#type, input)? } else { fork.bind_preserved(r#type, input)? };
                 let forked = carrier.try_as_reference("a threaded region allocation")?.allocation_id();
                 caller_to_fork.insert(allocation, forked);
                 fork_to_caller.insert(forked, allocation);
