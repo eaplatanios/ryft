@@ -4,10 +4,10 @@ use crate::contexts::Context;
 use crate::macros::check_count;
 use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
+use crate::programs::references::discharge::policies::ReferenceDischargePolicy;
+use crate::programs::references::discharge::transform::{ReferenceDischargeContext, ReferenceDischargeValue};
 
-use super::super::super::policies::ReferenceDischargePolicy;
 use super::super::rules::ReferenceDischargeDriver;
-use super::super::{ReferenceDischargeContext, ReferenceDischargeValue};
 use super::ReferenceRegionSummary;
 use super::boundaries::{ReferenceRegionDischargeBoundary, ReferenceRegionStateInsertion};
 
@@ -188,8 +188,8 @@ mod tests {
 
     use crate::programs::RecursiveReferenceDischargeDriver;
 
-    use super::super::super::ReferenceCaptureScope;
     use super::*;
+    use crate::programs::references::discharge::transform::ReferenceDischargeCaptureScope;
 
     #[test]
     fn test_reference_discharge_preserves_aliasing_between_repeated_declared_region_allocations() {
@@ -261,8 +261,10 @@ mod tests {
             .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
         let allocation = allocated.expect_reference("the capture-scoped allocation").unwrap().allocation_id();
-        let context = context
-            .with_captures(ReferenceCaptureScope::new(list_capture_position, vec![None, None, Some(allocation)]));
+        let context = context.with_captures(ReferenceDischargeCaptureScope::new(
+            list_capture_position,
+            vec![None, None, Some(allocation)],
+        ));
         let regions = [program];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
 
@@ -292,8 +294,10 @@ mod tests {
         let destination_reference = ListIrValue::Reference(reference_type.clone());
         let preserved = context.bind_preserved(reference_type, destination_reference.clone()).unwrap();
         let allocation = preserved.expect_reference("the preserved capture-scoped allocation").unwrap().allocation_id();
-        let context = context
-            .with_captures(ReferenceCaptureScope::new(list_capture_position, vec![None, None, Some(allocation)]));
+        let context = context.with_captures(ReferenceDischargeCaptureScope::new(
+            list_capture_position,
+            vec![None, None, Some(allocation)],
+        ));
         let regions = [program];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
 

@@ -55,14 +55,14 @@ impl Display for ReferenceDischargeTarget {
 /// allocation. A full discharge instead uses a distinct "everything" state because it must also discharge allocations
 /// that callers cannot name with a target, such as allocations bound directly during replay.
 #[derive(Clone, Debug)]
-pub(crate) struct ReferenceDischargeTargets {
+pub struct ReferenceDischargeTargets {
     /// Selected targets, or [`None`] when every target is selected.
     targets: Option<Rc<BTreeSet<ReferenceDischargeTarget>>>,
 }
 
 impl ReferenceDischargeTargets {
     /// Returns the [`ReferenceDischargeTargets`] that full discharge runs under, which select every reference.
-    pub(crate) const fn everything() -> Self {
+    pub const fn everything() -> Self {
         Self { targets: None }
     }
 
@@ -83,7 +83,7 @@ impl ReferenceDischargeTargets {
     /// out-of-range or non-reference entry position, names an instruction that the program does not contain, names an
     /// operation that defines no reference allocation, or names an output position that is not an allocation. It also
     /// returns an error when `capture_count` exceeds the program's input count.
-    pub(crate) fn from_targets<
+    pub fn from_targets<
         V: Value,
         O: Operation<Type = V::Type>,
         Input: Parameterized<V>,
@@ -145,7 +145,7 @@ impl ReferenceDischargeTargets {
 
     /// Returns `true` if `target` is selected for discharge by this [`ReferenceDischargeTargets`] set.
     #[inline]
-    pub(crate) fn selects(&self, target: ReferenceDischargeTarget) -> bool {
+    pub fn selects(&self, target: ReferenceDischargeTarget) -> bool {
         self.targets.as_ref().is_none_or(|targets| targets.contains(&target))
     }
 }

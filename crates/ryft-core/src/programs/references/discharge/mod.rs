@@ -152,10 +152,9 @@ mod targets;
 mod transform;
 
 pub use interpreter::{
-    RecursiveReferenceDischargeDriver, ReferenceDischargeAllocationId, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargeReference, ReferenceDischargeRegionDestination,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceRegionDischargeBoundary,
-    ReferenceRegionDischargeFork, ReferenceRegionStateInsertion, ReferenceRegionSummary, ReferenceStateWidening,
+    RecursiveReferenceDischargeDriver, ReferenceDischargeDriver, ReferenceDischargeRegionDestination,
+    ReferenceDischargeableOperation, ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork,
+    ReferenceRegionStateInsertion, ReferenceRegionSummary, ReferenceStateWidening,
     discharge_positional_region_operation, discharge_preserved_access, discharge_reference_free_operation,
 };
 pub use policies::{ReferenceAccumulationPolicy, ReferenceDischargePolicy, ReferenceDischargeableType};
@@ -163,6 +162,9 @@ pub use results::{
     ExternalReferenceBinding, PartialReferenceDischargeResult, ReferenceDischargeResult, ReferenceSource,
 };
 pub use targets::ReferenceDischargeTarget;
+pub use transform::{
+    ReferenceDischargeAllocationId, ReferenceDischargeContext, ReferenceDischargeReference, ReferenceDischargeValue,
+};
 
 #[cfg(test)]
 pub(crate) mod tests {

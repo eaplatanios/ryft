@@ -7,17 +7,17 @@ use crate::parameters::Placeholder;
 use crate::programs::ProgramError;
 use crate::programs::instructions::InstructionId;
 use crate::programs::operations::Operation;
+use crate::programs::references::discharge::policies::ReferenceDischargePolicy;
+use crate::programs::references::discharge::transform::{
+    ReferenceDischargeAllocationId, ReferenceDischargeContext, ReferenceDischargeValue,
+};
+use crate::programs::references::types::ReferenceType;
 use crate::programs::regions::{RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver};
 use crate::programs::types::Typed;
 use crate::programs::values::Value;
 
-use crate::programs::references::types::ReferenceType;
-
-use super::super::super::policies::ReferenceDischargePolicy;
+use super::super::ReferenceDischargeableOperation;
 use super::super::rules::{ReferenceDischargeDriver, discharge_preserved_access};
-use super::super::{
-    ReferenceDischargeAllocationId, ReferenceDischargeContext, ReferenceDischargeValue, ReferenceDischargeableOperation,
-};
 use super::analysis::nested_capture_scope;
 use super::boundaries::{
     ReferenceDischargeRegionDestination, ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork,
@@ -162,7 +162,7 @@ where
             // it would have in the caller's own body.
             let fork = ReferenceDischargeContext::<Destination<C>, P>::new_with_targets(
                 destination.clone(),
-                context.targets.clone(),
+                context.targets().clone(),
             );
 
             let mut declared_allocations = BTreeSet::new();
@@ -464,7 +464,7 @@ where
 
 /// Lifts one stored program constant into a discharge carrier.
 ///
-/// A reference-typed constant resolves through the active [`ReferenceCaptureScope`], which is how a capture-lifted
+/// A reference-typed constant resolves through the active [`ReferenceDischargeCaptureScope`], which is how a capture-lifted
 /// program's nested regions name their caller's references: the constant denotes the allocation that capture position
 /// already binds, so it yields that allocation's complete-value handle rather than a second allocation of its own.
 ///
@@ -540,8 +540,8 @@ mod tests {
     };
     use crate::tracing::TracingContext;
 
-    use super::super::super::ReferenceCaptureScope;
     use super::*;
+    use crate::programs::references::discharge::transform::ReferenceDischargeCaptureScope;
 
     #[test]
     fn test_reference_discharge_rejects_reference_typed_constants() {
@@ -575,8 +575,10 @@ mod tests {
         let context = ListDischargeContext::new(ListDestination::new());
         let allocated = context.allocate_discharged(pair.clone(), ListIrValue::List(vec![1, 2])).unwrap();
         let allocation = allocated.expect_reference("the captured allocation").unwrap().allocation_id();
-        let scoped = context
-            .with_captures(ReferenceCaptureScope::new(list_capture_position, vec![None, None, Some(allocation)]));
+        let scoped = context.with_captures(ReferenceDischargeCaptureScope::new(
+            list_capture_position,
+            vec![None, None, Some(allocation)],
+        ));
 
         let lifted = lift_constant(&scoped, ListIrValue::Reference(pair.clone())).unwrap();
         let reference = lifted.expect_reference("the resolved capture").unwrap();
@@ -630,8 +632,10 @@ mod tests {
             .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
         let allocation = allocated.expect_reference("the captured allocation").unwrap().allocation_id();
-        let context = context
-            .with_captures(ReferenceCaptureScope::new(list_capture_position, vec![None, None, Some(allocation)]));
+        let context = context.with_captures(ReferenceDischargeCaptureScope::new(
+            list_capture_position,
+            vec![None, None, Some(allocation)],
+        ));
 
         // The summary reports the capture-scoped access in caller-allocation terms, which is what sizes the boundary.
         let summary = context.region_summary(&ListOperation::Call, 0, program.entry_region_ref(), &[]).unwrap();

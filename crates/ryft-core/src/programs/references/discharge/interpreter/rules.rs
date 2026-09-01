@@ -2,14 +2,13 @@ use crate::contexts::{Context, Domain};
 use crate::programs::ProgramError;
 use crate::programs::instructions::InstructionId;
 use crate::programs::operations::Operation;
+use crate::programs::references::discharge::policies::ReferenceDischargePolicy;
+use crate::programs::references::discharge::transform::{ReferenceDischargeContext, ReferenceDischargeValue};
+use crate::programs::references::types::ReferenceType;
 use crate::programs::regions::{EmptyRegionDriver, RegionDriver, RegionRef};
 use crate::programs::types::Typed;
 
-use super::super::policies::ReferenceDischargePolicy;
 use super::regions::{ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork};
-use crate::programs::references::types::ReferenceType;
-
-use super::{ReferenceDischargeContext, ReferenceDischargeValue};
 
 // TODO(eaplatanios): Review this module.
 
@@ -152,51 +151,6 @@ where
             Ok(ReferenceDischargeValue::Ordinary(output))
         })
         .collect()
-}
-
-/// Validates that one destination value denotes a reference of exactly `r#type`.
-///
-/// # Parameters
-///
-///   - `value`: Destination value offered as a preserved reference's reference.
-///   - `r#type`: Reference type the handle that will carry `value` exposes.
-pub(super) fn validate_preserved_value<C: Domain, P: ReferenceDischargePolicy<C>>(
-    value: &C::Value,
-    r#type: &ReferenceType<P::Referent>,
-) -> Result<(), ProgramError>
-where
-    for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t C::Type>,
-{
-    let value_type = value.r#type();
-    match <&ReferenceType<P::Referent>>::try_from(value_type.as_ref()) {
-        Ok(actual) if actual == r#type => Ok(()),
-        Ok(actual) => Err(ProgramError::MalformedProgram(format!(
-            "reference discharge preserved an allocation as `{actual}` but its handle exposes `{type}`",
-        ))),
-        Err(_) => Err(ProgramError::MalformedProgram(format!(
-            "reference discharge preserved an allocation as `{}`, which is not a reference type",
-            value.r#type(),
-        ))),
-    }
-}
-
-/// Validates that one immutable discharged state carries the lifted referent type of `r#type`.
-pub(super) fn validate_discharged_value_type<C: Domain, P: ReferenceDischargePolicy<C>>(
-    value: &C::Value,
-    r#type: &ReferenceType<P::Referent>,
-) -> Result<(), ProgramError>
-where
-    C::Type: From<P::Referent>,
-{
-    let expected = C::Type::from(r#type.referent().clone());
-    if value.r#type().as_ref() != &expected {
-        return Err(ProgramError::MalformedProgram(format!(
-            "reference discharge state has type `{}` but allocation `{}` requires `{expected}`",
-            value.r#type(),
-            r#type,
-        )));
-    }
-    Ok(())
 }
 
 /// Provides one [`Operation`] application with its replay position and with recursive discharge of the

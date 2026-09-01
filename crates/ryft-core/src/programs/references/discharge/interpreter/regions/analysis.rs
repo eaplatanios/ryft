@@ -6,16 +6,16 @@ use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId};
 use crate::programs::instructions::Instruction;
 use crate::programs::operations::Operation;
+use crate::programs::references::discharge::policies::ReferenceDischargePolicy;
+use crate::programs::references::discharge::transform::{
+    ReferenceDischargeAllocationId, ReferenceDischargeBinding, ReferenceDischargeCaptureScope,
+    ReferenceDischargeContext, ReferenceDischargeValue,
+};
 use crate::programs::references::semantics::{ReferenceAccessMode, ReferenceOutput};
 use crate::programs::regions::{RegionId, RegionRef};
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
 
-use super::super::super::policies::ReferenceDischargePolicy;
-use super::super::{
-    ReferenceCaptureScope, ReferenceDischargeAllocationId, ReferenceDischargeBinding, ReferenceDischargeContext,
-    ReferenceDischargeValue,
-};
 use super::boundaries::ReferenceStateWidening;
 
 // TODO(eaplatanios): Review this module.
@@ -215,9 +215,9 @@ impl ReferenceRegionSummary {
 pub(super) fn nested_capture_scope<Constant>(
     capture_input_count: Option<usize>,
     inputs: &[Option<ReferenceDischargeAllocationId>],
-    inherited: &ReferenceCaptureScope<Constant>,
+    inherited: &ReferenceDischargeCaptureScope<Constant>,
     region: RegionId,
-) -> Result<ReferenceCaptureScope<Constant>, ProgramError> {
+) -> Result<ReferenceDischargeCaptureScope<Constant>, ProgramError> {
     let Some(count) = capture_input_count else {
         return Ok(inherited.clone());
     };
@@ -260,7 +260,7 @@ pub(super) fn nested_capture_scope<Constant>(
 fn summarize_region_closure<V: Value, O: Operation<Type = V::Type>>(
     region: RegionRef<'_, V, O>,
     inputs: &[Option<ReferenceDischargeAllocationId>],
-    captures: &ReferenceCaptureScope<V>,
+    captures: &ReferenceDischargeCaptureScope<V>,
     summary: &mut ReferenceRegionSummary,
 ) -> Result<Vec<Option<ReferenceDischargeAllocationId>>, ProgramError> {
     check_count!("input", inputs, region.input_ids().len(), ProgramError);
@@ -664,7 +664,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
             ReferenceDischargeValue::Reference(reference) => reference,
             ReferenceDischargeValue::Ordinary(value) => return Ok(value.clone()),
         };
-        match &reference.binding {
+        match reference.binding() {
             ReferenceDischargeBinding::Discharged => self.discharged_state(reference.allocation_id()),
             ReferenceDischargeBinding::Preserved { reference: value } => {
                 self.validate_live_allocation(reference.allocation_id())?;
@@ -706,8 +706,8 @@ mod tests {
         ReferenceRegionStateInsertion, ReferenceRegionSummary,
     };
 
-    use super::super::super::ReferenceCaptureScope;
     use super::*;
+    use crate::programs::references::discharge::transform::ReferenceDischargeCaptureScope;
 
     #[test]
     fn test_reference_region_summary_unions_exact_access_modes() {
@@ -961,8 +961,10 @@ mod tests {
             .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
         let allocation = allocated.expect_reference("the captured allocation").unwrap().allocation_id();
-        let context = context
-            .with_captures(ReferenceCaptureScope::new(list_capture_position, vec![None, None, Some(allocation)]));
+        let context = context.with_captures(ReferenceDischargeCaptureScope::new(
+            list_capture_position,
+            vec![None, None, Some(allocation)],
+        ));
 
         // The enclosing policy accepts writes only. Capture reachability still sizes the boundary, while the exact
         // access summary remains empty because neither closure semantically accesses the allocation.
@@ -1018,7 +1020,7 @@ mod tests {
             .unwrap();
         let preserved_allocation =
             preserved.expect_reference("the preserved captured allocation").unwrap().allocation_id();
-        let preserved_context = preserved_context.with_captures(ReferenceCaptureScope::new(
+        let preserved_context = preserved_context.with_captures(ReferenceDischargeCaptureScope::new(
             list_capture_position,
             vec![None, None, Some(preserved_allocation)],
         ));

@@ -4,10 +4,9 @@ use crate::contexts::Domain;
 use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
+use crate::programs::references::discharge::transform::ReferenceDischargeAllocationId;
 use crate::programs::values::Value;
 use crate::tracing::TracingContext;
-
-use super::super::ReferenceDischargeAllocationId;
 
 // TODO(eaplatanios): Review this module.
 
