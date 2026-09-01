@@ -26,9 +26,6 @@ use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
 use crate::tracing::TracingContext;
 
-// TODO(eaplatanios): Review `ReferenceDischargeCaptureScope`,
-//  `ReferenceDischargeReference`, and `ReferenceDischargeBinding`.
-
 /// [`ReferenceDischargeContext`]-free carrier flowing through the reference discharge transform.
 /// [`ReferenceDischargeableOperation`] implementations receive and return such carrier; the context that owns the
 /// allocation environment travels separately as an explicit argument rather than being stamped onto every value.
@@ -131,6 +128,7 @@ impl<C: Domain<Type: From<ReferenceType<P::Referent>>>, P: ReferenceDischargePol
     }
 }
 
+// TODO(eaplatanios): Review this and its impl blocks.
 /// Handle to one live reference allocation flowing through reference discharge.
 ///
 /// The fields are private and only [`ReferenceDischargeContext`] constructs them, so a rule can read a handle but
@@ -149,7 +147,7 @@ pub struct ReferenceDischargeReference<C: Domain, P: ReferenceDischargePolicy<C>
     /// Reference type this exact handle exposes, which differs from the allocation's type under a composed view.
     r#type: ReferenceType<P::Referent>,
 
-    /// Destination fate of this handle's allocation, fixed at construction.
+    /// How this handle's allocation is represented in the destination program.
     binding: ReferenceDischargeBinding<C::Value>,
 }
 
@@ -264,21 +262,20 @@ impl Display for ReferenceDischargeAllocationId {
     }
 }
 
-/// Destination fate a [`ReferenceDischargeReference`] handle carries for its allocation.
-///
-/// The binding is fixed when the handle is constructed and always agrees with the allocation's environment state, because
-/// allocations never move between the discharged and preserved fates after they are bound: carrying the fate on the handle
-/// makes a handle/environment disagreement unrepresentable rather than defensively re-checked at every access.
+/// Representation of a [`ReferenceDischargeReference`] in the destination program. An allocation is represented either
+/// as explicit immutable state or as a preserved reference, and that choice does not change after the allocation is
+/// bound. The context records the same choice in the handle and its environment entry, so the two cannot disagree and
+/// accesses do not need to check them against one another.
+// TODO(eaplatanios): Make private once the `discharge` module review and cleanup is completed.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) enum ReferenceDischargeBinding<V> {
-    /// The allocation became explicit immutable state, so accesses through this handle rewrite into state reads and
-    /// writes against the environment.
+    /// The allocation is represented as explicit immutable state, so accesses through this handle rewrite into read
+    /// and write operations against the environment.
     Discharged,
 
-    /// The allocation survives in the destination program, and this exact handle denotes `reference` there.
-    ///
-    /// A preserved handle must consume this value rather than re-deriving its view chain per access, because
-    /// re-deriving would duplicate and reorder the replayed view operations in the destination program.
+    /// The allocation remains a reference in the destination program.  preserved handle must consume this value rather
+    /// than re-deriving its view chain per access, because re-deriving would duplicate and reorder the replayed view
+    /// operations in the destination program.
     Preserved {
         /// Exact destination reference value this handle denotes.
         reference: V,
@@ -286,8 +283,8 @@ pub(super) enum ReferenceDischargeBinding<V> {
 }
 
 // TODO(eaplatanios): Order declarations as `ReferenceDischargeableType` -> `ReferenceDischargePolicy` ->
-//  `ReferenceAccumulationPolicy` -> `ReferenceDischargeDriver` -> `ReferenceDischargeableOperation` ->
-//  `ReferenceDischargeContext`.
+//  `ReferenceAccumulationPolicy` -> `ReferenceDischargeDriver` -> Recursive Driver ->
+//  `ReferenceDischargeableOperation` -> `ReferenceDischargeContext`.
 
 /// Active state of a reference discharge transform. Reference discharge interprets a source [`Program`] into a
 /// destination [`Program`], one [`Region`](crate::Region) at a time through a [`ReferenceDischargeDriver`]. Each
@@ -296,7 +293,8 @@ pub(super) enum ReferenceDischargeBinding<V> {
 ///
 /// Each source reference allocation is bound into this context exactly once. [`bind_discharged`](Self::bind_discharged)
 /// records an allocation as explicit immutable state, while [`bind_preserved`](Self::bind_preserved) records the
-/// exact destination reference value when partial discharge leaves the allocation intact. That fate never changes.
+/// exact destination reference value when partial discharge leaves the allocation intact. The allocation remains in
+/// that representation for the rest of the transform.
 /// A [`ReferenceDischargeableOperation`] implementation uses [`alias_reference`](Self::alias_reference) to construct
 /// another view of the same allocation, then either rewrites accesses through [`read`](Self::read),
 /// [`write`](Self::write), [`swap`](Self::swap), and [`accumulate`](Self::accumulate), or replays
@@ -675,8 +673,9 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         ))
     }
 
-    /// Inserts one validated allocation entry and returns its unviewed reference value. [`Self::bind_discharged`] and
-    /// [`Self::bind_preserved`] validate their fate-specific values before calling this shared environment primitive.
+    /// Inserts one validated allocation entry and returns its unviewed reference value. [`Self::bind_discharged`]
+    /// validates the initial immutable state, while [`Self::bind_preserved`] validates the destination reference value,
+    /// before calling this shared environment primitive.
     fn bind_allocation(
         &self,
         r#type: ReferenceType<P::Referent>,
@@ -1031,35 +1030,31 @@ enum ReferenceDischargeAllocationState<V> {
     },
 }
 
-/// Reference allocations the capture prefix of one discharge scope binds.
+/// Reference allocations the capture prefix of a reference discharge scope binds. A capture-lifted [`Program`] names
+/// its caller's references through constants rather than through its own boundary: the entry boundary carries the
+/// lifted capture prefix, and an attached [`Region`](crate::Region) inside that program names the very same references
+/// through capture constants. Resolving one is therefore a property of the scope a region discharges under, not of any
+/// rule, and so the scope rides on [`ReferenceDischargeContext`] beside the allocation environment and is recomputed at
+/// every region boundary (inherited by default, and replaced by a fresh prefix wherever an operation declares one
+/// through [`Operation::region_capture_input_count`]).
 ///
-/// A capture-lifted program names its caller's references through constants rather than through its own boundary: the
-/// entry boundary carries the lifted capture prefix, and an attached region inside that program names the very same
-/// references through capture constants. Resolving one is therefore a property of the scope a region discharges
-/// under, not of any rule, so the scope rides on [`ReferenceDischargeContext`] beside the allocation environment and is
-/// recomputed at every region boundary — inherited by default, and replaced by a fresh prefix wherever an operation
-/// declares one through [`Operation::region_capture_input_count`].
-///
-/// Recognizing a capture is a *constant-family* question, and the interpreter deliberately serves families that are
+/// Recognizing a capture is a _constant-family_ question, and the interpreter deliberately serves families that are
 /// not capture-bearing at all, so the resolver is a function pointer supplied by the entry point that knows the family
 /// rather than a [`CaptureConstant`] bound on the whole architecture. The [`Default`] scope recognizes nothing and
 /// binds nothing, which is exactly the behavior of a program that has no captures.
 pub struct ReferenceDischargeCaptureScope<Constant> {
-    /// Capture position a constant names, or [`None`] when it is a non-reference constant of its family.
+    /// Function that returns the capture index/position that a constant names, or [`None`] when it is a non-reference
+    /// constant of its family.
     capture_index_of: fn(&Constant) -> Option<usize>,
 
-    /// Allocation each capture position binds, or [`None`] when that position carries a value rather than a
-    /// reference. A capture position past the end of this list binds nothing.
+    /// List that contains the [`ReferenceDischargeAllocationId`] of the allocation that each capture position binds,
+    /// or [`None`] when that position carries a value rather than a reference. A capture position past the end of this
+    /// list binds nothing.
     allocations: Rc<[Option<ReferenceDischargeAllocationId>]>,
 }
 
 impl<Constant> ReferenceDischargeCaptureScope<Constant> {
-    /// Creates a capture scope.
-    ///
-    /// # Parameters
-    ///
-    ///   - `capture_index_of`: Function reporting the capture position a constant of this family names.
-    ///   - `allocations`: Allocation each capture position binds, in capture order.
+    /// Creates a new [`ReferenceDischargeCaptureScope`].
     #[inline]
     pub fn new(
         capture_index_of: fn(&Constant) -> Option<usize>,
@@ -1068,25 +1063,27 @@ impl<Constant> ReferenceDischargeCaptureScope<Constant> {
         Self { capture_index_of, allocations: allocations.into() }
     }
 
-    /// Returns the allocation each capture position binds, in capture order.
+    /// Returns a clone of this [`ReferenceDischargeCaptureScope`] with the same capture index resolver but over a
+    /// different set of bound allocations. This is how a nested [`Region`](crate::Region)'s scope and a region fork's
+    /// remapped [`ReferenceDischargeCaptureScope`] are built without restating the constant family's recognition rule.
     #[inline]
-    pub(super) fn allocations(&self) -> &[Option<ReferenceDischargeAllocationId>] {
+    pub fn with_allocations(&self, allocations: Vec<Option<ReferenceDischargeAllocationId>>) -> Self {
+        Self { capture_index_of: self.capture_index_of, allocations: allocations.into() }
+    }
+
+    /// Returns the [`ReferenceDischargeAllocationId`] of the allocation each capture position binds, in capture order.
+    #[inline]
+    pub fn allocations(&self) -> &[Option<ReferenceDischargeAllocationId>] {
         self.allocations.as_ref()
     }
 
-    /// Returns the allocation one constant denotes, or [`None`] when the constant names no capture position or that
-    /// position binds no allocation. A constant this scope cannot resolve is a non-reference constant of its family,
-    /// and a reference-typed one that no scope resolves is rejected where it is lifted.
+    /// Returns the [`ReferenceDischargeAllocationId`] of the allocation the provided constant names, or [`None`] when
+    /// the constant names no capture position or that position binds no allocation. A constant this scope cannot
+    /// resolve is a non-reference constant of its family, and a reference-typed one that no scope resolves is rejected
+    /// where it is lifted.
     #[inline]
-    pub(super) fn resolve(&self, constant: &Constant) -> Option<ReferenceDischargeAllocationId> {
+    pub fn resolve(&self, constant: &Constant) -> Option<ReferenceDischargeAllocationId> {
         (self.capture_index_of)(constant).and_then(|index| self.allocations.get(index).copied().flatten())
-    }
-
-    /// Returns this scope's resolver over a different set of bound allocations, which is how a nested region's scope and a
-    /// region fork's remapped scope are built without restating the constant family's recognition rule.
-    #[inline]
-    pub(super) fn with_allocations(&self, allocations: Vec<Option<ReferenceDischargeAllocationId>>) -> Self {
-        Self { capture_index_of: self.capture_index_of, allocations: allocations.into() }
     }
 }
 
@@ -1718,8 +1715,8 @@ mod tests {
             ))),
         );
 
-        // Deriving on a preserved reference hands the closure the parent handle's exact destination value, so the derived
-        // handle cannot disagree with its allocation's fate by construction.
+        // Deriving on a preserved reference hands the closure the parent handle's exact destination value, so the
+        // derived handle cannot disagree with the allocation's preserved representation by construction.
         let view_type = ReferenceType::new(ListType { length: 1 });
         let view_alias = ListAlias { offset: 0, length: 1 };
         let view = context
