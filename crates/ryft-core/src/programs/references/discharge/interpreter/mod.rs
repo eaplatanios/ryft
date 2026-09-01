@@ -2,8 +2,7 @@ mod regions;
 mod rules;
 
 pub use regions::{
-    ReferenceDischargeRegionBoundary, ReferenceDischargeRegionDestination, ReferenceDischargeRegionResult,
-    ReferenceRegionStateInsertion, ReferenceRegionSummary, ReferenceStateWidening,
+    ReferenceDischargeRegionDestination, ReferenceRegionStateInsertion, ReferenceRegionSummary, ReferenceStateWidening,
     discharge_positional_region_operation,
 };
 pub use rules::{ReferenceDischargeableOperation, discharge_preserved_access, discharge_reference_free_operation};

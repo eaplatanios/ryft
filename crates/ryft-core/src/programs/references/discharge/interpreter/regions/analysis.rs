@@ -952,7 +952,7 @@ mod tests {
         );
         let result = driver.rebuild_region(&context, 0, &boundary).unwrap();
         assert_eq!(
-            result.program.to_string(),
+            result.program().to_string(),
             indoc! {"
                 lambda %0:list<2>, %1:list<2> .
                 let %2:list<2> = list.call %1 %0 [
@@ -963,7 +963,7 @@ mod tests {
                 ]
                 in (%2)"},
         );
-        assert_eq!(result.mutated_allocations, []);
+        assert!(result.mutated_allocations().is_empty());
 
         // The same reached capture remains an entering boundary allocation when partial discharge preserves it. It
         // leaves the state-threaded and published sets empty because it crosses as its destination reference instead.
