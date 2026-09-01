@@ -365,7 +365,7 @@ mod tests {
         assert_eq!(sum, vec![ReferenceDischargeValue::Ordinary(ListIrValue::List(vec![11, 22]))]);
 
         let reference_type = ReferenceType::new(ListType { length: 2 });
-        let allocated = context.allocate_discharged(reference_type, ListIrValue::List(vec![1, 2])).unwrap();
+        let allocated = context.bind_discharged(reference_type, ListIrValue::List(vec![1, 2])).unwrap();
         let allocation = allocated.expect_reference("the allocated allocation").unwrap().allocation_id();
         assert_eq!(
             discharge_reference_free_operation(&ListOperation::Add, &context, &EmptyRegionDriver, &[allocated, rhs]),
@@ -516,7 +516,7 @@ mod tests {
         );
 
         // Every allocation the program created is gone once its `freeze` consumed it, so nothing leaks into the context.
-        assert_eq!(context.live_allocations(), Vec::new());
+        assert_eq!(context.live_allocation_ids(), Vec::new());
 
         // Replaying through the driver supplies every instruction's own source coordinate, which is what makes the
         // allocation selectable by a partial-discharge target.
@@ -578,8 +578,7 @@ mod tests {
 
         // A discharged reference has no destination reference value at all, so it cannot be replayed over.
         let context = ListDischargeContext::new(ListDestination::new());
-        let discharged =
-            context.allocate_discharged(ReferenceType::new(referent), ListIrValue::List(vec![1, 2])).unwrap();
+        let discharged = context.bind_discharged(ReferenceType::new(referent), ListIrValue::List(vec![1, 2])).unwrap();
         let discharged_allocation = discharged.expect_reference("the discharged reference").unwrap().allocation_id();
         assert_eq!(
             discharge_preserved_access(&ListOperation::Read, &context, std::slice::from_ref(&discharged)),

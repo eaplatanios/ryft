@@ -151,7 +151,7 @@ where
     let mut results = Vec::with_capacity(source_output_count);
     for (position, output) in outputs.into_iter().enumerate() {
         if position >= source_output_count {
-            context.replace_discharged_state(leaving[position - source_output_count], output, true)?;
+            context.update_discharged_state(leaving[position - source_output_count], output, true)?;
             continue;
         }
         match output_allocations[position] {
@@ -258,7 +258,7 @@ mod tests {
 
         let context = ListDischargeContext::new(ListDestination::new());
         let allocated = context
-            .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
+            .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
         let allocation = allocated.expect_reference("the capture-scoped allocation").unwrap().allocation_id();
         let context = context.with_captures(ReferenceDischargeCaptureScope::new(

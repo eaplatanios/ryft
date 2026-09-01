@@ -910,7 +910,7 @@ pub(crate) mod tests {
                         })?
                         .clone();
                     if context.selects_internal(driver.instruction(), 0) {
-                        return Ok(vec![context.allocate_discharged(r#type, initial)?]);
+                        return Ok(vec![context.bind_discharged(r#type, initial)?]);
                     }
                     let mut outputs = context.parent().bind(*self, Vec::new(), std::slice::from_ref(&initial))?;
                     check_count!("output", outputs, 1, ProgramError);
@@ -929,7 +929,7 @@ pub(crate) mod tests {
                     }
                     let composed = ListAlias { offset: alias.offset + offset, length: *length };
                     let r#type = ReferenceType::new(ListType { length: *length });
-                    Ok(vec![context.derive(reference, composed, r#type, |value| {
+                    Ok(vec![context.derive_reference(reference, composed, r#type, |value| {
                         let mut outputs = context.parent().bind(*self, Vec::new(), std::slice::from_ref(value))?;
                         check_count!("output", outputs, 1, ProgramError);
                         Ok(outputs.remove(0))

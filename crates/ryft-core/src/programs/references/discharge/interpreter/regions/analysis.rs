@@ -594,7 +594,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     ) -> Result<BTreeSet<ReferenceDischargeAllocationId>, ProgramError> {
         let mut threaded = BTreeSet::new();
         for allocation in summary.reached() {
-            if self.allocation_is_discharged(allocation).map_err(|error| {
+            if self.is_allocation_discharged(allocation).map_err(|error| {
                 ProgramError::MalformedProgram(format!("operation `{operation}` reaches {allocation}: {error}"))
             })? {
                 threaded.insert(allocation);
@@ -647,7 +647,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         C::Type: From<P::Referent>,
     {
         if threaded.contains(&allocation) {
-            self.replace_discharged_state(allocation, output, summary.is_mutated(allocation))?;
+            self.update_discharged_state(allocation, output, summary.is_mutated(allocation))?;
         }
         Ok(())
     }
@@ -715,7 +715,7 @@ mod tests {
     fn test_reference_region_summary_unions_exact_access_modes() {
         let context = ListDischargeContext::new(ListDestination::new());
         let allocated = context
-            .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
+            .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
         let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation_id();
         let mut left = ReferenceRegionSummary::default();
@@ -745,7 +745,7 @@ mod tests {
     fn test_reference_region_summary_validates_each_exact_access_mode() {
         let context = ListDischargeContext::new(ListDestination::new());
         let allocated = context
-            .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
+            .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
         let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation_id();
         let modes = [
@@ -886,7 +886,7 @@ mod tests {
 
         let context = ListDischargeContext::new(ListDestination::new());
         let allocated = context
-            .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
+            .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
         let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation_id();
         let summary = context
@@ -923,7 +923,7 @@ mod tests {
         // rejects that outright rather than letting the caller keep threading state that is no longer live.
         let context = ListDischargeContext::new(ListDestination::new());
         let allocated = context
-            .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
+            .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
         let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation_id();
         assert_eq!(
@@ -960,7 +960,7 @@ mod tests {
 
         let context = ListDischargeContext::new(ListDestination::new());
         let allocated = context
-            .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
+            .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
         let allocation = allocated.expect_reference("the captured allocation").unwrap().allocation_id();
         let context = context.with_captures(ReferenceDischargeCaptureScope::new(

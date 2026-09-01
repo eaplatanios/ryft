@@ -29,17 +29,25 @@ use crate::tracing::TracingContext;
 // TODO(eaplatanios): Order declarations as `ReferenceDischargeableType` -> `ReferenceDischargePolicy` ->
 //  `ReferenceAccumulationPolicy` -> `ReferenceDischargeDriver` -> `ReferenceDischargeContext`.
 
-/// Active state of a reference discharge transform pass, owning the [`ReferenceDischargeEnvironment`] that
-/// its flowing values refer to. Reference discharge is a single [`Program`]-to-[`Program`] interpretation driven
-/// [`Region`](crate::Region)-by-[`Region`](crate::Region) through a [`ReferenceDischargeDriver`]. Each replayed
-/// [`Instruction`](crate::Instruction) dispatches to its [`ReferenceDischargeableOperation`] implementation with this
-/// context as an explicit argument, and rules bind the rewritten, reference-free work through [`parent`](Self::parent).
+/// Active state of one reference discharge transform.
 ///
-/// Its state lives here rather than in the flowing values because a reference is an identity, and not a payload (i.e.,
-/// several handles can denote the same allocation through different views, and every one of them must observe the same
-/// current state). Clones therefore share one environment. A structured rule that must rebuild an attached region
-/// instead runs it against an isolated environment through [`ReferenceDischargeDriver::discharge_region_program`],
-/// which commits nothing here.
+/// Reference discharge interprets a source [`Program`] into a destination [`Program`], one [`Region`](crate::Region)
+/// at a time through a [`ReferenceDischargeDriver`]. Each replayed [`Instruction`](crate::Instruction) dispatches to
+/// its [`ReferenceDischargeableOperation`] implementation with this context, and the rule emits destination work
+/// through [`parent`](Self::parent).
+///
+/// Each source reference allocation is bound into this context exactly once. [`bind_discharged`](Self::bind_discharged)
+/// records an allocation as explicit immutable state, while [`bind_preserved`](Self::bind_preserved) records the exact
+/// destination reference value when partial discharge leaves the allocation intact. That fate never changes. A rule
+/// uses [`derive_reference`](Self::derive_reference) to construct another view of the same allocation, then either
+/// rewrites accesses through [`read`](Self::read), [`write`](Self::write), [`swap`](Self::swap), and
+/// [`accumulate`](Self::accumulate), or replays them against the preserved destination reference.
+///
+/// The allocation environment lives on the context rather than on flowing values because references carry identity:
+/// several reference values can denote different views of the same allocation, and every one must observe the same
+/// current state and liveness. Clones therefore share one environment. A structured rule that must rebuild an attached
+/// region instead uses [`ReferenceDischargeDriver::discharge_region_program`], which creates an isolated environment
+/// and commits nothing here until the rule explicitly merges its outputs.
 pub struct ReferenceDischargeContext<C: Domain, P: ReferenceDischargePolicy<C>> {
     /// Destination context that owns the discharged values and executes or stages the rewritten work.
     parent: C,
@@ -145,21 +153,124 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     pub fn selects_external(&self, source: ReferenceSource) -> bool {
         self.targets.selects(ReferenceDischargeTarget::External(source))
     }
-
+    
     // TODO(eaplatanios): Review from here onwards.
 
-    /// Binds a fresh allocation that threads as immutable state and returns the unviewed handle denoting it.
+    /// Returns the complete current immutable state of one live discharged allocation.
+    ///
+    /// Operation rules normally use [`read`](Self::read) to observe the coordinates selected by a reference value.
+    /// Structured-operation implementations use this function when they must thread the allocation's complete state
+    /// across a destination boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when `allocation` is unknown, belongs to another environment, has
+    /// already been consumed, or was preserved rather than discharged.
+    pub fn discharged_state(&self, allocation: ReferenceDischargeAllocationId) -> Result<C::Value, ProgramError> {
+        match &self.allocation_entry(allocation)?.state {
+            ReferenceDischargeAllocationState::Discharged { current, .. } => Ok(current.clone()),
+            ReferenceDischargeAllocationState::Preserved { .. } => Err(ProgramError::MalformedProgram(format!(
+                "reference discharge requested the discharged state of preserved {allocation}",
+            ))),
+        }
+    }
+
+    /// Returns whether one live discharged allocation has been mutated during this transform.
+    ///
+    /// A direct write, swap, or accumulation marks the allocation as mutated. Structured-operation implementations
+    /// use this fact to publish only final states that the source program could have changed; read-only state need not
+    /// become a hidden output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when `allocation` is unknown, belongs to another environment, has
+    /// already been consumed, or was preserved rather than discharged.
+    pub fn is_mutated(&self, allocation: ReferenceDischargeAllocationId) -> Result<bool, ProgramError> {
+        match &self.allocation_entry(allocation)?.state {
+            ReferenceDischargeAllocationState::Discharged { mutated, .. } => Ok(*mutated),
+            ReferenceDischargeAllocationState::Preserved { .. } => Err(ProgramError::MalformedProgram(format!(
+                "reference discharge queried mutation of preserved {allocation}",
+            ))),
+        }
+    }
+
+    /// Returns the IDs of every allocation still live in this context, in binding order.
+    ///
+    /// Consumption retains the allocation's environment slot but removes its entry, so consumed allocations are
+    /// omitted while the relative order of all remaining allocations stays stable.
+    pub fn live_allocation_ids(&self) -> Vec<ReferenceDischargeAllocationId> {
+        let environment = self.environment.borrow();
+        environment
+            .allocations
+            .iter()
+            .enumerate()
+            .filter(|(_, state)| state.is_some())
+            .map(|(index, _)| ReferenceDischargeAllocationId { environment: environment.id, index })
+            .collect()
+    }
+
+    /// Returns whether one live allocation is discharged rather than preserved.
+    ///
+    /// This function is useful when structured-operation code has only an allocation ID and must choose whether to
+    /// thread immutable state or a destination reference value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when `allocation` is unknown, belongs to another environment, or
+    /// has already been consumed.
+    pub fn is_allocation_discharged(&self, allocation: ReferenceDischargeAllocationId) -> Result<bool, ProgramError> {
+        Ok(matches!(&self.allocation_entry(allocation)?.state, ReferenceDischargeAllocationState::Discharged { .. },))
+    }
+
+    /// Returns an unviewed reference value denoting one live allocation already bound in this context.
+    ///
+    /// This function does not bind another allocation. Region threading and capture resolution use it to reconstruct
+    /// the complete-value reference associated with an allocation ID. A preserved allocation carries the exact
+    /// destination reference originally supplied to [`bind_preserved`](Self::bind_preserved).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when `allocation` is unknown, belongs to another environment, or
+    /// has already been consumed.
+    pub fn allocation_handle(
+        &self,
+        allocation: ReferenceDischargeAllocationId,
+    ) -> Result<ReferenceDischargeValue<C, P>, ProgramError> {
+        let (r#type, binding) = {
+            let entry = self.allocation_entry(allocation)?;
+            let binding = match &entry.state {
+                ReferenceDischargeAllocationState::Discharged { .. } => ReferenceDischargeBinding::Discharged,
+                ReferenceDischargeAllocationState::Preserved { reference } => {
+                    ReferenceDischargeBinding::Preserved { reference: reference.clone() }
+                }
+            };
+            (entry.r#type.clone(), binding)
+        };
+        let alias = P::storage_alias(r#type.referent());
+        Ok(ReferenceDischargeValue::Reference(ReferenceDischargeReference {
+            allocation_id: allocation,
+            denotes_complete_value: true,
+            alias,
+            r#type,
+            binding,
+        }))
+    }
+
+    /// Binds an allocation selected for discharge and returns its unviewed reference value.
+    ///
+    /// The allocation is fresh to this context even when it represents a reference that already existed at the source
+    /// program's entry boundary. Its `initial` value becomes the complete immutable state observed by
+    /// [`discharged_state`](Self::discharged_state) and transformed by the reference-operation functions below.
     ///
     /// # Parameters
     ///
-    ///   - `r#type`: Reference type of the fresh allocation, normally recovered from the allocating operation's
-    ///     inferred output type through the destination type universe's borrowed [`TryFrom`] conversion.
+    ///   - `r#type`: Reference type of the allocation.
     ///   - `initial`: Destination value that becomes the allocation's initial immutable state.
     ///
     /// # Errors
     ///
     /// Returns [`ProgramError::MalformedProgram`] when `initial` does not carry the lifted referent type of `r#type`.
-    pub fn allocate_discharged(
+    pub fn bind_discharged(
         &self,
         r#type: ReferenceType<P::Referent>,
         initial: C::Value,
@@ -174,14 +285,18 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
                 "reference discharge state has type `{actual}` but allocation `{type}` requires `{expected}`",
             )));
         }
-        Ok(self.bind_allocation_value(
+        Ok(self.bind_allocation(
             r#type,
             ReferenceDischargeAllocationState::Discharged { current: initial, mutated: false },
             ReferenceDischargeBinding::Discharged,
         ))
     }
 
-    /// Binds an allocation that survives in the destination program and returns the unviewed handle denoting it.
+    /// Binds an allocation preserved by partial discharge and returns its unviewed reference value.
+    ///
+    /// The environment retains `reference` so structured boundaries can thread the allocation, while each derived
+    /// reference retains the exact destination value produced when its view operation is replayed. A preserved
+    /// allocation never becomes discharged later in this transform.
     ///
     /// # Parameters
     ///
@@ -210,35 +325,34 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
                 "reference discharge preserved an allocation as `{actual}` but its handle exposes `{type}`",
             )));
         }
-        Ok(self.bind_allocation_value(
+        Ok(self.bind_allocation(
             r#type,
             ReferenceDischargeAllocationState::Preserved { reference: reference.clone() },
             ReferenceDischargeBinding::Preserved { reference },
         ))
     }
 
-    /// Returns a handle that composes `alias` onto `reference`, denoting the same allocation through a derived view.
+    /// Derives another reference value for the same allocation with the provided composed view and exposed type.
     ///
-    /// The composed alias is the authoritative view chain for the derived handle, so callers pass the complete chain
-    /// rather than a single step. When the allocation is preserved, `derive_preserved` receives the parent handle's exact
-    /// destination reference value and must return the destination value of the derived handle — normally by
-    /// replaying the view operation — so that later accesses consume that exact value instead of re-deriving the
-    /// chain. When the allocation is discharged, `derive_preserved` is never called, so a handle whose binding disagrees
-    /// with its allocation's fate cannot be constructed.
+    /// `alias` is the authoritative complete view chain, not merely the newest view step. For a discharged allocation,
+    /// later accesses apply that chain to the allocation's immutable state and `derive_preserved` is not called. For a
+    /// preserved allocation, `derive_preserved` receives the parent reference's exact destination value and normally
+    /// replays the source view operation; the returned value is retained on the derived reference so later accesses
+    /// use it directly instead of replaying the view again.
     ///
     /// # Parameters
     ///
-    ///   - `reference`: Handle the view is composed onto.
-    ///   - `alias`: Complete composed view chain of the derived handle.
-    ///   - `r#type`: Reference type the derived handle exposes.
-    ///   - `derive_preserved`: Produces the derived handle's destination reference value from the parent handle's,
+    ///   - `reference`: Reference value the view is composed onto.
+    ///   - `alias`: Complete composed view chain of the derived reference.
+    ///   - `r#type`: Reference type the derived reference exposes.
+    ///   - `derive_preserved`: Produces the derived reference's destination value from the parent reference's value,
     ///     invoked only when the allocation is preserved.
     ///
     /// # Errors
     ///
     /// Returns [`ProgramError::MalformedProgram`] when the allocation is no longer live or when the derived destination
     /// value does not carry the reference type `r#type`, and propagates every `derive_preserved` failure.
-    pub fn derive(
+    pub fn derive_reference(
         &self,
         reference: &ReferenceDischargeReference<C, P>,
         alias: P::Alias,
@@ -282,50 +396,10 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         }))
     }
 
-    /// Returns the current immutable state of one discharged reference.
+    /// Reads the coordinates that `reference` selects from its discharged allocation's current state.
     ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::MalformedProgram`] when the allocation is not live or was preserved rather than discharged.
-    pub fn discharged_state(&self, allocation: ReferenceDischargeAllocationId) -> Result<C::Value, ProgramError> {
-        match &self.allocation_entry(allocation)?.state {
-            ReferenceDischargeAllocationState::Discharged { current, .. } => Ok(current.clone()),
-            ReferenceDischargeAllocationState::Preserved { .. } => Err(ProgramError::MalformedProgram(format!(
-                "reference discharge requested the discharged state of preserved {allocation}",
-            ))),
-        }
-    }
-
-    /// Returns whether any ordered write or accumulation has been applied to one discharged reference.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::MalformedProgram`] when the allocation is not live or was preserved rather than discharged.
-    pub(in crate::programs::references) fn is_mutated(
-        &self,
-        allocation: ReferenceDischargeAllocationId,
-    ) -> Result<bool, ProgramError> {
-        match &self.allocation_entry(allocation)?.state {
-            ReferenceDischargeAllocationState::Discharged { mutated, .. } => Ok(*mutated),
-            ReferenceDischargeAllocationState::Preserved { .. } => Err(ProgramError::MalformedProgram(format!(
-                "reference discharge queried mutation of preserved {allocation}",
-            ))),
-        }
-    }
-
-    /// Returns every allocation that is still live in this context's environment, in binding order.
-    pub fn live_allocations(&self) -> Vec<ReferenceDischargeAllocationId> {
-        let environment = self.environment.borrow();
-        environment
-            .allocations
-            .iter()
-            .enumerate()
-            .filter(|(_, state)| state.is_some())
-            .map(|(index, _)| ReferenceDischargeAllocationId { environment: environment.id, index })
-            .collect()
-    }
-
-    /// Reads the coordinates that `reference` selects from its allocation's current state.
+    /// Reference-operation rules call this function only for discharged references. An access to a preserved reference
+    /// must instead replay the source operation against [`ReferenceDischargeReference::preserved`].
     ///
     /// # Errors
     ///
@@ -337,7 +411,10 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         P::read(&self.parent, &current, reference.alias())
     }
 
-    /// Replaces the coordinates that `reference` selects without observing their previous contents.
+    /// Replaces the coordinates that `reference` selects in a discharged allocation.
+    ///
+    /// The policy returns a complete successor state, which this function installs through
+    /// [`update_discharged_state`](Self::update_discharged_state) and records as a mutation.
     ///
     /// # Parameters
     ///
@@ -359,10 +436,13 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         let allocation = reference.allocation_id();
         let current = self.discharged_state(allocation)?;
         let successor = P::write(&self.parent, &current, replacement, reference.alias())?;
-        self.replace_discharged_state(allocation, successor, true)
+        self.update_discharged_state(allocation, successor, true)
     }
 
     /// Replaces the coordinates that `reference` selects and returns their previous contents.
+    ///
+    /// Like [`write`](Self::write), this function installs the policy's complete successor state and records a
+    /// mutation; unlike `write`, it also returns the value selected before replacement.
     ///
     /// # Parameters
     ///
@@ -384,11 +464,13 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         let allocation = reference.allocation_id();
         let current = self.discharged_state(allocation)?;
         let (previous, successor) = P::swap(&self.parent, &current, replacement, reference.alias())?;
-        self.replace_discharged_state(allocation, successor, true)?;
+        self.update_discharged_state(allocation, successor, true)?;
         Ok(previous)
     }
 
-    /// Accumulates `update` into the coordinates that `reference` selects.
+    /// Accumulates `update` into the coordinates that `reference` selects in a discharged allocation.
+    ///
+    /// The policy returns a complete successor state, which this function installs and records as a mutation.
     ///
     /// # Parameters
     ///
@@ -411,15 +493,16 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         let allocation = reference.allocation_id();
         let current = self.discharged_state(allocation)?;
         let successor = P::accumulate(&self.parent, &current, update, reference.alias())?;
-        self.replace_discharged_state(allocation, successor, true)
+        self.update_discharged_state(allocation, successor, true)
     }
 
-    /// Yields the complete stored value of `reference`'s allocation and unbinds the allocation, so that every later
-    /// access to it is reported as a use-after-consume.
+    /// Consumes a discharged allocation and returns its complete current immutable state.
     ///
-    /// Consumption is a complete-value event and always yields the complete stored value, so the handle's alias is
-    /// deliberately not applied. A derived handle therefore cannot name a consumption, even when its referent type
-    /// happens to equal the allocation's. The invariant is enforced at the state transition where it is relied upon.
+    /// Consumption removes the allocation's live environment entry, so every later access reports a use-after-consume.
+    /// It always yields the complete stored value and deliberately ignores aliases; only the unviewed reference value
+    /// returned when the allocation was bound can therefore name the transition. For a preserved allocation, the
+    /// destination operation performs the semantic consumption and
+    /// [`mark_preserved_consumed`](Self::mark_preserved_consumed) records the matching liveness transition.
     ///
     /// # Errors
     ///
@@ -448,23 +531,23 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         Ok(current)
     }
 
-    /// Unbinds one preserved reference, so that every later access to it is reported as a use-after-consume.
+    /// Records that a replayed destination operation consumed one preserved allocation.
     ///
-    /// This is [`consume`](Self::consume)'s counterpart for an allocation that survives in the destination. It yields no
-    /// value, because the consuming operation was replayed verbatim and its own result is what the destination
-    /// produced; all that remains is to stop the discharge environment from handing the allocation out again. Consumption is
-    /// still a complete-value event, so a derived handle cannot name one even when its referent type equals the allocation's.
+    /// This is [`consume`](Self::consume)'s bookkeeping counterpart for an allocation that survives in the destination.
+    /// It returns no value because the replayed operation already produced the destination result; it only removes the
+    /// environment entry so later accesses report a use-after-consume. Consumption still applies to the complete stored
+    /// value, so only the unviewed reference returned by [`bind_preserved`](Self::bind_preserved) can name it.
     ///
     /// # Errors
     ///
     /// Returns [`ProgramError::MalformedProgram`] when the allocation is not live, was discharged rather than preserved, or
     /// is named through a derived handle rather than an unviewed handle.
-    pub fn unbind_preserved(&self, reference: &ReferenceDischargeReference<C, P>) -> Result<(), ProgramError> {
+    pub fn mark_preserved_consumed(&self, reference: &ReferenceDischargeReference<C, P>) -> Result<(), ProgramError> {
         let allocation = reference.allocation_id();
         let whole = self.allocation_entry(allocation)?.r#type.clone();
-        if self.allocation_is_discharged(allocation)? {
+        if self.is_allocation_discharged(allocation)? {
             return Err(ProgramError::MalformedProgram(format!(
-                "reference discharge unbound discharged {allocation} as a preserved reference",
+                "reference discharge marked discharged {allocation} as consumed through the preserved path",
             )));
         }
         if !reference.denotes_complete_value() {
@@ -481,35 +564,6 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         Ok(())
     }
 
-    /// Returns the unviewed handle denoting one live allocation of this environment.
-    ///
-    /// This mints no allocation: it re-exposes one the environment already holds, which is what resolving a capture-scoped
-    /// reference constant needs. A preserved reference's handle carries the allocation's own destination reference value,
-    /// exactly as [`bind_preserved`](Self::bind_preserved) produced it.
-    pub(super) fn allocation_handle(
-        &self,
-        allocation: ReferenceDischargeAllocationId,
-    ) -> Result<ReferenceDischargeValue<C, P>, ProgramError> {
-        let (r#type, binding) = {
-            let entry = self.allocation_entry(allocation)?;
-            let binding = match &entry.state {
-                ReferenceDischargeAllocationState::Discharged { .. } => ReferenceDischargeBinding::Discharged,
-                ReferenceDischargeAllocationState::Preserved { reference } => {
-                    ReferenceDischargeBinding::Preserved { reference: reference.clone() }
-                }
-            };
-            (entry.r#type.clone(), binding)
-        };
-        let alias = P::storage_alias(r#type.referent());
-        Ok(ReferenceDischargeValue::Reference(ReferenceDischargeReference {
-            allocation_id: allocation,
-            denotes_complete_value: true,
-            alias,
-            r#type,
-            binding,
-        }))
-    }
-
     /// Returns an immutable borrow of one live allocation entry.
     ///
     /// The returned guard keeps the allocation environment immutably borrowed. Callers should copy or clone the fields
@@ -519,7 +573,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     ///
     /// Returns [`ProgramError::MalformedProgram`] when `allocation` belongs to another environment, was never bound,
     /// or has already been consumed.
-    pub(super) fn allocation_entry(
+    pub(crate) fn allocation_entry(
         &self,
         allocation: ReferenceDischargeAllocationId,
     ) -> Result<Ref<'_, ReferenceDischargeAllocationEntry<P::Referent, C::Value>>, ProgramError> {
@@ -533,16 +587,11 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         }))
     }
 
-    /// Returns whether one live allocation is discharged rather than preserved.
-    pub(super) fn allocation_is_discharged(
-        &self,
-        allocation: ReferenceDischargeAllocationId,
-    ) -> Result<bool, ProgramError> {
-        Ok(matches!(&self.allocation_entry(allocation)?.state, ReferenceDischargeAllocationState::Discharged { .. },))
-    }
-
-    /// Binds one fresh complete-value carrier from an already validated environment state.
-    fn bind_allocation_value(
+    /// Inserts one validated allocation entry and returns its unviewed reference value.
+    ///
+    /// [`bind_discharged`](Self::bind_discharged) and [`bind_preserved`](Self::bind_preserved) validate their
+    /// fate-specific values before calling this common environment primitive.
+    fn bind_allocation(
         &self,
         r#type: ReferenceType<P::Referent>,
         state: ReferenceDischargeAllocationState<C::Value>,
@@ -567,12 +616,23 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         })
     }
 
-    /// Replaces one live discharged reference's state and merges whether the transition mutated it.
+    /// Installs the complete current state of one live discharged allocation and merges its mutation status.
     ///
-    /// Direct writes pass `true`. A structured boundary passes its access summary because symmetric boundaries also
-    /// return unchanged state for read-only allocations, which must not cause those allocations to publish hidden
-    /// final-state outputs.
-    pub(super) fn replace_discharged_state(
+    /// Reference-operation functions pass `true`. Structured-boundary code passes its access summary because symmetric
+    /// boundaries also return unchanged state for read-only allocations, which must not cause those allocations to
+    /// publish hidden final-state outputs. Once an allocation is marked mutated, a later `false` never clears that fact.
+    ///
+    /// # Parameters
+    ///
+    ///   - `allocation`: Live discharged allocation whose complete state is being installed.
+    ///   - `current`: New complete immutable state.
+    ///   - `mutated`: Whether this transition should mark the allocation as mutated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when `allocation` is not a live discharged allocation or `current`
+    /// does not carry its referent type.
+    pub fn update_discharged_state(
         &self,
         allocation: ReferenceDischargeAllocationId,
         current: C::Value,
@@ -600,7 +660,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
                 Ok(())
             }
             Some(ReferenceDischargeAllocationState::Preserved { .. }) => Err(ProgramError::MalformedProgram(format!(
-                "reference discharge replaced the state of preserved {allocation}",
+                "reference discharge updated the state of preserved {allocation}",
             ))),
             None => Err(ProgramError::MalformedProgram(format!("reference discharge accessed consumed {allocation}"))),
         }
@@ -625,7 +685,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> Debug for ReferenceDischargeCont
             self.environment.borrow().allocations.iter().filter(|allocation| allocation.is_some()).count();
         formatter
             .debug_struct("ReferenceDischargeContext")
-            .field("live_allocations", &live_allocation_count)
+            .field("live_allocation_count", &live_allocation_count)
             .finish_non_exhaustive()
     }
 }
@@ -1294,7 +1354,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
                 let selected = context.selects_external(source);
                 let carrier = if selected {
                     let state = destination.input(V::Type::from(reference_type.referent().clone()));
-                    context.allocate_discharged(reference_type, state)?
+                    context.bind_discharged(reference_type, state)?
                 } else {
                     // An unselected external allocation keeps its reference-typed boundary position exactly as the
                     // source declared it, so the caller still supplies the reference, and every access to it replays
@@ -1456,18 +1516,19 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_discharge_context_threads_discharged_allocation_state() {
+    fn test_reference_discharge_context_bind_discharged() {
         let context = ListDischargeContext::new(ListDestination::new());
         let reference_type = ReferenceType::new(ListType { length: 4 });
-        let allocated =
-            context.allocate_discharged(reference_type.clone(), ListIrValue::List(vec![1, 2, 3, 4])).unwrap();
+        let allocated = context.bind_discharged(reference_type.clone(), ListIrValue::List(vec![1, 2, 3, 4])).unwrap();
         let reference = allocated.expect_reference("the allocated allocation").unwrap().clone();
         let allocation = reference.allocation_id();
 
         // A fresh allocation starts unmutated, exposes its identity alias and reference type, and carries no destination
         // reference value because it was discharged rather than preserved.
-        assert_eq!(context.live_allocations(), vec![allocation]);
+        assert_eq!(context.live_allocation_ids(), vec![allocation]);
         assert_eq!(context.is_mutated(allocation), Ok(false));
+        assert_eq!(context.is_allocation_discharged(allocation), Ok(true));
+        assert_eq!(context.allocation_handle(allocation), Ok(allocated.clone()));
         assert_eq!(reference.alias(), &ListAlias { offset: 0, length: 4 });
         assert_eq!(reference.r#type(), &reference_type);
         assert_eq!(reference.preserved(), None);
@@ -1476,14 +1537,18 @@ mod tests {
         // A derived handle narrows the view without touching the allocation's identity, and its accesses act only on the
         // coordinates it selects.
         let view = context
-            .derive(&reference, ListAlias { offset: 1, length: 2 }, ReferenceType::new(ListType { length: 2 }), |_| {
-                unreachable!("the allocation is discharged")
-            })
+            .derive_reference(
+                &reference,
+                ListAlias { offset: 1, length: 2 },
+                ReferenceType::new(ListType { length: 2 }),
+                |_| unreachable!("the allocation is discharged"),
+            )
             .unwrap();
         let view = view.expect_reference("the derived view").unwrap().clone();
         assert_eq!(view.allocation_id(), allocation);
         assert_eq!(context.read(&view), Ok(ListIrValue::List(vec![2, 3])));
-        assert_eq!(context.swap(&view, ListIrValue::List(vec![20, 30])), Ok(ListIrValue::List(vec![2, 3])));
+        assert_eq!(context.write(&view, ListIrValue::List(vec![10, 11])), Ok(()));
+        assert_eq!(context.swap(&view, ListIrValue::List(vec![20, 30])), Ok(ListIrValue::List(vec![10, 11])));
         assert_eq!(context.read(&reference), Ok(ListIrValue::List(vec![1, 20, 30, 4])));
         assert_eq!(context.is_mutated(allocation), Ok(true));
         assert_eq!(context.accumulate(&view, ListIrValue::List(vec![1, 1])), Ok(()));
@@ -1492,7 +1557,7 @@ mod tests {
         // Consumption is a complete-value event. Provenance, not type equality, distinguishes the complete-value handle
         // from a derived view: a policy may derive a view whose referent happens to have the allocation's exact type.
         let same_type_view = context
-            .derive(&reference, ListAlias { offset: 0, length: 4 }, reference_type.clone(), |_| {
+            .derive_reference(&reference, ListAlias { offset: 0, length: 4 }, reference_type.clone(), |_| {
                 unreachable!("the allocation is discharged")
             })
             .unwrap();
@@ -1528,15 +1593,15 @@ mod tests {
         // Through the complete-value handle it yields the complete state and unbinds the allocation, so every later
         // access through any handle of that allocation is reported against the exact allocation.
         assert_eq!(context.consume(&reference), Ok(ListIrValue::List(vec![1, 21, 31, 4])));
-        assert_eq!(context.live_allocations(), Vec::new());
+        assert_eq!(context.live_allocation_ids(), Vec::new());
         let consumed = ProgramError::MalformedProgram(format!("reference discharge accessed consumed {allocation}"));
         assert_eq!(context.read(&reference), Err(consumed.clone()));
-        assert_eq!(context.replace_discharged_state(allocation, ListIrValue::List(vec![0; 4]), true), Err(consumed),);
+        assert_eq!(context.update_discharged_state(allocation, ListIrValue::List(vec![0; 4]), true), Err(consumed),);
 
         // An allocation ID minted by an unrelated discharge is reported instead of silently addressing whichever
         // allocation occupies the same position here.
         let other = ListDischargeContext::new(ListDestination::new());
-        let foreign = other.allocate_discharged(reference_type, ListIrValue::List(vec![0; 4])).unwrap();
+        let foreign = other.bind_discharged(reference_type, ListIrValue::List(vec![0; 4])).unwrap();
         let foreign = foreign.expect_reference("the unrelated allocation").unwrap().allocation_id();
         let prefix =
             format!("reference discharge accessed {foreign}, which belongs to an environment other than the active");
@@ -1547,51 +1612,29 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_discharge_context_validates_allocation_state_types_before_mutation() {
+    fn test_reference_discharge_context_bind_preserved() {
         let context = ListDischargeContext::new(ListDestination::new());
         let reference_type = ReferenceType::new(ListType { length: 2 });
-        let wrong_state = ListIrValue::List(vec![1]);
-        let error = ProgramError::MalformedProgram(
-            "reference discharge state has type `list<1>` but allocation `ref<list<2>>` requires `list<2>`".to_string(),
+
+        // Binding validates the destination value before inserting an allocation into the environment.
+        assert_eq!(
+            context.bind_preserved(reference_type.clone(), ListIrValue::List(vec![1, 2])),
+            Err(ProgramError::MalformedProgram(
+                "reference discharge preserved an allocation as `list<2>`, which is not a reference type".to_string(),
+            )),
         );
+        assert_eq!(
+            context.bind_preserved(
+                reference_type.clone(),
+                ListIrValue::Reference(ReferenceType::new(ListType { length: 1 })),
+            ),
+            Err(ProgramError::MalformedProgram(
+                "reference discharge preserved an allocation as `ref<list<1>>` but its handle exposes `ref<list<2>>`"
+                    .to_string(),
+            )),
+        );
+        assert_eq!(context.live_allocation_ids(), Vec::new());
 
-        // A malformed allocation is rejected before an allocation is inserted into the environment.
-        assert_eq!(context.allocate_discharged(reference_type.clone(), wrong_state.clone()), Err(error.clone()));
-        assert_eq!(context.live_allocations(), Vec::new());
-
-        let allocated = context.allocate_discharged(reference_type, ListIrValue::List(vec![1, 2])).unwrap();
-        let reference = allocated.expect_reference("the allocated allocation").unwrap();
-        let allocation = reference.allocation_id();
-
-        // State replacement validates before taking the mutable environment borrow, so failure preserves the prior
-        // state and mutation bit.
-        assert_eq!(context.replace_discharged_state(allocation, wrong_state, true), Err(error));
-        assert_eq!(context.read(reference), Ok(ListIrValue::List(vec![1, 2])));
-        assert_eq!(context.is_mutated(allocation), Ok(false));
-    }
-
-    #[test]
-    fn test_reference_discharge_context_clones_share_allocation_state() {
-        let context = ListDischargeContext::new(ListDestination::new());
-        let reference_type = ReferenceType::new(ListType { length: 2 });
-        let allocated = context.allocate_discharged(reference_type, ListIrValue::List(vec![1, 2])).unwrap();
-        let reference = allocated.expect_reference("the allocated allocation").unwrap().clone();
-
-        // A clone shares the environment rather than copying it, which is the contract every stateful Ryft context
-        // follows: several handles can denote one allocation, and every one of them must observe the same current state.
-        // Isolation is therefore never implicit — a structured rule that must not commit rebuilds its region against
-        // an environment of its own through `discharge_region_program`.
-        let clone = context.clone();
-        clone.accumulate(&reference, ListIrValue::List(vec![10, 10])).unwrap();
-        assert_eq!(context.read(&reference), Ok(ListIrValue::List(vec![11, 12])));
-        context.accumulate(&reference, ListIrValue::List(vec![1, 1])).unwrap();
-        assert_eq!(clone.read(&reference), Ok(ListIrValue::List(vec![12, 13])));
-    }
-
-    #[test]
-    fn test_reference_discharge_context_binds_preserved_allocations() {
-        let context = ListDischargeContext::new(ListDestination::new());
-        let reference_type = ReferenceType::new(ListType { length: 2 });
         let destination_reference = ListIrValue::Reference(reference_type.clone());
         let bound = context.bind_preserved(reference_type.clone(), destination_reference.clone()).unwrap();
         let reference = bound.expect_reference("the preserved reference").unwrap().clone();
@@ -1601,6 +1644,8 @@ mod tests {
         // verbatim instead of re-deriving the handle.
         assert_eq!(reference.r#type(), &reference_type);
         assert_eq!(reference.preserved(), Some(&destination_reference));
+        assert_eq!(context.is_allocation_discharged(allocation), Ok(false));
+        assert_eq!(context.allocation_handle(allocation), Ok(bound.clone()));
         assert_eq!(
             context.operand_value(&ReferenceDischargeValue::Reference(reference.clone())),
             Ok(destination_reference.clone()),
@@ -1620,9 +1665,9 @@ mod tests {
             ))),
         );
         assert_eq!(
-            context.replace_discharged_state(allocation, ListIrValue::List(vec![0, 0]), true),
+            context.update_discharged_state(allocation, ListIrValue::List(vec![0, 0]), true),
             Err(ProgramError::MalformedProgram(format!(
-                "reference discharge replaced the state of preserved {allocation}",
+                "reference discharge updated the state of preserved {allocation}",
             ))),
         );
 
@@ -1631,7 +1676,7 @@ mod tests {
         let view_type = ReferenceType::new(ListType { length: 1 });
         let view_alias = ListAlias { offset: 0, length: 1 };
         let view = context
-            .derive(&reference, view_alias, view_type.clone(), |parent| {
+            .derive_reference(&reference, view_alias, view_type.clone(), |parent| {
                 assert_eq!(parent, &ListIrValue::Reference(ReferenceType::new(ListType { length: 2 })));
                 Ok(ListIrValue::Reference(view_type.clone()))
             })
@@ -1642,7 +1687,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_discharge_context_unbinds_preserved_allocations() {
+    fn test_reference_discharge_context_mark_preserved_consumed() {
         // Consuming a preserved reference yields no state — the replayed operation already produced the destination's own
         // result — but it must still stop the environment from handing the allocation out again, and only a handle denoting
         // the complete stored value can name a consumption.
@@ -1655,18 +1700,17 @@ mod tests {
             )
             .unwrap();
         let reference = preserved.expect_reference("the preserved reference").unwrap().clone();
-        let discharged =
-            context.allocate_discharged(ReferenceType::new(referent), ListIrValue::List(vec![1, 2])).unwrap();
+        let discharged = context.bind_discharged(ReferenceType::new(referent), ListIrValue::List(vec![1, 2])).unwrap();
         let discharged_allocation = discharged.expect_reference("the discharged reference").unwrap().allocation_id();
 
         let same_type_view = context
-            .derive(&reference, ListAlias { offset: 0, length: 2 }, reference.r#type().clone(), |_| {
+            .derive_reference(&reference, ListAlias { offset: 0, length: 2 }, reference.r#type().clone(), |_| {
                 Ok(ListIrValue::Reference(reference.r#type().clone()))
             })
             .unwrap();
         let same_type_view = same_type_view.expect_reference("the same-type preserved view").unwrap();
         assert_eq!(
-            context.unbind_preserved(same_type_view),
+            context.mark_preserved_consumed(same_type_view),
             Err(ProgramError::MalformedProgram(format!(
                 "reference discharge cannot consume {} through the derived view `ref<list<2>>`; consumption yields \
                  the complete stored value, whose reference type is `ref<list<2>>`",
@@ -1675,23 +1719,26 @@ mod tests {
         );
 
         let view = context
-            .derive(&reference, ListAlias { offset: 0, length: 1 }, ReferenceType::new(ListType { length: 1 }), |_| {
-                Ok(ListIrValue::Reference(ReferenceType::new(ListType { length: 1 })))
-            })
+            .derive_reference(
+                &reference,
+                ListAlias { offset: 0, length: 1 },
+                ReferenceType::new(ListType { length: 1 }),
+                |_| Ok(ListIrValue::Reference(ReferenceType::new(ListType { length: 1 }))),
+            )
             .unwrap();
         let view = view.expect_reference("the derived preserved view").unwrap().clone();
         assert_eq!(
-            context.unbind_preserved(&view),
+            context.mark_preserved_consumed(&view),
             Err(ProgramError::MalformedProgram(format!(
                 "reference discharge cannot consume {} through the derived view `ref<list<1>>`; consumption yields \
                  the complete stored value, whose reference type is `ref<list<2>>`",
                 reference.allocation_id(),
             ))),
         );
-        assert_eq!(context.unbind_preserved(&reference), Ok(()));
-        assert_eq!(context.live_allocations(), vec![discharged_allocation]);
+        assert_eq!(context.mark_preserved_consumed(&reference), Ok(()));
+        assert_eq!(context.live_allocation_ids(), vec![discharged_allocation]);
         assert_eq!(
-            context.unbind_preserved(&reference),
+            context.mark_preserved_consumed(&reference),
             Err(ProgramError::MalformedProgram(format!(
                 "reference discharge accessed consumed {}",
                 reference.allocation_id()
@@ -1702,11 +1749,58 @@ mod tests {
         // confused by a rule that dispatched on the wrong one.
         let discharged = discharged.expect_reference("the discharged reference").unwrap();
         assert_eq!(
-            context.unbind_preserved(discharged),
+            context.mark_preserved_consumed(discharged),
             Err(ProgramError::MalformedProgram(format!(
-                "reference discharge unbound discharged {discharged_allocation} as a preserved reference",
+                "reference discharge marked discharged {discharged_allocation} as consumed through the preserved path",
             ))),
         );
+    }
+
+    #[test]
+    fn test_reference_discharge_context_update_discharged_state() {
+        let context = ListDischargeContext::new(ListDestination::new());
+        let reference_type = ReferenceType::new(ListType { length: 2 });
+        let wrong_state = ListIrValue::List(vec![1]);
+        let error = ProgramError::MalformedProgram(
+            "reference discharge state has type `list<1>` but allocation `ref<list<2>>` requires `list<2>`".to_string(),
+        );
+
+        // A malformed allocation is rejected before an allocation is inserted into the environment.
+        assert_eq!(context.bind_discharged(reference_type.clone(), wrong_state.clone()), Err(error.clone()));
+        assert_eq!(context.live_allocation_ids(), Vec::new());
+
+        let allocated = context.bind_discharged(reference_type, ListIrValue::List(vec![1, 2])).unwrap();
+        let reference = allocated.expect_reference("the allocated allocation").unwrap();
+        let allocation = reference.allocation_id();
+
+        // Boundary reconciliation can install a successor without marking a read-only allocation as mutated.
+        assert_eq!(context.update_discharged_state(allocation, ListIrValue::List(vec![3, 4]), false), Ok(()));
+        assert_eq!(context.discharged_state(allocation), Ok(ListIrValue::List(vec![3, 4])));
+        assert_eq!(context.is_mutated(allocation), Ok(false));
+
+        // State updates validate before taking the mutable environment borrow, so failure preserves the prior state
+        // and mutation bit.
+        assert_eq!(context.update_discharged_state(allocation, wrong_state, true), Err(error));
+        assert_eq!(context.read(reference), Ok(ListIrValue::List(vec![3, 4])));
+        assert_eq!(context.is_mutated(allocation), Ok(false));
+    }
+
+    #[test]
+    fn test_reference_discharge_context_clone() {
+        let context = ListDischargeContext::new(ListDestination::new());
+        let reference_type = ReferenceType::new(ListType { length: 2 });
+        let allocated = context.bind_discharged(reference_type, ListIrValue::List(vec![1, 2])).unwrap();
+        let reference = allocated.expect_reference("the allocated allocation").unwrap().clone();
+
+        // A clone shares the environment rather than copying it, which is the contract every stateful Ryft context
+        // follows: several handles can denote one allocation, and every one of them must observe the same current state.
+        // Isolation is therefore never implicit — a structured rule that must not commit rebuilds its region against
+        // an environment of its own through `discharge_region_program`.
+        let clone = context.clone();
+        clone.accumulate(&reference, ListIrValue::List(vec![10, 10])).unwrap();
+        assert_eq!(context.read(&reference), Ok(ListIrValue::List(vec![11, 12])));
+        context.accumulate(&reference, ListIrValue::List(vec![1, 1])).unwrap();
+        assert_eq!(clone.read(&reference), Ok(ListIrValue::List(vec![12, 13])));
     }
 
     #[test]
@@ -1716,7 +1810,7 @@ mod tests {
         // an unresolvable reference-typed constant to the rejection at the lift site.
         let context = ListDischargeContext::new(ListDestination::new());
         let allocated = context
-            .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
+            .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
         let allocation = allocated.expect_reference("the captured allocation").unwrap().allocation_id();
 
@@ -1749,7 +1843,7 @@ mod tests {
         // an open set of third-party rules diagnosable without each of them inventing its own message.
         let context = ListDischargeContext::new(ListDestination::new());
         let reference_type = ReferenceType::new(ListType { length: 1 });
-        let allocated = context.allocate_discharged(reference_type, ListIrValue::List(vec![1])).unwrap();
+        let allocated = context.bind_discharged(reference_type, ListIrValue::List(vec![1])).unwrap();
         let allocation = allocated.expect_reference("the allocated allocation").unwrap().allocation_id();
         let ordinary: ListDischargeValue = ReferenceDischargeValue::Ordinary(ListIrValue::List(vec![1]));
 
@@ -1774,7 +1868,7 @@ mod tests {
         let ordinary =
             ReferenceDischargeValue::<ListDestination, ListReferenceDischarge>::Ordinary(ListIrValue::List(vec![1]));
         let reference_type = ReferenceType::new(ListType { length: 2 });
-        let reference = context.allocate_discharged(reference_type.clone(), ListIrValue::List(vec![1, 2])).unwrap();
+        let reference = context.bind_discharged(reference_type.clone(), ListIrValue::List(vec![1, 2])).unwrap();
 
         // An ordinary carrier reports the wrapped destination value's type, while a reference handle reports its own
         // reference type lifted into the destination universe.

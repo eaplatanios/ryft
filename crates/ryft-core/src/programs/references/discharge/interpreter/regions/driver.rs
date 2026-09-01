@@ -190,7 +190,7 @@ where
                 ProgramError,
             > {
                 let r#type = context.allocation_entry(allocation)?.r#type.clone();
-                let discharged = context.allocation_is_discharged(allocation)?;
+                let discharged = context.is_allocation_discharged(allocation)?;
                 let input_type = if discharged {
                     <Destination<C> as crate::contexts::Domain>::Type::from(r#type.referent().clone())
                 } else {
@@ -201,7 +201,7 @@ where
                     return fork.allocation_handle(forked);
                 }
                 let carrier = if discharged {
-                    fork.allocate_discharged(r#type, input)?
+                    fork.bind_discharged(r#type, input)?
                 } else {
                     fork.bind_preserved(r#type, input)?
                 };
@@ -349,7 +349,7 @@ where
             // the operations the source performed, so there is no successor state for the caller to merge.
             let mut mutated_allocations = BTreeSet::new();
             for (caller, forked) in &caller_to_fork {
-                if fork.allocation_is_discharged(*forked)? && fork.is_mutated(*forked)? {
+                if fork.is_allocation_discharged(*forked)? && fork.is_mutated(*forked)? {
                     mutated_allocations.insert(*caller);
                 }
             }
@@ -448,7 +448,7 @@ where
                             // A consuming access invalidates its preserved handles only after replay succeeds. This
                             // keeps a failed destination bind from changing the discharge environment.
                             for reference in consumed {
-                                context.unbind_preserved(reference)?;
+                                context.mark_preserved_consumed(reference)?;
                             }
                             return Ok(outputs);
                         }
@@ -573,7 +573,7 @@ mod tests {
         let pair = ReferenceType::new(ListType { length: 2 });
         let triple = ReferenceType::new(ListType { length: 3 });
         let context = ListDischargeContext::new(ListDestination::new());
-        let allocated = context.allocate_discharged(pair.clone(), ListIrValue::List(vec![1, 2])).unwrap();
+        let allocated = context.bind_discharged(pair.clone(), ListIrValue::List(vec![1, 2])).unwrap();
         let allocation = allocated.expect_reference("the captured allocation").unwrap().allocation_id();
         let scoped = context.with_captures(ReferenceDischargeCaptureScope::new(
             list_capture_position,
@@ -584,7 +584,7 @@ mod tests {
         let reference = lifted.expect_reference("the resolved capture").unwrap();
         assert_eq!(reference.allocation_id(), allocation);
         assert_eq!(reference.r#type(), &pair);
-        assert_eq!(scoped.live_allocations(), vec![allocation]);
+        assert_eq!(scoped.live_allocation_ids(), vec![allocation]);
 
         // An ordinary constant is unaffected by the scope and lifts through the destination as usual.
         let ordinary = lift_constant(&scoped, ListIrValue::List(vec![3, 4])).unwrap();
@@ -602,7 +602,7 @@ mod tests {
 
         // A capture constant names the complete stored value its position binds, so a declared type the bound allocation does not
         // carry is reported rather than silently widened where the constant is used.
-        let allocated = context.allocate_discharged(triple, ListIrValue::List(vec![1, 2, 3])).unwrap();
+        let allocated = context.bind_discharged(triple, ListIrValue::List(vec![1, 2, 3])).unwrap();
         let wider = allocated.expect_reference("the mismatched allocation").unwrap().allocation_id();
         let mismatched = scoped.with_captures(scoped.captures().with_allocations(vec![None, None, Some(wider)]));
         assert_eq!(
@@ -629,7 +629,7 @@ mod tests {
 
         let context = ListDischargeContext::new(ListDestination::new());
         let allocated = context
-            .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
+            .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
         let allocation = allocated.expect_reference("the captured allocation").unwrap().allocation_id();
         let context = context.with_captures(ReferenceDischargeCaptureScope::new(
@@ -707,7 +707,7 @@ mod tests {
             .unwrap();
 
         let context = ListDischargeContext::new(ListDestination::new());
-        let allocated = context.allocate_discharged(reference_type, ListIrValue::List(vec![1, 2])).unwrap();
+        let allocated = context.bind_discharged(reference_type, ListIrValue::List(vec![1, 2])).unwrap();
         let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation_id();
         let regions = [program];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
@@ -746,7 +746,7 @@ mod tests {
         let destination = TracingContext::<ListIrValue, ListOperation>::new();
         let context = ReferenceDischargeContext::<_, ListReferenceDischarge>::new(destination.clone());
         let state = destination.input(ListIrType::List(ListType { length: 2 }));
-        let allocated = context.allocate_discharged(ReferenceType::new(ListType { length: 2 }), state).unwrap();
+        let allocated = context.bind_discharged(ReferenceType::new(ListType { length: 2 }), state).unwrap();
         let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation_id();
         let regions = [program];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
@@ -810,7 +810,7 @@ mod tests {
 
         let context = ListDischargeContext::new(ListDestination::new());
         let allocated = context
-            .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
+            .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
         let allocation = allocated.expect_reference("the added allocation").unwrap().allocation_id();
         let regions = [program];
@@ -845,7 +845,7 @@ mod tests {
 
         let context = ListDischargeContext::new(ListDestination::new());
         let allocated = context
-            .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
+            .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
         let allocation = allocated.expect_reference("the declared allocation").unwrap().allocation_id();
         let regions = [program];
@@ -882,7 +882,7 @@ mod tests {
 
         let context = ListDischargeContext::new(ListDestination::new());
         let allocated = context
-            .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
+            .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
         let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation_id();
         let regions = [program];
@@ -923,11 +923,11 @@ mod tests {
         let context = ReferenceDischargeContext::<_, ListReferenceDischarge>::new(destination.clone());
         let reference_type = ReferenceType::new(ListType { length: 2 });
         let accessed = context
-            .allocate_discharged(reference_type.clone(), destination.input(ListIrType::List(ListType { length: 2 })))
+            .bind_discharged(reference_type.clone(), destination.input(ListIrType::List(ListType { length: 2 })))
             .unwrap();
         let accessed = accessed.expect_reference("the accessed allocation").unwrap().allocation_id();
         let carried = context
-            .allocate_discharged(reference_type, destination.input(ListIrType::List(ListType { length: 2 })))
+            .bind_discharged(reference_type, destination.input(ListIrType::List(ListType { length: 2 })))
             .unwrap();
         let carried = carried.expect_reference("the carried allocation").unwrap().allocation_id();
 

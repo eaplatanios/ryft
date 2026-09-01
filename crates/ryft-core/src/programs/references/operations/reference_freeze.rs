@@ -214,7 +214,7 @@ mod tests {
             Freeze::new().discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&handle)),
             Ok(vec![ReferenceDischargeValue::Ordinary(TestValue::new(REFERENT, 4))]),
         );
-        assert_eq!(context.live_allocations(), Vec::new());
+        assert_eq!(context.live_allocation_ids(), Vec::new());
         assert_eq!(
             Freeze::new().discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&handle)),
             Err(ProgramError::MalformedProgram(format!(

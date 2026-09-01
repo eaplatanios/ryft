@@ -343,7 +343,7 @@ mod tests {
 
         let context = ListDischargeContext::new(ListDestination::new());
         let allocated = context
-            .allocate_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
+            .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
         let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation_id();
         let regions = [program];

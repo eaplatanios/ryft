@@ -129,7 +129,7 @@ where
         })?;
         let r#type = r#type.clone();
         if context.selects_internal(driver.instruction(), 0) {
-            return Ok(vec![context.allocate_discharged(r#type, initial)?]);
+            return Ok(vec![context.bind_discharged(r#type, initial)?]);
         }
 
         // An unselected allocation target survives, so the operation is replayed and its result is the destination
@@ -218,7 +218,7 @@ mod tests {
         // type is the one this operation's own inference derives, exposed through the storage alias of a complete
         // value.
         let (context, reference) = allocated_allocation(4);
-        assert_eq!(context.live_allocations(), vec![reference.allocation_id()]);
+        assert_eq!(context.live_allocation_ids(), vec![reference.allocation_id()]);
         assert_eq!(reference.r#type(), &ReferenceType::new(REFERENT));
         assert_eq!(reference.alias(), &TestAlias);
         assert_eq!(reference.preserved(), None);
