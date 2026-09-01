@@ -1069,15 +1069,13 @@ impl ReferenceRegionStateInsertion {
     }
 }
 
-// TODO(eaplatanios): Review this.
 /// Result of rebuilding one attached [`Region`](crate::Region) against an isolated reference environment through
-/// [`ReferenceDischargeDriver::rebuild_region`].
-///
-/// This result carries the rebuilt [`Program`] and allocation facts stated in the caller's terms, but no values of any
-/// kind. A reference produced during the isolated rebuild would keep addressing the abandoned temporary environment,
-/// and a destination value produced under a staging destination is a tracer stamped with the temporary builder.
-/// Excluding both makes the isolation a type-level fact rather than a convention: the owning rule binds the rebuilt
-/// operation in its own context and merges final states from the outputs that binding produces.
+/// [`ReferenceDischargeDriver::rebuild_region`]. This result carries the rebuilt [`Program`] and allocation facts
+/// stated in the caller's terms, but no values of any kind. A reference produced during the isolated rebuild would keep
+/// addressing the abandoned temporary environment, and a destination value produced under a staging destination is a
+/// tracer stamped with the temporary builder. Excluding both makes the isolation a type-level fact rather than a
+/// convention: the owning rule binds the rebuilt operation in its own context and merges final states from the outputs
+/// that binding produces.
 #[derive(Debug)]
 pub struct ReferenceDischargeRegionResult<V: Value, O: Operation<Type = V::Type>> {
     /// Refer to the documentation of [`Self::program`].
@@ -1090,46 +1088,45 @@ pub struct ReferenceDischargeRegionResult<V: Value, O: Operation<Type = V::Type>
     mutated_allocations: Vec<ReferenceDischargeAllocationId>,
 }
 
-// TODO(eaplatanios): Review this.
 impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeRegionResult<V, O> {
-    /// Returns the rebuilt region program with its reference effects discharged. Its input boundary is the source
-    /// region's declared inputs with the boundary's added inputs inserted, and its output boundary is the source
-    /// region's declared outputs with the boundary's added outputs inserted.
+    /// Returns the rebuilt [`Region`](crate::Region) [`Program`] with its reference effects discharged. Its input
+    /// boundary is the source region's declared inputs with the boundary's added inputs inserted, and its output
+    /// boundary is the source region's declared outputs with the boundary's added outputs inserted.
     #[inline]
     pub const fn program(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
         &self.program
     }
 
-    /// Returns the caller allocation each declared region output denotes, or [`None`] for a value output, in region
-    /// output order.
+    /// Returns the [`ReferenceDischargeAllocationId`] of the caller allocation each declared [`Region`](crate::Region)
+    /// output denotes, or [`None`] for a value output, in region output order.
     #[inline]
     pub fn output_allocations(&self) -> &[Option<ReferenceDischargeAllocationId>] {
         self.output_allocations.as_slice()
     }
 
-    /// Returns the caller allocations threaded as state that the region mutated, in canonical allocation order. A
-    /// preserved reference never appears here, because its writes replay into the rebuilt region as the operations the
-    /// source performed and leave no successor state for the caller to merge.
+    /// Returns the [`ReferenceDischargeAllocationId`] of the caller allocations threaded as state that the
+    /// [`Region`](crate::Region) mutated, in canonical allocation order. A preserved reference never appears here,
+    /// because its writes replay into the rebuilt region as the operations the source performed and leave no successor
+    /// state for the caller to merge.
     #[inline]
     pub fn mutated_allocations(&self) -> &[ReferenceDischargeAllocationId] {
         self.mutated_allocations.as_slice()
     }
 
-    /// Consumes this result and returns the rebuilt region program.
+    /// Consumes this [`ReferenceDischargeRegionResult`] and returns the rebuilt [`Region`](crate::Region) [`Program`].
     #[inline]
     pub fn into_program(self) -> Program<V, O, Vec<V>, Vec<V>> {
         self.program
     }
 
-    /// Validates that the declared outputs of this region denote exactly the allocations that `expected` predicted.
-    ///
-    /// A structured rule sizes its boundary from a
-    /// [`ReferenceRegionSummary`](crate::programs::references::ReferenceRegionSummary) computed before the region is
-    /// rebuilt, and that boundary depends on the declared output allocations: an allocation the region already returns
-    /// publishes its final state at that output position and must not be published a second time. This function holds
-    /// that prediction to what the rebuild actually produced, so an operation whose rule disagrees with its own summary
-    /// is reported instead of silently losing an update. Checking every region of one operation against the same
-    /// summary also keeps those regions in agreement with each other.
+    /// Validates that the declared outputs of this [`Region`](crate::Region) denote exactly the allocations that
+    /// `expected` predicted. A structured rule sizes its boundary from a
+    /// [`ReferenceRegionSummary`](crate::ReferenceRegionSummary) computed before the region is rebuilt, and that
+    /// boundary depends on the declared output allocations: an allocation the region already returns publishes its
+    /// final state at that output position and must not be published a second time. This function holds that prediction
+    /// to what the rebuild actually produced, so an operation whose rule disagrees with its own summary is reported
+    /// instead of silently losing an update. Checking every region of one operation against the same summary also keeps
+    /// those regions in agreement with each other.
     ///
     /// # Parameters
     ///
@@ -1140,6 +1137,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeRegionResult<V, O
     ///
     /// Returns [`ProgramError::MalformedProgram`] when the declared outputs of this region denote different
     /// allocations.
+    #[inline]
     pub fn validate_predicted_output_allocations(
         &self,
         expected: &[Option<ReferenceDischargeAllocationId>],
@@ -1154,12 +1152,10 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeRegionResult<V, O
         Ok(())
     }
 
-    /// Validates that this region mutated only allocations contained in `published`.
-    ///
-    /// A structured rule decides which final states its rebuilt regions publish from a summary computed before the
-    /// region is rebuilt. This function holds that decision to the mutations the rebuild actually performed, so a
-    /// summary that under-reports what its operation does is reported here instead of surfacing later as a lost
-    /// update.
+    /// Validates that this [`Region`](crate::Region) mutated only allocations contained in `published`. A structured
+    /// rule decides which final states its rebuilt regions publish from a summary computed before the region is
+    /// rebuilt. This function holds that decision to the mutations the rebuild actually performed, so a summary that
+    /// under-reports what its operation does is reported here instead of surfacing later as a lost update.
     ///
     /// # Parameters
     ///
@@ -1170,6 +1166,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeRegionResult<V, O
     ///
     /// Returns [`ProgramError::MalformedProgram`] naming the first allocation this region mutated that `published`
     /// does not contain.
+    #[inline]
     pub fn validate_predicted_mutations(
         &self,
         published: &[ReferenceDischargeAllocationId],
@@ -1178,8 +1175,8 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeRegionResult<V, O
         for allocation in &self.mutated_allocations {
             if !published.contains(allocation) {
                 return Err(ProgramError::MalformedProgram(format!(
-                    "operation `{operation}` mutated {allocation} in an attached region that its state widening did not \
-                     predict",
+                    "operation `{operation}` mutated {allocation} in an attached region that its state widening \
+                     did not predict",
                 )));
             }
         }
