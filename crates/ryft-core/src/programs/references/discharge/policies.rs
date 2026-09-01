@@ -35,7 +35,7 @@ pub trait ReferenceDischargePolicy<C: Domain> {
 
     /// Returns the storage alias for a complete value with the provided referent [`Type`]. Allocation and
     /// entry-boundary binding assign this alias to each new complete-value handle. This is infallible by design.
-    /// Validating a referent type is type inference's job, and deriving the identity alias of an already-valid
+    /// Validating a referent type is type inference's job, and constructing the identity alias of an already-valid
     /// referent is total.
     fn storage_alias(referent: &Self::Referent) -> Self::Alias;
 

@@ -39,8 +39,8 @@
 //!   The allocation has its own referent — the type of the complete stored value — and a view's handle-local referent may
 //!   be narrower.
 //! - A **handle** is one name for an allocation: a program value of reference type, or an eager [`Reference`] clone.
-//! - An **alias** is a handle derived from another handle. It always denotes the same allocation, either identically or
-//!   through operation-owned view metadata ([`ReferenceAliasKind`]).
+//! - An **alias** is a reference created from another reference. It always denotes the same allocation, either
+//!   identically or through operation-owned view metadata ([`ReferenceAliasKind`]).
 //! - A **view** is a narrowing alias, such as the result of
 //!   [`reference_slice`](crate::arrays::ReferenceSliceOperation) or
 //!   [`reference_index`](crate::arrays::ReferenceIndexOperation): it selects part of the allocation's value while every
@@ -49,7 +49,7 @@
 //!   through every other member.
 //! - A **complete-value handle** exposes the allocation's complete stored value with no narrowing view. State that
 //!   crosses a structured-region or discharge boundary is always represented by a complete-value handle; views are
-//!   re-derived from that handle inside the region that needs them.
+//!   created from that reference inside the region that needs them.
 //!
 //! Every handle resolves to exactly one allocation: multi-source aliases (e.g., a hypothetical `select_reference(a, b)`)
 //! are structurally unrepresentable rather than merely rejected, so analyses reason about state per allocation.

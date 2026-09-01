@@ -7,4 +7,4 @@ error: cannot construct `ReferenceDischargeReference<_, _>` with struct literal 
    |                                   |              private field
    |                                   private field
    |
-   = note: ...and other private fields `denotes_complete_value` and `binding` that were not provided
+   = note: ...and other private fields `is_view` and `binding` that were not provided

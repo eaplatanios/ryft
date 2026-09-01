@@ -124,7 +124,7 @@ impl ReferenceRegionDischargeBoundary {
     ///
     /// The region's capture prefix is read off the operation rather than supplied, so that a rule cannot state one
     /// prefix here and let
-    /// [`region_summary`](crate::programs::references::ReferenceDischargeContext::region_summary) derive a different
+    /// [`region_summary`](crate::programs::references::ReferenceDischargeContext::region_summary) compute a different
     /// one from the same hook. A rule therefore never reasons about captures at all.
     ///
     /// # Parameters
@@ -136,7 +136,7 @@ impl ReferenceRegionDischargeBoundary {
     ///   - `declared_input_allocations`: Allocation entering at each declared boundary position, or [`None`] for an
     ///     value. Reference positions must come from
     ///     [`operand_allocation`](crate::programs::references::ReferenceDischargeContext::operand_allocation), which
-    ///     validates that each operand carries the complete stored value rather than a derived view. Its length must
+    ///     validates that each operand carries the complete stored value rather than a view. Its length must
     ///     equal the source region's input count, because every declared position is rebuilt.
     ///   - `added_inputs`: Allocations whose entering state or preserved reference the rebuilt region receives as added
     ///     inputs, grouped with the source input position receiving them.

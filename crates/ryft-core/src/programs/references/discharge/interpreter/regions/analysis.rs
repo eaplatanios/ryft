@@ -481,11 +481,11 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     ///
     /// A structured rule calls this before it can size its state boundary: which allocations a region closure touches, and
     /// which of them it mutates, is exactly what decides how wide the rewritten operation must be. The summary is
-    /// derived from generic hooks alone — operation-local [`Operation::reference_semantics`], the region-provenance
+    /// computed entirely from generic hooks — operation-local [`Operation::reference_semantics`], the region-provenance
     /// hooks, reference-output identity, and recursive summaries of nested regions — so a third-party structured
     /// operation needs no companion declaration surface to be summarized.
     ///
-    /// The region's own capture scope is derived here rather than supplied, because whether a region establishes a
+    /// The region's own capture scope is computed here rather than supplied, because whether a region establishes a
     /// fresh capture prefix is stated by [`Operation::region_capture_input_count`] and is therefore knowledge the
     /// summary can read off the operation itself. A rule never has to reason about captures.
     ///
@@ -524,12 +524,10 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         Ok(summary)
     }
 
-    /// Returns the complete stored value one operand of a structured operation denotes, or [`None`] when the operand is an
-    /// value.
+    /// Returns the allocation one operand of a structured operation denotes, or [`None`] when the operand is a value.
     ///
-    /// A derived view is rejected rather than resolved to its allocation. A state boundary carries complete-value values, so
-    /// only a handle with complete-value provenance may cross it; the view has to be re-derived from the allocation inside the
-    /// region instead.
+    /// A view is rejected rather than resolved to its allocation because a state boundary carries the allocation's
+    /// complete stored value. The view must instead be created inside the region.
     ///
     /// A *preserved* allocation is resolved like any other. It crosses the boundary as the reference it already is, at its
     /// own declared operand position, so it needs no state carry at all — which is exactly what
@@ -542,8 +540,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::MalformedProgram`] when the operand denotes a derived view of its allocation, or when its
-    /// allocation is no longer live.
+    /// Returns [`ProgramError::MalformedProgram`] when the operand is a view or its allocation is no longer live.
     pub fn operand_allocation(
         &self,
         operand: &ReferenceDischargeValue<C, P>,
@@ -554,10 +551,10 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         };
         let allocation = reference.allocation_id();
         let whole = self.allocation_entry(allocation)?.r#type().into_owned();
-        if !reference.denotes_complete_value() {
+        if reference.is_view() {
             return Err(ProgramError::MalformedProgram(format!(
-                "operation `{operation}` passes the derived view `{}` of {allocation} across a region boundary, which \
-                 carries the complete stored value `{}`; derive the view inside the region instead",
+                "operation `{operation}` passes the view `{}` of {allocation} across a region boundary, which carries \
+                 the complete stored value `{}`; create the view inside the region instead",
                 reference.r#type(),
                 whole,
             )));

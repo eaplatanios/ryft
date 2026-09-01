@@ -289,7 +289,7 @@ impl<C: Domain<Type = ArrayIrType, Value: ReferenceSlice<C::Value>>> Interpretab
 ///
 /// On an allocation that partial discharge *preserved*, the view is additionally replayed into the destination, and the
 /// reference it produces becomes the alias handle's own destination value, so that later accesses consume that
-/// exact value instead of re-deriving the chain and duplicating the view operations. The composed alias is recorded
+/// exact value instead of replaying the chain and duplicating the view operations. The composed alias is recorded
 /// either way, which is what keeps one handle's view chain single-sourced whichever state its allocation is in.
 ///
 /// # Parameters
@@ -739,8 +739,8 @@ mod tests {
 
     #[test]
     fn test_array_reference_view_operation_reference_discharge() {
-        // Both view rules derive a narrower handle onto the same allocation by composing their transform onto the incoming
-        // alias, and bind nothing: a view's coordinates are materialized at each access instead.
+        // Both view rules create a narrower reference to the same allocation by composing their transform onto the
+        // incoming alias, and bind nothing: a view's coordinates are materialized at each access instead.
         let context = ReferenceDischargeContext::<TestDestination, ArrayReferenceDischarge>::new(EagerContext::new());
         let allocation_type = ArrayType::new_static(DataType::F32, [3, 3]);
         let allocated = context
@@ -754,7 +754,7 @@ mod tests {
             .discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&allocated))
             .unwrap();
         assert_eq!(sliced.len(), 1);
-        let sliced = sliced[0].try_as_reference("the derived slice").unwrap().clone();
+        let sliced = sliced[0].try_as_reference("the slice view").unwrap().clone();
         assert_eq!(sliced.allocation_id(), allocation.allocation_id());
         assert_eq!(sliced.r#type(), &ReferenceType::new(ArrayType::new_static(DataType::F32, [2, 2])));
         assert_eq!(sliced.preserved(), None);
@@ -764,7 +764,7 @@ mod tests {
         let indexed = ReferenceIndexOperation::new(0, 1)
             .discharge_references(&context, &EmptyRegionDriver, &[ReferenceDischargeValue::Reference(sliced.clone())])
             .unwrap();
-        let indexed = indexed[0].try_as_reference("the derived index").unwrap().clone();
+        let indexed = indexed[0].try_as_reference("the index view").unwrap().clone();
         assert_eq!(indexed.allocation_id(), allocation.allocation_id());
         assert_eq!(indexed.r#type(), &ReferenceType::new(ArrayType::new_static(DataType::F32, [2])));
         assert_eq!(
@@ -806,7 +806,7 @@ mod tests {
         );
 
         // An allocation that partial discharge preserved survives in the destination, so the view is additionally replayed
-        // there and the reference that replay produced becomes the derived handle's own destination value. The
+        // there and the reference that replay produced becomes the view's own destination value. The
         // composed alias is recorded exactly as it is for a discharged allocation, which is what keeps one handle's view
         // chain single-sourced whichever state its allocation is in.
         let preserved = context
@@ -820,27 +820,27 @@ mod tests {
             )
             .unwrap();
         let preserved_allocation = preserved.try_as_reference("the preserved allocation").unwrap().allocation_id();
-        let derived = ReferenceIndexOperation::new(0, 0)
+        let view = ReferenceIndexOperation::new(0, 0)
             .discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&preserved))
             .unwrap();
-        assert_eq!(derived.len(), 1);
-        let derived = derived[0].try_as_reference("the derived preserved view").unwrap().clone();
-        assert_eq!(derived.allocation_id(), preserved_allocation);
-        assert_eq!(derived.r#type(), &ReferenceType::new(ArrayType::new_static(DataType::F32, [3])));
+        assert_eq!(view.len(), 1);
+        let view = view[0].try_as_reference("the preserved view").unwrap().clone();
+        assert_eq!(view.allocation_id(), preserved_allocation);
+        assert_eq!(view.r#type(), &ReferenceType::new(ArrayType::new_static(DataType::F32, [3])));
         assert_eq!(
-            derived.alias(),
+            view.alias(),
             &ArrayReferenceView::root()
                 .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 0, index: 0 }),
         );
         assert_eq!(
-            derived.preserved().map(|value| value.r#type().into_owned()),
+            view.preserved().map(|value| value.r#type().into_owned()),
             Some(ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])))),
         );
 
         // The replayed view denotes the coordinates the source named, which the eager destination proves by reading
-        // through the derived handle: the first row of the preserved allocation rather than the allocation itself.
+        // through the view: the first row of the preserved allocation rather than the allocation itself.
         assert_eq!(
-            derived.preserved().map(ReferenceRead::read),
+            view.preserved().map(ReferenceRead::read),
             Some(Ok(TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0])))),
         );
     }
@@ -1341,7 +1341,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(error, ProgramError::MalformedProgram(consumed.to_string()));
 
-        // Consumption invalidates a derived view exactly as it invalidates the allocation, because the view is an alias
+        // Consumption invalidates a view exactly as it invalidates the allocation, because the view is an alias
         // edge onto the same family rather than an independent resource.
         let error = TestContext::trace(
             |input: TestTracer| {

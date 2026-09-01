@@ -128,7 +128,6 @@ impl<C: Domain<Type: From<ReferenceType<P::Referent>>>, P: ReferenceDischargePol
     }
 }
 
-// TODO(eaplatanios): Review this and its impl blocks.
 /// Reference value tracked while reference discharge rewrites a [`Program`]. Each [`ReferenceDischargeReference`]
 /// identifies one allocation and denotes either its complete stored value or a view created by
 /// [`ReferenceDischargeContext::alias_reference`]. Its alias describes how the [`ReferenceDischargePolicy`] accesses
@@ -137,55 +136,54 @@ impl<C: Domain<Type: From<ReferenceType<P::Referent>>>, P: ReferenceDischargePol
 ///
 /// Note that only [`ReferenceDischargeContext`] constructs instances of type while also doing any necessary validation.
 pub struct ReferenceDischargeReference<C: Domain, P: ReferenceDischargePolicy<C>> {
-    /// [`ReferenceDischargeAllocationId`] of the allocation that this [`ReferenceDischargeReference`] denotes.
+    /// Refer to the documentation of [`Self::allocation_id`].
     allocation_id: ReferenceDischargeAllocationId,
 
-    /// [`ReferenceType`] exposed by this [`ReferenceDischargeReference`]. Note that a view can expose a different type
-    /// from the type of the allocation's complete stored value.
+    /// Refer to the documentation of [`Self::r#type`].
     r#type: ReferenceType<P::Referent>,
 
-    /// Boolean that represents whether this [`ReferenceDischargeReference`] is a view created by
-    /// [`ReferenceDischargeContext::alias_reference`] or not. Note that this remains `true` even when the view's
-    /// reference type equals the allocation's reference type.
+    /// Refer to the documentation of [`Self::is_view`].
     is_view: bool,
 
-    /// Alias that an [`ReferenceDischargePolicy`] can use to access the portion selected by this
-    /// [`ReferenceDischargeReference`]. It includes every view step from the allocation's complete stored value to this reference.
+    /// Refer to the documentation of [`Self::alias`].
     alias: P::Alias,
 
-    /// [`ReferenceDischargeBinding`] that specifies whether the allocation of this [`ReferenceDischargeReference`] was
-    /// discharged into explicit state or preserved as a reference in the destination [`Program`], including the exact
-    /// destination reference that this value denoted when it was preserved.
+    /// Refer to the documentation of [`Self::binding`].
     binding: ReferenceDischargeBinding<C::Value>,
 }
 
 impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeReference<C, P> {
-    /// Returns the allocation that this reference denotes.
+    /// Returns the [`ReferenceDischargeAllocationId`] of the allocation that this [`ReferenceDischargeReference`]
+    /// denotes.
     pub const fn allocation_id(&self) -> ReferenceDischargeAllocationId {
         self.allocation_id
     }
 
-    /// Returns the exact reference type exposed by this reference.
+    /// Returns the [`ReferenceType`] exposed by this [`ReferenceDischargeReference`]. Note that a view can expose a
+    /// different type from the type of the allocation's complete stored value.
     pub const fn r#type(&self) -> &ReferenceType<P::Referent> {
         &self.r#type
     }
 
-    /// Returns whether this reference is a view created by [`ReferenceDischargeContext::alias_reference`]. Consumption
-    /// and region boundaries reject views because they operate on the allocation's complete stored value. This function
-    /// returns `true` even when the view's reference type equals the allocation's reference type.
-    pub(super) const fn is_view(&self) -> bool {
+    /// Returns whether this [`ReferenceDischargeReference`] is a view created by
+    /// [`ReferenceDischargeContext::alias_reference`]. Consumption and region boundaries reject views because they
+    /// operate on the allocation's complete stored value. This function returns `true` even when the view's reference
+    /// type equals the allocation's reference type.
+    pub const fn is_view(&self) -> bool {
         self.is_view
     }
 
-    /// Returns the complete alias that the [`ReferenceDischargePolicy`] uses to access the portion selected by this
-    /// reference.
+    /// Returns the alias that a [`ReferenceDischargePolicy`] can use to access the portion selected by this
+    /// [`ReferenceDischargeReference`]. The alias always applies directly to the allocation's complete stored value.
+    /// When this reference is created from another view, the alias therefore describes the portion selected by the new
+    /// reference relative to the complete stored value, rather than relative only to the input view.
     pub const fn alias(&self) -> &P::Alias {
         &self.alias
     }
 
-    /// Returns the exact destination reference value that this reference denotes when its allocation was preserved, or
-    /// [`None`] when the allocation was discharged. For a view of a preserved allocation, this is the result of
-    /// replaying the view operation in the destination program.
+    /// Returns the exact destination reference value that this [`ReferenceDischargeReference`] denotes when its
+    /// allocation is preserved, or [`None`] when the allocation is discharged. For a view of a preserved allocation,
+    /// this is the result of replaying the view operation in the destination [`Program`].
     pub const fn preserved(&self) -> Option<&C::Value> {
         match &self.binding {
             ReferenceDischargeBinding::Discharged => None,
@@ -193,8 +191,11 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeReference<C, P
         }
     }
 
-    /// Returns whether the allocation was discharged into explicit state or preserved as a reference in the
-    /// destination program, including the exact destination reference that this value denotes when it was preserved.
+    /// Returns the [`ReferenceDischargeBinding`] that specifies whether the allocation of this
+    /// [`ReferenceDischargeReference`] was discharged into explicit state or preserved as a reference in the
+    /// destination [`Program`], including the exact destination reference that this value denoted when it was
+    /// preserved.
+    // TODO(eaplatanios): Make private once the `discharge` module review and cleanup is completed.
     pub(super) const fn binding(&self) -> &ReferenceDischargeBinding<C::Value> {
         &self.binding
     }

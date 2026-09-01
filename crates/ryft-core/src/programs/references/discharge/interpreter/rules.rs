@@ -84,12 +84,12 @@ where
 /// is also why it takes no driver: an access carries no regions.
 ///
 /// Each reference operand's *liveness* is checked against the environment rather than assumed from the handle, while
-/// the destination value it contributes comes from the handle itself, which is the only place a derived view's exact
+/// the destination value it contributes comes from the reference itself, which is the only place a view's exact
 /// value lives. Replaying reproduces the source's own operation, which the destination is free to reject later, but a
 /// use-after-consume is discharge's own invariant and belongs at the access that violates it.
 ///
 /// A reference-typed result is rejected rather than wrapped. The environment would have no allocation for it, so it could
-/// later cross a boundary or reach an access as an untracked value; an operation that derives a reference owns that
+/// later cross a boundary or reach an access as an untracked value; an operation that produces a reference owns that
 /// bookkeeping and must state it in its own rule, as the view primitives do.
 ///
 /// # Parameters
@@ -143,7 +143,7 @@ where
             if let Ok(r#type) = <&ReferenceType<P::Referent>>::try_from(output_type.as_ref()) {
                 return Err(ProgramError::MalformedProgram(format!(
                     "reference discharge replayed `{}` over a preserved reference, but its output {output_index} is the \
-                     reference `{type}`; an operation that derives a reference owns that allocation and needs a reference \
+                     reference `{type}`; an operation that produces a reference owns that allocation and needs a reference \
                      discharge rule of its own",
                     operation.name(),
                 )));
@@ -221,7 +221,7 @@ pub trait ReferenceDischargeDriver<C: Domain, P: ReferenceDischargePolicy<C>>:
     ///
     /// Returns [`ProgramError::MalformedProgram`] when this application has no region at `index`, when `boundary` does
     /// not describe that region's declared boundary, when an allocation is threaded twice, when the region publishes an allocation
-    /// its caller did not thread or publishes one through a derived view, and propagates every failure the rebuilt
+    /// its caller did not thread or publishes one through a view, and propagates every failure the rebuilt
     /// region's own rules raise.
     fn discharge_region_program(
         &self,
@@ -568,7 +568,7 @@ mod tests {
             discharge_preserved_access(&ListOperation::ReferenceNew, &staged, std::slice::from_ref(&initial)),
             Err(ProgramError::MalformedProgram(
                 "reference discharge replayed `list.reference_new` over a preserved reference, but its output 0 is the \
-                 reference `ref<list<2>>`; an operation that derives a reference owns that allocation and needs a reference \
+                 reference `ref<list<2>>`; an operation that produces a reference owns that allocation and needs a reference \
                  discharge rule of its own"
                     .to_string(),
             )),

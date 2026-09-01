@@ -4,8 +4,8 @@
 //! program into ordinary array SSA
 //! values by interpreting it under [`ArrayReferenceDischarge`], this universe's [`ReferenceDischargePolicy`]. Index
 //! and static unit-stride slice views lower through canonical slice, reshape, and update-slice operations.
-//! Conditions, loops, scans, and calls widen their own boundaries with explicit immutable allocation state; derived views
-//! must be recreated inside each attached region. The result keeps the original public outputs as a prefix and
+//! Conditions, loops, scans, and calls widen their own boundaries with explicit immutable allocation state; views must
+//! be recreated inside each attached region. The result keeps the original public outputs as a prefix and
 //! appends one hidden final-state output for every mutated external allocation.
 //!
 //! An operation without a [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation) rule of its own
@@ -578,9 +578,9 @@ mod tests {
                 if message.starts_with("reference discharge accessed consumed reference allocation "),
         ));
 
-        // A `freeze` through a derived view names no consumption at all, because consumption yields the complete stored value.
-        // The eager handles and the checked append both reject the same program; discharge runs neither (the frozen
-        // view is again assembled through the unchecked hatch), so it rejects rather than returning a complete-value
+        // A `freeze` through a view names no consumption at all, because consumption yields the complete stored value.
+        // The eager references and the checked append both reject the same program; discharge runs neither (the frozen
+        // view is again assembled through the unchecked hatch), so it rejects rather than returning the complete stored
         // value under the view's narrower type.
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let initial = builder.add_input(ArrayType::new_static(DataType::F32, [4]).into());
@@ -607,13 +607,13 @@ mod tests {
         assert!(matches!(
             source.discharge_references(0),
             Err(ProgramError::MalformedProgram(message)) if message.ends_with(
-                "through the derived view `ref<f32[2]>`; consumption yields the complete stored value, whose referent is \
+                "through the view `ref<f32[2]>`; consumption yields the complete stored value, whose referent is \
                  `f32[4]`",
             ),
         ));
 
-        // A structured boundary carries complete-value state, so a derived view cannot cross one: passing it would widen
-        // the view silently to the allocation's own value. The view has to be re-derived from the allocation inside the region.
+        // A structured boundary carries the complete stored value, so a view cannot cross one: passing it would widen
+        // the view silently to the allocation's own value. The view must be created inside the region.
         let view_type = ReferenceType::new(ArrayType::new_static(DataType::F32, [3]));
         let mut branch_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let branch_input = branch_builder.add_input(view_type.clone().into());
@@ -650,7 +650,7 @@ mod tests {
         assert!(matches!(
             source.discharge_references(0),
             Err(ProgramError::MalformedProgram(message)) if message.ends_with(
-                "across a region boundary, which carries the complete stored value `ref<f32[4]>`; derive the view inside the \
+                "across a region boundary, which carries the complete stored value `ref<f32[4]>`; create the view inside the \
                  region instead",
             ),
         ));
@@ -1223,9 +1223,9 @@ mod tests {
 
     #[test]
     fn test_partial_reference_discharge_keeps_kernel_references_beside_discharged_pipeline_state() {
-        // The shape the kernel pipeline needs: the pipeline's own allocation is normalized into explicit array state while
-        // the allocation a kernel body addresses stays a reference, including the view derived from it and the accesses
-        // performed through that view.
+        // The shape the kernel pipeline needs: the pipeline's own allocation is normalized into explicit array state
+        // while the allocation a kernel body addresses stays a reference, including its view and the accesses through
+        // that view.
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let pipeline_initial = builder.add_input(scalar_type().into());
         let kernel_initial = builder.add_input(ArrayType::new_static(DataType::F32, [3]).into());

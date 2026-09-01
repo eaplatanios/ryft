@@ -324,13 +324,12 @@ where
                             ))
                         })?;
 
-                        // The published value denotes the complete stored value, so only a handle with complete-value provenance may
-                        // cross. A view returned from a region has to be re-derived by whoever needs it, exactly as one
-                        // passed into a region does.
+                        // The boundary publishes the complete stored value, so a view cannot cross it. Whoever needs
+                        // the view must create it inside the region, just as for a view passed into a region.
                         let whole = fork.allocation_entry(reference.allocation_id())?.r#type().into_owned();
-                        if !reference.denotes_complete_value() {
+                        if reference.is_view() {
                             return Err(ProgramError::MalformedProgram(format!(
-                                "reference discharge cannot publish the derived view `{}` of {caller} from region `{}`, \
+                                "reference discharge cannot publish the view `{}` of {caller} from region `{}`, \
                              whose boundary carries the complete stored value `{whole}`",
                                 reference.r#type(),
                                 region.id(),
@@ -444,7 +443,7 @@ where
                                 instruction_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
                             operation.infer_output_types(input_types.as_slice(), &[])?;
 
-                            // Validate every consumption before replay. In particular, an alias cannot consume an
+                            // Validate every consumption before replay. In particular, a view cannot consume an
                             // allocation even when its view has the same reference type as the complete stored value;
                             // rejecting it after binding would leave a destination operation behind on an error path.
                             for reference in &consumed {
@@ -452,13 +451,12 @@ where
                                 let complete_reference_type =
                                     context.allocation_entry(allocation)?.r#type().into_owned();
 
-                                // Consumption yields and invalidates the complete stored value. An alias handle cannot
-                                // name that transition, even when its view happens to have the same reference type as
-                                // the allocation, because type equality does not make it the allocation's whole value.
-                                if !reference.denotes_complete_value() {
+                                // Consumption yields and invalidates the complete stored value. A view cannot name that
+                                // transition even when it has the same reference type as the allocation.
+                                if reference.is_view() {
                                     return Err(ProgramError::MalformedProgram(format!(
-                                        "reference discharge cannot consume {allocation} through the derived view \
-                                         `{}`; consumption yields the complete stored value, whose reference type is \
+                                        "reference discharge cannot consume {allocation} through the view `{}`; \
+                                         consumption yields the complete stored value, whose reference type is \
                                          `{complete_reference_type}`",
                                         reference.r#type(),
                                     )));
@@ -584,21 +582,21 @@ mod tests {
         let reference = preserved.try_as_reference("the preserved reference").unwrap();
         let allocation = reference.allocation_id();
 
-        // A same-type view is still an alias rather than the allocation's complete stored value. Replaying the
-        // consuming operation therefore leaves the allocation live and reports the invalid consumption at this seam.
+        // A same-type view is not the reference for the allocation's complete stored value. Replaying the consuming
+        // operation therefore leaves the allocation live and reports the invalid consumption at this seam.
         let same_type_view = context
             .alias_reference(reference, ListAlias { offset: 0, length: 2 }, reference_type, |value| Ok(value.clone()))
             .unwrap();
         assert_eq!(
             discharge_region_instructions(&context, program.entry_region_ref(), vec![same_type_view]),
             Err(ProgramError::MalformedProgram(format!(
-                "reference discharge cannot consume {allocation} through the derived view `ref<list<2>>`; consumption \
+                "reference discharge cannot consume {allocation} through the view `ref<list<2>>`; consumption \
                  yields the complete stored value, whose reference type is `ref<list<2>>`",
             ))),
         );
         assert_eq!(context.live_allocation_ids(), vec![allocation]);
 
-        // The original handle does denote the complete value. Once its destination operation has been staged, the
+        // The original reference does denote the complete value. Once its destination operation has been staged, the
         // allocation entry disappears so every later access is diagnosed as a use-after-consume.
         assert!(discharge_region_instructions(&context, program.entry_region_ref(), vec![preserved]).is_ok());
         assert!(context.live_allocation_ids().is_empty());
@@ -787,7 +785,7 @@ mod tests {
         assert_eq!(
             driver.discharge_region_program(&context, 0, &boundary).unwrap_err(),
             ProgramError::MalformedProgram(format!(
-                "reference discharge cannot publish the derived view `ref<list<2>>` of {allocation} from region `{}`, \
+                "reference discharge cannot publish the view `ref<list<2>>` of {allocation} from region `{}`, \
                  whose boundary carries the complete stored value `ref<list<2>>`",
                 regions[0].entry_region_ref().id(),
             )),

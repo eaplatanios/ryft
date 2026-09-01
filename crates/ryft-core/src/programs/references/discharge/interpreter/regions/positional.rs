@@ -43,10 +43,10 @@ use super::boundaries::{ReferenceRegionDischargeBoundary, ReferenceRegionStateIn
 ///
 /// Returns [`ProgramError::MalformedProgram`] when the application has fewer operands than
 /// `leading_operand_count`, when a leading operand is a live reference handle, when an attached region's boundary does
-/// not forward the remaining operands positionally, when a reference operand names a derived view rather than a whole
-/// allocation, when a region closure reaches an allocation that never entered the boundary or consumes one, when a region returns a
-/// allocation its caller never threaded, when the attached regions disagree on which outputs denote references, or when a
-/// region mutates an allocation the widening did not predict.
+/// not forward the remaining operands positionally, when a reference operand is a view rather than the reference for
+/// the complete stored value, when a region closure reaches an allocation that never entered the boundary or consumes
+/// one, when a region returns an allocation its caller never threaded, when the attached regions disagree on which
+/// outputs denote references, or when a region mutates an allocation the widening did not predict.
 pub fn discharge_positional_region_operation<C, P, O, D>(
     operation: &O,
     context: &ReferenceDischargeContext<C, P>,
