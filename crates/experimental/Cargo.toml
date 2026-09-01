@@ -2,6 +2,7 @@
 name = "ryft-experimental"
 version = "0.1.0"
 readme = "README.md"
+publish = false
 
 authors.workspace = true
 edition.workspace = true
@@ -10,7 +11,15 @@ categories.workspace = true
 license.workspace = true
 
 [dependencies]
-ryft = { path = "../ryft", version = "0.0.1" }
-half.workspace = true
-paste.workspace = true
-thiserror.workspace = true
+ryft-cuda.workspace = true
+ryft-pjrt.workspace = true
+
+[dev-dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[features]
+default = []
+cuda-12 = ["ryft-pjrt/cuda-12"]
+cuda-13 = ["ryft-pjrt/cuda-13"]

@@ -163,17 +163,17 @@ where
 pub trait ReferenceDischargeDriver<C: Domain, P: ReferenceDischargePolicy<C>>:
     RegionDriver<C::Constant, C::Operation>
 {
-    /// Returns the source coordinate of the operation application being discharged, or [`None`] when the application
-    /// did not come from a replayed instruction.
+    /// Returns the source program location of the operation application being discharged, or [`None`] when the
+    /// application did not come from a replayed instruction.
     ///
     /// An allocation rule needs its own target to decide whether the caller selected it for discharge, so replaying a
-    /// region through [`discharge_region`](Self::discharge_region) must supply the coordinate of every instruction it
-    /// replays. Returning [`None`] declares the allocation unnameable by any
+    /// region through [`discharge_region`](Self::discharge_region) must supply the source program location of every
+    /// instruction it replays. Returning [`None`] declares the allocation unnameable by any
     /// [`ReferenceDischargeTarget`](crate::programs::references::ReferenceDischargeTarget) and therefore *always
     /// discharged*, silently ignoring
-    /// the caller's partial-discharge targets. This function is deliberately required
-    /// rather than defaulted: a replaying driver that forgot to forward its coordinate would otherwise disable
-    /// partial discharge for its regions without any diagnostic.
+    /// the caller's partial-discharge targets. This function is deliberately required rather than defaulted: a
+    /// replaying driver that forgot to forward the source program location would otherwise disable partial discharge
+    /// for its regions without any diagnostic.
     fn instruction(&self) -> Option<InstructionId>;
 
     /// Discharges the region at `index` over the provided carriers by re-entering the active discharge transform,
@@ -234,7 +234,7 @@ pub trait ReferenceDischargeDriver<C: Domain, P: ReferenceDischargePolicy<C>>:
 }
 
 impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeDriver<C, P> for EmptyRegionDriver {
-    // A region-free application replays no instruction, so its allocations carry no selectable coordinate.
+    // A region-free application replays no instruction, so its allocations have no selectable source program location.
     #[inline]
     fn instruction(&self) -> Option<InstructionId> {
         None
@@ -518,7 +518,7 @@ mod tests {
         // Every allocation the program created is gone once its `freeze` consumed it, so nothing leaks into the context.
         assert_eq!(context.live_allocation_ids(), Vec::new());
 
-        // Replaying through the driver supplies every instruction's own source coordinate, which is what makes the
+        // Replaying through the driver supplies every instruction's source program location, which is what makes the
         // allocation selectable by a partial-discharge target.
         let observed = OBSERVED_ALLOCATION_POSITIONS.with_borrow(Vec::clone);
         assert_eq!(observed.len(), 1);

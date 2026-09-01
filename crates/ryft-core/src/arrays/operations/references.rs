@@ -322,7 +322,7 @@ where
     let reference = inputs[0].expect_reference("a reference to view")?;
     let referent = transform.output_type(reference.r#type().referent())?;
     let alias = reference.alias().with_transform_unchecked(transform);
-    Ok(vec![context.derive(reference, alias, ReferenceType::new(referent), |value| {
+    Ok(vec![context.derive_reference(reference, alias, ReferenceType::new(referent), |value| {
         let mut outputs = context.parent().bind(operation.clone(), Vec::new(), std::slice::from_ref(value))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
@@ -744,7 +744,7 @@ mod tests {
         let context = ReferenceDischargeContext::<TestDestination, ArrayReferenceDischarge>::new(EagerContext::new());
         let allocation_type = ArrayType::new_static(DataType::F32, [3, 3]);
         let allocated = context
-            .allocate_discharged(
+            .bind_discharged(
                 ReferenceType::new(allocation_type.clone()),
                 TestValue::Array(Array::matrix(3, 3, (1..=9).map(|value| value as f32).collect())),
             )

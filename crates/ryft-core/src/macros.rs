@@ -6044,7 +6044,7 @@ mod tests {
         // its own rewrite. The handle's own rendering is spliced into the expected diagnostic because a top-level
         // environment identity is minted process-globally and is therefore not stable across runs.
         let reference = context
-            .allocate_discharged(ReferenceType::new(ArrayType::scalar(DataType::F32)), Array::scalar(1.0f32))
+            .bind_discharged(ReferenceType::new(ArrayType::scalar(DataType::F32)), Array::scalar(1.0f32))
             .unwrap();
         assert_eq!(
             operation.discharge_references(&context, &EmptyRegionDriver, &[reference.clone()]),

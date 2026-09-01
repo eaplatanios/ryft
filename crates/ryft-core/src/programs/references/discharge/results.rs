@@ -134,8 +134,8 @@ impl<V: Value, O: Operation<Type = V::Type>> TryFrom<PartialReferenceDischargeRe
             ));
         }
 
-        // The closure traversal visits regions in an unspecified order, so the reported occurrence is the smallest
-        // coordinate rather than the first one encountered, keeping the diagnostic reproducible.
+        // The closure traversal visits regions in an unspecified order, so the reported occurrence is the earliest
+        // instruction position rather than the first one encountered, keeping the diagnostic reproducible.
         if let Some((instruction_id, instruction)) = entry
             .instructions_in_closure()
             .filter(|(_, instruction)| !instruction.operation().reference_semantics().is_empty())

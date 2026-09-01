@@ -32,7 +32,7 @@ pub struct RecursiveReferenceDischargeDriver<'r, D> {
     /// Application-scoped [`RegionDriver`].
     driver: &'r D,
 
-    /// Source coordinate of the application, or [`None`] for an application that replays no instruction.
+    /// Source program location of the application, or [`None`] for an application that replays no instruction.
     instruction: Option<InstructionId>,
 }
 
@@ -42,7 +42,7 @@ impl<'r, D> RecursiveReferenceDischargeDriver<'r, D> {
     /// # Parameters
     ///
     ///   - `driver`: Application-scoped [`RegionDriver`] exposing the attached regions.
-    ///   - `instruction`: Source coordinate of the application, or [`None`] for an application that replays no
+    ///   - `instruction`: Source program location of the application, or [`None`] for an application that replays no
     ///     instruction.
     pub const fn new(driver: &'r D, instruction: Option<InstructionId>) -> Self {
         Self { driver, instruction }
@@ -157,9 +157,9 @@ where
         let destination = Destination::<C>::new();
         let builder = destination.builder().clone();
         let (output_ids, output_allocations, mutated_allocations) = {
-            // The fork inherits its caller's targets, because a target names a source coordinate that means the same thing
-            // wherever the replay reaches it: an unselected allocation inside a rebuilt region survives there exactly as
-            // it would have in the caller's own body.
+            // The fork inherits its caller's targets because a target names the same source program location wherever
+            // the replay reaches it: an unselected allocation inside a rebuilt region survives there exactly as it would
+            // have in the caller's own body.
             let fork = ReferenceDischargeContext::<Destination<C>, P>::new_with_targets(
                 destination.clone(),
                 context.targets().clone(),
@@ -673,8 +673,8 @@ mod tests {
         let context = ListDischargeContext::new(ListDestination::new());
         let position = InstructionId::new(RegionId::new(0), 3);
 
-        // A driver built without a source instruction reports none, and one built for a replayed instruction reports
-        // exactly that coordinate.
+        // A driver built without a source program location reports none, and one built for a replayed instruction
+        // reports exactly that source program location.
         assert_eq!(
             ReferenceDischargeDriver::<ListDestination, ListReferenceDischarge>::instruction(&EmptyRegionDriver),
             None,

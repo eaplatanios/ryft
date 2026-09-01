@@ -29,25 +29,24 @@ use crate::tracing::TracingContext;
 // TODO(eaplatanios): Order declarations as `ReferenceDischargeableType` -> `ReferenceDischargePolicy` ->
 //  `ReferenceAccumulationPolicy` -> `ReferenceDischargeDriver` -> `ReferenceDischargeContext`.
 
-/// Active state of one reference discharge transform.
-///
-/// Reference discharge interprets a source [`Program`] into a destination [`Program`], one [`Region`](crate::Region)
-/// at a time through a [`ReferenceDischargeDriver`]. Each replayed [`Instruction`](crate::Instruction) dispatches to
-/// its [`ReferenceDischargeableOperation`] implementation with this context, and the rule emits destination work
-/// through [`parent`](Self::parent).
+/// Active state of a reference discharge transform. Reference discharge interprets a source [`Program`] into a
+/// destination [`Program`], one [`Region`](crate::Region) at a time through a [`ReferenceDischargeDriver`]. Each
+/// replayed [`Instruction`](crate::Instruction) dispatches to its [`ReferenceDischargeableOperation`] implementation
+/// with this context, and that implementation emits destination work through [`parent`](Self::parent).
 ///
 /// Each source reference allocation is bound into this context exactly once. [`bind_discharged`](Self::bind_discharged)
-/// records an allocation as explicit immutable state, while [`bind_preserved`](Self::bind_preserved) records the exact
-/// destination reference value when partial discharge leaves the allocation intact. That fate never changes. A rule
-/// uses [`derive_reference`](Self::derive_reference) to construct another view of the same allocation, then either
-/// rewrites accesses through [`read`](Self::read), [`write`](Self::write), [`swap`](Self::swap), and
-/// [`accumulate`](Self::accumulate), or replays them against the preserved destination reference.
+/// records an allocation as explicit immutable state, while [`bind_preserved`](Self::bind_preserved) records the
+/// exact destination reference value when partial discharge leaves the allocation intact. That fate never changes.
+/// A [`ReferenceDischargeableOperation`] implementation uses [`derive_reference`](Self::derive_reference) to construct
+/// another view of the same allocation, then either rewrites accesses through [`read`](Self::read),
+/// [`write`](Self::write), [`swap`](Self::swap), and [`accumulate`](Self::accumulate), or replays
+/// them against the preserved destination reference.
 ///
 /// The allocation environment lives on the context rather than on flowing values because references carry identity:
-/// several reference values can denote different views of the same allocation, and every one must observe the same
-/// current state and liveness. Clones therefore share one environment. A structured rule that must rebuild an attached
-/// region instead uses [`ReferenceDischargeDriver::discharge_region_program`], which creates an isolated environment
-/// and commits nothing here until the rule explicitly merges its outputs.
+/// several reference values can denote different views of the same allocation, and every one of them must observe the
+/// same current state and liveness. Clones therefore share one environment. A structured rule that must rebuild an
+/// attached region instead uses [`ReferenceDischargeDriver::discharge_region_program`], which creates an isolated
+/// environment and commits nothing here until the rule explicitly merges its outputs.
 pub struct ReferenceDischargeContext<C: Domain, P: ReferenceDischargePolicy<C>> {
     /// Destination context that owns the discharged values and executes or stages the rewritten work.
     parent: C,
@@ -62,7 +61,7 @@ pub struct ReferenceDischargeContext<C: Domain, P: ReferenceDischargePolicy<C>> 
 
     /// [`ReferenceDischargeTargets`] that the current reference discharge transform normalizes into immutable state.
     /// Every allocation they omit is preserved, and the targets are shared unchanged by every clone and by every region
-    /// fork, because a target names a source coordinate that means the same thing wherever the replay reaches it.
+    /// fork, because a target names the same source program location wherever the replay reaches it.
     targets: ReferenceDischargeTargets,
 }
 
@@ -71,8 +70,8 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     /// context starts with no live allocations or capture bindings. Capture bindings are populated while the program
     /// boundary is threaded because they refer to allocations minted by this context. To request partial discharge,
     /// use [`Program::partially_discharge_references`](crate::Program::partially_discharge_references) instead of
-    /// constructing a context directly; that function validates the targets against the program whose coordinates
-    /// they name.
+    /// constructing a context directly; that function validates the targets against the program in which they were
+    /// identified.
     #[inline]
     pub fn new(parent: C) -> Self {
         Self::new_with_targets(parent, ReferenceDischargeTargets::everything())
@@ -129,9 +128,9 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     /// Returns whether the allocation an [`Instruction`](crate::Instruction) performs was selected for discharge,
     /// which is what an allocation rule asks before deciding between a discharged reference and one that survives in
     /// the destination. An operation application that did not come from a replayed instruction (i.e., a region-free
-    /// rule invocation through [`EmptyRegionDriver`](crate::programs::EmptyRegionDriver)) has no source coordinate and
-    /// is always discharged as no [`ReferenceDischargeTarget`] can name it, and so declining it would express nothing
-    /// about the caller's choice.
+    /// rule invocation through [`EmptyRegionDriver`](crate::programs::EmptyRegionDriver)) has no source program
+    /// location and is always discharged as no [`ReferenceDischargeTarget`] can name it, and so declining it would
+    /// express nothing about the caller's choice.
     ///
     /// This is the only target query a rule ever makes, which is why it is the only one exposed. Whether an entry
     /// boundary allocation was selected is decided once, by the program-level entry point that threads the boundary,
@@ -153,14 +152,12 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     pub fn selects_external(&self, source: ReferenceSource) -> bool {
         self.targets.selects(ReferenceDischargeTarget::External(source))
     }
-    
+
     // TODO(eaplatanios): Review from here onwards.
 
-    /// Returns the complete current immutable state of one live discharged allocation.
-    ///
-    /// Operation rules normally use [`read`](Self::read) to observe the coordinates selected by a reference value.
-    /// Structured-operation implementations use this function when they must thread the allocation's complete state
-    /// across a destination boundary.
+    /// Returns the complete current immutable state of one live discharged allocation. Operation rules normally use
+    /// [`read`](Self::read) to observe the portion selected by a reference value. Structured-operation implementations
+    /// use this function when they must thread the allocation's complete state across a destination boundary.
     ///
     /// # Errors
     ///
@@ -396,7 +393,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         }))
     }
 
-    /// Reads the coordinates that `reference` selects from its discharged allocation's current state.
+    /// Reads the portion that `reference` selects from its discharged allocation's current state.
     ///
     /// Reference-operation rules call this function only for discharged references. An access to a preserved reference
     /// must instead replay the source operation against [`ReferenceDischargeReference::preserved`].
@@ -411,15 +408,15 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         P::read(&self.parent, &current, reference.alias())
     }
 
-    /// Replaces the coordinates that `reference` selects in a discharged allocation.
+    /// Replaces the portion that `reference` selects in a discharged allocation.
     ///
     /// The policy returns a complete successor state, which this function installs through
     /// [`update_discharged_state`](Self::update_discharged_state) and records as a mutation.
     ///
     /// # Parameters
     ///
-    ///   - `reference`: Handle selecting the coordinates to replace.
-    ///   - `replacement`: Value written into the selected coordinates.
+    ///   - `reference`: Handle selecting the portion to replace.
+    ///   - `replacement`: Value written into the selected portion.
     ///
     /// # Errors
     ///
@@ -439,15 +436,15 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         self.update_discharged_state(allocation, successor, true)
     }
 
-    /// Replaces the coordinates that `reference` selects and returns their previous contents.
+    /// Replaces the portion that `reference` selects and returns its previous contents.
     ///
     /// Like [`write`](Self::write), this function installs the policy's complete successor state and records a
     /// mutation; unlike `write`, it also returns the value selected before replacement.
     ///
     /// # Parameters
     ///
-    ///   - `reference`: Handle selecting the coordinates to replace.
-    ///   - `replacement`: Value written into the selected coordinates.
+    ///   - `reference`: Handle selecting the portion to replace.
+    ///   - `replacement`: Value written into the selected portion.
     ///
     /// # Errors
     ///
@@ -468,14 +465,14 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         Ok(previous)
     }
 
-    /// Accumulates `update` into the coordinates that `reference` selects in a discharged allocation.
+    /// Accumulates `update` into the portion that `reference` selects in a discharged allocation.
     ///
     /// The policy returns a complete successor state, which this function installs and records as a mutation.
     ///
     /// # Parameters
     ///
-    ///   - `reference`: Handle selecting the coordinates to accumulate into.
-    ///   - `update`: Value added into the selected coordinates.
+    ///   - `reference`: Handle selecting the portion to update.
+    ///   - `update`: Value accumulated into the selected portion.
     ///
     /// # Errors
     ///
@@ -693,7 +690,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> Debug for ReferenceDischargeCont
 /// Identity of one reference allocation inside a running reference discharge.
 ///
 /// IDs are minted by [`ReferenceDischargeContext`] as allocations enter its environment, so they are temporary
-/// discharge identities rather than source-program coordinates. They exist only for the duration of one discharge and
+/// discharge identities rather than source program locations. They exist only for the duration of one discharge and
 /// are meaningful only against the environment that produced them. Pre-transform identity for caller-facing targets
 /// is [`ReferenceDischargeTarget`] instead.
 ///
@@ -1534,8 +1531,8 @@ mod tests {
         assert_eq!(reference.preserved(), None);
         assert_eq!(context.read(&reference), Ok(ListIrValue::List(vec![1, 2, 3, 4])));
 
-        // A derived handle narrows the view without touching the allocation's identity, and its accesses act only on the
-        // coordinates it selects.
+        // A derived handle narrows the view without touching the allocation's identity, and its accesses act only
+        // on the portion it selects.
         let view = context
             .derive_reference(
                 &reference,

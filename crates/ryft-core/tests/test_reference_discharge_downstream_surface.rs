@@ -377,7 +377,7 @@ where
                 check_count!("input", inputs, 1, ProgramError);
                 let initial = inputs[0].expect_ordinary("an initial state")?.clone();
                 if context.selects_internal(driver.instruction(), 0) {
-                    return Ok(vec![context.allocate_discharged(ReferenceType::new(RegisterType), initial)?]);
+                    return Ok(vec![context.bind_discharged(ReferenceType::new(RegisterType), initial)?]);
                 }
                 let mut outputs = context.parent().bind(*self, Vec::new(), std::slice::from_ref(&initial))?;
                 check_count!("output", outputs, 1, ProgramError);
@@ -505,7 +505,25 @@ fn test_downstream_reference_universe_discharges_through_the_public_surface() {
             RegisterDischargeValue::Ordinary(RegisterValue(3)),
         ]),
     );
-    assert_eq!(context.live_allocations(), Vec::new());
+    assert_eq!(context.live_allocation_ids(), Vec::new());
+}
+
+#[test]
+fn test_downstream_reference_discharge_context_environment_accessors() {
+    let context = RegisterDischargeContext::new(RegisterDestination::new());
+    let bound = context.bind_discharged(ReferenceType::new(RegisterType), RegisterValue(1)).unwrap();
+    let allocation = bound.expect_reference("a downstream allocation").unwrap().allocation_id();
+
+    // These ID-based operations are the public seam custom structured transforms use to inspect, thread, and merge
+    // discharged state without accessing the environment's private representation.
+    assert_eq!(context.live_allocation_ids(), vec![allocation]);
+    assert_eq!(context.is_allocation_discharged(allocation), Ok(true));
+    assert_eq!(context.discharged_state(allocation), Ok(RegisterValue(1)));
+    assert_eq!(context.is_mutated(allocation), Ok(false));
+    assert_eq!(context.allocation_handle(allocation), Ok(bound));
+    assert_eq!(context.update_discharged_state(allocation, RegisterValue(2), true), Ok(()));
+    assert_eq!(context.discharged_state(allocation), Ok(RegisterValue(2)));
+    assert_eq!(context.is_mutated(allocation), Ok(true));
 }
 
 #[test]
@@ -536,7 +554,7 @@ fn test_downstream_reference_universe_discharges_into_a_staged_program() {
         let regions = [source];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let outputs = driver.discharge_region(&context, 0, carriers)?;
-        assert_eq!(context.live_allocations(), Vec::new());
+        assert_eq!(context.live_allocation_ids(), Vec::new());
         outputs
             .iter()
             .map(|output| output.expect_ordinary("a discharged output").cloned())
@@ -638,7 +656,7 @@ fn test_downstream_region_summary_exposes_exact_access_modes() {
         .unwrap();
 
     let context = RegisterDischargeContext::new(RegisterDestination::new());
-    let reference = context.allocate_discharged(ReferenceType::new(RegisterType), RegisterValue(1)).unwrap();
+    let reference = context.bind_discharged(ReferenceType::new(RegisterType), RegisterValue(1)).unwrap();
     let allocation = reference.expect_reference("a downstream allocation").unwrap().allocation_id();
     let summary = context
         .region_summary(&RegisterOperation::Call, 0, region.entry_region_ref(), &[Some(allocation), None])

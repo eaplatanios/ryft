@@ -102,8 +102,8 @@
 //!
 //! # Allocation Identities and Boundaries
 //!
-//! [`ReferenceDischargeTarget`] is a source-program coordinate used before replay to select an external reference or a
-//! locally allocated reference. [`ReferenceDischargeAllocationId`] is different: it is a temporary identity minted
+//! [`ReferenceDischargeTarget`] names a source program location used before replay to select an external reference or
+//! a locally allocated reference. [`ReferenceDischargeAllocationId`] is different: it is a temporary identity minted
 //! inside one live discharge environment. IDs from isolated region forks cannot address parent allocations, and fork
 //! results carry sealed programs and context-free summaries rather than child-context values.
 //!
@@ -127,11 +127,11 @@
 //!
 //! - An **external source** is the capture or public input through which caller-owned reference state enters, named by
 //!   [`ReferenceSource`].
-//! - A **discharge target** is a stable source-program coordinate used to select an external reference or internal
+//! - A **discharge target** is a stable source program location used to select an external reference or internal
 //!   allocation for partial discharge, represented by [`ReferenceDischargeTarget`].
 //! - An **allocation identity** is the temporary [`ReferenceDischargeAllocationId`] by which one running interpreter
-//!   identifies a reference allocation. It is not a source-program coordinate and cannot cross between isolated
-//!   environments.
+//!   identifies a reference allocation. It does not identify a source program location and cannot cross between
+//!   isolated environments.
 //! - A **discharged reference** is represented by its current immutable state. A **preserved reference** remains
 //!   represented by a reference value and its reference operations are replayed rather than rewritten.
 //! - A **carrier** is a [`ReferenceDischargeValue`]: either an ordinary destination value or a temporary reference

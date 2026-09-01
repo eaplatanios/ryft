@@ -18,10 +18,10 @@ use crate::programs::values::Value;
 /// single caller-owned reference and is deliberately not selectable. Targets resolve internally to allocations once
 /// discharge starts.
 ///
-/// Targets are arena-relative in exactly the sense that every other reference artifact is (i.e., their coordinates are
-/// meaningful only against the program they were enumerated from). Target validation rejects every kind mismatch, and
-/// the arena-relativity contract carries the rest because a coordinate taken from a different arena that happens to
-/// name a valid allocation here is indistinguishable in principle.
+/// Targets are arena-relative in exactly the sense that every other reference artifact is: their instruction and
+/// boundary identifiers are meaningful only in the program arena from which they were enumerated. Target validation
+/// rejects every kind mismatch, and the arena-relativity contract carries the rest because a target from a different
+/// arena that happens to name a valid allocation here is indistinguishable in principle.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReferenceDischargeTarget {
     /// Entry-boundary allocation supplied by the caller as a lifted capture or a public reference argument.
@@ -150,11 +150,11 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
 {
     /// Returns every [`ReferenceDischargeTarget`] that this [`Program`] exposes to partial reference discharge, in a
     /// canonical ordering with the entry-boundary externals in boundary order, followed by the interior allocations
-    /// ordered by their arena coordinates. This is a deliberately lightweight query. It reads only the entry boundary
-    /// types and the generic [`Operation::reference_semantics`] over the attached [`Region`](crate::Region) closure,
-    /// so it does not run the discharge rewrite or construct its environments, and callers can enumerate selectable
-    /// targets without paying for either. Allocations inside nested regions are included because every allocating
-    /// [`Instruction`](crate::Instruction) defines a concrete local reference wherever it occurs.
+    /// ordered by instruction and output position. This is a deliberately lightweight query. It reads only the entry
+    /// boundary types and the generic [`Operation::reference_semantics`] over the attached [`Region`](crate::Region)
+    /// closure, so it does not run the discharge rewrite or construct its environments, and callers can enumerate
+    /// selectable targets without paying for either. Allocations inside nested regions are included because every
+    /// allocating [`Instruction`](crate::Instruction) defines a concrete local reference wherever it occurs.
     ///
     /// One class of enumerated targets is inert: an allocation inside a closure that no operation ever replays, such
     /// as the dormant derivative rule region of a [`CustomJvpOperation`](crate::CustomJvpOperation). Discharge rejects
@@ -209,8 +209,8 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
             })
             .collect::<Vec<_>>();
 
-        // Closure traversal visits regions in an unspecified order, so allocation coordinates are sorted to make the
-        // enumeration reproducible for callers that persist or compare target sets.
+        // Closure traversal visits regions in an unspecified order, so internal targets are sorted by instruction and
+        // output position to make the enumeration reproducible for callers that persist or compare target sets.
         allocations.sort_unstable();
         targets.append(&mut allocations);
         Ok(targets)
@@ -365,8 +365,8 @@ mod tests {
             )
             .unwrap();
 
-        // Closure traversal order is unspecified, so internal targets must be sorted by arena coordinate.
-        // Importing the same region at two call sites must not duplicate the allocation it contains.
+        // Closure traversal order is unspecified, so internal targets must be sorted by instruction and output
+        // position. Importing the same region at two call sites must not duplicate the allocation it contains.
         assert_eq!(
             program.reference_discharge_targets(0),
             Ok(vec![

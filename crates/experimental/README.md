@@ -1,4 +1,10 @@
-# TODOs
+# Ryft Experimental
+
+This unpublished crate contains test-only integration seam probes. It does not expose supported runtime APIs.
+
+The cuTile CUDA probe exports a cubin and a JSON metadata record with `tools/cutile/export_vector_add.py`. The test
+consumes both `RYFT_CUTILE_CUBIN` and `RYFT_CUTILE_METADATA`, validates the artifact checksum and launch contract, and
+launches it through `ryft-cuda` using the production `ryft-pjrt` XLA FFI adapter.
 
 - [ ] For JAX-level support we need to be able to load the MLIR dialects and passes that are listed
   [here](https://github.com/jax-ml/jax/blob/d13a4754e3a8e265008ac3ab23c27d4cb244b8b9/jax/_src/interpreters/mlir.py#L601).
