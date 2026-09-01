@@ -61,7 +61,7 @@
 //! implements [`ReferenceDischargeableOperation`] to rewrite its own reference effects. Region-free operations can
 //! delegate to [`discharge_reference_free_operation`]; structured operations use [`ReferenceDischargeDriver`],
 //! [`ReferenceRegionSummary`], and
-//! [`ReferenceRegionDischargeBoundary`] to rebuild attached regions with the necessary state positions.
+//! [`ReferenceDischargeRegionBoundary`] to rebuild attached regions with the necessary state positions.
 //!
 //! # Full and Partial Discharge
 //!
@@ -93,7 +93,7 @@
 //!   verbatim.
 //! - [`ReferenceDischargeDriver`] exposes the current source instruction and attached regions. It can replay a region
 //!   against the live environment or rebuild one against an isolated environment and return a sealed
-//!   [`ReferenceRegionDischargeFork`]. [`ReferenceRegionSummary`] supplies the transitive access facts a structured
+//!   [`ReferenceDischargeRegionResult`]. [`ReferenceRegionSummary`] supplies the transitive access facts a structured
 //!   rule needs before choosing its state boundary.
 //!
 //! The driver provides shared mechanics but never chooses how an operation is rewritten. This keeps the system open:
@@ -104,10 +104,10 @@
 //!
 //! [`ReferenceDischargeTarget`] names a source program location used before replay to select an external reference or
 //! a locally allocated reference. [`ReferenceDischargeAllocationId`] is different: it is a temporary identity minted
-//! inside one live discharge environment. IDs from isolated region forks cannot address parent allocations, and fork
-//! results carry sealed programs and context-free summaries rather than child-context values.
+//! inside one live discharge environment. IDs from isolated region rebuilds cannot address parent allocations, and
+//! [`ReferenceDischargeRegionResult`] carries a sealed program and context-free summaries rather than temporary values.
 //!
-//! Structured rules use [`ReferenceRegionDischargeBoundary`] to describe their declared inputs plus the discharged
+//! Structured rules use [`ReferenceDischargeRegionBoundary`] to describe their declared inputs plus the discharged
 //! allocations that must enter and leave a rebuilt region. Read-only allocations are pruned where the operation's boundary permits
 //! it; loop-shaped operations retain the symmetry their fixed-point contracts require. Every rebuilt region is
 //! validated against the allocations and mutations its summary predicted before the parent environment accepts its outputs.
@@ -149,16 +149,15 @@ mod interpreter;
 mod transform;
 
 pub use interpreter::{
-    RecursiveReferenceDischargeDriver, ReferenceDischargeDriver, ReferenceDischargeRegionDestination,
-    ReferenceDischargeableOperation, ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork,
-    ReferenceRegionStateInsertion, ReferenceRegionSummary, ReferenceStateWidening,
+    ReferenceDischargeRegionBoundary, ReferenceDischargeRegionDestination, ReferenceDischargeRegionResult,
+    ReferenceDischargeableOperation, ReferenceRegionStateInsertion, ReferenceRegionSummary, ReferenceStateWidening,
     discharge_positional_region_operation, discharge_preserved_access, discharge_reference_free_operation,
 };
 pub use transform::{
-    ExternalReferenceBinding, PartialReferenceDischargeResult, ReferenceAccumulationPolicy,
-    ReferenceDischargeAllocationId, ReferenceDischargeContext, ReferenceDischargePolicy, ReferenceDischargeReference,
-    ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableType,
-    ReferenceSource,
+    ExternalReferenceBinding, PartialReferenceDischargeResult, RecursiveReferenceDischargeDriver,
+    ReferenceAccumulationPolicy, ReferenceDischargeAllocationId, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePolicy, ReferenceDischargeReference, ReferenceDischargeResult, ReferenceDischargeTarget,
+    ReferenceDischargeValue, ReferenceDischargeableType, ReferenceSource,
 };
 
 #[cfg(test)]
@@ -893,7 +892,8 @@ pub(crate) mod tests {
                 }
                 Self::ReferenceNew => {
                     check_count!("input", inputs, 1, ProgramError);
-                    OBSERVED_ALLOCATION_POSITIONS.with_borrow_mut(|positions| positions.push(driver.instruction()));
+                    OBSERVED_ALLOCATION_POSITIONS
+                        .with_borrow_mut(|positions| positions.push(driver.source_instruction_id()));
                     let initial = inputs[0].try_as_value("an initial state")?.clone();
                     let initial_type = initial.r#type().into_owned();
                     let output_type = self.infer_output_types(std::slice::from_ref(&initial_type), &[])?.remove(0);
@@ -904,7 +904,7 @@ pub(crate) mod tests {
                             )
                         })?
                         .clone();
-                    if context.selects_internal(driver.instruction(), 0) {
+                    if context.selects_internal(driver.source_instruction_id(), 0) {
                         return Ok(vec![context.bind_discharged(r#type, initial)?]);
                     }
                     let mut outputs = context.parent().bind(*self, Vec::new(), std::slice::from_ref(&initial))?;

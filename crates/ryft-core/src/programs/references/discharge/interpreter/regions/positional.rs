@@ -5,11 +5,12 @@ use crate::macros::check_count;
 use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
 use crate::programs::references::discharge::transform::ReferenceDischargePolicy;
-use crate::programs::references::discharge::transform::{ReferenceDischargeContext, ReferenceDischargeValue};
+use crate::programs::references::discharge::transform::{
+    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargeValue,
+};
 
-use super::super::rules::ReferenceDischargeDriver;
 use super::ReferenceRegionSummary;
-use super::boundaries::{ReferenceRegionDischargeBoundary, ReferenceRegionStateInsertion};
+use super::boundaries::{ReferenceDischargeRegionBoundary, ReferenceRegionStateInsertion};
 
 // TODO(eaplatanios): Review this module.
 
@@ -120,17 +121,17 @@ where
     for index in 0..region_count {
         // Every region receives the same state positions, so a rebuilt condition's branches keep agreeing with each
         // other. Only the capture prefix is read per region, because it is the operation's own per-region declaration.
-        let boundary = ReferenceRegionDischargeBoundary::new(
+        let boundary = ReferenceDischargeRegionBoundary::new(
             operation,
             index,
             declared_input_allocations.clone(),
             ReferenceRegionStateInsertion::new(entering.clone(), forwarded.len()),
             ReferenceRegionStateInsertion::new(leaving.clone(), source_output_count),
         );
-        let fork = driver.discharge_region_program(context, index, &boundary)?;
-        fork.validate_predicted_mutations(published.as_slice(), name)?;
-        fork.validate_predicted_output_allocations(summary.output_allocations(), name)?;
-        regions.push(fork.into_program());
+        let result = driver.rebuild_region(context, index, &boundary)?;
+        result.validate_predicted_mutations(published.as_slice(), name)?;
+        result.validate_predicted_output_allocations(summary.output_allocations(), name)?;
+        regions.push(result.into_program());
     }
     let output_allocations = summary.output_allocations();
 

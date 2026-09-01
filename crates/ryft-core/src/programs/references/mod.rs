@@ -175,9 +175,9 @@ mod values;
 pub use discharge::{
     ExternalReferenceBinding, PartialReferenceDischargeResult, RecursiveReferenceDischargeDriver,
     ReferenceAccumulationPolicy, ReferenceDischargeAllocationId, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeReference, ReferenceDischargeRegionDestination,
-    ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceDischargeableType, ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork,
+    ReferenceDischargePolicy, ReferenceDischargeReference, ReferenceDischargeRegionBoundary,
+    ReferenceDischargeRegionDestination, ReferenceDischargeRegionResult, ReferenceDischargeResult,
+    ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType,
     ReferenceRegionStateInsertion, ReferenceRegionSummary, ReferenceSource, ReferenceStateWidening,
     discharge_positional_region_operation, discharge_preserved_access, discharge_reference_free_operation,
 };

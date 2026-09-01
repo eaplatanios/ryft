@@ -1,14 +1,12 @@
 use crate::contexts::{Context, Domain};
 use crate::programs::ProgramError;
-use crate::programs::instructions::InstructionId;
 use crate::programs::operations::Operation;
-use crate::programs::references::discharge::transform::ReferenceDischargePolicy;
-use crate::programs::references::discharge::transform::{ReferenceDischargeContext, ReferenceDischargeValue};
+use crate::programs::references::discharge::transform::{
+    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
+};
 use crate::programs::references::types::ReferenceType;
-use crate::programs::regions::{EmptyRegionDriver, RegionDriver, RegionRef};
+use crate::programs::regions::RegionRef;
 use crate::programs::types::Typed;
-
-use super::regions::{ReferenceRegionDischargeBoundary, ReferenceRegionDischargeFork};
 
 // TODO(eaplatanios): Review this module.
 
@@ -151,112 +149,6 @@ where
             Ok(ReferenceDischargeValue::Value(output))
         })
         .collect()
-}
-
-/// Provides one [`Operation`] application with its replay position and with recursive discharge of the
-/// [`Region`](crate::Region)s attached to it.
-///
-/// [`RegionDriver`] supplies the structural region access, and this trait adds the three services that discharge
-/// rules need on top of it. Region-free applications expose a region count of zero through the same contract.
-pub trait ReferenceDischargeDriver<C: Domain, P: ReferenceDischargePolicy<C>>:
-    RegionDriver<C::Constant, C::Operation>
-{
-    /// Returns the source program location of the operation application being discharged, or [`None`] when the
-    /// application did not come from a replayed instruction.
-    ///
-    /// An allocation rule needs its own target to decide whether the caller selected it for discharge, so replaying a
-    /// region through [`discharge_region`](Self::discharge_region) must supply the source program location of every
-    /// instruction it replays. Returning [`None`] declares the allocation unnameable by any
-    /// [`ReferenceDischargeTarget`](crate::programs::references::ReferenceDischargeTarget) and therefore *always
-    /// discharged*, silently ignoring
-    /// the caller's partial-discharge targets. This function is deliberately required rather than defaulted: a
-    /// replaying driver that forgot to forward the source program location would otherwise disable partial discharge
-    /// for its regions without any diagnostic.
-    fn instruction(&self) -> Option<InstructionId>;
-
-    /// Discharges the region at `index` over the provided carriers by re-entering the active discharge transform,
-    /// binding the region's rewritten work directly into the destination program.
-    ///
-    /// The region is inlined under the *caller's* capture scope, which is correct for every region that inherits one.
-    /// A region declaring its own leading capture prefix has to be rebuilt instead, through
-    /// [`discharge_region_program`](Self::discharge_region_program), which establishes that prefix as the rebuilt
-    /// region's own scope.
-    ///
-    /// # Parameters
-    ///
-    ///   - `context`: Active discharge context whose environment the replayed region observes and mutates.
-    ///   - `index`: Position of the attached region in operation-defined order.
-    ///   - `inputs`: Carriers supplied to the region's boundary, in boundary order.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::MalformedProgram`] when this application has no region at `index` or when `inputs` does
-    /// not describe the region's boundary, and propagates every failure the replayed rules raise.
-    fn discharge_region(
-        &self,
-        context: &ReferenceDischargeContext<C, P>,
-        index: usize,
-        inputs: Vec<ReferenceDischargeValue<C, P>>,
-    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError>;
-
-    /// Discharges the region at `index` against an *isolated* environment over a fresh destination of the same
-    /// universe, and returns the sealed [`ReferenceRegionDischargeFork`] describing what that rebuilt region became.
-    ///
-    /// This is the transactional fork every structured rule builds on, and it is what
-    /// [`discharge_region`](Self::discharge_region) is deliberately not: that service inlines a region's rewritten
-    /// work into the live destination, which is right for an operation whose region is invoked in place and wrong for
-    /// one whose region must survive as a region. The fork's environment contains exactly the allocations `boundary` names,
-    /// each entering as a value at its boundary position, so a region cannot reach an allocation its caller did not
-    /// thread, and nothing it does can reach the caller's environment. The owning rule binds the rebuilt operation in
-    /// its own context and merges the final states from the outputs of that binding.
-    ///
-    /// # Parameters
-    ///
-    ///   - `context`: Active discharge context supplying the entering state, or the surviving reference, of every
-    ///     allocation the boundary names.
-    ///   - `index`: Position of the attached region in operation-defined order.
-    ///   - `boundary`: Complete requested boundary of the rebuilt region.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::MalformedProgram`] when this application has no region at `index`, when `boundary` does
-    /// not describe that region's declared boundary, when an allocation is threaded twice, when the region publishes an allocation
-    /// its caller did not thread or publishes one through a view, and propagates every failure the rebuilt
-    /// region's own rules raise.
-    fn discharge_region_program(
-        &self,
-        context: &ReferenceDischargeContext<C, P>,
-        index: usize,
-        boundary: &ReferenceRegionDischargeBoundary,
-    ) -> Result<ReferenceRegionDischargeFork<C::Constant, C::Operation>, ProgramError>;
-}
-
-impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeDriver<C, P> for EmptyRegionDriver {
-    // A region-free application replays no instruction, so its allocations have no selectable source program location.
-    #[inline]
-    fn instruction(&self) -> Option<InstructionId> {
-        None
-    }
-
-    #[inline]
-    fn discharge_region(
-        &self,
-        _context: &ReferenceDischargeContext<C, P>,
-        _index: usize,
-        _inputs: Vec<ReferenceDischargeValue<C, P>>,
-    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
-        Err(ProgramError::MalformedProgram("empty region driver cannot discharge a region".to_string()))
-    }
-
-    #[inline]
-    fn discharge_region_program(
-        &self,
-        _context: &ReferenceDischargeContext<C, P>,
-        _index: usize,
-        _boundary: &ReferenceRegionDischargeBoundary,
-    ) -> Result<ReferenceRegionDischargeFork<C::Constant, C::Operation>, ProgramError> {
-        Err(ProgramError::MalformedProgram("empty region driver cannot rebuild a region".to_string()))
-    }
 }
 
 /// Represents [`Operation`]s that can be discharged (i.e., rewritten so that the references they touch become
@@ -504,7 +396,7 @@ mod tests {
         let input = ReferenceDischargeValue::Value(ListIrValue::List(vec![1, 2, 3, 4]));
         let regions = [program];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
-        let outputs = driver.discharge_region(&context, 0, vec![input]).unwrap();
+        let outputs = driver.inline_region(&context, 0, vec![input]).unwrap();
         assert_eq!(
             outputs,
             vec![

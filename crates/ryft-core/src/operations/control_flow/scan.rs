@@ -43,8 +43,8 @@ use crate::partial::{
 use crate::programs::{
     AtomId, CalleeRegionDriver, MaybeZero, Operation, OperationFormatter, OperationProjection, OutputRegionProvenance,
     Program, ProgramBuilder, ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceRegionDischargeBoundary, ReferenceRegionStateInsertion, RegionInterface, RegionRef, RegionSlot, Type,
+    ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, ReferenceRegionStateInsertion, RegionInterface, RegionRef, RegionSlot, Type,
     TypeError, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
@@ -1754,25 +1754,26 @@ where
         let widening = context.state_widening(&summary, &carried, name)?;
         let entering = widening.entering().to_vec();
 
-        let boundary = ReferenceRegionDischargeBoundary::symmetric(
+        let boundary = ReferenceDischargeRegionBoundary::symmetric(
             self,
             0,
             body_allocations,
             ReferenceRegionStateInsertion::new(entering.clone(), carry_count),
         );
-        let fork = driver.discharge_region_program(context, 0, &boundary)?;
-        fork.validate_predicted_mutations(widening.published(), name)?;
-        fork.validate_predicted_output_allocations(summary.output_allocations(), name)?;
+        let result = driver.rebuild_region(context, 0, &boundary)?;
+        result.validate_predicted_mutations(widening.published(), name)?;
+        result.validate_predicted_output_allocations(summary.output_allocations(), name)?;
 
         // A carry must leave the body as the reference it entered with, or a zero-length scan would not return its
         // entering state.
-        let source_output_count = fork.output_allocations().len();
+        let source_output_count = result.output_allocations().len();
         if source_output_count < carry_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "operation `{name}` declares {carry_count} carries but its body declares {source_output_count} outputs",
             )));
         }
-        for (position, (returned, carry)) in fork.output_allocations()[..carry_count].iter().zip(&carries).enumerate() {
+        for (position, (returned, carry)) in result.output_allocations()[..carry_count].iter().zip(&carries).enumerate()
+        {
             if returned != carry {
                 return Err(ProgramError::MalformedProgram(format!(
                     "operation `{name}` does not return carry {position} as the reference it entered with, so its \
@@ -1794,7 +1795,7 @@ where
         }
         let outputs = context.parent().bind(
             self.with_added_carries(entering.len())?,
-            vec![fork.into_program()],
+            vec![result.into_program()],
             operands.as_slice(),
         )?;
         check_count!("output", outputs, source_output_count + entering.len(), ProgramError);

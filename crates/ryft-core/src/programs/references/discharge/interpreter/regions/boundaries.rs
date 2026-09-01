@@ -92,7 +92,7 @@ impl ReferenceStateWidening {
 /// separately the reference-related positions the rebuilt region gains: which allocations enter, which allocations it
 /// must publish, and where each group is inserted.
 #[derive(Clone, Debug, PartialEq)]
-pub struct ReferenceRegionDischargeBoundary {
+pub struct ReferenceDischargeRegionBoundary {
     /// Allocation entering at each declared source-region input position, or [`None`] for a value.
     declared_input_allocations: Vec<Option<ReferenceDischargeAllocationId>>,
 
@@ -115,7 +115,7 @@ pub struct ReferenceRegionDischargeBoundary {
     output_insertion: usize,
 }
 
-impl ReferenceRegionDischargeBoundary {
+impl ReferenceDischargeRegionBoundary {
     /// Creates a rebuilt-region boundary request.
     ///
     /// Added positions are described separately from the declared positions because only the declared positions are
@@ -174,66 +174,65 @@ impl ReferenceRegionDischargeBoundary {
 
     /// Returns the allocation entering at each declared boundary position, or [`None`] for a value.
     #[inline]
-    pub(super) fn declared_input_allocations(&self) -> &[Option<ReferenceDischargeAllocationId>] {
+    pub(crate) fn declared_input_allocations(&self) -> &[Option<ReferenceDischargeAllocationId>] {
         self.declared_input_allocations.as_slice()
     }
 
     /// Returns the region's own leading capture prefix, or [`None`] when it inherits its caller's capture scope.
-    pub(super) const fn capture_input_count(&self) -> Option<usize> {
+    pub(crate) const fn capture_input_count(&self) -> Option<usize> {
         self.capture_input_count
     }
 
     /// Returns the allocations whose entering state or preserved reference the rebuilt region receives as added inputs.
     #[inline]
-    pub(super) fn added_input_allocations(&self) -> &[ReferenceDischargeAllocationId] {
+    pub(crate) fn added_input_allocations(&self) -> &[ReferenceDischargeAllocationId] {
         self.added_input_allocations.as_slice()
     }
 
     /// Returns the source input position at which the added inputs are inserted.
-    pub(super) const fn input_insertion(&self) -> usize {
+    pub(crate) const fn input_insertion(&self) -> usize {
         self.input_insertion
     }
 
     /// Returns the allocations the rebuilt region publishes as added outputs.
     #[inline]
-    pub(super) fn added_output_allocations(&self) -> &[ReferenceDischargeAllocationId] {
+    pub(crate) fn added_output_allocations(&self) -> &[ReferenceDischargeAllocationId] {
         self.added_output_allocations.as_slice()
     }
 
     /// Returns the source output position at which the added outputs are inserted.
-    pub(super) const fn output_insertion(&self) -> usize {
+    pub(crate) const fn output_insertion(&self) -> usize {
         self.output_insertion
     }
 }
 
 /// Sealed result of discharging one attached region against an isolated environment.
 ///
-/// This is the transactional artifact of a structured rule's region fork, and it deliberately carries no values of
-/// any kind. A reference handle produced inside the fork would keep addressing the fork's own abandoned environment,
-/// and even a plain destination value is not detached under a staging destination, because it is itself a tracer
-/// stamped with the fork's builder. Excluding both structurally is what makes the isolation a type-level fact rather
-/// than a convention: the owning rule binds the rebuilt operation in its *own* context and merges the final states
-/// from the outputs that binding produced.
+/// This result deliberately carries no values of any kind. A reference produced during the isolated rebuild would
+/// keep addressing the abandoned temporary environment, and even a plain destination value is not detached under a
+/// staging destination because it is itself a tracer stamped with the temporary builder. Excluding both structurally
+/// makes the isolation a type-level fact rather than a convention: the owning rule binds the rebuilt operation in its
+/// own context and merges the final states from the outputs that binding produced.
 #[derive(Debug)]
-pub struct ReferenceRegionDischargeFork<V: Value, O: Operation<Type = V::Type>> {
+pub struct ReferenceDischargeRegionResult<V: Value, O: Operation<Type = V::Type>> {
     /// Rebuilt, discharged region program.
-    pub(super) program: Program<V, O, Vec<V>, Vec<V>>,
+    pub(crate) program: Program<V, O, Vec<V>, Vec<V>>,
 
     /// Allocation each *declared* region output denotes, or [`None`] for a value output, in region-boundary order.
-    pub(super) output_allocations: Vec<Option<ReferenceDischargeAllocationId>>,
+    pub(crate) output_allocations: Vec<Option<ReferenceDischargeAllocationId>>,
 
     /// Threaded allocations the region's closure mutated, in canonical allocation order.
-    pub(super) mutated_allocations: Vec<ReferenceDischargeAllocationId>,
+    pub(crate) mutated_allocations: Vec<ReferenceDischargeAllocationId>,
 }
 
-impl<V: Value, O: Operation<Type = V::Type>> ReferenceRegionDischargeFork<V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeRegionResult<V, O> {
     /// Returns the allocation each declared region output denotes, or [`None`] where the output is a value.
     #[inline]
     pub fn output_allocations(&self) -> &[Option<ReferenceDischargeAllocationId>] {
         self.output_allocations.as_slice()
     }
 
-    /// Consumes this fork and returns the rebuilt region program.
+    /// Consumes this result and returns the rebuilt region program.
     #[inline]
     pub fn into_program(self) -> Program<V, O, Vec<V>, Vec<V>> {
         self.program
@@ -318,14 +317,14 @@ mod tests {
     use crate::programs::references::types::ReferenceType;
 
     use crate::programs::{
-        RecursiveReferenceDischargeDriver, ReferenceDischargeDriver, ReferenceRegionDischargeBoundary,
+        RecursiveReferenceDischargeDriver, ReferenceDischargeDriver, ReferenceDischargeRegionBoundary,
         ReferenceRegionStateInsertion,
     };
 
     #[test]
-    fn test_reference_region_discharge_fork_holds_the_replay_to_the_widening_that_sized_it() {
+    fn test_reference_discharge_region_result_holds_the_replay_to_the_widening_that_sized_it() {
         // The boundary is sized from a summary computed before the region ran, so both validators exist to catch an
-        // operation whose generic hooks disagree with what its closure actually does. Here the fork is produced
+        // operation whose generic hooks disagree with what its closure actually does. Here the result is produced
         // honestly and then held to deliberately wrong predictions, which is the shape a lying third-party family
         // would present.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
@@ -348,35 +347,35 @@ mod tests {
         let allocation = allocated.try_as_reference("the caller allocation").unwrap().allocation_id();
         let regions = [program];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
-        let boundary = ReferenceRegionDischargeBoundary::new(
+        let boundary = ReferenceDischargeRegionBoundary::new(
             &ListOperation::Call,
             0,
             vec![Some(allocation), None],
             ReferenceRegionStateInsertion::new(Vec::new(), 2),
             ReferenceRegionStateInsertion::new(Vec::new(), 2),
         );
-        let fork = driver.discharge_region_program(&context, 0, &boundary).unwrap();
+        let result = driver.rebuild_region(&context, 0, &boundary).unwrap();
 
         // The region writes its entering allocation, so a widening that published nothing lost that update.
         assert_eq!(
-            fork.validate_predicted_mutations(&[], "list.call"),
+            result.validate_predicted_mutations(&[], "list.call"),
             Err(ProgramError::MalformedProgram(format!(
                 "operation `list.call` mutated {allocation} in an attached region that its state widening did not predict",
             ))),
         );
-        assert_eq!(fork.validate_predicted_mutations(&[allocation], "list.call"), Ok(()));
+        assert_eq!(result.validate_predicted_mutations(&[allocation], "list.call"), Ok(()));
 
         // The region returns that allocation at its second output, so a widening that predicted a value there
         // would have published the allocation's final state twice.
-        assert_eq!(fork.output_allocations(), &[None, Some(allocation)]);
+        assert_eq!(result.output_allocations(), &[None, Some(allocation)]);
         assert_eq!(
-            fork.validate_predicted_output_allocations(&[None, None], "list.call"),
+            result.validate_predicted_output_allocations(&[None, None], "list.call"),
             Err(ProgramError::MalformedProgram(
                 "operation `list.call` attaches a region whose outputs do not denote the references its state \
                  widening expected"
                     .to_string(),
             )),
         );
-        assert_eq!(fork.validate_predicted_output_allocations(&[None, Some(allocation)], "list.call"), Ok(()));
+        assert_eq!(result.validate_predicted_output_allocations(&[None, Some(allocation)], "list.call"), Ok(()));
     }
 }

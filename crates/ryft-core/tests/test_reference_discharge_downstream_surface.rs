@@ -25,11 +25,11 @@ use ryft_core::{
     Context, Domain, EagerContext, Effect, Effects, ExternalReferenceBinding, InterpretableOperation,
     InterpretationDriver, NoIdentity, Operation, OutputRegionProvenance, Parameter, Placeholder, Program,
     ProgramBuilder, ProgramError, RecursiveReferenceDischargeDriver, ReferenceAccessMode, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeResult, ReferenceDischargeTarget,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceInput,
-    ReferenceOperationSemantics, ReferenceOutput, ReferenceRegionDischargeBoundary, ReferenceRegionStateInsertion,
-    ReferenceSource, ReferenceType, RegionInterface, RegionSlot, Trace, Tracer, TracingContext, Type, TypeError, Typed,
-    Value, discharge_reference_free_operation,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeResult,
+    ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType,
+    ReferenceInput, ReferenceOperationSemantics, ReferenceOutput, ReferenceRegionStateInsertion, ReferenceSource,
+    ReferenceType, RegionInterface, RegionSlot, Trace, Tracer, TracingContext, Type, TypeError, Typed, Value,
+    discharge_reference_free_operation,
 };
 
 /// Destination universe of the downstream programs. Its dispatch domain is the constant-only eager context, which is
@@ -376,7 +376,7 @@ where
             Self::ReferenceNew => {
                 check_count!("input", inputs, 1, ProgramError);
                 let initial = inputs[0].try_as_value("an initial state")?.clone();
-                if context.selects_internal(driver.instruction(), 0) {
+                if context.selects_internal(driver.source_instruction_id(), 0) {
                     return Ok(vec![context.bind_discharged(ReferenceType::new(RegisterType), initial)?]);
                 }
                 let mut outputs = context.parent().bind(*self, Vec::new(), std::slice::from_ref(&initial))?;
@@ -407,7 +407,7 @@ where
                 Ok(vec![ReferenceDischargeValue::Value(context.consume(reference)?)])
             }
             // The hand-rolled structured widening a backend-owned region operation performs: summarize the closure,
-            // widen the boundary with the reached state, rebuild the region in an isolated fork, validate the fork
+            // widen the boundary with the reached state, rebuild the region in isolation, validate the result
             // against the summary's predictions, and merge every published successor state back. This is the same
             // shape a future kernel-call rule needs, expressed purely through the public discharge surface.
             Self::Call => {
@@ -429,10 +429,10 @@ where
                 let entering = widening.entering().to_vec();
                 let source_output_count = region.output_ids().len();
 
-                let fork = driver.discharge_region_program(
+                let result = driver.rebuild_region(
                     context,
                     0,
-                    &ReferenceRegionDischargeBoundary::new(
+                    &ReferenceDischargeRegionBoundary::new(
                         self,
                         0,
                         declared,
@@ -440,8 +440,8 @@ where
                         ReferenceRegionStateInsertion::new(widening.published().to_vec(), source_output_count),
                     ),
                 )?;
-                fork.validate_predicted_mutations(widening.published(), self.name())?;
-                fork.validate_predicted_output_allocations(summary.output_allocations(), self.name())?;
+                result.validate_predicted_mutations(widening.published(), self.name())?;
+                result.validate_predicted_output_allocations(summary.output_allocations(), self.name())?;
 
                 let mut operands = Vec::with_capacity(inputs.len() + entering.len());
                 for input in inputs {
@@ -450,7 +450,7 @@ where
                 for allocation in &entering {
                     operands.push(context.discharged_state(*allocation)?);
                 }
-                let outputs = context.parent().bind(*self, vec![fork.into_program()], operands.as_slice())?;
+                let outputs = context.parent().bind(*self, vec![result.into_program()], operands.as_slice())?;
                 check_count!("output", outputs, source_output_count + widening.published().len(), ProgramError);
 
                 let mut results = Vec::with_capacity(source_output_count);
@@ -497,7 +497,7 @@ fn test_downstream_reference_universe_discharges_through_the_public_surface() {
     let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
     let inputs = vec![RegisterDischargeValue::Value(RegisterValue(4)), RegisterDischargeValue::Value(RegisterValue(3))];
     assert_eq!(
-        driver.discharge_region(&context, 0, inputs),
+        driver.inline_region(&context, 0, inputs),
         Ok(vec![
             RegisterDischargeValue::Value(RegisterValue(4)),
             RegisterDischargeValue::Value(RegisterValue(3)),
@@ -552,7 +552,7 @@ fn test_downstream_reference_universe_discharges_into_a_staged_program() {
         let carriers = inputs.into_iter().map(ReferenceDischargeValue::Value).collect::<Vec<_>>();
         let regions = [source];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
-        let outputs = driver.discharge_region(&context, 0, carriers)?;
+        let outputs = driver.inline_region(&context, 0, carriers)?;
         assert_eq!(context.live_allocation_ids(), Vec::new());
         outputs
             .iter()
@@ -771,7 +771,7 @@ fn test_downstream_partial_targets_reach_an_internal_allocation_inside_a_structu
     // The allocation target sits inside the callee region, so whether it discharges is decided by the replay coordinate
     // the downstream rule's driver hands to `selects_internal` inside the fork. An empty target list must preserve
     // the allocation inside the rebuilt region, and selecting the enumerated target must discharge it completely —
-    // which is exactly the behavior a driver without a real `instruction()` coordinate would silently break.
+    // which is exactly the behavior a driver without a real `source_instruction_id()` would silently break.
     let mut callee = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
     let initial = callee.add_input(RegisterIrType::Register(RegisterType));
     let local = callee.add_instruction(RegisterOperation::ReferenceNew, Vec::new(), vec![initial], None).unwrap()[0];

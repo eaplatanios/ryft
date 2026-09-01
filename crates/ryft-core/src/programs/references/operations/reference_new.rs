@@ -128,7 +128,7 @@ where
             ))
         })?;
         let r#type = r#type.clone();
-        if context.selects_internal(driver.instruction(), 0) {
+        if context.selects_internal(driver.source_instruction_id(), 0) {
             return Ok(vec![context.bind_discharged(r#type, initial)?]);
         }
 

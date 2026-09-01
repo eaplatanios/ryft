@@ -9,10 +9,10 @@ use crate::programs::operations::Operation;
 use crate::programs::references::discharge::transform::ReferenceDischargePolicy;
 use crate::programs::references::discharge::transform::{
     ReferenceDischargeAllocationId, ReferenceDischargeBinding, ReferenceDischargeCaptureScope,
-    ReferenceDischargeContext, ReferenceDischargeValue,
+    ReferenceDischargeContext, ReferenceDischargeValue, nested_capture_scope,
 };
 use crate::programs::references::semantics::{ReferenceAccessMode, ReferenceOutput};
-use crate::programs::regions::{RegionId, RegionRef};
+use crate::programs::regions::RegionRef;
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
 
@@ -190,44 +190,6 @@ impl ReferenceRegionSummary {
         self.accesses.entry(allocation).or_default().insert(mode);
         Ok(())
     }
-}
-
-/// Returns the capture scope one attached region discharges under.
-///
-/// A region whose operation declares a leading capture prefix establishes a fresh scope over the allocations that prefix
-/// binds, exactly as a called program's captures shadow its caller's; every other region inherits the scope of the
-/// region it is attached in. This is the interpreter's counterpart of the scope propagation the standalone reference
-/// analysis performs over the whole arena, computed one boundary at a time because that is where the interpreter
-/// already resolves allocations.
-///
-/// # Parameters
-///
-///   - `capture_input_count`: Length of the region's own leading capture prefix, from
-///     [`Operation::region_capture_input_count`], or [`None`] when the region inherits its parent's scope.
-///   - `inputs`: Allocation each declared region input binds, in boundary order.
-///   - `inherited`: Capture scope of the region this one is attached in.
-///   - `region`: Identity of the region, used in the diagnostic.
-///
-/// # Errors
-///
-/// Returns [`ProgramError::MalformedProgram`] when the declared capture prefix is longer than the region's boundary.
-pub(super) fn nested_capture_scope<Constant>(
-    capture_input_count: Option<usize>,
-    inputs: &[Option<ReferenceDischargeAllocationId>],
-    inherited: &ReferenceDischargeCaptureScope<Constant>,
-    region: RegionId,
-) -> Result<ReferenceDischargeCaptureScope<Constant>, ProgramError> {
-    let Some(count) = capture_input_count else {
-        return Ok(inherited.clone());
-    };
-    if count > inputs.len() {
-        return Err(ProgramError::MalformedProgram(format!(
-            "reference discharge cannot establish a capture prefix of {count} for region `{region}`, which declares \
-             {} inputs",
-            inputs.len(),
-        )));
-    }
-    Ok(inherited.with_allocations(inputs[..count].to_vec()))
 }
 
 /// Accumulates the transitive reference accesses of one region closure into `summary` and returns the caller allocation
@@ -700,7 +662,7 @@ mod tests {
     use crate::programs::references::types::ReferenceType;
 
     use crate::programs::{
-        RecursiveReferenceDischargeDriver, ReferenceDischargeDriver, ReferenceRegionDischargeBoundary,
+        RecursiveReferenceDischargeDriver, ReferenceDischargeDriver, ReferenceDischargeRegionBoundary,
         ReferenceRegionStateInsertion, ReferenceRegionSummary,
     };
 
@@ -985,16 +947,16 @@ mod tests {
         // The rebuilt region therefore receives the allocation's entering state and hands it to its own callee.
         let regions = [program.clone()];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
-        let boundary = ReferenceRegionDischargeBoundary::new(
+        let boundary = ReferenceDischargeRegionBoundary::new(
             &ListOperation::Call,
             0,
             vec![None],
             ReferenceRegionStateInsertion::new(vec![allocation], 1),
             ReferenceRegionStateInsertion::new(Vec::new(), 0),
         );
-        let fork = driver.discharge_region_program(&context, 0, &boundary).unwrap();
+        let result = driver.rebuild_region(&context, 0, &boundary).unwrap();
         assert_eq!(
-            fork.program.to_string(),
+            result.program.to_string(),
             indoc! {"
                 lambda %0:list<2>, %1:list<2> .
                 let %2:list<2> = list.call %1 %0 [
@@ -1005,7 +967,7 @@ mod tests {
                 ]
                 in (%2)"},
         );
-        assert_eq!(fork.mutated_allocations, []);
+        assert_eq!(result.mutated_allocations, []);
 
         // The same reached capture remains an entering boundary allocation when partial discharge preserves it. It
         // leaves the state-threaded and published sets empty because it crosses as its destination reference instead.

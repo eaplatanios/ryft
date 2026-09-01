@@ -54,8 +54,8 @@ use crate::partial::{
 use crate::programs::{
     AtomId, CalleeRegionDriver, Concretizable, MaybeZero, Operation, OperationFormatter, OperationProjection,
     OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceAccessMode, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceRegionDischargeBoundary, ReferenceRegionStateInsertion, RegionInterface, RegionRef, RegionSlot, Type,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, ReferenceRegionStateInsertion, RegionInterface, RegionRef, RegionSlot, Type,
     TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
@@ -977,10 +977,10 @@ where
         // The condition publishes nothing — it returns only its predicate — so its declared output allocations need no
         // `validate_predicted_output_allocations` pass; the body's fixed-point carry check below is the stronger version of
         // that agreement for the one region that does return references.
-        let condition_fork = driver.discharge_region_program(
+        let condition_result = driver.rebuild_region(
             context,
             0,
-            &ReferenceRegionDischargeBoundary::new(
+            &ReferenceDischargeRegionBoundary::new(
                 self,
                 0,
                 carries.clone(),
@@ -988,22 +988,22 @@ where
                 ReferenceRegionStateInsertion::new(Vec::new(), condition.output_ids().len()),
             ),
         )?;
-        condition_fork.validate_predicted_mutations(&[], name)?;
-        let body_fork = driver.discharge_region_program(
+        condition_result.validate_predicted_mutations(&[], name)?;
+        let body_result = driver.rebuild_region(
             context,
             1,
-            &ReferenceRegionDischargeBoundary::symmetric(
+            &ReferenceDischargeRegionBoundary::symmetric(
                 self,
                 1,
                 carries.clone(),
                 ReferenceRegionStateInsertion::new(entering.clone(), inputs.len()),
             ),
         )?;
-        body_fork.validate_predicted_mutations(widening.published(), name)?;
+        body_result.validate_predicted_mutations(widening.published(), name)?;
 
         // Every carry must leave the body as the reference it entered with, or the loop's state has no fixed point and
         // its zero-iteration result would not be its entering state.
-        for (position, (returned, carry)) in body_fork.output_allocations().iter().zip(&carries).enumerate() {
+        for (position, (returned, carry)) in body_result.output_allocations().iter().zip(&carries).enumerate() {
             if returned != carry {
                 return Err(ProgramError::MalformedProgram(format!(
                     "operation `{name}` does not return carry {position} as the reference it entered with, so its \
@@ -1021,7 +1021,7 @@ where
         }
         let outputs = context.parent().bind(
             *self,
-            vec![condition_fork.into_program(), body_fork.into_program()],
+            vec![condition_result.into_program(), body_result.into_program()],
             operands.as_slice(),
         )?;
         check_count!("output", outputs, inputs.len() + entering.len(), ProgramError);

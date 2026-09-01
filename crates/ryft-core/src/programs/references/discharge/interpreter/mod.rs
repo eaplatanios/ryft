@@ -2,11 +2,8 @@ mod regions;
 mod rules;
 
 pub use regions::{
-    RecursiveReferenceDischargeDriver, ReferenceDischargeRegionDestination, ReferenceRegionDischargeBoundary,
-    ReferenceRegionDischargeFork, ReferenceRegionStateInsertion, ReferenceRegionSummary, ReferenceStateWidening,
+    ReferenceDischargeRegionBoundary, ReferenceDischargeRegionDestination, ReferenceDischargeRegionResult,
+    ReferenceRegionStateInsertion, ReferenceRegionSummary, ReferenceStateWidening,
     discharge_positional_region_operation,
 };
-pub use rules::{
-    ReferenceDischargeDriver, ReferenceDischargeableOperation, discharge_preserved_access,
-    discharge_reference_free_operation,
-};
+pub use rules::{ReferenceDischargeableOperation, discharge_preserved_access, discharge_reference_free_operation};
