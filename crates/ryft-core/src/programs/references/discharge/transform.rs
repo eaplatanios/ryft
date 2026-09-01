@@ -937,8 +937,8 @@ pub(super) enum ReferenceDischargeBinding<V> {
     },
 }
 
-// TODO(eaplatanios): Move `ReferenceDischargeRegionBoundary` here.
-// TODO(eaplatanios): Move `ReferenceDischargeRegionResult` here.
+// TODO(eaplatanios): Move `ReferenceDischargeRegionBoundary` and `ReferenceDischargeRegionResult` here and move
+//  (or add) unit tests for it at the appropriate location in the `tests` module below.
 
 /// [`Type`] capability selecting the canonical [`ReferenceDischargePolicy`] used by reference discharge entry points.
 /// This is a discharge-owned extension of [`Type`] rather than part of the core type contract. It lets generic
@@ -1347,16 +1347,14 @@ where
             // A preserved allocation occupies an added position only when an inherited capture is returned without
             // a declared operand.
             let mut declared = Vec::with_capacity(source_input_count);
-            for position in 0..=source_input_count {
+            for (position, (source_type, allocation)) in
+                source_input_types.iter().zip(boundary.declared_input_allocations()).enumerate()
+            {
                 if position == boundary.input_insertion() {
                     for allocation in boundary.added_input_allocations() {
                         thread(*allocation)?;
                     }
                 }
-                let Some(allocation) = boundary.declared_input_allocations().get(position) else {
-                    continue;
-                };
-                let source_type = &source_input_types[position];
                 declared.push(match allocation {
                     None => {
                         if <&ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>>::try_from(source_type).is_ok()
@@ -1395,6 +1393,12 @@ where
                         thread(*allocation)?
                     }
                 });
+            }
+
+            if boundary.input_insertion() == source_input_count {
+                for allocation in boundary.added_input_allocations() {
+                    thread(*allocation)?;
+                }
             }
 
             // The rebuilt region discharges under a scope naming only its own allocations, so its isolated environment
@@ -1512,7 +1516,8 @@ where
     }
 }
 
-// TODO(eaplatanios): Move `ReferenceDischargeableOperation` here.
+// TODO(eaplatanios): Move `ReferenceDischargeableOperation` here and move
+//  (or add) unit tests for it at the appropriate location in the `tests` module below.
 
 /// Active state of a reference discharge transform. Reference discharge interprets a source [`Program`] into a
 /// destination [`Program`], one [`Region`](crate::Region) at a time through a [`ReferenceDischargeDriver`]. Each
