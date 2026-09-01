@@ -7,7 +7,7 @@ use crate::programs::ProgramError;
 use crate::programs::instructions::InstructionId;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
-use crate::programs::references::discharge::results::ReferenceSource;
+use crate::programs::references::discharge::transform::ReferenceSource;
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
 

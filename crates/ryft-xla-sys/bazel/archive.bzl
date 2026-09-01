@@ -1,8 +1,12 @@
+"""Builds deterministic native release archives."""
+
 load("@com_google_protobuf//bazel/common:proto_info.bzl", "ProtoInfo")
 load("@rules_cc//cc/common:cc_info.bzl", "CcInfo")
 
 HEADERS = [
     "jaxlib/mosaic/gpu/integrations/c/passes.h",
+    "jaxlib/mosaic/dialect/gpu/integrations/c/attributes.h",
+    "jaxlib/mosaic/dialect/gpu/integrations/c/gpu_dialect.h",
     "llvm/Config/llvm-config.h",
     "llvm-c/Core.h",
     "llvm-c/DataTypes.h",
@@ -53,6 +57,7 @@ HEADERS = [
     "mlir-c/Dialect/Arith.h",
     "mlir-c/Dialect/Async.h",
     "mlir-c/Dialect/ControlFlow.h",
+    "mlir-c/Dialect/Complex.h",
     "mlir-c/Dialect/EmitC.h",
     "mlir-c/Dialect/Func.h",
     "mlir-c/Dialect/GPU.h",
@@ -111,9 +116,27 @@ HEADERS = [
     "xla/pjrt/c/pjrt_c_api_triton_extension.h",
     "xla/pjrt/c/pjrt_c_api_xla_transform_extension.h",
     "xla/pjrt/extensions/host_allocator/host_allocator_extension.h",
-    "xla/pjrt/extensions/host_allocator/host_memory_allocator/host_memory_allocator_extension.h",
+    "xla/pjrt/extensions/host_memory_allocator/host_memory_allocator_extension.h",
     "xla/service/custom_call_status.h",
     "xla/service/spmd/shardy/integrations/c/passes.h",
+    "src/c++/common.h",
+    "src/c++/distributed.h",
+    "src/c++/mlir/dialects/affine.h",
+    "src/c++/mlir/dialects/arith.h",
+    "src/c++/mlir/dialects/bufferization.h",
+    "src/c++/mlir/dialects/builtin.h",
+    "src/c++/mlir/dialects/complex.h",
+    "src/c++/mlir/dialects/gpu.h",
+    "src/c++/mlir/dialects/llvm.h",
+    "src/c++/mlir/dialects/mosaic_gpu.h",
+    "src/c++/mlir/dialects/mosaic_tpu.h",
+    "src/c++/mlir/dialects/nvgpu.h",
+    "src/c++/mlir/dialects/shape.h",
+    "src/c++/mlir/dialects/sparse_tensor.h",
+    "src/c++/mlir/dialects/transform.h",
+    "src/c++/mlir/dialects/triton.h",
+    "src/c++/mlir/dialects/ub.h",
+    "src/c++/profiler.h",
 ]
 
 def _build_archive_impl(ctx):
@@ -138,6 +161,7 @@ def _build_archive_impl(ctx):
             if path.startswith("external/"):
                 path = path[len("external/"):]
             for prefix in [
+                "jax/",
                 "llvm-project/llvm/include/",
                 "llvm-project/mlir/include/",
                 "shardy/",
@@ -165,7 +189,9 @@ def _build_archive_impl(ctx):
 
             # Add archive path prefix.
             if is_library:
-                path = "lib/" + path
+                # Libraries are admitted only from the explicit `library` attribute below. Some TableGen filegroups
+                # expose incidental helper archives in their default outputs; those are not part of our link contract.
+                continue
             elif is_header:
                 path = "include/" + path
             elif is_proto:
@@ -178,53 +204,68 @@ def _build_archive_impl(ctx):
 
             archive_files.append((file, path))
 
-    copy_commands = []
+    for file in ctx.attr.library[DefaultInfo].files.to_list():
+        path = file.basename
+        is_library = (
+            path.endswith(".so") or
+            path.endswith(".a") or
+            path.endswith(".dylib") or
+            path.endswith(".dll") or
+            path.endswith(".lib")
+        )
+        if not is_library:
+            fail("archive library target produced a non-library file: {}".format(file.short_path))
+        archive_files.append((file, "lib/" + path))
+
+    archive_paths = {}
+    unique_archive_files = []
     for file, path in archive_files:
-        copy_commands.append("""
-            dst="{dst}"
-            target_dir="$archive_dir/$(dirname "$dst")"
-            mkdir -p "$target_dir"
-            chmod 755 "$target_dir"
+        if path in archive_paths:
+            if archive_paths[path].path == file.path:
+                continue
+            fail(
+                "duplicate archive path {} from {} and {}".format(
+                    path,
+                    archive_paths[path].short_path,
+                    file.short_path,
+                ),
+            )
+        archive_paths[path] = file
+        unique_archive_files.append((file, path))
+    archive_files = unique_archive_files
 
-            cp "{src}" "$archive_dir/$dst"
-            chmod 644 "$archive_dir/$dst"
+    manifest_entries = []
+    for file, path in archive_files:
+        is_library = path.startswith("lib/")
+        manifest_entries.append({
+            "mode": 0o755 if is_library else 0o644,
+            "path": path,
+            "source": file.path,
+        })
 
-            # Set permissions based on file type
-            if [[ "$src" == *.so ]] || [[ "$src" == *.a ]] || [[ "$src" == *.dylib ]] || [[ "$src" == *.dll ]] || [[ "$src" == *.lib ]]; then
-                # Shared libraries need execute permissions.
-                chmod 755 "$archive_dir/$dst"
-            else
-                # Other files do not.
-                chmod 644 "$archive_dir/$dst"
-            fi
-        """.format(
-            src = file.path,
-            dst = path,
-        ))
-
-    ctx.actions.run_shell(
-        inputs = [file[0] for file in archive_files],
+    manifest = ctx.actions.declare_file(ctx.label.name + ".manifest.json")
+    ctx.actions.write(manifest, json.encode(manifest_entries))
+    ctx.actions.run(
+        executable = ctx.executable._archive_tool,
+        inputs = depset([manifest] + [file[0] for file in archive_files]),
         outputs = [output],
-        command = """
-            set -e
-            archive_dir=$(mktemp -d)
-            chmod 755 "$archive_dir"
-
-            {copy_commands}
-
-            tar -C "$archive_dir" -czf "{output}" .
-            rm -rf "$archive_dir"
-        """.format(
-            copy_commands = "\n".join(copy_commands),
-            output = output.path,
-        ),
+        arguments = [manifest.path, output.path],
+        mnemonic = "DeterministicArchive",
     )
 
     return [DefaultInfo(files = depset([output]))]
 
 build_archive = rule(
     implementation = _build_archive_impl,
-    attrs = {"deps": attr.label_list(providers = [[DefaultInfo], [CcInfo], [ProtoInfo]])},
+    attrs = {
+        "_archive_tool": attr.label(
+            default = Label("//:create-deterministic-archive"),
+            executable = True,
+            cfg = "exec",
+        ),
+        "deps": attr.label_list(providers = [[DefaultInfo], [CcInfo], [ProtoInfo]]),
+        "library": attr.label(mandatory = True, providers = [DefaultInfo]),
+    },
 )
 
 def _extract_headers_impl(ctx):

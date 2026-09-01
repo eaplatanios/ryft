@@ -147,7 +147,6 @@
 
 mod interpreter;
 mod policies;
-mod results;
 mod targets;
 mod transform;
 
@@ -158,12 +157,11 @@ pub use interpreter::{
     discharge_positional_region_operation, discharge_preserved_access, discharge_reference_free_operation,
 };
 pub use policies::{ReferenceAccumulationPolicy, ReferenceDischargePolicy, ReferenceDischargeableType};
-pub use results::{
-    ExternalReferenceBinding, PartialReferenceDischargeResult, ReferenceDischargeResult, ReferenceSource,
-};
 pub use targets::ReferenceDischargeTarget;
 pub use transform::{
-    ReferenceDischargeAllocationId, ReferenceDischargeContext, ReferenceDischargeReference, ReferenceDischargeValue,
+    ExternalReferenceBinding, PartialReferenceDischargeResult, ReferenceDischargeAllocationId,
+    ReferenceDischargeContext, ReferenceDischargeReference, ReferenceDischargeResult, ReferenceDischargeValue,
+    ReferenceSource,
 };
 
 #[cfg(test)]
