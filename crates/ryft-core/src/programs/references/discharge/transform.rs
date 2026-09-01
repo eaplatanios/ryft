@@ -1420,10 +1420,9 @@ where
                     ReferenceDischargeValue::Reference(reference) => Some(reference.allocation_id()),
                 })
                 .collect::<Vec<_>>();
-            let fork = fork.with_captures(nested_capture_scope(
+            let fork = fork.with_captures(inherited.nested_scope(
                 boundary.capture_input_count(),
                 fork_declared_allocations.as_slice(),
-                &inherited,
                 region.id(),
             )?);
 
@@ -1678,45 +1677,6 @@ where
         return context.allocation_reference(allocation);
     }
     Ok(ReferenceDischargeValue::Value(context.parent().lift(constant)?))
-}
-
-// TODO(eaplatanios): Review this.
-/// Returns the capture scope one attached region discharges under.
-///
-/// A region whose operation declares a leading capture prefix establishes a fresh scope over the allocations that prefix
-/// binds, exactly as a called program's captures shadow its caller's; every other region inherits the scope of the
-/// region it is attached in. This is the interpreter's counterpart of the scope propagation the standalone reference
-/// analysis performs over the whole arena, computed one boundary at a time because that is where the interpreter
-/// already resolves allocations.
-///
-/// # Parameters
-///
-///   - `capture_input_count`: Length of the region's own leading capture prefix, from
-///     [`Operation::region_capture_input_count`], or [`None`] when the region inherits its parent's scope.
-///   - `inputs`: Allocation each declared region input binds, in boundary order.
-///   - `inherited`: Capture scope of the region this one is attached in.
-///   - `region`: Identity of the region, used in the diagnostic.
-///
-/// # Errors
-///
-/// Returns [`ProgramError::MalformedProgram`] when the declared capture prefix is longer than the region's boundary.
-pub(super) fn nested_capture_scope<Constant>(
-    capture_input_count: Option<usize>,
-    inputs: &[Option<ReferenceDischargeAllocationId>],
-    inherited: &ReferenceDischargeCaptureScope<Constant>,
-    region: RegionId,
-) -> Result<ReferenceDischargeCaptureScope<Constant>, ProgramError> {
-    let Some(count) = capture_input_count else {
-        return Ok(inherited.clone());
-    };
-    if count > inputs.len() {
-        return Err(ProgramError::MalformedProgram(format!(
-            "reference discharge cannot establish a capture prefix of {count} for region `{region}`, which declares \
-             {} inputs",
-            inputs.len(),
-        )));
-    }
-    Ok(inherited.with_allocations(inputs[..count].to_vec()))
 }
 
 // TODO(eaplatanios): Order declarations as `ReferenceDischargeDriver` -> Recursive Driver ->
@@ -2506,6 +2466,43 @@ impl<Constant> ReferenceDischargeCaptureScope<Constant> {
     #[inline]
     pub fn with_allocations(&self, allocations: Vec<Option<ReferenceDischargeAllocationId>>) -> Self {
         Self { capture_index_of: self.capture_index_of, allocations: allocations.into() }
+    }
+
+    /// Returns the [`ReferenceDischargeCaptureScope`] to use when discharging a nested [`Region`](crate::Region). When
+    /// the [`Operation`] that owns the region declares a capture prefix, the corresponding leading region inputs become
+    /// the nested scope's capture bindings. When it does not declare a capture prefix, the region inherits this scope
+    /// unchanged.
+    ///
+    /// # Parameters
+    ///
+    ///   - `capture_input_count`: Number of leading region inputs that provide capture bindings, as reported by
+    ///     [`Operation::region_capture_input_count`], or [`None`] if the region inherits this scope.
+    ///   - `inputs`: Reference allocation bound by each region input, in region input order. A [`None`] entry
+    ///     identifies an input that does not bind a reference allocation.
+    ///   - `region`: Region identity to include in an error diagnostic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when the declared capture prefix is longer than the region's input
+    /// boundary.
+    pub fn nested_scope(
+        &self,
+        capture_input_count: Option<usize>,
+        inputs: &[Option<ReferenceDischargeAllocationId>],
+        region: RegionId,
+    ) -> Result<Self, ProgramError> {
+        let Some(count) = capture_input_count else {
+            return Ok(self.clone());
+        };
+        if count > inputs.len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "reference discharge cannot establish a capture prefix of {} for region `{}`, which declares {} inputs",
+                count,
+                region,
+                inputs.len(),
+            )));
+        }
+        Ok(self.with_allocations(inputs[..count].to_vec()))
     }
 
     /// Returns the [`ReferenceDischargeAllocationId`] of the allocation each capture position binds, in capture order.

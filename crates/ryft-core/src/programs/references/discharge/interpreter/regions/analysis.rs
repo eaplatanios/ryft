@@ -9,7 +9,7 @@ use crate::programs::operations::Operation;
 use crate::programs::references::discharge::transform::ReferenceDischargePolicy;
 use crate::programs::references::discharge::transform::{
     ReferenceDischargeAllocationId, ReferenceDischargeBinding, ReferenceDischargeCaptureScope,
-    ReferenceDischargeContext, ReferenceDischargeValue, nested_capture_scope,
+    ReferenceDischargeContext, ReferenceDischargeValue,
 };
 use crate::programs::references::semantics::{ReferenceAccessMode, ReferenceOutput};
 use crate::programs::regions::RegionRef;
@@ -332,10 +332,9 @@ fn summarize_region_closure<V: Value, O: Operation<Type = V::Type>>(
             // The nested closure is summarized on its own first, so that an operation restricting what its regions may
             // do to an entering allocation is held to that restriction here, where the offending region is still named,
             // rather than only indirectly when a rebuilt region contradicts the widening it was given.
-            let nested_captures = nested_capture_scope(
+            let nested_captures = captures.nested_scope(
                 operation.region_capture_input_count(region_index),
                 nested.as_slice(),
-                captures,
                 attached.id(),
             )?;
             let mut nested_summary = ReferenceRegionSummary::default();
@@ -474,12 +473,9 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         region: RegionRef<'_, C::Constant, C::Operation>,
         inputs: &[Option<ReferenceDischargeAllocationId>],
     ) -> Result<ReferenceRegionSummary, ProgramError> {
-        let captures = nested_capture_scope(
-            operation.region_capture_input_count(region_index),
-            inputs,
-            self.captures(),
-            region.id(),
-        )?;
+        let captures =
+            self.captures()
+                .nested_scope(operation.region_capture_input_count(region_index), inputs, region.id())?;
         let mut summary = ReferenceRegionSummary::default();
         summary.output_allocations = summarize_region_closure(region, inputs, &captures, &mut summary)?;
         validate_region_accesses(operation, region_index, &summary)?;
