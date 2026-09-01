@@ -1046,7 +1046,7 @@ pub trait ReferenceAccumulationPolicy<C: Domain>: ReferenceDischargePolicy<C> {
 }
 
 // TODO(eaplatanios): Order declarations as `ReferenceDischargeDriver` -> Recursive Driver ->
-//  `ReferenceDischargeableOperation` -> `ReferenceDischargeContext`.
+//  `ReferenceDischargeableOperation`.
 
 /// Active state of a reference discharge transform. Reference discharge interprets a source [`Program`] into a
 /// destination [`Program`], one [`Region`](crate::Region) at a time through a [`ReferenceDischargeDriver`]. Each
