@@ -228,7 +228,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// Ordinary referent type used to exercise generic reference operations without array-specific behavior.
+    /// Referent type used to exercise generic reference operations without array-specific behavior.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub(crate) struct TestReferent {
         pub(crate) identity: TestIdentity,
@@ -689,7 +689,7 @@ pub(crate) mod tests {
     // concern and are covered where a universe with real view mechanics lives.
     //
     // Two destinations are named because the rules serve two kinds of allocation. A discharged reference's rewrite
-    // reaches only ordinary values, so the eager destination executes it and the tests read the results directly. A
+    // reaches only values, so the eager destination executes it and the tests read the results directly. A
     // preserved reference is a *reference* of the destination universe, which an eager value of this fixture cannot
     // be, so the preserved replay is exercised against the staging destination and read back as the program it
     // recorded.
@@ -1016,9 +1016,9 @@ pub(crate) mod tests {
     /// Returns the discharge context together with the handle denoting the new allocation.
     pub(crate) fn allocated_allocation(payload: i64) -> (TestDischargeContext, TestDischargeReference) {
         let context = TestDischargeContext::new(TestDestination::new());
-        let initial = ReferenceDischargeValue::Ordinary(TestValue::new(REFERENT, payload));
+        let initial = ReferenceDischargeValue::Value(TestValue::new(REFERENT, payload));
         let allocated = New::new().discharge_references(&context, &EmptyRegionDriver, &[initial]).unwrap();
-        let reference = allocated[0].expect_reference("the allocated allocation").unwrap().clone();
+        let reference = allocated[0].try_as_reference("the allocated allocation").unwrap().clone();
         (context, reference)
     }
 
@@ -1033,7 +1033,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_reference_primitive_discharge_replays_accesses_to_a_preserved_allocation() {
-        // An allocation that partial discharge preserved survives in the destination as an ordinary reference, so the
+        // An allocation that partial discharge preserved survives in the destination as a reference value, so the
         // dispatch path replays every access verbatim over the handle's destination value instead of acting on
         // threaded state, and the access rules themselves never run. The rewritten program therefore performs the
         // same reference operations the source did, in the same order, and the consumed allocation contributes no

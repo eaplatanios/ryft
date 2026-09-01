@@ -93,7 +93,7 @@ impl ReferenceStateWidening {
 /// must publish, and where each group is inserted.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ReferenceRegionDischargeBoundary {
-    /// Allocation entering at each declared source-region input position, or [`None`] for an ordinary value.
+    /// Allocation entering at each declared source-region input position, or [`None`] for a value.
     declared_input_allocations: Vec<Option<ReferenceDischargeAllocationId>>,
 
     /// Length of the region's own leading capture prefix, from [`Operation::region_capture_input_count`], or [`None`]
@@ -134,7 +134,7 @@ impl ReferenceRegionDischargeBoundary {
     ///     capture prefix.
     ///   - `region_index`: Position of the region among that operation's attached regions.
     ///   - `declared_input_allocations`: Allocation entering at each declared boundary position, or [`None`] for an
-    ///     ordinary value. Reference positions must come from
+    ///     value. Reference positions must come from
     ///     [`operand_allocation`](crate::programs::references::ReferenceDischargeContext::operand_allocation), which
     ///     validates that each operand carries the complete stored value rather than a derived view. Its length must
     ///     equal the source region's input count, because every declared position is rebuilt.
@@ -172,7 +172,7 @@ impl ReferenceRegionDischargeBoundary {
         Self::new(operation, region_index, declared_input_allocations, state.clone(), state)
     }
 
-    /// Returns the allocation entering at each declared boundary position, or [`None`] for an ordinary value.
+    /// Returns the allocation entering at each declared boundary position, or [`None`] for a value.
     #[inline]
     pub(super) fn declared_input_allocations(&self) -> &[Option<ReferenceDischargeAllocationId>] {
         self.declared_input_allocations.as_slice()
@@ -219,7 +219,7 @@ pub struct ReferenceRegionDischargeFork<V: Value, O: Operation<Type = V::Type>> 
     /// Rebuilt, discharged region program.
     pub(super) program: Program<V, O, Vec<V>, Vec<V>>,
 
-    /// Allocation each *declared* region output denotes, or [`None`] for an ordinary output, in region-boundary order.
+    /// Allocation each *declared* region output denotes, or [`None`] for a value output, in region-boundary order.
     pub(super) output_allocations: Vec<Option<ReferenceDischargeAllocationId>>,
 
     /// Threaded allocations the region's closure mutated, in canonical allocation order.
@@ -227,7 +227,7 @@ pub struct ReferenceRegionDischargeFork<V: Value, O: Operation<Type = V::Type>> 
 }
 
 impl<V: Value, O: Operation<Type = V::Type>> ReferenceRegionDischargeFork<V, O> {
-    /// Returns the allocation each declared region output denotes, or [`None`] where the output is an ordinary value.
+    /// Returns the allocation each declared region output denotes, or [`None`] where the output is a value.
     #[inline]
     pub fn output_allocations(&self) -> &[Option<ReferenceDischargeAllocationId>] {
         self.output_allocations.as_slice()
@@ -345,7 +345,7 @@ mod tests {
         let allocated = context
             .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
-        let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation_id();
+        let allocation = allocated.try_as_reference("the caller allocation").unwrap().allocation_id();
         let regions = [program];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let boundary = ReferenceRegionDischargeBoundary::new(
@@ -366,7 +366,7 @@ mod tests {
         );
         assert_eq!(fork.validate_predicted_mutations(&[allocation], "list.call"), Ok(()));
 
-        // The region returns that allocation at its second output, so a widening that predicted an ordinary value there
+        // The region returns that allocation at its second output, so a widening that predicted a value there
         // would have published the allocation's final state twice.
         assert_eq!(fork.output_allocations(), &[None, Some(allocation)]);
         assert_eq!(

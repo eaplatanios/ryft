@@ -6031,13 +6031,13 @@ mod tests {
             EagerContext<Array, TestUnaryOperation<ArrayType>>,
             TestArrayReferenceDischarge,
         >::new(EagerContext::new());
-        let inputs = [ReferenceDischargeValue::Ordinary(Array::scalar(2.0f32))];
+        let inputs = [ReferenceDischargeValue::Value(Array::scalar(2.0f32))];
 
         // A reference-free, region-free application replays verbatim through the destination, which executes it and
         // returns its outputs as ordinary carriers.
         assert_eq!(
             operation.discharge_references(&context, &EmptyRegionDriver, &inputs),
-            Ok(vec![ReferenceDischargeValue::Ordinary(Array::scalar(-2.0f32))]),
+            Ok(vec![ReferenceDischargeValue::Value(Array::scalar(-2.0f32))]),
         );
 
         // An operand that is a live reference handle is rejected too, because a reference-touching operation owns
@@ -6049,7 +6049,7 @@ mod tests {
         assert_eq!(
             operation.discharge_references(&context, &EmptyRegionDriver, &[reference.clone()]),
             Err(ProgramError::MalformedProgram(format!(
-                "reference discharge expected an ordinary operand 0 of `test_unary` but received {reference}",
+                "reference discharge expected a value operand 0 of `test_unary` but received {reference}",
             ))),
         );
     }

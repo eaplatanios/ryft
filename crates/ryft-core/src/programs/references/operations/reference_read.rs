@@ -108,8 +108,8 @@ where
         inputs: &[ReferenceDischargeValue<C, P>],
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        let reference = inputs[0].expect_reference("a reference to read")?;
-        Ok(vec![ReferenceDischargeValue::Ordinary(context.read(reference)?)])
+        let reference = inputs[0].try_as_reference("a reference to read")?;
+        Ok(vec![ReferenceDischargeValue::Value(context.read(reference)?)])
     }
 }
 
@@ -169,16 +169,16 @@ mod tests {
         let handle = ReferenceDischargeValue::Reference(reference.clone());
         assert_eq!(
             Read::new().discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&handle)),
-            Ok(vec![ReferenceDischargeValue::Ordinary(TestValue::new(REFERENT, 4))]),
+            Ok(vec![ReferenceDischargeValue::Value(TestValue::new(REFERENT, 4))]),
         );
         assert_eq!(context.is_mutated(reference.allocation_id()), Ok(false));
 
-        // An ordinary operand denotes no allocation, so the rule reports what it expected instead of reading a value.
-        let pure: TestDischargeValue = ReferenceDischargeValue::Ordinary(TestValue::new(REFERENT, 4));
+        // An value operand denotes no allocation, so the rule reports what it expected instead of reading a value.
+        let pure: TestDischargeValue = ReferenceDischargeValue::Value(TestValue::new(REFERENT, 4));
         assert_eq!(
             Read::new().discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&pure)),
             Err(ProgramError::MalformedProgram(
-                "reference discharge expected a reference to read but received an ordinary value".to_string(),
+                "reference discharge expected a reference to read but received a value".to_string(),
             )),
         );
     }

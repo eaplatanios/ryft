@@ -15,7 +15,7 @@ use super::regions::{ReferenceRegionDischargeBoundary, ReferenceRegionDischargeF
 /// Replays one reference-free operation application verbatim over its rewritten operands.
 ///
 /// This is the shared rule body for every operation that touches no reference: it is the discharge counterpart of the
-/// ordinary interpretation path, and it is where the conversion seam from the payload into the destination's operation
+/// standard interpretation path, and it is where the conversion seam from the payload into the destination's operation
 /// family is spent. Because the operation is replayed rather than reinterpreted, the destination decides what
 /// replaying means, so an eager destination executes it and a staging destination records it.
 ///
@@ -67,18 +67,16 @@ where
         .iter()
         .enumerate()
         .map(|(input_index, input)| {
-            input
-                .expect_ordinary(&format!("an ordinary operand {input_index} of `{}`", operation.name()))
-                .cloned()
+            input.try_as_value(&format!("a value operand {input_index} of `{}`", operation.name())).cloned()
         })
         .collect::<Result<Vec<_>, _>>()?;
     let outputs = context.parent().bind(operation.clone(), regions, values.as_slice())?;
-    Ok(outputs.into_iter().map(ReferenceDischargeValue::Ordinary).collect())
+    Ok(outputs.into_iter().map(ReferenceDischargeValue::Value).collect())
 }
 
 /// Replays one access to a *preserved* allocation verbatim into the destination.
 ///
-/// A preserved reference survives partial reference discharge as an ordinary reference of the destination universe, so the
+/// A preserved reference survives partial reference discharge as a reference value of the destination universe, so the
 /// honest rewrite of an access to it is no rewrite at all: the operation is bound again, over the exact destination
 /// reference value each handle denotes, and its results are the destination's own. The dispatch path owns the replay
 /// for every region-free, access-only application, so access rules never call this themselves; it remains public for
@@ -119,7 +117,7 @@ where
     let values = inputs
         .iter()
         .map(|input| match input {
-            ReferenceDischargeValue::Ordinary(value) => Ok(value.clone()),
+            ReferenceDischargeValue::Value(value) => Ok(value.clone()),
             ReferenceDischargeValue::Reference(reference) => match reference.preserved() {
                 Some(value) => {
                     // The handle retains its destination value after consumption, so consult the environment before
@@ -150,7 +148,7 @@ where
                     operation.name(),
                 )));
             }
-            Ok(ReferenceDischargeValue::Ordinary(output))
+            Ok(ReferenceDischargeValue::Value(output))
         })
         .collect()
 }
@@ -208,7 +206,7 @@ pub trait ReferenceDischargeDriver<C: Domain, P: ReferenceDischargePolicy<C>>:
     /// [`discharge_region`](Self::discharge_region) is deliberately not: that service inlines a region's rewritten
     /// work into the live destination, which is right for an operation whose region is invoked in place and wrong for
     /// one whose region must survive as a region. The fork's environment contains exactly the allocations `boundary` names,
-    /// each entering as an ordinary value at its boundary position, so a region cannot reach an allocation its caller did not
+    /// each entering as a value at its boundary position, so a region cannot reach an allocation its caller did not
     /// thread, and nothing it does can reach the caller's environment. The owning rule binds the rebuilt operation in
     /// its own context and merges the final states from the outputs of that binding.
     ///
@@ -349,12 +347,12 @@ mod tests {
 
     #[test]
     fn test_reference_discharge_rules_unwrap_ordinary_carriers_and_reject_reference_handles() {
-        // The operation's own discharge rule owns the unwrapping of ordinary carriers and the rejection diagnostic
+        // The operation's own discharge rule owns the unwrapping of value carriers and the rejection diagnostic
         // for a live reference handle, so every operation-backed value capability inherits both without bespoke
         // delegation.
         let context = ListDischargeContext::new(ListDestination::new());
-        let lhs = ReferenceDischargeValue::Ordinary(ListIrValue::List(vec![1, 2]));
-        let rhs = ReferenceDischargeValue::Ordinary(ListIrValue::List(vec![10, 20]));
+        let lhs = ReferenceDischargeValue::Value(ListIrValue::List(vec![1, 2]));
+        let rhs = ReferenceDischargeValue::Value(ListIrValue::List(vec![10, 20]));
         let sum = discharge_reference_free_operation(
             &ListOperation::Add,
             &context,
@@ -362,15 +360,15 @@ mod tests {
             &[lhs.clone(), rhs.clone()],
         )
         .unwrap();
-        assert_eq!(sum, vec![ReferenceDischargeValue::Ordinary(ListIrValue::List(vec![11, 22]))]);
+        assert_eq!(sum, vec![ReferenceDischargeValue::Value(ListIrValue::List(vec![11, 22]))]);
 
         let reference_type = ReferenceType::new(ListType { length: 2 });
         let allocated = context.bind_discharged(reference_type, ListIrValue::List(vec![1, 2])).unwrap();
-        let allocation = allocated.expect_reference("the allocated allocation").unwrap().allocation_id();
+        let allocation = allocated.try_as_reference("the allocated allocation").unwrap().allocation_id();
         assert_eq!(
             discharge_reference_free_operation(&ListOperation::Add, &context, &EmptyRegionDriver, &[allocated, rhs]),
             Err(ProgramError::MalformedProgram(format!(
-                "reference discharge expected an ordinary operand 0 of `list.add` but received {allocation} ref<list<2>>",
+                "reference discharge expected a value operand 0 of `list.add` but received {allocation} ref<list<2>>",
             ))),
         );
 
@@ -388,12 +386,12 @@ mod tests {
         // family, so an eager destination executes the replay and a staging destination would record it.
         let context = ListDischargeContext::new(ListDestination::new());
         let inputs = vec![
-            ReferenceDischargeValue::Ordinary(ListIrValue::List(vec![1, 2])),
-            ReferenceDischargeValue::Ordinary(ListIrValue::List(vec![10, 20])),
+            ReferenceDischargeValue::Value(ListIrValue::List(vec![1, 2])),
+            ReferenceDischargeValue::Value(ListIrValue::List(vec![10, 20])),
         ];
         assert_eq!(
             discharge_reference_free_operation(&ListOperation::Add, &context, &EmptyRegionDriver, inputs.as_slice()),
-            Ok(vec![ReferenceDischargeValue::Ordinary(ListIrValue::List(vec![11, 22]))]),
+            Ok(vec![ReferenceDischargeValue::Value(ListIrValue::List(vec![11, 22]))]),
         );
 
         // A region-carrying application whose closure touches a reference is rejected rather than replayed, because
@@ -443,7 +441,7 @@ mod tests {
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         assert_eq!(
             discharge_reference_free_operation(&ListOperation::Call, &context, &driver, &inputs[..1]),
-            Ok(vec![ReferenceDischargeValue::Ordinary(ListIrValue::List(vec![2, 4]))]),
+            Ok(vec![ReferenceDischargeValue::Value(ListIrValue::List(vec![2, 4]))]),
         );
     }
 
@@ -499,19 +497,19 @@ mod tests {
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![total, frozen], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
 
-        // Replaying the program through the region driver rewrites every reference primitive into ordinary state
+        // Replaying the program through the region driver rewrites every reference primitive into explicit state
         // threading, so the outputs are the values an eager reference execution would have produced.
         OBSERVED_ALLOCATION_POSITIONS.with_borrow_mut(Vec::clear);
         let context = ListDischargeContext::new(ListDestination::new());
-        let input = ReferenceDischargeValue::Ordinary(ListIrValue::List(vec![1, 2, 3, 4]));
+        let input = ReferenceDischargeValue::Value(ListIrValue::List(vec![1, 2, 3, 4]));
         let regions = [program];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let outputs = driver.discharge_region(&context, 0, vec![input]).unwrap();
         assert_eq!(
             outputs,
             vec![
-                ReferenceDischargeValue::Ordinary(ListIrValue::List(vec![14, 16])),
-                ReferenceDischargeValue::Ordinary(ListIrValue::List(vec![1, 7, 8, 4])),
+                ReferenceDischargeValue::Value(ListIrValue::List(vec![14, 16])),
+                ReferenceDischargeValue::Value(ListIrValue::List(vec![1, 7, 8, 4])),
             ],
         );
 
@@ -545,7 +543,7 @@ mod tests {
             let outputs =
                 discharge_preserved_access(&ListOperation::Read, &context, std::slice::from_ref(&preserved)).unwrap();
             assert_eq!(outputs.len(), 1);
-            vec![outputs[0].expect_ordinary("the replayed read result").unwrap().atom_id().unwrap()]
+            vec![outputs[0].try_as_value("the replayed read result").unwrap().atom_id().unwrap()]
         };
         drop(staging);
         let program = Rc::try_unwrap(builder)
@@ -565,7 +563,7 @@ mod tests {
         // operation owning that allocation has to state its own rule instead.
         let staging = TracingContext::<ListIrValue, ListOperation>::new();
         let staged = ReferenceDischargeContext::<_, ListReferenceDischarge>::new(staging.clone());
-        let initial = ReferenceDischargeValue::Ordinary(staging.input(ListIrType::List(referent.clone())));
+        let initial = ReferenceDischargeValue::Value(staging.input(ListIrType::List(referent.clone())));
         assert_eq!(
             discharge_preserved_access(&ListOperation::ReferenceNew, &staged, std::slice::from_ref(&initial)),
             Err(ProgramError::MalformedProgram(
@@ -579,7 +577,7 @@ mod tests {
         // A discharged reference has no destination reference value at all, so it cannot be replayed over.
         let context = ListDischargeContext::new(ListDestination::new());
         let discharged = context.bind_discharged(ReferenceType::new(referent), ListIrValue::List(vec![1, 2])).unwrap();
-        let discharged_allocation = discharged.expect_reference("the discharged reference").unwrap().allocation_id();
+        let discharged_allocation = discharged.try_as_reference("the discharged reference").unwrap().allocation_id();
         assert_eq!(
             discharge_preserved_access(&ListOperation::Read, &context, std::slice::from_ref(&discharged)),
             Err(ProgramError::MalformedProgram(format!(

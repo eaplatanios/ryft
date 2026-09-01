@@ -120,8 +120,8 @@ where
         inputs: &[ReferenceDischargeValue<C, P>],
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
-        let reference = inputs[0].expect_reference("a reference to write")?;
-        let replacement = inputs[1].expect_ordinary("a replacement value")?.clone();
+        let reference = inputs[0].try_as_reference("a reference to write")?;
+        let replacement = inputs[1].try_as_value("a replacement value")?.clone();
         validate_operand_types(self, inputs)?;
         context.write(reference, replacement)?;
         Ok(Vec::new())
@@ -201,10 +201,10 @@ mod tests {
             ReferenceDischargeContext::<TestDestination, WriteOnlyReferenceDischarge>::new(TestDestination::new());
         let initial = TestValue::new(REFERENT, 4);
         let allocated = context.bind_discharged(ReferenceType::new(REFERENT), initial).unwrap();
-        let reference = allocated.expect_reference("the allocated allocation").unwrap().clone();
+        let reference = allocated.try_as_reference("the allocated allocation").unwrap().clone();
         let inputs = vec![
             ReferenceDischargeValue::Reference(reference.clone()),
-            ReferenceDischargeValue::Ordinary(TestValue::new(REFERENT, 9)),
+            ReferenceDischargeValue::Value(TestValue::new(REFERENT, 9)),
         ];
         assert_eq!(Write::new().discharge_references(&context, &EmptyRegionDriver, inputs.as_slice()), Ok(Vec::new()),);
         assert_eq!(context.read(&reference), Ok(TestValue::new(REFERENT, 9)));
@@ -213,7 +213,7 @@ mod tests {
         // Exact operand inference runs before mutation, so a rejected replacement leaves the allocation unchanged.
         let invalid = vec![
             ReferenceDischargeValue::Reference(reference.clone()),
-            ReferenceDischargeValue::Ordinary(TestValue::new(TestReferent::new(7, 32), 1)),
+            ReferenceDischargeValue::Value(TestValue::new(TestReferent::new(7, 32), 1)),
         ];
         assert_eq!(
             Write::new().discharge_references(&context, &EmptyRegionDriver, invalid.as_slice()),

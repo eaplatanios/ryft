@@ -63,7 +63,7 @@ impl<V: Value, O: Operation<Type = V::Type>, D: RegionDriver<V, O>> RegionDriver
 }
 
 // Recursive discharge replays the attached region one instruction at a time against the live environment, so an allocation
-// created outside the region stays the same allocation inside it and the region's own allocations are ordinary new allocations.
+// created outside the region stays the same allocation inside it and the region's own allocations remain distinct.
 // Constants lift into the destination through the parent, exactly as they do at the top level.
 //
 // The nested obligation is the one this crate's other structural transforms already carry: rebuilding a region needs
@@ -205,7 +205,7 @@ where
                 } else {
                     fork.bind_preserved(r#type, input)?
                 };
-                let forked = carrier.expect_reference("a threaded region allocation")?.allocation_id();
+                let forked = carrier.try_as_reference("a threaded region allocation")?.allocation_id();
                 caller_to_fork.insert(allocation, forked);
                 fork_to_caller.insert(forked, allocation);
                 Ok(carrier)
@@ -233,14 +233,14 @@ where
                             region.id(),
                         )));
                     }
-                    ReferenceDischargeValue::Ordinary(destination.input(source_type.clone()))
+                    ReferenceDischargeValue::Value(destination.input(source_type.clone()))
                 }
                 Some(allocation) => {
                     let Ok(source_reference_type) =
                         <&ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>>::try_from(source_type)
                     else {
                         return Err(ProgramError::MalformedProgram(format!(
-                            "reference discharge assigns {allocation} to ordinary input {position} of region `{}`",
+                            "reference discharge assigns {allocation} to value input {position} of region `{}`",
                             region.id(),
                         )));
                     };
@@ -274,7 +274,7 @@ where
             let fork_declared_allocations = declared
                 .iter()
                 .map(|input| match input {
-                    ReferenceDischargeValue::Ordinary(_) => None,
+                    ReferenceDischargeValue::Value(_) => None,
                     ReferenceDischargeValue::Reference(reference) => Some(reference.allocation_id()),
                 })
                 .collect::<Vec<_>>();
@@ -306,7 +306,7 @@ where
                     continue;
                 };
                 match output {
-                    ReferenceDischargeValue::Ordinary(value) => {
+                    ReferenceDischargeValue::Value(value) => {
                         output_allocations.push(None);
                         output_ids.push(value.atom_id()?);
                     }
@@ -413,7 +413,7 @@ where
                     let semantics = operation.reference_semantics();
 
                     // A region-free operation that only accesses references can replay verbatim when every reference
-                    // it accesses is preserved. Operations that do not access references need their ordinary rule,
+                    // it accesses is preserved. Operations that do not access references need their standard rule,
                     // while operations that produce references need their own rule to register the resulting handles.
                     if !semantics.inputs().is_empty() && semantics.outputs().is_empty() {
                         let mut consumed = Vec::new();
@@ -493,7 +493,7 @@ where
 ///
 /// A reference-typed constant that no scope resolves is rejected rather than lifted. Reference discharge threads allocations
 /// through the environment it owns, and such a reference belongs to no allocation: it never entered through an input, a
-/// capture binding, or an allocation, so nothing in the environment describes it. Wrapping it as an ordinary value
+/// capture binding, or an allocation, so nothing in the environment describes it. Wrapping it as a value
 /// instead would let it survive into the destination and silently break the reference-freedom guarantee of
 /// [`ReferenceDischargeResult`].
 ///
@@ -534,7 +534,7 @@ where
         }
         return context.allocation_reference(allocation);
     }
-    Ok(ReferenceDischargeValue::Ordinary(context.parent().lift(constant)?))
+    Ok(ReferenceDischargeValue::Value(context.parent().lift(constant)?))
 }
 
 #[cfg(test)]
@@ -580,7 +580,7 @@ mod tests {
         let context = ReferenceDischargeContext::<_, ListReferenceDischarge>::new(destination.clone());
         let destination_reference = destination.input(ListIrType::Reference(reference_type.clone()));
         let preserved = context.bind_preserved(reference_type.clone(), destination_reference).unwrap();
-        let reference = preserved.expect_reference("the preserved reference").unwrap();
+        let reference = preserved.try_as_reference("the preserved reference").unwrap();
         let allocation = reference.allocation_id();
 
         // A same-type view is still an alias rather than the allocation's complete stored value. Replaying the
@@ -609,7 +609,7 @@ mod tests {
 
     #[test]
     fn test_reference_discharge_rejects_reference_typed_constants() {
-        // A reference stored as a program constant belongs to no allocation, so lifting it as an ordinary value would let it
+        // A reference stored as a program constant belongs to no allocation, so lifting it as a value would let it
         // survive into the destination and break the reference-freedom guarantee. Both lifting paths reject it.
         let reference_type = ReferenceType::new(ListType { length: 2 });
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
@@ -638,23 +638,23 @@ mod tests {
         let triple = ReferenceType::new(ListType { length: 3 });
         let context = ListDischargeContext::new(ListDestination::new());
         let allocated = context.bind_discharged(pair.clone(), ListIrValue::List(vec![1, 2])).unwrap();
-        let allocation = allocated.expect_reference("the captured allocation").unwrap().allocation_id();
+        let allocation = allocated.try_as_reference("the captured allocation").unwrap().allocation_id();
         let scoped = context.with_captures(ReferenceDischargeCaptureScope::new(
             list_capture_position,
             vec![None, None, Some(allocation)],
         ));
 
         let lifted = lift_constant(&scoped, ListIrValue::Reference(pair.clone())).unwrap();
-        let reference = lifted.expect_reference("the resolved capture").unwrap();
+        let reference = lifted.try_as_reference("the resolved capture").unwrap();
         assert_eq!(reference.allocation_id(), allocation);
         assert_eq!(reference.r#type(), &pair);
         assert_eq!(scoped.live_allocation_ids(), vec![allocation]);
 
-        // An ordinary constant is unaffected by the scope and lifts through the destination as usual.
-        let ordinary = lift_constant(&scoped, ListIrValue::List(vec![3, 4])).unwrap();
-        assert_eq!(ordinary, ReferenceDischargeValue::Ordinary(ListIrValue::List(vec![3, 4])));
+        // A non-reference constant is unaffected by the scope and lifts through the destination as usual.
+        let value = lift_constant(&scoped, ListIrValue::List(vec![3, 4])).unwrap();
+        assert_eq!(value, ReferenceDischargeValue::Value(ListIrValue::List(vec![3, 4])));
 
-        // A capture position the scope does not bind keeps the ordinary reference-constant rejection.
+        // A capture position the scope does not bind keeps the unbound reference-constant rejection.
         assert_eq!(
             lift_constant(&scoped, ListIrValue::Reference(triple.clone())).err(),
             Some(ProgramError::MalformedProgram(
@@ -667,7 +667,7 @@ mod tests {
         // A capture constant names the complete stored value its position binds, so a declared type the bound allocation does not
         // carry is reported rather than silently widened where the constant is used.
         let allocated = context.bind_discharged(triple, ListIrValue::List(vec![1, 2, 3])).unwrap();
-        let wider = allocated.expect_reference("the mismatched allocation").unwrap().allocation_id();
+        let wider = allocated.try_as_reference("the mismatched allocation").unwrap().allocation_id();
         let mismatched = scoped.with_captures(scoped.captures().with_allocations(vec![None, None, Some(wider)]));
         assert_eq!(
             lift_constant(&mismatched, ListIrValue::Reference(pair)).err(),
@@ -695,7 +695,7 @@ mod tests {
         let allocated = context
             .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
-        let allocation = allocated.expect_reference("the captured allocation").unwrap().allocation_id();
+        let allocation = allocated.try_as_reference("the captured allocation").unwrap().allocation_id();
         let context = context.with_captures(ReferenceDischargeCaptureScope::new(
             list_capture_position,
             vec![None, None, Some(allocation)],
@@ -772,7 +772,7 @@ mod tests {
 
         let context = ListDischargeContext::new(ListDestination::new());
         let allocated = context.bind_discharged(reference_type, ListIrValue::List(vec![1, 2])).unwrap();
-        let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation_id();
+        let allocation = allocated.try_as_reference("the caller allocation").unwrap().allocation_id();
         let regions = [program];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let boundary = ReferenceRegionDischargeBoundary::new(
@@ -811,7 +811,7 @@ mod tests {
         let context = ReferenceDischargeContext::<_, ListReferenceDischarge>::new(destination.clone());
         let state = destination.input(ListIrType::List(ListType { length: 2 }));
         let allocated = context.bind_discharged(ReferenceType::new(ListType { length: 2 }), state).unwrap();
-        let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation_id();
+        let allocation = allocated.try_as_reference("the caller allocation").unwrap().allocation_id();
         let regions = [program];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let boundary = ReferenceRegionDischargeBoundary::new(
@@ -876,7 +876,7 @@ mod tests {
         let allocated = context
             .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
-        let allocation = allocated.expect_reference("the added allocation").unwrap().allocation_id();
+        let allocation = allocated.try_as_reference("the added allocation").unwrap().allocation_id();
         let regions = [program];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let boundary = ReferenceRegionDischargeBoundary::new(
@@ -911,7 +911,7 @@ mod tests {
         let allocated = context
             .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
-        let allocation = allocated.expect_reference("the declared allocation").unwrap().allocation_id();
+        let allocation = allocated.try_as_reference("the declared allocation").unwrap().allocation_id();
         let regions = [program];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let boundary = ReferenceRegionDischargeBoundary::new(
@@ -948,7 +948,7 @@ mod tests {
         let allocated = context
             .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
-        let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation_id();
+        let allocation = allocated.try_as_reference("the caller allocation").unwrap().allocation_id();
         let regions = [program];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let boundary = ReferenceRegionDischargeBoundary::new(
@@ -989,11 +989,11 @@ mod tests {
         let accessed = context
             .bind_discharged(reference_type.clone(), destination.input(ListIrType::List(ListType { length: 2 })))
             .unwrap();
-        let accessed = accessed.expect_reference("the accessed allocation").unwrap().allocation_id();
+        let accessed = accessed.try_as_reference("the accessed allocation").unwrap().allocation_id();
         let carried = context
             .bind_discharged(reference_type, destination.input(ListIrType::List(ListType { length: 2 })))
             .unwrap();
-        let carried = carried.expect_reference("the carried allocation").unwrap().allocation_id();
+        let carried = carried.try_as_reference("the carried allocation").unwrap().allocation_id();
 
         // The added input goes between the two declared inputs and the added output goes before the declared output,
         // which is the insertion arithmetic a scan's carry prefix depends on.

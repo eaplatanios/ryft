@@ -1,5 +1,5 @@
 //! Contains machinery related to _reference discharge_, which is the process of rewriting mutable reference state into
-//! explicit immutable dataflow. Specifically, a program containing reference operations is not ordinary functional
+//! explicit immutable dataflow. Specifically, a program containing reference operations is not purely functional
 //! Single Static Assignment (SSA) dataflow. A read operation depends on the latest write operation to the same
 //! allocation even though that dependency is represented by a reference handle rather than by an SSA operand carrying
 //! the current value. Many transforms and backends require the dependency to be explicit. Reference discharge makes it
@@ -35,7 +35,7 @@
 //! result.
 //!
 //! An external reference follows the same rewrite but its state crosses the program boundary. Its reference-typed input
-//! becomes an ordinary input carrying the entering referent. If the program mutates the reference, its final state is
+//! becomes a value input carrying the entering referent. If the program mutates the reference, its final state is
 //! appended after the public outputs as a hidden output. [`ExternalReferenceBinding`] records which capture or public
 //! argument owns that state and which hidden output must replace the caller's reference value. Its discharged input
 //! position follows from that logical source and the result's capture count. A read-only external reference has no
@@ -82,8 +82,8 @@
 //! - [`ReferenceDischargePolicy`] names everything that varies by reference universe: the referent type family, the
 //!   handle's composed alias metadata, type lifting and projection, and the mechanics of reading and replacing a
 //!   selected value. [`ReferenceAccumulationPolicy`] adds ordered accumulation only for universes that support it.
-//! - [`ReferenceDischargeValue`] is the context-free carrier flowing between rules. It contains either an ordinary
-//!   destination value or an opaque [`ReferenceDischargeReference`] handle.
+//! - [`ReferenceDischargeValue`] is the context-free carrier flowing between rules. It contains either a destination
+//!   value or an opaque [`ReferenceDischargeReference`] handle.
 //! - [`ReferenceDischargeContext`] owns the live allocation environment. Each allocation is either `Discharged`, with a
 //!   current immutable state and mutation bit, or `Preserved`, with the exact destination reference value that survived.
 //! - [`ReferenceDischargeableOperation`] is the rule implemented by each operation. Reference primitives rewrite
@@ -134,7 +134,7 @@
 //!   isolated environments.
 //! - A **discharged reference** is represented by its current immutable state. A **preserved reference** remains
 //!   represented by a reference value and its reference operations are replayed rather than rewritten.
-//! - A **carrier** is a [`ReferenceDischargeValue`]: either an ordinary destination value or a temporary reference
+//! - A **carrier** is a [`ReferenceDischargeValue`]: either an destination value or a temporary reference
 //!   handle passed between operation rules.
 //! - A summary allocation is **reached** when a region's closure accesses, returns, or otherwise rematerializes it. It is
 //!   **accessed** only when the closure performs a semantic reference access on it. Reached allocations may need to cross a
@@ -401,7 +401,7 @@ pub(crate) mod tests {
         }
     }
 
-    /// Type universe of the prototype programs, pairing ordinary lists with references to them.
+    /// Type universe of the prototype programs, pairing list values with references to them.
     #[derive(Clone, Debug, PartialEq)]
     pub(crate) enum ListIrType {
         List(ListType),
@@ -899,7 +899,7 @@ pub(crate) mod tests {
                 Self::ReferenceNew => {
                     check_count!("input", inputs, 1, ProgramError);
                     OBSERVED_ALLOCATION_POSITIONS.with_borrow_mut(|positions| positions.push(driver.instruction()));
-                    let initial = inputs[0].expect_ordinary("an initial state")?.clone();
+                    let initial = inputs[0].try_as_value("an initial state")?.clone();
                     let initial_type = initial.r#type().into_owned();
                     let output_type = self.infer_output_types(std::slice::from_ref(&initial_type), &[])?.remove(0);
                     let r#type = <&ReferenceType<ListType>>::try_from(&output_type)
@@ -918,7 +918,7 @@ pub(crate) mod tests {
                 }
                 Self::Slice { offset, length } => {
                     check_count!("input", inputs, 1, ProgramError);
-                    let reference = inputs[0].expect_reference("a reference to view")?;
+                    let reference = inputs[0].try_as_reference("a reference to view")?;
                     let alias = reference.alias();
                     if offset + length > alias.length {
                         return Err(ProgramError::MalformedProgram(format!(
@@ -937,38 +937,38 @@ pub(crate) mod tests {
                 }
                 Self::Read => {
                     check_count!("input", inputs, 1, ProgramError);
-                    let reference = inputs[0].expect_reference("a reference to read")?;
-                    Ok(vec![ReferenceDischargeValue::Ordinary(context.read(reference)?)])
+                    let reference = inputs[0].try_as_reference("a reference to read")?;
+                    Ok(vec![ReferenceDischargeValue::Value(context.read(reference)?)])
                 }
                 Self::Write => {
                     check_count!("input", inputs, 2, ProgramError);
-                    let reference = inputs[0].expect_reference("a reference to write")?;
-                    let replacement = inputs[1].expect_ordinary("a replacement value")?.clone();
+                    let reference = inputs[0].try_as_reference("a reference to write")?;
+                    let replacement = inputs[1].try_as_value("a replacement value")?.clone();
                     context.write(reference, replacement)?;
                     Ok(Vec::new())
                 }
                 Self::Swap => {
                     check_count!("input", inputs, 2, ProgramError);
-                    let reference = inputs[0].expect_reference("a reference to replace")?;
-                    let replacement = inputs[1].expect_ordinary("a replacement value")?.clone();
-                    Ok(vec![ReferenceDischargeValue::Ordinary(context.swap(reference, replacement)?)])
+                    let reference = inputs[0].try_as_reference("a reference to replace")?;
+                    let replacement = inputs[1].try_as_value("a replacement value")?.clone();
+                    Ok(vec![ReferenceDischargeValue::Value(context.swap(reference, replacement)?)])
                 }
                 Self::AddUpdate => {
                     check_count!("input", inputs, 2, ProgramError);
-                    let reference = inputs[0].expect_reference("a reference to accumulate into")?;
-                    let update = inputs[1].expect_ordinary("an update value")?.clone();
+                    let reference = inputs[0].try_as_reference("a reference to accumulate into")?;
+                    let update = inputs[1].try_as_value("an update value")?.clone();
                     context.accumulate(reference, update)?;
                     Ok(Vec::new())
                 }
                 Self::Freeze => {
                     check_count!("input", inputs, 1, ProgramError);
-                    let reference = inputs[0].expect_reference("a reference to freeze")?;
-                    Ok(vec![ReferenceDischargeValue::Ordinary(context.consume(reference)?)])
+                    let reference = inputs[0].try_as_reference("a reference to freeze")?;
+                    Ok(vec![ReferenceDischargeValue::Value(context.consume(reference)?)])
                 }
                 Self::UnreportedFreeze => {
                     check_count!("input", inputs, 1, ProgramError);
-                    let reference = inputs[0].expect_reference("a reference to freeze")?;
-                    Ok(vec![ReferenceDischargeValue::Ordinary(context.consume(reference)?)])
+                    let reference = inputs[0].try_as_reference("a reference to freeze")?;
+                    Ok(vec![ReferenceDischargeValue::Value(context.consume(reference)?)])
                 }
                 Self::Call => discharge_positional_region_operation(self, context, driver, inputs, 0),
             }

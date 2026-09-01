@@ -1,7 +1,7 @@
 //! Generic reference types, operations, eager runtime state, and staged discharge.
 //!
 //! References are Ryft's second-class mutable-state values. A reference may be created, aliased, read, replaced,
-//! updated, and consumed inside a program, but it is not ordinary immutable data: numeric operations cannot consume
+//! updated, and consumed inside a program, but it is not immutable value data: numeric operations cannot consume
 //! it directly, a local reference cannot escape as a public output, and an external reference denotes state owned by
 //! the caller. Reference operations carry ordered-state effects so that optimization and transformation machinery
 //! cannot reorder or duplicate them as if they were pure computations.
@@ -88,9 +88,9 @@
 //! # Eager and Staged State
 //!
 //! Eager code acts directly through a [`Reference`] handle. Staged programs instead use the six reference operations.
-//! Before a staged program reaches a backend that accepts only ordinary immutable values, discharge rewrites those
+//! Before a staged program reaches a backend that accepts only immutable values, discharge rewrites those
 //! operations into explicit state dataflow. A local allocation disappears entirely after that rewrite. An external
-//! allocation becomes an ordinary state input and, when mutated, a hidden final-state output described by a
+//! allocation becomes a state value input and, when mutated, a hidden final-state output described by a
 //! [`ExternalReferenceBinding`]; the backend's stateful invocation surface snapshots and publishes those values through
 //! the caller's reference. [`Program::discharge_references`] exposes the generic program-level entry point for this
 //! rewrite; the discharge module documentation contains a concrete before-and-after example.

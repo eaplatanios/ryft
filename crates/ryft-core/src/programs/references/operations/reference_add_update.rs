@@ -126,8 +126,8 @@ where
         inputs: &[ReferenceDischargeValue<C, P>],
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
-        let reference = inputs[0].expect_reference("a reference to accumulate into")?;
-        let update = inputs[1].expect_ordinary("an update value")?.clone();
+        let reference = inputs[0].try_as_reference("a reference to accumulate into")?;
+        let update = inputs[1].try_as_value("an update value")?.clone();
 
         // The sum of the handle's referent and the update must itself be the handle's referent, which is exactly what
         // this operation's own inference states and what a universe's addition alone does not guarantee.
@@ -211,7 +211,7 @@ mod tests {
         let (context, reference) = allocated_allocation(4);
         let inputs = vec![
             ReferenceDischargeValue::Reference(reference.clone()),
-            ReferenceDischargeValue::Ordinary(TestValue::new(REFERENT, 9)),
+            ReferenceDischargeValue::Value(TestValue::new(REFERENT, 9)),
         ];
         assert_eq!(
             AddUpdate::new().discharge_references(&context, &EmptyRegionDriver, inputs.as_slice()),
@@ -224,7 +224,7 @@ mod tests {
         // inference before the universe accumulates anything, so the allocation keeps its previous state.
         let promoted = vec![
             ReferenceDischargeValue::Reference(reference.clone()),
-            ReferenceDischargeValue::Ordinary(TestValue::new(TestReferent::new(7, 32), 1)),
+            ReferenceDischargeValue::Value(TestValue::new(TestReferent::new(7, 32), 1)),
         ];
         assert_eq!(
             AddUpdate::new().discharge_references(&context, &EmptyRegionDriver, promoted.as_slice()),

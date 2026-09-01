@@ -119,14 +119,14 @@ where
         inputs: &[ReferenceDischargeValue<C, P>],
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
         check_count!("input", inputs, 2, ProgramError);
-        let reference = inputs[0].expect_reference("a reference to replace")?;
-        let replacement = inputs[1].expect_ordinary("a replacement value")?.clone();
+        let reference = inputs[0].try_as_reference("a reference to replace")?;
+        let replacement = inputs[1].try_as_value("a replacement value")?.clone();
 
         // The replacement must carry exactly the handle's referent. A universe whose write mechanics only require the
         // replacement to fit inside the selected coordinates would otherwise perform a silent partial write, so the
         // rule re-derives the operand relationship its own inference already states.
         validate_operand_types(self, inputs)?;
-        Ok(vec![ReferenceDischargeValue::Ordinary(context.swap(reference, replacement)?)])
+        Ok(vec![ReferenceDischargeValue::Value(context.swap(reference, replacement)?)])
     }
 }
 
@@ -204,16 +204,16 @@ mod tests {
         let (context, reference) = allocated_allocation(4);
         let inputs = vec![
             ReferenceDischargeValue::Reference(reference.clone()),
-            ReferenceDischargeValue::Ordinary(TestValue::new(REFERENT, 9)),
+            ReferenceDischargeValue::Value(TestValue::new(REFERENT, 9)),
         ];
         assert_eq!(
             Swap::new().discharge_references(&context, &EmptyRegionDriver, inputs.as_slice()),
-            Ok(vec![ReferenceDischargeValue::Ordinary(TestValue::new(REFERENT, 4))]),
+            Ok(vec![ReferenceDischargeValue::Value(TestValue::new(REFERENT, 4))]),
         );
         assert_eq!(context.read(&reference), Ok(TestValue::new(REFERENT, 9)));
         assert_eq!(context.is_mutated(reference.allocation_id()), Ok(true));
 
-        // The replacement itself must be an ordinary value rather than a second reference handle.
+        // The replacement itself must be a value rather than a second reference handle.
         let handles =
             vec![ReferenceDischargeValue::Reference(reference.clone()), ReferenceDischargeValue::Reference(reference)];
         assert_eq!(

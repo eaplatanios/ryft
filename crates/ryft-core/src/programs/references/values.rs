@@ -87,9 +87,9 @@ impl ReferenceGeneration {
 /// owning type without fulfilling that obligation poisons the reference automatically.
 ///
 /// Committing an asynchronous replacement changes the state to `Pending`, which stores the replacement together with
-/// its cumulative [`ReferenceCompletion`]. Ordinary value access waits for that completion without holding the state
-/// lock, then changes the state to `Ready` on success or `Poisoned` on failure. Generations ensure that completion of
-/// an older execution cannot affect a newer mutation. `Frozen` and `Poisoned` are terminal states.
+/// its cumulative [`ReferenceCompletion`]. Value access waits for that completion without holding the state lock, then
+/// changes the state to `Ready` on success or `Poisoned` on failure. Generations ensure that completion of an older
+/// execution cannot affect a newer mutation. `Frozen` and `Poisoned` are terminal states.
 ///
 /// Read-only asynchronous executions do not enter a separate state. They publish completion leases on `Ready` or
 /// `Pending`. A mutation waits for those leases before it may remove the value, preventing donated storage from racing
@@ -282,7 +282,7 @@ impl<V: Value> Reference<V> {
     /// The returned [`ReadyOrPendingReferenceGuard`] always protects `Ready` or `Pending` state and can observe the
     /// current snapshot, publish a submitted read, or begin one of the typed replacement protocols.
     ///
-    /// Ordinary value access should use [`read`](Self::read), [`write`](Self::write), [`swap`](Self::swap),
+    /// Value access should use [`read`](Self::read), [`write`](Self::write), [`swap`](Self::swap),
     /// [`update`](Self::update), or [`freeze`](Self::freeze), which reconcile pending work before accessing the value.
     /// Backends that lock multiple references must acquire them in ascending [`ReferenceId`] order and retain every
     /// resulting guard or replacement typestate until all submitted hidden replacements have been validated and
@@ -316,9 +316,9 @@ impl<V: Value> Reference<V> {
     /// releases the mutex while awaiting the remaining leases, and retries. It never awaits backend work while holding
     /// the mutex.
     ///
-    /// Unlike [`lock`](Self::lock), this function is the private ordinary-access path: it hides pending-state
+    /// Unlike [`lock`](Self::lock), this function is the private value-access path: it hides pending-state
     /// reconciliation and returns a raw guard proven to contain `Ready`. It does not return
-    /// [`ReadyOrPendingReferenceGuard`] because ordinary reads and mutations do not expose `Pending` state or use the
+    /// [`ReadyOrPendingReferenceGuard`] because value reads and mutations do not expose `Pending` state or use the
     /// `Taken` state and its guard-drop poisoning rule.
     ///
     /// # Parameters
@@ -1347,8 +1347,8 @@ pub struct ValidatedPendingReplacementTransaction<'g, V: Value> {
 impl<'g, V: Value> ValidatedPendingReplacementTransaction<'g, V> {
     /// Stores the validated replacement and changes its [`Reference`] state from `Taken` to `Pending`. This function is
     /// infallible because validation established every precondition while retaining the exact taken guard. After the
-    /// stored completion resolves, ordinary reference access reconciles `Pending` to `Ready` on success or `Poisoned`
-    /// on backend failure.
+    /// stored completion resolves, value access reconciles `Pending` to `Ready` on success or `Poisoned` on backend
+    /// failure.
     #[inline]
     pub fn commit(self) -> ReadyOrPendingReferenceGuard<'g, V> {
         let Self { mut taken, value, completion } = self;
@@ -1741,7 +1741,7 @@ mod tests {
         assert_eq!(second_generation, ReferenceGeneration(first_generation.0 + 1));
 
         // Resolving generation one wakes the reader, but its stale result cannot promote generation two. Waiting until
-        // the reader reaches the second completion proves that it retried through the ordinary reconciliation path.
+        // the reader reaches the second completion proves that it retried through the value reconciliation path.
         first_backend.complete(Ok(()));
         second_backend.wait_until_awaited();
         assert_eq!(receiver.try_recv(), Err(TryRecvError::Empty));

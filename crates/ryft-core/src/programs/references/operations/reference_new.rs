@@ -115,7 +115,7 @@ where
         inputs: &[ReferenceDischargeValue<C, P>],
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        let initial = inputs[0].expect_ordinary("an initial reference state")?.clone();
+        let initial = inputs[0].try_as_value("an initial reference state")?.clone();
 
         // The allocation's reference type is exactly the one this operation's own inference derives from the
         // initializer, so the rewrite never re-derives a referent that the type system already settled.
@@ -238,7 +238,7 @@ mod tests {
         // The rule reads its fresh allocation's reference type back out of its own inferred output type. A deliberately
         // inconsistent canonical conversion therefore cannot silently allocate an unclassifiable allocation.
         let disagreeing = TestDischargeContext::new(TestDestination::new());
-        let initial = ReferenceDischargeValue::Ordinary(TestValue::new(NON_PROJECTING_REFERENT, 4));
+        let initial = ReferenceDischargeValue::Value(TestValue::new(NON_PROJECTING_REFERENT, 4));
         assert_eq!(
             New::new().discharge_references(&disagreeing, &EmptyRegionDriver, std::slice::from_ref(&initial)),
             Err(ProgramError::MalformedProgram(

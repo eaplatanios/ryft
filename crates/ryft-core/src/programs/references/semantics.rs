@@ -189,12 +189,12 @@ static EMPTY_REFERENCE_OPERATION_SEMANTICS: ReferenceOperationSemantics =
 /// ```
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReferenceOperationSemantics {
-    /// [`ReferenceInput`]s of the underlying [`Operation`](crate::Operation). Ordinary Single Static Assignment (SSA)
-    /// value (i.e., non-reference) inputs are omitted from this list.
+    /// [`ReferenceInput`]s of the underlying [`Operation`](crate::Operation). Single Static Assignment (SSA) value
+    /// (i.e., non-reference) inputs are omitted from this list.
     inputs: Vec<ReferenceInput>,
 
-    /// [`ReferenceOutput`]s of the underlying [`Operation`](crate::Operation). Ordinary Single Static Assignment (SSA)
-    /// value (i.e., non-reference) outputs are omitted from this list.
+    /// [`ReferenceOutput`]s of the underlying [`Operation`](crate::Operation). Single Static Assignment (SSA) value
+    /// (i.e., non-reference) outputs are omitted from this list.
     outputs: Vec<ReferenceOutput>,
 }
 
@@ -241,14 +241,14 @@ impl ReferenceOperationSemantics {
     }
 
     /// Returns the [`ReferenceInput`]s of the underlying [`Operation`](crate::Operation) in operation-defined order.
-    /// Ordinary Single Static Assignment (SSA) value (i.e., non-reference) inputs are omitted from this list.
+    /// Single Static Assignment (SSA) value (i.e., non-reference) inputs are omitted from this list.
     #[inline]
     pub fn inputs(&self) -> &[ReferenceInput] {
         self.inputs.as_slice()
     }
 
     /// Returns the [`ReferenceOutput`]s of the underlying [`Operation`](crate::Operation) in operation-defined order.
-    /// Ordinary Single Static Assignment (SSA) value (i.e., non-reference) outputs are omitted from this list.
+    /// Single Static Assignment (SSA) value (i.e., non-reference) outputs are omitted from this list.
     #[inline]
     pub fn outputs(&self) -> &[ReferenceOutput] {
         self.outputs.as_slice()

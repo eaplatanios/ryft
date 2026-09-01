@@ -71,7 +71,7 @@ where
     }
     let (leading, forwarded) = inputs.split_at(leading_operand_count);
     for (index, input) in leading.iter().enumerate() {
-        input.expect_ordinary(&format!("an ordinary leading operand {index} of `{name}`"))?;
+        input.try_as_value(&format!("a value leading operand {index} of `{name}`"))?;
     }
     let forwarded_allocations = forwarded
         .iter()
@@ -166,7 +166,7 @@ where
                     None => context.allocation_reference(allocation)?,
                 });
             }
-            None => results.push(ReferenceDischargeValue::Ordinary(output)),
+            None => results.push(ReferenceDischargeValue::Value(output)),
         }
     }
     Ok(results)
@@ -260,7 +260,7 @@ mod tests {
         let allocated = context
             .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
-        let allocation = allocated.expect_reference("the capture-scoped allocation").unwrap().allocation_id();
+        let allocation = allocated.try_as_reference("the capture-scoped allocation").unwrap().allocation_id();
         let context = context.with_captures(ReferenceDischargeCaptureScope::new(
             list_capture_position,
             vec![None, None, Some(allocation)],
@@ -271,11 +271,11 @@ mod tests {
         let results = discharge_positional_region_operation(&ListOperation::Call, &context, &driver, &[], 0).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(
-            results[0].expect_reference("the returned capture-scoped allocation").unwrap().allocation_id(),
+            results[0].try_as_reference("the returned capture-scoped allocation").unwrap().allocation_id(),
             allocation
         );
         assert_eq!(
-            context.read(results[0].expect_reference("the returned capture-scoped allocation").unwrap()),
+            context.read(results[0].try_as_reference("the returned capture-scoped allocation").unwrap()),
             Ok(ListIrValue::List(vec![1, 2]),)
         );
         assert_eq!(context.is_mutated(allocation), Ok(false));
@@ -293,7 +293,7 @@ mod tests {
         let context = ListDischargeContext::new(ListDestination::new());
         let destination_reference = ListIrValue::Reference(reference_type.clone());
         let preserved = context.bind_preserved(reference_type, destination_reference.clone()).unwrap();
-        let allocation = preserved.expect_reference("the preserved capture-scoped allocation").unwrap().allocation_id();
+        let allocation = preserved.try_as_reference("the preserved capture-scoped allocation").unwrap().allocation_id();
         let context = context.with_captures(ReferenceDischargeCaptureScope::new(
             list_capture_position,
             vec![None, None, Some(allocation)],
@@ -303,7 +303,7 @@ mod tests {
 
         let results = discharge_positional_region_operation(&ListOperation::Call, &context, &driver, &[], 0).unwrap();
         assert_eq!(results.len(), 1);
-        let returned = results[0].expect_reference("the returned preserved capture-scoped allocation").unwrap();
+        let returned = results[0].try_as_reference("the returned preserved capture-scoped allocation").unwrap();
         assert_eq!(returned.allocation_id(), allocation);
         assert_eq!(returned.preserved(), Some(&destination_reference));
         assert_eq!(context.operand_value(&results[0]), Ok(destination_reference));

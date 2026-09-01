@@ -375,7 +375,7 @@ where
             Self::Negate => discharge_reference_free_operation(self, context, driver, inputs),
             Self::ReferenceNew => {
                 check_count!("input", inputs, 1, ProgramError);
-                let initial = inputs[0].expect_ordinary("an initial state")?.clone();
+                let initial = inputs[0].try_as_value("an initial state")?.clone();
                 if context.selects_internal(driver.instruction(), 0) {
                     return Ok(vec![context.bind_discharged(ReferenceType::new(RegisterType), initial)?]);
                 }
@@ -385,26 +385,26 @@ where
             }
             Self::Read => {
                 check_count!("input", inputs, 1, ProgramError);
-                let reference = inputs[0].expect_reference("a reference to read")?;
-                Ok(vec![ReferenceDischargeValue::Ordinary(context.read(reference)?)])
+                let reference = inputs[0].try_as_reference("a reference to read")?;
+                Ok(vec![ReferenceDischargeValue::Value(context.read(reference)?)])
             }
             Self::Write => {
                 check_count!("input", inputs, 2, ProgramError);
-                let reference = inputs[0].expect_reference("a reference to write")?;
-                let replacement = inputs[1].expect_ordinary("a replacement value")?.clone();
+                let reference = inputs[0].try_as_reference("a reference to write")?;
+                let replacement = inputs[1].try_as_value("a replacement value")?.clone();
                 context.write(reference, replacement)?;
                 Ok(Vec::new())
             }
             Self::Swap => {
                 check_count!("input", inputs, 2, ProgramError);
-                let reference = inputs[0].expect_reference("a reference to replace")?;
-                let replacement = inputs[1].expect_ordinary("a replacement value")?.clone();
-                Ok(vec![ReferenceDischargeValue::Ordinary(context.swap(reference, replacement)?)])
+                let reference = inputs[0].try_as_reference("a reference to replace")?;
+                let replacement = inputs[1].try_as_value("a replacement value")?.clone();
+                Ok(vec![ReferenceDischargeValue::Value(context.swap(reference, replacement)?)])
             }
             Self::Freeze => {
                 check_count!("input", inputs, 1, ProgramError);
-                let reference = inputs[0].expect_reference("a reference to freeze")?;
-                Ok(vec![ReferenceDischargeValue::Ordinary(context.consume(reference)?)])
+                let reference = inputs[0].try_as_reference("a reference to freeze")?;
+                Ok(vec![ReferenceDischargeValue::Value(context.consume(reference)?)])
             }
             // The hand-rolled structured widening a backend-owned region operation performs: summarize the closure,
             // widen the boundary with the reached state, rebuild the region in an isolated fork, validate the fork
@@ -456,7 +456,7 @@ where
                 let mut results = Vec::with_capacity(source_output_count);
                 for (position, output) in outputs.into_iter().enumerate() {
                     if position < source_output_count {
-                        results.push(ReferenceDischargeValue::Ordinary(output));
+                        results.push(ReferenceDischargeValue::Value(output));
                     } else {
                         let allocation = widening.published()[position - source_output_count];
                         context.merge_boundary_state(&summary, widening.threaded(), allocation, output)?;
@@ -490,19 +490,18 @@ fn test_downstream_reference_universe_discharges_through_the_public_surface() {
         )
         .unwrap();
 
-    // Discharging through the region driver rewrites every reference primitive into ordinary state threading, so the
+    // Discharging through the region driver rewrites every reference primitive into explicit state threading, so the
     // downstream universe reaches the same outputs an eager reference execution would have produced.
     let context = RegisterDischargeContext::new(RegisterDestination::new());
     let regions = [program];
     let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
-    let inputs =
-        vec![RegisterDischargeValue::Ordinary(RegisterValue(4)), RegisterDischargeValue::Ordinary(RegisterValue(3))];
+    let inputs = vec![RegisterDischargeValue::Value(RegisterValue(4)), RegisterDischargeValue::Value(RegisterValue(3))];
     assert_eq!(
         driver.discharge_region(&context, 0, inputs),
         Ok(vec![
-            RegisterDischargeValue::Ordinary(RegisterValue(4)),
-            RegisterDischargeValue::Ordinary(RegisterValue(3)),
-            RegisterDischargeValue::Ordinary(RegisterValue(3)),
+            RegisterDischargeValue::Value(RegisterValue(4)),
+            RegisterDischargeValue::Value(RegisterValue(3)),
+            RegisterDischargeValue::Value(RegisterValue(3)),
         ]),
     );
     assert_eq!(context.live_allocation_ids(), Vec::new());
@@ -512,7 +511,7 @@ fn test_downstream_reference_universe_discharges_through_the_public_surface() {
 fn test_downstream_reference_discharge_context_environment_accessors() {
     let context = RegisterDischargeContext::new(RegisterDestination::new());
     let bound = context.bind_discharged(ReferenceType::new(RegisterType), RegisterValue(1)).unwrap();
-    let allocation = bound.expect_reference("a downstream allocation").unwrap().allocation_id();
+    let allocation = bound.try_as_reference("a downstream allocation").unwrap().allocation_id();
 
     // These ID-based operations are the public seam custom structured transforms use to inspect, thread, and merge
     // discharged state without accessing the environment's private representation.
@@ -550,14 +549,14 @@ fn test_downstream_reference_universe_discharges_into_a_staged_program() {
 
     let discharge = |inputs: Vec<Tracer<TracingContext<RegisterValue, RegisterOperation>>>| {
         let context = ReferenceDischargeContext::new(inputs[0].context().clone());
-        let carriers = inputs.into_iter().map(ReferenceDischargeValue::Ordinary).collect::<Vec<_>>();
+        let carriers = inputs.into_iter().map(ReferenceDischargeValue::Value).collect::<Vec<_>>();
         let regions = [source];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         let outputs = driver.discharge_region(&context, 0, carriers)?;
         assert_eq!(context.live_allocation_ids(), Vec::new());
         outputs
             .iter()
-            .map(|output| output.expect_ordinary("a discharged output").cloned())
+            .map(|output| output.try_as_value("a discharged output").cloned())
             .collect::<Result<Vec<_>, _>>()
     };
     let (_, discharged): (_, Program<_, _, Vec<RegisterValue>, Vec<RegisterValue>>) =
@@ -600,7 +599,7 @@ fn test_downstream_program_level_discharge_threads_external_state_through_the_en
         )
         .unwrap();
 
-    // Each reference input keeps its boundary position and becomes an ordinary input carrying the referent's lifted
+    // Each reference input keeps its boundary position and becomes a value input carrying the referent's lifted
     // type, the public outputs are exactly the source outputs, and only the written allocation appends a hidden final-state
     // output after them.
     let discharged = source.discharge_references(1).unwrap();
@@ -657,7 +656,7 @@ fn test_downstream_region_summary_exposes_exact_access_modes() {
 
     let context = RegisterDischargeContext::new(RegisterDestination::new());
     let reference = context.bind_discharged(ReferenceType::new(RegisterType), RegisterValue(1)).unwrap();
-    let allocation = reference.expect_reference("a downstream allocation").unwrap().allocation_id();
+    let allocation = reference.try_as_reference("a downstream allocation").unwrap().allocation_id();
     let summary = context
         .region_summary(&RegisterOperation::Call, 0, region.entry_region_ref(), &[Some(allocation), None])
         .unwrap();

@@ -86,12 +86,12 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeResult<V, O> {
     /// an empty [`Self::external_reference_bindings`] slice.
     ///
     /// An empty binding slice also guarantees that there are no hidden external final-state outputs, so
-    /// [`Self::output_count`] equals the returned program's complete output count. [`Self::capture_count`] may still be
-    /// nonzero because ordinary, non-reference captures require no binding. The returned program is both reference-free
-    /// and independent of caller-owned references.
+    /// [`Self::output_count`] equals the returned program's complete output count. [`Self::capture_count`] may still
+    /// be nonzero because non-reference captures require no binding. The returned program is both reference-free and
+    /// independent of caller-owned references.
     ///
-    /// Conceptually, a program with only ordinary captures or local reference allocations can be returned directly,
-    /// while either of the following external dependencies is rejected:
+    /// Conceptually, a program with only non-reference captures or local reference allocations can be returned
+    /// directly, while either of the following external dependencies is rejected:
     ///
     /// ```text
     /// read-only external: input initial state
@@ -267,7 +267,7 @@ impl<V: Value, O: Operation<Type = V::Type>> PartialReferenceDischargeResult<V, 
 
     /// Returns the number of leading [`Program`] inputs lifted from the source program's capture table. The boundary
     /// uses `[captures..., inputs...]` order, and this count is the split point between the two groups. It counts all
-    /// lifted captures, including ordinary captures and preserved reference captures that do not appear in
+    /// lifted captures, including non-reference captures and preserved reference captures that do not appear in
     /// [`Self::external_reference_bindings`]. For example, a count of `1` gives `[capture 0 | input 0, input 1, ...]`.
     pub const fn capture_count(&self) -> usize {
         self.capture_count
@@ -305,9 +305,9 @@ impl<V: Value, O: Operation<Type = V::Type>> PartialReferenceDischargeResult<V, 
 }
 
 /// Metadata connecting one caller-owned [`Reference`] to its explicit inputs and outputs after reference discharge.
-/// Reference discharge turns implicit access to a reference into ordinary value flow that a reference-free backend can
-/// execute. For example, consider a source function that takes parameter state by reference, updates it, and returns a
-/// public result:
+/// Reference discharge turns implicit access to a reference into value flow that a reference-free backend can execute.
+/// For example, consider a source function that takes parameter state by reference, updates it, and returns a public
+/// result:
 ///
 /// ```text
 /// train_step(parameters: Reference<Array>, batch: Array) -> Array
@@ -651,7 +651,7 @@ mod tests {
     fn test_reference_discharge_result_try_from_enforces_reference_freedom() {
         // Operation family that separates the two facts the reference-freedom proof must distinguish: an unrelated
         // ordered-state operation that discharge never touches, and a retained reference operation that it must reject
-        // even though its boundary types are ordinary.
+        // even though its boundary types contain no references.
         #[derive(Copy, Clone, Debug)]
         enum ProofOperation {
             OrderedIo,
@@ -727,7 +727,7 @@ mod tests {
             ),
         );
 
-        // A retained reference operation is disqualifying even when every value in the program is ordinary.
+        // A retained reference operation is disqualifying even when every value in the program is non-reference.
         assert_eq!(
             ReferenceDischargeResult::try_from(partial(program(
                 &[ProofOperation::OrderedIo, ProofOperation::RetainedReference],

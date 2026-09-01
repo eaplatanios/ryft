@@ -303,9 +303,9 @@ mod tests {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         builder.add_input(reference_type(0));
         builder.add_input(reference_type(1));
-        let ordinary = builder.add_input(TestType::Value(0));
+        let value = builder.add_input(TestType::Value(0));
         let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![ordinary], vec![Placeholder; 3], vec![Placeholder])
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![value], vec![Placeholder; 3], vec![Placeholder])
             .unwrap();
 
         assert_eq!(

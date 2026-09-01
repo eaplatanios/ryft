@@ -147,8 +147,8 @@ where
         inputs: &[ReferenceDischargeValue<C, P>],
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
         check_count!("input", inputs, 1, ProgramError);
-        let reference = inputs[0].expect_reference("a reference to freeze")?;
-        Ok(vec![ReferenceDischargeValue::Ordinary(context.consume(reference)?)])
+        let reference = inputs[0].try_as_reference("a reference to freeze")?;
+        Ok(vec![ReferenceDischargeValue::Value(context.consume(reference)?)])
     }
 }
 
@@ -212,7 +212,7 @@ mod tests {
         let handle = ReferenceDischargeValue::Reference(reference.clone());
         assert_eq!(
             Freeze::new().discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&handle)),
-            Ok(vec![ReferenceDischargeValue::Ordinary(TestValue::new(REFERENT, 4))]),
+            Ok(vec![ReferenceDischargeValue::Value(TestValue::new(REFERENT, 4))]),
         );
         assert_eq!(context.live_allocation_ids(), Vec::new());
         assert_eq!(

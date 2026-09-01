@@ -302,7 +302,7 @@ impl<C: Domain<Type = ArrayIrType, Value: ReferenceSlice<C::Value>>> Interpretab
 /// # Errors
 ///
 /// Returns [`ProgramError::InvalidInputCount`] for an application that does not supply exactly one operand,
-/// [`ProgramError::MalformedProgram`] when that operand is an ordinary value rather than a reference handle, and
+/// [`ProgramError::MalformedProgram`] when that operand is a value rather than a reference handle, and
 /// [`ProgramError::InvalidOutputCount`] when replaying the view on a preserved allocation does not produce exactly one
 /// value. Propagates the view algebra's own [`TypeError`] when `transform` does not compose onto the incoming
 /// handle's referent, and the discharge context's own [`ProgramError::MalformedProgram`] when the replayed
@@ -319,7 +319,7 @@ where
     O: Clone + Operation<Type = ArrayIrType>,
 {
     check_count!("input", inputs, 1, ProgramError);
-    let reference = inputs[0].expect_reference("a reference to view")?;
+    let reference = inputs[0].try_as_reference("a reference to view")?;
     let referent = transform.output_type(reference.r#type().referent())?;
     let alias = reference.alias().with_transform_unchecked(transform);
     Ok(vec![context.alias_reference(reference, alias, ReferenceType::new(referent), |value| {
@@ -639,7 +639,7 @@ impl<A: Value<Type = ArrayType>> ReferenceFreeze for ArrayIrValue<A> {
 
 impl<A: Value<Type = ArrayType>> ReferenceIndex for ArrayIrValue<A> {
     fn reference_index(&self, axis: usize, index: usize) -> Result<Self, ProgramError> {
-        // Projection rejects ordinary operands and `with_transform` validates the transform against the handle's
+        // Projection rejects value operands and `with_transform` validates the transform against the handle's
         // cached referent type, so a separate operation-level inference pass would only repeat both checks.
         let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
         Ok(Self::Reference(reference.with_transform(ArrayReferenceViewTransform::Index { axis, index })?))
@@ -648,7 +648,7 @@ impl<A: Value<Type = ArrayType>> ReferenceIndex for ArrayIrValue<A> {
 
 impl<A: Value<Type = ArrayType>> ReferenceSlice for ArrayIrValue<A> {
     fn reference_slice(&self, axes: &[ArraySliceAxis]) -> Result<Self, ProgramError> {
-        // Projection rejects ordinary operands and `with_transform` validates the transform against the handle's
+        // Projection rejects value operands and `with_transform` validates the transform against the handle's
         // cached referent type, so a separate operation-level inference pass would only repeat both checks.
         let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
         Ok(Self::Reference(reference.with_transform(ArrayReferenceViewTransform::Slice { axes: axes.to_vec() })?))
@@ -749,12 +749,12 @@ mod tests {
                 TestValue::Array(Array::matrix(3, 3, (1..=9).map(|value| value as f32).collect())),
             )
             .unwrap();
-        let allocation = allocated.expect_reference("the allocated allocation").unwrap().clone();
+        let allocation = allocated.try_as_reference("the allocated allocation").unwrap().clone();
         let sliced = ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 2, 1)])
             .discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&allocated))
             .unwrap();
         assert_eq!(sliced.len(), 1);
-        let sliced = sliced[0].expect_reference("the derived slice").unwrap().clone();
+        let sliced = sliced[0].try_as_reference("the derived slice").unwrap().clone();
         assert_eq!(sliced.allocation_id(), allocation.allocation_id());
         assert_eq!(sliced.r#type(), &ReferenceType::new(ArrayType::new_static(DataType::F32, [2, 2])));
         assert_eq!(sliced.preserved(), None);
@@ -764,7 +764,7 @@ mod tests {
         let indexed = ReferenceIndexOperation::new(0, 1)
             .discharge_references(&context, &EmptyRegionDriver, &[ReferenceDischargeValue::Reference(sliced.clone())])
             .unwrap();
-        let indexed = indexed[0].expect_reference("the derived index").unwrap().clone();
+        let indexed = indexed[0].try_as_reference("the derived index").unwrap().clone();
         assert_eq!(indexed.allocation_id(), allocation.allocation_id());
         assert_eq!(indexed.r#type(), &ReferenceType::new(ArrayType::new_static(DataType::F32, [2])));
         assert_eq!(
@@ -789,7 +789,7 @@ mod tests {
         );
 
         // The operand must be a reference handle, and there must be exactly one of them.
-        let pure = ReferenceDischargeValue::Ordinary(TestValue::Array(Array::scalar(1.0_f32)));
+        let pure = ReferenceDischargeValue::Value(TestValue::Array(Array::scalar(1.0_f32)));
         assert_eq!(
             ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 1, 1)]).discharge_references(
                 &context,
@@ -797,7 +797,7 @@ mod tests {
                 std::slice::from_ref(&pure),
             ),
             Err(ProgramError::MalformedProgram(
-                "reference discharge expected a reference to view but received an ordinary value".to_string(),
+                "reference discharge expected a reference to view but received a value".to_string(),
             )),
         );
         assert_eq!(
@@ -819,12 +819,12 @@ mod tests {
                 ))),
             )
             .unwrap();
-        let preserved_allocation = preserved.expect_reference("the preserved allocation").unwrap().allocation_id();
+        let preserved_allocation = preserved.try_as_reference("the preserved allocation").unwrap().allocation_id();
         let derived = ReferenceIndexOperation::new(0, 0)
             .discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&preserved))
             .unwrap();
         assert_eq!(derived.len(), 1);
-        let derived = derived[0].expect_reference("the derived preserved view").unwrap().clone();
+        let derived = derived[0].try_as_reference("the derived preserved view").unwrap().clone();
         assert_eq!(derived.allocation_id(), preserved_allocation);
         assert_eq!(derived.r#type(), &ReferenceType::new(ArrayType::new_static(DataType::F32, [3])));
         assert_eq!(

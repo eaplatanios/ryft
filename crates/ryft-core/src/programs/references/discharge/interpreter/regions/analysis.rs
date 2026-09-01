@@ -83,7 +83,7 @@ pub struct ReferenceRegionSummary {
     /// Every caller allocation the closure accesses, mapped to its exact non-consuming access modes.
     accesses: BTreeMap<ReferenceDischargeAllocationId, ReferenceAccessModes>,
 
-    /// Caller allocation each *declared* region output denotes, or [`None`] where the output is an ordinary value.
+    /// Caller allocation each *declared* region output denotes, or [`None`] where the output is a value.
     pub(super) output_allocations: Vec<Option<ReferenceDischargeAllocationId>>,
 }
 
@@ -114,8 +114,7 @@ impl ReferenceRegionSummary {
         self.access_modes(allocation).any(|recorded| recorded == mode)
     }
 
-    /// Returns the caller allocation each declared region output denotes, or [`None`] where the output is an ordinary
-    /// value.
+    /// Returns the caller allocation each declared region output denotes, or [`None`] where the output is a value.
     ///
     /// A region that returns an allocation already publishes that allocation's final state at its own output position, so a rule
     /// that widens the boundary must not publish it a second time.
@@ -496,7 +495,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     ///   - `region_index`: Position of the region among that operation's attached regions.
     ///   - `region`: Region whose closure is summarized.
     ///   - `inputs`: Caller allocation denoted by each of the region's declared inputs, in boundary order, with [`None`]
-    ///     wherever the position carries an ordinary value.
+    ///     wherever the position carries a value.
     ///
     /// # Errors
     ///
@@ -526,7 +525,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     }
 
     /// Returns the complete stored value one operand of a structured operation denotes, or [`None`] when the operand is an
-    /// ordinary value.
+    /// value.
     ///
     /// A derived view is rejected rather than resolved to its allocation. A state boundary carries complete-value values, so
     /// only a handle with complete-value provenance may cross it; the view has to be re-derived from the allocation inside the
@@ -572,7 +571,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     /// A closure needs an allocation threaded whenever its replay must be able to resolve that allocation — because it accesses
     /// it, returns it, or merely rematerializes a capture constant that denotes it — so the set is the summary's
     /// reached allocations, a strict superset of the accessed and returned allocations, with the *preserved* allocations removed. A
-    /// preserved reference survives in the destination as an ordinary reference and crosses at its own declared operand
+    /// preserved reference survives in the destination as a reference value and crosses at its own declared operand
     /// position, exactly as the source passed it, so it
     /// needs no state carry, publishes no successor, and widens nothing. This is the one place that distinction is
     /// drawn, which is what keeps the four structured rewrites stating one thing.
@@ -654,7 +653,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
 
     /// Returns the destination value one operand of a structured operation contributes to the rewritten application:
     /// the current immutable state of a discharged reference, the destination reference of a preserved one, or the
-    /// operand's own ordinary value.
+    /// operand's own value.
     ///
     /// # Errors
     ///
@@ -662,7 +661,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     pub fn operand_value(&self, operand: &ReferenceDischargeValue<C, P>) -> Result<C::Value, ProgramError> {
         let reference = match operand {
             ReferenceDischargeValue::Reference(reference) => reference,
-            ReferenceDischargeValue::Ordinary(value) => return Ok(value.clone()),
+            ReferenceDischargeValue::Value(value) => return Ok(value.clone()),
         };
         match reference.binding() {
             ReferenceDischargeBinding::Discharged => self.discharged_state(reference.allocation_id()),
@@ -717,7 +716,7 @@ mod tests {
         let allocated = context
             .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
-        let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation_id();
+        let allocation = allocated.try_as_reference("the caller allocation").unwrap().allocation_id();
         let mut left = ReferenceRegionSummary::default();
         left.record(allocation, ReferenceAccessMode::Read, "list.read").unwrap();
         left.record(allocation, ReferenceAccessMode::ReadWrite, "list.swap").unwrap();
@@ -747,7 +746,7 @@ mod tests {
         let allocated = context
             .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
-        let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation_id();
+        let allocation = allocated.try_as_reference("the caller allocation").unwrap().allocation_id();
         let modes = [
             ReferenceAccessMode::Read,
             ReferenceAccessMode::Write,
@@ -888,7 +887,7 @@ mod tests {
         let allocated = context
             .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
-        let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation_id();
+        let allocation = allocated.try_as_reference("the caller allocation").unwrap().allocation_id();
         let summary = context
             .region_summary(&ListOperation::Call, 0, program.entry_region_ref(), &[Some(allocation), None])
             .unwrap();
@@ -906,7 +905,7 @@ mod tests {
         assert!(summary.is_mutated(allocation));
 
         // A declared output resolves to the caller allocation it denotes: the first output returns the allocation itself, the
-        // second returns a region-local allocation, and the remaining three are ordinary values.
+        // second returns a region-local allocation, and the remaining three are values.
         assert_eq!(summary.output_allocations(), &[Some(allocation), None, None, None, None]);
     }
 
@@ -925,7 +924,7 @@ mod tests {
         let allocated = context
             .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
-        let allocation = allocated.expect_reference("the caller allocation").unwrap().allocation_id();
+        let allocation = allocated.try_as_reference("the caller allocation").unwrap().allocation_id();
         assert_eq!(
             context.region_summary(&ListOperation::Call, 0, program.entry_region_ref(), &[Some(allocation)]),
             Err(ProgramError::MalformedProgram(format!(
@@ -962,7 +961,7 @@ mod tests {
         let allocated = context
             .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
-        let allocation = allocated.expect_reference("the captured allocation").unwrap().allocation_id();
+        let allocation = allocated.try_as_reference("the captured allocation").unwrap().allocation_id();
         let context = context.with_captures(ReferenceDischargeCaptureScope::new(
             list_capture_position,
             vec![None, None, Some(allocation)],
@@ -1021,7 +1020,7 @@ mod tests {
             )
             .unwrap();
         let preserved_allocation =
-            preserved.expect_reference("the preserved captured allocation").unwrap().allocation_id();
+            preserved.try_as_reference("the preserved captured allocation").unwrap().allocation_id();
         let preserved_context = preserved_context.with_captures(ReferenceDischargeCaptureScope::new(
             list_capture_position,
             vec![None, None, Some(preserved_allocation)],

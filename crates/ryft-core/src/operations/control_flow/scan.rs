@@ -1789,11 +1789,8 @@ where
             operands.push(context.allocation_value(*allocation)?);
         }
         for (position, input) in stacked_operands.iter().enumerate() {
-            operands.push(
-                input
-                    .expect_ordinary(&format!("an ordinary operand {} of `{name}`", carry_count + position))?
-                    .clone(),
-            );
+            operands
+                .push(input.try_as_value(&format!("a value operand {} of `{name}`", carry_count + position))?.clone());
         }
         let outputs = context.parent().bind(
             self.with_added_carries(entering.len())?,
@@ -1810,13 +1807,13 @@ where
                         context.merge_boundary_state(&summary, widening.threaded(), allocation, output)?;
                         results.push(carry_operands[position].clone());
                     }
-                    None => results.push(ReferenceDischargeValue::Ordinary(output)),
+                    None => results.push(ReferenceDischargeValue::Value(output)),
                 }
             } else if position < carry_count + entering.len() {
                 let allocation = entering[position - carry_count];
                 context.merge_boundary_state(&summary, widening.threaded(), allocation, output)?;
             } else {
-                results.push(ReferenceDischargeValue::Ordinary(output));
+                results.push(ReferenceDischargeValue::Value(output));
             }
         }
         Ok(results)

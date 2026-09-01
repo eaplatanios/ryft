@@ -1037,7 +1037,7 @@ where
                     context.merge_boundary_state(&summary, widening.threaded(), allocation, output)?;
                     results.push(inputs[position].clone());
                 }
-                None if position < inputs.len() => results.push(ReferenceDischargeValue::Ordinary(output)),
+                None if position < inputs.len() => results.push(ReferenceDischargeValue::Value(output)),
                 None => {
                     let allocation = entering[position - inputs.len()];
                     context.merge_boundary_state(&summary, widening.threaded(), allocation, output)?;
@@ -4972,7 +4972,7 @@ mod tests {
             EagerContext::new(),
         );
         let reference = context.bind_discharged(reference_type, TestValue::Array(Array::scalar(0.0_f32))).unwrap();
-        let allocation = reference.expect_reference("the loop-carried allocation").unwrap().allocation_id();
+        let allocation = reference.try_as_reference("the loop-carried allocation").unwrap().allocation_id();
         assert_eq!(
             context.region_summary(
                 &WhileOperation::<ArrayIrType>::new(),
