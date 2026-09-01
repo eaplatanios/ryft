@@ -1541,7 +1541,7 @@ where
     let mut instruction_index = 0;
     region.interpret_with(
         inputs,
-        |_, constant| lift_constant::<C, P>(context, constant.clone()),
+        |_, constant| context.lift(constant.clone()),
         |instruction, instruction_inputs| {
             let position = InstructionId::new(region.id(), instruction_index);
             instruction_index += 1;
@@ -1626,61 +1626,7 @@ where
     )
 }
 
-// TODO(eaplatanios): Review this.
-/// Lifts one stored program constant into a discharge carrier.
-///
-/// A reference-typed constant resolves through the active [`ReferenceDischargeCaptureScope`], which is how a capture-lifted
-/// program's nested regions name their caller's references: the constant denotes the allocation that capture position
-/// already binds, so it yields that allocation's complete-value handle rather than a second allocation of its own.
-///
-/// A reference-typed constant that no scope resolves is rejected rather than lifted. Reference discharge threads allocations
-/// through the environment it owns, and such a reference belongs to no allocation: it never entered through an input, a
-/// capture binding, or an allocation, so nothing in the environment describes it. Wrapping it as a value
-/// instead would let it survive into the destination and silently break the reference-freedom guarantee of
-/// [`ReferenceDischargeResult`].
-///
-/// # Parameters
-///
-///   - `context`: Active discharge context, supplying both the capture scope and the destination that lifts the
-///     constant.
-///   - `constant`: Stored program constant being lifted.
-///
-/// # Errors
-///
-/// Returns [`ProgramError::MalformedProgram`] when a reference-typed constant resolves to no allocation, or resolves to a
-/// allocation whose reference type is not the one the constant declares, and propagates the destination's own lift error.
-fn lift_constant<C: Context, P: ReferenceDischargePolicy<C>>(
-    context: &ReferenceDischargeContext<C, P>,
-    constant: C::Constant,
-) -> Result<ReferenceDischargeValue<C, P>, ProgramError>
-where
-    for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t C::Type>,
-{
-    let constant_type = constant.r#type();
-    if let Ok(r#type) = <&ReferenceType<P::Referent>>::try_from(constant_type.as_ref()) {
-        let Some(allocation) = context.captures().resolve(&constant) else {
-            return Err(ProgramError::MalformedProgram(format!(
-                "reference discharge cannot lift a constant of reference type `{type}`; a reference enters a program \
-                 through an input, a capture binding, or an allocation",
-            )));
-        };
-
-        // A capture constant names the complete stored value its position binds, so a narrower declared type would silently
-        // widen to the allocation's own value where the constant is used.
-        let bound = context.allocation_entry(allocation)?.r#type().into_owned();
-        if r#type != &bound {
-            return Err(ProgramError::MalformedProgram(format!(
-                "reference discharge resolved a capture constant of reference type `{type}` to {allocation}, which carries \
-                 the reference type `{bound}`",
-            )));
-        }
-        return context.allocation_reference(allocation);
-    }
-    Ok(ReferenceDischargeValue::Value(context.parent().lift(constant)?))
-}
-
-// TODO(eaplatanios): Order declarations as `ReferenceDischargeDriver` -> Recursive Driver ->
-//  `ReferenceDischargeableOperation`.
+// TODO(eaplatanios): Move `ReferenceDischargeableOperation` here.
 
 /// Active state of a reference discharge transform. Reference discharge interprets a source [`Program`] into a
 /// destination [`Program`], one [`Region`](crate::Region) at a time through a [`ReferenceDischargeDriver`]. Each
@@ -1976,14 +1922,13 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         }))
     }
 
-    /// Removes and returns one live allocation entry. This is an environment-storage primitive: the caller must first
-    /// validate that the operation may consume the allocation and that its reference denotes the complete stored value.
+    /// Removes and returns one live [`ReferenceDischargeAllocationEntry`].
     ///
     /// # Errors
     ///
     /// Returns [`ProgramError::MalformedProgram`] when `allocation` belongs to another environment, was never bound,
     /// or has already been consumed.
-    pub(in crate::programs::references::discharge) fn take_allocation_entry(
+    pub(crate) fn take_allocation_entry(
         &self,
         allocation: ReferenceDischargeAllocationId,
     ) -> Result<ReferenceDischargeAllocationEntry<P::Referent, C::Value>, ProgramError> {
@@ -1992,6 +1937,47 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         environment.allocations[allocation.index].take().ok_or_else(|| {
             ProgramError::MalformedProgram(format!("reference discharge accessed consumed {allocation}"))
         })
+    }
+
+    /// Lifts a stored [`Program`] constant into a value that can flow through reference discharge. A non-reference
+    /// constant is lifted by the destination [`Context`] and wrapped as a [`ReferenceDischargeValue::Value`]. A
+    /// reference-typed constant instead names an existing capture binding. This function resolves that binding through
+    /// the active [`ReferenceDischargeCaptureScope`] and returns its [`ReferenceDischargeValue::Reference`]. It never
+    /// creates another allocation for a captured reference. A reference-typed constant that the active capture scope
+    /// does not resolve is rejected because no allocation in this context represents that reference. Allowing it to
+    /// flow as an ordinary destination value would leave an untracked reference in the discharged program.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when a reference-typed constant does not resolve to an allocation or
+    /// its declared reference type differs from the allocation's reference type. For a non-reference constant,
+    /// propagates any error returned by the destination [`Context::lift`] function.
+    pub fn lift(&self, constant: C::Constant) -> Result<ReferenceDischargeValue<C, P>, ProgramError>
+    where
+        C: Context,
+        for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t C::Type>,
+    {
+        let constant_type = constant.r#type();
+        if let Ok(r#type) = <&ReferenceType<P::Referent>>::try_from(constant_type.as_ref()) {
+            let Some(allocation) = self.captures.resolve(&constant) else {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "reference discharge cannot lift a constant of reference type `{type}`; a reference enters a \
+                     program through an input, a capture binding, or an allocation",
+                )));
+            };
+
+            // A capture constant names the complete stored value its position binds, so a narrower declared type would
+            // silently widen to the allocation's own value where the constant is used.
+            let bound = self.allocation_entry(allocation)?.r#type().into_owned();
+            if r#type != &bound {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "reference discharge resolved a capture constant of reference type `{type}` to {allocation},\
+                     which carries the reference type `{bound}`",
+                )));
+            }
+            return self.allocation_reference(allocation);
+        }
+        Ok(ReferenceDischargeValue::Value(self.parent.lift(constant)?))
     }
 
     /// Binds an allocation selected for discharge and returns its unviewed reference value. The allocation is fresh to
@@ -4258,7 +4244,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lift_constant() {
+    fn test_reference_discharge_context_lift() {
         // A capture-lifted program names its caller's references through constants, and such a constant denotes the
         // allocation that capture position already binds rather than a second allocation of its own.
         let pair = ReferenceType::new(ListType { length: 2 });
@@ -4271,19 +4257,19 @@ mod tests {
             vec![None, None, Some(allocation)],
         ));
 
-        let lifted = lift_constant(&scoped, ListIrValue::Reference(pair.clone())).unwrap();
+        let lifted = scoped.lift(ListIrValue::Reference(pair.clone())).unwrap();
         let reference = lifted.try_as_reference("the resolved capture").unwrap();
         assert_eq!(reference.allocation_id(), allocation);
         assert_eq!(reference.r#type(), &pair);
         assert_eq!(scoped.live_allocation_ids(), vec![allocation]);
 
         // A non-reference constant is unaffected by the scope and lifts through the destination as usual.
-        let value = lift_constant(&scoped, ListIrValue::List(vec![3, 4])).unwrap();
+        let value = scoped.lift(ListIrValue::List(vec![3, 4])).unwrap();
         assert_eq!(value, ReferenceDischargeValue::Value(ListIrValue::List(vec![3, 4])));
 
         // A capture position the scope does not bind keeps the unbound reference-constant rejection.
         assert_eq!(
-            lift_constant(&scoped, ListIrValue::Reference(triple.clone())).err(),
+            scoped.lift(ListIrValue::Reference(triple.clone())).err(),
             Some(ProgramError::MalformedProgram(
                 "reference discharge cannot lift a constant of reference type `ref<list<3>>`; a reference enters a \
                  program through an input, a capture binding, or an allocation"
@@ -4297,7 +4283,7 @@ mod tests {
         let wider = allocated.try_as_reference("the mismatched allocation").unwrap().allocation_id();
         let mismatched = scoped.with_captures(scoped.captures().with_allocations(vec![None, None, Some(wider)]));
         assert_eq!(
-            lift_constant(&mismatched, ListIrValue::Reference(pair)).err(),
+            mismatched.lift(ListIrValue::Reference(pair)).err(),
             Some(ProgramError::MalformedProgram(format!(
                 "reference discharge resolved a capture constant of reference type `ref<list<2>>` to {wider}, which \
                  carries the reference type `ref<list<3>>`",
