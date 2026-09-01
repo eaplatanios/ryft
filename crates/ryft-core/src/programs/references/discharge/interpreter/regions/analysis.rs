@@ -553,7 +553,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
             return Ok(None);
         };
         let allocation = reference.allocation_id();
-        let whole = self.allocation_entry(allocation)?.r#type.clone();
+        let whole = self.allocation_entry(allocation)?.r#type().into_owned();
         if !reference.denotes_complete_value() {
             return Err(ProgramError::MalformedProgram(format!(
                 "operation `{operation}` passes the derived view `{}` of {allocation} across a region boundary, which \

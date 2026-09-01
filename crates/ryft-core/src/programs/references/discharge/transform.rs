@@ -26,6 +26,9 @@ use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
 use crate::tracing::TracingContext;
 
+// TODO(eaplatanios): Review `ReferenceDischargeAllocationState`, `ReferenceDischargeCaptureScope`,
+//  `ReferenceDischargeReference`, and `ReferenceDischargeBinding`.
+
 /// Identity of a reference allocation inside an ongoing reference discharge transform.
 /// [`ReferenceDischargeAllocationId`]s are minted by [`ReferenceDischargeContext`] as allocations enter its
 /// environment, so they are temporary discharge identities rather than source [`Program`] locations. They exist only
@@ -112,20 +115,29 @@ impl<T: Type, V> ReferenceDischargeEnvironment<T, V> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Complete environment record of one live allocation: the reference type of its complete stored value and what
-/// discharge turned that allocation into.
-///
-/// The reference type is recorded because an allocation's identity outlives every handle that denotes it. A structured rule
-/// threading an inherited allocation through a rebuilt region boundary holds only that allocation's handle, never a handle it
-/// could read a type off, so the environment is where the complete-value type has to live.
+/// Complete record of a live reference allocation during a reference discharge transform, which contains the reference
+/// type of its complete stored value and what discharge turned that allocation into. The reference type is recorded
+/// because an allocation's identity outlives every handle that denotes it. A structured rule threading an inherited
+/// allocation through a rebuilt region boundary holds only that allocation's handle, never a handle it could read a
+/// type off, so the environment is where the complete-value type has to live.
+// TODO(eaplatanios): Make private once the `discharge` module review and cleanup is completed.
 pub(crate) struct ReferenceDischargeAllocationEntry<T: Type, V> {
-    /// Reference type of the complete stored value, whose referent types the immutable state a discharged reference threads.
-    pub(crate) r#type: ReferenceType<T>,
+    /// [`ReferenceType`] of the allocation's complete stored value. When the allocation is discharged, its referent
+    /// type is the type of the immutable state threaded through the rewritten program.
+    r#type: ReferenceType<T>,
 
-    /// What discharge turned this allocation into.
+    /// Current representation of the allocation in the rewritten program (either immutable state for a discharged
+    /// allocation or a destination reference value for a preserved allocation).
     state: ReferenceDischargeAllocationState<V>,
+}
+
+impl<T: Type, V> Typed for ReferenceDischargeAllocationEntry<T, V> {
+    type Type = ReferenceType<T>;
+
+    #[inline]
+    fn r#type(&self) -> Cow<'_, Self::Type> {
+        Cow::Borrowed(&self.r#type)
+    }
 }
 
 /// Environment entry describing what one live reference allocation became during reference discharge.
@@ -357,8 +369,6 @@ pub(super) enum ReferenceDischargeBinding<V> {
         reference: V,
     },
 }
-
-// TODO(eaplatanios): Review up to here.
 
 /// [`ReferenceDischargeContext`]-free carrier flowing through the reference discharge transform.
 /// [`ReferenceDischargeableOperation`] implementations receive and return such carrier; the context that owns the
@@ -635,7 +645,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     {
         // Validate before taking the mutable environment borrow so a type error leaves both the current state and its
         // mutation bit unchanged.
-        let r#type = self.allocation_entry(allocation)?.r#type.clone();
+        let r#type = self.allocation_entry(allocation)?.r#type().into_owned();
         let expected = C::Type::from(r#type.referent().clone());
         let actual = current.r#type();
         if actual.as_ref() != &expected {
@@ -725,7 +735,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
                     ReferenceDischargeBinding::Preserved { reference: reference.clone() }
                 }
             };
-            (entry.r#type.clone(), binding)
+            (entry.r#type().into_owned(), binding)
         };
         let alias = P::storage_alias(r#type.referent());
         Ok(ReferenceDischargeValue::Reference(ReferenceDischargeReference {

@@ -189,7 +189,7 @@ where
                 ReferenceDischargeValue<Destination<C>, P>,
                 ProgramError,
             > {
-                let r#type = context.allocation_entry(allocation)?.r#type.clone();
+                let r#type = context.allocation_entry(allocation)?.r#type().into_owned();
                 let discharged = context.is_allocation_discharged(allocation)?;
                 let input_type = if discharged {
                     <Destination<C> as crate::contexts::Domain>::Type::from(r#type.referent().clone())
@@ -244,7 +244,7 @@ where
                             region.id(),
                         )));
                     };
-                    let allocation_type = context.allocation_entry(*allocation)?.r#type.clone();
+                    let allocation_type = context.allocation_entry(*allocation)?.r#type().into_owned();
                     if &allocation_type != source_reference_type {
                         return Err(ProgramError::MalformedProgram(format!(
                             "reference discharge assigns {allocation} of type `{allocation_type}` to input {position} of region \
@@ -327,7 +327,7 @@ where
                         // The published value denotes the complete stored value, so only a handle with complete-value provenance may
                         // cross. A view returned from a region has to be re-derived by whoever needs it, exactly as one
                         // passed into a region does.
-                        let whole = fork.allocation_entry(reference.allocation_id())?.r#type.clone();
+                        let whole = fork.allocation_entry(reference.allocation_id())?.r#type().into_owned();
                         if !reference.denotes_complete_value() {
                             return Err(ProgramError::MalformedProgram(format!(
                                 "reference discharge cannot publish the derived view `{}` of {caller} from region `{}`, \
@@ -449,7 +449,8 @@ where
                             // rejecting it after binding would leave a destination operation behind on an error path.
                             for reference in &consumed {
                                 let allocation = reference.allocation_id();
-                                let complete_reference_type = context.allocation_entry(allocation)?.r#type.clone();
+                                let complete_reference_type =
+                                    context.allocation_entry(allocation)?.r#type().into_owned();
 
                                 // Consumption yields and invalidates the complete stored value. An alias handle cannot
                                 // name that transition, even when its view happens to have the same reference type as
@@ -525,7 +526,7 @@ where
 
         // A capture constant names the complete stored value its position binds, so a narrower declared type would silently
         // widen to the allocation's own value where the constant is used.
-        let bound = context.allocation_entry(allocation)?.r#type.clone();
+        let bound = context.allocation_entry(allocation)?.r#type().into_owned();
         if r#type != &bound {
             return Err(ProgramError::MalformedProgram(format!(
                 "reference discharge resolved a capture constant of reference type `{type}` to {allocation}, which carries \
