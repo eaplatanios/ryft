@@ -280,8 +280,8 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeDriver<C, P> f
 /// Access rules see only *discharged* allocations. When partial discharge preserves an allocation, the dispatch path replays every
 /// region-free, access-only application over it verbatim through [`discharge_preserved_access`] before rule dispatch,
 /// so an access rule never needs a preserved branch of its own. The exceptions own their preserved handling because
-/// their outputs mint or derive handles: an allocation rule consults its replay position against the targets, and a
-/// view rule derives through [`ReferenceDischargeContext::derive`], which replays the view over a preserved parent's
+/// their outputs mint or alias handles: an allocation rule consults its replay position against the targets, and a
+/// view rule calls [`ReferenceDischargeContext::alias_reference`], which replays the view over a preserved parent's
 /// destination value.
 ///
 /// `C` is bounded by [`Domain`] rather than [`Context`] for the same reason
