@@ -129,51 +129,63 @@ impl<C: Domain<Type: From<ReferenceType<P::Referent>>>, P: ReferenceDischargePol
 }
 
 // TODO(eaplatanios): Review this and its impl blocks.
-/// Handle to one live reference allocation flowing through reference discharge.
+/// Reference value tracked while reference discharge rewrites a [`Program`]. Each [`ReferenceDischargeReference`]
+/// identifies one allocation and denotes either its complete stored value or a view created by
+/// [`ReferenceDischargeContext::alias_reference`]. Its alias describes how the [`ReferenceDischargePolicy`] accesses
+/// the portion selected by this reference, and its reference type describes that selected portion. When partial
+/// discharge preserves the allocation, this value also retains the exact destination reference that it denotes.
 ///
-/// The fields are private and only [`ReferenceDischargeContext`] constructs them, so a rule can read a handle but
-/// cannot fabricate an allocation, an alias, a derived type, or a preserved destination value. That keeps allocation
-/// identity and view composition checked even though the rule trait is open to third-party operations.
+/// Note that only [`ReferenceDischargeContext`] constructs instances of type while also doing any necessary validation.
 pub struct ReferenceDischargeReference<C: Domain, P: ReferenceDischargePolicy<C>> {
-    /// Identity of the allocation this handle denotes.
+    /// [`ReferenceDischargeAllocationId`] of the allocation that this [`ReferenceDischargeReference`] denotes.
     allocation_id: ReferenceDischargeAllocationId,
 
-    /// Whether this handle denotes the complete stored value rather than a derived view of it.
-    denotes_complete_value: bool,
-
-    /// Composed policy-owned view chain from the allocation to this handle.
-    alias: P::Alias,
-
-    /// Reference type this exact handle exposes, which differs from the allocation's type under a composed view.
+    /// [`ReferenceType`] exposed by this [`ReferenceDischargeReference`]. Note that a view can expose a different type
+    /// from the type of the allocation's complete stored value.
     r#type: ReferenceType<P::Referent>,
 
-    /// How this handle's allocation is represented in the destination program.
+    /// Boolean that represents whether this [`ReferenceDischargeReference`] is a view created by
+    /// [`ReferenceDischargeContext::alias_reference`] or not. Note that this remains `true` even when the view's
+    /// reference type equals the allocation's reference type.
+    is_view: bool,
+
+    /// Alias that an [`ReferenceDischargePolicy`] can use to access the portion selected by this
+    /// [`ReferenceDischargeReference`]. It includes every view step from the allocation's complete stored value to this reference.
+    alias: P::Alias,
+
+    /// [`ReferenceDischargeBinding`] that specifies whether the allocation of this [`ReferenceDischargeReference`] was
+    /// discharged into explicit state or preserved as a reference in the destination [`Program`], including the exact
+    /// destination reference that this value denoted when it was preserved.
     binding: ReferenceDischargeBinding<C::Value>,
 }
 
 impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeReference<C, P> {
-    /// Returns the identity of the allocation this handle denotes.
+    /// Returns the allocation that this reference denotes.
     pub const fn allocation_id(&self) -> ReferenceDischargeAllocationId {
         self.allocation_id
     }
 
-    /// Returns whether this handle denotes the complete stored value rather than a derived view.
-    pub(super) const fn denotes_complete_value(&self) -> bool {
-        self.denotes_complete_value
-    }
-
-    /// Returns the composed view chain from the allocation to this handle.
-    pub const fn alias(&self) -> &P::Alias {
-        &self.alias
-    }
-
-    /// Returns the reference type this exact handle exposes.
+    /// Returns the exact reference type exposed by this reference.
     pub const fn r#type(&self) -> &ReferenceType<P::Referent> {
         &self.r#type
     }
 
-    /// Returns the exact destination reference value of a preserved handle, or [`None`] when the allocation was
-    /// discharged.
+    /// Returns whether this reference is a view created by [`ReferenceDischargeContext::alias_reference`]. Consumption
+    /// and region boundaries reject views because they operate on the allocation's complete stored value. This function
+    /// returns `true` even when the view's reference type equals the allocation's reference type.
+    pub(super) const fn is_view(&self) -> bool {
+        self.is_view
+    }
+
+    /// Returns the complete alias that the [`ReferenceDischargePolicy`] uses to access the portion selected by this
+    /// reference.
+    pub const fn alias(&self) -> &P::Alias {
+        &self.alias
+    }
+
+    /// Returns the exact destination reference value that this reference denotes when its allocation was preserved, or
+    /// [`None`] when the allocation was discharged. For a view of a preserved allocation, this is the result of
+    /// replaying the view operation in the destination program.
     pub const fn preserved(&self) -> Option<&C::Value> {
         match &self.binding {
             ReferenceDischargeBinding::Discharged => None,
@@ -181,7 +193,8 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeReference<C, P
         }
     }
 
-    /// Returns how this handle's allocation is represented in the destination program.
+    /// Returns whether the allocation was discharged into explicit state or preserved as a reference in the
+    /// destination program, including the exact destination reference that this value denotes when it was preserved.
     pub(super) const fn binding(&self) -> &ReferenceDischargeBinding<C::Value> {
         &self.binding
     }
@@ -192,9 +205,9 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> Clone for ReferenceDischargeRefe
     fn clone(&self) -> Self {
         Self {
             allocation_id: self.allocation_id,
-            denotes_complete_value: self.denotes_complete_value,
-            alias: self.alias.clone(),
             r#type: self.r#type.clone(),
+            is_view: self.is_view,
+            alias: self.alias.clone(),
             binding: self.binding.clone(),
         }
     }
@@ -206,9 +219,9 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> Debug for ReferenceDischargeRefe
         formatter
             .debug_struct("ReferenceDischargeReference")
             .field("allocation_id", &self.allocation_id)
-            .field("denotes_complete_value", &self.denotes_complete_value)
-            .field("alias", &self.alias)
             .field("type", &self.r#type)
+            .field("is_view", &self.is_view)
+            .field("alias", &self.alias)
             .field("binding", &self.binding)
             .finish()
     }
@@ -227,9 +240,9 @@ impl<C: Domain<Value: PartialEq>, P: ReferenceDischargePolicy<C, Alias: PartialE
     #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.allocation_id == other.allocation_id
-            && self.denotes_complete_value == other.denotes_complete_value
-            && self.alias == other.alias
             && self.r#type == other.r#type
+            && self.is_view == other.is_view
+            && self.alias == other.alias
             && self.binding == other.binding
     }
 }
@@ -273,8 +286,8 @@ pub(super) enum ReferenceDischargeBinding<V> {
     /// and write operations against the environment.
     Discharged,
 
-    /// The allocation remains a reference in the destination program.  preserved handle must consume this value rather
-    /// than re-deriving its view chain per access, because re-deriving would duplicate and reorder the replayed view
+    /// The allocation remains a reference in the destination program. A preserved reference must consume this value
+    /// rather than replaying its view chain per access, because doing so would duplicate and reorder the view
     /// operations in the destination program.
     Preserved {
         /// Exact destination reference value this handle denotes.
@@ -551,9 +564,9 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         let alias = P::storage_alias(r#type.referent());
         Ok(ReferenceDischargeValue::Reference(ReferenceDischargeReference {
             allocation_id: allocation,
-            denotes_complete_value: true,
-            alias,
             r#type,
+            is_view: false,
+            alias,
             binding,
         }))
     }
@@ -694,9 +707,9 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         };
         ReferenceDischargeValue::Reference(ReferenceDischargeReference {
             allocation_id: allocation,
-            denotes_complete_value: true,
-            alias,
             r#type,
+            is_view: false,
+            alias,
             binding,
         })
     }
@@ -764,9 +777,9 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
 
         Ok(ReferenceDischargeValue::Reference(ReferenceDischargeReference {
             allocation_id: allocation,
-            denotes_complete_value: false,
-            alias,
             r#type,
+            is_view: true,
+            alias,
             binding,
         }))
     }
@@ -876,7 +889,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     /// # Errors
     ///
     /// Returns [`ProgramError::MalformedProgram`] when the allocation is not live, was preserved rather than
-    /// discharged, or is named through a derived handle rather than an unviewed handle.
+    /// discharged, or is named through a view rather than the reference for its complete stored value.
     pub fn consume(&self, reference: &ReferenceDischargeReference<C, P>) -> Result<C::Value, ProgramError> {
         let allocation = reference.allocation_id();
         let referent_type = match &self.allocation_entry(allocation)?.state {
@@ -885,9 +898,9 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
                 "reference discharge requested the discharged state of preserved {allocation}",
             ))),
         }?;
-        if !reference.denotes_complete_value() {
+        if reference.is_view() {
             return Err(ProgramError::MalformedProgram(format!(
-                "reference discharge cannot consume {} through the derived view `{}`; consumption yields the \
+                "reference discharge cannot consume {} through the view `{}`; consumption yields the \
                  complete stored value, whose referent is `{}`",
                 allocation,
                 reference.r#type(),
@@ -1022,8 +1035,8 @@ enum ReferenceDischargeAllocationState<V> {
     },
 
     /// Allocation not selected for discharge, which survives in the destination [`Program`] as a reference value. This
-    /// is the allocation's own destination reference value and is what boundary threading uses; a handle derived from
-    /// it through a view carries its own exact destination value instead.
+    /// is the allocation's own destination reference value and is what boundary threading uses; a view created from it
+    /// carries its own exact destination value instead.
     Preserved {
         /// Destination reference-typed value denoting the allocation.
         reference: V,
@@ -1203,7 +1216,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     ///
     /// The selected references follow the same rewrite as [`discharge_references`](Self::discharge_references). An
     /// unselected reference keeps its reference-typed boundary position or allocation operation, and its accesses and
-    /// derived views are replayed unchanged. It contributes no [`ExternalReferenceBinding`] or hidden final-state
+    /// views are replayed unchanged. It contributes no [`ExternalReferenceBinding`] or hidden final-state
     /// output because it never becomes explicit state.
     ///
     /// Preserved references can cross structured-[`Region`](crate::Region) boundaries beside discharged state. A
@@ -1551,9 +1564,9 @@ mod tests {
         assert_eq!(
             format!("{reference:?}"),
             format!(
-                "Reference(ReferenceDischargeReference {{ allocation_id: {allocation:?}, denotes_complete_value: true, \
-                 alias: ListAlias \
-                 {{ offset: 0, length: 2 }}, type: ReferenceType {{ referent: ListType {{ length: 2 }} }}, \
+                "Reference(ReferenceDischargeReference {{ allocation_id: {allocation:?}, type: ReferenceType {{ \
+                 referent: ListType {{ length: 2 }} }}, is_view: false, alias: ListAlias \
+                 {{ offset: 0, length: 2 }}, \
                  binding: Discharged }})",
             ),
         );
@@ -1578,8 +1591,7 @@ mod tests {
         assert_eq!(reference.preserved(), None);
         assert_eq!(context.read(&reference), Ok(ListIrValue::List(vec![1, 2, 3, 4])));
 
-        // A derived handle narrows the view without touching the allocation's identity, and its accesses act only
-        // on the portion it selects.
+        // A view keeps the allocation's identity, and its accesses act only on the portion it selects.
         let view = context
             .alias_reference(
                 &reference,
@@ -1588,7 +1600,7 @@ mod tests {
                 |_| unreachable!("the allocation is discharged"),
             )
             .unwrap();
-        let view = view.try_as_reference("the derived view").unwrap().clone();
+        let view = view.try_as_reference("the view").unwrap().clone();
         assert_eq!(view.allocation_id(), allocation);
         assert_eq!(context.read(&view), Ok(ListIrValue::List(vec![2, 3])));
         assert_eq!(context.write(&view, ListIrValue::List(vec![10, 11])), Ok(()));
@@ -1598,38 +1610,38 @@ mod tests {
         assert_eq!(context.accumulate(&view, ListIrValue::List(vec![1, 1])), Ok(()));
         assert_eq!(context.read(&reference), Ok(ListIrValue::List(vec![1, 21, 31, 4])));
 
-        // Consumption is a complete-value event. Provenance, not type equality, distinguishes the complete-value handle
-        // from a derived view: a policy may derive a view whose referent happens to have the allocation's exact type.
+        // A view remains distinct from the reference for the complete stored value even when both expose the same type.
+        // Consumption and region boundaries therefore consult `is_view` rather than comparing reference types.
         let same_type_view = context
             .alias_reference(&reference, ListAlias { offset: 0, length: 4 }, reference_type.clone(), |_| {
                 unreachable!("the allocation is discharged")
             })
             .unwrap();
-        let same_type_view = same_type_view.try_as_reference("the same-type derived view").unwrap();
+        let same_type_view = same_type_view.try_as_reference("the same-type view").unwrap();
         assert_eq!(
             context.operand_allocation(
                 &ReferenceDischargeValue::Reference(same_type_view.clone()),
                 ListOperation::Call.name(),
             ),
             Err(ProgramError::MalformedProgram(format!(
-                "operation `list.call` passes the derived view `ref<list<4>>` of {allocation} across a region boundary, \
-                 which carries the complete stored value `ref<list<4>>`; derive the view inside the region instead",
+                "operation `list.call` passes the view `ref<list<4>>` of {allocation} across a region boundary, which \
+                 carries the complete stored value `ref<list<4>>`; create the view inside the region instead",
             ))),
         );
         assert_eq!(
             context.consume(same_type_view),
             Err(ProgramError::MalformedProgram(format!(
-                "reference discharge cannot consume {allocation} through the derived view `ref<list<4>>`; consumption \
+                "reference discharge cannot consume {allocation} through the view `ref<list<4>>`; consumption \
                  yields the complete stored value, whose referent is `list<4>`",
             ))),
         );
 
-        // A narrower derived view is rejected by the same provenance check rather than silently yielding the whole
-        // allocation's value under the view's type.
+        // A narrower view is rejected rather than silently yielding the allocation's complete stored value under the
+        // view's type.
         assert_eq!(
             context.consume(&view),
             Err(ProgramError::MalformedProgram(format!(
-                "reference discharge cannot consume {allocation} through the derived view `ref<list<2>>`; consumption \
+                "reference discharge cannot consume {allocation} through the view `ref<list<2>>`; consumption \
                  yields the complete stored value, whose referent is `list<4>`",
             ))),
         );
@@ -1684,8 +1696,8 @@ mod tests {
         let reference = bound.try_as_reference("the preserved reference").unwrap().clone();
         let allocation = reference.allocation_id();
 
-        // A preserved reference keeps its destination reference value on the handle, so a later access can replay
-        // verbatim instead of re-deriving the handle.
+        // A preserved reference keeps its destination reference value, so a later access can replay verbatim without
+        // reconstructing it.
         assert_eq!(reference.r#type(), &reference_type);
         assert_eq!(reference.preserved(), Some(&destination_reference));
         assert_eq!(context.is_allocation_discharged(allocation), Ok(false));
@@ -1715,8 +1727,8 @@ mod tests {
             ))),
         );
 
-        // Deriving on a preserved reference hands the closure the parent handle's exact destination value, so the
-        // derived handle cannot disagree with the allocation's preserved representation by construction.
+        // `alias_reference` hands the closure the preserved reference's exact destination value, so the returned view
+        // cannot disagree with the allocation's preserved representation.
         let view_type = ReferenceType::new(ListType { length: 1 });
         let view_alias = ListAlias { offset: 0, length: 1 };
         let view = context
@@ -1725,7 +1737,7 @@ mod tests {
                 Ok(ListIrValue::Reference(view_type.clone()))
             })
             .unwrap();
-        let view = view.try_as_reference("the derived view").unwrap();
+        let view = view.try_as_reference("the view").unwrap();
         assert_eq!(view.allocation_id(), allocation);
         assert_eq!(view.preserved(), Some(&ListIrValue::Reference(view_type)));
     }
@@ -1968,8 +1980,8 @@ mod tests {
             .unwrap();
 
         // Selecting nothing preserves the allocation, so the whole reference language survives: the view operation is
-        // replayed too, and the derived handle consumes the reference that replay produced rather than re-deriving
-        // the chain at the access.
+        // replayed too, and the resulting view consumes the exact reference produced by that replay rather than
+        // replaying the chain again at the access.
         let discharged = source.clone().partially_discharge_references(0, &[]);
         let discharged = discharged.unwrap();
         assert_eq!(discharged.output_count(), 1);
