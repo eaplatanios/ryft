@@ -957,30 +957,23 @@ pub struct ReferenceDischargeRegionBoundary {
     added_outputs: ReferenceRegionStateInsertion,
 }
 
-// TODO(eaplatanios): Review this.
 impl ReferenceDischargeRegionBoundary {
-    /// Creates a boundary request for one rebuilt region.
-    ///
-    /// Added positions are described separately from the declared positions because only the declared positions are
-    /// replayed. An added input occupies a position in the rebuilt region's boundary and in the caller's operand list,
-    /// but the source region's body never named it and so cannot consume it.
-    ///
-    /// The region's capture prefix is read from `operation` rather than supplied by the rule, so that the prefix used
-    /// here always agrees with the one that
-    /// [`region_summary`](crate::programs::references::ReferenceDischargeContext::region_summary) computes from the
-    /// same operation. A rule therefore never reasons about captures.
+    /// Creates a [`ReferenceDischargeRegionBoundary`] for one rebuilt region. Added positions are described separately
+    /// from the declared positions because only the declared positions are replayed. An added input occupies a position
+    /// in the rebuilt region's boundary and in the caller's operand list, but the source region's body never named it
+    /// and so cannot consume it. The region's capture prefix is read from `operation` rather than supplied by the rule,
+    /// so that the prefix used here always agrees with the one that [`ReferenceDischargeContext::region_summary`]
+    /// computes from the same operation. A rule therefore never reasons about captures.
     ///
     /// # Parameters
     ///
-    ///   - `operation`: [`Operation`] the region is attached to, whose
-    ///     [`region_capture_input_count`](Operation::region_capture_input_count) declares the region's own leading
-    ///     capture prefix.
-    ///   - `region_index`: Position of the region among that operation's attached regions.
+    ///   - `operation`: [`Operation`] the region is attached to, whose [`Operation::region_capture_input_count`]
+    ///     declares the [`Region`](crate::Region)'s own leading capture prefix.
+    ///   - `region_index`: Position of the [`Region`](crate::Region) among that [`Operation`]'s attached regions.
     ///   - `declared_input_allocations`: Allocation entering at each declared input position, or [`None`] for a value
-    ///     input. Reference positions must come from
-    ///     [`operand_allocation`](crate::programs::references::ReferenceDischargeContext::operand_allocation), which
-    ///     validates that each operand carries the complete stored value rather than a view. The length must equal
-    ///     the source region's input count, because every declared position is rebuilt.
+    ///     input. Reference positions must come from [`ReferenceDischargeContext::operand_allocation`], which validates
+    ///     that each operand carries the complete stored value rather than a view. The length must equal the source
+    ///     region's input count, because every declared position is rebuilt.
     ///   - `added_inputs`: Allocations the rebuilt region receives as added inputs, together with the source input
     ///     position at which they are inserted.
     ///   - `added_outputs`: Allocations the rebuilt region publishes as added outputs, together with the source output
@@ -1001,8 +994,8 @@ impl ReferenceDischargeRegionBoundary {
         }
     }
 
-    /// Creates a boundary request whose added inputs and added outputs are the same allocations inserted at the same
-    /// position. This is the loop-carry shape that `while` and `scan` bodies thread.
+    /// Creates a [`ReferenceDischargeRegionBoundary`] whose added inputs and added outputs are the same allocations
+    /// inserted at the same position. This is the loop-carry shape that `while` and `scan` operation bodies thread.
     #[inline]
     pub fn symmetric<O: Operation>(
         operation: &O,
@@ -1013,30 +1006,31 @@ impl ReferenceDischargeRegionBoundary {
         Self::new(operation, region_index, declared_input_allocations, state.clone(), state)
     }
 
-    /// Returns the allocation entering at each declared input position of the source region, or [`None`] for a value
-    /// input, in region input order.
+    /// Returns the [`ReferenceDischargeAllocationId`] of the allocation entering at each declared input position of
+    /// the source region, or [`None`] for a value input, in [`Region`](crate::Region) input order.
     #[inline]
-    pub(crate) fn declared_input_allocations(&self) -> &[Option<ReferenceDischargeAllocationId>] {
+    pub fn declared_input_allocations(&self) -> &[Option<ReferenceDischargeAllocationId>] {
         self.declared_input_allocations.as_slice()
     }
 
-    /// Returns the length of the region's own leading capture prefix, from [`Operation::region_capture_input_count`],
-    /// or [`None`] when the region inherits the capture scope of the region in which its operation is applied.
-    pub(crate) const fn capture_input_count(&self) -> Option<usize> {
+    /// Returns the length of the [`Region`](crate::Region)'s own leading capture prefix, from
+    /// [`Operation::region_capture_input_count`], or [`None`] when the region inherits the capture scope of the region
+    /// in which its operation is applied.
+    pub const fn capture_input_count(&self) -> Option<usize> {
         self.capture_input_count
     }
 
-    /// Returns the allocations the rebuilt region receives as added inputs, together with the position in the source
-    /// region's input boundary at which they are inserted. A discharged allocation enters as immutable state and a
-    /// preserved allocation enters as its destination reference.
-    pub(crate) const fn added_inputs(&self) -> &ReferenceRegionStateInsertion {
+    /// Returns the allocations the rebuilt [`Region`](crate::Region) receives as added inputs, together with the
+    /// position in the source region's input boundary at which they are inserted. A discharged allocation enters as
+    /// immutable state and a preserved allocation enters as its destination reference.
+    pub const fn added_inputs(&self) -> &ReferenceRegionStateInsertion {
         &self.added_inputs
     }
 
-    /// Returns the allocations the rebuilt region publishes as added outputs, together with the position in the source
-    /// region's output boundary at which they are inserted. A discharged allocation publishes its final state and a
-    /// preserved allocation publishes its destination reference.
-    pub(crate) const fn added_outputs(&self) -> &ReferenceRegionStateInsertion {
+    /// Returns the allocations the rebuilt [`Region`](crate::Region) publishes as added outputs, together with the
+    /// position in the source region's output boundary at which they are inserted. A discharged allocation publishes
+    /// its final state and a preserved allocation publishes its destination reference.
+    pub const fn added_outputs(&self) -> &ReferenceRegionStateInsertion {
         &self.added_outputs
     }
 }
