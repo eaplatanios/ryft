@@ -7,6 +7,10 @@ runtime coordination, and various PJRT extensions (e.g., layouts, shardings, FFI
 primary crate to use when writing Rust code against PJRT in this repository. It is built on top of `ryft-xla-sys`,
 which contains the low-level bindings and native artifact building and/or downloading.
 
+Producer-neutral cubin/PTX artifact loading and CUDA Driver API kernel launching live in the independent
+[`ryft-cuda`](../ryft-cuda) crate. This crate only adapts CUDA PJRT clients and XLA FFI streams and buffers to that
+runtime when either the `cuda-12` or `cuda-13` feature is enabled.
+
 Note that this crate forwards the following feature flags directly to `ryft-xla-sys`: `cuda-12`, `cuda-13`, `rocm-7`,
 `tpu`, `neuron`, `metal`, and `mps`. For information on what those flags represent and guidance on how to use them,
 refer to [`crates/ryft-xla-sys/README.md`](../ryft-xla-sys/README.md).

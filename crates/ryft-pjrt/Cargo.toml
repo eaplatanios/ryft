@@ -29,8 +29,8 @@ pre-release-replacements = [
 
 [features]
 default = []
-cuda-12 = ["ryft-xla-sys/cuda-12"]
-cuda-13 = ["ryft-xla-sys/cuda-13"]
+cuda-12 = ["ryft-xla-sys/cuda-12", "dep:ryft-cuda"]
+cuda-13 = ["ryft-xla-sys/cuda-13", "dep:ryft-cuda"]
 rocm-7 = ["ryft-xla-sys/rocm-7"]
 tpu = ["ryft-xla-sys/tpu"]
 neuron = ["ryft-xla-sys/neuron"]
@@ -38,6 +38,7 @@ metal = ["ryft-xla-sys/metal"]
 mps = ["ryft-xla-sys/mps"]
 
 [dependencies]
+ryft-cuda = { workspace = true, optional = true }
 ryft-xla-sys.workspace = true
 half.workspace = true
 hex.workspace = true

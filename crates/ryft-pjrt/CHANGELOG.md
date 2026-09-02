@@ -39,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   and partitions of an execution.
 - Added `XlaTransformExtension::clear_transform` together with `Client::clear_xla_transform` and
   `Plugin::clear_xla_transform` for the new `PJRT_Clear_Xla_Transform` extension function.
+- Added adapters from CUDA PJRT clients and XLA FFI streams/buffers to the producer-neutral `ryft-cuda` artifact
+  launcher behind the `cuda-12` and `cuda-13` features.
 
 ### Changed
 

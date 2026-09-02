@@ -1854,8 +1854,12 @@ dependencies = [
 name = "ryft-experimental"
 version = "0.1.0"
 dependencies = [
+ "indoc",
+ "pretty_assertions",
  "ryft-cuda",
+ "ryft-mlir",
  "ryft-pjrt",
+ "ryft-xla-sys",
  "serde",
  "serde_json",
  "sha2",
