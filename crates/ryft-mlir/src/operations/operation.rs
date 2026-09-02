@@ -1223,13 +1223,27 @@ impl<'t> Context<'t> {
         source: &str,
         filename: &str,
     ) -> Result<DetachedOperation<'c, 't>, Error> {
+        self.parse_operation_from_bytes(source.as_bytes(), filename)
+    }
+
+    /// Parses a [`DetachedOperation`] directly from the provided bytes. The bytes may contain either textual MLIR or
+    /// MLIR bytecode and are passed to the native parser without UTF-8 validation or `nul` termination.
+    ///
+    /// Returns an [`Error`] if MLIR fails to parse the provided bytes. MLIR will also emit structured diagnostics to
+    /// handlers attached with [`Context::attach_diagnostics_handler`]. The provided `filename` is used as the source
+    /// name for those diagnostics and for parsed locations.
+    pub fn parse_operation_from_bytes<'o, 'c: 'o, B: AsRef<[u8]>>(
+        &'c self,
+        source: B,
+        filename: &str,
+    ) -> Result<DetachedOperation<'c, 't>, Error> {
         unsafe {
             let handle = mlirOperationCreateParse(
                 // The following context borrow ensures that access to the underlying MLIR data structures is done
                 // safely from Rust. It is maybe more conservative than would be ideal, but that is due to the
                 // limited exposure to MLIR internals that we have when working with the MLIR C API.
                 *self.handle.borrow(),
-                StringRef::from(source).to_c_api(),
+                StringRef::from(source.as_ref()).to_c_api(),
                 StringRef::from(filename).to_c_api(),
             );
             if handle.ptr.is_null() {
@@ -1382,14 +1396,16 @@ impl WalkResult {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::RefCell;
     use std::collections::HashMap;
+    use std::rc::Rc;
 
     use pretty_assertions::assert_eq;
 
     use crate::dialects::func;
     use crate::{
-        Block, Context, DetachedModuleOperation, DialectHandle, OperationBuilder, Region, Size, SymbolVisibility, Type,
-        Value, ValueRef,
+        Block, Context, DetachedModuleOperation, DiagnosticSeverity, DialectHandle, OperationBuilder, Region, Size,
+        SymbolVisibility, Type, Value, ValueRef,
     };
 
     use super::*;
@@ -2200,7 +2216,37 @@ mod tests {
         assert!(op.verify());
         assert_eq!(op.name().as_str(), Ok("func.func"));
 
-        // Trying parsing a bad operation.
+        // Parse the operation's bytecode directly without interpreting it as UTF-8.
+        let bytecode = op.bytecode();
+        assert!(bytecode.starts_with(b"ML\xefR"));
+        let parsed = context.parse_operation_from_bytes(&bytecode, "test.mlir").unwrap();
+        assert!(parsed.verify());
+        assert_eq!(parsed.to_string(), op.to_string());
+        assert_eq!(parsed.bytecode(), bytecode);
+
+        // Parse invalid bytes and retain the caller-provided filename in both the error and structured diagnostic.
+        let diagnostics = Rc::new(RefCell::new(Vec::new()));
+        let diagnostics_clone = diagnostics.clone();
+        let handler = context.attach_diagnostics_handler(move |diagnostic| {
+            diagnostics_clone.borrow_mut().push((
+                diagnostic.severity(),
+                diagnostic.location().unwrap().to_string(),
+                diagnostic.to_string(),
+            ));
+            true
+        });
+        assert!(matches!(
+            context.parse_operation_from_bytes([0, 255], "invalid-bytes.mlir"),
+            Err(Error::ParsingError { message, .. })
+                if message == "failed to parse MLIR operation from `invalid-bytes.mlir`",
+        ));
+        assert_eq!(diagnostics.borrow().len(), 1);
+        assert_eq!(diagnostics.borrow()[0].0, DiagnosticSeverity::Error);
+        assert!(diagnostics.borrow()[0].1.contains("invalid-bytes.mlir"));
+        assert!(!diagnostics.borrow()[0].2.is_empty());
+        context.detach_diagnostics_handler(handler);
+
+        // Try parsing a bad operation.
         let op = context.parse_operation("invalid syntax", "invalid.mlir");
         assert!(op.is_err());
     }

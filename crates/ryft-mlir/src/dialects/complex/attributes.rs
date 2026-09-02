@@ -93,8 +93,11 @@ mod tests {
         assert_eq!(attribute.type_id().unwrap(), NumberAttributeRef::type_id().unwrap());
         assert_eq!(attribute.r#type().unwrap(), r#type);
         assert_eq!(attribute, context.complex_number_attribute(r#type, 1.5, -2.25).unwrap());
-        assert_eq!(attribute.to_string(), "#complex.number<:f64 1.500000e+00, -2.250000e+00>");
-        assert_eq!(format!("{attribute:?}"), "NumberAttributeRef[#complex.number<:f64 1.500000e+00, -2.250000e+00>]",);
+        assert_eq!(attribute.to_string(), "#complex.number<:f64 1.500000e+00, -2.250000e+00> : complex<f64>");
+        assert_eq!(
+            format!("{attribute:?}"),
+            "NumberAttributeRef[#complex.number<:f64 1.500000e+00, -2.250000e+00> : complex<f64>]",
+        );
         assert!(attribute.as_ref().is::<NumberAttributeRef>());
         assert_eq!(
             context

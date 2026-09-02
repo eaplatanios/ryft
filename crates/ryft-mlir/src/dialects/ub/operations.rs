@@ -111,7 +111,7 @@ mod tests {
             indoc! {"
                 module {
                   func.func @poison_test() -> i32 {
-                    %0 = ub.poison <#ub.poison> : i32
+                    %0 = ub.poison : i32
                     return %0 : i32
                   }
                 }
