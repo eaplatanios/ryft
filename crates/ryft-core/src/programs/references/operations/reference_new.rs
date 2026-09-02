@@ -129,14 +129,14 @@ where
         })?;
         let r#type = r#type.clone();
         if context.selects_internal(driver.source_instruction_id(), 0) {
-            return Ok(vec![context.bind_discharged(r#type, initial)?]);
+            return Ok(vec![context.bind_discharged(r#type, initial)?.into()]);
         }
 
         // An unselected allocation target survives, so the operation is replayed and its result is the destination
         // reference bound to that allocation.
         let mut outputs = context.parent().bind(*self, Vec::new(), std::slice::from_ref(&initial))?;
         check_count!("output", outputs, 1, ProgramError);
-        Ok(vec![context.bind_preserved(r#type, outputs.remove(0))?])
+        Ok(vec![context.bind_preserved(r#type, outputs.remove(0))?.into()])
     }
 }
 

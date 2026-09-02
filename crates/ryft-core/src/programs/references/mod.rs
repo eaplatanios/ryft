@@ -70,14 +70,18 @@
 //!   generations, guards, read leases, pending completion, and terminal poisoning.
 //! - `semantics.rs` defines the operation-local [`ReferenceOperationSemantics`] descriptor, access modes, and
 //!   allocation/alias classifications.
+//! - `analysis.rs` defines the generic program-level [`ReferenceAnalysis`]: canonical [`ReferenceRoot`]s, alias
+//!   edges, accesses, capture scopes, root-only region boundaries, lifetime validation, and per-instruction transitive
+//!   access summaries. It is kernel-owned validation infrastructure invoked explicitly by its consumers rather than a
+//!   standing lint on every program.
 //! - `operations/` defines the six generic primitives in separate modules together with their value-level
 //!   capabilities: allocation ([`ReferenceNew`]), immutable reads ([`ReferenceRead`]), write-only replacement
 //!   ([`ReferenceWrite`]), swapping ([`ReferenceSwap`]), ordered additive updates ([`ReferenceAddUpdate`]), and
 //!   consuming finalization ([`ReferenceFreeze`]). Each primitive module also owns its type inference, effects, eager
 //!   interpretation, discharge rule, and unit tests.
-//! - `discharge/` implements an interpreter-style transform that replaces selected mutable allocations with explicitly
-//!   threaded immutable values. Its policy, context, driver, and operation-rule contracts keep the transform open to
-//!   non-array value families and to third-party operations.
+//! - `discharge.rs` implements an interpreter-style transform that replaces selected mutable allocations with
+//!   explicitly threaded immutable values. Its policy, context, driver, and operation-rule contracts keep the transform
+//!   open to non-array value families and to third-party operations.
 //!
 //! Structured operations own their reference boundary rewrites. For example, condition, while, and scan operations
 //! decide how immutable state is added to their branch or loop boundaries; the discharge driver supplies isolated
@@ -166,12 +170,17 @@ pub enum ReferenceError {
     },
 }
 
+mod analysis;
 mod discharge;
 mod operations;
 mod semantics;
 mod types;
 mod values;
 
+pub use analysis::{
+    ReferenceAccess, ReferenceAliasEdge, ReferenceAnalysis, ReferenceAnalysisError, ReferenceRegionInputBinding,
+    ReferenceRoot, ReferenceTransitiveAccess,
+};
 pub use discharge::{
     ExternalReferenceBinding, PartialReferenceDischargeResult, RecursiveReferenceDischargeDriver,
     ReferenceAccumulationPolicy, ReferenceDischargeAllocationId, ReferenceDischargeBoundaryWidening,

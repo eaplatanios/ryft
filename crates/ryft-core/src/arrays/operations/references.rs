@@ -322,11 +322,15 @@ where
     let reference = inputs[0].try_as_reference("a reference to view")?;
     let referent = transform.output_type(reference.r#type().referent())?;
     let alias = reference.alias().with_transform_unchecked(transform);
-    Ok(vec![context.alias_reference(reference, alias, ReferenceType::new(referent), |value| {
-        let mut outputs = context.parent().bind(operation.clone(), Vec::new(), std::slice::from_ref(value))?;
-        check_count!("output", outputs, 1, ProgramError);
-        Ok(outputs.remove(0))
-    })?])
+    Ok(vec![
+        context
+            .alias_reference(reference, alias, ReferenceType::new(referent), |value| {
+                let mut outputs = context.parent().bind(operation.clone(), Vec::new(), std::slice::from_ref(value))?;
+                check_count!("output", outputs, 1, ProgramError);
+                Ok(outputs.remove(0))
+            })?
+            .into(),
+    ])
 }
 
 impl<C, P> ReferenceDischargeableOperation<C, P> for ReferenceIndexOperation
@@ -743,12 +747,14 @@ mod tests {
         // incoming alias, and bind nothing: a view's coordinates are materialized at each access instead.
         let context = ReferenceDischargeContext::<TestDestination, ArrayReferenceDischarge>::new(EagerContext::new());
         let allocation_type = ArrayType::new_static(DataType::F32, [3, 3]);
-        let allocated = context
-            .bind_discharged(
-                ReferenceType::new(allocation_type.clone()),
-                TestValue::Array(Array::matrix(3, 3, (1..=9).map(|value| value as f32).collect())),
-            )
-            .unwrap();
+        let allocated = ReferenceDischargeValue::from(
+            context
+                .bind_discharged(
+                    ReferenceType::new(allocation_type.clone()),
+                    TestValue::Array(Array::matrix(3, 3, (1..=9).map(|value| value as f32).collect())),
+                )
+                .unwrap(),
+        );
         let allocation = allocated.try_as_reference("the allocated allocation").unwrap().clone();
         let sliced = ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 2, 1)])
             .discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&allocated))
@@ -809,16 +815,18 @@ mod tests {
         // there and the reference that replay produced becomes the view's own destination value. The
         // composed alias is recorded exactly as it is for a discharged allocation, which is what keeps one handle's view
         // chain single-sourced whichever state its allocation is in.
-        let preserved = context
-            .bind_preserved(
-                ReferenceType::new(allocation_type),
-                TestValue::Reference(ArrayReference::new(Array::matrix(
-                    3,
-                    3,
-                    (1..=9).map(|value| value as f32).collect(),
-                ))),
-            )
-            .unwrap();
+        let preserved = ReferenceDischargeValue::from(
+            context
+                .bind_preserved(
+                    ReferenceType::new(allocation_type),
+                    TestValue::Reference(ArrayReference::new(Array::matrix(
+                        3,
+                        3,
+                        (1..=9).map(|value| value as f32).collect(),
+                    ))),
+                )
+                .unwrap(),
+        );
         let preserved_allocation = preserved.try_as_reference("the preserved allocation").unwrap().allocation_id();
         let view = ReferenceIndexOperation::new(0, 0)
             .discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&preserved))

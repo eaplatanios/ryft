@@ -197,7 +197,55 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
                 .collect()
         };
         let output_types = operation.infer_output_types(input_types.as_slice(), region_interfaces.as_slice())?;
-        operation.reference_semantics().validate_arity(operation.name(), inputs.len(), output_types.len())?;
+        let semantics = operation.reference_semantics();
+        semantics.validate_arity(operation.name(), inputs.len(), output_types.len())?;
+
+        // A region-carrying operation must state how references cross its boundaries, because reference analysis and
+        // discharge resolve reference identity through these hooks rather than by inspecting region bodies. Checking
+        // them here reports an inconsistent operation at construction rather than when a transform first needs them.
+        for (region_index, region_id) in regions.iter().copied().enumerate() {
+            let region_input_types = self.regions[region_id.index()].input_types();
+            if let Some(count) = operation.region_capture_input_count(region_index)
+                && count > region_input_types.len()
+            {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "operation `{}` declares a capture prefix of {} for region {}, which has {} inputs",
+                    operation.name(),
+                    count,
+                    region_index,
+                    region_input_types.len(),
+                )));
+            }
+
+            for (input_index, input_type) in region_input_types.iter().enumerate() {
+                if input_type.is_reference() && operation.input_region_provenance(region_index, input_index).is_none() {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "operation `{}` passes a reference into region {} input {} without \
+                         declaring which input supplies it",
+                        operation.name(),
+                        region_index,
+                        input_index,
+                    )));
+                }
+            }
+        }
+
+        if !regions.is_empty() {
+            for (output_index, output_type) in output_types.iter().enumerate() {
+                let declared = semantics.outputs().into_iter().any(|output| output.output_index() == output_index)
+                    || operation.reference_output_identity_input(output_index).is_some()
+                    || !operation.output_region_provenance(output_index).is_empty();
+                if output_type.is_reference() && !declared {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "operation `{}` produces a reference at output {} without declaring which input \
+                         allocation it preserves or which region output it forwards",
+                        operation.name(),
+                        output_index,
+                    )));
+                }
+            }
+        }
+
         let outputs = output_types.into_iter().map(|r#type| self.add_variable(r#type)).collect::<Vec<_>>();
         self.instructions.push(
             Instruction::new(operation, inputs, outputs, regions)
@@ -662,6 +710,7 @@ struct ResolvedReferenceAlias {
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+    use std::fmt::Display;
     use std::sync::Arc;
 
     use pretty_assertions::assert_eq;
@@ -669,11 +718,15 @@ mod tests {
     use crate::arrays::{
         Array, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
     };
+    use crate::captures::CaptureReference;
     use crate::operations::{AddOperation, NegOperation};
-    use crate::parameters::Placeholder;
+    use crate::parameters::{Parameter, Placeholder};
+    use crate::programs::identities::NoIdentity;
     use crate::programs::instructions::InstructionId;
     use crate::programs::provenance::ProvenanceScope;
-    use crate::programs::references::{ReferenceAccessMode, ReferenceInput, ReferenceOperationSemantics};
+    use crate::programs::references::{
+        ReferenceAccessMode, ReferenceInput, ReferenceOperationSemantics, ReferenceOutput,
+    };
     use crate::programs::regions::RegionSlot;
     use crate::programs::types::TypeError;
     use crate::programs::values::ValueId;
@@ -1455,6 +1508,179 @@ mod tests {
         );
         assert_eq!(builder.atoms.len(), atom_count);
         assert_eq!(builder.instructions.len(), instruction_count);
+    }
+
+    #[test]
+    fn test_program_builder_add_instruction_rejects_undeclared_region_reference_flow() {
+        // A minimal type family with a reference type, and an operation family with an allocation and a region-carrying
+        // operation that declares none of the reference provenance hooks.
+        #[derive(Clone, Debug, PartialEq)]
+        enum HookType {
+            Value,
+            Reference,
+        }
+
+        impl Display for HookType {
+            fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str(match self {
+                    Self::Value => "value",
+                    Self::Reference => "reference",
+                })
+            }
+        }
+
+        impl Parameter for HookType {}
+
+        impl Type for HookType {
+            type Identity = NoIdentity;
+            type Refinements = ();
+
+            fn is_compatible_with(&self, other: &Self) -> bool {
+                self == other
+            }
+
+            fn is_refined_by(&self, other: &Self) -> bool {
+                self == other
+            }
+
+            fn is_scalar(&self) -> bool {
+                false
+            }
+
+            fn is_complex(&self) -> bool {
+                false
+            }
+
+            fn is_reference(&self) -> bool {
+                matches!(self, Self::Reference)
+            }
+        }
+
+        #[derive(Clone, Debug)]
+        enum HookOperation {
+            Allocate,
+            Region { capture_input_count: Option<usize> },
+        }
+
+        impl Operation for HookOperation {
+            type Type = HookType;
+
+            fn name(&self) -> &'static str {
+                match self {
+                    Self::Allocate => "test.allocate",
+                    Self::Region { .. } => "test.region",
+                }
+            }
+
+            fn region_slots(&self) -> &'static [RegionSlot] {
+                match self {
+                    Self::Allocate => &[],
+                    Self::Region { .. } => const { &[RegionSlot::computation("body")] },
+                }
+            }
+
+            fn region_capture_input_count(&self, _region_index: usize) -> Option<usize> {
+                match self {
+                    Self::Allocate => None,
+                    Self::Region { capture_input_count } => *capture_input_count,
+                }
+            }
+
+            fn infer_output_types(
+                &self,
+                _input_types: &[HookType],
+                region_interfaces: &[RegionInterface<HookType>],
+            ) -> Result<Vec<HookType>, TypeError> {
+                match self {
+                    Self::Allocate => Ok(vec![HookType::Reference]),
+                    Self::Region { .. } => Ok(region_interfaces[0].output_types().to_vec()),
+                }
+            }
+
+            fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
+                match self {
+                    Self::Allocate => Cow::Owned(ReferenceOperationSemantics::new(
+                        Vec::new(),
+                        vec![ReferenceOutput::Allocation { output_index: 0 }],
+                    )),
+                    Self::Region { .. } => Cow::Borrowed(ReferenceOperationSemantics::empty()),
+                }
+            }
+        }
+
+        type HookValue = CaptureReference<HookType>;
+        let region_returning_its_input = |input_type: HookType| {
+            let mut builder = ProgramBuilder::<HookValue, HookOperation>::new();
+            let input = builder.add_input(input_type);
+            builder
+                .build::<Vec<HookValue>, Vec<HookValue>>(vec![input], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let region = HookOperation::Region { capture_input_count: None };
+
+        // A reference-typed region input needs a declared supplying input.
+        let mut builder = ProgramBuilder::<HookValue, HookOperation>::new();
+        let sealed = builder.import_region(region_returning_its_input(HookType::Reference).entry_region_ref());
+        let input = builder.add_input(HookType::Reference);
+        assert_eq!(
+            builder.add_instruction(region.clone(), vec![sealed], vec![input], None),
+            Err(ProgramError::MalformedProgram(
+                "operation `test.region` passes a reference into region 0 input 0 without declaring which input \
+                 supplies it"
+                    .to_string(),
+            )),
+        );
+
+        // A declared capture prefix must fit the region's inputs.
+        let mut builder = ProgramBuilder::<HookValue, HookOperation>::new();
+        let sealed = builder.import_region(region_returning_its_input(HookType::Value).entry_region_ref());
+        let input = builder.add_input(HookType::Value);
+        assert_eq!(
+            builder.add_instruction(
+                HookOperation::Region { capture_input_count: Some(2) },
+                vec![sealed],
+                vec![input],
+                None,
+            ),
+            Err(ProgramError::MalformedProgram(
+                "operation `test.region` declares a capture prefix of 2 for region 0, which has 1 inputs".to_string(),
+            )),
+        );
+
+        // A reference-typed output of a region-carrying operation needs an identity input or region provenance.
+        let mut region_builder = ProgramBuilder::<HookValue, HookOperation>::new();
+        let initial = region_builder.add_input(HookType::Value);
+        let allocated =
+            region_builder.add_instruction(HookOperation::Allocate, Vec::new(), vec![initial], None).unwrap()[0];
+        let allocating_region = region_builder
+            .build::<Vec<HookValue>, Vec<HookValue>>(vec![allocated], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<HookValue, HookOperation>::new();
+        let sealed = builder.import_region(allocating_region.entry_region_ref());
+        let input = builder.add_input(HookType::Value);
+        assert_eq!(
+            builder.add_instruction(region, vec![sealed], vec![input], None),
+            Err(ProgramError::MalformedProgram(
+                "operation `test.region` produces a reference at output 0 without declaring which input allocation it \
+                 preserves or which region output it forwards"
+                    .to_string(),
+            )),
+        );
+
+        // A value-only boundary needs no hooks at all.
+        let mut builder = ProgramBuilder::<HookValue, HookOperation>::new();
+        let sealed = builder.import_region(region_returning_its_input(HookType::Value).entry_region_ref());
+        let input = builder.add_input(HookType::Value);
+        assert!(
+            builder
+                .add_instruction(
+                    HookOperation::Region { capture_input_count: Some(1) },
+                    vec![sealed],
+                    vec![input],
+                    None
+                )
+                .is_ok()
+        );
     }
 
     #[test]

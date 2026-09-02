@@ -200,7 +200,8 @@ mod tests {
         let context =
             ReferenceDischargeContext::<TestDestination, WriteOnlyReferenceDischarge>::new(TestDestination::new());
         let initial = TestValue::new(REFERENT, 4);
-        let allocated = context.bind_discharged(ReferenceType::new(REFERENT), initial).unwrap();
+        let allocated =
+            ReferenceDischargeValue::from(context.bind_discharged(ReferenceType::new(REFERENT), initial).unwrap());
         let reference = allocated.try_as_reference("the allocated allocation").unwrap().clone();
         let inputs = vec![
             ReferenceDischargeValue::Reference(reference.clone()),

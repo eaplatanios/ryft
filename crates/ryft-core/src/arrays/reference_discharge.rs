@@ -173,6 +173,8 @@
 //! semantics cannot drift apart, because both reach their coordinates through the one [`ArrayReferenceView`]
 //! traversal — the eager handles through a value carrier, the policy through a destination-context carrier.
 
+// TODO(eaplatanios): Review this module.
+
 use std::borrow::Cow;
 
 use crate::arrays::operations::ArrayReferenceViewOperation;
@@ -607,8 +609,8 @@ mod tests {
         assert!(matches!(
             source.discharge_references(0),
             Err(ProgramError::MalformedProgram(message)) if message.ends_with(
-                "through the view `ref<f32[2]>`; consumption yields the complete stored value, whose referent is \
-                 `f32[4]`",
+                "through the view `ref<f32[2]>`; consumption yields the complete stored value, whose reference type is \
+                 `ref<f32[4]>`",
             ),
         ));
 
@@ -2763,6 +2765,13 @@ mod tests {
 
             fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self {
                 Self::Native(TestOperation::from_reference_update_slice(operation))
+            }
+
+            fn reference_view_transform(&self) -> Option<ArrayReferenceViewTransform> {
+                match self {
+                    Self::Native(operation) => operation.reference_view_transform(),
+                    Self::Call => None,
+                }
             }
         }
 

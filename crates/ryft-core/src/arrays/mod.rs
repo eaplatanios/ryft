@@ -8,6 +8,7 @@ pub mod encoding;
 pub mod ir;
 pub mod macros;
 pub mod operations;
+pub mod reference_analysis;
 pub mod reference_discharge;
 pub mod reference_views;
 pub mod sharding;
@@ -36,6 +37,7 @@ pub use operations::{
     REFERENCE_INDEX_OPERATION_NAME, REFERENCE_SLICE_OPERATION_NAME, ReferenceIndex, ReferenceIndexOperation,
     ReferenceSlice, ReferenceSliceOperation,
 };
+pub use reference_analysis::{ArrayReferenceAnalysis, ArrayReferenceAnalysisError};
 pub use reference_discharge::ArrayReferenceDischarge;
 pub use reference_views::{ArrayReference, ArrayReferenceView, ArrayReferenceViewError, ArrayReferenceViewTransform};
 pub use sharding::{

@@ -1805,14 +1805,14 @@ where
             if position < carry_count {
                 match carries[position] {
                     Some(allocation) => {
-                        context.merge_boundary_state(&summary, widening.threaded(), allocation, output)?;
+                        context.merge_boundary_state(&summary, &widening, allocation, output)?;
                         results.push(carry_operands[position].clone());
                     }
                     None => results.push(ReferenceDischargeValue::Value(output)),
                 }
             } else if position < carry_count + entering.len() {
                 let allocation = entering[position - carry_count];
-                context.merge_boundary_state(&summary, widening.threaded(), allocation, output)?;
+                context.merge_boundary_state(&summary, &widening, allocation, output)?;
             } else {
                 results.push(ReferenceDischargeValue::Value(output));
             }

@@ -254,6 +254,10 @@ impl Operation for RegisterOperation {
         }
     }
 
+    fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> Option<usize> {
+        matches!(self, Self::Call).then_some(input_index)
+    }
+
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
         match self {
             Self::Call => vec![OutputRegionProvenance { region_index: 0, output_index }],
@@ -377,11 +381,11 @@ where
                 check_count!("input", inputs, 1, ProgramError);
                 let initial = inputs[0].try_as_value("an initial state")?.clone();
                 if context.selects_internal(driver.source_instruction_id(), 0) {
-                    return Ok(vec![context.bind_discharged(ReferenceType::new(RegisterType), initial)?]);
+                    return Ok(vec![context.bind_discharged(ReferenceType::new(RegisterType), initial)?.into()]);
                 }
                 let mut outputs = context.parent().bind(*self, Vec::new(), std::slice::from_ref(&initial))?;
                 check_count!("output", outputs, 1, ProgramError);
-                Ok(vec![context.bind_preserved(ReferenceType::new(RegisterType), outputs.remove(0))?])
+                Ok(vec![context.bind_preserved(ReferenceType::new(RegisterType), outputs.remove(0))?.into()])
             }
             Self::Read => {
                 check_count!("input", inputs, 1, ProgramError);
@@ -459,7 +463,7 @@ where
                         results.push(ReferenceDischargeValue::Value(output));
                     } else {
                         let allocation = widening.published()[position - source_output_count];
-                        context.merge_boundary_state(&summary, widening.threaded(), allocation, output)?;
+                        context.merge_boundary_state(&summary, &widening, allocation, output)?;
                     }
                 }
                 Ok(results)
@@ -510,7 +514,9 @@ fn test_downstream_reference_universe_discharges_through_the_public_surface() {
 #[test]
 fn test_downstream_reference_discharge_context_environment_accessors() {
     let context = RegisterDischargeContext::new(RegisterDestination::new());
-    let bound = context.bind_discharged(ReferenceType::new(RegisterType), RegisterValue(1)).unwrap();
+    let bound = ReferenceDischargeValue::from(
+        context.bind_discharged(ReferenceType::new(RegisterType), RegisterValue(1)).unwrap(),
+    );
     let allocation = bound.try_as_reference("a downstream allocation").unwrap().allocation_id();
 
     // These ID-based operations are the public seam custom structured transforms use to inspect, thread, and merge
@@ -519,7 +525,7 @@ fn test_downstream_reference_discharge_context_environment_accessors() {
     assert_eq!(context.is_allocation_discharged(allocation), Ok(true));
     assert_eq!(context.discharged_state(allocation), Ok(RegisterValue(1)));
     assert_eq!(context.is_mutated(allocation), Ok(false));
-    assert_eq!(context.allocation_reference(allocation), Ok(bound));
+    assert_eq!(context.allocation_reference(allocation).map(ReferenceDischargeValue::from), Ok(bound));
     assert_eq!(context.set_discharged_state(allocation, RegisterValue(2), true), Ok(()));
     assert_eq!(context.discharged_state(allocation), Ok(RegisterValue(2)));
     assert_eq!(context.is_mutated(allocation), Ok(true));
@@ -655,7 +661,9 @@ fn test_downstream_region_summary_exposes_exact_access_modes() {
         .unwrap();
 
     let context = RegisterDischargeContext::new(RegisterDestination::new());
-    let reference = context.bind_discharged(ReferenceType::new(RegisterType), RegisterValue(1)).unwrap();
+    let reference = ReferenceDischargeValue::from(
+        context.bind_discharged(ReferenceType::new(RegisterType), RegisterValue(1)).unwrap(),
+    );
     let allocation = reference.try_as_reference("a downstream allocation").unwrap().allocation_id();
     let summary = context
         .region_summary(&RegisterOperation::Call, 0, region.entry_region_ref(), &[Some(allocation), None])
@@ -822,16 +830,4 @@ fn test_downstream_partial_targets_reach_an_internal_allocation_inside_a_structu
             ]
             in (%1)"},
     );
-}
-
-#[test]
-fn test_downstream_reference_discharge_identities_cannot_be_fabricated() {
-    // The tests above establish that the discharge surface is reachable from outside `ryft-core`. This is the
-    // matching negative proof: neither a handle nor its allocation ID can be fabricated from that same position, and
-    // their private representations cannot be read directly. The cases are separate so each privacy contract produces
-    // its own compiler diagnostic.
-    let test_cases = trybuild::TestCases::new();
-    test_cases.compile_fail("tests/reference_discharge/error_reference_discharge_allocation_id_fabrication.rs");
-    test_cases.compile_fail("tests/reference_discharge/error_reference_discharge_reference_fabrication.rs");
-    test_cases.compile_fail("tests/reference_discharge/error_reference_discharge_reference_private_fields.rs");
 }

@@ -6043,9 +6043,11 @@ mod tests {
         // An operand that is a live reference handle is rejected too, because a reference-touching operation owns
         // its own rewrite. The handle's own rendering is spliced into the expected diagnostic because a top-level
         // environment identity is minted process-globally and is therefore not stable across runs.
-        let reference = context
-            .bind_discharged(ReferenceType::new(ArrayType::scalar(DataType::F32)), Array::scalar(1.0f32))
-            .unwrap();
+        let reference = ReferenceDischargeValue::from(
+            context
+                .bind_discharged(ReferenceType::new(ArrayType::scalar(DataType::F32)), Array::scalar(1.0f32))
+                .unwrap(),
+        );
         assert_eq!(
             operation.discharge_references(&context, &EmptyRegionDriver, &[reference.clone()]),
             Err(ProgramError::MalformedProgram(format!(
