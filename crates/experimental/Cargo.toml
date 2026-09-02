@@ -11,15 +11,19 @@ categories.workspace = true
 license.workspace = true
 
 [dependencies]
-ryft-cuda.workspace = true
+ryft-cuda = { workspace = true, optional = true }
 ryft-pjrt.workspace = true
 
 [dev-dependencies]
+indoc.workspace = true
+pretty_assertions.workspace = true
+ryft-mlir.workspace = true
+ryft-xla-sys.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 
 [features]
 default = []
-cuda-12 = ["ryft-pjrt/cuda-12"]
-cuda-13 = ["ryft-pjrt/cuda-13"]
+cuda-12 = ["dep:ryft-cuda", "ryft-pjrt/cuda-12"]
+cuda-13 = ["dep:ryft-cuda", "ryft-pjrt/cuda-13"]

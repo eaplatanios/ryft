@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 use std::{env, fs};
@@ -14,9 +13,8 @@ use crate::extensions::ffi::{
     FfiBuffer, FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput,
     FfiOutput, FfiTypeId, XLA_FFI_CallFrame, XLA_FFI_Error,
 };
-use crate::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
-use crate::tests::{TestPlatform, test_for_each_platform};
-use crate::{BufferType, ExecutionDeviceInputs, ExecutionInput, Program};
+use crate::tests::{TestPlatform, test_compilation_options, test_for_each_platform};
+use crate::{BufferType, ExecutionDeviceInputs, ExecutionInput, LoadOptions, LoadedExecutable, Program, Value};
 
 const EXPECTED_SUM: i32 = 42;
 const TARGET_NAME: &str = "ryft.test.cutile.aot_add";
@@ -185,26 +183,6 @@ fn parse_cutile_artifact(metadata_json: &str, cubin_path: &Path, cubin: Vec<u8>)
     .map_err(|error| format!("invalid cuTile kernel artifact: {error}"))
 }
 
-fn test_compilation_options() -> CompilationOptions {
-    CompilationOptions {
-        argument_layouts: Vec::new(),
-        parameter_is_tupled_arguments: false,
-        executable_build_options: Some(ExecutableCompilationOptions {
-            device_ordinal: -1,
-            replica_count: 1,
-            partition_count: 1,
-            ..Default::default()
-        }),
-        compile_portable_executable: false,
-        profile_version: 0,
-        serialized_multi_slice_configuration: Vec::new(),
-        environment_option_overrides: HashMap::new(),
-        target_config: None,
-        allow_in_place_mlir_modification: false,
-        matrix_unit_operand_precision: Precision::Default as i32,
-    }
-}
-
 fn test_program() -> Program {
     Program::Mlir {
         bytecode: format!(
@@ -293,6 +271,46 @@ unsafe extern "C" fn cutile_handler(call_frame: *mut XLA_FFI_CallFrame) -> *mut 
     }
 }
 
+/// Executes the cuTile vector-add program on `7 + 35` and asserts the exact device result.
+fn execute_cutile_add(client: &crate::Client<'_>, executable: &LoadedExecutable<'_>, device: &crate::Device<'_>) {
+    let lhs = client
+        .buffer(7i32.to_ne_bytes().as_slice(), BufferType::I32, &[1], None, device.clone(), None)
+        .unwrap();
+    let rhs = client
+        .buffer(35i32.to_ne_bytes().as_slice(), BufferType::I32, &[1], None, device.clone(), None)
+        .unwrap();
+    let execution_inputs = [ExecutionInput::from(lhs), ExecutionInput::from(rhs)];
+    let inputs = ExecutionDeviceInputs::from(execution_inputs.as_slice());
+    let mut device_outputs = executable
+        .execute(vec![inputs], vec![], 0, None, None, None, None)
+        .unwrap()
+        .block_until_ready()
+        .unwrap()
+        .remove(0);
+    let output = device_outputs.outputs.remove(0);
+    let output_bytes = output.copy_to_host(None).unwrap().r#await().unwrap();
+    assert_eq!(output_bytes, EXPECTED_SUM.to_ne_bytes());
+}
+
+/// Returns a synthetic cubin: a little-endian ELF64 header for NVIDIA CUDA (`e_machine` 190) using the
+/// `ELFABIVERSION_CUDA_V1` encoding, whose `e_flags` low byte records `architecture`, followed by `payload`.
+fn test_cubin(architecture: u32, payload: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![0u8; 64];
+    bytes[..4].copy_from_slice(&[0x7f, b'E', b'L', b'F']);
+    bytes[4] = 2;
+    bytes[5] = 1;
+    bytes[6] = 1;
+    bytes[7] = 51;
+    bytes[8] = 7;
+    bytes[16..18].copy_from_slice(&2u16.to_le_bytes());
+    bytes[18..20].copy_from_slice(&190u16.to_le_bytes());
+    bytes[20..24].copy_from_slice(&1u32.to_le_bytes());
+    bytes[48..52].copy_from_slice(&(architecture & 0xff).to_le_bytes());
+    bytes[52..54].copy_from_slice(&64u16.to_le_bytes());
+    bytes.extend_from_slice(payload);
+    bytes
+}
+
 #[test]
 fn test_cutile_cubin_on_xla_ffi_cuda_stream() {
     if env::var("RYFT_PJRT_RUN_CUTILE_SEAM_PROBE").ok().as_deref() != Some("1") {
@@ -327,23 +345,25 @@ fn test_cutile_cubin_on_xla_ffi_cuda_stream() {
                 Ok(()),
             );
 
-            let executable = client.compile(&test_program(), &test_compilation_options()).unwrap();
-            let device = executable.addressable_devices().unwrap().remove(0);
-            let lhs = client
-                .buffer(7i32.to_ne_bytes().as_slice(), BufferType::I32, &[1], None, device.clone(), None)
+            // The cubin's ELF architecture must agree with both the export metadata and the device the plugin exposes.
+            let device = client.addressable_devices().unwrap().remove(0);
+            let Value::String(compute_capability) = device.attribute("compute_capability").unwrap() else {
+                panic!("the CUDA PJRT device does not report a string `compute_capability` attribute");
+            };
+            let target_sm = artifact.target_architecture().strip_prefix("sm_").unwrap().parse::<u32>().unwrap();
+            assert_eq!(artifact.cubin_architecture(), Some(target_sm));
+            assert_eq!(compute_capability.replace('.', ""), target_sm.to_string());
+
+            let options = test_compilation_options();
+            let executable = client.compile(&test_program(), &options).unwrap();
+            execute_cutile_add(&client, &executable, &device);
+
+            // Ahead-of-time persistence: serialize the executable, reload it, and launch the cubin again through it.
+            let serialized = executable.executable().unwrap().serialize().unwrap();
+            let reloaded = client
+                .deserialize_and_load_executable(serialized.data(), Some(&options), &LoadOptions::default())
                 .unwrap();
-            let rhs = client.buffer(35i32.to_ne_bytes().as_slice(), BufferType::I32, &[1], None, device, None).unwrap();
-            let execution_inputs = [ExecutionInput::from(lhs), ExecutionInput::from(rhs)];
-            let inputs = ExecutionDeviceInputs::from(execution_inputs.as_slice());
-            let mut device_outputs = executable
-                .execute(vec![inputs], vec![], 0, None, None, None, None)
-                .unwrap()
-                .block_until_ready()
-                .unwrap()
-                .remove(0);
-            let output = device_outputs.outputs.remove(0);
-            let output_bytes = output.copy_to_host(None).unwrap().r#await().unwrap();
-            assert_eq!(output_bytes, EXPECTED_SUM.to_ne_bytes());
+            execute_cutile_add(&client, &reloaded, &device);
 
             // Unload cached modules before dropping the PJRT client that owns their CUDA contexts.
             let mut state = CUTILE_TEST_STATE.lock().unwrap().take().unwrap();
@@ -357,7 +377,7 @@ fn test_cutile_cubin_on_xla_ffi_cuda_stream() {
 
 #[test]
 fn test_cutile_metadata_contract() {
-    let cubin = vec![1, 2, 3, 4];
+    let cubin = test_cubin(100, &[1, 2, 3, 4]);
     let cubin_path = Path::new("/tmp/ryft-cutile-test.cubin");
     let metadata = serde_json::json!({
         "schema_version": 1,
@@ -442,12 +462,21 @@ fn test_cutile_metadata_contract() {
             .contains("SHA-256 mismatch"),
     );
 
-    let mut invalid_metadata = metadata;
+    let mut invalid_metadata = metadata.clone();
     invalid_metadata["kernel"]["parameters"][0]["abi"] =
         serde_json::json!(["device_pointer", "stride_i32", "shape_i32"]);
     assert!(
-        parse_cutile_artifact(invalid_metadata.to_string().as_str(), cubin_path, vec![1, 2, 3, 4])
+        parse_cutile_artifact(invalid_metadata.to_string().as_str(), cubin_path, cubin.clone())
             .unwrap_err()
             .contains("does not match the vector-add seam contract"),
+    );
+
+    // A cubin assembled for another SM than the metadata records is rejected by the `ryft-cuda` ELF inspection.
+    let mut invalid_metadata = metadata;
+    invalid_metadata["artifact"]["target_sm"] = serde_json::Value::String("sm_90".to_string());
+    assert_eq!(
+        parse_cutile_artifact(invalid_metadata.to_string().as_str(), cubin_path, cubin).unwrap_err(),
+        "invalid cuTile kernel artifact: cuda cubin ELF header targets `sm_100`, but the artifact records target \
+         architecture `sm_90`",
     );
 }

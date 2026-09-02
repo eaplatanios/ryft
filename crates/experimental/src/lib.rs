@@ -7,6 +7,31 @@ mod jax;
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::collections::HashMap;
+
+    use crate::protos::{CompilationOptions, ExecutableCompilationOptions, Precision};
+
+    /// Returns single-device compilation options shared by the prototype seam probes.
+    pub(crate) fn test_compilation_options() -> CompilationOptions {
+        CompilationOptions {
+            argument_layouts: Vec::new(),
+            parameter_is_tupled_arguments: false,
+            executable_build_options: Some(ExecutableCompilationOptions {
+                device_ordinal: -1,
+                replica_count: 1,
+                partition_count: 1,
+                ..Default::default()
+            }),
+            compile_portable_executable: false,
+            profile_version: 0,
+            serialized_multi_slice_configuration: Vec::new(),
+            environment_option_overrides: HashMap::new(),
+            target_config: None,
+            allow_in_place_mlir_modification: false,
+            matrix_unit_operand_precision: Precision::Default as i32,
+        }
+    }
+
     /// Platform identifier used by [`test_for_each_platform`] in prototype tests.
     #[allow(dead_code)]
     #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
