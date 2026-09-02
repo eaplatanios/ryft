@@ -14,7 +14,7 @@ use crate::programs::instructions::InstructionId;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::references::discharge::interpreter::{
-    ReferenceDischargeRegionDestination, ReferenceDischargeableOperation, discharge_preserved_access,
+    ReferenceDischargeableOperation, discharge_preserved_access,
 };
 use crate::programs::references::types::ReferenceType;
 use crate::programs::regions::{
@@ -1453,11 +1453,11 @@ impl<
             Type: From<<P as ReferenceDischargePolicy<C>>::Referent>
                       + From<ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>>,
             Operation: ReferenceDischargeableOperation<C, P>
-                           + ReferenceDischargeableOperation<ReferenceDischargeRegionDestination<C>, P>,
+                           + ReferenceDischargeableOperation<TracingContext<C::Constant, C::Operation>, P>,
         >,
     P: ReferenceDischargePolicy<C>
         + ReferenceDischargePolicy<
-            ReferenceDischargeRegionDestination<C>,
+            TracingContext<C::Constant, C::Operation>,
             Referent = <P as ReferenceDischargePolicy<C>>::Referent,
         >,
     D: RegionDriver<C::Constant, C::Operation>,
@@ -1528,14 +1528,14 @@ where
 
         // Every carrier, the region context, and the destination itself stay inside this block, because recovering the
         // rebuilt program below requires unique ownership of the destination's builder.
-        let destination = ReferenceDischargeRegionDestination::<C>::new();
+        let destination = TracingContext::<C::Constant, C::Operation>::new();
         let builder = destination.builder().clone();
         let (output_ids, output_allocations, mutated_allocations) = {
             // The region context inherits the caller's targets because a target names the same source program location
             // wherever the replay reaches it: an unselected allocation inside a rebuilt region survives there exactly
             // as it would have in the caller's own body.
             let region_context =
-                ReferenceDischargeContext::<ReferenceDischargeRegionDestination<C>, P>::new_with_targets(
+                ReferenceDischargeContext::<TracingContext<C::Constant, C::Operation>, P>::new_with_targets(
                     destination.clone(),
                     context.targets().clone(),
                 );
@@ -1563,16 +1563,13 @@ where
             let mut region_to_caller_allocations =
                 HashMap::<ReferenceDischargeAllocationId, ReferenceDischargeAllocationId>::new();
             let mut thread = |allocation: ReferenceDischargeAllocationId| -> Result<
-                ReferenceDischargeValue<ReferenceDischargeRegionDestination<C>, P>,
+                ReferenceDischargeValue<TracingContext<C::Constant, C::Operation>, P>,
                 ProgramError,
             > {
                 let r#type = context.allocation_entry(allocation)?.r#type().into_owned();
                 let discharged = context.is_allocation_discharged(allocation)?;
-                let input_type = if discharged {
-                    <ReferenceDischargeRegionDestination<C> as Domain>::Type::from(r#type.referent().clone())
-                } else {
-                    <ReferenceDischargeRegionDestination<C> as Domain>::Type::from(r#type.clone())
-                };
+                let input_type =
+                    if discharged { C::Type::from(r#type.referent().clone()) } else { C::Type::from(r#type.clone()) };
                 let input = destination.input(input_type);
                 if let Some(region_allocation) = caller_to_region_allocations.get(&allocation).copied() {
                     return region_context.allocation_reference(region_allocation);
@@ -2445,11 +2442,11 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
                 Type: From<<P as ReferenceDischargePolicy<C>>::Referent>
                           + From<ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>>,
                 Operation: ReferenceDischargeableOperation<C, P>
-                               + ReferenceDischargeableOperation<ReferenceDischargeRegionDestination<C>, P>,
+                               + ReferenceDischargeableOperation<TracingContext<C::Constant, C::Operation>, P>,
             >,
         P: ReferenceDischargePolicy<C>
             + ReferenceDischargePolicy<
-                ReferenceDischargeRegionDestination<C>,
+                TracingContext<C::Constant, C::Operation>,
                 Referent = <P as ReferenceDischargePolicy<C>>::Referent,
             >,
         for<'t> &'t ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>: TryFrom<&'t C::Type>,

@@ -1,19 +1,8 @@
 use std::collections::BTreeSet;
 
-use crate::contexts::Domain;
 use crate::programs::references::discharge::transform::ReferenceDischargeAllocationId;
-use crate::tracing::TracingContext;
 
 // TODO(eaplatanios): Review this module.
-
-/// of the same program universe, which seals into a program the rule attaches to its rewritten operation.
-///
-/// It is deliberately a fresh allocation trace rather than a nested trace of the live destination. A rebuilt region is a
-/// self-contained artifact whose complete interface is its own boundary, so it must not close over any value of the
-/// destination it will be attached in. Being an allocation trace is also what makes the type a fixed point of its own
-/// construction — the destination of a destination is that same destination — which is what keeps the obligation that
-/// this universe's operations discharge into it finite.
-pub type ReferenceDischargeRegionDestination<C> = TracingContext<<C as Domain>::Constant, <C as Domain>::Operation>;
 
 /// Symmetric widening facts one structured rule derives from a region summary through
 /// [`state_widening`](crate::programs::references::ReferenceDischargeContext::state_widening).

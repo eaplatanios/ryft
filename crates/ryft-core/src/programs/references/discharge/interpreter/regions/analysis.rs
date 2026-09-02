@@ -356,7 +356,47 @@ fn summarize_region_closure<V: Value, O: Operation<Type = V::Type>>(
                 Some(input_index) => {
                     resolve(&allocations, operand(instruction, input_index, "a preserved")?, operation.name())?
                 }
-                None => forwarded_output_allocation(operation, output_index, attached_output_allocations.as_slice())?,
+                None => {
+                    // Without an explicit operand identity, the operation must identify the attached-region outputs
+                    // that it forwards. At least one origin is required because otherwise there is no allocation
+                    // identity that discharge can associate with this reference-typed output.
+                    let provenance = operation.output_region_provenance(output_index);
+                    if provenance.is_empty() {
+                        return Err(ProgramError::MalformedProgram(format!(
+                            "operation `{}` produces a reference at output {output_index} without declaring which \
+                             operand allocation it preserves or which region output it forwards",
+                            operation.name()
+                        )));
+                    }
+
+                    // The first origin establishes the forwarded allocation. Every additional origin must denote the
+                    // same allocation, as happens for corresponding outputs of condition branches.
+                    let mut forwarded = None;
+                    for (position, origin) in provenance.iter().enumerate() {
+                        let allocation = attached_output_allocations
+                            .get(origin.region_index)
+                            .and_then(|allocations| allocations.get(origin.output_index).copied())
+                            .ok_or_else(|| {
+                                ProgramError::MalformedProgram(format!(
+                                    "operation `{}` forwards output {output_index} from region {} output {}, which it \
+                                     does not attach",
+                                    operation.name(),
+                                    origin.region_index,
+                                    origin.output_index,
+                                ))
+                            })?;
+                        if position == 0 {
+                            forwarded = allocation;
+                        } else if forwarded != allocation {
+                            return Err(ProgramError::MalformedProgram(format!(
+                                "operation `{}` forwards output {output_index} from regions that return different \
+                                 reference allocations",
+                                operation.name(),
+                            )));
+                        }
+                    }
+                    forwarded
+                }
             };
             allocations.insert(output, preserved);
         }
@@ -390,52 +430,6 @@ fn validate_region_accesses<O: Operation>(
     Ok(())
 }
 
-/// Returns the caller allocation one region-carrying operation's reference-typed output forwards out of its attached
-/// regions, requiring every region that contributes to that output to agree on it.
-///
-/// # Parameters
-///
-///   - `operation`: Operation producing the output.
-///   - `output_index`: Output position being resolved.
-///   - `attached_output_allocations`: Allocation each attached region's declared outputs denote, in region order.
-fn forwarded_output_allocation<O: Operation>(
-    operation: &O,
-    output_index: usize,
-    attached_output_allocations: &[Vec<Option<ReferenceDischargeAllocationId>>],
-) -> Result<Option<ReferenceDischargeAllocationId>, ProgramError> {
-    let provenance = operation.output_region_provenance(output_index);
-    if provenance.is_empty() {
-        return Err(ProgramError::MalformedProgram(format!(
-            "operation `{}` produces a reference at output {output_index} without declaring which operand allocation it \
-             preserves or which region output it forwards",
-            operation.name()
-        )));
-    }
-    let mut forwarded = None;
-    for (position, origin) in provenance.iter().enumerate() {
-        let allocation = attached_output_allocations
-            .get(origin.region_index)
-            .and_then(|allocations| allocations.get(origin.output_index).copied())
-            .ok_or_else(|| {
-                ProgramError::MalformedProgram(format!(
-                    "operation `{}` forwards output {output_index} from region {} output {}, which it does not \
-                     attach",
-                    operation.name(),
-                    origin.region_index,
-                    origin.output_index,
-                ))
-            })?;
-        if position == 0 {
-            forwarded = allocation;
-        } else if forwarded != allocation {
-            return Err(ProgramError::MalformedProgram(format!(
-                "operation `{}` forwards output {output_index} from regions that return different reference allocations",
-                operation.name(),
-            )));
-        }
-    }
-    Ok(forwarded)
-}
 impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> {
     /// Summarizes the transitive reference accesses of one region closure, in the terms of the caller allocations its
     /// boundary names.

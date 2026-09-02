@@ -1,8 +1,5 @@
 mod regions;
 mod rules;
 
-pub use regions::{
-    ReferenceDischargeRegionDestination, ReferenceRegionSummary, ReferenceStateWidening,
-    discharge_positional_region_operation,
-};
+pub use regions::{ReferenceRegionSummary, ReferenceStateWidening, discharge_positional_region_operation};
 pub use rules::{ReferenceDischargeableOperation, discharge_preserved_access, discharge_reference_free_operation};
