@@ -4420,9 +4420,9 @@ mod tests {
         length: usize,
     }
 
-    // Binds one single-result prototype operation into a destination. Routing the alias mechanics through the
-    // operation family is what keeps this universe's policy independent of whether its destination executes the
-    // work or stages it, which one policy implementation must be for a rebuilt region to be traced at all.
+    /// Binds one single-result prototype operation into a destination. Routing the alias mechanics through the
+    /// operation family is what keeps this universe's policy independent of whether its destination executes the
+    /// work or stages it, which one policy implementation must be for a rebuilt region to be traced at all.
     fn bind_list<C: Context<Type = ListIrType, Operation: From<ListOperation>>>(
         context: &C,
         operation: ListOperation,
@@ -4866,9 +4866,9 @@ mod tests {
         builder.build(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count]).unwrap()
     }
 
-    // Capture seam for the prototype universe, which has no capture constants of its own: a reference-typed constant
-    // names the capture position given by its referent length. The seam is the only universe-specific part of capture
-    // resolution, so supplying one here exercises every branch of it without inventing a second constant family.
+    /// Capture seam for the prototype universe, which has no capture constants of its own: a reference-typed constant
+    /// names the capture position given by its referent length. The seam is the only universe-specific part of capture
+    /// resolution, so supplying one here exercises every branch of it without inventing a second constant family.
     fn list_capture_position(constant: &ListIrValue) -> Option<usize> {
         match constant {
             ListIrValue::Reference(r#type) => Some(r#type.referent().length),
