@@ -75,7 +75,7 @@ impl ReferenceAccessModes {
 /// [`access_modes`](Self::access_modes) hold only the allocations the closure semantically accesses, which is what region
 /// access policies validate. Reading `accessed` to size a boundary under-threads merely-forwarded captures.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ReferenceRegionSummary {
+pub struct ReferenceDischargeRegionSummary {
     /// Every caller allocation the closure must be able to resolve while replaying, whether or not it is semantically
     /// accessed.
     reached: BTreeSet<ReferenceDischargeAllocationId>,
@@ -87,7 +87,7 @@ pub struct ReferenceRegionSummary {
     pub(super) output_allocations: Vec<Option<ReferenceDischargeAllocationId>>,
 }
 
-impl ReferenceRegionSummary {
+impl ReferenceDischargeRegionSummary {
     /// Returns every caller allocation the closure must be able to resolve, in canonical allocation order.
     #[inline]
     pub(crate) fn reached(&self) -> impl Iterator<Item = ReferenceDischargeAllocationId> + '_ {
@@ -222,7 +222,7 @@ fn summarize_region_closure<V: Value, O: Operation<Type = V::Type>>(
     region: RegionRef<'_, V, O>,
     inputs: &[Option<ReferenceDischargeAllocationId>],
     captures: &ReferenceDischargeCaptureScope<V>,
-    summary: &mut ReferenceRegionSummary,
+    summary: &mut ReferenceDischargeRegionSummary,
 ) -> Result<Vec<Option<ReferenceDischargeAllocationId>>, ProgramError> {
     check_count!("input", inputs, region.input_ids().len(), ProgramError);
     let is_reference = |atom: AtomId| region.atoms()[atom.index()].r#type().is_reference();
@@ -337,7 +337,7 @@ fn summarize_region_closure<V: Value, O: Operation<Type = V::Type>>(
                 nested.as_slice(),
                 attached.id(),
             )?;
-            let mut nested_summary = ReferenceRegionSummary::default();
+            let mut nested_summary = ReferenceDischargeRegionSummary::default();
             let nested_outputs =
                 summarize_region_closure(attached, nested.as_slice(), &nested_captures, &mut nested_summary)?;
             validate_region_accesses(operation, region_index, &nested_summary)?;
@@ -415,7 +415,7 @@ fn summarize_region_closure<V: Value, O: Operation<Type = V::Type>>(
 fn validate_region_accesses<O: Operation>(
     operation: &O,
     region_index: usize,
-    summary: &ReferenceRegionSummary,
+    summary: &ReferenceDischargeRegionSummary,
 ) -> Result<(), ProgramError> {
     for allocation in summary.accessed() {
         for mode in summary.access_modes(allocation) {
@@ -466,11 +466,11 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         region_index: usize,
         region: RegionRef<'_, C::Constant, C::Operation>,
         inputs: &[Option<ReferenceDischargeAllocationId>],
-    ) -> Result<ReferenceRegionSummary, ProgramError> {
+    ) -> Result<ReferenceDischargeRegionSummary, ProgramError> {
         let captures =
             self.captures()
                 .nested_scope(operation.region_capture_input_count(region_index), inputs, region.id())?;
-        let mut summary = ReferenceRegionSummary::default();
+        let mut summary = ReferenceDischargeRegionSummary::default();
         summary.output_allocations = summarize_region_closure(region, inputs, &captures, &mut summary)?;
         validate_region_accesses(operation, region_index, &summary)?;
         Ok(summary)
@@ -537,7 +537,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     /// this check is in no position to restate it.
     pub fn threaded_state_allocations(
         &self,
-        summary: &ReferenceRegionSummary,
+        summary: &ReferenceDischargeRegionSummary,
         operation: &str,
     ) -> Result<BTreeSet<ReferenceDischargeAllocationId>, ProgramError> {
         let mut threaded = BTreeSet::new();
@@ -568,7 +568,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     /// Propagates [`threaded_state_allocations`](Self::threaded_state_allocations)'s liveness failures.
     pub fn state_widening(
         &self,
-        summary: &ReferenceRegionSummary,
+        summary: &ReferenceDischargeRegionSummary,
         declared: &BTreeSet<ReferenceDischargeAllocationId>,
         operation: &str,
     ) -> Result<ReferenceStateWidening, ProgramError> {
@@ -586,7 +586,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     /// Propagates the underlying state replacement's liveness and type failures.
     pub fn merge_boundary_state(
         &self,
-        summary: &ReferenceRegionSummary,
+        summary: &ReferenceDischargeRegionSummary,
         threaded: &BTreeSet<ReferenceDischargeAllocationId>,
         allocation: ReferenceDischargeAllocationId,
         output: C::Value,
@@ -653,24 +653,24 @@ mod tests {
 
     use crate::programs::{
         RecursiveReferenceDischargeDriver, ReferenceDischargeDriver, ReferenceDischargeRegionBoundary,
-        ReferenceRegionStateInsertion, ReferenceRegionSummary,
+        ReferenceDischargeRegionSummary, ReferenceRegionStateInsertion,
     };
 
     use super::*;
     use crate::programs::references::discharge::transform::ReferenceDischargeCaptureScope;
 
     #[test]
-    fn test_reference_region_summary_unions_exact_access_modes() {
+    fn test_reference_discharge_region_summary_unions_exact_access_modes() {
         let context = ListDischargeContext::new(ListDestination::new());
         let allocated = context
             .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap();
         let allocation = allocated.try_as_reference("the caller allocation").unwrap().allocation_id();
-        let mut left = ReferenceRegionSummary::default();
+        let mut left = ReferenceDischargeRegionSummary::default();
         left.record(allocation, ReferenceAccessMode::Read, "list.read").unwrap();
         left.record(allocation, ReferenceAccessMode::ReadWrite, "list.swap").unwrap();
         left.output_allocations = vec![Some(allocation)];
-        let mut right = ReferenceRegionSummary::default();
+        let mut right = ReferenceDischargeRegionSummary::default();
         right.record(allocation, ReferenceAccessMode::Write, "list.write").unwrap();
         right.record(allocation, ReferenceAccessMode::Accumulate, "list.add_update").unwrap();
         right.output_allocations = vec![None];
@@ -690,7 +690,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_region_summary_validates_each_exact_access_mode() {
+    fn test_reference_discharge_region_summary_validates_each_exact_access_mode() {
         let context = ListDischargeContext::new(ListDestination::new());
         let allocated = context
             .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
@@ -798,7 +798,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_region_summary_reports_transitive_accesses_and_output_allocations() {
+    fn test_reference_discharge_region_summary_reports_transitive_accesses_and_output_allocations() {
         // A callee that replaces the state of the reference it receives, so the outer region's access to that allocation is
         // transitive rather than local.
         let mut callee_builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
@@ -859,7 +859,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_region_summary_rejects_a_closure_that_consumes_a_caller_allocation() {
+    fn test_reference_discharge_region_summary_rejects_a_closure_that_consumes_a_caller_allocation() {
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
         let reference = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
         let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![reference], None).unwrap()[0];

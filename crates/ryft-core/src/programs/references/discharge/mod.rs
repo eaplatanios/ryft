@@ -60,7 +60,7 @@
 //! [`ReferenceDischargeableType`], and, when supported, implementing [`ReferenceAccumulationPolicy`]. Each operation
 //! implements [`ReferenceDischargeableOperation`] to rewrite its own reference effects. Region-free operations can
 //! delegate to [`discharge_reference_free_operation`]; structured operations use [`ReferenceDischargeDriver`],
-//! [`ReferenceRegionSummary`], and
+//! [`ReferenceDischargeRegionSummary`], and
 //! [`ReferenceDischargeRegionBoundary`] to rebuild attached regions with the necessary state positions.
 //!
 //! # Full and Partial Discharge
@@ -93,8 +93,8 @@
 //!   verbatim.
 //! - [`ReferenceDischargeDriver`] exposes the current source instruction and attached regions. It can replay a region
 //!   against the live environment or rebuild one against an isolated environment and return a sealed
-//!   [`ReferenceDischargeRegionResult`]. [`ReferenceRegionSummary`] supplies the transitive access facts a structured
-//!   rule needs before choosing its state boundary.
+//!   [`ReferenceDischargeRegionResult`]. [`ReferenceDischargeRegionSummary`] supplies the transitive access facts a
+//!   structured rule needs before choosing its state boundary.
 //!
 //! The driver provides shared mechanics but never chooses how an operation is rewritten. This keeps the system open:
 //! a third-party primitive or structured operation participates by implementing its own rule, while a non-array
@@ -148,7 +148,7 @@
 mod interpreter;
 mod transform;
 
-pub use interpreter::{ReferenceRegionSummary, ReferenceStateWidening};
+pub use interpreter::{ReferenceDischargeRegionSummary, ReferenceStateWidening};
 pub use transform::{
     ExternalReferenceBinding, PartialReferenceDischargeResult, RecursiveReferenceDischargeDriver,
     ReferenceAccumulationPolicy, ReferenceDischargeAllocationId, ReferenceDischargeContext, ReferenceDischargeDriver,

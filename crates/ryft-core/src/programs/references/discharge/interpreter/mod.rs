@@ -1,3 +1,3 @@
 mod regions;
 
-pub use regions::{ReferenceRegionSummary, ReferenceStateWidening};
+pub use regions::{ReferenceDischargeRegionSummary, ReferenceStateWidening};

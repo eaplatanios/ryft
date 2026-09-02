@@ -13,7 +13,7 @@ use crate::programs::ProgramError;
 use crate::programs::instructions::InstructionId;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
-use crate::programs::references::discharge::interpreter::ReferenceRegionSummary;
+use crate::programs::references::discharge::interpreter::ReferenceDischargeRegionSummary;
 use crate::programs::references::types::ReferenceType;
 use crate::programs::regions::{
     EmptyRegionDriver, RegionDriver, RegionId, RegionRef, RegionReplayMappings, ReplayRegionDriver,
@@ -1117,14 +1117,14 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeRegionResult<V, O
         self.program
     }
 
-    /// Validates that the declared outputs of this [`Region`](crate::Region) denote exactly the allocations that
-    /// `expected` predicted. A structured rule sizes its boundary from a
-    /// [`ReferenceRegionSummary`](crate::ReferenceRegionSummary) computed before the region is rebuilt, and that
-    /// boundary depends on the declared output allocations: an allocation the region already returns publishes its
-    /// final state at that output position and must not be published a second time. This function holds that prediction
-    /// to what the rebuild actually produced, so an operation whose rule disagrees with its own summary is reported
-    /// instead of silently losing an update. Checking every region of one operation against the same summary also keeps
-    /// those regions in agreement with each other.
+    /// Validates that the declared outputs of this [`Region`](crate::Region) denote exactly
+    /// the allocations that `expected` predicted. A structured rule sizes its boundary from a
+    /// [`ReferenceDischargeRegionSummary`](crate::ReferenceDischargeRegionSummary) computed before the region is
+    /// rebuilt, and that boundary depends on the declared output allocations: an allocation the region already returns
+    /// publishes its final state at that output position and must not be published a second time. This function holds
+    /// that prediction to what the rebuild actually produced, so an operation whose rule disagrees with its own summary
+    /// is reported instead of silently losing an update. Checking every region of one operation against the same
+    /// summary also keeps those regions in agreement with each other.
     ///
     /// # Parameters
     ///
@@ -3399,7 +3399,7 @@ where
     // from the first region rather than from an empty summary, because merging keeps the receiver's declared output
     // allocations and an empty summary declares none.
     let region_count = driver.region_count();
-    let mut summary: Option<ReferenceRegionSummary> = None;
+    let mut summary: Option<ReferenceDischargeRegionSummary> = None;
     for index in 0..region_count {
         let region = driver.region(index)?;
         check_count!("input", region.input_ids(), forwarded.len(), ProgramError);
@@ -5316,9 +5316,9 @@ mod tests {
         let reference = allocated.try_as_reference("the allocated allocation").unwrap().clone();
 
         // A clone shares the environment rather than copying it, which is the contract every stateful Ryft context
-        // follows: several handles can denote one allocation, and every one of them must observe the same current state.
-        // Isolation is therefore never implicit — a structured rule that must not commit rebuilds its region against
-        // an environment of its own through `rebuild_region`.
+        // follows: several handles can denote one allocation, and every one of them must observe the same current
+        // state. Isolation is therefore never implicit; a structured rule that must not commit rebuilds its region
+        // against an environment of its own through `rebuild_region`.
         let clone = context.clone();
         clone.accumulate(&reference, ListIrValue::List(vec![10, 10])).unwrap();
         assert_eq!(context.read(&reference), Ok(ListIrValue::List(vec![11, 12])));
