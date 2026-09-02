@@ -90,7 +90,7 @@ pub struct ReferenceRegionSummary {
 impl ReferenceRegionSummary {
     /// Returns every caller allocation the closure must be able to resolve, in canonical allocation order.
     #[inline]
-    pub(super) fn reached(&self) -> impl Iterator<Item = ReferenceDischargeAllocationId> + '_ {
+    pub(crate) fn reached(&self) -> impl Iterator<Item = ReferenceDischargeAllocationId> + '_ {
         self.reached.iter().copied()
     }
 

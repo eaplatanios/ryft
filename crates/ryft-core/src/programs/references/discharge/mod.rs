@@ -148,16 +148,14 @@
 mod interpreter;
 mod transform;
 
-pub use interpreter::{
-    ReferenceRegionSummary, ReferenceStateWidening, discharge_positional_region_operation, discharge_preserved_access,
-    discharge_reference_free_operation,
-};
+pub use interpreter::{ReferenceRegionSummary, ReferenceStateWidening};
 pub use transform::{
     ExternalReferenceBinding, PartialReferenceDischargeResult, RecursiveReferenceDischargeDriver,
     ReferenceAccumulationPolicy, ReferenceDischargeAllocationId, ReferenceDischargeContext, ReferenceDischargeDriver,
     ReferenceDischargePolicy, ReferenceDischargeReference, ReferenceDischargeRegionBoundary,
     ReferenceDischargeRegionResult, ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceRegionStateInsertion, ReferenceSource,
+    discharge_positional_region_operation, discharge_reference_free_operation,
 };
 
 #[cfg(test)]

@@ -186,7 +186,7 @@ pub use programs::{
     ReplayRegionDriver, TakenReferenceGuard, Transform, TransformArtifact, TransformCache, Type, TypeError,
     TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature, TypeRefinements, Typed,
     ValidatedPendingReplacementTransaction, Value, ValueId, ValueProjection, discharge_positional_region_operation,
-    discharge_preserved_access, discharge_reference_free_operation, infer_projected_operation_output_types,
+    discharge_reference_free_operation, infer_projected_operation_output_types,
     infer_projected_operation_region_input_types,
 };
 pub use specialization::{

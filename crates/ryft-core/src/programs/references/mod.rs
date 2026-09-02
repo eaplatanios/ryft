@@ -178,8 +178,7 @@ pub use discharge::{
     ReferenceDischargePolicy, ReferenceDischargeReference, ReferenceDischargeRegionBoundary,
     ReferenceDischargeRegionResult, ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceRegionStateInsertion, ReferenceRegionSummary,
-    ReferenceSource, ReferenceStateWidening, discharge_positional_region_operation, discharge_preserved_access,
-    discharge_reference_free_operation,
+    ReferenceSource, ReferenceStateWidening, discharge_positional_region_operation, discharge_reference_free_operation,
 };
 pub use operations::{
     REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME,

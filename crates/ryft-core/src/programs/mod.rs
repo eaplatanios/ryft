@@ -163,7 +163,7 @@ pub use references::{
     ReferenceReplacementPreparation, ReferenceReplacementTransaction, ReferenceSource, ReferenceStateWidening,
     ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceTypeRefinements, ReferenceWrite,
     ReferenceWriteOperation, TakenReferenceGuard, ValidatedPendingReplacementTransaction,
-    discharge_positional_region_operation, discharge_preserved_access, discharge_reference_free_operation,
+    discharge_positional_region_operation, discharge_reference_free_operation,
 };
 pub use regions::{
     BindingRegionDriver, CalleeRegionDriver, DestinationRegionMapping, EagerInterpretationValidation,
