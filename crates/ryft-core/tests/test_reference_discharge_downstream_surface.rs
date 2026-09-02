@@ -661,7 +661,7 @@ fn test_downstream_region_summary_exposes_exact_access_modes() {
         .region_summary(&RegisterOperation::Call, 0, region.entry_region_ref(), &[Some(allocation), None])
         .unwrap();
 
-    assert_eq!(summary.accessed().collect::<Vec<_>>(), vec![allocation]);
+    assert_eq!(summary.accessed_allocations().collect::<Vec<_>>(), vec![allocation]);
     assert_eq!(
         summary.access_modes(allocation).collect::<Vec<_>>(),
         vec![ReferenceAccessMode::Read, ReferenceAccessMode::Write, ReferenceAccessMode::ReadWrite],

@@ -13,10 +13,7 @@ use crate::programs::ProgramError;
 use crate::programs::instructions::InstructionId;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
-use crate::programs::references::discharge::interpreter::{
-    ReferenceDischargeRegionSummary, ReferenceDischargeStateWidening, summarize_region_closure,
-    validate_region_accesses,
-};
+use crate::programs::references::discharge::interpreter::ReferenceDischargeRegionSummary;
 use crate::programs::references::types::ReferenceType;
 use crate::programs::regions::{
     EmptyRegionDriver, RegionDriver, RegionId, RegionRef, RegionReplayMappings, ReplayRegionDriver,
@@ -1182,6 +1179,49 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeRegionResult<V, O
             }
         }
         Ok(())
+    }
+}
+
+/// Widening facts that a structured reference discharge rule computes from a [`ReferenceDischargeRegionSummary`]
+/// through [`ReferenceDischargeContext::state_widening`], and that every symmetric structured rewrite shares. The
+/// threaded allocations are the discharged references that cross the rebuilt boundary as immutable state, the entering
+/// allocations gain added boundary positions because no declared position already carries them, and the published
+/// allocations are the threaded allocations whose final states the rebuilt regions must return. An entering preserved
+/// reference crosses at its added position as the destination reference it already denotes, so it belongs to neither
+/// the threaded nor the published set.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ReferenceDischargeStateWidening {
+    /// Refer to the documentation of [`Self::threaded`].
+    threaded: BTreeSet<ReferenceDischargeAllocationId>,
+
+    /// Refer to the documentation of [`Self::entering`].
+    entering: Vec<ReferenceDischargeAllocationId>,
+
+    /// Refer to the documentation of [`Self::published`].
+    published: Vec<ReferenceDischargeAllocationId>,
+}
+
+impl ReferenceDischargeStateWidening {
+    /// Returns the discharged allocations that the region closures reach and that therefore cross the rebuilt boundary
+    /// as immutable state, in canonical allocation order.
+    #[inline]
+    pub fn threaded(&self) -> &BTreeSet<ReferenceDischargeAllocationId> {
+        &self.threaded
+    }
+
+    /// Returns the reached allocations that gain added boundary positions because no declared position already carries
+    /// them, in canonical allocation order. A discharged allocation enters as immutable state and a preserved
+    /// allocation enters as its destination reference.
+    #[inline]
+    pub fn entering(&self) -> &[ReferenceDischargeAllocationId] {
+        self.entering.as_slice()
+    }
+
+    /// Returns the threaded allocations that some region closure mutates and whose final states the rebuilt regions
+    /// must therefore publish, in canonical allocation order.
+    #[inline]
+    pub fn published(&self) -> &[ReferenceDischargeAllocationId] {
+        self.published.as_slice()
     }
 }
 
@@ -2438,34 +2478,11 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         Ok(current)
     }
 
-    /// Summarizes the transitive reference accesses of a [`Region`](crate::Region) closure, in the terms of the caller
-    /// allocations its boundary names. A structured rule calls this before it can size its state boundary (i.e., which
-    /// allocations a region closure touches, and which of them it mutates, is exactly what decides how wide the
-    /// rewritten operation must be). The summary is computed entirely from generic hooks, namely operation-local
-    /// [`Operation::reference_semantics`], the region-provenance hooks, reference-output identity, and recursive
-    /// summaries of nested regions, so a third-party structured operation needs no companion declaration surface
-    /// to be summarized.
-    ///
-    /// The region's own capture scope is computed here rather than supplied, because whether a region establishes a
-    /// fresh capture prefix is stated by [`Operation::region_capture_input_count`] and is therefore knowledge the
-    /// summary can read off the operation itself. A rule never has to reason about captures.
-    ///
-    /// # Parameters
-    ///
-    ///   - `operation`: [`Operation`] the [`Region`](crate::Region) is attached to.
-    ///   - `region_index`: Position of the [`Region`](crate::Region) among that [`Operation`]'s attached regions.
-    ///   - `region`: [`Region`](crate::Region) whose closure is summarized.
-    ///   - `inputs`: Caller allocation denoted by each of the region's declared inputs, in boundary order, with
-    ///     [`None`] wherever the position carries a value.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::MalformedProgram`] when `inputs` does not describe the region's boundary, when the
-    /// operation declares a capture prefix longer than the region's boundary, when a reference-typed nested boundary
-    /// position declares no provenance the summary could follow, when the closure reaches a reference that entered
-    /// neither through its boundary nor through its capture scope, or when the closure consumes a caller allocation,
-    /// which no state boundary can express. It also returns this error when `operation` does not permit one of the
-    /// exact access modes the closure performs through `region_index`.
+    /// Summarizes the transitive reference accesses of a [`Region`](crate::Region) closure under this context's capture
+    /// scope, in the terms of the caller allocations its boundary names. A structured rule calls this before it can
+    /// size its state boundary. Refer to the documentation of [`ReferenceDischargeRegionSummary::new`] for the
+    /// analysis, its parameters, and its errors.
+    #[inline]
     pub fn region_summary<O: Operation>(
         &self,
         operation: &O,
@@ -2473,13 +2490,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         region: RegionRef<'_, C::Constant, C::Operation>,
         inputs: &[Option<ReferenceDischargeAllocationId>],
     ) -> Result<ReferenceDischargeRegionSummary, ProgramError> {
-        let captures =
-            self.captures()
-                .nested_scope(operation.region_capture_input_count(region_index), inputs, region.id())?;
-        let mut summary = ReferenceDischargeRegionSummary::default();
-        summarize_region_closure(region, inputs, &captures, &mut summary)?;
-        validate_region_accesses(operation, region_index, &summary)?;
-        Ok(summary)
+        ReferenceDischargeRegionSummary::new(operation, region_index, region, inputs, self.captures())
     }
 
     // TODO(eaplatanios): Review this.
@@ -2550,12 +2561,12 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         declared: &BTreeSet<ReferenceDischargeAllocationId>,
     ) -> Result<ReferenceDischargeStateWidening, ProgramError> {
         let mut threaded = BTreeSet::new();
-        for allocation in summary.reached() {
+        for allocation in summary.reached_allocations() {
             if self.is_allocation_discharged(allocation)? {
                 threaded.insert(allocation);
             }
         }
-        let entering = summary.reached().filter(|allocation| !declared.contains(allocation)).collect();
+        let entering = summary.reached_allocations().filter(|allocation| !declared.contains(allocation)).collect();
         let published = threaded.iter().copied().filter(|allocation| summary.is_mutated(*allocation)).collect();
         Ok(ReferenceDischargeStateWidening { threaded, entering, published })
     }
@@ -3672,7 +3683,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeSet, HashMap, HashSet};
 
     use indoc::indoc;
     use pretty_assertions::assert_eq;
@@ -3737,6 +3748,23 @@ mod tests {
             .build::<Vec<ListCapture>, Vec<ListCapture>>(vec![observed], Vec::<Placeholder>::new(), vec![Placeholder])
             .unwrap();
         ClosedProgram::new(source, vec![ListIrValue::Reference(reference_type)]).unwrap()
+    }
+
+    /// Builds a region that writes its first reference input, reads its second and third, and returns the third's
+    /// snapshot as a value, so that its summary records one mutated and two read-only caller allocations.
+    fn list_region_writing_one_and_reading_two_references()
+    -> Program<ListIrValue, ListOperation, Vec<ListIrValue>, Vec<ListIrValue>> {
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let written = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
+        let observed = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
+        let forwarded = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
+        let update = builder.add_input(ListIrType::List(ListType { length: 2 }));
+        builder.add_instruction(ListOperation::Write, Vec::new(), vec![written, update], None).unwrap();
+        builder.add_instruction(ListOperation::Read, Vec::new(), vec![observed], None).unwrap();
+        let snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![forwarded], None).unwrap()[0];
+        builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![snapshot], vec![Placeholder; 4], vec![Placeholder])
+            .unwrap()
     }
 
     #[test]
@@ -4865,7 +4893,7 @@ mod tests {
 
         // The summary reports the capture-scoped access in caller-allocation terms, which is what sizes the boundary.
         let summary = context.region_summary(&ListOperation::Call, 0, program.entry_region_ref(), &[]).unwrap();
-        assert_eq!(summary.accessed().collect::<Vec<_>>(), vec![allocation]);
+        assert_eq!(summary.accessed_allocations().collect::<Vec<_>>(), vec![allocation]);
         assert!(!summary.is_mutated(allocation));
         assert_eq!(summary.output_allocations(), &[None]);
 
@@ -5347,6 +5375,221 @@ mod tests {
         assert_eq!(context.set_discharged_state(allocation, wrong_state, true), Err(error));
         assert_eq!(context.read(reference), Ok(ListIrValue::List(vec![3, 4])));
         assert_eq!(context.is_mutated(allocation), Ok(false));
+    }
+
+    #[test]
+    fn test_reference_discharge_context_region_summary() {
+        // The region writes the first caller allocation, reads the other two, and returns the third one's snapshot as
+        // a value, so the summary records one mutated and two read-only allocations and no reference-typed output.
+        let region = list_region_writing_one_and_reading_two_references();
+        let context = ListDischargeContext::new(ListDestination::new());
+        let reference_type = ReferenceType::new(ListType { length: 2 });
+        let written = context.bind_discharged(reference_type.clone(), ListIrValue::List(vec![1, 2])).unwrap();
+        let written = written.try_as_reference("the written allocation").unwrap().allocation_id();
+        let observed = context
+            .bind_preserved(reference_type.clone(), ListIrValue::Reference(reference_type.clone()))
+            .unwrap();
+        let observed = observed.try_as_reference("the observed allocation").unwrap().allocation_id();
+        let forwarded = context.bind_discharged(reference_type, ListIrValue::List(vec![5, 6])).unwrap();
+        let forwarded = forwarded.try_as_reference("the forwarded allocation").unwrap().allocation_id();
+        let inputs = [Some(written), Some(observed), Some(forwarded), None];
+        let summary = context.region_summary(&ListOperation::Call, 0, region.entry_region_ref(), &inputs).unwrap();
+        assert_eq!(summary.reached_allocations().collect::<Vec<_>>(), vec![written, observed, forwarded]);
+        assert_eq!(summary.accessed_allocations().collect::<Vec<_>>(), vec![written, observed, forwarded]);
+        assert_eq!(summary.access_modes(written).collect::<Vec<_>>(), vec![ReferenceAccessMode::Write]);
+        assert_eq!(summary.access_modes(observed).collect::<Vec<_>>(), vec![ReferenceAccessMode::Read]);
+        assert!(summary.is_mutated(written));
+        assert!(!summary.is_mutated(forwarded));
+        assert_eq!(summary.output_allocations(), &[None]);
+
+        // The owning operation's region access policy is enforced against the summary.
+        assert_eq!(
+            context.region_summary(
+                &SingleModeRegionOperation(ReferenceAccessMode::Read),
+                0,
+                region.entry_region_ref(),
+                &inputs,
+            ),
+            Err(ProgramError::MalformedProgram(format!(
+                "operation `test.single_mode_region` does not allow region 0 to access {written} with mode `{}`",
+                ReferenceAccessMode::Write,
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_reference_discharge_context_operand_allocation() {
+        let context = ListDischargeContext::new(ListDestination::new());
+        let reference_type = ReferenceType::new(ListType { length: 2 });
+
+        // A value input denotes no allocation, while discharged and preserved references denote theirs alike.
+        let value = ReferenceDischargeValue::Value(ListIrValue::List(vec![1, 2]));
+        assert_eq!(context.operand_allocation(&value, "list.call"), Ok(None));
+        let discharged = context.bind_discharged(reference_type.clone(), ListIrValue::List(vec![1, 2])).unwrap();
+        let discharged_reference = discharged.try_as_reference("the discharged allocation").unwrap();
+        let discharged_allocation = discharged_reference.allocation_id();
+        assert_eq!(context.operand_allocation(&discharged, "list.call"), Ok(Some(discharged_allocation)));
+        let preserved = context
+            .bind_preserved(reference_type.clone(), ListIrValue::Reference(reference_type.clone()))
+            .unwrap();
+        let preserved_allocation = preserved.try_as_reference("the preserved allocation").unwrap().allocation_id();
+        assert_eq!(context.operand_allocation(&preserved, "list.call"), Ok(Some(preserved_allocation)));
+
+        // A view cannot cross a region boundary, because the boundary carries the complete stored value.
+        let view = context
+            .alias_reference(
+                discharged_reference,
+                ListAlias { offset: 0, length: 1 },
+                ReferenceType::new(ListType { length: 1 }),
+                |_| unreachable!("the allocation is discharged"),
+            )
+            .unwrap();
+        assert_eq!(
+            context.operand_allocation(&view, "list.call"),
+            Err(ProgramError::MalformedProgram(format!(
+                "operation `list.call` passes the view `ref<list<1>>` of {discharged_allocation} across a region \
+                 boundary, which carries the complete stored value `ref<list<2>>`; create the view inside the region \
+                 instead",
+            ))),
+        );
+
+        // A consumed allocation is no longer live.
+        context.consume(discharged_reference).unwrap();
+        assert_eq!(
+            context.operand_allocation(&discharged, "list.call"),
+            Err(ProgramError::MalformedProgram(format!(
+                "reference discharge accessed consumed {discharged_allocation}"
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_reference_discharge_context_state_widening() {
+        let region = list_region_writing_one_and_reading_two_references();
+        let context = ListDischargeContext::new(ListDestination::new());
+        let reference_type = ReferenceType::new(ListType { length: 2 });
+        let written = context.bind_discharged(reference_type.clone(), ListIrValue::List(vec![1, 2])).unwrap();
+        let written = written.try_as_reference("the written allocation").unwrap().allocation_id();
+        let observed = context
+            .bind_preserved(reference_type.clone(), ListIrValue::Reference(reference_type.clone()))
+            .unwrap();
+        let observed = observed.try_as_reference("the observed allocation").unwrap().allocation_id();
+        let forwarded = context.bind_discharged(reference_type, ListIrValue::List(vec![5, 6])).unwrap();
+        let forwarded_reference = forwarded.try_as_reference("the forwarded allocation").unwrap();
+        let forwarded = forwarded_reference.allocation_id();
+        let inputs = [Some(written), Some(observed), Some(forwarded), None];
+        let summary = context.region_summary(&ListOperation::Call, 0, region.entry_region_ref(), &inputs).unwrap();
+
+        // Only discharged allocations are threaded as state and only the mutated one is published, while every reached
+        // allocation that no declared position already carries enters, whether discharged or preserved.
+        let widening = context.state_widening(&summary, &BTreeSet::from([written])).unwrap();
+        assert_eq!(widening.threaded(), &BTreeSet::from([written, forwarded]));
+        assert_eq!(widening.entering(), &[observed, forwarded]);
+        assert_eq!(widening.published(), &[written]);
+        let widening = context.state_widening(&summary, &BTreeSet::new()).unwrap();
+        assert_eq!(widening.entering(), &[written, observed, forwarded]);
+
+        // A reached allocation that is no longer live propagates the environment's own reason.
+        context.consume(forwarded_reference).unwrap();
+        assert_eq!(
+            context.state_widening(&summary, &BTreeSet::new()),
+            Err(ProgramError::MalformedProgram(format!("reference discharge accessed consumed {forwarded}"))),
+        );
+    }
+
+    #[test]
+    fn test_reference_discharge_context_operand_value() {
+        let context = ListDischargeContext::new(ListDestination::new());
+        let reference_type = ReferenceType::new(ListType { length: 2 });
+
+        // A value input contributes itself.
+        let value = ReferenceDischargeValue::Value(ListIrValue::List(vec![7, 8]));
+        assert_eq!(context.operand_value(&value), Ok(ListIrValue::List(vec![7, 8])));
+
+        // A discharged reference contributes its current state, so a write is observed.
+        let discharged = context.bind_discharged(reference_type.clone(), ListIrValue::List(vec![1, 2])).unwrap();
+        let discharged_reference = discharged.try_as_reference("the discharged allocation").unwrap();
+        assert_eq!(context.operand_value(&discharged), Ok(ListIrValue::List(vec![1, 2])));
+        context.write(discharged_reference, ListIrValue::List(vec![3, 4])).unwrap();
+        assert_eq!(context.operand_value(&discharged), Ok(ListIrValue::List(vec![3, 4])));
+
+        // A preserved reference contributes its destination reference.
+        let destination_reference = ListIrValue::Reference(reference_type.clone());
+        let preserved = context.bind_preserved(reference_type, destination_reference.clone()).unwrap();
+        assert_eq!(context.operand_value(&preserved), Ok(destination_reference));
+
+        // A consumed allocation is rejected.
+        let discharged_allocation = discharged_reference.allocation_id();
+        context.consume(discharged_reference).unwrap();
+        assert_eq!(
+            context.operand_value(&discharged),
+            Err(ProgramError::MalformedProgram(format!(
+                "reference discharge accessed consumed {discharged_allocation}"
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_reference_discharge_context_allocation_value() {
+        let context = ListDischargeContext::new(ListDestination::new());
+        let reference_type = ReferenceType::new(ListType { length: 2 });
+
+        // A discharged allocation contributes its current state and a preserved one its destination reference.
+        let discharged = context.bind_discharged(reference_type.clone(), ListIrValue::List(vec![1, 2])).unwrap();
+        let discharged_reference = discharged.try_as_reference("the discharged allocation").unwrap();
+        let discharged_allocation = discharged_reference.allocation_id();
+        assert_eq!(context.allocation_value(discharged_allocation), Ok(ListIrValue::List(vec![1, 2])));
+        let destination_reference = ListIrValue::Reference(reference_type.clone());
+        let preserved = context.bind_preserved(reference_type, destination_reference.clone()).unwrap();
+        let preserved_allocation = preserved.try_as_reference("the preserved allocation").unwrap().allocation_id();
+        assert_eq!(context.allocation_value(preserved_allocation), Ok(destination_reference));
+
+        // A consumed allocation is rejected.
+        context.consume(discharged_reference).unwrap();
+        assert_eq!(
+            context.allocation_value(discharged_allocation),
+            Err(ProgramError::MalformedProgram(format!(
+                "reference discharge accessed consumed {discharged_allocation}"
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_reference_discharge_context_merge_boundary_state() {
+        let region = list_region_writing_one_and_reading_two_references();
+        let context = ListDischargeContext::new(ListDestination::new());
+        let reference_type = ReferenceType::new(ListType { length: 2 });
+        let written = context.bind_discharged(reference_type.clone(), ListIrValue::List(vec![1, 2])).unwrap();
+        let written = written.try_as_reference("the written allocation").unwrap().allocation_id();
+        let observed = context
+            .bind_preserved(reference_type.clone(), ListIrValue::Reference(reference_type.clone()))
+            .unwrap();
+        let observed = observed.try_as_reference("the observed allocation").unwrap().allocation_id();
+        let forwarded = context.bind_discharged(reference_type, ListIrValue::List(vec![5, 6])).unwrap();
+        let forwarded = forwarded.try_as_reference("the forwarded allocation").unwrap().allocation_id();
+        let inputs = [Some(written), Some(observed), Some(forwarded), None];
+        let summary = context.region_summary(&ListOperation::Call, 0, region.entry_region_ref(), &inputs).unwrap();
+        let threaded = BTreeSet::from([written, forwarded]);
+
+        // A threaded allocation the summary reports as mutated receives the successor state and is marked mutated,
+        // while a threaded read-only allocation receives its successor without being marked.
+        assert_eq!(context.merge_boundary_state(&summary, &threaded, written, ListIrValue::List(vec![9, 9])), Ok(()));
+        assert_eq!(context.discharged_state(written), Ok(ListIrValue::List(vec![9, 9])));
+        assert_eq!(context.is_mutated(written), Ok(true));
+        assert_eq!(context.merge_boundary_state(&summary, &threaded, forwarded, ListIrValue::List(vec![5, 6])), Ok(()));
+        assert_eq!(context.is_mutated(forwarded), Ok(false));
+
+        // An allocation outside the threaded set returned itself as a reference, so there is no successor to merge.
+        assert_eq!(context.merge_boundary_state(&summary, &threaded, observed, ListIrValue::List(vec![0, 0])), Ok(()));
+
+        // A successor of the wrong type is rejected by the underlying state replacement.
+        assert_eq!(
+            context.merge_boundary_state(&summary, &threaded, written, ListIrValue::List(vec![1])),
+            Err(ProgramError::MalformedProgram(
+                "reference discharge state has type `list<1>` but allocation `ref<list<2>>` requires `list<2>`"
+                    .to_string(),
+            )),
+        );
     }
 
     #[test]

@@ -11,9 +11,9 @@ new runnable examples. For deeper code, documentation, and testing conventions, 
   this up automatically.
 - **Platform / accelerator toolchains:** these are only required if you are building the corresponding
   backend. See the per-crate READMEs for details:
-  - [`crates/ryft-xla-sys/README.md`](crates/ryft-xla-sys/README.md) — XLA artifacts and supported
-    platforms.
+  - [`crates/ryft-xla-sys/README.md`](crates/ryft-xla-sys/README.md) — XLA artifacts and supported platforms.
   - [`crates/ryft-pjrt/README.md`](crates/ryft-pjrt/README.md) — PJRT bindings.
+  - [`crates/ryft-cuda/README.md`](crates/ryft-cuda/README.md) — CUDA bindings and launch runtime.
   - [`crates/ryft-mlir/README.md`](crates/ryft-mlir/README.md) — MLIR bindings.
 - **Node.js 20+ and npm:** required if you are working on the marketing surface of the
   documentation site (the Astro project under [`docs/`](docs/)).

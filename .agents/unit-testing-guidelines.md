@@ -7,8 +7,11 @@ Use this file as the single detailed reference for `ryft` testing conventions.
 - Keep unit tests colocated in the owning module under `#[cfg(test)] mod tests`. Make colocated module tests primarily
   cover behavior implemented in that module; move incidental downstream behavior coverage to the operation, transform,
   or helper module that owns it.
-- Do not attach rustdoc comments to private unit-test functions. Put explanatory comments inside the test body so they
-  describe the setup and assertions where readers encounter them.
+- Order a module's unit tests by the production API surface they cover, following the production definitions' order.
+  Give each public function a primary test named `test_<owning_type>_<function>` (e.g.,
+  `test_program_discharge_references`). Place additional edge-case tests immediately after that primary test and suffix
+  their names with the behavior they cover. Do not replace API-oriented primary tests with broad scenario-oriented
+  tests, and do not combine several public functions into one test merely because they share setup.
 - Cover every new or changed behavior with deterministic tests and explicit assertions.
 - Name unit tests with a `test_...` prefix.
 - Use `pretty_assertions::assert_eq` when comparing rendered strings or structured values where readable diffs matter.

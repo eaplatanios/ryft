@@ -15,6 +15,8 @@ crate is an umbrella crate that re-exports functionality from a few different cr
 - **`ryft-macros`:** Procedural macros used by `ryft` and `ryft-core` (e.g., parameter-related derivation macros).
 - **Backends:**
   - **`ryft-xla`:** XLA backend for `ryft`.
+- **Runtimes:**
+  - **`ryft-cuda`:** Provides support for CUDA artifact loading, typed kernel launching, and module caching.
 - **Bindings:**
   - **`ryft-mlir`:** High-level, ownership-aware Rust bindings for MLIR and MLIR dialects used by XLA tooling.
   - **`ryft-pjrt`:** High-level, ownership-aware Rust bindings for PJRT plugins, clients, buffers, and programs.
@@ -31,6 +33,8 @@ platform/runtime requirements, and artifact-loading behavior, refer to:
   and for instructions on how to configure for obtaining pre-built binaries for supported platforms.
 - **[`crates/ryft-pjrt/README.md`](crates/ryft-pjrt/README.md):** Reference for our PJRT bindings.
 - **[`crates/ryft-mlir/README.md`](crates/ryft-mlir/README.md):** Reference for our MLIR bindings.
+- **[`crates/ryft-cuda/README.md`](crates/ryft-cuda/README.md):** Reference for CUDA loading, typed kernel launching,
+  and module caching.
 
 ## **Example:** Low-Level StableHLO Matrix Multiplication
 
