@@ -151,6 +151,9 @@ where
         .collect()
 }
 
+// TODO(eaplatanios): Restore the strict `Operation<Type = C::Type>` super-trait bound once the next-generation trait
+//  solver stabilizes. The current solver cannot discharge this projection equality at implementation heads whose
+//  context type is built from `Self` (E0284); the equality is enforced per method through `where` clauses instead.
 /// Represents [`Operation`]s that can be discharged (i.e., rewritten so that the references they touch become
 /// explicit immutable state).
 ///
@@ -181,9 +184,12 @@ where
 /// uses, and higher-order rules request nested work through their driver rather than carrying a bound stating that
 /// their own operation family is dischargeable, which is what keeps an operation enum's bound graph finite.
 ///
-/// The super-trait is a plain [`Operation`] rather than `Operation<Type = C::Type>`, with the equality required per
-/// function instead, matching [`BatchableOperation`](crate::BatchableOperation): the current trait solver cannot
-/// discharge that projection equality at implementation heads whose context type is built from `Self`.
+/// The super-trait is a plain [`Operation`] rather than `Operation<Type = C::Type>` because the current trait solver
+/// cannot discharge that projection equality at implementation heads whose reference discharge context is itself built
+/// from `Self`. The equality is instead required per method through `where Self: Operation<Type = C::Type>`, so a
+/// payload whose [`Operation::Type`] disagrees with `C::Type` cannot be batched in `C`: the requirement is restated by
+/// the derived dispatcher's per-payload predicates and by the generic projected-discharge helpers, and any mismatched
+/// payload is rejected with a type-mismatch error at its use site.
 pub trait ReferenceDischargeableOperation<C: Domain, P: ReferenceDischargePolicy<C>>: Operation {
     /// Rewrites this operation application so that the references it touches become explicit immutable state, and
     /// returns the carriers its outputs produce.
