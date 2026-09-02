@@ -4626,6 +4626,71 @@ mod tests {
         assert_eq!(result.mutated_allocations(), [accessed]);
         assert_eq!(result.output_allocations(), &[None]);
     }
+
+    #[test]
+    fn test_reference_dischargeable_operation_discharge_references() {
+        // A region-free application has no source instruction, so an allocation rule sees `None` and treats the
+        // allocation as unconditionally discharged.
+        let context = ListDischargeContext::new(ListDestination::new());
+        let input = ReferenceDischargeValue::Value(ListIrValue::List(vec![1, 2]));
+        let driver = RecursiveReferenceDischargeDriver::new(&EmptyRegionDriver, None);
+
+        OBSERVED_ALLOCATION_POSITIONS.with_borrow_mut(Vec::clear);
+        ListOperation::ReferenceNew.discharge_references(&context, &driver, &[input]).unwrap();
+        assert_eq!(OBSERVED_ALLOCATION_POSITIONS.with_borrow(Vec::clone), vec![None]);
+    }
+
+    #[test]
+    fn test_reference_dischargeable_operation_discharge_references_threads_state_through_replayed_program() {
+        // The program allocates one local reference, creates a composed view, accumulates into that view, replaces it,
+        // adds the replaced and current selections, and finally freezes the complete stored value.
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let initial = builder.add_input(ListIrType::List(ListType { length: 4 }));
+        let allocation =
+            builder.add_instruction(ListOperation::ReferenceNew, Vec::new(), vec![initial], None).unwrap()[0];
+        let view = builder
+            .add_instruction(ListOperation::Slice { offset: 1, length: 2 }, Vec::new(), vec![allocation], None)
+            .unwrap()[0];
+        let update = builder.add_constant(ListIrValue::List(vec![10, 20]));
+        builder.add_instruction(ListOperation::AddUpdate, Vec::new(), vec![view, update], None).unwrap();
+        let replacement = builder.add_constant(ListIrValue::List(vec![7, 8]));
+        builder.add_instruction(ListOperation::Write, Vec::new(), vec![view, replacement], None).unwrap();
+        let replaced =
+            builder.add_instruction(ListOperation::Swap, Vec::new(), vec![view, replacement], None).unwrap()[0];
+        let snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![view], None).unwrap()[0];
+        let total = builder.add_instruction(ListOperation::Add, Vec::new(), vec![replaced, snapshot], None).unwrap()[0];
+        let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![allocation], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![total, frozen], vec![Placeholder], vec![Placeholder; 2])
+            .unwrap();
+
+        // Replaying the program through the region driver rewrites every reference primitive into explicit state
+        // threading, so the outputs are the values an eager reference execution would have produced.
+        OBSERVED_ALLOCATION_POSITIONS.with_borrow_mut(Vec::clear);
+        let context = ListDischargeContext::new(ListDestination::new());
+        let input = ReferenceDischargeValue::Value(ListIrValue::List(vec![1, 2, 3, 4]));
+        let regions = [program];
+        let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
+        let outputs = driver.inline_region(&context, 0, vec![input]).unwrap();
+        assert_eq!(
+            outputs,
+            vec![
+                ReferenceDischargeValue::Value(ListIrValue::List(vec![14, 16])),
+                ReferenceDischargeValue::Value(ListIrValue::List(vec![1, 7, 8, 4])),
+            ],
+        );
+
+        // Every allocation the program created is gone once its `freeze` consumed it, so nothing leaks into the
+        // context.
+        assert_eq!(context.live_allocation_ids(), Vec::new());
+
+        // Replaying through the driver supplies every instruction's source program location, which makes the
+        // allocation selectable by a partial-discharge target.
+        let observed = OBSERVED_ALLOCATION_POSITIONS.with_borrow(Vec::clone);
+        assert_eq!(observed.len(), 1);
+        assert!(observed[0].is_some());
+    }
+
     #[test]
     fn test_reference_discharge_context_bind_discharged() {
         let context = ListDischargeContext::new(ListDestination::new());
