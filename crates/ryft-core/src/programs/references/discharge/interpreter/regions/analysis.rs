@@ -25,7 +25,7 @@ use crate::programs::values::Value;
 /// The summary separates reachability from semantic access. The reached set holds every caller allocation the
 /// closure's replay must be able to resolve, including a capture constant that is only rematerialized and passed
 /// along, and is what sizes the state boundary through
-/// [`state_widening`](crate::programs::references::ReferenceDischargeContext::state_widening).
+/// [`boundary_widening`](crate::programs::references::ReferenceDischargeContext::boundary_widening).
 /// [`accessed_allocations`](Self::accessed_allocations) and [`access_modes`](Self::access_modes) hold only the
 /// allocations the closure semantically accesses, which is what region access policies validate. Sizing a boundary
 /// from the accessed allocations would under-thread merely-forwarded captures.
@@ -663,7 +663,7 @@ mod tests {
         assert_eq!(summary.access_modes(allocation).collect::<Vec<_>>(), Vec::<ReferenceAccessMode>::new());
         assert!(!summary.is_mutated(allocation));
         assert_eq!(
-            context.state_widening(&summary, &BTreeSet::new()).unwrap().threaded(),
+            context.boundary_widening(&summary, &BTreeSet::new()).unwrap().threaded(),
             &BTreeSet::from([allocation]),
         );
 
@@ -715,7 +715,7 @@ mod tests {
                 &[None],
             )
             .unwrap();
-        let widening = preserved_context.state_widening(&preserved_summary, &BTreeSet::new()).unwrap();
+        let widening = preserved_context.boundary_widening(&preserved_summary, &BTreeSet::new()).unwrap();
         assert_eq!(widening.threaded(), &BTreeSet::new());
         assert_eq!(widening.entering(), &[preserved_allocation]);
         assert_eq!(widening.published(), &[]);

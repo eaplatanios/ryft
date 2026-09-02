@@ -1183,14 +1183,14 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeRegionResult<V, O
 }
 
 /// Widening facts that a structured reference discharge rule computes from a [`ReferenceDischargeRegionSummary`]
-/// through [`ReferenceDischargeContext::state_widening`], and that every symmetric structured rewrite shares. The
+/// through [`ReferenceDischargeContext::boundary_widening`], and that every symmetric structured rewrite shares. The
 /// threaded allocations are the discharged references that cross the rebuilt boundary as immutable state, the entering
 /// allocations gain added boundary positions because no declared position already carries them, and the published
 /// allocations are the threaded allocations whose final states the rebuilt regions must return. An entering preserved
 /// reference crosses at its added position as the destination reference it already denotes, so it belongs to neither
 /// the threaded nor the published set.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReferenceDischargeStateWidening {
+pub struct ReferenceDischargeBoundaryWidening {
     /// Refer to the documentation of [`Self::threaded`].
     threaded: BTreeSet<ReferenceDischargeAllocationId>,
 
@@ -1201,7 +1201,7 @@ pub struct ReferenceDischargeStateWidening {
     published: Vec<ReferenceDischargeAllocationId>,
 }
 
-impl ReferenceDischargeStateWidening {
+impl ReferenceDischargeBoundaryWidening {
     /// Returns the discharged allocations that the region closures reach and that therefore cross the rebuilt boundary
     /// as immutable state, in canonical allocation order.
     #[inline]
@@ -2494,6 +2494,45 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     }
 
     // TODO(eaplatanios): Review this.
+    /// Computes the symmetric widening facts one structured rule needs from a region summary: the discharged
+    /// allocations threaded as state, every reached allocation gaining an added boundary position because no declared
+    /// position already carries it, and the discharged subset whose successor states the rebuilt regions must publish.
+    ///
+    /// A closure needs an allocation threaded whenever its replay must be able to resolve that allocation, because it
+    /// accesses it, returns it, or merely rematerializes a capture constant that denotes it. The threaded set is
+    /// therefore the summary's reached allocations with the preserved allocations removed. A preserved reference
+    /// survives in the destination as a reference value and crosses at its own declared input position, or at an
+    /// added position as the destination reference it already denotes, exactly as the source passed it, so it needs no
+    /// state carry, publishes no successor, and widens nothing. This is the one place that distinction is drawn, which
+    /// is what keeps the structured rewrites stating one thing.
+    ///
+    /// # Parameters
+    ///
+    ///   - `summary`: Summary of the closures the rewritten operation attaches, in caller-allocation terms.
+    ///   - `declared`: Allocations already crossing at declared boundary positions, which therefore need no added
+    ///     position.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the environment's error for the first reached allocation that is not live, which states whether the
+    /// allocation was consumed, was never bound, or belongs to another environment.
+    pub fn boundary_widening(
+        &self,
+        summary: &ReferenceDischargeRegionSummary,
+        declared: &BTreeSet<ReferenceDischargeAllocationId>,
+    ) -> Result<ReferenceDischargeBoundaryWidening, ProgramError> {
+        let mut threaded = BTreeSet::new();
+        for allocation in summary.reached_allocations() {
+            if self.is_allocation_discharged(allocation)? {
+                threaded.insert(allocation);
+            }
+        }
+        let entering = summary.reached_allocations().filter(|allocation| !declared.contains(allocation)).collect();
+        let published = threaded.iter().copied().filter(|allocation| summary.is_mutated(*allocation)).collect();
+        Ok(ReferenceDischargeBoundaryWidening { threaded, entering, published })
+    }
+
+    // TODO(eaplatanios): Review this.
     /// Returns the allocation one input of a structured operation denotes, or [`None`] when the input is a value.
     ///
     /// A view is rejected rather than resolved to its allocation because a state boundary carries the allocation's
@@ -2501,7 +2540,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     ///
     /// A preserved allocation is resolved like any other. It crosses the boundary as the reference it already is, at
     /// its own declared input position, so it needs no state carry at all, which is exactly what
-    /// [`state_widening`](Self::state_widening) leaves it out of.
+    /// [`boundary_widening`](Self::boundary_widening) leaves it out of.
     ///
     /// # Parameters
     ///
@@ -2530,45 +2569,6 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
             )));
         }
         Ok(Some(allocation))
-    }
-
-    // TODO(eaplatanios): Review this.
-    /// Computes the symmetric widening facts one structured rule needs from a region summary: the discharged
-    /// allocations threaded as state, every reached allocation gaining an added boundary position because no declared
-    /// position already carries it, and the discharged subset whose successor states the rebuilt regions must publish.
-    ///
-    /// A closure needs an allocation threaded whenever its replay must be able to resolve that allocation, because it
-    /// accesses it, returns it, or merely rematerializes a capture constant that denotes it. The threaded set is
-    /// therefore the summary's reached allocations with the preserved allocations removed. A preserved reference
-    /// survives in the destination as a reference value and crosses at its own declared input position, or at an
-    /// added position as the destination reference it already denotes, exactly as the source passed it, so it needs no
-    /// state carry, publishes no successor, and widens nothing. This is the one place that distinction is drawn, which
-    /// is what keeps the structured rewrites stating one thing.
-    ///
-    /// # Parameters
-    ///
-    ///   - `summary`: Summary of the closures the rewritten operation attaches, in caller-allocation terms.
-    ///   - `declared`: Allocations already crossing at declared boundary positions, which therefore need no added
-    ///     position.
-    ///
-    /// # Errors
-    ///
-    /// Propagates the environment's error for the first reached allocation that is not live, which states whether the
-    /// allocation was consumed, was never bound, or belongs to another environment.
-    pub fn state_widening(
-        &self,
-        summary: &ReferenceDischargeRegionSummary,
-        declared: &BTreeSet<ReferenceDischargeAllocationId>,
-    ) -> Result<ReferenceDischargeStateWidening, ProgramError> {
-        let mut threaded = BTreeSet::new();
-        for allocation in summary.reached_allocations() {
-            if self.is_allocation_discharged(allocation)? {
-                threaded.insert(allocation);
-            }
-        }
-        let entering = summary.reached_allocations().filter(|allocation| !declared.contains(allocation)).collect();
-        let published = threaded.iter().copied().filter(|allocation| summary.is_mutated(*allocation)).collect();
-        Ok(ReferenceDischargeStateWidening { threaded, entering, published })
     }
 
     // TODO(eaplatanios): Review this.
@@ -3613,7 +3613,7 @@ where
     // that output position, so only a mutated state allocation absent from the declared outputs leaves through an
     // added output. The complete published set is what the rebuilt regions are held to.
     let forwarded_allocation_set = forwarded_allocations.iter().copied().flatten().collect::<BTreeSet<_>>();
-    let widening = context.state_widening(&summary, &forwarded_allocation_set)?;
+    let widening = context.boundary_widening(&summary, &forwarded_allocation_set)?;
     let entering = widening.entering();
     let represented = summary.output_allocations().iter().copied().flatten().collect::<BTreeSet<_>>();
     let leaving = widening
@@ -5418,6 +5418,40 @@ mod tests {
     }
 
     #[test]
+    fn test_reference_discharge_context_boundary_widening() {
+        let region = list_region_writing_one_and_reading_two_references();
+        let context = ListDischargeContext::new(ListDestination::new());
+        let reference_type = ReferenceType::new(ListType { length: 2 });
+        let written = context.bind_discharged(reference_type.clone(), ListIrValue::List(vec![1, 2])).unwrap();
+        let written = written.try_as_reference("the written allocation").unwrap().allocation_id();
+        let observed = context
+            .bind_preserved(reference_type.clone(), ListIrValue::Reference(reference_type.clone()))
+            .unwrap();
+        let observed = observed.try_as_reference("the observed allocation").unwrap().allocation_id();
+        let forwarded = context.bind_discharged(reference_type, ListIrValue::List(vec![5, 6])).unwrap();
+        let forwarded_reference = forwarded.try_as_reference("the forwarded allocation").unwrap();
+        let forwarded = forwarded_reference.allocation_id();
+        let inputs = [Some(written), Some(observed), Some(forwarded), None];
+        let summary = context.region_summary(&ListOperation::Call, 0, region.entry_region_ref(), &inputs).unwrap();
+
+        // Only discharged allocations are threaded as state and only the mutated one is published, while every reached
+        // allocation that no declared position already carries enters, whether discharged or preserved.
+        let widening = context.boundary_widening(&summary, &BTreeSet::from([written])).unwrap();
+        assert_eq!(widening.threaded(), &BTreeSet::from([written, forwarded]));
+        assert_eq!(widening.entering(), &[observed, forwarded]);
+        assert_eq!(widening.published(), &[written]);
+        let widening = context.boundary_widening(&summary, &BTreeSet::new()).unwrap();
+        assert_eq!(widening.entering(), &[written, observed, forwarded]);
+
+        // A reached allocation that is no longer live propagates the environment's own reason.
+        context.consume(forwarded_reference).unwrap();
+        assert_eq!(
+            context.boundary_widening(&summary, &BTreeSet::new()),
+            Err(ProgramError::MalformedProgram(format!("reference discharge accessed consumed {forwarded}"))),
+        );
+    }
+
+    #[test]
     fn test_reference_discharge_context_operand_allocation() {
         let context = ListDischargeContext::new(ListDestination::new());
         let reference_type = ReferenceType::new(ListType { length: 2 });
@@ -5460,40 +5494,6 @@ mod tests {
             Err(ProgramError::MalformedProgram(format!(
                 "reference discharge accessed consumed {discharged_allocation}"
             ))),
-        );
-    }
-
-    #[test]
-    fn test_reference_discharge_context_state_widening() {
-        let region = list_region_writing_one_and_reading_two_references();
-        let context = ListDischargeContext::new(ListDestination::new());
-        let reference_type = ReferenceType::new(ListType { length: 2 });
-        let written = context.bind_discharged(reference_type.clone(), ListIrValue::List(vec![1, 2])).unwrap();
-        let written = written.try_as_reference("the written allocation").unwrap().allocation_id();
-        let observed = context
-            .bind_preserved(reference_type.clone(), ListIrValue::Reference(reference_type.clone()))
-            .unwrap();
-        let observed = observed.try_as_reference("the observed allocation").unwrap().allocation_id();
-        let forwarded = context.bind_discharged(reference_type, ListIrValue::List(vec![5, 6])).unwrap();
-        let forwarded_reference = forwarded.try_as_reference("the forwarded allocation").unwrap();
-        let forwarded = forwarded_reference.allocation_id();
-        let inputs = [Some(written), Some(observed), Some(forwarded), None];
-        let summary = context.region_summary(&ListOperation::Call, 0, region.entry_region_ref(), &inputs).unwrap();
-
-        // Only discharged allocations are threaded as state and only the mutated one is published, while every reached
-        // allocation that no declared position already carries enters, whether discharged or preserved.
-        let widening = context.state_widening(&summary, &BTreeSet::from([written])).unwrap();
-        assert_eq!(widening.threaded(), &BTreeSet::from([written, forwarded]));
-        assert_eq!(widening.entering(), &[observed, forwarded]);
-        assert_eq!(widening.published(), &[written]);
-        let widening = context.state_widening(&summary, &BTreeSet::new()).unwrap();
-        assert_eq!(widening.entering(), &[written, observed, forwarded]);
-
-        // A reached allocation that is no longer live propagates the environment's own reason.
-        context.consume(forwarded_reference).unwrap();
-        assert_eq!(
-            context.state_widening(&summary, &BTreeSet::new()),
-            Err(ProgramError::MalformedProgram(format!("reference discharge accessed consumed {forwarded}"))),
         );
     }
 
