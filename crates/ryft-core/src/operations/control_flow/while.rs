@@ -972,7 +972,7 @@ where
         // resolve. A preserved reference already in the carry list stays at its declared position; one reached only
         // through a capture gains a reference-typed carry rather than a state carry.
         let carried = carries.iter().copied().flatten().collect::<BTreeSet<_>>();
-        let widening = context.state_widening(&summary, &carried)?;
+        let widening = context.boundary_widening(&summary, &carried)?;
         let entering = widening.entering().to_vec();
 
         // The condition publishes nothing — it returns only its predicate — so its declared output allocations need no

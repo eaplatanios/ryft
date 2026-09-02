@@ -425,7 +425,7 @@ where
                     )));
                 }
                 let operand_allocations = declared.iter().copied().flatten().collect::<BTreeSet<_>>();
-                let widening = context.state_widening(&summary, &operand_allocations)?;
+                let widening = context.boundary_widening(&summary, &operand_allocations)?;
                 let entering = widening.entering().to_vec();
                 let source_output_count = region.output_ids().len();
 

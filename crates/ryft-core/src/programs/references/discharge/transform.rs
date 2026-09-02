@@ -834,8 +834,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeReference<C, P
     /// [`ReferenceDischargeReference`] was discharged into explicit state or preserved as a reference in the
     /// destination [`Program`], including the exact destination reference that this value denoted when it was
     /// preserved.
-    // TODO(eaplatanios): Make private once the `discharge` module review and cleanup is completed.
-    pub(super) const fn binding(&self) -> &ReferenceDischargeBinding<C::Value> {
+    const fn binding(&self) -> &ReferenceDischargeBinding<C::Value> {
         &self.binding
     }
 }
@@ -919,9 +918,8 @@ impl Display for ReferenceDischargeAllocationId {
 /// as explicit immutable state or as a preserved reference, and that choice does not change after the allocation is
 /// bound. The context records the same choice in the handle and its environment entry, so the two cannot disagree and
 /// accesses do not need to check them against one another.
-// TODO(eaplatanios): Make private once the `discharge` module review and cleanup is completed.
 #[derive(Clone, Debug, PartialEq)]
-pub(super) enum ReferenceDischargeBinding<V> {
+enum ReferenceDischargeBinding<V> {
     /// The allocation is represented as explicit immutable state, so accesses through this handle rewrite into read
     /// and write operations against the environment.
     Discharged,
@@ -2507,7 +2505,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     ///
     /// Returns [`ProgramError::MalformedProgram`] when `allocation` belongs to another environment, was never bound,
     /// or has already been consumed.
-    pub(crate) fn allocation_entry(
+    fn allocation_entry(
         &self,
         allocation: ReferenceDischargeAllocationId,
     ) -> Result<Ref<'_, ReferenceDischargeAllocationEntry<P::Referent, C::Value>>, ProgramError> {
@@ -2527,7 +2525,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     ///
     /// Returns [`ProgramError::MalformedProgram`] when `allocation` belongs to another environment, was never bound,
     /// or has already been consumed.
-    pub(crate) fn take_allocation_entry(
+    fn take_allocation_entry(
         &self,
         allocation: ReferenceDischargeAllocationId,
     ) -> Result<ReferenceDischargeAllocationEntry<P::Referent, C::Value>, ProgramError> {
@@ -3307,8 +3305,7 @@ impl<T: Type, V> ReferenceDischargeEnvironment<T, V> {
 /// because an allocation's identity outlives every handle that denotes it. A structured rule threading an inherited
 /// allocation through a rebuilt region boundary holds only that allocation's handle, never a handle it could read a
 /// type off, so the environment is where the complete-value type has to live.
-// TODO(eaplatanios): Make private once the `discharge` module review and cleanup is completed.
-pub(crate) struct ReferenceDischargeAllocationEntry<T: Type, V> {
+struct ReferenceDischargeAllocationEntry<T: Type, V> {
     /// [`ReferenceType`] of the allocation's complete stored value. When the allocation is discharged, its referent
     /// type is the type of the immutable state threaded through the rewritten program.
     r#type: ReferenceType<T>,
