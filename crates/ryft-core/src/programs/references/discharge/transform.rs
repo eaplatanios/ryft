@@ -123,7 +123,7 @@ impl ReferenceDischargeTargets {
         for target in targets {
             let invalid_target = || {
                 ProgramError::MalformedProgram(format!(
-                    "reference discharge targets include {target}, which is not selectable in this program",
+                    "reference discharge targets include {target} which is not selectable in this program",
                 ))
             };
             match target {
@@ -3488,7 +3488,7 @@ mod tests {
             )
             .unwrap_err(),
             ProgramError::MalformedProgram(
-                "reference discharge targets include external capture 0, which is not selectable in this program"
+                "reference discharge targets include external capture 0 which is not selectable in this program"
                     .to_string(),
             ),
         );
@@ -3500,7 +3500,7 @@ mod tests {
             )
             .unwrap_err(),
             ProgramError::MalformedProgram(
-                "reference discharge targets include external input 2, which is not selectable in this program"
+                "reference discharge targets include external input 2 which is not selectable in this program"
                     .to_string(),
             ),
         );
@@ -3512,7 +3512,7 @@ mod tests {
             )
             .unwrap_err(),
             ProgramError::MalformedProgram(
-                "reference discharge targets include external input 1, which is not selectable in this program"
+                "reference discharge targets include external input 1 which is not selectable in this program"
                     .to_string(),
             ),
         );
@@ -3524,7 +3524,7 @@ mod tests {
             )
             .unwrap_err(),
             ProgramError::MalformedProgram(format!(
-                "reference discharge targets include external input {}, which is not selectable in this program",
+                "reference discharge targets include external input {} which is not selectable in this program",
                 usize::MAX,
             )),
         );
@@ -3542,7 +3542,7 @@ mod tests {
             )
             .unwrap_err(),
             ProgramError::MalformedProgram(
-                "reference discharge targets include internal allocation at `^0[7]` output 0, which is not selectable \
+                "reference discharge targets include internal allocation at `^0[7]` output 0 which is not selectable \
                  in this program"
                     .to_string(),
             ),
@@ -3555,7 +3555,7 @@ mod tests {
             )
             .unwrap_err(),
             ProgramError::MalformedProgram(
-                "reference discharge targets include internal allocation at `^0[1]` output 0, which is not selectable \
+                "reference discharge targets include internal allocation at `^0[1]` output 0 which is not selectable \
                  in this program"
                     .to_string(),
             ),
@@ -3568,7 +3568,7 @@ mod tests {
             )
             .unwrap_err(),
             ProgramError::MalformedProgram(
-                "reference discharge targets include internal allocation at `^0[0]` output 1, which is not selectable \
+                "reference discharge targets include internal allocation at `^0[0]` output 1 which is not selectable \
                  in this program"
                     .to_string(),
             ),
