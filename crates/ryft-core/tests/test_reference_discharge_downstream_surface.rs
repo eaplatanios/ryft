@@ -25,11 +25,11 @@ use ryft_core::{
     Context, Domain, EagerContext, Effect, Effects, ExternalReferenceBinding, InterpretableOperation,
     InterpretationDriver, NoIdentity, Operation, OutputRegionProvenance, Parameter, Placeholder, Program,
     ProgramBuilder, ProgramError, RecursiveReferenceDischargeDriver, ReferenceAccessMode, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeResult,
-    ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType,
-    ReferenceInput, ReferenceOperationSemantics, ReferenceOutput, ReferenceRegionStateInsertion, ReferenceSource,
-    ReferenceType, RegionInterface, RegionSlot, Trace, Tracer, TracingContext, Type, TypeError, Typed, Value,
-    discharge_reference_free_operation,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary,
+    ReferenceDischargeRegionStateInsertion, ReferenceDischargeResult, ReferenceDischargeTarget,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceInput,
+    ReferenceOperationSemantics, ReferenceOutput, ReferenceSource, ReferenceType, RegionInterface, RegionSlot, Trace,
+    Tracer, TracingContext, Type, TypeError, Typed, Value, discharge_reference_free_operation,
 };
 
 /// Destination universe of the downstream programs. Its dispatch domain is the constant-only eager context, which is
@@ -425,7 +425,7 @@ where
                     )));
                 }
                 let operand_allocations = declared.iter().copied().flatten().collect::<BTreeSet<_>>();
-                let widening = context.state_widening(&summary, &operand_allocations, self.name())?;
+                let widening = context.state_widening(&summary, &operand_allocations)?;
                 let entering = widening.entering().to_vec();
                 let source_output_count = region.output_ids().len();
 
@@ -436,8 +436,8 @@ where
                         self,
                         0,
                         declared,
-                        ReferenceRegionStateInsertion::new(entering.clone(), inputs.len()),
-                        ReferenceRegionStateInsertion::new(widening.published().to_vec(), source_output_count),
+                        ReferenceDischargeRegionStateInsertion::new(entering.clone(), inputs.len()),
+                        ReferenceDischargeRegionStateInsertion::new(widening.published().to_vec(), source_output_count),
                     ),
                 )?;
                 result.validate_predicted_mutations(widening.published(), self.name())?;
@@ -666,8 +666,8 @@ fn test_downstream_region_summary_exposes_exact_access_modes() {
         summary.access_modes(allocation).collect::<Vec<_>>(),
         vec![ReferenceAccessMode::Read, ReferenceAccessMode::Write, ReferenceAccessMode::ReadWrite],
     );
-    assert!(summary.has_access(allocation, ReferenceAccessMode::ReadWrite));
-    assert!(!summary.has_access(allocation, ReferenceAccessMode::Accumulate));
+    assert!(summary.access_modes(allocation).any(|mode| mode == ReferenceAccessMode::ReadWrite));
+    assert!(!summary.access_modes(allocation).any(|mode| mode == ReferenceAccessMode::Accumulate));
     assert!(summary.is_mutated(allocation));
 }
 

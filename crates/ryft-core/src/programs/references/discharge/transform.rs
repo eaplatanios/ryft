@@ -13,7 +13,10 @@ use crate::programs::ProgramError;
 use crate::programs::instructions::InstructionId;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
-use crate::programs::references::discharge::interpreter::ReferenceDischargeRegionSummary;
+use crate::programs::references::discharge::interpreter::{
+    ReferenceDischargeRegionSummary, ReferenceDischargeStateWidening, summarize_region_closure,
+    validate_region_accesses,
+};
 use crate::programs::references::types::ReferenceType;
 use crate::programs::regions::{
     EmptyRegionDriver, RegionDriver, RegionId, RegionRef, RegionReplayMappings, ReplayRegionDriver,
@@ -2435,6 +2438,186 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         Ok(current)
     }
 
+    /// Summarizes the transitive reference accesses of a [`Region`](crate::Region) closure, in the terms of the caller
+    /// allocations its boundary names. A structured rule calls this before it can size its state boundary (i.e., which
+    /// allocations a region closure touches, and which of them it mutates, is exactly what decides how wide the
+    /// rewritten operation must be). The summary is computed entirely from generic hooks, namely operation-local
+    /// [`Operation::reference_semantics`], the region-provenance hooks, reference-output identity, and recursive
+    /// summaries of nested regions, so a third-party structured operation needs no companion declaration surface
+    /// to be summarized.
+    ///
+    /// The region's own capture scope is computed here rather than supplied, because whether a region establishes a
+    /// fresh capture prefix is stated by [`Operation::region_capture_input_count`] and is therefore knowledge the
+    /// summary can read off the operation itself. A rule never has to reason about captures.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operation`: [`Operation`] the [`Region`](crate::Region) is attached to.
+    ///   - `region_index`: Position of the [`Region`](crate::Region) among that [`Operation`]'s attached regions.
+    ///   - `region`: [`Region`](crate::Region) whose closure is summarized.
+    ///   - `inputs`: Caller allocation denoted by each of the region's declared inputs, in boundary order, with
+    ///     [`None`] wherever the position carries a value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when `inputs` does not describe the region's boundary, when the
+    /// operation declares a capture prefix longer than the region's boundary, when a reference-typed nested boundary
+    /// position declares no provenance the summary could follow, when the closure reaches a reference that entered
+    /// neither through its boundary nor through its capture scope, or when the closure consumes a caller allocation,
+    /// which no state boundary can express. It also returns this error when `operation` does not permit one of the
+    /// exact access modes the closure performs through `region_index`.
+    pub fn region_summary<O: Operation>(
+        &self,
+        operation: &O,
+        region_index: usize,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        inputs: &[Option<ReferenceDischargeAllocationId>],
+    ) -> Result<ReferenceDischargeRegionSummary, ProgramError> {
+        let captures =
+            self.captures()
+                .nested_scope(operation.region_capture_input_count(region_index), inputs, region.id())?;
+        let mut summary = ReferenceDischargeRegionSummary::default();
+        summarize_region_closure(region, inputs, &captures, &mut summary)?;
+        validate_region_accesses(operation, region_index, &summary)?;
+        Ok(summary)
+    }
+
+    // TODO(eaplatanios): Review this.
+    /// Returns the allocation one input of a structured operation denotes, or [`None`] when the input is a value.
+    ///
+    /// A view is rejected rather than resolved to its allocation because a state boundary carries the allocation's
+    /// complete stored value. The view must instead be created inside the region.
+    ///
+    /// A preserved allocation is resolved like any other. It crosses the boundary as the reference it already is, at
+    /// its own declared input position, so it needs no state carry at all, which is exactly what
+    /// [`state_widening`](Self::state_widening) leaves it out of.
+    ///
+    /// # Parameters
+    ///
+    ///   - `operand`: Carrier being classified.
+    ///   - `operation`: Name of the operation being rewritten, used in the diagnostic.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when the input is a view or its allocation is no longer live.
+    pub fn operand_allocation(
+        &self,
+        operand: &ReferenceDischargeValue<C, P>,
+        operation: &str,
+    ) -> Result<Option<ReferenceDischargeAllocationId>, ProgramError> {
+        let ReferenceDischargeValue::Reference(reference) = operand else {
+            return Ok(None);
+        };
+        let allocation = reference.allocation_id();
+        let whole = self.allocation_entry(allocation)?.r#type().into_owned();
+        if reference.is_view() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "operation `{operation}` passes the view `{}` of {allocation} across a region boundary, which carries \
+                 the complete stored value `{}`; create the view inside the region instead",
+                reference.r#type(),
+                whole,
+            )));
+        }
+        Ok(Some(allocation))
+    }
+
+    // TODO(eaplatanios): Review this.
+    /// Computes the symmetric widening facts one structured rule needs from a region summary: the discharged
+    /// allocations threaded as state, every reached allocation gaining an added boundary position because no declared
+    /// position already carries it, and the discharged subset whose successor states the rebuilt regions must publish.
+    ///
+    /// A closure needs an allocation threaded whenever its replay must be able to resolve that allocation, because it
+    /// accesses it, returns it, or merely rematerializes a capture constant that denotes it. The threaded set is
+    /// therefore the summary's reached allocations with the preserved allocations removed. A preserved reference
+    /// survives in the destination as a reference value and crosses at its own declared input position, or at an
+    /// added position as the destination reference it already denotes, exactly as the source passed it, so it needs no
+    /// state carry, publishes no successor, and widens nothing. This is the one place that distinction is drawn, which
+    /// is what keeps the structured rewrites stating one thing.
+    ///
+    /// # Parameters
+    ///
+    ///   - `summary`: Summary of the closures the rewritten operation attaches, in caller-allocation terms.
+    ///   - `declared`: Allocations already crossing at declared boundary positions, which therefore need no added
+    ///     position.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the environment's error for the first reached allocation that is not live, which states whether the
+    /// allocation was consumed, was never bound, or belongs to another environment.
+    pub fn state_widening(
+        &self,
+        summary: &ReferenceDischargeRegionSummary,
+        declared: &BTreeSet<ReferenceDischargeAllocationId>,
+    ) -> Result<ReferenceDischargeStateWidening, ProgramError> {
+        let mut threaded = BTreeSet::new();
+        for allocation in summary.reached() {
+            if self.is_allocation_discharged(allocation)? {
+                threaded.insert(allocation);
+            }
+        }
+        let entering = summary.reached().filter(|allocation| !declared.contains(allocation)).collect();
+        let published = threaded.iter().copied().filter(|allocation| summary.is_mutated(*allocation)).collect();
+        Ok(ReferenceDischargeStateWidening { threaded, entering, published })
+    }
+
+    // TODO(eaplatanios): Review this.
+    /// Returns the destination value one input of a structured operation contributes to the rewritten application:
+    /// the current immutable state of a discharged reference, the destination reference of a preserved one, or the
+    /// input's own value.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when the input's allocation is not live.
+    pub fn operand_value(&self, operand: &ReferenceDischargeValue<C, P>) -> Result<C::Value, ProgramError> {
+        let reference = match operand {
+            ReferenceDischargeValue::Reference(reference) => reference,
+            ReferenceDischargeValue::Value(value) => return Ok(value.clone()),
+        };
+        match reference.binding() {
+            ReferenceDischargeBinding::Discharged => self.discharged_state(reference.allocation_id()),
+            ReferenceDischargeBinding::Preserved { reference: value } => {
+                // A preserved handle keeps its destination value after consumption, so resolve its allocation before
+                // returning that value to the rebuilt boundary.
+                self.allocation_entry(reference.allocation_id())?;
+                Ok(value.clone())
+            }
+        }
+    }
+
+    // TODO(eaplatanios): Review this.
+    /// Returns the destination value one live allocation contributes to a rewritten boundary: its current immutable
+    /// state when discharged, or its destination reference when preserved.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError::MalformedProgram`] when `allocation` is not live in this environment.
+    pub fn allocation_value(&self, allocation: ReferenceDischargeAllocationId) -> Result<C::Value, ProgramError> {
+        self.operand_value(&self.allocation_reference(allocation)?)
+    }
+
+    // TODO(eaplatanios): Review this.
+    /// Merges one boundary state output back into `allocation` with the summary's mutation fact, skipping allocations
+    /// outside `threaded`: a carry that survives as a reference returned itself, so it has no successor state to merge.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the underlying state replacement's liveness and type failures.
+    pub fn merge_boundary_state(
+        &self,
+        summary: &ReferenceDischargeRegionSummary,
+        threaded: &BTreeSet<ReferenceDischargeAllocationId>,
+        allocation: ReferenceDischargeAllocationId,
+        output: C::Value,
+    ) -> Result<(), ProgramError>
+    where
+        C::Type: From<P::Referent>,
+    {
+        if threaded.contains(&allocation) {
+            self.set_discharged_state(allocation, output, summary.is_mutated(allocation))?;
+        }
+        Ok(())
+    }
+
     /// Lifts a stored [`Program`] constant into a value that can flow through reference discharge. A non-reference
     /// constant is lifted by the destination [`Context`] and wrapped as a [`ReferenceDischargeValue::Value`]. A
     /// reference-typed constant instead names an existing capture binding. This function resolves that binding through
@@ -3413,26 +3596,23 @@ where
         ProgramError::MalformedProgram(format!("operation `{name}` forwards its inputs but attaches no regions"))
     })?;
 
-    // A region that returns a discharged reference already publishes its final state at that output position, so only
-    // a mutated state allocation absent from the declared outputs needs an appended output. Every reached allocation
-    // absent from the operands gains an input: discharged captures cross as state, while preserved captures cross as
-    // their destination references so the rebuilt region can bind its inherited capture scope.
+    // Every reached allocation absent from the forwarded inputs enters through an added input: a discharged capture
+    // crosses as state and a preserved capture crosses as its destination reference, so the rebuilt region can bind
+    // its inherited capture scope. A region that returns a discharged reference already publishes its final state at
+    // that output position, so only a mutated state allocation absent from the declared outputs leaves through an
+    // added output. The complete published set is what the rebuilt regions are held to.
+    let forwarded_allocation_set = forwarded_allocations.iter().copied().flatten().collect::<BTreeSet<_>>();
+    let widening = context.state_widening(&summary, &forwarded_allocation_set)?;
+    let entering = widening.entering();
     let represented = summary.output_allocations().iter().copied().flatten().collect::<BTreeSet<_>>();
-    let threaded = context.threaded_state_allocations(&summary)?;
-    let operand_allocations = forwarded_allocations.iter().copied().flatten().collect::<BTreeSet<_>>();
-    let entering = summary.reached().filter(|allocation| !operand_allocations.contains(allocation)).collect::<Vec<_>>();
-    let leaving = threaded
-        .difference(&represented)
+    let leaving = widening
+        .published()
+        .iter()
         .copied()
-        .filter(|allocation| summary.is_mutated(*allocation))
+        .filter(|allocation| !represented.contains(allocation))
         .collect::<Vec<_>>();
 
-    // Every mutated allocation is published, whether through an appended output or through a declared reference
-    // output, and that complete set is what the rebuilt regions are held to.
-    let published = threaded.iter().copied().filter(|allocation| summary.is_mutated(*allocation)).collect::<Vec<_>>();
-
     let source_output_count = driver.region(0)?.output_ids().len();
-    let declared_input_allocations = forwarded_allocations.clone();
     let mut regions = Vec::with_capacity(region_count);
     for index in 0..region_count {
         // Every region receives the same state positions, so a rebuilt condition's branches keep agreeing with each
@@ -3440,12 +3620,12 @@ where
         let boundary = ReferenceDischargeRegionBoundary::new(
             operation,
             index,
-            declared_input_allocations.clone(),
-            ReferenceDischargeRegionStateInsertion::new(entering.clone(), forwarded.len()),
+            forwarded_allocations.clone(),
+            ReferenceDischargeRegionStateInsertion::new(entering.to_vec(), forwarded.len()),
             ReferenceDischargeRegionStateInsertion::new(leaving.clone(), source_output_count),
         );
         let result = driver.rebuild_region(context, index, &boundary)?;
-        result.validate_predicted_mutations(published.as_slice(), name)?;
+        result.validate_predicted_mutations(widening.published(), name)?;
         result.validate_predicted_output_allocations(summary.output_allocations(), name)?;
         regions.push(result.into_program());
     }
@@ -3455,7 +3635,7 @@ where
     for input in inputs {
         operands.push(context.operand_value(input)?);
     }
-    for allocation in &entering {
+    for allocation in entering {
         operands.push(context.allocation_value(*allocation)?);
     }
     let outputs = context.parent().bind(operation.clone(), regions, operands.as_slice())?;
@@ -3473,7 +3653,7 @@ where
         }
         match output_allocations[position] {
             Some(allocation) => {
-                context.merge_boundary_state(&summary, &threaded, allocation, output)?;
+                context.merge_boundary_state(&summary, widening.threaded(), allocation, output)?;
                 let forwarded = forwarded_allocations
                     .iter()
                     .position(|candidate| *candidate == Some(allocation))

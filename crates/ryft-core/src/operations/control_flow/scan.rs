@@ -43,9 +43,9 @@ use crate::partial::{
 use crate::programs::{
     AtomId, CalleeRegionDriver, MaybeZero, Operation, OperationFormatter, OperationProjection, OutputRegionProvenance,
     Program, ProgramBuilder, ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceRegionStateInsertion, RegionInterface, RegionRef, RegionSlot, Type,
-    TypeError, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionStateInsertion,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, RegionInterface, RegionRef, RegionSlot, Type, TypeError,
+    TypeIdentityPosition, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -1751,14 +1751,14 @@ where
         // resolve. A preserved reference already in the carry list stays at its declared position; one reached only
         // through a capture gains a reference-typed carry rather than a state carry.
         let carried = carries.iter().copied().flatten().collect::<BTreeSet<_>>();
-        let widening = context.state_widening(&summary, &carried, name)?;
+        let widening = context.state_widening(&summary, &carried)?;
         let entering = widening.entering().to_vec();
 
         let boundary = ReferenceDischargeRegionBoundary::symmetric(
             self,
             0,
             body_allocations,
-            ReferenceRegionStateInsertion::new(entering.clone(), carry_count),
+            ReferenceDischargeRegionStateInsertion::new(entering.clone(), carry_count),
         );
         let result = driver.rebuild_region(context, 0, &boundary)?;
         result.validate_predicted_mutations(widening.published(), name)?;

@@ -54,9 +54,9 @@ use crate::partial::{
 use crate::programs::{
     AtomId, CalleeRegionDriver, Concretizable, MaybeZero, Operation, OperationFormatter, OperationProjection,
     OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceAccessMode, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceRegionStateInsertion, RegionInterface, RegionRef, RegionSlot, Type,
-    TypeError, Typed, Value, ValueProjection,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary,
+    ReferenceDischargeRegionStateInsertion, ReferenceDischargeValue, ReferenceDischargeableOperation, RegionInterface,
+    RegionRef, RegionSlot, Type, TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -964,14 +964,15 @@ where
         check_count!("output", body.output_ids(), inputs.len(), ProgramError);
         let condition_summary = context.region_summary(self, 0, condition, carries.as_slice())?;
         let body_summary = context.region_summary(self, 1, body, carries.as_slice())?;
-        let summary = body_summary.merged(&condition_summary);
+        let mut summary = body_summary;
+        summary.merge(&condition_summary);
 
         // An allocation the body returns is threaded even if the body never accesses it, so that a boundary the loop's fixed
         // point requires is reported as a broken fixed point rather than as a reference the rebuilt body cannot
         // resolve. A preserved reference already in the carry list stays at its declared position; one reached only
         // through a capture gains a reference-typed carry rather than a state carry.
         let carried = carries.iter().copied().flatten().collect::<BTreeSet<_>>();
-        let widening = context.state_widening(&summary, &carried, name)?;
+        let widening = context.state_widening(&summary, &carried)?;
         let entering = widening.entering().to_vec();
 
         // The condition publishes nothing — it returns only its predicate — so its declared output allocations need no
@@ -984,8 +985,8 @@ where
                 self,
                 0,
                 carries.clone(),
-                ReferenceRegionStateInsertion::new(entering.clone(), inputs.len()),
-                ReferenceRegionStateInsertion::new(Vec::new(), condition.output_ids().len()),
+                ReferenceDischargeRegionStateInsertion::new(entering.clone(), inputs.len()),
+                ReferenceDischargeRegionStateInsertion::new(Vec::new(), condition.output_ids().len()),
             ),
         )?;
         condition_result.validate_predicted_mutations(&[], name)?;
@@ -996,7 +997,7 @@ where
                 self,
                 1,
                 carries.clone(),
-                ReferenceRegionStateInsertion::new(entering.clone(), inputs.len()),
+                ReferenceDischargeRegionStateInsertion::new(entering.clone(), inputs.len()),
             ),
         )?;
         body_result.validate_predicted_mutations(widening.published(), name)?;
