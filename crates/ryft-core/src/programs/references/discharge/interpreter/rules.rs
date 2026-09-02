@@ -1,4 +1,4 @@
-use crate::contexts::{Context, Domain};
+use crate::contexts::Context;
 use crate::programs::ProgramError;
 use crate::programs::operations::Operation;
 use crate::programs::references::discharge::transform::{
@@ -25,7 +25,8 @@ use crate::programs::types::Typed;
 /// regions are copied into the destination as they stand, which is exactly right for an operation whose regions
 /// contain no state to thread. As soon as a reference does appear anywhere in that closure — or as an operand — the
 /// application is rejected, because how a reference boundary widens is knowledge that belongs to the operation, and
-/// such an operation must implement its own [`ReferenceDischargeableOperation`] rule.
+/// such an operation must implement its own
+/// [`ReferenceDischargeableOperation`](crate::programs::references::ReferenceDischargeableOperation) rule.
 ///
 /// # Parameters
 ///
@@ -151,71 +152,6 @@ where
         .collect()
 }
 
-// TODO(eaplatanios): Restore the strict `Operation<Type = C::Type>` super-trait bound once the next-generation trait
-//  solver stabilizes. The current solver cannot discharge this projection equality at implementation heads whose
-//  context type is built from `Self` (E0284); the equality is enforced per method through `where` clauses instead.
-/// Represents [`Operation`]s that can be discharged (i.e., rewritten so that the references they touch become
-/// explicit immutable state).
-///
-/// The trait is parameterized by the destination [`Domain`] `C` that owns the rewritten values and by the
-/// [`ReferenceDischargePolicy`] `P` naming the reference universe being discharged. Every rule receives the active
-/// [`ReferenceDischargeContext`], which owns the allocation environment, plus a [`ReferenceDischargeDriver`] exposing the
-/// application's replay position and attached regions.
-///
-/// Reference primitives implement their own rewrites: an allocation binds a fresh allocation, an access acts on the allocation's
-/// current state through the policy's alias mechanics, and a freeze yields the current state and unbinds the allocation.
-/// Structured operations implement their own boundary widening, because widening is a property of what the operation
-/// does with its regions and therefore belongs to the operation. Everything else replays as-is over rewritten
-/// operands. The system is consequently open over primitives: a third-party operation family participates by
-/// implementing this trait, with no companion declaration surface beyond the generic
-/// [`Operation::reference_semantics`] and region-provenance hooks it already implements.
-///
-/// Access rules see only *discharged* allocations. When partial discharge preserves an allocation, the dispatch path replays every
-/// region-free, access-only application over it verbatim through [`discharge_preserved_access`] before rule dispatch,
-/// so an access rule never needs a preserved branch of its own. The exceptions own their preserved handling because
-/// their outputs mint or alias handles: an allocation rule consults its replay position against the targets, and a
-/// view rule calls [`ReferenceDischargeContext::alias_reference`], which replays the view over a preserved parent's
-/// destination value.
-///
-/// `C` is bounded by [`Domain`] rather than [`Context`] for the same reason
-/// [`InterpretableOperation`](crate::InterpretableOperation) is: the destination context's own binding contract is
-/// established in terms of its operation family's rules, so reaching [`Context`] through this trait would make that
-/// obligation recursive. Implementations bound `C` by the value and conversion capabilities their rewrite actually
-/// uses, and higher-order rules request nested work through their driver rather than carrying a bound stating that
-/// their own operation family is dischargeable, which is what keeps an operation enum's bound graph finite.
-///
-/// The super-trait is a plain [`Operation`] rather than `Operation<Type = C::Type>` because the current trait solver
-/// cannot discharge that projection equality at implementation heads whose reference discharge context is itself built
-/// from `Self`. The equality is instead required per method through `where Self: Operation<Type = C::Type>`, so a
-/// payload whose [`Operation::Type`] disagrees with `C::Type` cannot be batched in `C`: the requirement is restated by
-/// the derived dispatcher's per-payload predicates and by the generic projected-discharge helpers, and any mismatched
-/// payload is rejected with a type-mismatch error at its use site.
-pub trait ReferenceDischargeableOperation<C: Domain, P: ReferenceDischargePolicy<C>>: Operation {
-    /// Rewrites this operation application so that the references it touches become explicit immutable state, and
-    /// returns the carriers its outputs produce.
-    ///
-    /// # Parameters
-    ///
-    ///   - `context`: Active discharge context owning the allocation environment, through whose
-    ///     [`parent`](ReferenceDischargeContext::parent) the rewritten work is bound.
-    ///   - `driver`: Application-scoped driver exposing the replay position and any attached regions.
-    ///   - `inputs`: Carriers supplied as this application's operands, in operation-defined order.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError`] when this application cannot be rewritten — because an operand is of the wrong kind,
-    /// because the references its regions touch cannot be threaded through its boundary, or because the destination
-    /// rejected the rewritten work.
-    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
-        &self,
-        context: &ReferenceDischargeContext<C, P>,
-        driver: &D,
-        inputs: &[ReferenceDischargeValue<C, P>],
-    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError>
-    where
-        Self: Operation<Type = C::Type>;
-}
-
 #[cfg(test)]
 mod tests {
 
@@ -238,45 +174,10 @@ mod tests {
     use crate::programs::references::types::ReferenceType;
     use crate::programs::regions::EmptyRegionDriver;
 
-    use crate::programs::{RecursiveReferenceDischargeDriver, ReferenceDischargeDriver};
+    use crate::programs::RecursiveReferenceDischargeDriver;
     use crate::tracing::TracingContext;
 
     use super::*;
-
-    #[test]
-    fn test_reference_discharge_rules_unwrap_ordinary_carriers_and_reject_reference_handles() {
-        // The operation's own discharge rule owns the unwrapping of value carriers and the rejection diagnostic
-        // for a live reference handle, so every operation-backed value capability inherits both without bespoke
-        // delegation.
-        let context = ListDischargeContext::new(ListDestination::new());
-        let lhs = ReferenceDischargeValue::Value(ListIrValue::List(vec![1, 2]));
-        let rhs = ReferenceDischargeValue::Value(ListIrValue::List(vec![10, 20]));
-        let sum = discharge_reference_free_operation(
-            &ListOperation::Add,
-            &context,
-            &EmptyRegionDriver,
-            &[lhs.clone(), rhs.clone()],
-        )
-        .unwrap();
-        assert_eq!(sum, vec![ReferenceDischargeValue::Value(ListIrValue::List(vec![11, 22]))]);
-
-        let reference_type = ReferenceType::new(ListType { length: 2 });
-        let allocated = context.bind_discharged(reference_type, ListIrValue::List(vec![1, 2])).unwrap();
-        let allocation = allocated.try_as_reference("the allocated allocation").unwrap().allocation_id();
-        assert_eq!(
-            discharge_reference_free_operation(&ListOperation::Add, &context, &EmptyRegionDriver, &[allocated, rhs]),
-            Err(ProgramError::MalformedProgram(format!(
-                "reference discharge expected a value operand 0 of `list.add` but received {allocation} ref<list<2>>",
-            ))),
-        );
-
-        // A region-free application replays no instruction, so an allocation rule that consults its replay position
-        // sees `None` and treats the allocation as unconditionally discharged.
-        OBSERVED_ALLOCATION_POSITIONS.with_borrow_mut(Vec::clear);
-        let driver = RecursiveReferenceDischargeDriver::new(&EmptyRegionDriver, None);
-        ListOperation::ReferenceNew.discharge_references(&context, &driver, &[lhs]).unwrap();
-        assert_eq!(OBSERVED_ALLOCATION_POSITIONS.with_borrow(Vec::clone), vec![None]);
-    }
 
     #[test]
     fn test_discharge_reference_free_operation_replays_reference_free_applications() {
@@ -290,6 +191,23 @@ mod tests {
         assert_eq!(
             discharge_reference_free_operation(&ListOperation::Add, &context, &EmptyRegionDriver, inputs.as_slice()),
             Ok(vec![ReferenceDischargeValue::Value(ListIrValue::List(vec![11, 22]))]),
+        );
+
+        // This helper accepts only value carriers because an operation that receives a live reference owns its own
+        // discharge rule.
+        let reference_type = ReferenceType::new(ListType { length: 2 });
+        let allocated = context.bind_discharged(reference_type, ListIrValue::List(vec![1, 2])).unwrap();
+        let allocation = allocated.try_as_reference("the allocated allocation").unwrap().allocation_id();
+        assert_eq!(
+            discharge_reference_free_operation(
+                &ListOperation::Add,
+                &context,
+                &EmptyRegionDriver,
+                &[allocated, inputs[1].clone()],
+            ),
+            Err(ProgramError::MalformedProgram(format!(
+                "reference discharge expected a value operand 0 of `list.add` but received {allocation} ref<list<2>>",
+            ))),
         );
 
         // A region-carrying application whose closure touches a reference is rejected rather than replayed, because
@@ -369,56 +287,6 @@ mod tests {
         .to_string();
         assert!(rendered.contains("; probe_write"), "write provenance lost:\n{rendered}");
         assert!(rendered.contains("; probe_read"), "read provenance lost:\n{rendered}");
-    }
-
-    #[test]
-    fn test_reference_discharge_rules_thread_state_through_a_replayed_program() {
-        // The program allocates one local allocation, narrows it to a composed view, accumulates into that view, replaces
-        // it, adds the replaced and current selections, and finally freezes the complete stored value.
-        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
-        let initial = builder.add_input(ListIrType::List(ListType { length: 4 }));
-        let allocation =
-            builder.add_instruction(ListOperation::ReferenceNew, Vec::new(), vec![initial], None).unwrap()[0];
-        let view = builder
-            .add_instruction(ListOperation::Slice { offset: 1, length: 2 }, Vec::new(), vec![allocation], None)
-            .unwrap()[0];
-        let update = builder.add_constant(ListIrValue::List(vec![10, 20]));
-        builder.add_instruction(ListOperation::AddUpdate, Vec::new(), vec![view, update], None).unwrap();
-        let replacement = builder.add_constant(ListIrValue::List(vec![7, 8]));
-        builder.add_instruction(ListOperation::Write, Vec::new(), vec![view, replacement], None).unwrap();
-        let replaced =
-            builder.add_instruction(ListOperation::Swap, Vec::new(), vec![view, replacement], None).unwrap()[0];
-        let snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![view], None).unwrap()[0];
-        let total = builder.add_instruction(ListOperation::Add, Vec::new(), vec![replaced, snapshot], None).unwrap()[0];
-        let frozen = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![allocation], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![total, frozen], vec![Placeholder], vec![Placeholder; 2])
-            .unwrap();
-
-        // Replaying the program through the region driver rewrites every reference primitive into explicit state
-        // threading, so the outputs are the values an eager reference execution would have produced.
-        OBSERVED_ALLOCATION_POSITIONS.with_borrow_mut(Vec::clear);
-        let context = ListDischargeContext::new(ListDestination::new());
-        let input = ReferenceDischargeValue::Value(ListIrValue::List(vec![1, 2, 3, 4]));
-        let regions = [program];
-        let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
-        let outputs = driver.inline_region(&context, 0, vec![input]).unwrap();
-        assert_eq!(
-            outputs,
-            vec![
-                ReferenceDischargeValue::Value(ListIrValue::List(vec![14, 16])),
-                ReferenceDischargeValue::Value(ListIrValue::List(vec![1, 7, 8, 4])),
-            ],
-        );
-
-        // Every allocation the program created is gone once its `freeze` consumed it, so nothing leaks into the context.
-        assert_eq!(context.live_allocation_ids(), Vec::new());
-
-        // Replaying through the driver supplies every instruction's source program location, which is what makes the
-        // allocation selectable by a partial-discharge target.
-        let observed = OBSERVED_ALLOCATION_POSITIONS.with_borrow(Vec::clone);
-        assert_eq!(observed.len(), 1);
-        assert!(observed[0].is_some());
     }
 
     #[test]

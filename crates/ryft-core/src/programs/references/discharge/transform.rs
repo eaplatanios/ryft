@@ -13,9 +13,7 @@ use crate::programs::ProgramError;
 use crate::programs::instructions::InstructionId;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
-use crate::programs::references::discharge::interpreter::{
-    ReferenceDischargeableOperation, discharge_preserved_access,
-};
+use crate::programs::references::discharge::interpreter::discharge_preserved_access;
 use crate::programs::references::types::ReferenceType;
 use crate::programs::regions::{
     EmptyRegionDriver, RegionDriver, RegionId, RegionRef, RegionReplayMappings, ReplayRegionDriver,
@@ -1759,8 +1757,72 @@ where
     }
 }
 
-// TODO(eaplatanios): Move `ReferenceDischargeableOperation` here and move
-//  (or add) unit tests for it at the appropriate location in the `tests` module below.
+// TODO(eaplatanios): Restore the strict `Operation<Type = C::Type>` super-trait bound once the next-generation trait
+//  solver stabilizes. The current solver cannot discharge this projection equality at implementation heads whose
+//  context type is built from `Self` (E0284); the equality is enforced per function through `where` clauses instead.
+/// Represents [`Operation`]s that can be discharged (i.e., rewritten so that the references they touch become explicit
+/// immutable state).
+///
+/// The trait is parameterized by the destination [`Domain`] `C` that owns the rewritten values and by the
+/// [`ReferenceDischargePolicy`] `P` naming the reference universe being discharged. Every rule receives the active
+/// [`ReferenceDischargeContext`], which owns the allocation environment, plus a [`ReferenceDischargeDriver`] exposing
+/// the application's replay position and attached regions.
+///
+/// Reference primitives implement their own rewrites (e.g., an allocation binds a fresh allocation, a read/write access
+/// acts on the allocation's current state through the policy's alias mechanics, and a freeze yields the current state
+/// and unbinds the allocation). Structured operations implement their own boundary widening, because widening is a
+/// property of what the operation does with its regions and therefore belongs to the operation. Everything else replays
+/// as-is over rewritten operands. The system is consequently open over primitives: a third-party operation family
+/// participates by implementing this trait, with no companion declaration surface beyond the generic
+/// [`Operation::reference_semantics`] and region-provenance hooks it already implements.
+///
+/// Access rules see only _discharged_ allocations. When partial discharge preserves an allocation, the dispatch path
+/// replays every region-free, access-only application over it verbatim through [`discharge_preserved_access`] before
+/// rule dispatch, so an access rule never needs a preserved branch of its own. The exceptions own their preserved
+/// handling because their outputs mint or alias references (i.e., an allocation rule consults its replay position
+/// against the targets, and a view rule calls [`ReferenceDischargeContext::alias_reference`], which replays the view
+/// over a preserved parent's destination value).
+///
+/// `C` is bounded by [`Domain`] rather than [`Context`] for the same reason as with
+/// [`InterpretableOperation`](crate::InterpretableOperation): the destination context's own binding contract is
+/// established in terms of its operation family's rules, so reaching [`Context`] through this trait would make that
+/// obligation recursive. Implementations bound `C` by the value and conversion capabilities their rewrite actually
+/// uses, and higher-order rules request nested work through their driver rather than carrying a bound stating that
+/// their own operation family is dischargeable, which is what keeps an operation enum's bound graph finite.
+///
+/// The super-trait is a plain [`Operation`] rather than `Operation<Type = C::Type>` because the current trait solver
+/// cannot discharge that projection equality at implementation heads whose reference discharge context is itself built
+/// from `Self`. The equality is instead required per function through `where Self: Operation<Type = C::Type>`, so a
+/// payload whose [`Operation::Type`] disagrees with `C::Type` cannot be batched in `C`: the requirement is restated by
+/// the dispatcher's per-payload predicates and by the generic projected-discharge helpers, and any mismatched payload
+/// is rejected with a type-mismatch error at its use site.
+pub trait ReferenceDischargeableOperation<C: Domain, P: ReferenceDischargePolicy<C>>: Operation {
+    /// Rewrites this [`Operation`] application so that the references it touches become explicit immutable state,
+    /// and returns the carrier [`ReferenceDischargeValue`]s its outputs produce.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Active discharge context owning the allocation environment, through whose
+    ///     [`ReferenceDischargeContext::parent`] the rewritten work is bound.
+    ///   - `driver`: Application-scoped [`ReferenceDischargeDriver`] exposing the replay position and any attached
+    ///     [`Region`](crate::Region)s.
+    ///   - `inputs`: Carrier [`ReferenceDischargeValue`]s supplied as this application's operands,
+    ///     in [`Operation`]-defined order.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProgramError`] when this application cannot be rewritten because an operand is of the wrong kind,
+    /// because the references its regions touch cannot be threaded through its boundary, or because the destination
+    /// rejected the rewritten work.
+    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
+        &self,
+        context: &ReferenceDischargeContext<C, P>,
+        driver: &D,
+        inputs: &[ReferenceDischargeValue<C, P>],
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError>
+    where
+        Self: Operation<Type = C::Type>;
+}
 
 /// Active state of a reference discharge transform. Reference discharge interprets a source [`Program`] into a
 /// destination [`Program`], one [`Region`](crate::Region) at a time through a [`ReferenceDischargeDriver`]. Each
