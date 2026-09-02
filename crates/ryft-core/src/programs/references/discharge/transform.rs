@@ -949,10 +949,10 @@ pub struct ReferenceDischargeRegionBoundary {
     capture_input_count: Option<usize>,
 
     /// Refer to the documentation of [`Self::added_inputs`].
-    added_inputs: ReferenceRegionStateInsertion,
+    added_inputs: ReferenceDischargeRegionStateInsertion,
 
     /// Refer to the documentation of [`Self::added_outputs`].
-    added_outputs: ReferenceRegionStateInsertion,
+    added_outputs: ReferenceDischargeRegionStateInsertion,
 }
 
 impl ReferenceDischargeRegionBoundary {
@@ -981,8 +981,8 @@ impl ReferenceDischargeRegionBoundary {
         operation: &O,
         region_index: usize,
         declared_input_allocations: Vec<Option<ReferenceDischargeAllocationId>>,
-        added_inputs: ReferenceRegionStateInsertion,
-        added_outputs: ReferenceRegionStateInsertion,
+        added_inputs: ReferenceDischargeRegionStateInsertion,
+        added_outputs: ReferenceDischargeRegionStateInsertion,
     ) -> Self {
         Self {
             declared_input_allocations,
@@ -999,7 +999,7 @@ impl ReferenceDischargeRegionBoundary {
         operation: &O,
         region_index: usize,
         declared_input_allocations: Vec<Option<ReferenceDischargeAllocationId>>,
-        state: ReferenceRegionStateInsertion,
+        state: ReferenceDischargeRegionStateInsertion,
     ) -> Self {
         Self::new(operation, region_index, declared_input_allocations, state.clone(), state)
     }
@@ -1021,14 +1021,14 @@ impl ReferenceDischargeRegionBoundary {
     /// Returns the allocations the rebuilt [`Region`](crate::Region) receives as added inputs, together with the
     /// position in the source region's input boundary at which they are inserted. A discharged allocation enters as
     /// immutable state and a preserved allocation enters as its destination reference.
-    pub const fn added_inputs(&self) -> &ReferenceRegionStateInsertion {
+    pub const fn added_inputs(&self) -> &ReferenceDischargeRegionStateInsertion {
         &self.added_inputs
     }
 
     /// Returns the allocations the rebuilt [`Region`](crate::Region) publishes as added outputs, together with the
     /// position in the source region's output boundary at which they are inserted. A discharged allocation publishes
     /// its final state and a preserved allocation publishes its destination reference.
-    pub const fn added_outputs(&self) -> &ReferenceRegionStateInsertion {
+    pub const fn added_outputs(&self) -> &ReferenceDischargeRegionStateInsertion {
         &self.added_outputs
     }
 }
@@ -1037,7 +1037,7 @@ impl ReferenceDischargeRegionBoundary {
 /// at those positions and the position in the source region's boundary at which the group is inserted. A discharged
 /// allocation crosses as immutable state and a preserved allocation crosses as its destination reference.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReferenceRegionStateInsertion {
+pub struct ReferenceDischargeRegionStateInsertion {
     /// Refer to the documentation of [`Self::allocations`].
     allocations: Vec<ReferenceDischargeAllocationId>,
 
@@ -1045,23 +1045,23 @@ pub struct ReferenceRegionStateInsertion {
     position: usize,
 }
 
-impl ReferenceRegionStateInsertion {
-    /// Creates a [`ReferenceRegionStateInsertion`] that inserts `allocations` at `position`.
+impl ReferenceDischargeRegionStateInsertion {
+    /// Creates a [`ReferenceDischargeRegionStateInsertion`] that inserts `allocations` at `position`.
     #[inline]
     pub fn new(allocations: Vec<ReferenceDischargeAllocationId>, position: usize) -> Self {
         Self { allocations, position }
     }
 
     /// Returns the [`ReferenceDischargeAllocationId`]s of the allocations crossing at this
-    /// [`ReferenceRegionStateInsertion`]'s positions, in canonical allocation order. A discharged allocation crosses
-    /// as immutable state and a preserved allocation crosses as its destination reference.
+    /// [`ReferenceDischargeRegionStateInsertion`]'s positions, in canonical allocation order. A discharged
+    /// allocation crosses as immutable state and a preserved allocation crosses as its destination reference.
     #[inline]
     pub fn allocations(&self) -> &[ReferenceDischargeAllocationId] {
         self.allocations.as_slice()
     }
 
     /// Returns the position in the source [`Region`](crate::Region)'s boundary at which this
-    /// [`ReferenceRegionStateInsertion`] is inserted.
+    /// [`ReferenceDischargeRegionStateInsertion`] is inserted.
     pub const fn position(&self) -> usize {
         self.position
     }
@@ -3404,10 +3404,10 @@ where
         let region = driver.region(index)?;
         check_count!("input", region.input_ids(), forwarded.len(), ProgramError);
         let region_summary = context.region_summary(operation, index, region, forwarded_allocations.as_slice())?;
-        summary = Some(match summary {
-            Some(summary) => summary.merged(&region_summary),
-            None => region_summary,
-        });
+        match &mut summary {
+            Some(summary) => summary.merge(&region_summary),
+            None => summary = Some(region_summary),
+        }
     }
     let summary = summary.ok_or_else(|| {
         ProgramError::MalformedProgram(format!("operation `{name}` forwards its inputs but attaches no regions"))
@@ -3418,7 +3418,7 @@ where
     // absent from the operands gains an input: discharged captures cross as state, while preserved captures cross as
     // their destination references so the rebuilt region can bind its inherited capture scope.
     let represented = summary.output_allocations().iter().copied().flatten().collect::<BTreeSet<_>>();
-    let threaded = context.threaded_state_allocations(&summary, name)?;
+    let threaded = context.threaded_state_allocations(&summary)?;
     let operand_allocations = forwarded_allocations.iter().copied().flatten().collect::<BTreeSet<_>>();
     let entering = summary.reached().filter(|allocation| !operand_allocations.contains(allocation)).collect::<Vec<_>>();
     let leaving = threaded
@@ -3441,8 +3441,8 @@ where
             operation,
             index,
             declared_input_allocations.clone(),
-            ReferenceRegionStateInsertion::new(entering.clone(), forwarded.len()),
-            ReferenceRegionStateInsertion::new(leaving.clone(), source_output_count),
+            ReferenceDischargeRegionStateInsertion::new(entering.clone(), forwarded.len()),
+            ReferenceDischargeRegionStateInsertion::new(leaving.clone(), source_output_count),
         );
         let result = driver.rebuild_region(context, index, &boundary)?;
         result.validate_predicted_mutations(published.as_slice(), name)?;
@@ -4310,8 +4310,8 @@ mod tests {
             &ListOperation::Call,
             0,
             vec![Some(first), None],
-            ReferenceRegionStateInsertion::new(vec![second], 1),
-            ReferenceRegionStateInsertion::new(vec![first, second], 2),
+            ReferenceDischargeRegionStateInsertion::new(vec![second], 1),
+            ReferenceDischargeRegionStateInsertion::new(vec![first, second], 2),
         );
         assert_eq!(boundary.declared_input_allocations(), &[Some(first), None]);
         assert_eq!(boundary.capture_input_count(), None);
@@ -4324,7 +4324,7 @@ mod tests {
             &ListOperation::Call,
             0,
             vec![Some(first)],
-            ReferenceRegionStateInsertion::new(vec![second], 1),
+            ReferenceDischargeRegionStateInsertion::new(vec![second], 1),
         );
         assert_eq!(symmetric.added_inputs().allocations(), &[second]);
         assert_eq!(symmetric.added_inputs().position(), 1);
@@ -4362,8 +4362,8 @@ mod tests {
             &ListOperation::Call,
             0,
             vec![Some(allocation), None],
-            ReferenceRegionStateInsertion::new(Vec::new(), 2),
-            ReferenceRegionStateInsertion::new(Vec::new(), 2),
+            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 2),
+            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 2),
         );
         let result = driver.rebuild_region(&context, 0, &boundary).unwrap();
 
@@ -4507,8 +4507,8 @@ mod tests {
             &ListOperation::Call,
             0,
             Vec::new(),
-            ReferenceRegionStateInsertion::new(Vec::new(), 0),
-            ReferenceRegionStateInsertion::new(Vec::new(), 0),
+            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 0),
+            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 0),
         );
 
         assert_eq!(
@@ -4611,8 +4611,8 @@ mod tests {
             &ListOperation::Call,
             0,
             vec![Some(allocation)],
-            ReferenceRegionStateInsertion::new(Vec::new(), 0),
-            ReferenceRegionStateInsertion::new(Vec::new(), 1),
+            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 0),
+            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 1),
         );
         let result = driver.rebuild_region(&context, 0, &boundary).unwrap();
 
@@ -4695,8 +4695,8 @@ mod tests {
             &ListOperation::Call,
             0,
             Vec::new(),
-            ReferenceRegionStateInsertion::new(vec![allocation], 0),
-            ReferenceRegionStateInsertion::new(Vec::new(), 0),
+            ReferenceDischargeRegionStateInsertion::new(vec![allocation], 0),
+            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 0),
         );
         let result = driver.rebuild_region(&context, 0, &boundary).unwrap();
         assert_eq!(
@@ -4735,8 +4735,8 @@ mod tests {
             &ListOperation::Call,
             0,
             vec![Some(allocation)],
-            ReferenceRegionStateInsertion::new(Vec::new(), 1),
-            ReferenceRegionStateInsertion::new(Vec::new(), 1),
+            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 1),
+            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 1),
         );
 
         assert_eq!(
@@ -4765,8 +4765,8 @@ mod tests {
             &ListOperation::Call,
             0,
             Vec::new(),
-            ReferenceRegionStateInsertion::new(vec![allocation, allocation], 0),
-            ReferenceRegionStateInsertion::new(Vec::new(), 0),
+            ReferenceDischargeRegionStateInsertion::new(vec![allocation, allocation], 0),
+            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 0),
         );
 
         assert_eq!(
@@ -4800,8 +4800,8 @@ mod tests {
             &ListOperation::Call,
             0,
             vec![Some(allocation)],
-            ReferenceRegionStateInsertion::new(vec![allocation], 1),
-            ReferenceRegionStateInsertion::new(Vec::new(), 0),
+            ReferenceDischargeRegionStateInsertion::new(vec![allocation], 1),
+            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 0),
         );
 
         assert_eq!(
@@ -4837,8 +4837,8 @@ mod tests {
             &ListOperation::Call,
             0,
             vec![Some(allocation)],
-            ReferenceRegionStateInsertion::new(Vec::new(), 1),
-            ReferenceRegionStateInsertion::new(Vec::new(), 1),
+            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 1),
+            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 1),
         );
 
         assert!(matches!(
@@ -4885,8 +4885,8 @@ mod tests {
             &ListOperation::Call,
             0,
             vec![None, Some(accessed)],
-            ReferenceRegionStateInsertion::new(vec![carried], 1),
-            ReferenceRegionStateInsertion::new(vec![carried], 0),
+            ReferenceDischargeRegionStateInsertion::new(vec![carried], 1),
+            ReferenceDischargeRegionStateInsertion::new(vec![carried], 0),
         );
         let result = driver.rebuild_region(&context, 0, &boundary).unwrap();
         assert_eq!(

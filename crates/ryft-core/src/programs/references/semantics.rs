@@ -3,7 +3,7 @@ use std::fmt::Display;
 use crate::programs::ProgramError;
 
 /// Represents the type of [`Reference`](crate::Reference) access performed by an [`Operation`](crate::Operation).
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReferenceAccessMode {
     /// Reads the referenced value without replacing it.
     Read,
