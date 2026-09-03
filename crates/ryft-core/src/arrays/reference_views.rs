@@ -338,11 +338,8 @@ impl ArrayReferenceView {
         }
         let mut reconstructed = replacement;
         for transform_index in (0..transforms.len()).rev() {
-            reconstructed = transforms[transform_index].replace_in(
-                carrier,
-                &intermediates[transform_index],
-                &reconstructed,
-            )?;
+            reconstructed =
+                transforms[transform_index].replace_in(carrier, &intermediates[transform_index], &reconstructed)?;
         }
         Ok(reconstructed)
     }

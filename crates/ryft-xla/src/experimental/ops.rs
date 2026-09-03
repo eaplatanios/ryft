@@ -16,35 +16,37 @@ use ryft_core::operations::sort::SortOperation;
 use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
 use ryft_core::{
     AbsOperation, AddOperation, AndOperation, Array as ReferenceArray, ArrayBatch, ArrayBatching, ArrayIrOperation,
-    ArrayIrType, ArrayOperation, ArrayReferenceViewOperation, ArrayType, Atan2Operation, AxisIndexOperation, BatchAxis,
-    BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
-    BroadcastOperation, CalleeRegionDriver, CaptureConstant, CaptureReference, CeilOperation, CompareOperation,
-    CompiledCallOperation, ConcatenateOperation, Concretizable, ConditionOperation, ConstantOperation, Context,
-    ConvertElementTypeOperation, CosOperation, CumulativeLogSumExpOperation, CumulativeMaxOperation,
-    CumulativeMinOperation, CumulativeProductOperation, CumulativeSumOperation, CustomJvpOperation, CustomVjpOperation,
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    Dimension, DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionMaxOperation,
-    DimensionMinOperation, DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
-    DimensionRequirementOperation, DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation,
-    DimensionToScalarOperation, DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation,
-    DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
-    EagerContext, ErfOperation, ExpOperation, FloorOperation, GatherOperation, IotaOperation, LinearCallOperation,
-    Log1pOperation, LogAddExpOperation, LogOperation, LogSumExpOperation, LogisticOperation, MaxOperation, MaybeZero,
-    MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation,
-    OperationFormatter, OrOperation, OutputRegionProvenance, PadOperation, ParallelReduceOperation, Parameter,
-    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
-    PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program, ProgramBatchingOutputAxesPolicy,
-    ProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation, ReduceOperation, ReferenceAddUpdateOperation,
-    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceIndexOperation, ReferenceNewOperation,
-    ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation, ReferenceWriteOperation, RegionInterface,
-    RegionSlot, RemOperation, ReshapeOperation, ReshardOperation, ResidualZeroProvider, RoundOperation, RsqrtOperation,
-    ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation,
-    SinOperation, SliceOperation, SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation,
-    TanhOperation, Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation,
-    TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection,
-    WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation, ZeroOperationProvider,
-    discharge_positional_region_operation,
+    ArrayIrType, ArrayOperation, ArrayReferenceViewOperation, ArrayReferenceViewTransform, ArrayType, Atan2Operation,
+    AxisIndexOperation, BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver,
+    BatchingError, BroadcastOperation, CalleeRegionDriver, CaptureConstant, CaptureReference, CeilOperation,
+    CompareOperation, CompiledCallOperation, ConcatenateOperation, Concretizable, ConditionOperation,
+    ConstantOperation, Context, ConvertElementTypeOperation, CosOperation, CumulativeLogSumExpOperation,
+    CumulativeMaxOperation, CumulativeMinOperation, CumulativeProductOperation, CumulativeSumOperation,
+    CustomJvpOperation, CustomVjpOperation, DifferentiableOperation, DifferentiableType, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, Dimension, DimensionAddOperation, DimensionDivFloorOperation,
+    DimensionFromScalarOperation, DimensionMaxOperation, DimensionMinOperation, DimensionMulOperation,
+    DimensionOperation, DimensionPowOperation, DimensionRemOperation, DimensionRequirementOperation,
+    DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation,
+    DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
+    DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, ErfOperation,
+    ExpOperation, FloorOperation, GatherOperation, IotaOperation, LinearCallOperation, Log1pOperation,
+    LogAddExpOperation, LogOperation, LogSumExpOperation, LogisticOperation, MaxOperation, MaybeZero, MinOperation,
+    MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation, OperationFormatter,
+    OrOperation, OutputRegionProvenance, PadOperation, ParallelReduceOperation, Parameter, PartialEvaluationContext,
+    PartialEvaluationDriver, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PowOperation,
+    PrintOperation, Program, ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, ProjectedValue,
+    RaggedDotOperation, ReduceOperation, ReferenceAddUpdateOperation, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    ReferenceFreezeOperation, ReferenceIndexOperation, ReferenceNewOperation, ReferenceReadOperation,
+    ReferenceSliceOperation, ReferenceSwapOperation, ReferenceViewOperation, ReferenceViewValidationError,
+    ReferenceWriteOperation, RegionInterface, RegionSlot, RemOperation, ReshapeOperation, ReshardOperation,
+    ResidualZeroProvider, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation, ScatterOperation,
+    SelectOperation, ShardingConstraintOperation, SignOperation, SinOperation, SliceOperation, SqrtOperation,
+    StagingContext, StopGradientOperation, SubOperation, TagOperation, TanhOperation, Tracer, TracingContext,
+    TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionDriver, Type, TypeError,
+    TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection, WhileOperation, XorOperation, Zero,
+    ZeroLikeOperation, ZeroOperation, ZeroOperationProvider, discharge_positional_region_operation,
+    reapply_array_reference_view, validate_array_reference_view,
 };
 use ryft_macros::Parameter;
 
@@ -122,9 +124,7 @@ impl Value for XlaConstant {
             Self::Dimension(value) => Ok(Self::Dimension(value.rename_type_identities(renaming)?)),
         }
     }
-}
 
-impl CaptureConstant for XlaConstant {
     #[inline]
     fn capture_index(&self) -> Option<usize> {
         match self {
@@ -132,7 +132,9 @@ impl CaptureConstant for XlaConstant {
             Self::Dimension(_) => None,
         }
     }
+}
 
+impl CaptureConstant for XlaConstant {
     #[inline]
     fn map_capture_index<F: FnOnce(usize) -> usize>(&self, map: F) -> Self {
         match self {
@@ -369,6 +371,39 @@ where
 
     /// XLA-specific `shard_map`.
     ShardMap(Box<ShardMapOperation<Constant>>),
+}
+
+impl<Constant> ReferenceViewOperation for XlaOperation<Constant>
+where
+    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    type View = ArrayReferenceViewTransform;
+
+    fn reference_view(&self, output_index: usize) -> Option<ArrayReferenceViewTransform> {
+        // The two view derivations are the only members whose reference semantics declare a view alias, each at its
+        // single output; every other member and every backend-owned higher-order operation derives no view.
+        match self {
+            Self::ReferenceIndex(operation) if output_index == 0 => Some(operation.transform()),
+            Self::ReferenceSlice(operation) if output_index == 0 => Some(operation.transform()),
+            _ => None,
+        }
+    }
+
+    fn validate_view(
+        view: &ArrayReferenceViewTransform,
+        source: &ArrayIrType,
+        output: &ArrayIrType,
+    ) -> Result<(), ReferenceViewValidationError> {
+        validate_array_reference_view(view, source, output)
+    }
+
+    fn reapply_view<C: Context<Type = ArrayIrType, Operation = Self>>(
+        context: &C,
+        view: &ArrayReferenceViewTransform,
+        source: C::Value,
+    ) -> Result<C::Value, ProgramError> {
+        reapply_array_reference_view(context, view, source)
+    }
 }
 
 impl<Constant> ArrayReferenceViewOperation for XlaOperation<Constant>

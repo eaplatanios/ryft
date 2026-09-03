@@ -2849,13 +2849,36 @@ mod tests {
         .unwrap();
         assert!(matches!(
             compiled.call_statefully(&domain, ArrayIrValue::Reference(reference.clone())),
-            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
-                if reason == format!(
-                    "reference `{:?}` is bound more than once in one invocation",
-                    reference.id(),
-                ),
+            Err(XlaDomainError::Tracing(ProgramError::InvalidArgument { message }))
+                if message == "input 0 and capture 0 bind the same reference allocation",
         ));
         assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![1.0]);
+    }
+
+    #[test]
+    fn test_stateful_compilation_rejects_duplicate_reference_captures_before_staging() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let array_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+        let reference = ArrayReference::new(
+            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice()).unwrap(),
+        );
+        let result = compile_statefully_with_captures::<_, ArrayIrType, ArrayIrType>(
+            |captures, _| captures[0].read().map_err(Into::into),
+            vec![ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Reference(reference)],
+            ArrayIrType::Array(array_type),
+            &domain,
+            XlaOptions::new(mesh),
+        );
+        assert!(matches!(
+            result,
+            Err(XlaDomainError::Tracing(ProgramError::InvalidArgument { message }))
+                if message == "capture 1 and capture 0 bind the same reference allocation",
+        ));
     }
 
     #[test]

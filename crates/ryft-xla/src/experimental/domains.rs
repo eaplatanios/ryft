@@ -23,7 +23,7 @@ use ryft_core::{
     ReferenceDischargeResult, ReferenceExecution, ReferenceId, ReferenceReplacementPreparation, ReferenceSource,
     ScatterReductionKind, Shape, Sharding, ShardingDimension, StageRequest, StagedFunction, StatefulCompilationDomain,
     StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Type, TypeError, TypeRefinements, Typed,
-    ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperationProvider,
+    ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperationProvider, validate_reference_boundary,
 };
 #[cfg(test)]
 use ryft_core::{Array as CpuArray, ProjectedContext};
@@ -2848,6 +2848,8 @@ impl<'c> XlaDomain<'c> {
             }
 
             let arguments = request.into_arguments();
+            let (captures, inputs) = arguments.split_at(program.capture_count.min(arguments.len()));
+            validate_reference_boundary(inputs.iter(), captures.iter()).map_err(ProgramError::from)?;
             let reference_state_input_indices = program
                 .reference_states
                 .iter()
@@ -2855,7 +2857,6 @@ impl<'c> XlaDomain<'c> {
                 .collect::<Result<Vec<_>, _>>()?;
             let mut bindings =
                 Vec::<(ReferenceId, ArrayReference<Array<'c>>)>::with_capacity(program.reference_states.len());
-            let mut seen = HashSet::with_capacity(program.reference_states.len());
             for (_, &logical_input_index) in program.reference_states.iter().zip(&reference_state_input_indices) {
                 let reference = match arguments.get(logical_input_index) {
                     Some(ArrayIrValue::Reference(reference)) => reference,
@@ -2896,11 +2897,6 @@ impl<'c> XlaDomain<'c> {
                 if !reference.is_runtime_root_handle() {
                     return Err(XlaDomainError::UnsupportedReferenceAbi {
                         reason: format!("external state input {logical_input_index} must be a root reference handle"),
-                    });
-                }
-                if !seen.insert(reference.id()) {
-                    return Err(XlaDomainError::UnsupportedReferenceAbi {
-                        reason: format!("reference `{:?}` is bound more than once in one invocation", reference.id(),),
                     });
                 }
                 bindings.push((reference.id(), reference.clone()));

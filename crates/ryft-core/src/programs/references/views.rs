@@ -254,8 +254,8 @@ impl<View: Parameter> Parameter for ReferenceViewPath<View> {}
 ///
 /// The overlay is retained in the region's transform cache under exactly the cache identity of the structural analysis
 /// (refer to the documentation of [`RegionRef::reference_view_analysis`]) and shares that analysis through an [`Arc`]
-/// rather than re-deriving it. Like the structural analysis, it is kernel-owned validation infrastructure that consumers
-/// invoke explicitly on the programs they own.
+/// rather than re-deriving it. Like the structural analysis, it is kernel-owned validation infrastructure that
+/// consumers invoke explicitly on the programs they own.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReferenceViewAnalysis<View> {
     /// Structural analysis of the closure.
@@ -327,8 +327,8 @@ impl<View> ReferenceViewAnalysis<View> {
                         let atoms = current.atoms();
                         let source_type = atoms[edge.source().atom().index()].r#type();
                         let output_type = atoms[value.atom().index()].r#type();
-                        O::validate_view(&view, source_type.as_ref(), output_type.as_ref()).map_err(|error| {
-                            match error {
+                        O::validate_view(&view, source_type.as_ref(), output_type.as_ref()).map_err(
+                            |error| match error {
                                 ReferenceViewValidationError::TypeMismatch { expected, actual } => {
                                     ReferenceViewAnalysisError::ViewTypeMismatch {
                                         operation: name,
@@ -344,8 +344,8 @@ impl<View> ReferenceViewAnalysis<View> {
                                         message,
                                     }
                                 }
-                            }
-                        })?;
+                            },
+                        )?;
                         source.with_view(view)
                     }
                 }
@@ -487,7 +487,8 @@ mod tests {
         let mut builder = TestBuilder::new();
         let matrix = builder.add_input(reference_type([2, 3]));
         let axes = vec![ArraySliceAxis::new(0, 1, 1), ArraySliceAxis::new(0, 3, 1)];
-        let row = builder.add_instruction(ReferenceSliceOperation::new(axes), Vec::new(), vec![matrix], None).unwrap()[0];
+        let row =
+            builder.add_instruction(ReferenceSliceOperation::new(axes), Vec::new(), vec![matrix], None).unwrap()[0];
         let element =
             builder.add_instruction(ReferenceIndexOperation::new(0, 0), Vec::new(), vec![row], None).unwrap()[0];
         let snapshot =
@@ -887,12 +888,7 @@ mod tests {
         let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
         let matrix = builder.add_input(reference_type([2, 3]));
         let output = builder
-            .add_instruction(
-                ConditionOperation::<TestValue>::new(),
-                vec![row_0, row_0],
-                vec![predicate, matrix],
-                None,
-            )
+            .add_instruction(ConditionOperation::<TestValue>::new(), vec![row_0, row_0], vec![predicate, matrix], None)
             .unwrap()[0];
         let first = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])

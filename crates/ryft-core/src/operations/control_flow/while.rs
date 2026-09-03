@@ -5120,7 +5120,7 @@ mod tests {
         assert_eq!(rendered.matches("while ").count(), 1);
         assert!(discharged.external_reference_bindings()[0].is_mutated());
         assert_eq!(discharged.external_reference_bindings()[0].output_index(), Some(1));
-        let loop_instruction = &discharged.program().entry_region_ref().instructions()[4];
+        let loop_instruction = &discharged.program().entry_region_ref().instructions()[2];
         assert!(matches!(
             loop_instruction.operation(),
             TestOperation::While(operation) if operation.iteration_bound().is_none(),

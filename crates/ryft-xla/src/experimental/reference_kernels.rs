@@ -304,7 +304,7 @@ pub fn validate_kernel_body(
 ) -> Result<KernelReferenceSummary, KernelValidationError> {
     // Kernel bodies capture no references, so no constant names a capture and every reference-typed constant is
     // rejected by the generic analysis.
-    let analysis = ArrayReferenceAnalysis::new(region, 0, |_| None)?;
+    let analysis = ArrayReferenceAnalysis::new(region, 0)?;
     let generic = analysis.analysis();
     let entry = region.id();
     let inputs = region.input_ids();
@@ -570,7 +570,7 @@ mod tests {
     #[test]
     fn test_kernel_validation_error() {
         assert_eq!(
-            KernelValidationError::from(ArrayReferenceAnalysisError::MissingViewTransform {
+            KernelValidationError::from(ArrayReferenceAnalysisError::MissingView {
                 operation: "view",
                 instruction: id(0, 1),
             })

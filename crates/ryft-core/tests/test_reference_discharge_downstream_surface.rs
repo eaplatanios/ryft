@@ -912,7 +912,10 @@ fn test_downstream_view_operation_records_output_indices_and_distinct_paths() {
     // the same root, exercised through the generic static view contract from downstream position.
     let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
     let reference = builder.add_input(RegisterIrType::Reference(ReferenceType::new(RegisterType)));
-    let halves = builder.add_instruction(RegisterOperation::Halves, Vec::new(), vec![reference], None).unwrap().to_vec();
+    let halves = builder
+        .add_instruction(RegisterOperation::Halves, Vec::new(), vec![reference], None)
+        .unwrap()
+        .to_vec();
     let low = builder.add_instruction(RegisterOperation::Read, Vec::new(), vec![halves[0]], None).unwrap()[0];
     let high = builder.add_instruction(RegisterOperation::Read, Vec::new(), vec![halves[1]], None).unwrap()[0];
     let program = builder

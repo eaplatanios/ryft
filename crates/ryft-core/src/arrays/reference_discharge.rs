@@ -358,9 +358,9 @@ mod tests {
         ProgramBuilder, ReferenceAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver,
         ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation,
         ReferenceFreezeOperation, ReferenceNewOperation, ReferenceOperationSemantics, ReferenceReadOperation,
-        ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceViewOperation,
-        ReferenceViewValidationError, ReferenceWriteOperation, RegionInterface, RegionSlot, TypeError,
-        discharge_positional_region_operation, discharge_reference_free_operation,
+        ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceViewOperation, ReferenceViewValidationError,
+        ReferenceWriteOperation, RegionInterface, RegionSlot, TypeError, discharge_positional_region_operation,
+        discharge_reference_free_operation,
     };
     use crate::tracing::{Trace, Tracer, TracingContext};
 
@@ -2392,7 +2392,9 @@ mod tests {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = builder.add_input(ReferenceType::new(scalar_type()).into());
         let update = builder.add_constant(scalar(1.0));
-        builder.add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None).unwrap();
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap();
         let counter =
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let limit = builder.add_constant(scalar(limit));
@@ -2404,7 +2406,9 @@ mod tests {
                 None,
             )
             .unwrap()[0];
-        builder.build::<Vec<TestValue>, Vec<TestValue>>(vec![predicate], vec![Placeholder], vec![Placeholder]).unwrap()
+        builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+            .unwrap()
     }
 
     #[test]
@@ -2513,8 +2517,9 @@ mod tests {
             )
             .unwrap()
             .to_vec();
-        let frozen =
-            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![outputs[0]], None).unwrap()[0];
+        let frozen = builder
+            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![outputs[0]], None)
+            .unwrap()[0];
         let source = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
                 vec![frozen, outputs[1]],
@@ -2610,8 +2615,9 @@ mod tests {
         let reference_type = ReferenceType::new(scalar_type());
         let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = body_builder.add_input(reference_type.clone().into());
-        let counter =
-            body_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let counter = body_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
         let doubled = body_builder
             .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![counter, counter], None)
             .unwrap()[0];

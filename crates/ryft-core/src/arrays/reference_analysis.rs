@@ -1,7 +1,7 @@
 //! Array view overlay over the generic program-level reference analysis.
 //!
 //! [`ArrayReferenceAnalysis`] is the array instantiation of the value-family-generic
-//! [`ReferenceViewAnalysis`](crate::ReferenceViewAnalysis): it runs the generic
+//! [`ReferenceViewAnalysis`]: it runs the generic
 //! [`ReferenceAnalysis`](crate::ReferenceAnalysis) over a [`Region`](crate::Region) closure whose values are typed by
 //! [`ArrayIrType`](crate::ArrayIrType) and derives, exactly once per reference-typed value, the [`ArrayReferenceView`]
 //! that maps the value's canonical root to the coordinates the value selects. The generic analysis owns roots, alias
@@ -21,7 +21,7 @@
 //!
 //! Every root handle (a region input, an allocation, a capture constant, or a provenance-forwarded region output) maps
 //! to [`ArrayReferenceView::root`]. An identity edge copies the view of its source. A view edge composes the aliasing
-//! operation's [`ArrayReferenceViewTransform`](crate::ArrayReferenceViewTransform) onto the view of its source after
+//! operation's [`ArrayReferenceViewTransform`] onto the view of its source after
 //! validating it with [`validate_array_reference_view`](crate::validate_array_reference_view), rejecting an operation
 //! that declares a view alias but describes none, a transform that is invalid for the source referent, and a declared
 //! output referent that differs from the derived one. Nested region inputs are separate roots of the generic analysis

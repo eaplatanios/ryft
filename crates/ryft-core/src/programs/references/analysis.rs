@@ -925,7 +925,10 @@ impl ReferenceAnalysisTransformArguments {
     /// same key identifies every overlay derived from that analysis (e.g., the retained
     /// [`ReferenceViewAnalysis`](crate::programs::references::ReferenceViewAnalysis)), so all of them share one cache
     /// identity and one revalidation rule.
-    pub(crate) fn new<V: Value, O: Operation<Type = V::Type>>(region: RegionRef<'_, V, O>, capture_count: usize) -> Self {
+    pub(crate) fn new<V: Value, O: Operation<Type = V::Type>>(
+        region: RegionRef<'_, V, O>,
+        capture_count: usize,
+    ) -> Self {
         Self { capture_count, regions: region.region_ids_in_closure() }
     }
 
@@ -955,13 +958,11 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     /// not retained.
     pub fn reference_analysis(self, capture_count: usize) -> Result<Arc<ReferenceAnalysis>, ReferenceAnalysisError> {
         let arguments = ReferenceAnalysisTransformArguments::new(self, capture_count);
-        let artifact = self.transform::<ReferenceAnalysisTransform, _, ReferenceAnalysisError>(
-            arguments,
-            |region, arguments| {
+        let artifact =
+            self.transform::<ReferenceAnalysisTransform, _, ReferenceAnalysisError>(arguments, |region, arguments| {
                 let analysis = ReferenceAnalysis::new(region, arguments.capture_count())?;
                 Ok(TransformArtifact::new(Vec::new(), Arc::new(analysis)))
-            },
-        )?;
+            })?;
         let (programs, analysis) = artifact.into_parts();
         assert!(programs.is_empty(), "reference analysis transform retained a program");
         Ok(analysis)
