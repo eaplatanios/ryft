@@ -5,20 +5,35 @@
 use std::borrow::Cow;
 use std::sync::LazyLock;
 
+use crate::batching::{
+    BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
+};
 use crate::contexts::{Context, Domain};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
+};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_non_transposable_operation};
+use crate::macros::check_count;
+use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
+use crate::programs::atoms::MaybeZero;
 use crate::programs::effects::{Effect, Effects};
 use crate::programs::operations::Operation;
 use crate::programs::references::discharge::{
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
     ReferenceDischargeableOperation,
 };
+use crate::programs::references::operations::{ReferenceAddUpdate, ReferenceNew};
 use crate::programs::references::semantics::{ReferenceAccessMode, ReferenceInput, ReferenceOperationSemantics};
 use crate::programs::references::types::ReferenceType;
+use crate::programs::references::views::ReferenceViewOperation;
 use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError};
+use crate::programs::types::{Type, TypeError, Typed};
+use crate::programs::values::Value;
+use crate::tracing::{Tracer, TracingContext};
+
+use super::forwarded_tangent;
 
 /// Canonical operation name for [`ReferenceFreezeOperation`].
 pub const REFERENCE_FREEZE_OPERATION_NAME: &str = "reference_freeze";
@@ -152,21 +167,103 @@ where
     }
 }
 
-impl_unsupported_reference_transforms!(ReferenceFreezeOperation);
+impl<T, U, C> PartiallyEvaluatableOperation<C> for ReferenceFreezeOperation<T, U>
+where
+    T: Type,
+    U: Type,
+    C: Context<Type = U, Operation: From<ReferenceFreezeOperation<T, U>>>,
+{
+    // The default partial-evaluation behavior applies: the primitive's ordered-state effect is placed centrally
+    // before any operation rule runs.
+}
 
-impl_non_transposable_operation!(
-    <T, U> ReferenceFreezeOperation<T, U>
-    where
-        T: Type,
-        U: Type,
-);
+impl<T, U, C> DifferentiableOperation<C> for ReferenceFreezeOperation<T, U>
+where
+    T: Type,
+    U: DifferentiableType,
+    ReferenceFreezeOperation<T, U>: Operation<Type = U>,
+    C: Context<Type = U, Value: ReferenceFreeze<C::Value>>,
+{
+    // Freezing a reference freezes its tangent reference alongside, so the final value pairs with the final tangent
+    // contents. A plumbing reference carries no tangent reference, so its final value has a symbolic zero tangent. The
+    // operands are cloned before consumption for the same reason the interpretation rule clones them: the rule replays
+    // an already-built application over borrowed duals, and a clone names the same allocation.
+    fn jvp<D: DifferentiationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        check_count!("input", inputs, 1, ProgramError);
+        let primal = inputs[0].primal().clone().freeze()?;
+        Ok(vec![forwarded_tangent(&inputs[0], primal, |tangent_reference| tangent_reference.clone().freeze())?])
+    }
+}
+
+impl<T, U, C, P> BatchableOperation<C, P> for ReferenceFreezeOperation<T, U>
+where
+    T: Type,
+    U: Type,
+    ReferenceFreezeOperation<T, U>: Operation<Type = U>,
+    C: Context<Type = U, Value: ReferenceFreeze<C::Value>>,
+    P: BatchingPolicy<C>,
+{
+    // Freezing yields the final packed referent, batched at the reference's own axis.
+    fn batch<D: BatchingDriver<C, P>>(
+        &self,
+        _context: &BatchingContext<C, P>,
+        _driver: &D,
+        inputs: &[P::Batch],
+    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+        check_count!("input", inputs, 1, ProgramError);
+        Ok(vec![P::batch(P::value(&inputs[0]).clone().freeze()?, P::batch_axis(&inputs[0]))?].into())
+    }
+}
+
+impl<T, U, V, O> TransposableOperation<V, O> for ReferenceFreezeOperation<T, U>
+where
+    T: Type,
+    U: DifferentiableType,
+    ReferenceFreezeOperation<T, U>: Operation<Type = U>,
+    V: Value<Type = U>,
+    O: ReferenceViewOperation<Type = U> + ResidualZeroProvider<U>,
+    Tracer<TracingContext<V, O>>:
+        ReferenceNew<Tracer<TracingContext<V, O>>> + ReferenceAddUpdate<Tracer<TracingContext<V, O>>>,
+{
+    // A freeze reads the final state and consumes the allocation, so its transpose accumulates the frozen value's
+    // cotangent into the root's cotangent reference exactly like a read. The cotangent reference stays live for the
+    // earlier (in program order) accesses that the reverse sweep visits next.
+    fn transpose<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TranspositionContext<'_, V, O>,
+        _driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        check_count!("input", inputs, 1, ProgramError);
+        check_count!("output", outputs, 1, ProgramError);
+        if let MaybeZero::Value(cotangent) = &outputs[0] {
+            context.cotangent_reference(0)?.add_update(cotangent)?;
+        }
+        Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)])
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        Array, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType,
+        DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
+    };
+    use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
+    use crate::contexts::EagerContext;
+    use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
     use crate::programs::references::operations::tests::*;
+    use crate::programs::references::operations::{ReferenceNew, ReferenceRead};
     use crate::programs::regions::EmptyRegionDriver;
+    use crate::programs::types::Typed;
 
     use super::*;
 
@@ -222,5 +319,74 @@ mod tests {
                 reference.allocation_id(),
             ))),
         );
+    }
+
+    #[test]
+    fn test_reference_freeze_operation_jvp() {
+        type TestValue = ArrayIrValue<Array>;
+
+        let context = DifferentiationContext::new(EagerContext::<TestValue, ArrayIrOperation<Array>>::new());
+        let reference = TestValue::Array(Array::vector(vec![1.0_f32, 2.0])).reference_new().unwrap();
+        let tangent_reference = TestValue::Array(Array::vector(vec![3.0_f32, 4.0])).reference_new().unwrap();
+
+        // Freezing an active reference freezes its tangent reference alongside and invalidates both alias families.
+        let active = DifferentiationTracer::new(
+            DifferentiationDual::new(reference.clone(), tangent_reference.clone()).unwrap(),
+            context.clone(),
+        );
+        let outputs = context.bind(ReferenceFreezeOperation::new(), Vec::new(), &[active]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].primal(), &TestValue::Array(Array::vector(vec![1.0_f32, 2.0])));
+        assert_eq!(outputs[0].tangent().as_value(), Some(&TestValue::Array(Array::vector(vec![3.0_f32, 4.0]))));
+        assert!(reference.read().is_err());
+        assert!(tangent_reference.read().is_err());
+
+        // Freezing a plumbing reference yields a symbolic zero tangent of the referent's tangent type.
+        let reference = TestValue::Array(Array::vector(vec![5.0_f32, 6.0])).reference_new().unwrap();
+        let plumbing = DifferentiationTracer::new(
+            DifferentiationDual::new_with_zero_tangent(reference.clone()).unwrap(),
+            context.clone(),
+        );
+        let outputs = context.bind(ReferenceFreezeOperation::new(), Vec::new(), &[plumbing]).unwrap();
+        assert_eq!(outputs[0].primal(), &TestValue::Array(Array::vector(vec![5.0_f32, 6.0])));
+        assert!(matches!(
+            outputs[0].tangent(),
+            MaybeZero::Zero(r#type) if *r#type == ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2])),
+        ));
+        assert!(reference.read().is_err());
+    }
+
+    #[test]
+    fn test_reference_freeze_operation_batching() {
+        type TestValue = ArrayIrValue<Array>;
+
+        let extent = TestValue::Dimension(
+            DimensionValue::new(DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())), 2)
+                .unwrap(),
+        );
+        let context = BatchingContext::<_, ArrayIrBatching>::new(
+            EagerContext::<TestValue, ArrayIrOperation<Array>>::new(),
+            extent,
+        );
+        let packed_type = ArrayType::new_static(DataType::F32, [3, 2]);
+        let packed = TestValue::Array(Array::from_f64s(packed_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
+
+        // Freezing a batched reference yields the final packed referent at the reference's batch axis.
+        let reference = packed.reference_new().unwrap();
+        let input =
+            BatchingTracer::new(context.clone(), ArrayIrBatch::new(reference.clone(), BatchAxis::new(1)).unwrap());
+        let outputs = context.bind(ReferenceFreezeOperation::new(), Vec::new(), &[input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(1));
+        assert_eq!(outputs[0].batch().value(), &packed);
+        assert_eq!(outputs[0].r#type().as_ref(), &ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3])));
+        assert!(reference.read().is_err());
+
+        // Freezing a replicated reference stays replicated.
+        let reference = packed.reference_new().unwrap();
+        let input = BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(reference));
+        let outputs = context.bind(ReferenceFreezeOperation::new(), Vec::new(), &[input]).unwrap();
+        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::replicated());
+        assert_eq!(outputs[0].batch().value(), &packed);
     }
 }

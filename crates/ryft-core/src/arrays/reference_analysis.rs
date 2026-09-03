@@ -24,9 +24,12 @@
 //! operation's [`ArrayReferenceViewTransform`] onto the view of its source after
 //! validating it with [`validate_array_reference_view`](crate::validate_array_reference_view), rejecting an operation
 //! that declares a view alias but describes none, a transform that is invalid for the source referent, and a declared
-//! output referent that differs from the derived one. Nested region inputs are separate roots of the generic analysis
-//! and therefore map to [`ArrayReferenceView::root`], which is consistent with the root-only boundary rule the generic
-//! analysis enforces: the region that needs a view recreates it from the carried root.
+//! output referent that differs from the derived one. Nested region inputs are separate roots of the generic analysis:
+//! an input forwarded as a complete handle maps to [`ArrayReferenceView::root`], while an input the attaching
+//! operation creates as a boundary view (e.g., the per-iteration slice of a stacked `scan` reference operand) maps to
+//! that operation's single [`ArrayReferenceViewTransform`] closed over the attached region, whose iteration symbol is
+//! bound to that region. Both views are relative to the nested input itself rather than to the caller root it is bound
+//! to.
 
 // TODO(eaplatanios): Review this module.
 
@@ -46,20 +49,23 @@ pub type ArrayReferenceAnalysisError = ReferenceViewAnalysisError;
 /// like the generic analysis it is kernel-owned validation infrastructure that consumers invoke explicitly rather than
 /// a standing whole-program lint.
 ///
-/// Every reference-typed value of the closure has exactly one view. Root handles and nested region inputs map to
-/// [`ArrayReferenceView::root`], identity aliases copy the view of their source, and view aliases compose the
-/// aliasing operation's [`ArrayReferenceViewTransform`] onto the view of their source. The view of a value composed
-/// with the referent type of its root therefore reproduces exactly the referent type the program declares for that
-/// value, which the analysis verifies while deriving the table. Construct it with [`ReferenceViewAnalysis::new`]
-/// (uncached) or through [`RegionRef::reference_view_analysis`](crate::RegionRef::reference_view_analysis)
-/// (retained), and read it through [`view`](Self::view) and [`views`](Self::views) or the generic
-/// [`path`](ReferenceViewAnalysis::path) and [`paths`](ReferenceViewAnalysis::paths).
+/// Every reference-typed value of the closure has exactly one view. Root handles and forwarded nested region inputs
+/// map to [`ArrayReferenceView::root`], a nested region input created as a boundary view by its attaching operation
+/// carries that operation's transform closed over the attached region, identity aliases copy the view of their
+/// source, and view aliases compose the aliasing operation's [`ArrayReferenceViewTransform`] onto the view of their
+/// source. The view of a value composed with the referent type of its root therefore reproduces exactly the referent
+/// type the program declares for that value, which the analysis verifies while deriving the table. Construct it with
+/// [`ReferenceViewAnalysis::new`] (uncached) or through
+/// [`RegionRef::reference_view_analysis`](crate::RegionRef::reference_view_analysis) (retained), and read it through
+/// [`view`](Self::view) and [`views`](Self::views) or the generic [`path`](ReferenceViewAnalysis::path) and
+/// [`paths`](ReferenceViewAnalysis::paths).
 pub type ArrayReferenceAnalysis = ReferenceViewAnalysis<ArrayReferenceViewTransform>;
 
 impl ArrayReferenceAnalysis {
     /// Returns the [`ArrayReferenceView`] mapping the root of the reference-typed `value` to the coordinates it
-    /// selects, or [`None`] when `value` is not a reference-typed value of the closure. Root handles and nested region
-    /// inputs map to [`ArrayReferenceView::root`].
+    /// selects, or [`None`] when `value` is not a reference-typed value of the closure. Root handles and forwarded
+    /// nested region inputs map to [`ArrayReferenceView::root`]; a nested region input created as a boundary view by
+    /// its attaching operation carries that operation's transform closed over the attached region.
     #[inline]
     pub fn view(&self, value: ValueId) -> Option<&ArrayReferenceView> {
         self.path(value)
@@ -86,6 +92,7 @@ mod tests {
         ArrayIrOperation, ArrayReferenceViewOperation, REFERENCE_INDEX_OPERATION_NAME, ReferenceIndexOperation,
         ReferenceSliceOperation, reapply_array_reference_view,
     };
+    use crate::arrays::reference_views::ViewIndex;
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::ir::ArrayIrType;
@@ -96,7 +103,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::{
         AtomId, Effects, Instruction, InstructionId, Operation, ProgramBuilder, ProgramError, ReferenceAccessMode,
-        ReferenceAliasEdge, ReferenceAliasKind, ReferenceAnalysisError, ReferenceFreezeOperation,
+        ReferenceAliasEdge, ReferenceAliasKind, ReferenceAliasOrigin, ReferenceAnalysisError, ReferenceFreezeOperation,
         ReferenceOperationSemantics, ReferenceOutput, ReferenceReadOperation, ReferenceRoot, ReferenceSource,
         ReferenceType, ReferenceViewOperation, ReferenceViewValidationError, ReferenceWriteOperation, RegionId,
         RegionInterface, TypeError,
@@ -198,9 +205,10 @@ mod tests {
         let root = ReferenceRoot::RegionInput { region: RegionId::new(0), input_index: 0 };
         let row_view = ArrayReferenceView::root()
             .with_transform_unchecked(ArrayReferenceViewTransform::Slice { axes: row_axes.clone() });
-        let element_view = row_view.with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 0, index: 0 });
+        let element_view = row_view
+            .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(0) });
         let column_view = ArrayReferenceView::root()
-            .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 1, index: 2 });
+            .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 1, index: ViewIndex::Static(2) });
         assert_eq!(analysis.view(value(0, 0)), Some(&ArrayReferenceView::root()));
         assert_eq!(analysis.view(value(0, 1)), Some(&row_view));
         assert_eq!(analysis.view(value(0, 2)), Some(&element_view));
@@ -277,7 +285,13 @@ mod tests {
         let analysis = ArrayReferenceAnalysis::new(program.entry_region_ref(), 0).unwrap();
         assert_eq!(
             analysis.analysis().alias(value(2, 3)),
-            Some(ReferenceAliasEdge::new(id(2, 0), 1, value(2, 1), ReferenceAliasKind::Identity, false)),
+            Some(ReferenceAliasEdge::new(
+                id(2, 0),
+                ReferenceAliasOrigin::Output(1),
+                value(2, 1),
+                ReferenceAliasKind::Identity,
+                false,
+            )),
         );
         assert_eq!(analysis.view(value(2, 1)), Some(&ArrayReferenceView::root()));
         assert_eq!(analysis.view(value(2, 3)), Some(&ArrayReferenceView::root()));
@@ -286,8 +300,10 @@ mod tests {
         assert_eq!(
             analysis.view(value(1, 2)),
             Some(
-                &ArrayReferenceView::root()
-                    .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 0, index: 1 })
+                &ArrayReferenceView::root().with_transform_unchecked(ArrayReferenceViewTransform::Index {
+                    axis: 0,
+                    index: ViewIndex::Static(1)
+                })
             ),
         );
         assert_eq!(
@@ -337,15 +353,19 @@ mod tests {
         assert_eq!(
             analysis.view(value(0, 1)),
             Some(
-                &ArrayReferenceView::root()
-                    .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 0, index: 0 })
+                &ArrayReferenceView::root().with_transform_unchecked(ArrayReferenceViewTransform::Index {
+                    axis: 0,
+                    index: ViewIndex::Static(0)
+                })
             ),
         );
         assert_eq!(
             analysis.view(value(1, 1)),
             Some(
-                &ArrayReferenceView::root()
-                    .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 0, index: 1 })
+                &ArrayReferenceView::root().with_transform_unchecked(ArrayReferenceViewTransform::Index {
+                    axis: 0,
+                    index: ViewIndex::Static(1)
+                })
             ),
         );
         assert_eq!(
@@ -470,8 +490,9 @@ mod tests {
                 context: &C,
                 view: &ArrayReferenceViewTransform,
                 source: C::Value,
+                symbols: &[C::Value],
             ) -> Result<C::Value, ProgramError> {
-                reapply_array_reference_view(context, view, source)
+                reapply_array_reference_view(context, view, source, symbols)
             }
         }
 
@@ -587,8 +608,10 @@ mod tests {
         assert_eq!(
             analysis.view(value(0, 1)),
             Some(
-                &ArrayReferenceView::root()
-                    .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 0, index: 1 })
+                &ArrayReferenceView::root().with_transform_unchecked(ArrayReferenceViewTransform::Index {
+                    axis: 0,
+                    index: ViewIndex::Static(1)
+                })
             ),
         );
         assert_eq!(analysis.view(value(0, 2)), None);
@@ -609,7 +632,7 @@ mod tests {
             .unwrap();
         let analysis = ArrayReferenceAnalysis::new(program.entry_region_ref(), 0).unwrap();
         let element_view = ArrayReferenceView::root()
-            .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 0, index: 1 });
+            .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) });
         assert_eq!(
             analysis.views().collect::<Vec<_>>(),
             vec![(value(0, 0), &ArrayReferenceView::root()), (value(0, 1), &element_view)],

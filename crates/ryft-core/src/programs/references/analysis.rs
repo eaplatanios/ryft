@@ -4,9 +4,10 @@
 //! canonical [`ReferenceRoot`], records the alias edges and accesses that connect values to roots, and validates the
 //! lifetime, capture, and region-boundary rules of the reference model. It relies only on the generic
 //! [`Operation`] hooks ([`Operation::reference_semantics`], [`Operation::input_region_provenance`],
-//! [`Operation::output_region_provenance`], [`Operation::region_capture_input_count`],
-//! [`Operation::reference_output_identity_input`], and [`Operation::allows_reference_access_through_region_input`])
-//! and on [`Type::is_reference`], so it knows nothing about arrays, views, or any particular value family.
+//! [`Operation::region_input_view_source`], [`Operation::output_region_provenance`],
+//! [`Operation::region_capture_input_count`], [`Operation::reference_output_identity_input`], and
+//! [`Operation::allows_reference_access_through_region_input`]) and on [`Type::is_reference`], so it knows nothing
+//! about arrays, view descriptions, or any particular value family.
 //!
 //! This analysis is the shared fact source for everything that reasons about references structurally: reference
 //! discharge, kernel-boundary validation, diagnostics, lowering, and every transform rule that must know which root an
@@ -25,7 +26,12 @@
 //! analysis never rewrites a nested region's records into its parent's namespace. Instead, each attachment of a nested
 //! region records one [`ReferenceRegionInputBinding`] per reference-typed region input, mapping that formal input to
 //! the caller root it denotes, and the attaching instruction's [`ReferenceTransitiveAccess`] summary is expressed in
-//! the caller's namespace after substituting those bindings and dropping the nested region's local allocations.
+//! the caller's namespace after substituting those bindings and dropping the nested region's local allocations. Only
+//! [`RegionRole::Computation`] regions are entered: a dormant [`RegionRole::Rule`] region (e.g., a derived
+//! rematerialization or custom-derivative rule) is an input to a later transform rather than an executed child of the
+//! attaching instruction, its reference-typed inputs are bound by that transform rather than by the instruction's
+//! operands, and the transform validates it separately, so the analysis neither enters it nor attributes its accesses
+//! to the instruction — the same rule by which effects exclude rule regions.
 //!
 //! # Capture Scopes
 //!
@@ -35,11 +41,19 @@
 //! establishes a fresh scope from its first `n` inputs. A reference-typed constant resolves to the root bound at its
 //! capture position, so a capture root is the same root in every region that inherits the scope.
 //!
-//! # Root-Only Boundaries
+//! # Boundaries
 //!
-//! Only complete-value handles cross a region boundary. A derived view (any alias chain containing a
-//! [`ReferenceAliasKind::View`] edge) may neither enter an attached region nor be forwarded out of one; the region
-//! that needs a view recreates it from the carried root. Reference-typed outputs of region-carrying operations resolve
+//! Complete-value handles cross a region boundary freely: a nested region input bound through
+//! [`Operation::input_region_provenance`] denotes the caller root of the forwarding operand, and a forwarded region
+//! output denotes the root it carried in. A derived view (any alias chain containing a [`ReferenceAliasKind::View`]
+//! edge) crosses only when the attaching operation itself creates it for a region input and declares that through
+//! [`Operation::region_input_view_source`]: the named operand must be a complete-value handle, and the region input is
+//! recorded as a view of it through a [`ReferenceAliasEdge`] of origin [`ReferenceAliasOrigin::RegionInput`], whose
+//! description comes from the value family's
+//! [`region_input_view`](crate::programs::references::ReferenceViewOperation::region_input_view) hook.
+//! Such an input may be accessed inside the region, where its accesses are attributed to the whole caller root, but it
+//! can neither be consumed there nor be forwarded out. No other view enters or leaves an attached region; a region
+//! that needs one recreates it from the carried root. Reference-typed outputs of region-carrying operations resolve
 //! through [`Operation::reference_output_identity_input`] (every provenance origin must return exactly the constrained
 //! root) or through [`Operation::output_region_provenance`] (all origins must agree). An origin rooted in an allocation
 //! local to the attached region is an escaping allocation and is rejected.
@@ -78,7 +92,7 @@ use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::references::discharge::ReferenceSource;
 use crate::programs::references::semantics::{ReferenceAccessMode, ReferenceAliasKind, ReferenceOutput};
-use crate::programs::regions::{OutputRegionProvenance, Region, RegionId, RegionRef};
+use crate::programs::regions::{OutputRegionProvenance, Region, RegionId, RegionRef, RegionRole};
 use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::{Value, ValueId};
@@ -160,6 +174,36 @@ pub enum ReferenceAnalysisError {
 
         /// Description of the invalid scope.
         message: String,
+    },
+
+    /// A shared region is reached by attachments that disagree on which of its reference-typed inputs are boundary
+    /// views created by the attaching operation.
+    #[error("region {region} has an invalid boundary shape: {message}")]
+    InvalidBoundaryShape {
+        /// Region whose boundary shape is invalid.
+        region: RegionId,
+
+        /// Description of the invalid shape.
+        message: String,
+    },
+
+    /// An operation declares both an identity provenance and a view source for one attached region input.
+    #[error(
+        "operation `{operation}` at {instruction} declares both an identity provenance and a view source for region \
+             {region_index} input {input_index}; a region input is either forwarded or created as a view"
+    )]
+    ConflictingRegionInputProvenance {
+        /// Name of the operation.
+        operation: &'static str,
+
+        /// Instruction applying the operation.
+        instruction: InstructionId,
+
+        /// Position of the attached region.
+        region_index: usize,
+
+        /// Reference-typed input of the attached region.
+        input_index: usize,
     },
 
     /// An operation passes a reference into an attached region input without declaring which input supplies it.
@@ -504,18 +548,48 @@ impl ReferenceAccess {
     }
 }
 
-/// Alias edge that defines one reference-typed value from another reference-typed value of the same region. Edges are
-/// recorded for [`ReferenceOutput::Alias`] outputs and for outputs constrained by
-/// [`Operation::reference_output_identity_input`], which are identity edges from the constrained input. Narrowing is
+/// Position at which the instruction of a [`ReferenceAliasEdge`] defines the aliasing value.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ReferenceAliasOrigin {
+    /// The aliasing value is the given output of the instruction, whose description a
+    /// [`ReferenceViewOperation`](crate::programs::references::ReferenceViewOperation) reports through
+    /// [`reference_view`](crate::programs::references::ReferenceViewOperation::reference_view).
+    Output(usize),
+
+    /// The aliasing value is input `input_index` of the region attached at `region_index` of the instruction: a
+    /// boundary view the instruction's operation creates from the operand named by
+    /// [`Operation::region_input_view_source`], whose description a
+    /// [`ReferenceViewOperation`](crate::programs::references::ReferenceViewOperation) reports through
+    /// [`region_input_view`](crate::programs::references::ReferenceViewOperation::region_input_view).
+    RegionInput {
+        /// Position of the attached region among the instruction's regions.
+        region_index: usize,
+
+        /// Reference-typed input of the attached region.
+        input_index: usize,
+    },
+}
+
+/// Alias edge that defines one reference-typed value from another reference-typed value. Edges are recorded for
+/// [`ReferenceOutput::Alias`] outputs and for outputs constrained by [`Operation::reference_output_identity_input`],
+/// which are identity edges from the constrained input, both of which connect values of the same region, and for
+/// region inputs that the attaching operation creates as boundary views ([`ReferenceAliasOrigin::RegionInput`]), which
+/// connect a nested region input to an operand of the attaching instruction in the parent region. Narrowing is
 /// transitive: an identity alias of a derived view still represents only that view, so [`narrows`](Self::narrows)
 /// describes the complete chain from the root to the aliasing value rather than only this edge's own kind.
+///
+/// A shared region is analyzed once, so the edge of a boundary view is attachment-independent in every respect except
+/// its [`instruction`](Self::instruction) and [`source`](Self::source), which name the attaching instruction and its
+/// operand of the attachment that first reached the region; the analysis rejects a shared region whose attachments
+/// disagree on which inputs are boundary views. Consumers that need per-attachment data use
+/// [`ReferenceAnalysis::region_input_bindings`], which record every attachment.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReferenceAliasEdge {
     /// Instruction defining the aliasing value.
     instruction: InstructionId,
 
-    /// Index of the aliasing instruction's output that defines the aliasing value.
-    output_index: usize,
+    /// Position at which the instruction defines the aliasing value.
+    origin: ReferenceAliasOrigin,
 
     /// Reference-typed value the alias is derived from.
     source: ValueId,
@@ -532,12 +606,12 @@ impl ReferenceAliasEdge {
     #[inline]
     pub const fn new(
         instruction: InstructionId,
-        output_index: usize,
+        origin: ReferenceAliasOrigin,
         source: ValueId,
         kind: ReferenceAliasKind,
         narrows: bool,
     ) -> Self {
-        Self { instruction, output_index, source, kind, narrows }
+        Self { instruction, origin, source, kind, narrows }
     }
 
     /// Returns the instruction defining the aliasing value.
@@ -546,12 +620,20 @@ impl ReferenceAliasEdge {
         self.instruction
     }
 
-    /// Returns the index of the aliasing instruction's output that defines the aliasing value, which is the output
-    /// whose description a [`ReferenceViewOperation`](crate::programs::references::ReferenceViewOperation) reports
-    /// for this edge.
+    /// Returns the position at which the instruction defines the aliasing value.
     #[inline]
-    pub const fn output_index(self) -> usize {
-        self.output_index
+    pub const fn origin(self) -> ReferenceAliasOrigin {
+        self.origin
+    }
+
+    /// Returns the index of the aliasing instruction's output that defines the aliasing value, or [`None`] when the
+    /// aliasing value is a boundary view input of an attached region.
+    #[inline]
+    pub const fn output_index(self) -> Option<usize> {
+        match self.origin {
+            ReferenceAliasOrigin::Output(output_index) => Some(output_index),
+            ReferenceAliasOrigin::RegionInput { .. } => None,
+        }
     }
 
     /// Returns the reference-typed value the alias is derived from.
@@ -575,7 +657,9 @@ impl ReferenceAliasEdge {
 
 /// Binding of one reference-typed input of an attached [`Region`](crate::Region) to the caller root it denotes for one
 /// particular attachment. A shared region attached by several instructions has one binding per attachment, so nested
-/// records stay in the nested region's own namespace and consumers substitute them through these bindings.
+/// records stay in the nested region's own namespace and consumers substitute them through these bindings. The binding
+/// also records whether the input is a boundary view the attaching operation creates from its operand
+/// ([`Operation::region_input_view_source`]) rather than a forwarding of it ([`Operation::input_region_provenance`]).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReferenceRegionInputBinding {
     /// Instruction attaching the region.
@@ -589,13 +673,29 @@ pub struct ReferenceRegionInputBinding {
 
     /// Root the input denotes, in the namespace of the region containing the instruction.
     root: ReferenceRoot,
+
+    /// Whether the input is a boundary view of the root rather than a forwarded complete-value handle.
+    view: bool,
 }
 
 impl ReferenceRegionInputBinding {
     /// Creates a new [`ReferenceRegionInputBinding`].
     #[inline]
-    pub const fn new(instruction: InstructionId, region_index: usize, input: ValueId, root: ReferenceRoot) -> Self {
-        Self { instruction, region_index, input, root }
+    pub const fn new(
+        instruction: InstructionId,
+        region_index: usize,
+        input: ValueId,
+        root: ReferenceRoot,
+        view: bool,
+    ) -> Self {
+        Self { instruction, region_index, input, root, view }
+    }
+
+    /// Returns whether the input is a boundary view of its root that the attaching operation creates from its operand,
+    /// as opposed to a forwarded complete-value handle of that root.
+    #[inline]
+    pub const fn is_view(self) -> bool {
+        self.view
     }
 
     /// Returns the instruction attaching the region.
@@ -683,7 +783,8 @@ impl ReferenceTransitiveAccess {
 /// [`ReferenceTransitiveAccess`] summary is expressed in the caller's namespace with nested-local allocations dropped.
 ///
 /// Along the way it enforces the reference model: operation semantics and region hooks must be well-formed, only
-/// complete-value handles cross region boundaries (derived views neither enter nor leave attached regions), a
+/// complete-value handles cross region boundaries (a derived view neither enters nor leaves an attached region unless
+/// the attaching operation itself creates it for a region input, as described in the module documentation), a
 /// reference-typed output of a region-carrying operation must preserve its identity-constrained input root or be
 /// forwarded consistently from region outputs that are not nested-local allocations, attached regions may only perform
 /// the access modes their operation permits on entering roots, and consumption must go through a complete-value handle
@@ -722,7 +823,8 @@ impl ReferenceAnalysis {
     /// Reference-typed inputs of `region` become [`ReferenceRoot::RegionInput`] roots classified by
     /// [`ReferenceSource::from_flat_input_index`] relative to `capture_count`, and the first `capture_count` inputs
     /// form the capture scope through which reference-typed constants of `region` and of every region inheriting that
-    /// scope are resolved. Attached regions are analyzed recursively, shared regions exactly once.
+    /// scope are resolved. Attached [`RegionRole::Computation`] regions are analyzed recursively, shared regions
+    /// exactly once; dormant [`RegionRole::Rule`] regions are skipped, as described in the module documentation.
     ///
     /// # Parameters
     ///
@@ -771,7 +873,7 @@ impl ReferenceAnalysis {
             },
             summaries: HashMap::new(),
         };
-        let summary = traversal.analyze_region(region, scope)?;
+        let summary = traversal.analyze_region(region, scope, vec![None; input_ids.len()].into())?;
         traversal.analysis.output_roots =
             summary.outputs.into_iter().map(|output| output.map(|(root, _)| root)).collect();
         Ok(traversal.analysis)
@@ -909,8 +1011,12 @@ impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for Referen
 /// transform cache is deliberately shared across topology-preserving imports that renumber attached regions. The capture
 /// count alone would therefore serve a rebased copy records that name the original arena's identifiers, so the key also
 /// carries the closure's region identifiers in first-encounter structural order (refer to the documentation of
-/// [`RegionRef::region_ids_in_closure`]). Equal keys then guarantee that every recorded identifier is still valid: a
-/// rebased copy gets its own entry, and repeated analysis of an unmoved region hits.
+/// [`RegionRef::region_ids_in_closure`]). The identifier sequence alone does not make a hit valid, because two arenas
+/// may file different bodies under the same identifiers; what does is the sealing rule the cache rides on: re-sealing a
+/// region that attaches any descendant mints a fresh cache, and only closure-preserving imports (which keep every
+/// attached body up to a topology-preserving renumbering) carry the cache over. Within one cache, equal keys therefore
+/// name the same bodies, so every recorded identifier is still valid: a rebased copy gets its own entry, and repeated
+/// analysis of an unmoved region hits.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ReferenceAnalysisTransformArguments {
     /// Number of leading analyzed-region inputs that originate in a lifted capture table.
@@ -957,12 +1063,25 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     /// Returns the [`ReferenceAnalysisError`] naming the first violated rule in program order. A failed analysis is
     /// not retained.
     pub fn reference_analysis(self, capture_count: usize) -> Result<Arc<ReferenceAnalysis>, ReferenceAnalysisError> {
-        let arguments = ReferenceAnalysisTransformArguments::new(self, capture_count);
-        let artifact =
-            self.transform::<ReferenceAnalysisTransform, _, ReferenceAnalysisError>(arguments, |region, arguments| {
+        self.reference_analysis_with_arguments(&ReferenceAnalysisTransformArguments::new(self, capture_count))
+    }
+
+    /// Returns the [`ReferenceAnalysis`] of this [`Region`]'s closure under the already-derived cache key `arguments`.
+    /// Refer to the documentation of [`reference_analysis`](Self::reference_analysis) for the analysis and its cache
+    /// identity. Overlays derived from the analysis under the same key (e.g., the retained
+    /// [`ReferenceViewAnalysis`](crate::programs::references::ReferenceViewAnalysis)) call this so that the closure is
+    /// walked once per derivation rather than once more to rebuild the key.
+    pub(crate) fn reference_analysis_with_arguments(
+        self,
+        arguments: &ReferenceAnalysisTransformArguments,
+    ) -> Result<Arc<ReferenceAnalysis>, ReferenceAnalysisError> {
+        let artifact = self.transform::<ReferenceAnalysisTransform, _, ReferenceAnalysisError>(
+            arguments.clone(),
+            |region, arguments| {
                 let analysis = ReferenceAnalysis::new(region, arguments.capture_count())?;
                 Ok(TransformArtifact::new(Vec::new(), Arc::new(analysis)))
-            })?;
+            },
+        )?;
         let (programs, analysis) = artifact.into_parts();
         assert!(programs.is_empty(), "reference analysis transform retained a program");
         Ok(analysis)
@@ -998,11 +1117,19 @@ struct ValueRecord {
 /// Active capture scope: the root bound at each capture position, or [`None`] where the position carries a value.
 type CaptureScope = Rc<[Option<ReferenceRoot>]>;
 
+/// Boundary views the attaching instruction creates for the inputs of an attached region: the alias edge seeding each
+/// input the operation creates as a view, or [`None`] where the input is a value or a forwarded complete-value handle.
+type BoundaryViews = Rc<[Option<ReferenceAliasEdge>]>;
+
 /// Result of analyzing one region once, in that region's own namespace.
 #[derive(Clone, Debug)]
 struct RegionSummary {
     /// Capture scope the region was analyzed under.
     scope: CaptureScope,
+
+    /// Boundary views the region was analyzed under. Only their shape (i.e., which inputs are views) is independent of
+    /// the attaching instruction, so that is what later attachments of a shared region are checked against.
+    boundary: BoundaryViews,
 
     /// Direct and transitive access modes per root, including the region's local allocations.
     accesses: BTreeMap<ReferenceRoot, BTreeSet<ReferenceAccessMode>>,
@@ -1034,7 +1161,9 @@ enum Substituted {
 
 /// Translates a root of an attached region's namespace into the attaching instruction's namespace: the attached
 /// region's own inputs resolve through their bindings, capture roots of enclosing scopes pass through unchanged, and
-/// allocations are local to the attached region or to one of its descendants.
+/// allocations are local to the attached region or to one of its descendants. A boundary view input is bound to the
+/// complete root of the operand it was created from, so accesses through the view are attributed to that whole root;
+/// this is conservative, and consumers that reason about the viewed coordinates do so through the view descriptions.
 fn substitute(root: ReferenceRoot, attached: RegionId, entering: &[Option<ReferenceRoot>]) -> Substituted {
     match root {
         // Every reference-typed input of the attached region is bound before the region is analyzed, so the binding
@@ -1115,11 +1244,13 @@ struct Traversal<'r, V: Value, O: Operation<Type = V::Type>> {
 }
 
 impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
-    /// Analyzes `region` under `scope`, or returns its memoized summary when it was analyzed before.
+    /// Analyzes `region` under `scope` with the boundary views in `boundary` (one entry per region input), or returns
+    /// its memoized summary when it was analyzed before.
     fn analyze_region(
         &mut self,
         region: RegionRef<'r, V, O>,
         scope: CaptureScope,
+        boundary: BoundaryViews,
     ) -> Result<RegionSummary, ReferenceAnalysisError> {
         let region_id = region.id();
         if let Some(summary) = self.summaries.get(&region_id) {
@@ -1129,6 +1260,12 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                     message: "shared region is reached under two different capture scopes".to_string(),
                 });
             }
+            if summary.boundary.iter().map(Option::is_some).ne(boundary.iter().map(Option::is_some)) {
+                return Err(ReferenceAnalysisError::InvalidBoundaryShape {
+                    region: region_id,
+                    message: "shared region is reached with two different sets of boundary view inputs".to_string(),
+                });
+            }
             return Ok(summary.clone());
         }
         let is_entry = region_id == self.entry.id();
@@ -1136,15 +1273,18 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
         let is_reference = |atom: AtomId| atoms[atom.index()].r#type().is_reference();
         let value_id = |atom: AtomId| ValueId::new(region_id, atom);
 
-        // Reference-typed inputs seed the region's own roots. Only the analyzed region's inputs are external.
+        // Reference-typed inputs seed the region's own roots. Only the analyzed region's inputs are external, and an
+        // input the attaching operation creates as a boundary view is a narrowing view alias of the operand it was
+        // created from, so nothing inside the region can consume it or forward it out.
         for (input_index, input) in region.input_ids().iter().copied().enumerate() {
             if !is_reference(input) {
                 continue;
             }
             let root = ReferenceRoot::RegionInput { region: region_id, input_index };
             let source = is_entry.then(|| ReferenceSource::from_flat_input_index(input_index, self.capture_count));
+            let alias = boundary[input_index];
             self.analysis.roots.insert(root, RootRecord { source, ..RootRecord::default() });
-            self.analysis.values.insert(value_id(input), ValueRecord { root, narrows: false, alias: None });
+            self.analysis.values.insert(value_id(input), ValueRecord { root, narrows: alias.is_some(), alias });
         }
 
         // Reference-typed constants resolve through the active capture scope. Materializing one is not an access.
@@ -1170,7 +1310,12 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
             self.analysis.values.insert(value_id(atom_id), ValueRecord { root, narrows: false, alias: None });
         }
 
-        let mut summary = RegionSummary { scope: Rc::clone(&scope), accesses: BTreeMap::new(), outputs: Vec::new() };
+        let mut summary = RegionSummary {
+            scope: Rc::clone(&scope),
+            boundary: Rc::clone(&boundary),
+            accesses: BTreeMap::new(),
+            outputs: Vec::new(),
+        };
         let mut consumed = BTreeMap::<ReferenceRoot, InstructionId>::new();
         for (index, instruction) in region.instructions().iter().enumerate() {
             let id = InstructionId::new(region_id, index);
@@ -1252,7 +1397,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                         let narrows = kind == ReferenceAliasKind::View || source.narrows;
                         let alias = ReferenceAliasEdge {
                             instruction: id,
-                            output_index,
+                            origin: ReferenceAliasOrigin::Output(output_index),
                             source: value_id(source_atom),
                             kind,
                             narrows,
@@ -1269,6 +1414,15 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
             // instruction's summary.
             let mut attached = Vec::with_capacity(instruction.regions().len());
             for (region_index, attached_id) in instruction.regions().iter().copied().enumerate() {
+                // Dormant rule regions are inputs to later transforms rather than executed children of this
+                // instruction, exactly as for effects: their reference-typed inputs are bound by the transform that
+                // instantiates them rather than by this instruction's operands, so they are neither entered nor
+                // folded into this instruction's summary. The placeholder keeps region indices aligned for output
+                // provenance, which may only name computation regions.
+                if operation.region_role(region_index) == Some(RegionRole::Rule) {
+                    attached.push(AttachedRegion { id: attached_id, entering: Vec::new(), outputs: Vec::new() });
+                    continue;
+                }
                 let nested = region
                     .with_id(attached_id)
                     .map_err(|error| malformed(format!("attached region {attached_id} cannot be resolved: {error}")))?;
@@ -1298,18 +1452,37 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                     }
                 };
                 let mut entering = Vec::with_capacity(nested_inputs.len());
+                let mut boundary = Vec::with_capacity(nested_inputs.len());
                 for (input_index, input) in nested_inputs.iter().copied().enumerate() {
                     if !nested_is_reference(input) {
                         entering.push(None);
+                        boundary.push(None);
                         continue;
                     }
-                    let Some(supplying_index) = operation.input_region_provenance(region_index, input_index) else {
-                        return Err(ReferenceAnalysisError::UndeclaredRegionInputProvenance {
-                            operation: name,
-                            instruction: id,
-                            region_index,
-                            input_index,
-                        });
+
+                    // A reference-typed region input is either a forwarded complete-value handle or a view the
+                    // operation creates at the boundary from one of its operands. Either way the operand itself must
+                    // be a complete-value handle, and the region input is bound to its root.
+                    let forwarded = operation.input_region_provenance(region_index, input_index);
+                    let viewed = operation.region_input_view_source(region_index, input_index);
+                    let supplying_index = match (forwarded, viewed) {
+                        (Some(_), Some(_)) => {
+                            return Err(ReferenceAnalysisError::ConflictingRegionInputProvenance {
+                                operation: name,
+                                instruction: id,
+                                region_index,
+                                input_index,
+                            });
+                        }
+                        (None, None) => {
+                            return Err(ReferenceAnalysisError::UndeclaredRegionInputProvenance {
+                                operation: name,
+                                instruction: id,
+                                region_index,
+                                input_index,
+                            });
+                        }
+                        (Some(supplying_index), None) | (None, Some(supplying_index)) => supplying_index,
                     };
                     let atom = input_atom(supplying_index, "region-supplying")?;
                     let record = self.resolve(value_id(atom), name, id, supplying_index)?;
@@ -1322,15 +1495,24 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                             index: input_index,
                         });
                     }
+                    let view = viewed.is_some();
                     self.analysis.region_input_bindings.push(ReferenceRegionInputBinding {
                         instruction: id,
                         region_index,
                         input: ValueId::new(attached_id, input),
                         root: record.root,
+                        view,
                     });
                     entering.push(Some(record.root));
+                    boundary.push(view.then(|| ReferenceAliasEdge {
+                        instruction: id,
+                        origin: ReferenceAliasOrigin::RegionInput { region_index, input_index },
+                        source: value_id(atom),
+                        kind: ReferenceAliasKind::View,
+                        narrows: true,
+                    }));
                 }
-                let nested_summary = self.analyze_region(nested, nested_scope)?;
+                let nested_summary = self.analyze_region(nested, nested_scope, boundary.into())?;
                 for (nested_root, modes) in &nested_summary.accesses {
                     let Substituted::Caller(root) = substitute(*nested_root, attached_id, &entering) else {
                         continue;
@@ -1383,7 +1565,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                         }
                         let alias = ReferenceAliasEdge {
                             instruction: id,
-                            output_index,
+                            origin: ReferenceAliasOrigin::Output(output_index),
                             source: value_id(atom),
                             kind: ReferenceAliasKind::Identity,
                             narrows: source.narrows,
@@ -1592,8 +1774,10 @@ mod tests {
     type TestArrayOperation = ArrayIrOperation<Array>;
 
     /// Minimal generic operation universe: the flat reference language, two call-like operations with inherited and
-    /// fresh capture scopes, while-, condition-, and scan-like structured operations, one region operation declaring
-    /// no reference hooks, and one operation with caller-supplied (possibly malformed) semantics.
+    /// fresh capture scopes, while-, condition-, and scan-like structured operations (the scan views its stacked
+    /// reference operands per iteration at the body boundary), one region operation declaring no reference hooks, one
+    /// region operation declaring both an identity provenance and a view source for every region input, and one
+    /// operation with caller-supplied (possibly malformed) semantics.
     #[derive(Clone, Debug)]
     enum TestOperation {
         New,
@@ -1610,6 +1794,7 @@ mod tests {
         Condition,
         Scan { carry_count: usize },
         Opaque,
+        Conflicting,
         Malformed(ReferenceOperationSemantics),
     }
 
@@ -1638,6 +1823,7 @@ mod tests {
                 Self::Condition => "test.condition",
                 Self::Scan { .. } => "test.scan",
                 Self::Opaque => "test.opaque",
+                Self::Conflicting => "test.conflicting",
                 Self::Malformed(_) => "test.malformed",
             }
         }
@@ -1647,7 +1833,7 @@ mod tests {
                 Self::Call | Self::CallWithCaptures(_) => const { &[RegionSlot::computation("callee")] },
                 Self::While => const { &[RegionSlot::computation("condition"), RegionSlot::computation("body")] },
                 Self::Condition => const { &[RegionSlot::computation("true"), RegionSlot::computation("false")] },
-                Self::Scan { .. } | Self::Opaque => const { &[RegionSlot::computation("body")] },
+                Self::Scan { .. } | Self::Opaque | Self::Conflicting => const { &[RegionSlot::computation("body")] },
                 _ => &[],
             }
         }
@@ -1667,25 +1853,36 @@ mod tests {
                 Self::Write | Self::Accumulate => referent(0).map(|_| Vec::new()),
                 Self::View | Self::Identity => referent(0).map(|_| vec![input_types[0].clone()]),
                 Self::While => Ok(input_types.to_vec()),
-                Self::Call | Self::CallWithCaptures(_) | Self::Condition | Self::Scan { .. } | Self::Opaque => {
-                    Ok(region_interfaces[0].output_types().to_vec())
-                }
+                Self::Call
+                | Self::CallWithCaptures(_)
+                | Self::Condition
+                | Self::Scan { .. }
+                | Self::Opaque
+                | Self::Conflicting => Ok(region_interfaces[0].output_types().to_vec()),
                 Self::Malformed(_) => Ok(Vec::new()),
             }
         }
 
         fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> Option<usize> {
             match self {
-                Self::Call | Self::CallWithCaptures(_) | Self::While => Some(input_index),
+                Self::Call | Self::CallWithCaptures(_) | Self::While | Self::Conflicting => Some(input_index),
                 Self::Condition => Some(input_index + 1),
                 Self::Scan { carry_count } => (input_index < *carry_count).then_some(input_index),
                 _ => None,
             }
         }
 
+        fn region_input_view_source(&self, _region_index: usize, input_index: usize) -> Option<usize> {
+            match self {
+                Self::Scan { carry_count } => (input_index >= *carry_count).then_some(input_index),
+                Self::Conflicting => Some(input_index),
+                _ => None,
+            }
+        }
+
         fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
             match self {
-                Self::Call | Self::CallWithCaptures(_) | Self::Scan { .. } => {
+                Self::Call | Self::CallWithCaptures(_) | Self::Scan { .. } | Self::Conflicting => {
                     vec![OutputRegionProvenance { region_index: 0, output_index }]
                 }
                 Self::While => vec![OutputRegionProvenance { region_index: 1, output_index }],
@@ -1928,6 +2125,24 @@ mod tests {
                 "region ^2 has an invalid capture scope: the capture prefix of 3 inputs exceeds the region's 1 inputs",
             ),
             (
+                ReferenceAnalysisError::InvalidBoundaryShape {
+                    region: RegionId::new(2),
+                    message: "shared region is reached with two different sets of boundary view inputs".to_string(),
+                },
+                "region ^2 has an invalid boundary shape: shared region is reached with two different sets of boundary \
+                 view inputs",
+            ),
+            (
+                ReferenceAnalysisError::ConflictingRegionInputProvenance {
+                    operation: "test.conflicting",
+                    instruction: id(1, 0),
+                    region_index: 0,
+                    input_index: 1,
+                },
+                "operation `test.conflicting` at ^1[0] declares both an identity provenance and a view source for \
+                 region 0 input 1; a region input is either forwarded or created as a view",
+            ),
+            (
                 ReferenceAnalysisError::UndeclaredRegionInputProvenance {
                     operation: "test.opaque",
                     instruction: id(1, 0),
@@ -2086,26 +2301,40 @@ mod tests {
 
     #[test]
     fn test_reference_alias_edge() {
-        let edge = ReferenceAliasEdge::new(id(1, 1), 2, value(1, 3), ReferenceAliasKind::View, true);
+        let output = ReferenceAliasOrigin::Output(2);
+        let edge = ReferenceAliasEdge::new(id(1, 1), output, value(1, 3), ReferenceAliasKind::View, true);
         assert_eq!(edge.instruction(), id(1, 1));
-        assert_eq!(edge.output_index(), 2);
+        assert_eq!(edge.origin(), output);
+        assert_eq!(edge.output_index(), Some(2));
         assert_eq!(edge.source(), value(1, 3));
         assert_eq!(edge.kind(), ReferenceAliasKind::View);
         assert!(edge.narrows());
-        assert_eq!(edge, ReferenceAliasEdge::new(id(1, 1), 2, value(1, 3), ReferenceAliasKind::View, true));
-        assert_ne!(edge, ReferenceAliasEdge::new(id(1, 1), 0, value(1, 3), ReferenceAliasKind::View, true));
-        assert_ne!(edge, ReferenceAliasEdge::new(id(1, 1), 2, value(1, 3), ReferenceAliasKind::Identity, true));
+        assert_eq!(edge, ReferenceAliasEdge::new(id(1, 1), output, value(1, 3), ReferenceAliasKind::View, true));
+        let other = ReferenceAliasOrigin::Output(0);
+        assert_ne!(edge, ReferenceAliasEdge::new(id(1, 1), other, value(1, 3), ReferenceAliasKind::View, true));
+        assert_ne!(edge, ReferenceAliasEdge::new(id(1, 1), output, value(1, 3), ReferenceAliasKind::Identity, true));
+
+        // A boundary view edge is defined at a region input of the attaching instruction rather than at an output.
+        let region_input = ReferenceAliasOrigin::RegionInput { region_index: 0, input_index: 1 };
+        let boundary = ReferenceAliasEdge::new(id(1, 1), region_input, value(1, 3), ReferenceAliasKind::View, true);
+        assert_eq!(boundary.origin(), region_input);
+        assert_eq!(boundary.output_index(), None);
+        assert_ne!(edge, boundary);
     }
 
     #[test]
     fn test_reference_region_input_binding() {
-        let binding = ReferenceRegionInputBinding::new(id(1, 7), 0, value(0, 0), input_root(1, 1));
+        let binding = ReferenceRegionInputBinding::new(id(1, 7), 0, value(0, 0), input_root(1, 1), false);
         assert_eq!(binding.instruction(), id(1, 7));
         assert_eq!(binding.region_index(), 0);
         assert_eq!(binding.input(), value(0, 0));
         assert_eq!(binding.root(), input_root(1, 1));
-        assert_eq!(binding, ReferenceRegionInputBinding::new(id(1, 7), 0, value(0, 0), input_root(1, 1)));
-        assert_ne!(binding, ReferenceRegionInputBinding::new(id(1, 7), 1, value(0, 0), input_root(1, 1)));
+        assert!(!binding.is_view());
+        assert_eq!(binding, ReferenceRegionInputBinding::new(id(1, 7), 0, value(0, 0), input_root(1, 1), false));
+        assert_ne!(binding, ReferenceRegionInputBinding::new(id(1, 7), 1, value(0, 0), input_root(1, 1), false));
+        let view = ReferenceRegionInputBinding::new(id(1, 7), 0, value(0, 0), input_root(1, 1), true);
+        assert!(view.is_view());
+        assert_ne!(binding, view);
     }
 
     #[test]
@@ -2153,7 +2382,10 @@ mod tests {
                 ReferenceAccess::new(id(1, 8), 0, c, ReferenceAccessMode::Consume),
             ],
         );
-        assert_eq!(analysis.region_input_bindings(), &[ReferenceRegionInputBinding::new(id(1, 7), 0, value(0, 0), b)]);
+        assert_eq!(
+            analysis.region_input_bindings(),
+            &[ReferenceRegionInputBinding::new(id(1, 7), 0, value(0, 0), b, false)]
+        );
         assert_eq!(analysis.output_roots(), &[None, Some(b), None]);
 
         // A region without references analyzes to an empty artifact.
@@ -2235,7 +2467,10 @@ mod tests {
         assert_eq!(analysis.root_of(value(0, 2)), Some(k));
         assert_eq!(analysis.external_source(a), Some(ReferenceSource::Input { index: 0 }));
         assert_eq!(analysis.external_source(k), None);
-        assert_eq!(analysis.region_input_bindings(), &[ReferenceRegionInputBinding::new(id(1, 0), 0, value(0, 0), a)]);
+        assert_eq!(
+            analysis.region_input_bindings(),
+            &[ReferenceRegionInputBinding::new(id(1, 0), 0, value(0, 0), a, false)]
+        );
         assert_eq!(
             analysis.accesses(),
             &[
@@ -2263,14 +2498,20 @@ mod tests {
         assert_eq!(analysis.root_of(value(2, 2)), Some(a));
         assert_eq!(
             analysis.alias(value(2, 2)),
-            Some(ReferenceAliasEdge::new(id(2, 0), 0, value(2, 0), ReferenceAliasKind::Identity, false))
+            Some(ReferenceAliasEdge::new(
+                id(2, 0),
+                ReferenceAliasOrigin::Output(0),
+                value(2, 0),
+                ReferenceAliasKind::Identity,
+                false
+            ))
         );
         assert!(!analysis.is_view(value(2, 2)));
         assert_eq!(
             analysis.region_input_bindings(),
             &[
-                ReferenceRegionInputBinding::new(id(2, 0), 0, value(0, 0), a),
-                ReferenceRegionInputBinding::new(id(2, 0), 1, value(1, 0), a),
+                ReferenceRegionInputBinding::new(id(2, 0), 0, value(0, 0), a, false),
+                ReferenceRegionInputBinding::new(id(2, 0), 1, value(1, 0), a, false),
             ],
         );
         assert_eq!(
@@ -2299,9 +2540,18 @@ mod tests {
         assert_eq!(analysis.root_of(value(1, 2)), Some(a));
         assert_eq!(
             analysis.alias(value(1, 2)),
-            Some(ReferenceAliasEdge::new(id(1, 0), 0, value(1, 0), ReferenceAliasKind::Identity, false))
+            Some(ReferenceAliasEdge::new(
+                id(1, 0),
+                ReferenceAliasOrigin::Output(0),
+                value(1, 0),
+                ReferenceAliasKind::Identity,
+                false
+            ))
         );
-        assert_eq!(analysis.region_input_bindings(), &[ReferenceRegionInputBinding::new(id(1, 0), 0, value(0, 0), a)]);
+        assert_eq!(
+            analysis.region_input_bindings(),
+            &[ReferenceRegionInputBinding::new(id(1, 0), 0, value(0, 0), a, false)]
+        );
         assert_eq!(
             analysis.transitive_access(id(1, 0)).unwrap().accesses(),
             &BTreeMap::from([(a, BTreeSet::from([ReferenceAccessMode::Write]))]),
@@ -2347,8 +2597,8 @@ mod tests {
         assert_eq!(
             analysis.region_input_bindings(),
             &[
-                ReferenceRegionInputBinding::new(id(2, 0), 0, value(0, 0), a),
-                ReferenceRegionInputBinding::new(id(2, 0), 1, value(1, 0), a),
+                ReferenceRegionInputBinding::new(id(2, 0), 0, value(0, 0), a, false),
+                ReferenceRegionInputBinding::new(id(2, 0), 1, value(1, 0), a, false),
             ],
         );
         assert_eq!(
@@ -2416,11 +2666,221 @@ mod tests {
         assert_eq!(
             analysis.region_input_bindings(),
             &[
-                ReferenceRegionInputBinding::new(id(1, 0), 0, value(0, 0), a),
-                ReferenceRegionInputBinding::new(id(1, 0), 1, value(0, 0), a),
+                ReferenceRegionInputBinding::new(id(1, 0), 0, value(0, 0), a, false),
+                ReferenceRegionInputBinding::new(id(1, 0), 1, value(0, 0), a, false),
             ],
         );
         assert_eq!(analysis.output_roots(), &[Some(a)]);
+    }
+
+    /// Builds a `scan`-like program over one reference carry `%0:ref<value<0>>` and one stacked reference operand
+    /// `%1:ref<value<1>>` that the scan views per iteration at the boundary of `body`, whose inputs are the carry and
+    /// the per-iteration view. When `narrowed_operand` is set, the stacked operand is first narrowed through
+    /// `test.view`, so the scan is instruction `^1[1]` instead of `^1[0]`.
+    fn stacked_scan_program(body: TestProgram, narrowed_operand: bool) -> TestProgram {
+        let mut builder = TestBuilder::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let carry = builder.add_input(reference_type(0));
+        let mut stacked = builder.add_input(reference_type(1));
+        if narrowed_operand {
+            stacked = builder.add_instruction(TestOperation::View, Vec::new(), vec![stacked], None).unwrap()[0];
+        }
+        let outputs = builder
+            .add_instruction(TestOperation::Scan { carry_count: 1 }, vec![body], vec![carry, stacked], None)
+            .unwrap()
+            .to_vec();
+        build(builder, outputs)
+    }
+
+    /// Builds a scan body over a reference carry and a per-iteration reference view that reads the view and returns
+    /// the carry.
+    fn reading_scan_body() -> TestProgram {
+        let mut body = TestBuilder::new();
+        let carry = body.add_input(reference_type(0));
+        let element = body.add_input(reference_type(1));
+        body.add_instruction(TestOperation::Read, Vec::new(), vec![element], None).unwrap();
+        build(body, vec![carry])
+    }
+
+    #[test]
+    fn test_reference_analysis_new_binds_boundary_views() {
+        // The stacked operand enters the body as a view the scan creates at the boundary: the body input is its own
+        // root in the body's namespace, is recorded as a view alias of the operand with a region-input origin, and the
+        // body's accesses through it are attributed to the whole caller root.
+        let analysis = stacked_scan_program(reading_scan_body(), false).reference_analysis(0).unwrap();
+        let (a, b) = (input_root(1, 0), input_root(1, 1));
+        assert_eq!(analysis.root_of(value(0, 1)), Some(input_root(0, 1)));
+        assert!(!analysis.is_view(value(0, 0)));
+        assert!(analysis.is_view(value(0, 1)));
+        assert_eq!(analysis.alias(value(0, 0)), None);
+        assert_eq!(
+            analysis.alias(value(0, 1)),
+            Some(ReferenceAliasEdge::new(
+                id(1, 0),
+                ReferenceAliasOrigin::RegionInput { region_index: 0, input_index: 1 },
+                value(1, 1),
+                ReferenceAliasKind::View,
+                true,
+            )),
+        );
+        assert_eq!(
+            analysis.region_input_bindings(),
+            &[
+                ReferenceRegionInputBinding::new(id(1, 0), 0, value(0, 0), a, false),
+                ReferenceRegionInputBinding::new(id(1, 0), 0, value(0, 1), b, true),
+            ],
+        );
+        assert_eq!(
+            analysis.accesses(),
+            &[ReferenceAccess::new(id(0, 0), 0, input_root(0, 1), ReferenceAccessMode::Read)],
+        );
+        assert_eq!(
+            analysis.transitive_access(id(1, 0)).unwrap().accesses(),
+            &BTreeMap::from([(b, BTreeSet::from([ReferenceAccessMode::Read]))]),
+        );
+        assert_eq!(analysis.access_modes(b).collect::<Vec<_>>(), vec![ReferenceAccessMode::Read]);
+        assert!(analysis.access_modes(a).next().is_none());
+        assert_eq!(analysis.output_roots(), &[Some(a)]);
+    }
+
+    #[test]
+    fn test_reference_analysis_new_analyzes_shared_boundary_views_once() {
+        // Two scans attaching one body with the same boundary shape share its analysis: the body input's edge names
+        // the first attachment, while each attachment records its own view binding.
+        let body = reading_scan_body();
+        let mut builder = TestBuilder::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let carry = builder.add_input(reference_type(0));
+        let stacked = builder.add_input(reference_type(1));
+        let first = builder
+            .add_instruction(TestOperation::Scan { carry_count: 1 }, vec![body], vec![carry, stacked], None)
+            .unwrap()[0];
+        let outputs = builder
+            .add_instruction(TestOperation::Scan { carry_count: 1 }, vec![body], vec![first, stacked], None)
+            .unwrap()
+            .to_vec();
+        let analysis = build(builder, outputs).reference_analysis(0).unwrap();
+        let (a, b) = (input_root(1, 0), input_root(1, 1));
+        assert_eq!(
+            analysis.alias(value(0, 1)),
+            Some(ReferenceAliasEdge::new(
+                id(1, 0),
+                ReferenceAliasOrigin::RegionInput { region_index: 0, input_index: 1 },
+                value(1, 1),
+                ReferenceAliasKind::View,
+                true,
+            )),
+        );
+        assert_eq!(
+            analysis.region_input_bindings(),
+            &[
+                ReferenceRegionInputBinding::new(id(1, 0), 0, value(0, 0), a, false),
+                ReferenceRegionInputBinding::new(id(1, 0), 0, value(0, 1), b, true),
+                ReferenceRegionInputBinding::new(id(1, 1), 0, value(0, 0), a, false),
+                ReferenceRegionInputBinding::new(id(1, 1), 0, value(0, 1), b, true),
+            ],
+        );
+        assert_eq!(
+            analysis.transitive_access(id(1, 1)).unwrap().accesses(),
+            &BTreeMap::from([(b, BTreeSet::from([ReferenceAccessMode::Read]))]),
+        );
+
+        // The same body attached once with a boundary view and once with two forwarded handles has no single set of
+        // input records that is correct for both attachments.
+        let body = reading_scan_body();
+        let mut builder = TestBuilder::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let carry = builder.add_input(reference_type(0));
+        let stacked = builder.add_input(reference_type(1));
+        builder
+            .add_instruction(TestOperation::Scan { carry_count: 1 }, vec![body], vec![carry, stacked], None)
+            .unwrap();
+        builder.add_instruction(TestOperation::Call, vec![body], vec![carry, stacked], None).unwrap();
+        assert!(matches!(
+            build(builder, Vec::new()).reference_analysis(0),
+            Err(ReferenceAnalysisError::InvalidBoundaryShape { region, message })
+                if region == RegionId::new(0)
+                    && message == "shared region is reached with two different sets of boundary view inputs",
+        ));
+    }
+
+    #[test]
+    fn test_reference_analysis_new_rejects_narrowed_boundary_view_sources() {
+        // The operand a boundary view is created from must itself be a complete-value handle.
+        assert!(matches!(
+            stacked_scan_program(reading_scan_body(), true).reference_analysis(0),
+            Err(ReferenceAnalysisError::ViewCrossesRegionBoundary {
+                operation: "test.scan",
+                instruction,
+                region_index: 0,
+                boundary: "input",
+                index: 1,
+            }) if instruction == id(1, 1),
+        ));
+    }
+
+    #[test]
+    fn test_reference_analysis_new_rejects_consumption_through_boundary_views() {
+        let mut body = TestBuilder::new();
+        let carry = body.add_input(reference_type(0));
+        let element = body.add_input(reference_type(1));
+        body.add_instruction(TestOperation::Consume, Vec::new(), vec![element], None).unwrap();
+        let body = build(body, vec![carry]);
+        assert!(matches!(
+            stacked_scan_program(body, false).reference_analysis(0),
+            Err(ReferenceAnalysisError::ConsumeThroughView {
+                operation: "test.consume",
+                instruction,
+                input_index: 0,
+                root,
+            }) if instruction == id(0, 0) && root == input_root(0, 1),
+        ));
+    }
+
+    #[test]
+    fn test_reference_analysis_new_rejects_forwarding_boundary_views() {
+        // The view created at the boundary stays inside the region: returning it is a view leaving the region.
+        let mut body = TestBuilder::new();
+        let carry = body.add_input(reference_type(0));
+        let element = body.add_input(reference_type(1));
+        let body = build(body, vec![carry, element]);
+        assert!(matches!(
+            stacked_scan_program(body, false).reference_analysis(0),
+            Err(ReferenceAnalysisError::ViewCrossesRegionBoundary {
+                operation: "test.scan",
+                instruction,
+                region_index: 0,
+                boundary: "output",
+                index: 1,
+            }) if instruction == id(1, 0),
+        ));
+    }
+
+    #[test]
+    fn test_reference_analysis_new_rejects_conflicting_region_input_provenance() {
+        // The builder rejects an operation declaring both hooks for one input, so the instruction is added unchecked.
+        let mut body = TestBuilder::new();
+        let reference = body.add_input(reference_type(0));
+        let body = build(body, vec![reference]);
+        let mut builder = TestBuilder::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let reference = builder.add_input(reference_type(0));
+        let output = builder.add_variable(reference_type(0));
+        builder.add_instruction_unchecked(Instruction::new(
+            TestOperation::Conflicting,
+            vec![reference],
+            vec![output],
+            vec![body],
+        ));
+        assert!(matches!(
+            build(builder, Vec::new()).reference_analysis(0),
+            Err(ReferenceAnalysisError::ConflictingRegionInputProvenance {
+                operation: "test.conflicting",
+                instruction,
+                region_index: 0,
+                input_index: 0,
+            }) if instruction == id(1, 0),
+        ));
     }
 
     #[test]
@@ -2966,11 +3426,23 @@ mod tests {
         assert_eq!(analysis.external_source(input_root(0, 0)), None);
         assert_eq!(
             analysis.alias(value(2, 4)),
-            Some(ReferenceAliasEdge::new(id(2, 0), 0, value(2, 0), ReferenceAliasKind::View, true))
+            Some(ReferenceAliasEdge::new(
+                id(2, 0),
+                ReferenceAliasOrigin::Output(0),
+                value(2, 0),
+                ReferenceAliasKind::View,
+                true
+            ))
         );
         assert_eq!(
             analysis.alias(value(2, 5)),
-            Some(ReferenceAliasEdge::new(id(2, 1), 0, value(2, 4), ReferenceAliasKind::View, true))
+            Some(ReferenceAliasEdge::new(
+                id(2, 1),
+                ReferenceAliasOrigin::Output(0),
+                value(2, 4),
+                ReferenceAliasKind::View,
+                true
+            ))
         );
         assert!(analysis.is_view(value(2, 5)));
         assert_eq!(analysis.root_of(value(2, 5)), Some(captured));
@@ -2988,8 +3460,8 @@ mod tests {
         assert_eq!(
             analysis.region_input_bindings(),
             &[
-                ReferenceRegionInputBinding::new(id(2, 4), 0, value(0, 0), external),
-                ReferenceRegionInputBinding::new(id(2, 4), 1, value(1, 0), external),
+                ReferenceRegionInputBinding::new(id(2, 4), 0, value(0, 0), external, false),
+                ReferenceRegionInputBinding::new(id(2, 4), 1, value(1, 0), external, false),
             ],
         );
         assert!(!analysis.is_mutated(captured));
@@ -3078,7 +3550,13 @@ mod tests {
         assert_eq!(analysis.root_of(value(2, 3)), Some(reference));
         assert_eq!(
             analysis.alias(value(2, 3)),
-            Some(ReferenceAliasEdge::new(id(2, 0), 1, value(2, 1), ReferenceAliasKind::Identity, false))
+            Some(ReferenceAliasEdge::new(
+                id(2, 0),
+                ReferenceAliasOrigin::Output(1),
+                value(2, 1),
+                ReferenceAliasKind::Identity,
+                false
+            ))
         );
         assert_eq!(
             analysis.transitive_access(id(2, 0)).unwrap().accesses(),
@@ -3240,11 +3718,23 @@ mod tests {
         assert_eq!(analysis.alias(value(1, 3)), None);
         assert_eq!(
             analysis.alias(value(1, 4)),
-            Some(ReferenceAliasEdge::new(id(1, 1), 0, value(1, 3), ReferenceAliasKind::View, true))
+            Some(ReferenceAliasEdge::new(
+                id(1, 1),
+                ReferenceAliasOrigin::Output(0),
+                value(1, 3),
+                ReferenceAliasKind::View,
+                true
+            ))
         );
         assert_eq!(
             analysis.alias(value(1, 5)),
-            Some(ReferenceAliasEdge::new(id(1, 2), 0, value(1, 4), ReferenceAliasKind::Identity, true))
+            Some(ReferenceAliasEdge::new(
+                id(1, 2),
+                ReferenceAliasOrigin::Output(0),
+                value(1, 4),
+                ReferenceAliasKind::Identity,
+                true
+            ))
         );
         assert_eq!(analysis.alias(value(1, 0)), None);
         assert_eq!(analysis.alias(value(0, 3)), None);
@@ -3266,7 +3756,7 @@ mod tests {
     fn test_reference_analysis_region_input_bindings() {
         assert_eq!(
             fixture_analysis().region_input_bindings(),
-            &[ReferenceRegionInputBinding::new(id(1, 7), 0, value(0, 0), input_root(1, 1))],
+            &[ReferenceRegionInputBinding::new(id(1, 7), 0, value(0, 0), input_root(1, 1), false)],
         );
     }
 

@@ -376,7 +376,7 @@ mod tests {
         let (output, pullback) = differentiate_at(Array::vector(vec![2.0, 3.0]))
             .vjp(|x| Ok(x.transfer_to_memory(PINNED_HOST)))
             .unwrap();
-        let (pullback, residuals) = pullback.into_parts();
+        let (pullback, residuals) = pullback.into_transposed_parts().unwrap();
         assert_eq!(output.to_f64s(), vec![2.0, 3.0]);
         // The linear transfer carries no residual, so the direct-transpose pullback consumes only the pinned-host
         // cotangent and transfers it back to the operand's source memory.

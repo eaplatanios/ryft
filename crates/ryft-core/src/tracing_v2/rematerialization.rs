@@ -28,6 +28,21 @@
 //!      feeder with its saved payload (behind its staged restore operation) or with a memoized *recompute slice*
 //!      copied from the primal program.
 //!
+//! # References
+//!
+//! A body may allocate, access, and consume its own references and may read reference-typed inputs. The reference
+//! analysis of the traced body classifies every root: a *local* root is an allocation inside the body and an *external*
+//! root is a reference-typed input. A complete local lifecycle is recomputable: the recompute slice of a residual
+//! includes, for every local root that an instruction in the slice accesses, every earlier mutation of that root, so
+//! recomputing a read replays exactly the state the read observed, and recomputing the allocation changes an identity
+//! that nothing outside the body can observe. Reads of external roots are force-saved, because recomputing them could
+//! observe changed state, and any other non-pure instruction (e.g., a print) keeps forcing a save. A body that mutates
+//! an external root is rejected, as is a body that captures a reference (the fresh trace rejects captures and
+//! reference-typed constants, so references enter a rematerialized function only as inputs) or that returns a
+//! reference it allocated (the handle would escape the recomputed lifecycle). A
+//! reference-typed residual is never saved: an external one is the input reference itself and reaches the derived
+//! programs through the forward tail's region inputs, and a local one is rejected as an escaping handle.
+//!
 //! The built-in policies mirror JAX's `jax.checkpoint_policies` (the name-based members classify residuals by the
 //! [`tag`](crate::operations::tag::Tag::tag) key carried by the producing
 //! [`TagOperation`]), and closure-backed custom policies wrap in [`PolicyFn`] with full access to every operation that
@@ -54,14 +69,16 @@ use crate::differentiation::{
     DifferentiationError, ResidualZeroProvider, TransposableOperation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, check_types, impl_reference_free_dischargeable_operation};
+use crate::macros::{check_count, check_types};
 use crate::operations::{AddOperation, DotOperation, TagOperation, TransferToMemoryOperation, Zero};
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{
-    Atom, AtomId, InstructionId, Operation, OperationFormatter, Program, ProgramBuilder, ProgramError,
-    ReferenceDischargePolicy, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceType, Region,
-    RegionId, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueId,
+    Atom, AtomId, Effect, Effects, InstructionId, Operation, OperationFormatter, OutputRegionProvenance, Program,
+    ProgramBuilder, ProgramError, ReferenceAccessMode, ReferenceAnalysis, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary,
+    ReferenceDischargeRegionStateInsertion, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceRoot,
+    Region, RegionId, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueId,
 };
 use crate::tracing::{DomainTracer, Trace, TracingContext};
 
@@ -88,11 +105,26 @@ pub const REMATERIALIZE_OPERATION_NAME: &str = "rematerialize";
 /// state through a structurally batched region's boundary (e.g., a composite universe's first-class mapped extent)
 /// reintroduces that state as additional leading non-differentiated operands of the batched call.
 ///
+/// The forward region maps the operands to the primal outputs followed by the *forward tail*: the region inputs and
+/// then the saved residuals. The tangent region maps `(non_differentiated..., forward_tail..., tangents...)`, with one
+/// tangent per differentiated operand (a tangent reference for a reference-typed operand), to one tangent per primal
+/// output. The backward region maps `(non_differentiated..., forward_tail..., lead...)` to one cotangent per
+/// differentiated operand, where `lead` is one cotangent per non-reference primal output followed by one cotangent
+/// destination reference per differentiated reference-typed operand, in operand order: exactly the boundary that
+/// [`Program::transpose_with_destinations`] gives the transposed tangent program under the default destination kinds. A
+/// reference-typed primal output forwards an input root and therefore has no cotangent slot, and a differentiated
+/// reference-typed operand's cotangent output is its destination reference returned by identity. The operands are
+/// forwarded positionally into the primal and forward regions and, for the leading non-differentiated operands, into
+/// the backward and tangent regions; the primal outputs forward the primal region's outputs.
+///
 /// The `T` parameter fixes the type universe of every attached region and the call boundary. Each concrete payload
 /// therefore has exactly one [`Operation<Type = T>`](Operation) contract, while the rematerialization algorithm remains one
-/// shared implementation for all type universes.
+/// shared implementation for all type universes. The universe must be [`DifferentiableType`], because the backward and
+/// tangent boundaries are stated in terms of the tangent and cotangent representations of the primal types (e.g., the
+/// cotangent destination of a `ref<T>` operand is a `ref<cotangent(T)>`), which coincide with the primal types only
+/// for self-dual universes.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RematerializeOperation<T: Type> {
+pub struct RematerializeOperation<T: DifferentiableType> {
     /// Backend lowering hint requesting an optimization barrier around rematerialized backward/tangent outputs.
     prevent_cse: bool,
 
@@ -103,9 +135,9 @@ pub struct RematerializeOperation<T: Type> {
     marker: PhantomData<fn() -> T>,
 }
 
-impl<T: Type> Copy for RematerializeOperation<T> {}
+impl<T: DifferentiableType> Copy for RematerializeOperation<T> {}
 
-impl<T: Type> RematerializeOperation<T> {
+impl<T: DifferentiableType> RematerializeOperation<T> {
     /// Creates a rematerialization operation. The primal, forward, backward, and tangent [`Program`]s are supplied
     /// separately as the operation's attached regions (via the region driver passed to
     /// [`Context::bind`]) in the region order `["primal", "forward", "backward", "tangent"]`;
@@ -160,6 +192,42 @@ impl<T: Type> RematerializeOperation<T> {
         Ok(values.split_at(self.non_differentiated_count))
     }
 
+    /// Returns the input types of the four attached regions (`["primal", "forward", "backward", "tangent"]` region
+    /// order) for a call over `input_types` whose primal produces `output_types` and whose forward tail saves
+    /// `residual_types`. The primal and forward regions receive the operands; the backward region receives the
+    /// non-differentiated operands, the residuals, one cotangent per non-reference primal output, and one cotangent
+    /// destination reference per differentiated reference-typed operand; and the tangent region receives the
+    /// non-differentiated operands, the residuals, and one tangent per differentiated operand. Derivative positions
+    /// carry the [`DifferentiableType::tangent`] and [`DifferentiableType::cotangent`] representations of their primal
+    /// types, which is what [`Program::transpose_with_destinations`] and the linearization tangent program expose
+    /// (e.g., `ref<cotangent(T)>` for the destination of a `ref<T>` operand). Refer to the documentation of
+    /// [`RematerializeOperation`] for the complete contract.
+    fn region_input_types(
+        &self,
+        input_types: &[T],
+        output_types: &[T],
+        residual_types: &[T],
+    ) -> Result<[Vec<T>; 4], TypeError> {
+        let (non_differentiated_types, differentiated_types) = self.split_inputs(input_types)?;
+        let forward_tail = non_differentiated_types.iter().chain(residual_types).cloned();
+        let backward_lead = output_types
+            .iter()
+            .filter(|r#type| !r#type.is_reference())
+            .chain(differentiated_types.iter().filter(|r#type| r#type.is_reference()))
+            .map(DifferentiableType::cotangent)
+            .collect::<Result<Vec<_>, DifferentiationError>>()?;
+        let differentiated_tangent_types = differentiated_types
+            .iter()
+            .map(DifferentiableType::tangent)
+            .collect::<Result<Vec<_>, DifferentiationError>>()?;
+        Ok([
+            input_types.to_vec(),
+            input_types.to_vec(),
+            forward_tail.clone().chain(backward_lead).collect(),
+            forward_tail.chain(differentiated_tangent_types).collect(),
+        ])
+    }
+
     /// Validates the rematerialization contract over the four attached region interfaces
     /// (`["primal", "forward", "backward", "tangent"]` region order) and returns the primal interface; refer to the
     /// documentation of [`RematerializeOperation::new`] for the contract.
@@ -174,7 +242,7 @@ impl<T: Type> RematerializeOperation<T> {
         let tangent_interface = &region_interfaces[3];
         let input_types = primal_interface.input_types();
         let output_types = primal_interface.output_types();
-        let (non_differentiated_types, differentiated_types) = self.split_inputs(input_types)?;
+        let (_, differentiated_types) = self.split_inputs(input_types)?;
         check_types!(@same, format!("{REMATERIALIZE_OPERATION_NAME} forward input"), [
             input_types,
             forward_interface.input_types(),
@@ -193,44 +261,50 @@ impl<T: Type> RematerializeOperation<T> {
             &forward_output_types[..output_types.len()],
         ]);
         let residual_types = &forward_output_types[output_types.len()..];
-        let expected_backward_input_types: Vec<T> =
-            non_differentiated_types.iter().chain(residual_types).chain(output_types.iter()).cloned().collect();
+        let [_, _, expected_backward_input_types, expected_tangent_input_types] =
+            self.region_input_types(input_types, output_types, residual_types)?;
         check_types!(@same, format!("{REMATERIALIZE_OPERATION_NAME} backward input"), [
             &expected_backward_input_types,
             backward_interface.input_types(),
         ]);
+        let expected_backward_output_types = differentiated_types
+            .iter()
+            .map(DifferentiableType::cotangent)
+            .collect::<Result<Vec<_>, DifferentiationError>>()?;
         check_types!(@same, format!("{REMATERIALIZE_OPERATION_NAME} backward output"), [
-            differentiated_types,
+            &expected_backward_output_types,
             backward_interface.output_types(),
         ]);
-        let expected_tangent_input_types: Vec<T> =
-            non_differentiated_types.iter().chain(residual_types).chain(differentiated_types).cloned().collect();
         check_types!(@same, format!("{REMATERIALIZE_OPERATION_NAME} tangent input"), [
             &expected_tangent_input_types,
             tangent_interface.input_types(),
         ]);
+        let expected_tangent_output_types = output_types
+            .iter()
+            .map(DifferentiableType::tangent)
+            .collect::<Result<Vec<_>, DifferentiationError>>()?;
         check_types!(@same, format!("{REMATERIALIZE_OPERATION_NAME} tangent output"), [
-            output_types,
+            &expected_tangent_output_types,
             tangent_interface.output_types(),
         ]);
         Ok(primal_interface)
     }
 }
 
-impl<T: Type> Default for RematerializeOperation<T> {
+impl<T: DifferentiableType> Default for RematerializeOperation<T> {
     #[inline]
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl<T: Type> Display for RematerializeOperation<T> {
+impl<T: DifferentiableType> Display for RematerializeOperation<T> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.render(formatter, 0)
     }
 }
 
-impl<T: Type> Operation for RematerializeOperation<T> {
+impl<T: DifferentiableType> Operation for RematerializeOperation<T> {
     type Type = T;
 
     #[inline]
@@ -279,21 +353,9 @@ impl<T: Type> Operation for RematerializeOperation<T> {
             )));
         }
         let residual_types = &forward_output_types[primal_output_types.len()..];
-        let (non_differentiated_types, differentiated_types) = self.split_inputs(input_types)?;
-        let backward_input_types = non_differentiated_types
-            .iter()
-            .chain(residual_types)
-            .chain(primal_output_types.iter())
-            .cloned()
-            .collect::<Vec<_>>();
-        let tangent_input_types =
-            non_differentiated_types.iter().chain(residual_types).chain(differentiated_types).cloned().collect();
-        Ok(vec![
-            Some(input_types.to_vec()),
-            Some(input_types.to_vec()),
-            Some(backward_input_types),
-            Some(tangent_input_types),
-        ])
+        let region_input_types =
+            self.region_input_types(input_types, primal_output_types.as_slice(), residual_types)?;
+        Ok(region_input_types.into_iter().map(Some).collect())
     }
 
     fn infer_output_types(
@@ -307,6 +369,24 @@ impl<T: Type> Operation for RematerializeOperation<T> {
             input_types,
         ]);
         Ok(primal_interface.output_types().to_vec())
+    }
+
+    #[inline]
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
+        // The primal and forward regions receive the operands positionally. The backward and tangent regions receive
+        // only the leading non-differentiated operands positionally; the rest of their boundaries is bound by the
+        // forward tail and by the transform that consumes the rule, not by the operands directly.
+        match region_index {
+            0 | 1 => Some(input_index),
+            2 | 3 => (input_index < self.non_differentiated_count).then_some(input_index),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
+        // Every output is the corresponding output of the primal region, which is what interpretation runs.
+        vec![OutputRegionProvenance { region_index: 0, output_index }]
     }
 
     #[inline]
@@ -331,7 +411,7 @@ impl<T: Type> Operation for RematerializeOperation<T> {
     }
 }
 
-impl<C: Domain> InterpretableOperation<C> for RematerializeOperation<C::Type> {
+impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for RematerializeOperation<C::Type> {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
         context: &C,
@@ -345,15 +425,87 @@ impl<C: Domain> InterpretableOperation<C> for RematerializeOperation<C::Type> {
 /// Partial evaluation defers to the default fold-or-residualize behavior of [`Program::partially_evaluate`] for a
 /// [`RematerializeOperation`]: a call with all-known operands folds by interpreting its primal, and otherwise
 /// residualizes unchanged.
-impl<C: Context> PartiallyEvaluatableOperation<C> for RematerializeOperation<C::Type> where
+impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for RematerializeOperation<C::Type> where
     C::Operation: From<RematerializeOperation<C::Type>>
 {
 }
 
-// Rematerialization replays verbatim. Recomputing a region is only sound when recomputing it has no observable effect,
-// which a mutation is, so the shared reference-free rule copies its primal region and its three dormant rule regions
-// across unchanged and rejects the application by name if a reference reaches any of their closures.
-impl_reference_free_dischargeable_operation!(<T> RematerializeOperation<T> where T: Type);
+// Rematerialization discharges each of its four regions independently. Reference operands are rejected: the derived
+// rule regions bind a reference operand through the forward tail and through cotangent destinations rather than
+// positionally, so discharge has no state boundary through which to thread caller state, and a caller that needs a
+// discharged program discharges before rematerializing. Without reference operands no caller allocation enters any
+// region, so a local lifecycle inside a region discharges within that region, and every region summary must report
+// that no caller allocation is reached, including through a capture constant.
+impl<T, C, P> ReferenceDischargeableOperation<C, P> for RematerializeOperation<T>
+where
+    T: DifferentiableType,
+    RematerializeOperation<T>: Operation<Type = C::Type>,
+    C: Context<Operation: From<RematerializeOperation<T>>>,
+    P: ReferenceDischargePolicy<C>,
+{
+    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
+        &self,
+        context: &ReferenceDischargeContext<C, P>,
+        driver: &D,
+        inputs: &[ReferenceDischargeValue<C, P>],
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        let name = self.name();
+        self.validate_region_count(driver.region_count())?;
+        let is_reference =
+            |input: &ReferenceDischargeValue<C, P>| matches!(input, ReferenceDischargeValue::Reference(_));
+        if let Some(position) = inputs.iter().position(is_reference) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "`{name}` does not thread external references through discharge, but operand {position} is a \
+                     reference; pass reference-free operands or discharge before rematerializing",
+                ),
+            });
+        }
+        // Reference-free operands leave the primal and forward boundaries reference-free, but a hand-built call may
+        // still declare reference inputs on its rule regions (through a reference-typed residual in the forward tail).
+        // Those inputs are bound by the transform that instantiates the rule rather than by any operand, so no caller
+        // allocation can be threaded into them; they are rejected here, under the operand diagnostic, instead of
+        // failing the region rebuild with an internal boundary error.
+        for index in 0..driver.region_count() {
+            if let Some(position) = driver.region(index)?.input_types().iter().position(Type::is_reference) {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "`{name}` does not thread external references through discharge, but input {position} of \
+                         region {index} is a reference; pass reference-free operands or discharge before \
+                         rematerializing",
+                    ),
+                });
+            }
+        }
+        let mut regions = Vec::with_capacity(driver.region_count());
+        for index in 0..driver.region_count() {
+            let region = driver.region(index)?;
+            let declared_input_allocations = vec![None; region.input_ids().len()];
+            let summary = context.region_summary(self, index, region, declared_input_allocations.as_slice())?;
+            if let Some(allocation) = summary.reached_allocations().next() {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: format!(
+                        "`{name}` does not thread external references through discharge, but its region {index} \
+                         reaches {allocation}; discharge before rematerializing",
+                    ),
+                });
+            }
+            let boundary = ReferenceDischargeRegionBoundary::new(
+                self,
+                index,
+                declared_input_allocations,
+                ReferenceDischargeRegionStateInsertion::new(Vec::new(), region.input_ids().len()),
+                ReferenceDischargeRegionStateInsertion::new(Vec::new(), region.output_ids().len()),
+            );
+            let result = driver.rebuild_region(context, index, &boundary)?;
+            result.validate_predicted_mutations(&[], name)?;
+            regions.push(result.into_program());
+        }
+        let operands = inputs.iter().map(|input| context.operand_value(input)).collect::<Result<Vec<_>, _>>()?;
+        let outputs = context.parent().bind(*self, regions, operands.as_slice())?;
+        Ok(outputs.into_iter().map(ReferenceDischargeValue::Value).collect())
+    }
+}
 
 /// Capture-free forward-mode (JVP) rule for [`RematerializeOperation`]: replays the derived forward and tangent
 /// programs through the active context, staging their operations in the shared builder.
@@ -459,7 +611,7 @@ where
     }
 }
 
-crate::impl_non_transposable_operation!(<T> RematerializeOperation<T> where T: Type);
+crate::impl_non_transposable_operation!(<T> RematerializeOperation<T> where T: DifferentiableType);
 
 /// Batching rule for [`RematerializeOperation`]. The primal and forward regions receive the wrapper operands' existing
 /// axes, forward-tail residuals retain their natural axes, and the tangent region receives the non-differentiated
@@ -1594,41 +1746,196 @@ fn validate_restored_residual_type<T: Type>(restored_type: &T, logical_type: &T)
     Ok(())
 }
 
-/// Returns whether the transitive recompute slice rooted at `root` stays pure: whether it reaches only pure
-/// instructions before terminating at region inputs, constants, or the current saved cuts.
+/// Reference facts of a linearization primal that recompute slices consult, derived from the primal's
+/// [`ReferenceAnalysis`]: which local roots each entry instruction accesses, whether it accesses an external root,
+/// where each local root is mutated, and consequently whether each entry instruction is recomputable.
+///
+/// A *local* root is a [`ReferenceRoot::Allocation`] performed by an entry instruction of the primal, and every other
+/// root an entry instruction reaches is *external*: a reference-typed input of the primal. Recomputing an instruction
+/// that accesses only local roots is sound once every earlier mutation of those roots is recomputed too, because the
+/// recomputed lifecycle is then complete and its identity is unobservable outside the body. Recomputing an access of an
+/// external root could observe changed state and is never done, and an ordered instruction that reaches no local root
+/// at all (e.g., a print, or an opaque stateful operation) is not a reference lifecycle and is never recomputed either.
+/// An instruction whose attached regions allocate, access, and consume references entirely inside them reaches no entry
+/// root and is conservatively treated the same way.
+struct PrimalReferenceAccesses {
+    /// Per entry instruction, the local roots it accesses directly or through attached computation regions, as indices
+    /// into [`mutations`](Self::mutations).
+    local_roots: Vec<Vec<usize>>,
+
+    /// Per entry instruction, whether it accesses an external root.
+    external: Vec<bool>,
+
+    /// Per local root, the entry instructions that define or mutate it (its allocation and every non-read access), in
+    /// program order.
+    mutations: Vec<Vec<usize>>,
+
+    /// Per entry instruction, whether recompute slices may copy it (refer to the documentation of
+    /// [`is_recomputable`](Self::is_recomputable)).
+    recomputable: Vec<bool>,
+}
+
+impl PrimalReferenceAccesses {
+    /// Derives the reference facts of `primal` from `analysis`, or facts recording no reference access when the primal
+    /// contains no references and therefore has no analysis.
+    fn new<V: Value, O: Operation<Type = V::Type>>(
+        primal: &Program<V, O, Vec<V>, Vec<V>>,
+        analysis: Option<&ReferenceAnalysis>,
+    ) -> Self {
+        let instruction_count = primal.instructions().len();
+        let mut accesses = Self {
+            local_roots: vec![Vec::new(); instruction_count],
+            external: vec![false; instruction_count],
+            mutations: Vec::new(),
+            recomputable: Vec::with_capacity(instruction_count),
+        };
+        if let Some(analysis) = analysis {
+            accesses.record_accesses(primal, analysis);
+        }
+
+        // An instruction is recomputable when it is pure, or when it is an ordered-state instruction whose only effect
+        // is accessing local roots. Instruction-level effects include the recursively derived effects of attached
+        // computation regions, so an effect inside a nested body (e.g., a print in a scan body) also forces the save.
+        for index in 0..instruction_count {
+            let effects = primal.instruction_effects(InstructionId::new(primal.entry(), index)).unwrap();
+            accesses.recomputable.push(
+                effects.is_pure()
+                    || (!accesses.external[index]
+                        && !accesses.local_roots[index].is_empty()
+                        && effects == Effects::single(Effect::OrderedState)),
+            );
+        }
+        accesses
+    }
+
+    /// Records into `self` which local and external roots every entry instruction of `primal` accesses and where each
+    /// local root is mutated, according to `analysis`.
+    fn record_accesses<V: Value, O: Operation<Type = V::Type>>(
+        &mut self,
+        primal: &Program<V, O, Vec<V>, Vec<V>>,
+        analysis: &ReferenceAnalysis,
+    ) {
+        let entry = primal.entry();
+
+        // The allocation defines the root's state, so it heads the root's mutation list, and the allocating
+        // instruction accesses the root so that it counts as a reference lifecycle instruction rather than as an
+        // opaque ordered one.
+        let mut slots = HashMap::new();
+        for root in analysis.roots() {
+            let ReferenceRoot::Allocation { instruction, .. } = root else {
+                continue;
+            };
+            if instruction.region() != entry {
+                continue;
+            }
+            let slot = self.mutations.len();
+            self.mutations.push(vec![instruction.index()]);
+            self.local_roots[instruction.index()].push(slot);
+            slots.insert(root, slot);
+        }
+
+        // Transitive access summaries are expressed in the entry namespace, so every root they name is either an
+        // entry allocation or an entry input, and every access recorded there happened at or below this instruction.
+        for index in 0..primal.instructions().len() {
+            let Some(access) = analysis.transitive_access(InstructionId::new(entry, index)) else {
+                continue;
+            };
+            for (root, modes) in access.accesses() {
+                let Some(slot) = slots.get(root).copied() else {
+                    self.external[index] = true;
+                    continue;
+                };
+                if !self.local_roots[index].contains(&slot) {
+                    self.local_roots[index].push(slot);
+                }
+                if modes.iter().any(|mode| *mode != ReferenceAccessMode::Read) {
+                    self.mutations[slot].push(index);
+                }
+            }
+        }
+    }
+
+    /// Returns whether recompute slices may copy the entry instruction at `index`: whether it is pure, or an
+    /// ordered-state instruction whose only effect is accessing local roots.
+    #[inline]
+    fn is_recomputable(&self, index: usize) -> bool {
+        self.recomputable[index]
+    }
+
+    /// Returns the entry instructions preceding `index` that define or mutate a local root the instruction at `index`
+    /// accesses: the state predecessors a recompute slice must replay so that the access observes the state it
+    /// observed in the primal.
+    fn state_predecessors(&self, index: usize) -> impl Iterator<Item = usize> + '_ {
+        self.local_roots[index].iter().flat_map(move |slot| {
+            self.mutations[*slot].iter().copied().take_while(move |predecessor| *predecessor < index)
+        })
+    }
+}
+
+/// Gathers the recompute slice of the primal atom `root`: the indices of the not-yet-terminal instructions the slice
+/// needs, closed under data dependencies and, for every local root an instruction in the slice accesses, under the
+/// earlier definitions and mutations of that root (refer to the documentation of
+/// [`PrimalReferenceAccesses::state_predecessors`]), so that the slice replays exactly the state each access observed.
+/// Traversal stops at atoms for which `terminal` holds, at instructions for which `copied` holds (state predecessors
+/// reach instructions directly, including ones without outputs, so they need their own terminal test), and at region
+/// inputs and constants, and records every atom it visits in `visited`. Iterating the returned set copies the
+/// instructions in primal instruction order, so every copied instruction's inputs and state predecessors are available
+/// by the time it is copied.
+fn gather_recompute_slice<V: Value, O: Operation<Type = V::Type>>(
+    primal: &Program<V, O, Vec<V>, Vec<V>>,
+    accesses: &PrimalReferenceAccesses,
+    instruction_by_output: &[Option<usize>],
+    terminal: impl Fn(usize) -> bool,
+    copied: impl Fn(usize) -> bool,
+    visited: &mut HashSet<usize>,
+    root: AtomId,
+) -> BTreeSet<usize> {
+    let mut needed = BTreeSet::new();
+    let mut atoms = vec![root.index()];
+    let mut instructions = Vec::new();
+    loop {
+        while let Some(atom) = atoms.pop() {
+            if terminal(atom) || !visited.insert(atom) {
+                continue;
+            }
+            if let Some(instruction) = instruction_by_output[atom] {
+                instructions.push(instruction);
+            }
+        }
+        let Some(instruction) = instructions.pop() else {
+            break;
+        };
+        if copied(instruction) || !needed.insert(instruction) {
+            continue;
+        }
+        atoms.extend(primal.instructions()[instruction].inputs().iter().map(|input| input.index()));
+        instructions.extend(accesses.state_predecessors(instruction));
+    }
+    needed
+}
+
+/// Returns whether the transitive recompute slice rooted at `root` is recomputable: whether it reaches only
+/// recomputable instructions (refer to the documentation of [`PrimalReferenceAccesses::is_recomputable`]) before
+/// terminating at region inputs, constants, or the current saved cuts.
 ///
 /// `safe` memoizes only *positive* answers, which stay valid as the classification pass upgrades residuals — cuts
-/// only ever grow, and adding a cut can never make a pure slice impure. Negative answers are recomputed per root, so
-/// the producer-topological upgrade pass in [`Rematerialize::call`] is deterministic: once an earlier root upgrades
-/// to a saved cut, every later root's slice legitimately terminates there.
-fn residual_slice_is_pure<V: Value, O: Operation<Type = V::Type>>(
+/// only ever grow, and adding a cut can never make a recomputable slice non-recomputable. Negative answers are
+/// recomputed per root, so the producer-topological upgrade pass in [`Rematerialize::call`] is deterministic: once an
+/// earlier root upgrades to a saved cut, every later root's slice legitimately terminates there.
+fn residual_slice_is_recomputable<V: Value, O: Operation<Type = V::Type>>(
     primal: &Program<V, O, Vec<V>, Vec<V>>,
+    accesses: &PrimalReferenceAccesses,
     instruction_by_output: &[Option<usize>],
     cuts: &HashSet<usize>,
     safe: &mut HashSet<usize>,
     root: AtomId,
 ) -> bool {
-    let mut stack = vec![root.index()];
     let mut visited = HashSet::new();
-    while let Some(index) = stack.pop() {
-        if safe.contains(&index) || cuts.contains(&index) || !visited.insert(index) {
-            continue;
-        }
-        match instruction_by_output[index] {
-            // Region inputs and constants terminate every slice.
-            None => {}
-            Some(instruction_index) => {
-                let instruction = &primal.instructions()[instruction_index];
-                // Instruction-level effects include the recursively derived effects of attached regions, so an
-                // effect inside a nested body (e.g., a print in a scan body) also forces the save.
-                let effects =
-                    primal.instruction_effects(InstructionId::new(primal.entry(), instruction_index)).unwrap();
-                if !effects.is_pure() {
-                    return false;
-                }
-                stack.extend(instruction.inputs().iter().map(|input| input.index()));
-            }
-        }
+    let terminal = |index: usize| safe.contains(&index) || cuts.contains(&index);
+    let slice =
+        gather_recompute_slice(primal, accesses, instruction_by_output, terminal, |_| false, &mut visited, root);
+    if !slice.iter().all(|instruction| accesses.is_recomputable(*instruction)) {
+        return false;
     }
     safe.extend(visited);
     true
@@ -1642,12 +1949,20 @@ fn residual_slice_is_pure<V: Value, O: Operation<Type = V::Type>>(
 /// [`replayed`](Self::replayed) map recording the outputs of copied producer instructions. Resolution always
 /// consults the cuts first, so for a producer `(a, b)` with `a` saved and `b` recomputed, the replayed instruction
 /// also produces a replayed `a`, but every dependency on `a` resolves to the restored saved input — never the
-/// replayed sibling. Each producer instruction is copied at most once (all of its outputs are recorded together),
-/// slices terminate at cuts, region inputs, and constants, and — because the classification pass force-saves any
-/// residual whose slice would reach a non-pure instruction — copying a non-pure instruction is an internal error.
+/// replayed sibling. Each producer instruction is copied at most once (all of its outputs are recorded together), the
+/// state predecessors of a copied reference access are copied with it (refer to the documentation of
+/// [`gather_recompute_slice`]), slices terminate at cuts, region inputs, and constants, and — because the
+/// classification pass force-saves any residual whose slice would reach a non-recomputable instruction — copying a
+/// non-recomputable instruction is an internal error. Several slices can be copied together as one union in primal
+/// instruction order (refer to the documentation of [`copy_slices`](Self::copy_slices)), which is how the accesses of
+/// one local reference lifecycle keep their primal order however they are demanded.
 struct PrimalSliceResolver<'p, V: Value, O> {
     /// Linearization primal program the slices are copied from.
     primal: &'p Program<V, O, Vec<V>, Vec<V>>,
+
+    /// Reference facts of the primal deciding which instructions are recomputable and which state predecessors a
+    /// copied reference access needs.
+    accesses: &'p PrimalReferenceAccesses,
 
     /// Producing-instruction index per primal atom index.
     instruction_by_output: Vec<Option<usize>>,
@@ -1659,22 +1974,33 @@ struct PrimalSliceResolver<'p, V: Value, O> {
     /// Replay-output map from primal atom index to the destination atom produced by its copied instruction.
     replayed: Vec<Option<AtomId>>,
 
+    /// Per primal instruction, whether it has been copied. State predecessors reach instructions directly (including
+    /// ones without outputs, such as writes), so this is what keeps each of them copied at most once.
+    copied: Vec<bool>,
+
     /// Mapping preserving attached-region sharing across every producer instruction copied from the primal.
     region_remapping: HashMap<RegionId, RegionId>,
 }
 
 impl<'p, V: Value, O: Operation<Type = V::Type>> PrimalSliceResolver<'p, V, O> {
-    /// Creates a resolver over `primal` whose region inputs resolve to `region_inputs` in the destination program.
-    fn new(primal: &'p Program<V, O, Vec<V>, Vec<V>>, region_inputs: &[AtomId]) -> Self {
+    /// Creates a resolver over `primal`, with reference facts `accesses`, whose region inputs resolve to
+    /// `region_inputs` in the destination program.
+    fn new(
+        primal: &'p Program<V, O, Vec<V>, Vec<V>>,
+        accesses: &'p PrimalReferenceAccesses,
+        region_inputs: &[AtomId],
+    ) -> Self {
         let mut cuts = vec![None; primal.atoms().len()];
         for (position, input) in primal.input_ids().iter().enumerate() {
             cuts[input.index()] = Some(region_inputs[position]);
         }
         Self {
             primal,
+            accesses,
             instruction_by_output: primal.instruction_by_output(),
             cuts,
             replayed: vec![None; primal.atoms().len()],
+            copied: vec![false; primal.instructions().len()],
             region_remapping: HashMap::new(),
         }
     }
@@ -1699,41 +2025,59 @@ impl<'p, V: Value, O: Operation<Type = V::Type>> PrimalSliceResolver<'p, V, O> {
         Err(ProgramError::UnboundAtomId { id: atom })
     }
 
+    /// Gathers the not-yet-copied recompute slice of the primal `atom` (refer to the documentation of
+    /// [`gather_recompute_slice`]), recording every visited atom in `visited`.
+    fn gather_slice(&self, atom: AtomId, visited: &mut HashSet<usize>) -> BTreeSet<usize> {
+        gather_recompute_slice(
+            self.primal,
+            self.accesses,
+            &self.instruction_by_output,
+            |index| self.cuts[index].is_some() || self.replayed[index].is_some(),
+            |index| self.copied[index],
+            visited,
+            atom,
+        )
+    }
+
+    /// Returns whether the not-yet-copied recompute slice of the primal `atom` contains an instruction that accesses a
+    /// local reference root.
+    fn slice_accesses_local_root(&self, atom: AtomId) -> bool {
+        self.gather_slice(atom, &mut HashSet::new())
+            .iter()
+            .any(|instruction| !self.accesses.local_roots[*instruction].is_empty())
+    }
+
     /// Resolves the primal `atom` into the destination program, copying its memoized recompute slice (every needed
     /// producer instruction, in primal instruction order) when it is not already available.
     fn resolve(&mut self, atom: AtomId, builder: &mut ProgramBuilder<V, O>) -> Result<AtomId, ProgramError> {
-        if let Some(destination) = self.cuts[atom.index()].or(self.replayed[atom.index()]) {
-            return Ok(destination);
-        }
-        if self.primal.atoms()[atom.index()].is_constant() {
-            return self.leaf(atom, builder);
-        }
+        self.copy_slices(std::iter::once(atom), builder)?;
+        self.leaf(atom, builder)
+    }
 
-        // Gather the not-yet-copied producer instructions the slice needs. `BTreeSet` iteration then copies them in
-        // primal instruction order, so every copied instruction's inputs are terminal by the time it is copied.
+    /// Copies the memoized recompute slices of every primal atom in `atoms` that is not already available into the
+    /// destination program, as one slice: the union of the needed producer instructions, in primal instruction order.
+    /// Copying several slices in one pass is what keeps a local reference lifecycle in primal order however its
+    /// accesses are demanded: an access copied on its own can only be appended after everything already copied, so a
+    /// read demanded after a later mutation of the same root has been copied would observe the mutated state.
+    fn copy_slices(
+        &mut self,
+        atoms: impl IntoIterator<Item = AtomId>,
+        builder: &mut ProgramBuilder<V, O>,
+    ) -> Result<(), ProgramError> {
+        // Gather the not-yet-copied instructions the slices need, including the state predecessors of every copied
+        // reference access. `BTreeSet` iteration then copies them in primal instruction order, so every copied
+        // instruction's inputs are terminal, and its state predecessors copied, by the time it is copied.
+        let mut visited = HashSet::new();
         let mut needed = BTreeSet::new();
-        let mut stack = vec![atom];
-        while let Some(current) = stack.pop() {
-            if self.cuts[current.index()].is_some()
-                || self.replayed[current.index()].is_some()
-                || self.primal.atoms()[current.index()].is_constant()
-            {
-                continue;
-            }
-            let Some(instruction_index) = self.instruction_by_output[current.index()] else {
-                return Err(ProgramError::UnboundAtomId { id: current });
-            };
-            if needed.insert(instruction_index) {
-                stack.extend(self.primal.instructions()[instruction_index].inputs().iter().copied());
-            }
+        for atom in atoms {
+            needed.extend(self.gather_slice(atom, &mut visited));
         }
         for instruction_index in needed {
+            self.copied[instruction_index] = true;
             let instruction = &self.primal.instructions()[instruction_index];
-            // The classification pass force-saves residual roots whose slices reach non-pure instructions
+            // The classification pass force-saves residual roots whose slices reach non-recomputable instructions
             // (including effects inside attached regions), so a recompute slice can never legitimately copy one.
-            let effects =
-                self.primal.instruction_effects(InstructionId::new(self.primal.entry(), instruction_index)).unwrap();
-            if !effects.is_pure() {
+            if !self.accesses.is_recomputable(instruction_index) {
                 return Err(ProgramError::MalformedProgram(format!(
                     "rematerialization attempted to recompute the non-pure operation `{}`",
                     instruction.operation().name(),
@@ -1763,28 +2107,42 @@ impl<'p, V: Value, O: Operation<Type = V::Type>> PrimalSliceResolver<'p, V, O> {
                 self.replayed[source_output.index()] = Some(destination_output);
             }
         }
-        self.leaf(atom, builder)
+        Ok(())
     }
 }
 
+/// Residual bookkeeping of one rematerialization derivation, shared by the reconstruction programs assembled from it.
+struct ResidualPlan<T, S> {
+    /// Linearization residuals as atoms of the linearization primal, in residual order.
+    atoms: Vec<AtomId>,
+
+    /// Logical type of every residual, in residual order.
+    types: Vec<T>,
+
+    /// Memoized policy decision for every residual, in residual order, after the force-save upgrades.
+    decisions: Vec<RematerializationDecision<S>>,
+
+    /// Residual indices of the saved residuals in residual order, which is also the order of the saved payloads in
+    /// the forward tail and of the saved inputs on the reconstruction boundary.
+    saved_indices: Vec<usize>,
+}
+
 /// Assembles one reconstruction-side program (the tangent or backward program of a rematerialized region) over the
-/// boundary `(inputs..., saved..., lead...)` — where `lead` is the input tangents for the tangent program and the
-/// output cotangents for the backward program — by relocating the linearization's linear `source` program
-/// (`(lead..., residuals...) -> outputs`) onto that boundary. Each residual feeder resolves to its saved payload
-/// (behind a staged restore operation for stored payloads, validated to reproduce the logical residual type exactly)
-/// or to its memoized recompute slice copied from the primal program. Effectful `source` instructions are relocated
-/// as-is (they are part of the linear map's own semantics); only recompute slices are restricted to pure
-/// instructions.
+/// boundary `(inputs..., saved..., lead...)` — where `lead` is every leading input of the linear `source` program
+/// ahead of its trailing residuals: the input tangents for the tangent program, and the output cotangents followed by
+/// the cotangent destination references for the backward program — by relocating the linearization's linear `source`
+/// program (`(lead..., residuals...) -> outputs`) onto that boundary. Each residual feeder resolves to its saved
+/// payload (behind a staged restore operation for stored payloads, validated to reproduce the logical residual type
+/// exactly) or to its memoized recompute slice copied from the primal program under the reference facts `accesses`.
+/// Effectful `source` instructions are relocated as-is (they are part of the linear map's own semantics); only
+/// recompute slices are restricted to recomputable instructions.
 fn assemble_reconstruction_program<V, O, S>(
     primal: &Program<V, O, Vec<V>, Vec<V>>,
+    accesses: &PrimalReferenceAccesses,
     source: &Program<V, O, Vec<V>, Vec<V>>,
-    lead_count: usize,
     input_types: &[V::Type],
     saved_types: &[V::Type],
-    residual_atoms: &[AtomId],
-    residual_types: &[V::Type],
-    decisions: &[RematerializationDecision<S>],
-    saved_indices: &[usize],
+    plan: &ResidualPlan<V::Type, S>,
 ) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError>
 where
     V: Value,
@@ -1796,6 +2154,7 @@ where
     let region_inputs = input_types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
     let saved_inputs = saved_types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
     let source_input_types = source.input_types();
+    let lead_count = source_input_types.len() - plan.atoms.len();
     let lead_inputs = source_input_types[..lead_count]
         .iter()
         .map(|r#type| builder.add_input(r#type.clone()))
@@ -1803,24 +2162,41 @@ where
 
     // Seed the saved cuts, staging each stored payload's restore operation before any consumer and validating that
     // restoration reproduces the logical residual type exactly.
-    let mut resolver = PrimalSliceResolver::new(primal, region_inputs.as_slice());
-    for (slot, &index) in saved_indices.iter().enumerate() {
-        let destination = match &decisions[index] {
+    let mut resolver = PrimalSliceResolver::new(primal, accesses, region_inputs.as_slice());
+    for (slot, &index) in plan.saved_indices.iter().enumerate() {
+        let destination = match &plan.decisions[index] {
             RematerializationDecision::Recompute => continue,
             RematerializationDecision::Save => saved_inputs[slot],
             RematerializationDecision::SaveWith(storage) => {
-                let operation = storage.restore_operation(&saved_types[slot], &residual_types[index])?;
+                let operation = storage.restore_operation(&saved_types[slot], &plan.types[index])?;
                 let restored = stage_storage_operation(&mut builder, operation, saved_inputs[slot])?;
                 let restored_type = builder.atoms()[restored.index()].r#type().into_owned();
-                validate_restored_residual_type(&restored_type, &residual_types[index])?;
+                validate_restored_residual_type(&restored_type, &plan.types[index])?;
                 restored
             }
         };
-        resolver.seed_cut(residual_atoms[index], destination);
+        resolver.seed_cut(plan.atoms[index], destination);
     }
 
-    // Relocate the source program onto the destination boundary. Residual feeders resolve lazily, so recompute
-    // slices are copied only for residuals the source program actually demands.
+    // Residual feeders resolve lazily below, so recompute slices are copied only for residuals the source program
+    // actually demands, but a local reference lifecycle replays correctly only if every recomputed access of a root is
+    // copied at its primal position relative to the root's mutations, whereas the source program demands its feeders
+    // in its own order (a pullback demands the newest residuals first). Every demanded recomputed residual whose slice
+    // reaches a local root is therefore resolved up front, as one slice in primal order, so that each root's lifecycle
+    // is copied exactly once and in program order; reference-free slices are unaffected by demand order.
+    let mut demanded = vec![false; source.atoms().len()];
+    for atom in source.instructions().iter().flat_map(|instruction| instruction.inputs()).chain(source.output_ids()) {
+        demanded[atom.index()] = true;
+    }
+    let lifecycle_atoms = source.input_ids()[lead_count..]
+        .iter()
+        .zip(plan.atoms.iter())
+        .filter(|(feeder, atom)| demanded[feeder.index()] && resolver.slice_accesses_local_root(**atom))
+        .map(|(_, atom)| *atom)
+        .collect::<Vec<_>>();
+    resolver.copy_slices(lifecycle_atoms, &mut builder)?;
+
+    // Relocate the source program onto the destination boundary.
     let mut source_input_positions = vec![None; source.atoms().len()];
     for (position, input) in source.input_ids().iter().enumerate() {
         source_input_positions[input.index()] = Some(position);
@@ -1847,7 +2223,7 @@ where
         }
         let destination = match source_input_positions[atom.index()] {
             Some(position) if position < lead_count => lead_inputs[position],
-            Some(position) => resolver.resolve(residual_atoms[position - lead_count], builder)?,
+            Some(position) => resolver.resolve(plan.atoms[position - lead_count], builder)?,
             None => match &source.atoms()[atom.index()] {
                 Atom::Constant(value) => builder.add_constant(value.clone()),
                 Atom::Variable(_) => return Err(ProgramError::UnboundAtomId { id: atom }),
@@ -1891,6 +2267,48 @@ where
         .into_simplified()
 }
 
+/// Validates the reference use of a traced rematerialization body against the contract described in the module
+/// documentation: no external root is mutated and no reference allocated inside the body escapes as an output. A body
+/// without references is trivially valid. References enter the body only as inputs by construction: the fresh trace
+/// rejects both captures and reference-typed constants before this validation runs.
+///
+/// # Errors
+///
+/// Returns [`ProgramError::UnsupportedOperation`] naming the mutated external reference or the escaping output, and
+/// propagates any [`ReferenceAnalysisError`](crate::programs::ReferenceAnalysisError) of the body unchanged.
+fn validate_rematerialized_body<V: Value, O: Operation<Type = V::Type>>(
+    primal: &Program<V, O, Vec<V>, Vec<V>>,
+) -> Result<(), ProgramError> {
+    if !primal.entry_region_ref().contains_references_in_closure() {
+        return Ok(());
+    }
+    let analysis = primal.reference_analysis(0)?;
+    for root in analysis.roots() {
+        let Some(source) = analysis.external_source(root) else {
+            continue;
+        };
+        if analysis.access_modes(root).any(|mode| mode != ReferenceAccessMode::Read) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "rematerialization cannot recompute a body that mutates external reference {source}; mutate it \
+                     outside the rematerialized function",
+                ),
+            });
+        }
+    }
+    for (output_index, root) in analysis.output_roots().iter().enumerate() {
+        if let Some(ReferenceRoot::Allocation { .. }) = root {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "rematerialization cannot return output {output_index}, a reference allocated inside the \
+                     rematerialized body, because its handle would escape the recomputed lifecycle",
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Function whose reverse-mode differentiation rematerializes interior values instead of storing them — the
 /// ergonomic analogue of JAX's [`jax.checkpoint`](https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint.html),
 /// built by [`rematerialize`].
@@ -1918,7 +2336,7 @@ where
 /// memoized across the derivation passes. Capability-requiring policies — for example, offloading policies whose
 /// [`MemoryTransferStorage`] stages memory transfers — bring their own operation-type bounds without imposing them on
 /// plain rematerialization.
-pub struct Rematerialize<D: Domain, B, IT, OT, P = NothingSaveable>
+pub struct Rematerialize<D: Domain<Type: DifferentiableType>, B, IT, OT, P = NothingSaveable>
 where
     OT: Parameterized<DomainTracer<D>>,
 {
@@ -1964,7 +2382,7 @@ type CachedDerivation<D, OT> = (
 /// documentation of [`Rematerialize`] for the derivation and rematerialization semantics.
 pub fn rematerialize<D, B, IT, OT>(body: B) -> Rematerialize<D, B, IT, OT>
 where
-    D: Domain,
+    D: Domain<Type: DifferentiableType>,
     B: Fn(IT) -> Result<OT, ProgramError>,
     OT: Parameterized<DomainTracer<D>>,
 {
@@ -1977,48 +2395,9 @@ where
     }
 }
 
-impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
-    /// Builds a rematerialized flat-vector function after discharging every local reference into immutable state.
-    /// External reference inputs and reference captures are rejected because rematerialization has no caller-visible
-    /// state write-back contract; ordinary non-reference captures remain valid. The returned wrapper delegates
-    /// derivation, caching, policy selection, and `prevent_cse` behavior to the ordinary [`Rematerialize`]
-    /// implementation. `capture_count` classifies leading boundary inputs that have already been lifted; this
-    /// ordinary-value adapter does not accept capture-reference constants retained in attached regions.
-    ///
-    /// # Parameters
-    ///
-    ///   - `capture_count`: Number of leading flat inputs lifted from the source capture table.
-    pub fn rematerialize_with_local_references<D, P>(
-        self,
-        capture_count: usize,
-    ) -> Result<
-        Rematerialize<
-            D,
-            impl Fn(Vec<DomainTracer<D>>) -> Result<Vec<DomainTracer<D>>, ProgramError>,
-            Vec<DomainTracer<D>>,
-            Vec<DomainTracer<D>>,
-        >,
-        ProgramError,
-    >
-    where
-        D: Context<Type = V::Type, Constant = V, Operation = O>,
-        P: ReferenceDischargePolicy<TracingContext<V, O>>,
-        V::Type: From<P::Referent> + From<ReferenceType<P::Referent>> + ReferenceDischargeableType<Policy = P>,
-        O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
-        for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
-    {
-        let program = self.discharge_references::<P>(capture_count)?.into_program_without_external_references()?;
-        Ok(rematerialize(move |inputs: Vec<DomainTracer<D>>| {
-            // `Rematerialize::call` rejects empty inputs before this body runs, so the context is always recoverable.
-            let context = inputs.first().unwrap().context().clone();
-            program.interpret_in_context(&context, inputs)
-        }))
-    }
-}
-
 impl<D, B, IT, OT, P> Rematerialize<D, B, IT, OT, P>
 where
-    D: Domain,
+    D: Domain<Type: DifferentiableType>,
     OT: Parameterized<DomainTracer<D>>,
 {
     /// Replaces this rematerialization's policy, re-typing the wrapper to the new policy type — any
@@ -2062,7 +2441,7 @@ where
 
 impl<D, B, IT, OT, P> Rematerialize<D, B, IT, OT, P>
 where
-    D: Context,
+    D: Context<Type: DifferentiableType>,
     B: Fn(IT) -> Result<OT, ProgramError>,
     P: RematerializationPolicy<D::Type, <D as Domain>::Operation>,
     IT: Parameterized<DomainTracer<D>>,
@@ -2091,7 +2470,6 @@ where
         + DifferentiableOperation<
             PartialEvaluationContext<TracingContext<<D as Domain>::Constant, <D as Domain>::Operation>>,
         > + PartiallyEvaluatableOperation<TracingContext<<D as Domain>::Constant, <D as Domain>::Operation>>,
-    <D as Domain>::Type: DifferentiableType,
     Vec<<D as Domain>::Constant>: Parameterized<<D as Domain>::Constant, ParameterStructure = Vec<Placeholder>>,
 {
     /// Stages this rematerialized function on the provided tracer inputs and returns its outputs, deriving the
@@ -2099,7 +2477,6 @@ where
     /// stores only the region inputs plus the policy-saved residuals and recomputes everything else.
     pub fn call<V, ICT>(&self, input: ICT) -> Result<<OT::To<D::Type> as Parameterized<D::Type>>::To<V>, ProgramError>
     where
-        <D as Domain>::Type: DifferentiableType,
         V: Value<Type = D::Type>,
         V::DispatchDomain:
             Context<Type = D::Type, Constant = <D as Domain>::Constant, Operation = <D as Domain>::Operation>,
@@ -2143,6 +2520,7 @@ where
 
         let (structured_output_types, primal) = D::trace(|xs| (self.body)(xs), structured_input_types.clone())?;
         let primal = primal.to_flat_program();
+        validate_rematerialized_body(&primal)?;
         let output_types = structured_output_types.parameters().cloned().collect::<Vec<_>>();
         let output_count = output_types.len();
         let input_count = input_types.len();
@@ -2156,15 +2534,43 @@ where
         let residual_atoms = linearization.primal().output_ids()[output_count..].to_vec();
         let residual_types = linearization.primal().output_types().split_off(output_count);
 
+        // The reference facts of the linearization primal decide which ordered instructions recompute slices may copy
+        // (reference operations on local roots, together with their state predecessors) and which force a save (reads
+        // of external roots and every other effect). A reference-free primal has no analysis and empty facts.
+        let analysis = match linearization.primal().entry_region_ref().contains_references_in_closure() {
+            true => Some(linearization.primal().reference_analysis(0)?),
+            false => None,
+        };
+        let accesses = PrimalReferenceAccesses::new(linearization.primal(), analysis.as_deref());
+
         // Classify each instruction-produced residual exactly once from the provenance recovered from the primal
         // sub-program (the operation defining the residual atom, looked through nested provenance), memoizing the
         // returned decisions — storage values included — so the derivation passes below all reuse them. Residuals that
         // are region inputs, constants, or explicitly absent have no classifiable producer, so
         // `from_program_residual` returns `None` and they are never saved — the backward program always receives the
         // region inputs and recomputes everything else, exactly as before. A policy rejection aborts the whole
-        // transformation.
+        // transformation. A reference-typed residual is a primal reference threaded by identity and is never saved: an
+        // external root's residual is the input reference itself (or a view of it), which the derived programs reach
+        // through the region inputs, while a local root's residual would carry a handle out of the recomputed
+        // lifecycle and is rejected.
         let mut decisions = Vec::with_capacity(residual_count);
         for index in 0..residual_count {
+            if residual_types[index].is_reference() {
+                let value = ValueId::new(linearization.primal().entry(), residual_atoms[index]);
+                if let Some(ReferenceRoot::Allocation { instruction, .. }) =
+                    analysis.as_ref().and_then(|analysis| analysis.root_of(value))
+                {
+                    return Err(ProgramError::UnsupportedOperation {
+                        message: format!(
+                            "rematerialization cannot thread the reference allocated at {instruction} inside the \
+                             rematerialized body into its derived programs, because its handle would escape the \
+                             recomputed lifecycle",
+                        ),
+                    });
+                }
+                decisions.push(RematerializationDecision::Recompute);
+                continue;
+            }
             let candidate = RematerializationCandidate::from_program_residual(
                 linearization.primal(),
                 residual_atoms[index],
@@ -2186,11 +2592,12 @@ where
             });
         }
         // Force-save upgrades, in producer-topological order: a `Recompute` residual whose recompute slice would
-        // reach a non-pure instruction before terminating at a saved cut, a region input, or a constant is upgraded
-        // to `Save` — recompute slices may only ever copy pure instructions, so the effect executes exactly once, in
-        // the forward program. Roots are processed in ascending producing-instruction order, so once an earlier root
-        // upgrades, every later root's slice legitimately terminates at the new cut (later producers cannot be
-        // ancestors of earlier roots), making the pass deterministic.
+        // reach a non-recomputable instruction before terminating at a saved cut, a region input, or a constant is
+        // upgraded to `Save` — recompute slices may only ever copy pure instructions and complete local reference
+        // lifecycles, so every other effect executes exactly once, in the forward program. Roots are processed in
+        // ascending producing-instruction order, so once an earlier root upgrades, every later root's slice
+        // legitimately terminates at the new cut (later producers cannot be ancestors of earlier roots), making the
+        // pass deterministic. Reference-typed residuals are never saved (see above) and so are never upgraded.
         let instruction_by_output = linearization.primal().instruction_by_output();
         let mut cuts = decisions
             .iter()
@@ -2201,7 +2608,9 @@ where
         let mut recompute_roots = decisions
             .iter()
             .enumerate()
-            .filter(|(_, decision)| matches!(decision, RematerializationDecision::Recompute))
+            .filter(|(index, decision)| {
+                matches!(decision, RematerializationDecision::Recompute) && !residual_types[*index].is_reference()
+            })
             .filter_map(|(index, _)| {
                 instruction_by_output[residual_atoms[index].index()].map(|producer| (producer, index))
             })
@@ -2210,7 +2619,14 @@ where
         let mut safe = HashSet::new();
         for (_, index) in recompute_roots {
             let root = residual_atoms[index];
-            if !residual_slice_is_pure(linearization.primal(), &instruction_by_output, &cuts, &mut safe, root) {
+            if !residual_slice_is_recomputable(
+                linearization.primal(),
+                &accesses,
+                &instruction_by_output,
+                &cuts,
+                &mut safe,
+                root,
+            ) {
                 decisions[index] = RematerializationDecision::Save;
                 cuts.insert(root.index());
             }
@@ -2222,7 +2638,7 @@ where
             .filter(|(_, decision)| !matches!(decision, RematerializationDecision::Recompute))
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
-        let saved_count = saved_indices.len();
+        let plan = ResidualPlan { atoms: residual_atoms, types: residual_types, decisions, saved_indices };
 
         // Assemble the forward program directly from the primal sub-program: it is the primal with a rewritten
         // output boundary — the body outputs, then the region inputs, then the policy-saved residuals (behind their
@@ -2236,22 +2652,22 @@ where
             let mut instructions = source.instructions().to_vec();
             let mut output_ids = source.output_ids()[..output_count].to_vec();
             output_ids.extend(source.input_ids().iter().copied());
-            let mut saved_types = Vec::with_capacity(saved_count);
-            for &index in saved_indices.iter() {
-                match &decisions[index] {
+            let mut saved_types = Vec::with_capacity(plan.saved_indices.len());
+            for &index in plan.saved_indices.iter() {
+                match &plan.decisions[index] {
                     RematerializationDecision::Recompute => continue,
                     RematerializationDecision::Save => {
-                        saved_types.push(residual_types[index].clone());
-                        output_ids.push(residual_atoms[index]);
+                        saved_types.push(plan.types[index].clone());
+                        output_ids.push(plan.atoms[index]);
                     }
                     RematerializationDecision::SaveWith(storage) => {
-                        let operation = storage.store_operation(&residual_types[index])?;
-                        let stored_type = validate_storage_operation(&operation, &residual_types[index])?;
+                        let operation = storage.store_operation(&plan.types[index])?;
+                        let stored_type = validate_storage_operation(&operation, &plan.types[index])?;
                         let stored = AtomId::new(atoms.len());
                         atoms.push(Atom::Variable(stored_type.clone()));
                         instructions.push(crate::programs::Instruction::new(
                             operation,
-                            vec![residual_atoms[index]],
+                            vec![plan.atoms[index]],
                             vec![stored],
                             Vec::new(),
                         ));
@@ -2270,21 +2686,20 @@ where
             (forward.into_simplified()?, saved_types)
         };
 
-        // Assemble the backward program `(inputs..., saved..., output_cotangents...) -> input_cotangents` by
-        // relocating the transposed pullback `(output_cotangents..., residuals...)` onto that boundary: saved
-        // residual feeders map to the saved inputs (behind staged restore operations for stored payloads) and
-        // recomputed feeders to memoized recompute slices copied from the primal program.
+        // Assemble the backward program `(inputs..., saved..., output_cotangents..., cotangent_destinations...) ->
+        // input_cotangents` by relocating the transposed pullback `(output_cotangents..., cotangent_destinations...,
+        // residuals...)` onto that boundary (one cotangent per non-reference output and one destination reference per
+        // reference input, per the default destination kinds): saved residual feeders map to the saved inputs (behind
+        // staged restore operations for stored payloads) and recomputed feeders to memoized recompute slices copied
+        // from the primal program.
         let pullback = linearization.pullback()?;
         let backward = assemble_reconstruction_program(
             linearization.primal(),
+            &accesses,
             &pullback,
-            output_count,
             input_types.as_slice(),
             saved_types.as_slice(),
-            residual_atoms.as_slice(),
-            residual_types.as_slice(),
-            decisions.as_slice(),
-            saved_indices.as_slice(),
+            &plan,
         )?;
 
         // Assemble the tangent program `(inputs..., saved..., input_tangents...) -> output_tangents` the same way
@@ -2292,14 +2707,11 @@ where
         // differentiation works through the rematerialized call (JAX's `jax.checkpoint` also supports `jvp`).
         let tangent = assemble_reconstruction_program(
             linearization.primal(),
+            &accesses,
             linearization.tangent(),
-            input_count,
             input_types.as_slice(),
             saved_types.as_slice(),
-            residual_atoms.as_slice(),
-            residual_types.as_slice(),
-            decisions.as_slice(),
-            saved_indices.as_slice(),
+            &plan,
         )?;
 
         let operation = RematerializeOperation::new().with_prevent_cse(self.prevent_cse);
@@ -2323,17 +2735,20 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, Memory,
-        Shape, ShardingDimension,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceDischarge,
+        ArrayType, DataType, Dimension, Memory, Shape, ShardingDimension,
     };
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::{Differentiate, ForwardModeDifferentiate, ReverseModeDifferentiate, differentiate_at};
-    use crate::operations::{Cos, Dot, DotDimensionNumbers, ScanOperation, Sin, Tag};
+    use crate::differentiation::{
+        CotangentDestination, CotangentSeed, Differentiate, ForwardModeDifferentiate, ReverseModeDifferentiate,
+        differentiate_at,
+    };
+    use crate::operations::{Cos, Dot, DotDimensionNumbers, MulOperation, ScanOperation, Sin, Tag};
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::{
-        Effect, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
-        ReferenceNew, ReferenceNewOperation, ReferenceReadOperation, ReferenceType, RegionRole,
+        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
+        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceType, RegionRole,
     };
     use crate::tests::TestOrderedStateOperation;
 
@@ -2426,6 +2841,105 @@ mod tests {
     type ReferenceTestValue = ArrayIrValue<Array>;
     type ReferenceTestOperation = ArrayIrOperation<Array>;
     type ReferenceTestContext = EagerContext<ReferenceTestValue, ReferenceTestOperation>;
+    type ReferenceTestTracer = DomainTracer<ReferenceTestContext>;
+    type ReferenceTestProgram =
+        Program<ReferenceTestValue, ReferenceTestOperation, Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>;
+
+    /// Returns the composite scalar `f32` type used by the reference tests.
+    fn reference_test_scalar_type() -> ArrayIrType {
+        ArrayIrType::Array(ArrayType::scalar(DataType::F32))
+    }
+
+    /// Returns the composite `ref<f32[]>` type used by the reference tests.
+    fn reference_test_reference_type() -> ArrayIrType {
+        ReferenceType::new(ArrayType::scalar(DataType::F32)).into()
+    }
+
+    /// Wraps a scalar `f32` array into the composite value used by the reference tests.
+    fn reference_test_scalar(value: f32) -> ReferenceTestValue {
+        ArrayIrValue::Array(Array::scalar(value))
+    }
+
+    /// Stages `left · right` in the array IR universe through the tracers' context.
+    fn reference_test_mul(
+        left: ReferenceTestTracer,
+        right: ReferenceTestTracer,
+    ) -> Result<ReferenceTestTracer, ProgramError> {
+        let context = left.context().clone();
+        let operation = ArrayIrOperation::Array(ArrayOperation::Mul(MulOperation::new()));
+        Ok(context.bind(operation, Vec::new(), &[left, right])?.remove(0))
+    }
+
+    /// Body `x ↦ (x + x²)²` that accumulates `x²` onto a local reference initialized with `x`; the frozen sum
+    /// `v = x + x²` is a linearization residual of the final product, and its recompute slice is the complete local
+    /// lifecycle.
+    fn local_lifecycle_body(x: ReferenceTestTracer) -> Result<ReferenceTestTracer, ProgramError> {
+        let square = reference_test_mul(x.clone(), x.clone())?;
+        let reference = x.reference_new()?;
+        reference.add_update(&square)?;
+        let sum = reference.freeze()?;
+        reference_test_mul(sum.clone(), sum)
+    }
+
+    /// Stages `left + right` in the array IR universe through the tracers' context.
+    fn reference_test_add(
+        left: ReferenceTestTracer,
+        right: ReferenceTestTracer,
+    ) -> Result<ReferenceTestTracer, ProgramError> {
+        let context = left.context().clone();
+        let operation = ArrayIrOperation::Array(ArrayOperation::Add(AddOperation::new()));
+        Ok(context.bind(operation, Vec::new(), &[left, right])?.remove(0))
+    }
+
+    /// Body `x ↦ a² + b²` reading `a = x` from a local reference initialized with `x` before `x` is accumulated onto
+    /// it and `b = 2x` afterwards: two reads of one root at different states, both of them linearization residuals.
+    fn two_reads_body(x: ReferenceTestTracer) -> Result<ReferenceTestTracer, ProgramError> {
+        let reference = x.reference_new()?;
+        let a = reference.read()?;
+        reference.add_update(&x)?;
+        let b = reference.read()?;
+        let a_squared = reference_test_mul(a.clone(), a)?;
+        let b_squared = reference_test_mul(b.clone(), b)?;
+        reference_test_add(a_squared, b_squared)
+    }
+
+    /// Body `x ↦ a · s` reading `a = x` from a local reference initialized with `x` and freezing `s = 2x` after `x` is
+    /// accumulated onto it: a read residual followed by the consuming freeze of the same root.
+    fn read_then_freeze_body(x: ReferenceTestTracer) -> Result<ReferenceTestTracer, ProgramError> {
+        let reference = x.reference_new()?;
+        let a = reference.read()?;
+        reference.add_update(&x)?;
+        let s = reference.freeze()?;
+        reference_test_mul(a, s)
+    }
+
+    /// Body `(r, x) ↦ read(r) · x` over an external reference input.
+    fn external_read_body(
+        (reference, x): (ReferenceTestTracer, ReferenceTestTracer),
+    ) -> Result<ReferenceTestTracer, ProgramError> {
+        reference_test_mul(reference.read()?, x)
+    }
+
+    /// Returns the region programs of the single staged rematerialize call of `program`, in
+    /// `["primal", "forward", "backward", "tangent"]` region order.
+    fn rematerialize_regions(program: &ReferenceTestProgram) -> Vec<ReferenceTestProgram> {
+        assert_eq!(program.instructions().len(), 1);
+        let instruction = &program.instructions()[0];
+        assert!(matches!(instruction.operation(), ReferenceTestOperation::Rematerialize(_)));
+        instruction
+            .regions()
+            .iter()
+            .map(|region| program.region_ref(*region).unwrap().to_program())
+            .collect()
+    }
+
+    /// Returns how many instructions of the operation named `name` the entry region of `program` stages.
+    fn count_operations<V: Value, O: Operation<Type = V::Type>>(
+        program: &Program<V, O, Vec<V>, Vec<V>>,
+        name: &str,
+    ) -> usize {
+        program.instructions().iter().filter(|instruction| instruction.operation().name() == name).count()
+    }
 
     #[test]
     fn test_rematerialize_effects_only_include_the_primal_region() {
@@ -3441,7 +3955,7 @@ mod tests {
             |x: DomainTracer<EagerContext<Array, ArrayOperation<Array>>>| Ok((x.clone() * x).sin()?),
         );
         let (_, pullback) = domain.vjp(|x, ()| function.call(x), Array::scalar(0.7), ()).unwrap();
-        let (pullback, residuals) = pullback.into_parts();
+        let (pullback, residuals) = pullback.into_transposed_parts().unwrap();
         let mut pullback_inputs = vec![Array::scalar(1.0)];
         pullback_inputs.extend(residuals);
         let output = pullback.interpret(pullback_inputs).unwrap();
@@ -3813,7 +4327,8 @@ mod tests {
         let mut destination = ProgramBuilder::<Array, SplitOperation>::new();
         let region_input = destination.add_input(scalar_type.clone());
         let saved_input = destination.add_input(scalar_type);
-        let mut resolver = PrimalSliceResolver::new(&primal, std::slice::from_ref(&region_input));
+        let accesses = PrimalReferenceAccesses::new(&primal, None);
+        let mut resolver = PrimalSliceResolver::new(&primal, &accesses, std::slice::from_ref(&region_input));
         resolver.seed_cut(split_outputs[0], saved_input);
 
         let recomputed_b = resolver.resolve(split_outputs[1], &mut destination).unwrap();
@@ -4151,7 +4666,10 @@ mod tests {
     }
 
     #[test]
-    fn test_ordered_state_residuals_are_non_recomputable() {
+    fn test_residual_slice_is_recomputable() {
+        // An opaque ordered-state operation is not a reference lifecycle: classification sees its effect through the
+        // pure residual root and therefore must upgrade that root from recompute to save. This is the exact predicate
+        // used by the producer-topological force-save pass.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let mut builder = ProgramBuilder::<Array, TestOrderedStateOperation>::new();
         let input = builder.add_input(scalar_type.clone());
@@ -4161,18 +4679,21 @@ mod tests {
             builder.add_instruction(TestOrderedStateOperation::Pure, Vec::new(), vec![state], None).unwrap()[0];
         let primal =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-
-        // Classification sees the state effect through the pure residual root and therefore must upgrade that root
-        // from recompute to save. This is the exact predicate used by the producer-topological force-save pass.
+        let accesses = PrimalReferenceAccesses::new(&primal, None);
         let instruction_by_output = primal.instruction_by_output();
-        assert!(
-            !residual_slice_is_pure(&primal, &instruction_by_output, &HashSet::new(), &mut HashSet::new(), output,)
-        );
+        assert!(!residual_slice_is_recomputable(
+            &primal,
+            &accesses,
+            &instruction_by_output,
+            &HashSet::new(),
+            &mut HashSet::new(),
+            output,
+        ));
 
         // The resolver independently refuses to copy the state producer if classification ever misses the upgrade.
         let mut destination = ProgramBuilder::<Array, TestOrderedStateOperation>::new();
         let destination_input = destination.add_input(scalar_type.clone());
-        let mut resolver = PrimalSliceResolver::new(&primal, &[destination_input]);
+        let mut resolver = PrimalSliceResolver::new(&primal, &accesses, &[destination_input]);
         assert!(matches!(
             resolver.resolve(output, &mut destination),
             Err(ProgramError::MalformedProgram(message))
@@ -4184,134 +4705,400 @@ mod tests {
         let mut destination = ProgramBuilder::<Array, TestOrderedStateOperation>::new();
         let destination_input = destination.add_input(scalar_type.clone());
         let saved = destination.add_input(scalar_type);
-        let mut resolver = PrimalSliceResolver::new(&primal, &[destination_input]);
+        let mut resolver = PrimalSliceResolver::new(&primal, &accesses, &[destination_input]);
         resolver.seed_cut(output, saved);
         assert_eq!(resolver.resolve(output, &mut destination), Ok(saved));
         assert!(destination.instructions().is_empty());
-    }
 
-    #[test]
-    fn test_program_rematerialize_with_local_references() {
-        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        // A complete local reference lifecycle is recomputable even though every reference operation is ordered: a
+        // read's slice includes the allocation through its data input and the earlier accumulations through the
+        // root's state predecessors, so the resolver replays exactly the state the read observed, in primal order.
+        // Resolving a later read of the same root then copies only the accesses between the two reads.
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let input = builder.add_input(scalar_type);
+        let input = builder.add_input(reference_test_scalar_type());
         let reference =
             builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         builder
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, input], None)
             .unwrap();
+        let first_read =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, first_read], None)
+            .unwrap();
+        let second_read =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let output =
             builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-        let source = builder
+        let primal = builder
             .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
-                vec![output],
+                vec![output, first_read, second_read],
                 vec![Placeholder],
-                vec![Placeholder],
+                vec![Placeholder; 3],
             )
             .unwrap();
-
-        // Before discharge, simplification retains the complete ordered state chain and generic rematerialization
-        // would reject it. Discharge eliminates that chain, after which ordinary pure simplification and the existing
-        // rematerialization derivation can run without any reference-specific rule.
-        let pre_discharge = source.simplified().unwrap();
-        assert_eq!(pre_discharge.instructions().len(), 3);
-        assert!(pre_discharge.effects().contains(Effect::OrderedState));
-        let unresolved = rematerialize::<ReferenceTestContext, _, _, _>(|input: DomainTracer<ReferenceTestContext>| {
-            let reference = input.reference_new()?;
-            reference.add_update(&input)?;
-            reference.freeze()
-        });
-        let unresolved_context = TracingContext::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let unresolved_input = unresolved_context.input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
-        assert!(matches!(
-            unresolved.call(unresolved_input),
-            Err(ProgramError::UnsupportedOperation { message })
-                if message == "program carries unresolved state and must be discharged before differentiation",
+        let analysis = primal.reference_analysis(0).unwrap();
+        let accesses = PrimalReferenceAccesses::new(&primal, Some(&analysis));
+        let instruction_by_output = primal.instruction_by_output();
+        let mut safe = HashSet::new();
+        assert!(residual_slice_is_recomputable(
+            &primal,
+            &accesses,
+            &instruction_by_output,
+            &HashSet::new(),
+            &mut safe,
+            first_read,
         ));
-
-        let rematerialized = source.rematerialize_with_local_references::<ReferenceTestContext, _>(0).unwrap();
-        let wrong_context = TracingContext::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let wrong_input = wrong_context.input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
-        assert!(matches!(
-            rematerialized.call(vec![wrong_input]),
-            Err(ProgramError::Type(TypeError::Invalid { message }))
-                if message == "encountered input type bool[] which is incompatible with the program's declared type \
-                    f32[]",
+        assert!(residual_slice_is_recomputable(
+            &primal,
+            &accesses,
+            &instruction_by_output,
+            &HashSet::new(),
+            &mut safe,
+            second_read,
         ));
-        let (_, staged) = TracingContext::<ReferenceTestValue, ReferenceTestOperation>::trace(
-            |input| {
-                let mut outputs = rematerialized.call(vec![input])?;
-                Ok(outputs.pop().unwrap())
-            },
-            ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
-        )
-        .unwrap();
-        assert!(matches!(staged.instructions()[0].operation(), ReferenceTestOperation::Rematerialize(_)));
+        let mut destination = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
+        let destination_input = destination.add_input(reference_test_scalar_type());
+        let mut resolver = PrimalSliceResolver::new(&primal, &accesses, &[destination_input]);
+        let replayed_first_read = resolver.resolve(first_read, &mut destination).unwrap();
+        let names = |destination: &ProgramBuilder<ReferenceTestValue, ReferenceTestOperation>| {
+            destination
+                .instructions()
+                .iter()
+                .map(|instruction| instruction.operation().name())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names(&destination), vec!["reference_new", "reference_add_update", "reference_read"]);
+        assert_eq!(destination.instructions()[2].outputs(), &[replayed_first_read]);
+        let replayed_second_read = resolver.resolve(second_read, &mut destination).unwrap();
         assert_eq!(
-            staged.interpret(ReferenceTestValue::Array(Array::scalar(3.0_f32))),
-            Ok(ReferenceTestValue::Array(Array::scalar(6.0_f32))),
+            names(&destination),
+            vec!["reference_new", "reference_add_update", "reference_read", "reference_add_update", "reference_read"],
         );
+        assert_eq!(destination.instructions()[3].inputs()[1], replayed_first_read);
+        assert_eq!(destination.instructions()[4].outputs(), &[replayed_second_read]);
 
-        let (_, repeated) = TracingContext::<ReferenceTestValue, ReferenceTestOperation>::trace(
-            |input| {
-                let mut outputs = rematerialized.call(vec![input])?;
-                Ok(outputs.pop().unwrap())
-            },
-            ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
-        )
-        .unwrap();
-        assert_eq!(repeated.to_string(), staged.to_string());
-
-        let domain = ReferenceTestContext::new();
-        let (primal, tangent) = domain
-            .jvp(
-                |input, ()| {
-                    let mut outputs = rematerialized.call(vec![input])?;
-                    Ok(outputs.pop().unwrap())
-                },
-                ReferenceTestValue::Array(Array::scalar(3.0_f32)),
-                ReferenceTestValue::Array(Array::scalar(1.0_f32)),
-                (),
-            )
+        // A read of an external root can observe changed state and is never recomputed.
+        let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
+        let reference = builder.add_input(reference_test_reference_type());
+        let read =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let primal = builder
+            .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(vec![read], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        assert_eq!(primal, ReferenceTestValue::Array(Array::scalar(6.0_f32)));
-        assert_eq!(tangent, ReferenceTestValue::Array(Array::scalar(2.0_f32)));
-        let (_, pullback) = domain
-            .vjp(
-                |input, ()| {
-                    let mut outputs = rematerialized.call(vec![input])?;
-                    Ok(outputs.pop().unwrap())
-                },
-                ReferenceTestValue::Array(Array::scalar(3.0_f32)),
-                (),
-            )
-            .unwrap();
-        assert_eq!(
-            pullback.apply(ReferenceTestValue::Array(Array::scalar(4.0_f32))).unwrap(),
-            ReferenceTestValue::Array(Array::scalar(8.0_f32)),
-        );
+        let analysis = primal.reference_analysis(0).unwrap();
+        let accesses = PrimalReferenceAccesses::new(&primal, Some(&analysis));
+        let instruction_by_output = primal.instruction_by_output();
+        assert!(!residual_slice_is_recomputable(
+            &primal,
+            &accesses,
+            &instruction_by_output,
+            &HashSet::new(),
+            &mut HashSet::new(),
+            read,
+        ));
     }
 
     #[test]
-    fn test_program_rematerialize_with_local_references_rejects_external_roots() {
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+    fn test_rematerialization_recomputes_local_reference_lifecycles() {
+        // f(x) = (x + x²)² over a local reference lifecycle. The transposed tangent map itself accumulates through one
+        // cotangent reference lifecycle (allocation, accumulation, read, and freeze), so the backward and tangent
+        // programs always contain one reference lifecycle of their own. Under `NothingSaveable` the frozen sum `v` is
+        // recomputed, so the backward program additionally replays the complete primal lifecycle and the forward
+        // program saves nothing beyond the region input; under `EverythingSaveable` `v` is saved and only the
+        // cotangent lifecycle remains. Both derivations yield the analytic gradient f'(x) = 2 (x + x²) (1 + 2x), which
+        // is exact in `f32` at x = 0.5: f = 0.5625 and f' = 3.
+        let function = rematerialize::<ReferenceTestContext, _, _, _>(local_lifecycle_body);
+        let (_, program) = ReferenceTestContext::trace(|x| function.call(x), reference_test_scalar_type()).unwrap();
+        let regions = rematerialize_regions(&program.to_flat_program());
+        assert_eq!(regions[1].output_types().len(), 2);
+        assert_eq!(count_operations(&regions[2], "reference_new"), 2);
+        assert_eq!(count_operations(&regions[2], "reference_add_update"), 2);
+        assert_eq!(count_operations(&regions[2], "reference_freeze"), 2);
+        assert_eq!(count_operations(&regions[3], "reference_new"), 2);
+        let (value, gradient) = ReferenceTestContext::new()
+            .differentiate_at(reference_test_scalar(0.5))
+            .value_and_gradient(|x| function.call(x).unwrap())
+            .unwrap();
+        assert_eq!(value, reference_test_scalar(0.5625));
+        assert_eq!(gradient, reference_test_scalar(3.0));
+
+        let function =
+            rematerialize::<ReferenceTestContext, _, _, _>(local_lifecycle_body).with_policy(EverythingSaveable);
+        let (_, program) = ReferenceTestContext::trace(|x| function.call(x), reference_test_scalar_type()).unwrap();
+        let regions = rematerialize_regions(&program.to_flat_program());
+        assert_eq!(regions[1].output_types().len(), 3);
+        assert_eq!(count_operations(&regions[2], "reference_new"), 1);
+        assert_eq!(count_operations(&regions[2], "reference_add_update"), 1);
+        assert_eq!(count_operations(&regions[2], "reference_freeze"), 1);
+        assert_eq!(count_operations(&regions[3], "reference_new"), 1);
+        let (value, gradient) = ReferenceTestContext::new()
+            .differentiate_at(reference_test_scalar(0.5))
+            .value_and_gradient(|x| function.call(x).unwrap())
+            .unwrap();
+        assert_eq!(value, reference_test_scalar(0.5625));
+        assert_eq!(gradient, reference_test_scalar(3.0));
+    }
+
+    #[test]
+    fn test_rematerialization_replays_recomputed_reads_at_their_primal_positions() {
+        // f(x) = a² + b² with a = x read before, and b = 2x read after, one accumulation of x onto the same local root,
+        // so both reads are recomputed residuals of one lifecycle. The pullback demands the newer residual first, and
+        // appending the earlier read's slice after the accumulation it precedes would replay a = 2x, giving
+        // f'(x) = 12x instead of the analytic f'(x) = 2a + 4b = 10x. The recompute slices of one root are instead
+        // copied together in primal order, so the backward program replays the lifecycle exactly as the primal ran it.
+        let function = rematerialize::<ReferenceTestContext, _, _, _>(two_reads_body);
+        let (_, program) = ReferenceTestContext::trace(|x| function.call(x), reference_test_scalar_type()).unwrap();
+        let regions = rematerialize_regions(&program.to_flat_program());
+        let reference_operation_names = regions[2]
+            .instructions()
+            .iter()
+            .map(|instruction| instruction.operation().name())
+            .filter(|name| name.starts_with("reference_"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &reference_operation_names[..4],
+            ["reference_new", "reference_read", "reference_add_update", "reference_read"],
+        );
+        let (value, gradient) = ReferenceTestContext::new()
+            .differentiate_at(reference_test_scalar(0.5))
+            .value_and_gradient(|x| function.call(x).unwrap())
+            .unwrap();
+        assert_eq!(value, reference_test_scalar(1.25));
+        assert_eq!(gradient, reference_test_scalar(5.0));
+
+        // f(x) = a · s with a = x read before, and s = 2x frozen after, the accumulation: the consuming freeze is the
+        // newer residual, and a read appended after it would access a consumed reference, so the read must be copied
+        // at its primal position ahead of the freeze. f'(x) = s + 2a = 4x.
+        let function = rematerialize::<ReferenceTestContext, _, _, _>(read_then_freeze_body);
+        let (_, program) = ReferenceTestContext::trace(|x| function.call(x), reference_test_scalar_type()).unwrap();
+        let regions = rematerialize_regions(&program.to_flat_program());
+        let reference_operation_names = regions[2]
+            .instructions()
+            .iter()
+            .map(|instruction| instruction.operation().name())
+            .filter(|name| name.starts_with("reference_"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &reference_operation_names[..4],
+            ["reference_new", "reference_read", "reference_add_update", "reference_freeze"],
+        );
+        let (value, gradient) = ReferenceTestContext::new()
+            .differentiate_at(reference_test_scalar(0.5))
+            .value_and_gradient(|x| function.call(x).unwrap())
+            .unwrap();
+        assert_eq!(value, reference_test_scalar(0.5));
+        assert_eq!(gradient, reference_test_scalar(2.0));
+    }
+
+    #[test]
+    fn test_rematerialization_saves_external_reference_reads_once() {
+        // f(r, x) = read(r) · x: the read of the external reference is force-saved (recomputing it could observe
+        // changed state) while the reference itself is a region input rather than a saved residual, so the forward
+        // tail is `(r, x, read(r))`, the backward program contains no read, and its boundary carries one cotangent
+        // for the value output followed by one cotangent destination for the reference input.
+        let function = rematerialize::<ReferenceTestContext, _, _, _>(external_read_body);
+        let (_, program) = ReferenceTestContext::trace(
+            |input| function.call(input),
+            (reference_test_reference_type(), reference_test_scalar_type()),
+        )
+        .unwrap();
+        let regions = rematerialize_regions(&program.to_flat_program());
+        let scalar_type = reference_test_scalar_type();
+        let reference_type = reference_test_reference_type();
+        assert_eq!(
+            regions[1].output_types(),
+            vec![scalar_type.clone(), reference_type.clone(), scalar_type.clone(), scalar_type.clone()],
+        );
+        assert_eq!(count_operations(&regions[2], "reference_read"), 0);
+        assert_eq!(
+            regions[2].input_types(),
+            vec![
+                reference_type.clone(),
+                scalar_type.clone(),
+                scalar_type.clone(),
+                scalar_type.clone(),
+                reference_type.clone(),
+            ],
+        );
+        assert_eq!(regions[2].output_types(), vec![reference_type.clone(), scalar_type.clone()]);
+        assert_eq!(
+            regions[3].input_types(),
+            vec![reference_type.clone(), scalar_type.clone(), scalar_type.clone(), reference_type, scalar_type],
+        );
+
+        // The gradient with respect to the array input is the reference contents, and the cotangent of the
+        // reference's initial state is the array input times the output cotangent.
+        let reference = ArrayReference::new(Array::scalar(2.0_f32));
+        let (value, pullback) = differentiate_at((ArrayIrValue::Reference(reference), reference_test_scalar(3.0)))
+            .vjp(|input| function.call(input))
+            .unwrap();
+        assert_eq!(value, reference_test_scalar(6.0));
+        assert_eq!(
+            pullback.apply_with_destinations(
+                CotangentSeed::Value(reference_test_scalar(1.0)),
+                (CotangentDestination::Ignore, CotangentDestination::Return),
+            ),
+            Ok((None, Some(reference_test_scalar(2.0)))),
+        );
+        let destination = ArrayReference::new(Array::scalar(0.0_f32));
+        assert_eq!(
+            pullback.apply_with_destinations(
+                CotangentSeed::Value(reference_test_scalar(1.0)),
+                (
+                    CotangentDestination::Reference(ArrayIrValue::Reference(destination.clone())),
+                    CotangentDestination::Return,
+                ),
+            ),
+            Ok((None, Some(reference_test_scalar(2.0)))),
+        );
+        assert_eq!(destination.read(), Ok(Array::scalar(3.0_f32)));
+    }
+
+    #[test]
+    fn test_rematerialization_rejects_external_reference_mutation() {
+        let function = rematerialize::<ReferenceTestContext, _, _, _>(
+            |(reference, x): (ReferenceTestTracer, ReferenceTestTracer)| {
+                reference.add_update(&x)?;
+                reference.read()
+            },
+        );
+        assert!(matches!(
+            ReferenceTestContext::trace(
+                |input| function.call(input),
+                (reference_test_reference_type(), reference_test_scalar_type()),
+            ),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "rematerialization cannot recompute a body that mutates external reference input 0; \
+                    mutate it outside the rematerialized function",
+        ));
+    }
+
+    #[test]
+    fn test_rematerialization_rejects_captured_references() {
+        // A reference the body closes over would have to enter the traced body as a reference-typed constant, which
+        // the trace rejects: references reach a rematerialized function only as inputs.
+        let captured = ArrayReference::new(Array::scalar(2.0_f32));
+        let function = rematerialize::<ReferenceTestContext, _, _, _>(move |x: ReferenceTestTracer| {
+            let context = x.context().clone();
+            let reference = StagingContext::constant(&context, ArrayIrValue::Reference(captured.clone()));
+            reference_test_mul(reference.read()?, x)
+        });
+        assert!(matches!(
+            ReferenceTestContext::trace(|x| function.call(x), reference_test_scalar_type()),
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "reference values cannot be stored as program constants; pass external references \
+                    through program inputs or captures instead",
+        ));
+    }
+
+    #[test]
+    fn test_rematerialization_rejects_escaping_local_references() {
+        let function = rematerialize::<ReferenceTestContext, _, _, _>(|x: ReferenceTestTracer| x.reference_new());
+        assert!(matches!(
+            ReferenceTestContext::trace(|x| function.call(x), reference_test_scalar_type()),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "rematerialization cannot return output 0, a reference allocated inside the \
+                    rematerialized body, because its handle would escape the recomputed lifecycle",
+        ));
+    }
+
+    #[test]
+    fn test_rematerialize_operation_discharge_references() {
+        // A staged rematerialize call over a local lifecycle discharges region by region: the rewritten call keeps its
+        // four regions, none of which contains a reference afterwards, and interprets to the same value.
+        let function = rematerialize::<ReferenceTestContext, _, _, _>(local_lifecycle_body);
+        let (_, program) = ReferenceTestContext::trace(|x| function.call(x), reference_test_scalar_type()).unwrap();
+        let program = program.to_flat_program();
+        assert!(program.entry_region_ref().contains_references_in_closure());
+        let discharged = program
+            .clone()
+            .discharge_references::<ArrayReferenceDischarge>(0)
+            .unwrap()
+            .into_program_without_external_references()
+            .unwrap();
+        assert!(!discharged.entry_region_ref().contains_references_in_closure());
+        assert_eq!(rematerialize_regions(&discharged).len(), 4);
+        assert_eq!(
+            discharged.interpret(vec![reference_test_scalar(0.5)]),
+            program.interpret(vec![reference_test_scalar(0.5)]),
+        );
+        assert_eq!(discharged.interpret(vec![reference_test_scalar(0.5)]), Ok(vec![reference_test_scalar(0.5625)]));
+
+        // A reference operand is rejected because discharge does not thread caller state through the rematerialized
+        // call's derived rule regions.
+        let function = rematerialize::<ReferenceTestContext, _, _, _>(external_read_body);
+        let (_, program) = ReferenceTestContext::trace(
+            |input| function.call(input),
+            (reference_test_reference_type(), reference_test_scalar_type()),
+        )
+        .unwrap();
+        assert!(matches!(
+            program.to_flat_program().discharge_references::<ArrayReferenceDischarge>(0),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "`rematerialize` does not thread external references through discharge, but operand 0 \
+                    is a reference; pass reference-free operands or discharge before rematerializing",
+        ));
+
+        // A hand-built call over reference-free operands whose forward tail carries a reference it allocates declares
+        // reference inputs on its backward and tangent rules. Nothing can bind those inputs during discharge, so the
+        // call is rejected with the same diagnostic rather than failing the rule rebuild internally.
+        let scalar_type = reference_test_scalar_type();
+        let reference_type = reference_test_reference_type();
+        let identity = |input_types: Vec<ArrayIrType>, output_positions: Vec<usize>| {
+            let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
+            let inputs = input_types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
+            let outputs = output_positions.iter().map(|position| inputs[*position]).collect::<Vec<_>>();
+            builder
+                .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
+                    outputs,
+                    vec![Placeholder; input_types.len()],
+                    vec![Placeholder; output_positions.len()],
+                )
+                .unwrap()
+        };
+        let forward = {
+            let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
+            let input = builder.add_input(scalar_type.clone());
+            let reference =
+                builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+            builder
+                .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
+                    vec![input, reference],
+                    vec![Placeholder],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+        let regions = [
+            identity(vec![scalar_type.clone()], vec![0]),
+            forward,
+            identity(vec![reference_type.clone(), scalar_type.clone()], vec![1]),
+            identity(vec![reference_type, scalar_type.clone()], vec![1]),
+        ];
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let reference = builder.add_input(reference_type);
-        let output =
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-        let external = builder
+        let regions = regions.iter().map(|region| builder.import_region(region.entry_region_ref())).collect();
+        let input = builder.add_input(scalar_type);
+        let output = builder
+            .add_instruction(
+                ReferenceTestOperation::Rematerialize(RematerializeOperation::new()),
+                regions,
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
             .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
                 vec![output],
                 vec![Placeholder],
                 vec![Placeholder],
             )
             .unwrap();
-
-        // Caller-owned references require runtime state plumbing that rematerialization does not own.
         assert!(matches!(
-            external.rematerialize_with_local_references::<ReferenceTestContext, _>(0),
+            program.discharge_references::<ArrayReferenceDischarge>(0),
             Err(ProgramError::UnsupportedOperation { message })
-                if message == "reference discharge cannot discard the binding for external `input 0`",
+                if message == "`rematerialize` does not thread external references through discharge, but input 0 of \
+                    region 2 is a reference; pass reference-free operands or discharge before rematerializing",
         ));
     }
 

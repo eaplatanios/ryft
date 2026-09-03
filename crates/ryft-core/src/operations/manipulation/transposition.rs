@@ -500,7 +500,7 @@ mod tests {
         MeshAxis, MeshAxisType, RaggedAxis, Sharding, ShardingDimension, StridedLayout, f8e8m0fnu,
     };
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::{DifferentiableOperation, TransposableOperation};
+    use crate::differentiation::{DifferentiableOperation, TransposableOperation, TranspositionContext};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
@@ -877,10 +877,10 @@ mod tests {
         assert_eq!(duals[0].tangent().r#type().as_ref(), &cycle_output_type.tangent().unwrap());
         assert_eq!(context.builder().borrow().instructions().len(), 1);
 
-        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let contributions = TransposeOperation::new([2, 0, 1])
             .transpose(
-                &mut context,
+                &mut TranspositionContext::new(context.clone()),
                 &EmptyRegionDriver,
                 &[PartialValue::Unknown(cycle_input_type.clone())],
                 &[MaybeZero::Zero(cycle_output_type.cotangent().unwrap())],

@@ -5,23 +5,36 @@
 use std::borrow::Cow;
 use std::sync::LazyLock;
 
+use crate::batching::{
+    BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
+};
 use crate::contexts::{Context, Domain};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    TransposableOperation, TranspositionContext, TranspositionDriver,
+};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_non_transposable_operation};
+use crate::macros::check_count;
 use crate::operations::AddOperation;
+use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
+use crate::programs::atoms::MaybeZero;
 use crate::programs::effects::{Effect, Effects};
 use crate::programs::operations::Operation;
 use crate::programs::references::discharge::{
     ReferenceAccumulationPolicy, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargeValue,
     ReferenceDischargeableOperation,
 };
+use crate::programs::references::operations::ReferenceRead;
 use crate::programs::references::semantics::{ReferenceAccessMode, ReferenceInput, ReferenceOperationSemantics};
 use crate::programs::references::types::ReferenceType;
+use crate::programs::references::views::ReferenceViewOperation;
 use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError};
+use crate::programs::types::{Type, TypeError, Typed};
+use crate::programs::values::Value;
+use crate::tracing::{Tracer, TracingContext};
 
-use super::validate_operand_types;
+use super::{align_stored_batch, stored_tangents, validate_operand_types};
 
 /// Canonical operation name for [`ReferenceAddUpdateOperation`].
 pub const REFERENCE_ADD_UPDATE_OPERATION_NAME: &str = "reference_add_update";
@@ -137,20 +150,111 @@ where
     }
 }
 
-impl_unsupported_reference_transforms!(ReferenceAddUpdateOperation);
+impl<T, U, C> PartiallyEvaluatableOperation<C> for ReferenceAddUpdateOperation<T, U>
+where
+    T: Type,
+    U: Type,
+    C: Context<Type = U, Operation: From<ReferenceAddUpdateOperation<T, U>>>,
+{
+    // The default partial-evaluation behavior applies: the primitive's ordered-state effect is placed centrally
+    // before any operation rule runs.
+}
 
-impl_non_transposable_operation!(
-    <T, U> ReferenceAddUpdateOperation<T, U>
-    where
-        T: Type,
-        U: Type,
-);
+impl<T, U, C> DifferentiableOperation<C> for ReferenceAddUpdateOperation<T, U>
+where
+    T: Type,
+    U: DifferentiableType,
+    ReferenceAddUpdateOperation<T, U>: Operation<Type = U>,
+    C: Context<Type = U, Value: ReferenceAddUpdate<C::Value>>,
+{
+    // Addition is linear, so the update's tangent is accumulated into the tangent reference exactly as the primal
+    // update is accumulated into the primal reference. Accumulating a symbolic zero tangent is a no-op and stages
+    // nothing. The tangent pairing is resolved before either accumulation so that a rejected plumbing store leaves both
+    // references untouched.
+    fn jvp<D: DifferentiationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        check_count!("input", inputs, 2, ProgramError);
+        let stored = stored_tangents(REFERENCE_ADD_UPDATE_OPERATION_NAME, &inputs[0], &inputs[1])?;
+        inputs[0].primal().add_update(inputs[1].primal())?;
+        if let Some((tangent_reference, MaybeZero::Value(tangent))) = stored {
+            tangent_reference.add_update(&tangent)?;
+        }
+        Ok(Vec::new())
+    }
+}
+
+impl<T, U, C, P> BatchableOperation<C, P> for ReferenceAddUpdateOperation<T, U>
+where
+    T: Type,
+    U: Type,
+    ReferenceAddUpdateOperation<T, U>: Operation<Type = U>,
+    C: Context<Type = U, Value: ReferenceAddUpdate<C::Value>>,
+    P: BatchingPolicy<C>,
+{
+    // The update is aligned with the reference's fixed batch axis before the packed accumulation.
+    fn batch<D: BatchingDriver<C, P>>(
+        &self,
+        context: &BatchingContext<C, P>,
+        driver: &D,
+        inputs: &[P::Batch],
+    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+        check_count!("input", inputs, 2, ProgramError);
+        let update =
+            align_stored_batch(context, driver, REFERENCE_ADD_UPDATE_OPERATION_NAME, &inputs[0], inputs[1].clone())?;
+        P::value(&inputs[0]).add_update(P::value(&update))?;
+        Ok(Vec::new().into())
+    }
+}
+
+impl<T, U, V, O> TransposableOperation<V, O> for ReferenceAddUpdateOperation<T, U>
+where
+    T: Type,
+    U: DifferentiableType,
+    ReferenceAddUpdateOperation<T, U>: Operation<Type = U>,
+    V: Value<Type = U>,
+    O: ReferenceViewOperation<Type = U>,
+    Tracer<TracingContext<V, O>>: ReferenceRead<Tracer<TracingContext<V, O>>>,
+{
+    // An accumulation maps `(state, x) ↦ state + x`, so its transpose reads the cotangent reference as the cotangent of
+    // the update and leaves the reference's contents unchanged for the earlier accesses. An accumulator that nothing
+    // has reached yet holds zero, so nothing is staged and the update's cotangent stays symbolic.
+    fn transpose<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TranspositionContext<'_, V, O>,
+        _driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        check_count!("input", inputs, 2, ProgramError);
+        check_count!("output", outputs, 0, ProgramError);
+        let reference_cotangent = MaybeZero::Zero(inputs[0].r#type().cotangent()?);
+        let Some(accumulator) = context.cotangent_reference_if_allocated(0)? else {
+            return Ok(vec![reference_cotangent, MaybeZero::Zero(inputs[1].r#type().cotangent()?)]);
+        };
+        Ok(vec![reference_cotangent, MaybeZero::Value(accumulator.read()?)])
+    }
+}
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        Array, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrValue, ArrayType, DataType, DimensionBounds,
+        DimensionType, DimensionValue, DimensionVariable,
+    };
+    use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
+    use crate::contexts::EagerContext;
+    use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
+    use crate::parameters::Placeholder;
+    use crate::programs::builders::ProgramBuilder;
     use crate::programs::references::operations::tests::*;
+    use crate::programs::references::operations::{ReferenceNew, ReferenceRead};
     use crate::programs::regions::EmptyRegionDriver;
 
     use super::*;
@@ -235,5 +339,140 @@ mod tests {
             .into()),
         );
         assert_eq!(context.read(&reference), Ok(TestValue::new(REFERENT, 13)));
+    }
+
+    #[test]
+    fn test_reference_add_update_operation_jvp() {
+        type TestValue = ArrayIrValue<Array>;
+
+        let context = DifferentiationContext::new(EagerContext::<TestValue, ArrayIrOperation<Array>>::new());
+        let reference = TestValue::Array(Array::vector(vec![1.0_f32, 2.0])).reference_new().unwrap();
+        let tangent_reference = TestValue::Array(Array::vector(vec![3.0_f32, 4.0])).reference_new().unwrap();
+        let active = DifferentiationTracer::new(
+            DifferentiationDual::new(reference.clone(), tangent_reference.clone()).unwrap(),
+            context.clone(),
+        );
+
+        // Addition is linear, so the update's tangent accumulates into the tangent reference.
+        let update = DifferentiationTracer::new(
+            DifferentiationDual::new(
+                TestValue::Array(Array::vector(vec![5.0_f32, 6.0])),
+                TestValue::Array(Array::vector(vec![7.0_f32, 8.0])),
+            )
+            .unwrap(),
+            context.clone(),
+        );
+        let outputs = context.bind(ReferenceAddUpdateOperation::new(), Vec::new(), &[active.clone(), update]).unwrap();
+        assert!(outputs.is_empty());
+        assert_eq!(reference.read(), Ok(TestValue::Array(Array::vector(vec![6.0_f32, 8.0]))));
+        assert_eq!(tangent_reference.read(), Ok(TestValue::Array(Array::vector(vec![10.0_f32, 12.0]))));
+
+        // A symbolic zero update tangent accumulates nothing and is not instantiated.
+        let update = DifferentiationTracer::new(
+            DifferentiationDual::new_with_zero_tangent(TestValue::Array(Array::vector(vec![1.0_f32, 1.0]))).unwrap(),
+            context.clone(),
+        );
+        context.bind(ReferenceAddUpdateOperation::new(), Vec::new(), &[active, update]).unwrap();
+        assert_eq!(reference.read(), Ok(TestValue::Array(Array::vector(vec![7.0_f32, 9.0]))));
+        assert_eq!(tangent_reference.read(), Ok(TestValue::Array(Array::vector(vec![10.0_f32, 12.0]))));
+
+        // Staged, the zero-tangent accumulation is therefore elided from the tangent side entirely: the fused program
+        // accumulates the constant into the primal reference and leaves the tangent reference untouched.
+        let mut builder = ProgramBuilder::<TestValue, ArrayIrOperation<Array>>::new();
+        let reference_atom = builder.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
+        let constant = builder.add_constant(TestValue::Array(Array::scalar(1.0_f32)));
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference_atom, constant], None)
+            .unwrap();
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference_atom], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            program.jvp().unwrap().to_string(),
+            indoc! {"
+                lambda %0:ref<f32[]>, %1:ref<f32[]> .
+                let %2:f32[] = const 1.0
+                    reference_add_update %0 %2
+                in (%0, %1)
+            "}
+            .trim_end(),
+        );
+
+        // A plumbing reference accepts an update without a live tangent, while a live update tangent has no tangent
+        // reference to accumulate into and the rejection precedes the primal accumulation.
+        let plumbing = DifferentiationTracer::new(
+            DifferentiationDual::new_with_zero_tangent(reference.clone()).unwrap(),
+            context.clone(),
+        );
+        let update = DifferentiationTracer::new(
+            DifferentiationDual::new_with_zero_tangent(TestValue::Array(Array::vector(vec![1.0_f32, 1.0]))).unwrap(),
+            context.clone(),
+        );
+        context.bind(ReferenceAddUpdateOperation::new(), Vec::new(), &[plumbing.clone(), update]).unwrap();
+        assert_eq!(reference.read(), Ok(TestValue::Array(Array::vector(vec![8.0_f32, 10.0]))));
+        let update = DifferentiationTracer::new(
+            DifferentiationDual::new(
+                TestValue::Array(Array::vector(vec![1.0_f32, 1.0])),
+                TestValue::Array(Array::vector(vec![1.0_f32, 1.0])),
+            )
+            .unwrap(),
+            context.clone(),
+        );
+        let error = context.bind(ReferenceAddUpdateOperation::new(), Vec::new(), &[plumbing, update]).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<DifferentiationError>(),
+            Some(&DifferentiationError::PlumbingReferenceTangent { operation: REFERENCE_ADD_UPDATE_OPERATION_NAME }),
+        );
+        assert_eq!(reference.read(), Ok(TestValue::Array(Array::vector(vec![8.0_f32, 10.0]))));
+        assert_eq!(tangent_reference.read(), Ok(TestValue::Array(Array::vector(vec![10.0_f32, 12.0]))));
+    }
+
+    #[test]
+    fn test_reference_add_update_operation_batching() {
+        type TestValue = ArrayIrValue<Array>;
+
+        let extent = TestValue::Dimension(
+            DimensionValue::new(DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())), 2)
+                .unwrap(),
+        );
+        let context = BatchingContext::<_, ArrayIrBatching>::new(
+            EagerContext::<TestValue, ArrayIrOperation<Array>>::new(),
+            extent,
+        );
+        let packed_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let initial = TestValue::Array(Array::from_f64s(packed_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        let reference = initial.reference_new().unwrap();
+        let batched =
+            BatchingTracer::new(context.clone(), ArrayIrBatch::new(reference.clone(), BatchAxis::new(0)).unwrap());
+
+        // An update mapped at the reference's batch axis accumulates packed.
+        let update = BatchingTracer::new(
+            context.clone(),
+            ArrayIrBatch::new(TestValue::Array(Array::from_f64s(packed_type.clone(), vec![1.0; 6])), BatchAxis::new(0))
+                .unwrap(),
+        );
+        let outputs = context.bind(ReferenceAddUpdateOperation::new(), Vec::new(), &[batched, update]).unwrap();
+        assert!(outputs.is_empty());
+        assert_eq!(
+            reference.read(),
+            Ok(TestValue::Array(Array::from_f64s(packed_type.clone(), vec![2.0, 3.0, 4.0, 5.0, 6.0, 7.0]))),
+        );
+
+        // A batched update cannot accumulate into an unbatched reference.
+        let replicated = BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(reference.clone()));
+        let update = BatchingTracer::new(
+            context.clone(),
+            ArrayIrBatch::new(TestValue::Array(Array::from_f64s(packed_type, vec![1.0; 6])), BatchAxis::new(0))
+                .unwrap(),
+        );
+        let error = context.bind(ReferenceAddUpdateOperation::new(), Vec::new(), &[replicated, update]).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<BatchingError>(),
+            Some(&BatchingError::UnsupportedOperation {
+                message: "`reference_add_update` cannot store a batched value into an unbatched reference; pass the \
+                          reference as a batched input instead"
+                    .to_string(),
+            }),
+        );
     }
 }

@@ -7,10 +7,14 @@
 
 // TODO(eaplatanios): Review this module.
 
-use crate::contexts::Domain;
+use crate::batching::{BatchingContext, BatchingDriver, BatchingError, BatchingPolicy};
+use crate::contexts::{Context, Domain};
+use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationError};
 use crate::programs::ProgramError;
+use crate::programs::atoms::MaybeZero;
 use crate::programs::operations::Operation;
 use crate::programs::types::{Type, Typed};
+use crate::programs::values::Value;
 
 use super::discharge::{ReferenceDischargePolicy, ReferenceDischargeValue};
 use super::types::ReferenceType;
@@ -114,60 +118,100 @@ where
     Ok(())
 }
 
-macro_rules! impl_unsupported_reference_transforms {
-    // Defines the same conservative transform rejections for one unresolved generic reference primitive.
-    ($operation:ident) => {
-        impl<T, U, C> $crate::partial::PartiallyEvaluatableOperation<C> for $operation<T, U>
-        where
-            T: $crate::programs::Type,
-            U: $crate::programs::Type,
-            C: $crate::contexts::Context<Type = U, Operation: From<$operation<T, U>>>,
-        {
-        }
+/// Aligns the batch carrier of a value stored into a reference with the reference's batch axis. A reference's batch
+/// axis is fixed by its packed referent and cannot move, so the stored value is the operand that adapts: a replicated
+/// value is broadcast to a batched reference's axis and a value mapped elsewhere is moved to it, both through
+/// [`BatchingDriver::align_batch_axis`], which reaches the policy's broadcast and transpose machinery without bounding
+/// the rule by [`RecursiveBatchingPolicy`](crate::batching::RecursiveBatchingPolicy). Storing a batched value into a
+/// replicated reference is rejected, because the reference has no batch axis to receive the per-item values; the
+/// reference must instead enter the transform as a batched input.
+///
+/// # Parameters
+///
+///   - `context`: Batching context whose extent describes the batch axis.
+///   - `driver`: Application-scoped driver through which the value is aligned.
+///   - `operation_name`: Name of the storing operation, used in the rejection diagnostic.
+///   - `reference`: Batch carrier of the reference being stored into.
+///   - `value`: Batch carrier of the stored value.
+///
+/// # Errors
+///
+/// Returns [`BatchingError::UnsupportedOperation`] when `reference` is replicated and `value` is mapped, and propagates
+/// the driver's alignment error otherwise.
+fn align_stored_batch<C: Context, P: BatchingPolicy<C>, D: BatchingDriver<C, P>>(
+    context: &BatchingContext<C, P>,
+    driver: &D,
+    operation_name: &str,
+    reference: &P::Batch,
+    value: P::Batch,
+) -> Result<P::Batch, BatchingError> {
+    match (P::batch_axis(reference).axis(), P::batch_axis(&value).axis()) {
+        (Some(axis), _) => driver.align_batch_axis(context, value, axis),
+        (None, None) => Ok(value),
+        (None, Some(_)) => Err(BatchingError::UnsupportedOperation {
+            message: format!(
+                "`{operation_name}` cannot store a batched value into an unbatched reference; pass the reference as a \
+                 batched input instead",
+            ),
+        }),
+    }
+}
 
-        impl<T, U, C, P> $crate::batching::BatchableOperation<C, P> for $operation<T, U>
-        where
-            T: $crate::programs::Type,
-            U: $crate::programs::Type,
-            $operation<T, U>: $crate::programs::Operation<Type = U>,
-            C: $crate::contexts::Context<Type = U, Operation: From<$operation<T, U>>>,
-            P: $crate::batching::BatchingPolicy<C>,
-        {
-            fn batch<D: $crate::batching::BatchingDriver<C, P>>(
-                &self,
-                _context: &$crate::batching::BatchingContext<C, P>,
-                _driver: &D,
-                _inputs: &[P::Batch],
-            ) -> Result<$crate::batching::BatchedOutputs<C, P>, $crate::batching::BatchingError> {
-                Err($crate::batching::BatchingError::UnsupportedOperation {
-                    message: format!("`{}` must be discharged before batching", self.name()),
-                })
-            }
+/// Pairs the tangent reference of `reference` with the tangent of a value stored into it, for the forward-mode rules of
+/// the storing primitives. A reference dual whose tangent is a [`MaybeZero::Value`] carries a tangent reference that
+/// receives the stored value's tangent, which is returned still symbolic so that each rule decides what a zero stored
+/// tangent means for it: a write or swap must instantiate it because the tangent reference observes the store, while
+/// an additive update of zero is a no-op that stages nothing. A reference dual whose tangent is a [`MaybeZero::Zero`]
+/// is a plumbing reference (i.e., a captured reference without a tangent slot): a zero stored tangent leaves nothing to
+/// record, so `None` is returned, while a live stored tangent has nowhere to go and is rejected.
+///
+/// # Parameters
+///
+///   - `operation_name`: Name of the storing operation, used in the rejection diagnostic.
+///   - `reference`: Dual of the reference being stored into.
+///   - `value`: Dual of the stored value.
+///
+/// # Errors
+///
+/// Returns [`DifferentiationError::PlumbingReferenceTangent`] when `reference` is a plumbing reference and `value`
+/// carries a live tangent.
+fn stored_tangents<'r, V: Value>(
+    operation_name: &'static str,
+    reference: &'r DifferentiationDual<V>,
+    value: &DifferentiationDual<V>,
+) -> Result<Option<(&'r V, MaybeZero<V>)>, DifferentiationError> {
+    match (reference.tangent(), value.tangent()) {
+        (MaybeZero::Value(tangent_reference), tangent) => Ok(Some((tangent_reference, tangent.clone()))),
+        (MaybeZero::Zero(_), MaybeZero::Zero(_)) => Ok(None),
+        (MaybeZero::Zero(_), MaybeZero::Value(_)) => {
+            Err(DifferentiationError::PlumbingReferenceTangent { operation: operation_name })
         }
+    }
+}
 
-        impl<T, U, C> $crate::differentiation::DifferentiableOperation<C> for $operation<T, U>
-        where
-            T: $crate::programs::Type,
-            U: $crate::programs::Type,
-            $operation<T, U>: $crate::programs::Operation<Type = U>,
-            C: $crate::contexts::Context<Type = U, Operation: From<$operation<T, U>>>,
-        {
-            fn jvp<D: $crate::differentiation::DifferentiationDriver<C>>(
-                &self,
-                _context: &C,
-                _driver: &D,
-                _inputs: &[$crate::differentiation::DifferentiationDual<C::Value>],
-            ) -> Result<
-                Vec<$crate::differentiation::DifferentiationDual<C::Value>>,
-                $crate::differentiation::DifferentiationError,
-            > {
-                Err($crate::programs::ProgramError::UnsupportedOperation {
-                    message: format!("`{}` must be discharged before differentiation", self.name()),
-                }
-                .into())
-            }
+/// Pairs the `primal` result of a reference access or view with its tangent, for the forward-mode rules of the
+/// primitives that read from or view a reference without storing into it (i.e., reads, freezes, and the array view
+/// operations). A reference dual whose tangent is a [`MaybeZero::Value`] carries a tangent reference to which `forward`
+/// applies the same access or view, yielding the live tangent of `primal`. A reference dual whose tangent is a
+/// [`MaybeZero::Zero`] is a plumbing reference that carries no tangent reference, so `primal` receives a symbolic zero
+/// tangent (for a view, that zero is typed with the view's own reference type, so the view stays plumbing).
+///
+/// # Parameters
+///
+///   - `reference`: Dual of the reference being accessed or viewed.
+///   - `primal`: Result of applying the access or view to the primal reference.
+///   - `forward`: Applies the same access or view to the tangent reference.
+pub(crate) fn forwarded_tangent<V: Value<Type: DifferentiableType>, F: FnOnce(&V) -> Result<V, ProgramError>>(
+    reference: &DifferentiationDual<V>,
+    primal: V,
+    forward: F,
+) -> Result<DifferentiationDual<V>, DifferentiationError> {
+    match reference.tangent() {
+        MaybeZero::Value(tangent_reference) => {
+            DifferentiationDual::new(primal, MaybeZero::Value(forward(tangent_reference)?))
         }
-    };
+        MaybeZero::Zero(_) => DifferentiationDual::new_with_zero_tangent(primal),
+    }
 }
 
 mod reference_add_update;

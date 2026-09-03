@@ -375,7 +375,11 @@ impl<
 
         // Concrete resource-bearing value families need a complete, all-or-nothing legality check before replay can
         // lift constants or execute the first instruction. Transform wrappers use their own value family and therefore
-        // retain their operation-level gates even when their innermost execution context is eager.
+        // retain their operation-level gates even when their innermost execution context is eager. Runtime reference
+        // alias validation is deliberately not performed here as it belongs to the public transform boundaries (e.g.,
+        // `jvp`, `linearize`, `batch`, etc.) that bind concrete values, whereas this replay is also reached with
+        // transform tracers over an eager parent, which report no identity, and with legitimately repeated residual
+        // reference slots.
         let requires_validation = context.is_eager() && C::Value::VALIDATES_EAGER_INTERPRETATION;
         if requires_validation {
             C::Value::validate_eager_interpretation(self.entry_region_ref())?;

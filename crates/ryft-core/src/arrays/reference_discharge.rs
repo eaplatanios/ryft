@@ -11,75 +11,82 @@
 //! An operation without a [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation) rule of its own
 //! conservatively rejects reference state
 //! anywhere in its attached-region closures — including state that is allocated, mutated, and consumed entirely
-//! inside the region. Today that covers `shard_map`, rematerialization, linear-call, and custom-derivative carriers,
-//! for each of which threading state through the region has no defined meaning rather than merely being
-//! unimplemented.
+//! inside the region. Today that covers `shard_map`, linear-call, and custom-derivative carriers, for each of which
+//! threading state through the region has no defined meaning rather than merely being unimplemented. A rematerialized
+//! call discharges each of its regions independently: a local lifecycle inside a region discharges within that region,
+//! and reference operands are rejected because discharge does not thread external state through rematerialization.
 //!
 //! # Transform Boundary
 //!
-//! Discharge is the only supported route from local mutable state into generic transforms. Partial evaluation,
-//! batching, forward- and reverse-mode differentiation, and rematerialization first prove that every allocation is local,
-//! discharge the complete program, and then transform the reference-free result. The resulting behavior is the same
-//! as transforming an explicitly immutable state-passing program. External public or captured allocations are rejected by
-//! these adapters: automatic differentiation of caller-owned state, mapped/shared reference batching, and
-//! externally stateful rematerialization have no implicit semantics. Custom-derivative rule regions reject reference
-//! state independently rather than inheriting a derivative for mutation.
+//! Discharge is the lowering and normalization route, not a precondition for transforms. Backend lowering rejects any
+//! reference that survives to it (the stateful XLA ABI opens and commits external references and has no protocol for
+//! a backend-created reference), kernel pipelines discharge their own state while preserving the references a kernel
+//! body lowers to target memory operations, and callers may normalize a program into explicit state passing whenever
+//! they want the reference-free form. Every transform instead operates on references directly, reading its structural
+//! facts from the [`ReferenceAnalysis`](crate::ReferenceAnalysis) cached on the region and checking runtime aliasing
+//! by [`ReferenceId`](crate::ReferenceId) through [`validate_reference_boundary`](crate::validate_reference_boundary)
+//! at every public boundary where live values are bound:
 //!
-//! Supported local control flow follows the same rule. Conditions receive the current allocation state in both branches;
-//! while bodies and scan bodies return updated hidden carries; nested calls receive and return the state required by
-//! their canonical allocation summaries. A while condition may read entering state, and a condition that mutates it is
-//! rotated into do-while form: the condition runs once before the loop for the initial predicate and again at the tail
-//! of the rebuilt body, so its updates publish through the body's carries even though its own Boolean-only boundary
-//! cannot. A loop with an iteration bound cannot be rotated and is rejected when its condition mutates state. No region
-//! closure of any shape may consume a caller allocation, because a consumed allocation has no successor state for a
-//! boundary to carry. Derived views do not cross any of these boundaries and must be recreated from the allocation
-//! inside the attached region.
+//! - **Forward mode** ([`Program::jvp`](crate::Program::jvp) and [`differentiate_at`](crate::differentiate_at)) pairs
+//!   every active primal reference with a caller-supplied tangent reference and mutates both in program order; a
+//!   captured reference is plumbing with a symbolic zero tangent, and a live tangent stored into it is rejected.
+//! - **Linearization** ([`Program::linearize`](crate::Program::linearize)) is the known-ness split of the fused
+//!   forward pass: the primal accesses fold into the forward pass (mutating the primal reference at linearization
+//!   time) while the tangent accesses stage into the pushforward over the tangent reference, placed by the per-root
+//!   effect frontier of partial evaluation.
+//! - **Reverse mode** ([`Pullback::apply_with_destinations`](crate::Pullback::apply_with_destinations)) accumulates
+//!   the state cotangent of every linear reference through a cotangent reference: a caller-supplied
+//!   [`CotangentDestination::Reference`](crate::CotangentDestination::Reference), an internal one whose final contents
+//!   are discarded ([`Ignore`](crate::CotangentDestination::Ignore)), or, for a local allocation, one allocated by the
+//!   transposed program and frozen into the initial value's cotangent.
+//! - **Batching** ([`batch`](crate::batch)) gives a reference a batch axis by giving its referent one, so accesses
+//!   through a mapped reference are packed per item; a replicated or captured reference accepts only replicated
+//!   stores.
+//! - **Partial evaluation** ([`Program::partially_evaluate`](crate::Program::partially_evaluate)) keeps one effect
+//!   frontier per reference root: once a mutation of a root must stage, every later access of that root stages, and a
+//!   live reference reaching the residual program is threaded as a reference rather than as a snapshot.
+//! - **Rematerialization** recomputes complete local reference lifecycles, saves reads of external references, and
+//!   rejects bodies that mutate an external reference or return a local one.
+//! - **Custom derivatives** admit references only as leading non-differentiated inputs, replay their rules with local
+//!   reference state, and reject reference outputs; `jit_call` threads references positionally through its callee, and
+//!   `shard_map` follows the ownership contract in its own module documentation.
+//!
+//! The control-flow rules follow the same model: reference carries of `while` and `scan` keep their identity and their
+//! batch axis across iterations, a `condition` passes its reference operands into both branches, and the eager `while`
+//! interpreter selects reference carries wholesale under a scalar predicate. Only discharge rewrites control flow
+//! around references, as described next.
+//!
+//! Under discharge, structured control flow threads state explicitly. Conditions receive the current allocation state
+//! in both branches; while bodies and scan bodies return updated hidden carries; nested calls receive and return the
+//! state required by their canonical allocation summaries. A while condition may read entering state, and a condition
+//! that mutates it is rotated into do-while form: the condition runs once before the loop for the initial predicate
+//! and again at the tail of the rebuilt body, so its updates publish through the body's carries even though its own
+//! Boolean-only boundary cannot. A loop with an iteration bound cannot be rotated and is rejected when its condition
+//! mutates state. No region closure of any shape may consume a caller allocation, because a consumed allocation has no
+//! successor state for a boundary to carry. Derived views do not cross any of these boundaries and must be recreated
+//! from the allocation inside the attached region.
 //!
 //! Mutation summaries are conservative: a write in either condition branch or in a loop/scan body publishes hidden
 //! final state and advances the external reference generation even when one execution takes the other branch, performs
 //! zero loop iterations, or scans a zero-length axis. In those executions the published state equals the input state.
 //!
 //! ```text
-//! local reference program
-//!     -> discharge to immutable array SSA, rejecting misuse against the allocation it reached
-//!     -> partial evaluation / batching / AD / rematerialization
-//!
-//! external or captured reference program
-//!     -> stateful compilation and execution, or a targeted transform rejection
+//! reference program
+//!     -> forward mode / linearization / reverse mode / batching / partial evaluation / rematerialization, directly
+//!     -> discharge to immutable array SSA (external references become state inputs and hidden final-state outputs)
+//!     -> backend lowering
 //! ```
 //!
-//! Representative supported compositions are shown below. The transforms themselves reject reference operations
-//! outright ("must be discharged before differentiation/batching"). First call
-//! [`Program::discharge_references`](crate::Program::discharge_references), convert the result through
-//! [`crate::ReferenceDischargeResult::into_program_without_external_references`],
-//! and then use the ordinary transform:
-//! [`Program::jvp`](crate::Program::jvp) or [`Program::linearize`](crate::Program::linearize) for forward mode,
-//! [`Pullback`](crate::Pullback) obtained from the linearization for reverse
-//! mode, [`Program::batched_with_threaded_extent`](crate::Program::batched_with_threaded_extent) for batching,
-//! [`Program::partially_evaluate`](crate::Program::partially_evaluate) for partial evaluation, and
-//! [`Program::rematerialize_with_local_references`](crate::Program::rematerialize_with_local_references) for
-//! rematerialization, which composes the discharge itself.
+//! The discharged program doubles as the oracle for the direct rules: transforming the reference-free result is the
+//! same as transforming an explicitly immutable state-passing program, which is how the transform tests check the
+//! direct rules against [`Program::jvp`](crate::Program::jvp), [`Program::linearize`](crate::Program::linearize),
+//! [`Program::batched_with_threaded_extent`](crate::Program::batched_with_threaded_extent), and
+//! [`Program::partially_evaluate`](crate::Program::partially_evaluate).
 //!
 //! ```text
-//! condition(predicate,
-//!     true  = || { state.add_update(true_update) },
-//!     false = || { state.swap(false_replacement) })
-//! while read(state) < limit { state.add_update(step) }
-//! scan(inputs) { |input| state.add_update(input); read(state) }
-//!     -> explicit immutable state carries at every attached-region boundary
-//!
-//! let program = program
-//!     .discharge_references(capture_count)?
-//!     .into_program_without_external_references()?;
-//! program.jvp()?                                  // state = reference_new(x); state.add_update(x); freeze(state)
-//! program.linearize()?.pullback()
-//!     -> discharge local state -> differentiate the reference-free program
-//!
-//! program
-//!     .discharge_references(capture_count)?
-//!     .into_program_without_external_references()?
-//!     .batched_with_threaded_extent(...)
-//!     -> discharge local state -> batch independent immutable state-passing programs
+//! let discharged = program.discharge_references(capture_count)?.into_program_without_external_references()?;
+//! discharged.jvp()?                                // agrees with `program.jvp()?` on every non-reference output
+//! discharged.batched_with_threaded_extent(...)     // agrees with batching `program` at the same axes
 //! ```
 //!
 //! An allocation that is allocated, mutated, and consumed inside one program is discharged into ordinary array SSA, so the
@@ -171,10 +178,14 @@
 //!
 //! [`ArrayReferenceDischarge`] is this universe's [`ReferenceDischargePolicy`], and it is what
 //! [`Program::discharge_references`](crate::Program::discharge_references) threads: its referent is an
-//! [`ArrayType`]-typed array and its alias
-//! is the composed [`ArrayReferenceView`] mapping an allocation to one handle's coordinates. Staged and eager reference
-//! semantics cannot drift apart, because both reach their coordinates through the one [`ArrayReferenceView`]
-//! traversal — the eager handles through a value carrier, the policy through a destination-context carrier.
+//! [`ArrayType`]-typed array and its alias is the composed [`ArrayReferenceView`] mapping an allocation to one
+//! handle's coordinates, closed over destination values: a view step with a symbolic coordinate binds the destination
+//! value of the operand it names, so the policy can resolve it without an environment lookup. Staged and eager
+//! reference semantics cannot drift apart, because both reach their coordinates through the one
+//! [`ArrayReferenceView`] traversal — the eager handles through a value carrier over static steps, the policy through
+//! a destination-context carrier. That carrier does not yet lower a symbolic coordinate (no dynamic slice constructor
+//! exists on [`ArrayReferenceViewOperation`]), so discharging an access through such a step is rejected with
+//! [`ProgramError::UnsupportedOperation`].
 
 // TODO(eaplatanios): Review this module.
 
@@ -195,10 +206,12 @@ use crate::programs::{
 /// [`ReferenceDischargePolicy`] of the array reference universe.
 ///
 /// An array reference's referent is an ordinary [`ArrayType`]-typed array, and the alias one flowing handle carries is
-/// the composed [`ArrayReferenceView`] mapping its allocation to its own coordinates. Every access therefore reaches its
-/// coordinates through the same view traversal the eager handles use, which is what keeps staged and eager reference
-/// semantics from drifting apart: reading materializes the allocation-to-handle chain and takes its last snapshot, while a
-/// replacement or an accumulation writes the new leaf back through that chain in reverse.
+/// the composed [`ArrayReferenceView`] mapping its allocation to its own coordinates, with every symbolic coordinate
+/// closed over the destination value it selects. Every access therefore reaches its coordinates through the same view
+/// traversal the eager handles use, which is what keeps staged and eager reference semantics from drifting apart:
+/// reading materializes the allocation-to-handle chain and takes its last snapshot, while a replacement or an
+/// accumulation writes the new leaf back through that chain in reverse. An access through a symbolic step is rejected
+/// with [`ProgramError::UnsupportedOperation`] until the view operations expose dynamic slicing.
 ///
 /// The destination is bounded by [`Context`] rather than [`Domain`](crate::Domain) because the view traversal binds
 /// canonical slice, reshape, and update-slice operations into it. Those three have no value-level capability in the
@@ -216,13 +229,13 @@ where
     C::Operation: ArrayReferenceViewOperation,
 {
     type Referent = ArrayType;
-    type Alias = ArrayReferenceView;
+    type Alias = ArrayReferenceView<C::Value>;
 
-    fn storage_alias(_referent: &ArrayType) -> ArrayReferenceView {
+    fn storage_alias(_referent: &ArrayType) -> ArrayReferenceView<C::Value> {
         ArrayReferenceView::root()
     }
 
-    fn read(context: &C, current: &C::Value, alias: &ArrayReferenceView) -> Result<C::Value, ProgramError> {
+    fn read(context: &C, current: &C::Value, alias: &ArrayReferenceView<C::Value>) -> Result<C::Value, ProgramError> {
         let mut intermediates = alias.intermediates_in(&mut DestinationViewCarrier(context), current.clone())?;
 
         // The traversal always pushes the allocation itself first, so the chain is never empty and its last snapshot is the
@@ -234,7 +247,7 @@ where
         context: &C,
         current: &C::Value,
         replacement: C::Value,
-        alias: &ArrayReferenceView,
+        alias: &ArrayReferenceView<C::Value>,
     ) -> Result<C::Value, ProgramError> {
         alias.write_in(&mut DestinationViewCarrier(context), current.clone(), replacement)
     }
@@ -243,7 +256,7 @@ where
         context: &C,
         current: &C::Value,
         replacement: C::Value,
-        alias: &ArrayReferenceView,
+        alias: &ArrayReferenceView<C::Value>,
     ) -> Result<(C::Value, C::Value), ProgramError> {
         alias.swap_in(&mut DestinationViewCarrier(context), current.clone(), replacement)
     }
@@ -261,7 +274,7 @@ where
         context: &C,
         current: &C::Value,
         update: C::Value,
-        alias: &ArrayReferenceView,
+        alias: &ArrayReferenceView<C::Value>,
     ) -> Result<C::Value, ProgramError> {
         let mut carrier = DestinationViewCarrier(context);
         let intermediates = alias.intermediates_in(&mut carrier, current.clone())?;
@@ -273,7 +286,9 @@ where
 
 /// View carrier that binds the canonical slice, reshape, and update-slice operations of one array reference view into
 /// a reference discharge destination, sharing the single [`ArrayReferenceView`] traversal with the eager value
-/// carrier, which is what keeps staged and eager reference semantics from drifting apart.
+/// carrier, which is what keeps staged and eager reference semantics from drifting apart. Symbolic coordinates arrive
+/// closed over destination values but have no dynamic slice constructor to lower to yet, so both symbolic hooks reject
+/// them with [`ProgramError::UnsupportedOperation`].
 struct DestinationViewCarrier<'c, C>(
     /// Destination context the staged view operations are bound through.
     &'c C,
@@ -284,6 +299,7 @@ where
     C::Operation: ArrayReferenceViewOperation,
 {
     type Value = C::Value;
+    type Binding = C::Value;
 
     fn array_type<'c>(&'c self, value: &'c C::Value) -> Result<Cow<'c, ArrayType>, ProgramError> {
         match value.r#type() {
@@ -299,6 +315,15 @@ where
     fn reshape(&mut self, input: &C::Value, shape: Shape) -> Result<C::Value, ProgramError> {
         self.bind(C::Operation::from_reference_reshape(ReshapeOperation::new(shape)), &[input])
     }
+
+    fn index_symbolic(
+        &mut self,
+        _input: &C::Value,
+        _axis: usize,
+        _binding: &C::Value,
+    ) -> Result<C::Value, ProgramError> {
+        Err(symbolic_coordinate_unsupported())
+    }
 }
 
 impl<C: Context<Type = ArrayIrType>> ViewWriteCarrier for DestinationViewCarrier<'_, C>
@@ -312,6 +337,24 @@ where
         starts: Vec<usize>,
     ) -> Result<C::Value, ProgramError> {
         self.bind(C::Operation::from_reference_update_slice(UpdateSliceOperation::new(starts)), &[target, update])
+    }
+
+    fn update_index_symbolic(
+        &mut self,
+        _target: &C::Value,
+        _update: &C::Value,
+        _axis: usize,
+        _binding: &C::Value,
+    ) -> Result<C::Value, ProgramError> {
+        Err(symbolic_coordinate_unsupported())
+    }
+}
+
+/// Returns the error with which the destination carrier rejects an access through a symbolic view coordinate.
+fn symbolic_coordinate_unsupported() -> ProgramError {
+    ProgramError::UnsupportedOperation {
+        message: "a symbolic reference view coordinate cannot be discharged until dynamic slicing is supported"
+            .to_string(),
     }
 }
 
@@ -345,7 +388,7 @@ mod tests {
         ArrayIrOperation, ArrayOperation, ReferenceIndexOperation, ReferenceSliceOperation,
         reapply_array_reference_view,
     };
-    use crate::arrays::reference_views::{ArrayReference, ArrayReferenceView, ArrayReferenceViewTransform};
+    use crate::arrays::reference_views::{ArrayReference, ArrayReferenceView, ArrayReferenceViewTransform, ViewIndex};
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
     use crate::captures::{CaptureReference, ClosedProgram};
@@ -359,8 +402,8 @@ mod tests {
         ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation,
         ReferenceFreezeOperation, ReferenceNewOperation, ReferenceOperationSemantics, ReferenceReadOperation,
         ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceViewOperation, ReferenceViewValidationError,
-        ReferenceWriteOperation, RegionInterface, RegionSlot, TypeError, discharge_positional_region_operation,
-        discharge_reference_free_operation,
+        ReferenceWriteOperation, RegionInterface, RegionSlot, TypeError, ViewSymbol,
+        discharge_positional_region_operation, discharge_reference_free_operation,
     };
     use crate::tracing::{Trace, Tracer, TracingContext};
 
@@ -699,12 +742,13 @@ mod tests {
         // instruction sequence each of its three alias applications stages, over a composed index-of-slice view of a
         // 3x3 allocation. Each access materializes the allocation-to-handle chain against the state it observes, so the chain is
         // restaged per access rather than shared, and a replacement and an accumulation then write their new leaf
-        // back through that chain in reverse.
-        let alias = ArrayReferenceView::root()
+        // back through that chain in reverse. The alias is closed over destination values, and a static chain binds
+        // none of them.
+        let alias: ArrayReferenceView<Tracer<TestDestination>> = ArrayReferenceView::root()
             .with_transform_unchecked(ArrayReferenceViewTransform::Slice {
                 axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 2, 1)],
             })
-            .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 0, index: 1 });
+            .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) });
         let stage = |inputs: Vec<Tracer<TracingContext<TestValue, TestOperation>>>| {
             let context = inputs[0].context().clone();
             let read = ArrayReferenceDischarge::read(&context, &inputs[0], &alias)?;
@@ -765,7 +809,7 @@ mod tests {
             .with_transform_unchecked(ArrayReferenceViewTransform::Slice {
                 axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 2, 1)],
             })
-            .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 0, index: 1 });
+            .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) });
         let stage = |inputs: Vec<Tracer<TracingContext<TestValue, TestOperation>>>| {
             let context = inputs[0].context().clone();
             Ok(vec![ArrayReferenceDischarge::write(&context, &inputs[0], inputs[1].clone(), &alias)?])
@@ -788,6 +832,60 @@ mod tests {
                     %4:f32[2, 2] = update_slice [start_indices=[1, 0]] %2 %3
                     %5:f32[3, 3] = update_slice [start_indices=[1, 0]] %0 %4
                 in (%5)"},
+        );
+    }
+
+    #[test]
+    fn test_array_reference_discharge_policy_rejects_a_symbolic_view_coordinate() {
+        // A symbolic coordinate is closed over the destination value of the operand it names, so the alias alone
+        // carries everything an access needs. The destination carrier has no dynamic slice constructor to lower that
+        // coordinate to yet, so every access through such a step is rejected before anything is bound into the
+        // destination, whichever position the step occupies in the chain.
+        let unsupported = ProgramError::UnsupportedOperation {
+            message: "a symbolic reference view coordinate cannot be discharged until dynamic slicing is supported"
+                .to_string(),
+        };
+        let stage = |inputs: Vec<Tracer<TestDestination>>| {
+            let context = inputs[0].context().clone();
+            let symbolic =
+                ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Symbolic(ViewSymbol::Operand(1)) };
+            let leaf: ArrayReferenceView<Tracer<TestDestination>> =
+                ArrayReferenceView::root().with_step(symbolic.clone(), vec![inputs[1].clone()]);
+            let parent = leaf.with_transform_unchecked(ArrayReferenceViewTransform::Slice {
+                axes: vec![ArraySliceAxis::new(1, 2, 1)],
+            });
+            for alias in [&leaf, &parent] {
+                assert_eq!(ArrayReferenceDischarge::read(&context, &inputs[0], alias), Err(unsupported.clone()));
+                assert_eq!(
+                    ArrayReferenceDischarge::write(&context, &inputs[0], inputs[2].clone(), alias),
+                    Err(unsupported.clone()),
+                );
+                assert_eq!(
+                    ArrayReferenceDischarge::swap(&context, &inputs[0], inputs[2].clone(), alias),
+                    Err(unsupported.clone()),
+                );
+                assert_eq!(
+                    ArrayReferenceDischarge::accumulate(&context, &inputs[0], inputs[2].clone(), alias),
+                    Err(unsupported.clone()),
+                );
+            }
+            Ok(vec![inputs[0].clone()])
+        };
+        let (_, staged): (_, Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>) =
+            EagerContext::<TestValue, TestOperation>::trace(
+                stage,
+                vec![
+                    ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3, 4])),
+                    ArrayIrType::Array(ArrayType::scalar(DataType::I32)),
+                    ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4])),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            staged.to_string(),
+            indoc! {"
+                lambda %0:f32[3, 4], %1:i32[], %2:f32[4] .
+                in (%0)"},
         );
     }
 
@@ -1763,16 +1861,13 @@ mod tests {
                 in (%3, %5)"},
         );
 
-        // The eager interpreter cannot carry a reference through a loop at all — its masked predicate selection needs
-        // value semantics for every carry — so the mixed program is exactly as runnable as the source it came from,
-        // and both report the same limitation. Running it needs a stateful domain, which is what preserving a
-        // reference asks for in the first place.
+        // The eager interpreter carries a reference through the loop by selecting the handle wholesale under the
+        // scalar predicate, so the mixed program runs exactly like the source it came from: the counter accumulates
+        // `0 + 2 + 2` before the condition fails, and the untouched step still holds its initial value.
         let inputs = vec![scalar(0.0), scalar(2.0)];
-        let rejection = Err(ProgramError::UnsupportedOperation {
-            message: "references must be discharged before while predicate selection".to_string(),
-        });
-        assert_eq!(source.interpret(inputs.clone()), rejection);
-        assert_eq!(discharged.program().interpret(inputs), rejection);
+        let expected = Ok(vec![scalar(4.0), scalar(2.0)]);
+        assert_eq!(source.interpret(inputs.clone()), expected);
+        assert_eq!(discharged.program().interpret(inputs), expected);
     }
 
     #[test]
@@ -3313,8 +3408,9 @@ mod tests {
                 context: &C,
                 view: &ArrayReferenceViewTransform,
                 source: C::Value,
+                symbols: &[C::Value],
             ) -> Result<C::Value, ProgramError> {
-                reapply_array_reference_view(context, view, source)
+                reapply_array_reference_view(context, view, source, symbols)
             }
         }
 

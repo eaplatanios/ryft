@@ -10,8 +10,8 @@ use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingCon
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
     BroadcastDerivativeAlignment, DifferentiableOperation, DifferentiableType, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, LinearCallOperation, TransposableOperation, TranspositionDriver,
-    transpose_projected_operation,
+    DifferentiationDual, DifferentiationError, LinearCallOperation, TransposableOperation, TranspositionContext,
+    TranspositionDriver, transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_free_dischargeable_operation};
@@ -646,7 +646,7 @@ where
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        context: &mut TracingContext<V, O>,
+        context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -1651,10 +1651,10 @@ mod tests {
         let input_cotangent_type = input_type.cotangent().unwrap();
         let output_cotangent_type = output_type.cotangent().unwrap();
 
-        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let contributions = operation
             .transpose(
-                &mut context,
+                &mut TranspositionContext::new(context.clone()),
                 &EmptyRegionDriver,
                 &[PartialValue::Unknown(input_type)],
                 &[MaybeZero::Zero(output_cotangent_type)],
@@ -1670,7 +1670,7 @@ mod tests {
         let operation = BroadcastOperation::new(output_type.clone(), vec![1]);
         let contributions = operation
             .transpose(
-                &mut context,
+                &mut TranspositionContext::new(context.clone()),
                 &EmptyRegionDriver,
                 &[PartialValue::Unknown(input_type.clone())],
                 &[MaybeZero::Zero(output_type.cotangent().unwrap())],

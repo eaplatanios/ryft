@@ -13,7 +13,7 @@ use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
     ElementwiseDerivativeAlignment, LinearCallOperation, MemberDifferentiableOperation, TransposableOperation,
-    TranspositionDriver, jvp_projected_operation,
+    TranspositionContext, TranspositionDriver, jvp_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_reference_free_dischargeable_operation};
@@ -341,7 +341,7 @@ impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> Transposabl
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        _context: &mut TracingContext<V, O>,
+        _context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -696,11 +696,13 @@ where
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        context: &mut TracingContext<V, O>,
+        context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        // The rule stages into the tracing context only, so the transposition context is narrowed once up front.
+        let context: &mut TracingContext<V, O> = context;
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
@@ -1156,11 +1158,13 @@ where
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        context: &mut TracingContext<V, O>,
+        context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        // The rule stages into the tracing context only, so the transposition context is narrowed once up front.
+        let context: &mut TracingContext<V, O> = context;
         check_count!("input", inputs, 2, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
@@ -2270,11 +2274,13 @@ where
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        context: &mut TracingContext<V, O>,
+        context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        // The rule stages into the tracing context only, so the transposition context is narrowed once up front.
+        let context: &mut TracingContext<V, O> = context;
         if inputs.is_empty() {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         }
@@ -2343,11 +2349,13 @@ where
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        context: &mut TracingContext<V, O>,
+        context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        // The rule stages into the tracing context only, so the transposition context is narrowed once up front.
+        let context: &mut TracingContext<V, O> = context;
         if inputs.len() < 2 {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
         }

@@ -5,20 +5,34 @@
 use std::borrow::Cow;
 use std::sync::LazyLock;
 
+use crate::axes::Axis;
+use crate::batching::{
+    BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
+};
 use crate::contexts::{Context, Domain};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    TransposableOperation, TranspositionContext, TranspositionDriver,
+};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_non_transposable_operation};
+use crate::macros::check_count;
+use crate::operations::Zero;
+use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
+use crate::programs::atoms::MaybeZero;
 use crate::programs::effects::{Effect, Effects};
 use crate::programs::operations::Operation;
 use crate::programs::references::discharge::{
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
     ReferenceDischargeableOperation,
 };
+use crate::programs::references::operations::ReferenceFreeze;
 use crate::programs::references::semantics::{ReferenceOperationSemantics, ReferenceOutput};
 use crate::programs::references::types::ReferenceType;
 use crate::programs::regions::RegionInterface;
 use crate::programs::types::{Type, TypeError, Typed};
+use crate::programs::values::Value;
+use crate::tracing::{Tracer, TracingContext};
 
 /// Canonical operation name for [`ReferenceNewOperation`].
 pub const REFERENCE_NEW_OPERATION_NAME: &str = "reference_new";
@@ -78,6 +92,13 @@ where
     #[inline]
     fn effects(&self) -> Effects {
         Effects::single(Effect::OrderedState)
+    }
+
+    // An allocation that nothing reads, mutates, or consumes is unobservable, and every access consumes the
+    // allocation's output, so a dead allocation has no live dependents that removing it could leave dangling.
+    #[inline]
+    fn is_removable_when_unused(&self) -> bool {
+        true
     }
 }
 
@@ -140,25 +161,112 @@ where
     }
 }
 
-impl_unsupported_reference_transforms!(ReferenceNewOperation);
+impl<T, U, C> PartiallyEvaluatableOperation<C> for ReferenceNewOperation<T, U>
+where
+    T: Type,
+    U: Type,
+    C: Context<Type = U, Operation: From<ReferenceNewOperation<T, U>>>,
+{
+    // The default partial-evaluation behavior applies: the primitive's ordered-state effect is placed centrally
+    // before any operation rule runs.
+}
 
-impl_non_transposable_operation!(
-    <T, U> ReferenceNewOperation<T, U>
-    where
-        T: Type,
-        U: Type,
-);
+impl<T, U, C> DifferentiableOperation<C> for ReferenceNewOperation<T, U>
+where
+    T: Type,
+    U: DifferentiableType,
+    ReferenceNewOperation<T, U>: Operation<Type = U>,
+    C: Context<Type = U, Value: ReferenceNew<C::Value>> + Zero<C::Value>,
+{
+    // Forward mode allocates a tangent reference beside the primal one, initialized from the initial value's tangent.
+    // A symbolic zero tangent is instantiated first, because the tangent reference must exist as a concrete allocation
+    // for later stores to land in: a reference type is never zero-space, so the allocation's dual always carries a live
+    // tangent reference.
+    fn jvp<D: DifferentiationDriver<C>>(
+        &self,
+        context: &C,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        check_count!("input", inputs, 1, ProgramError);
+        let primal = inputs[0].primal().reference_new()?;
+        let tangent = inputs[0].tangent().clone().materialize(context)?.reference_new()?;
+        Ok(vec![DifferentiationDual::new(primal, MaybeZero::Value(tangent))?])
+    }
+}
+
+impl<T, U, C, P> BatchableOperation<C, P> for ReferenceNewOperation<T, U>
+where
+    T: Type,
+    U: Type,
+    ReferenceNewOperation<T, U>: Operation<Type = U>,
+    C: Context<Type = U, Value: ReferenceNew<C::Value>>,
+    P: BatchingPolicy<C>,
+{
+    // A reference may later receive a batched value, and its batch axis is fixed by the packed referent at allocation
+    // time, so the allocation is always batched: a mapped initial value keeps its axis and a replicated one is first
+    // broadcast along a new leading batch axis through the driver.
+    fn batch<D: BatchingDriver<C, P>>(
+        &self,
+        context: &BatchingContext<C, P>,
+        driver: &D,
+        inputs: &[P::Batch],
+    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+        check_count!("input", inputs, 1, ProgramError);
+        let batch_axis = P::batch_axis(&inputs[0]).axis().unwrap_or(Axis::from(0));
+        let initial = driver.align_batch_axis(context, inputs[0].clone(), batch_axis)?;
+        let reference = P::value(&initial).reference_new()?;
+        Ok(vec![P::batch(reference, P::batch_axis(&initial))?].into())
+    }
+}
+
+impl<T, U, V, O> TransposableOperation<V, O> for ReferenceNewOperation<T, U>
+where
+    T: Type,
+    U: DifferentiableType,
+    ReferenceNewOperation<T, U>: Operation<Type = U>,
+    V: Value<Type = U>,
+    O: Operation<Type = U>,
+    Tracer<TracingContext<V, O>>: ReferenceFreeze<Tracer<TracingContext<V, O>>>,
+{
+    // The allocation is the map from the initial value to the initial state, so its transpose is the final step of the
+    // reverse sweep for its root: the cotangent accumulated into the root's cotangent reference is frozen into the
+    // cotangent of the initial value. An accumulator that nothing ever reached was never allocated, so the initial
+    // value's cotangent is a symbolic zero and neither `reference_new` nor `reference_freeze` is staged.
+    fn transpose<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TranspositionContext<'_, V, O>,
+        _driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        check_count!("input", inputs, 1, ProgramError);
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(vec![match context.allocation_cotangent(0)? {
+            Some(accumulator) => MaybeZero::Value(accumulator.freeze()?),
+            None => MaybeZero::Zero(inputs[0].r#type().cotangent()?),
+        }])
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        Array, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType,
+        DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
+    };
+    use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
+    use crate::contexts::EagerContext;
+    use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::identities::TypeIdentityPosition;
     use crate::programs::references::discharge::ReferenceDischargeResult;
     use crate::programs::references::operations::tests::*;
+    use crate::programs::references::operations::{ReferenceRead, ReferenceWrite};
     use crate::programs::regions::EmptyRegionDriver;
 
     use super::*;
@@ -294,6 +402,87 @@ mod tests {
             lambda %0:value<i7,p16>, %1:value<i7,p16> .
             let %2:value<i7,p16> = test.add %0 %1
             in (%2)"},
+        );
+    }
+
+    #[test]
+    fn test_reference_new_operation_jvp() {
+        type TestValue = ArrayIrValue<Array>;
+
+        let context = DifferentiationContext::new(EagerContext::<TestValue, ArrayIrOperation<Array>>::new());
+        let initial = TestValue::Array(Array::vector(vec![1.0_f32, 2.0]));
+
+        // A live initial tangent seeds an independent tangent reference beside the primal allocation.
+        let input = DifferentiationTracer::new(
+            DifferentiationDual::new(initial.clone(), TestValue::Array(Array::vector(vec![3.0_f32, 4.0]))).unwrap(),
+            context.clone(),
+        );
+        let outputs = context.bind(ReferenceNewOperation::new(), Vec::new(), &[input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(
+            outputs[0].r#type().as_ref(),
+            &ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2]))),
+        );
+        assert_eq!(outputs[0].primal().read(), Ok(initial.clone()));
+        let tangent_reference = outputs[0].tangent().as_value().unwrap();
+        assert_eq!(tangent_reference.read(), Ok(TestValue::Array(Array::vector(vec![3.0_f32, 4.0]))));
+        tangent_reference.write(&TestValue::Array(Array::vector(vec![5.0_f32, 6.0]))).unwrap();
+        assert_eq!(outputs[0].primal().read(), Ok(initial.clone()));
+
+        // A symbolic zero initial tangent is instantiated as a zero-filled tangent reference, because a reference type
+        // is never zero-space and later stores need a concrete allocation to land in.
+        let input =
+            DifferentiationTracer::new(DifferentiationDual::new_with_zero_tangent(initial).unwrap(), context.clone());
+        let outputs = context.bind(ReferenceNewOperation::new(), Vec::new(), &[input]).unwrap();
+        assert_eq!(
+            outputs[0].tangent().as_value().unwrap().read(),
+            Ok(TestValue::Array(Array::vector(vec![0.0_f32, 0.0]))),
+        );
+    }
+
+    #[test]
+    fn test_reference_new_operation_batching() {
+        type TestValue = ArrayIrValue<Array>;
+
+        let extent = TestValue::Dimension(
+            DimensionValue::new(DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())), 2)
+                .unwrap(),
+        );
+        let context = BatchingContext::<_, ArrayIrBatching>::new(
+            EagerContext::<TestValue, ArrayIrOperation<Array>>::new(),
+            extent,
+        );
+
+        // A mapped initial value allocates a reference batched at the same axis.
+        let packed_type = ArrayType::new_static(DataType::F32, [3, 2]);
+        let initial = TestValue::Array(Array::from_f64s(packed_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        let input =
+            BatchingTracer::new(context.clone(), ArrayIrBatch::new(initial.clone(), BatchAxis::new(1)).unwrap());
+        let outputs = context.bind(ReferenceNewOperation::new(), Vec::new(), &[input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(1));
+        assert_eq!(
+            outputs[0].r#type().as_ref(),
+            &ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3]))),
+        );
+        assert_eq!(outputs[0].batch().value().read(), Ok(initial));
+
+        // A replicated initial value is broadcast along a new leading batch axis, so the allocation is always batched
+        // and can later receive batched values.
+        let initial = TestValue::Array(Array::vector(vec![1.0_f32, 2.0]));
+        let input = BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(initial));
+        let outputs = context.bind(ReferenceNewOperation::new(), Vec::new(), &[input]).unwrap();
+        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(0));
+        assert_eq!(
+            outputs[0].r#type().as_ref(),
+            &ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2]))),
+        );
+        assert_eq!(
+            outputs[0].batch().value().read(),
+            Ok(TestValue::Array(Array::from_f64s(
+                ArrayType::new_static(DataType::F32, [2, 2]),
+                vec![1.0, 2.0, 1.0, 2.0],
+            ))),
         );
     }
 }

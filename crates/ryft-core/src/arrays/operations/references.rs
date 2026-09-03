@@ -19,7 +19,7 @@ use ryft_macros::Parameter;
 
 use crate::arrays::addressing::ArraySliceAxis;
 use crate::arrays::ir::ArrayIrValue;
-use crate::arrays::reference_views::{ArrayReference, ArrayReferenceView, ArrayReferenceViewTransform};
+use crate::arrays::reference_views::{ArrayReference, ArrayReferenceView, ArrayReferenceViewTransform, ViewIndex};
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::ir::ArrayIrType;
 use crate::batching::{
@@ -27,21 +27,25 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    TransposableOperation, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_non_transposable_operation};
+use crate::macros::check_count;
 use crate::operations::{Add, Reshape, Slice, UpdateSlice};
 use crate::parameters::Parameter;
-use crate::partial::PartiallyEvaluatableOperation;
+use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
+use crate::programs::references::forwarded_tangent;
 use crate::programs::{
-    Operation, OperationFormatter, ProgramError, ProjectedValue, ReferenceAddUpdate, ReferenceAddUpdateOperation,
-    ReferenceAliasKind, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
-    ReferenceNewOperation, ReferenceOperationSemantics, ReferenceOutput, ReferenceRead, ReferenceReadOperation,
-    ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceViewValidationError, ReferenceWrite,
-    ReferenceWriteOperation, RegionInterface, TypeError, Typed, Value, ValueProjection,
+    MaybeZero, Operation, OperationFormatter, ProgramError, ProjectedValue, ReferenceAddUpdate,
+    ReferenceAddUpdateOperation, ReferenceAliasKind, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceFreeze,
+    ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceOperationSemantics, ReferenceOutput,
+    ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceView,
+    ReferenceViewOperation, ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation, RegionInterface,
+    TypeError, Typed, Value, ValueProjection, ViewSymbol, batch_reference_view_operation,
 };
+use crate::tracing::{Tracer, TracingContext};
 
 /// Canonical operation name for [`ReferenceIndexOperation`].
 pub const REFERENCE_INDEX_OPERATION_NAME: &str = "reference_index";
@@ -156,7 +160,7 @@ impl ReferenceIndexOperation {
 
     /// Returns this operation's allocation-preserving view transform.
     pub const fn transform(&self) -> ArrayReferenceViewTransform {
-        ArrayReferenceViewTransform::Index { axis: self.axis, index: self.index }
+        ArrayReferenceViewTransform::Index { axis: self.axis, index: ViewIndex::Static(self.index) }
     }
 }
 
@@ -285,7 +289,9 @@ impl<C: Domain<Type = ArrayIrType, Value: ReferenceSlice<C::Value>>> Interpretab
 /// it validates the composed referent type with exactly the eager handle's arithmetic, rejecting an invalid composition
 /// before any handle exists, and then records the composed chain as the new handle's authoritative alias. Nothing is
 /// bound into the destination, because the portion this handle selects is materialized at each access rather than at
-/// the view.
+/// the view. The step is closed over destination values: each [`ViewSymbol::Operand`] the transform reports binds the
+/// destination value of that operand, so the operands of a view operation are its reference followed by one value per
+/// symbol, and a static transform binds nothing.
 ///
 /// On an allocation that partial discharge *preserved*, the view is additionally replayed into the destination, and the
 /// reference it produces becomes the alias handle's own destination value, so that later accesses consume that
@@ -301,12 +307,14 @@ impl<C: Domain<Type = ArrayIrType, Value: ReferenceSlice<C::Value>>> Interpretab
 ///
 /// # Errors
 ///
-/// Returns [`ProgramError::InvalidInputCount`] for an application that does not supply exactly one operand,
-/// [`ProgramError::MalformedProgram`] when that operand is a value rather than a reference handle, and
-/// [`ProgramError::InvalidOutputCount`] when replaying the view on a preserved allocation does not produce exactly one
-/// value. Propagates the view algebra's own [`TypeError`] when `transform` does not compose onto the incoming
-/// handle's referent, and the discharge context's own [`ProgramError::MalformedProgram`] when the replayed
-/// reference does not carry the composed type.
+/// Returns [`ProgramError::InvalidInputCount`] for an application that does not supply exactly one operand per
+/// symbol beyond the reference, [`ProgramError::MalformedProgram`] when the first operand is a value rather than a
+/// reference handle, when a symbol operand is a reference rather than a value, or when a symbol names the reference
+/// operand or an operand outside the application, [`ProgramError::UnsupportedOperation`] for a
+/// [`ViewSymbol::Iteration`] coordinate, and [`ProgramError::InvalidOutputCount`] when replaying the view on a
+/// preserved allocation does not produce exactly one value. Propagates the view algebra's own [`TypeError`] when
+/// `transform` does not compose onto the incoming handle's referent, and the discharge context's own
+/// [`ProgramError::MalformedProgram`] when the replayed reference does not carry the composed type.
 fn discharge_reference_view<C, P, O>(
     operation: &O,
     transform: ArrayReferenceViewTransform,
@@ -315,13 +323,33 @@ fn discharge_reference_view<C, P, O>(
 ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError>
 where
     C: Context<Type = ArrayIrType, Operation: From<O>>,
-    P: ReferenceDischargePolicy<C, Referent = ArrayType, Alias = ArrayReferenceView>,
+    P: ReferenceDischargePolicy<C, Referent = ArrayType, Alias = ArrayReferenceView<C::Value>>,
     O: Clone + Operation<Type = ArrayIrType>,
 {
-    check_count!("input", inputs, 1, ProgramError);
+    let symbols = transform.symbols();
+    check_count!("input", inputs, 1 + symbols.len(), ProgramError);
     let reference = inputs[0].try_as_reference("a reference to view")?;
     let referent = transform.output_type(reference.r#type().referent())?;
-    let alias = reference.alias().with_transform_unchecked(transform);
+    let bindings = symbols
+        .iter()
+        .map(|symbol| match symbol {
+            ViewSymbol::Operand(index) => match inputs.get(*index) {
+                Some(input) if *index > 0 => input.try_as_value("a view coordinate").cloned(),
+                _ => Err(ProgramError::MalformedProgram(format!(
+                    "reference view symbol names operand {index} but the coordinate operands of a view with {} \
+                     operands are 1..{}",
+                    inputs.len(),
+                    inputs.len(),
+                ))),
+            },
+            ViewSymbol::Iteration => Err(ProgramError::UnsupportedOperation {
+                message: "an iteration view is created by its region-carrying operation and never discharged as an \
+                          instruction"
+                    .to_string(),
+            }),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let alias = reference.alias().with_step(transform, bindings);
     Ok(vec![
         context
             .alias_reference(reference, alias, ReferenceType::new(referent), |value| {
@@ -336,7 +364,7 @@ where
 impl<C, P> ReferenceDischargeableOperation<C, P> for ReferenceIndexOperation
 where
     C: Context<Type = ArrayIrType, Operation: From<ReferenceIndexOperation>>,
-    P: ReferenceDischargePolicy<C, Referent = ArrayType, Alias = ArrayReferenceView>,
+    P: ReferenceDischargePolicy<C, Referent = ArrayType, Alias = ArrayReferenceView<C::Value>>,
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
         &self,
@@ -351,7 +379,7 @@ where
 impl<C, P> ReferenceDischargeableOperation<C, P> for ReferenceSliceOperation
 where
     C: Context<Type = ArrayIrType, Operation: From<ReferenceSliceOperation>>,
-    P: ReferenceDischargePolicy<C, Referent = ArrayType, Alias = ArrayReferenceView>,
+    P: ReferenceDischargePolicy<C, Referent = ArrayType, Alias = ArrayReferenceView<C::Value>>,
 {
     fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
         &self,
@@ -363,49 +391,113 @@ where
     }
 }
 
-macro_rules! impl_unsupported_reference_view_transforms {
-    // Installs the same conservative transform rejections for one unresolved array reference-view operation.
+// The default partial-evaluation behavior applies to both views: a view carries no effect of its own and is placed
+// wherever its reference operand is.
+impl<C: Context<Type = ArrayIrType, Operation: From<ReferenceIndexOperation>>> PartiallyEvaluatableOperation<C>
+    for ReferenceIndexOperation
+{
+}
+
+impl<C: Context<Type = ArrayIrType, Operation: From<ReferenceSliceOperation>>> PartiallyEvaluatableOperation<C>
+    for ReferenceSliceOperation
+{
+}
+
+macro_rules! impl_default_reference_view_transposition {
+    // Installs the transposition rule for one array reference-view operation.
     ($operation:ty) => {
-        impl_non_transposable_operation!($operation);
-
-        impl<C: Context<Type = ArrayIrType, Operation: From<$operation>>> PartiallyEvaluatableOperation<C>
+        // A view is aliasing metadata rather than a linear map of its own: the cotangent of a view operand is reached
+        // by reapplying the view path to its root's cotangent reference inside the transposition context, so the
+        // reverse sweep never needs this rule to run and every operand receives a structural zero.
+        impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> TransposableOperation<V, O>
             for $operation
         {
-        }
-
-        impl<C: Context<Type = ArrayIrType, Operation: From<$operation>>, P: BatchingPolicy<C>> BatchableOperation<C, P>
-            for $operation
-        {
-            fn batch<D: BatchingDriver<C, P>>(
+            fn transpose<D: TranspositionDriver<V, O>>(
                 &self,
-                _context: &BatchingContext<C, P>,
+                _context: &mut TranspositionContext<'_, V, O>,
                 _driver: &D,
-                _inputs: &[P::Batch],
-            ) -> Result<BatchedOutputs<C, P>, BatchingError> {
-                Err(BatchingError::UnsupportedOperation {
-                    message: format!("`{}` must be discharged before batching", self.name()),
-                })
-            }
-        }
-
-        impl<C: Context<Type = ArrayIrType, Operation: From<$operation>>> DifferentiableOperation<C> for $operation {
-            fn jvp<D: DifferentiationDriver<C>>(
-                &self,
-                _context: &C,
-                _driver: &D,
-                _inputs: &[DifferentiationDual<C::Value>],
-            ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-                Err(ProgramError::UnsupportedOperation {
-                    message: format!("`{}` must be discharged before differentiation", self.name()),
-                }
-                .into())
+                inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+                _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+            ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+                inputs.iter().map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?))).collect()
             }
         }
     };
 }
 
-impl_unsupported_reference_view_transforms!(ReferenceIndexOperation);
-impl_unsupported_reference_view_transforms!(ReferenceSliceOperation);
+impl_default_reference_view_transposition!(ReferenceIndexOperation);
+impl_default_reference_view_transposition!(ReferenceSliceOperation);
+
+impl<C: Context<Type = ArrayIrType, Value: ReferenceIndex<C::Value>>> DifferentiableOperation<C>
+    for ReferenceIndexOperation
+{
+    // A view is pure aliasing metadata, so the tangent reference receives the same view as the primal reference. A
+    // plumbing reference (i.e., a reference dual whose tangent is a symbolic zero) carries no tangent reference, so its
+    // view stays plumbing.
+    fn jvp<D: DifferentiationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        check_count!("input", inputs, 1, ProgramError);
+        let primal = inputs[0].primal().reference_index(self.axis, self.index)?;
+        Ok(vec![forwarded_tangent(&inputs[0], primal, |tangent_reference| {
+            tangent_reference.reference_index(self.axis, self.index)
+        })?])
+    }
+}
+
+impl<C: Context<Type = ArrayIrType, Value: ReferenceSlice<C::Value>>> DifferentiableOperation<C>
+    for ReferenceSliceOperation
+{
+    // As in the `ReferenceIndexOperation` rule, the tangent reference receives the same view as the primal reference.
+    fn jvp<D: DifferentiationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        check_count!("input", inputs, 1, ProgramError);
+        let primal = inputs[0].primal().reference_slice(self.axes.as_slice())?;
+        Ok(vec![forwarded_tangent(&inputs[0], primal, |tangent_reference| {
+            tangent_reference.reference_slice(self.axes.as_slice())
+        })?])
+    }
+}
+
+impl<
+    C: Context<Type = ArrayIrType, Operation: ReferenceViewOperation + From<ReferenceIndexOperation>>,
+    P: BatchingPolicy<C>,
+> BatchableOperation<C, P> for ReferenceIndexOperation
+{
+    // The axis arithmetic lives on the view description (`ArrayReferenceViewTransform::batch`); the shared rule moves
+    // the source's batch axis through it and binds the batched view on the parent context.
+    fn batch<D: BatchingDriver<C, P>>(
+        &self,
+        context: &BatchingContext<C, P>,
+        _driver: &D,
+        inputs: &[P::Batch],
+    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+        batch_reference_view_operation(self, context, inputs)
+    }
+}
+
+impl<
+    C: Context<Type = ArrayIrType, Operation: ReferenceViewOperation + From<ReferenceSliceOperation>>,
+    P: BatchingPolicy<C>,
+> BatchableOperation<C, P> for ReferenceSliceOperation
+{
+    // As for `ReferenceIndexOperation`, the shared rule batches the slice through its view description.
+    fn batch<D: BatchingDriver<C, P>>(
+        &self,
+        context: &BatchingContext<C, P>,
+        _driver: &D,
+        inputs: &[P::Batch],
+    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+        batch_reference_view_operation(self, context, inputs)
+    }
+}
 
 /// Validates one [`ArrayReferenceViewTransform`] as a step from the reference type `source` to the reference type
 /// `output`. This is the array family's
@@ -440,26 +532,43 @@ pub fn validate_array_reference_view(
 /// Stages one [`ArrayReferenceViewTransform`] over the reference `source` through `context` and returns the derived
 /// reference. This is the array family's
 /// [`ReferenceViewOperation::reapply_view`](crate::programs::ReferenceViewOperation::reapply_view) rule, shared by
-/// every operation family that embeds the array view operations: an [`Index`](ArrayReferenceViewTransform::Index)
+/// every operation family that embeds the array view operations: a static [`Index`](ArrayReferenceViewTransform::Index)
 /// transform stages a [`ReferenceIndexOperation`] and a [`Slice`](ArrayReferenceViewTransform::Slice) transform
-/// stages a [`ReferenceSliceOperation`], through the same conversions the eager array reference views use.
+/// stages a [`ReferenceSliceOperation`], through the same conversions the eager array reference views use. `symbols`
+/// supplies one value per symbol of `view`, which is none for both static transforms.
 ///
 /// # Errors
 ///
-/// Propagates the staging error of `context`, and returns [`ProgramError::InvalidOutputCount`] when the staged view
-/// does not produce exactly one value.
+/// Returns [`ProgramError::MalformedProgram`] when `symbols` does not supply exactly one value per symbol of `view`,
+/// [`ProgramError::UnsupportedOperation`] for a symbolic index (no array operation reapplies one until dynamic
+/// indexing is supported), and [`ProgramError::InvalidOutputCount`] when the staged view does not produce exactly one
+/// value. Propagates the staging error of `context`.
 pub fn reapply_array_reference_view<C>(
     context: &C,
     view: &ArrayReferenceViewTransform,
     source: C::Value,
+    symbols: &[C::Value],
 ) -> Result<C::Value, ProgramError>
 where
     C: Context<Type = ArrayIrType>,
     C::Operation: From<ReferenceIndexOperation> + From<ReferenceSliceOperation>,
 {
+    let expected = view.symbols().len();
+    if symbols.len() != expected {
+        return Err(ProgramError::MalformedProgram(format!(
+            "reapplying reference view `{view:?}` requires {expected} symbol values but received {}",
+            symbols.len(),
+        )));
+    }
     let mut outputs = match view {
-        ArrayReferenceViewTransform::Index { axis, index } => {
+        ArrayReferenceViewTransform::Index { axis, index: ViewIndex::Static(index) } => {
             context.bind(ReferenceIndexOperation::new(*axis, *index), Vec::new(), std::slice::from_ref(&source))?
+        }
+        ArrayReferenceViewTransform::Index { index: ViewIndex::Symbolic(_), .. } => {
+            return Err(ProgramError::UnsupportedOperation {
+                message: "no array operation reapplies a symbolic reference index until dynamic indexing is supported"
+                    .to_string(),
+            });
         }
         ArrayReferenceViewTransform::Slice { axes } => {
             context.bind(ReferenceSliceOperation::new(axes.clone()), Vec::new(), std::slice::from_ref(&source))?
@@ -708,7 +817,8 @@ impl<A: Value<Type = ArrayType>> ReferenceIndex for ArrayIrValue<A> {
         // Projection rejects value operands and `with_transform` validates the transform against the handle's
         // cached referent type, so a separate operation-level inference pass would only repeat both checks.
         let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
-        Ok(Self::Reference(reference.with_transform(ArrayReferenceViewTransform::Index { axis, index })?))
+        let transform = ArrayReferenceViewTransform::Index { axis, index: ViewIndex::Static(index) };
+        Ok(Self::Reference(reference.with_transform(transform)?))
     }
 }
 
@@ -729,22 +839,28 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::arrays::Array;
-    use crate::arrays::batching::ArrayIrBatching;
+    use crate::arrays::batching::{ArrayIrBatch, ArrayIrBatching};
+    use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::operations::ArrayIrOperation;
     use crate::arrays::reference_discharge::ArrayReferenceDischarge;
     use crate::arrays::reference_views::ArrayReferenceViewError;
     use crate::arrays::types::data::DataType;
-    use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionVariable, Shape};
-    use crate::contexts::{Context, EagerContext};
-    use crate::differentiation::{DifferentiationError, TransposableOperation};
+    use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
+    use crate::axes::Axis;
+    use crate::batching::{BatchAxis, BatchingTracer};
+    use crate::contexts::{Context, EagerContext, StagingContext};
+    use crate::differentiation::{
+        DifferentiationContext, DifferentiationDual, DifferentiationError, DifferentiationTracer,
+        TransposableOperation, differentiate_at,
+    };
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::control_flow::scan::ScanOperation;
     use crate::operations::control_flow::r#while::WhileOperation;
     use crate::parameters::Placeholder;
-    use crate::partial::PartialEvaluationContext;
+    use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, ReferencePlacement};
     use crate::programs::{
         Effect, Effects, EmptyRegionDriver, ProgramBuilder, ProgramError, REFERENCE_NEW_OPERATION_NAME,
-        REFERENCE_READ_OPERATION_NAME, ReferenceError, TypeError,
+        REFERENCE_READ_OPERATION_NAME, ReferenceError, TypeError, ViewSymbol,
     };
     use crate::tracing::{Tracer, TracingContext};
 
@@ -778,7 +894,7 @@ mod tests {
             &[ReferenceOutput::Alias { output_index: 0, input_index: 0, kind: ReferenceAliasKind::View }],
         );
         assert!(index.reference_semantics().inputs().is_empty());
-        assert_eq!(index.transform(), ArrayReferenceViewTransform::Index { axis: 0, index: 1 });
+        assert_eq!(index.transform(), ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) });
         assert_eq!(index.to_string(), "reference_index [axis=0, index=1]");
 
         let slice = ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 3, 1)]);
@@ -841,7 +957,7 @@ mod tests {
                 .with_transform_unchecked(ArrayReferenceViewTransform::Slice {
                     axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 2, 1)],
                 })
-                .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 0, index: 1 }),
+                .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) }),
         );
         assert_eq!(context.read(&indexed), Ok(TestValue::Array(Array::vector(vec![7.0_f32, 8.0]))));
 
@@ -900,7 +1016,7 @@ mod tests {
         assert_eq!(
             view.alias(),
             &ArrayReferenceView::root()
-                .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 0, index: 0 }),
+                .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(0) }),
         );
         assert_eq!(
             view.preserved().map(|value| value.r#type().into_owned()),
@@ -912,6 +1028,194 @@ mod tests {
         assert_eq!(
             view.preserved().map(ReferenceRead::read),
             Some(Ok(TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0])))),
+        );
+    }
+
+    #[test]
+    fn test_array_reference_view_operations_jvp() {
+        let context = DifferentiationContext::new(TestDestination::new());
+        let allocation_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let reference = TestValue::Array(Array::from_f64s(allocation_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))
+            .reference_new()
+            .unwrap();
+        let tangent_reference =
+            TestValue::Array(Array::from_f64s(allocation_type, vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]))
+                .reference_new()
+                .unwrap();
+
+        // An active reference's view is applied to its tangent reference with the same alias, so both views select the
+        // same coordinates of their respective allocations.
+        let active = DifferentiationTracer::new(
+            DifferentiationDual::new(reference.clone(), tangent_reference.clone()).unwrap(),
+            context.clone(),
+        );
+        let indexed = context.bind(ReferenceIndexOperation::new(0, 1), Vec::new(), &[active.clone()]).unwrap();
+        assert_eq!(indexed.len(), 1);
+        assert_eq!(indexed[0].primal().read(), Ok(TestValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]))));
+        assert_eq!(
+            indexed[0].tangent().as_value().unwrap().read(),
+            Ok(TestValue::Array(Array::vector(vec![10.0_f32, 11.0, 12.0]))),
+        );
+        let axes = vec![ArraySliceAxis::new(0, 2, 1), ArraySliceAxis::new(1, 2, 1)];
+        let sliced = context.bind(ReferenceSliceOperation::new(axes), Vec::new(), &[active]).unwrap();
+        let sliced_type = ArrayType::new_static(DataType::F32, [2, 2]);
+        assert_eq!(
+            sliced[0].primal().read(),
+            Ok(TestValue::Array(Array::from_f64s(sliced_type.clone(), vec![2.0, 3.0, 5.0, 6.0]))),
+        );
+        assert_eq!(
+            sliced[0].tangent().as_value().unwrap().read(),
+            Ok(TestValue::Array(Array::from_f64s(sliced_type.clone(), vec![8.0, 9.0, 11.0, 12.0]))),
+        );
+
+        // A store through the tangent view lands in the tangent allocation and leaves the primal allocation untouched.
+        let zeros = TestValue::Array(Array::from_f64s(sliced_type, vec![0.0; 4]));
+        sliced[0].tangent().as_value().unwrap().write(&zeros).unwrap();
+        assert_eq!(
+            tangent_reference.read(),
+            Ok(TestValue::Array(Array::from_f64s(
+                ArrayType::new_static(DataType::F32, [2, 3]),
+                vec![7.0, 0.0, 0.0, 10.0, 0.0, 0.0],
+            ))),
+        );
+        assert_eq!(
+            reference.read(),
+            Ok(TestValue::Array(Array::from_f64s(
+                ArrayType::new_static(DataType::F32, [2, 3]),
+                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            ))),
+        );
+
+        // The views of a plumbing reference stay plumbing, typed with the view's own reference type.
+        let plumbing =
+            DifferentiationTracer::new(DifferentiationDual::new_with_zero_tangent(reference).unwrap(), context.clone());
+        let indexed = context.bind(ReferenceIndexOperation::new(1, 2), Vec::new(), &[plumbing.clone()]).unwrap();
+        assert_eq!(indexed[0].primal().read(), Ok(TestValue::Array(Array::vector(vec![3.0_f32, 6.0]))));
+        assert!(matches!(
+            indexed[0].tangent(),
+            MaybeZero::Zero(r#type)
+                if *r#type == ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2]))),
+        ));
+        let axes = vec![ArraySliceAxis::new(1, 1, 1), ArraySliceAxis::new(0, 3, 1)];
+        let sliced = context.bind(ReferenceSliceOperation::new(axes), Vec::new(), &[plumbing]).unwrap();
+        assert!(matches!(
+            sliced[0].tangent(),
+            MaybeZero::Zero(r#type)
+                if *r#type == ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [1, 3]))),
+        ));
+    }
+
+    #[test]
+    fn test_array_reference_view_operations_batching() {
+        let extent = TestValue::Dimension(
+            DimensionValue::new(DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())), 2)
+                .unwrap(),
+        );
+        let context = BatchingContext::<_, ArrayIrBatching>::new(TestDestination::new(), extent);
+        let packed_type = ArrayType::new_static(DataType::F32, [2, 3, 4]);
+        let reference = TestValue::Array(Array::from_f64s(packed_type, (0..24).map(f64::from).collect()))
+            .reference_new()
+            .unwrap();
+
+        // A batch axis before the indexed axis shifts the packed indexed axis one position later and keeps the output
+        // batch axis.
+        let leading =
+            BatchingTracer::new(context.clone(), ArrayIrBatch::new(reference.clone(), BatchAxis::new(0)).unwrap());
+        let outputs = context.bind(ReferenceIndexOperation::new(1, 2), Vec::new(), &[leading]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(0));
+        assert_eq!(
+            outputs[0].r#type().as_ref(),
+            &ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3]))),
+        );
+        assert_eq!(
+            outputs[0].batch().value().read(),
+            Ok(TestValue::Array(Array::from_f64s(
+                ArrayType::new_static(DataType::F32, [2, 3]),
+                vec![2.0, 6.0, 10.0, 14.0, 18.0, 22.0],
+            ))),
+        );
+
+        // A batch axis after the indexed axis leaves the packed indexed axis alone and moves the output batch axis one
+        // position earlier.
+        let inner =
+            BatchingTracer::new(context.clone(), ArrayIrBatch::new(reference.clone(), BatchAxis::new(1)).unwrap());
+        let outputs = context.bind(ReferenceIndexOperation::new(0, 1), Vec::new(), &[inner.clone()]).unwrap();
+        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(0));
+        assert_eq!(
+            outputs[0].r#type().as_ref(),
+            &ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [4]))),
+        );
+        assert_eq!(
+            outputs[0].batch().value().read(),
+            Ok(TestValue::Array(Array::from_f64s(
+                ArrayType::new_static(DataType::F32, [3, 4]),
+                (12..24).map(f64::from).collect(),
+            ))),
+        );
+
+        // A batch axis at the indexed axis position precedes the indexed per-item axis in the packed referent.
+        let outputs = context.bind(ReferenceIndexOperation::new(1, 3), Vec::new(), &[inner.clone()]).unwrap();
+        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(1));
+        assert_eq!(
+            outputs[0].r#type().as_ref(),
+            &ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2]))),
+        );
+        assert_eq!(
+            outputs[0].batch().value().read(),
+            Ok(TestValue::Array(Array::from_f64s(
+                ArrayType::new_static(DataType::F32, [2, 3]),
+                vec![3.0, 7.0, 11.0, 15.0, 19.0, 23.0],
+            ))),
+        );
+
+        // Slicing inserts an identity selection at the batch axis position and keeps the output batch axis.
+        let axes = vec![ArraySliceAxis::new(1, 1, 1), ArraySliceAxis::new(1, 2, 1)];
+        let outputs = context.bind(ReferenceSliceOperation::new(axes), Vec::new(), &[inner]).unwrap();
+        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(1));
+        assert_eq!(
+            outputs[0].r#type().as_ref(),
+            &ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [1, 2]))),
+        );
+        assert_eq!(
+            outputs[0].batch().value().read(),
+            Ok(TestValue::Array(Array::from_f64s(
+                ArrayType::new_static(DataType::F32, [1, 3, 2]),
+                vec![13.0, 14.0, 17.0, 18.0, 21.0, 22.0],
+            ))),
+        );
+
+        // Replicated references are viewed unchanged and stay replicated.
+        let replicated = BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(reference));
+        let outputs = context.bind(ReferenceIndexOperation::new(0, 1), Vec::new(), &[replicated.clone()]).unwrap();
+        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::replicated());
+        assert_eq!(
+            outputs[0].r#type().as_ref(),
+            &ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3, 4]))),
+        );
+        let axes = vec![ArraySliceAxis::new(0, 1, 1), ArraySliceAxis::new(0, 3, 1), ArraySliceAxis::new(0, 4, 1)];
+        let outputs = context.bind(ReferenceSliceOperation::new(axes), Vec::new(), &[replicated]).unwrap();
+        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::replicated());
+        assert_eq!(
+            outputs[0].r#type().as_ref(),
+            &ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [1, 3, 4]))),
+        );
+
+        // A static identity slice cannot be formed for a dynamically sized batch axis.
+        let trace = TracingContext::<TestValue, TestOperation>::new();
+        let batch = DimensionVariable::new("batch", DimensionBounds::unbounded());
+        let extent = trace.input(DimensionType::new(batch.clone()).into());
+        let dynamic_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(3)]));
+        let reference = trace.input(ReferenceType::new(dynamic_type.clone()).into());
+        let context = BatchingContext::<_, ArrayIrBatching>::new(trace, extent);
+        let batched = BatchingTracer::new(context.clone(), ArrayIrBatch::new(reference, BatchAxis::new(0)).unwrap());
+        let error = context
+            .bind(ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 3, 1)]), Vec::new(), &[batched])
+            .unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<BatchingError>(),
+            Some(&BatchingError::DynamicBatchAxis { r#type: Box::new(dynamic_type), axis: Axis::from(0) }),
         );
     }
 
@@ -1237,61 +1541,94 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_reference_write_and_swap_reject_transforms_before_discharge() {
+    fn test_array_ir_reference_write_and_swap_partial_evaluation_placement() {
         type TestContext = EagerContext<TestValue, TestOperation>;
 
-        let partial_context = PartialEvaluationContext::new(TestContext::new());
-        assert!(matches!(
-            TestWrite::new().partially_evaluate(&partial_context, &EmptyRegionDriver, &[]),
-            Err(ProgramError::UnsupportedOperation { message })
-                if message == "`reference_write` must be discharged before partial evaluation",
-        ));
-        assert!(matches!(
-            TestSwap::new().partially_evaluate(&partial_context, &EmptyRegionDriver, &[]),
-            Err(ProgramError::UnsupportedOperation { message })
-                if message == "`reference_swap` must be discharged before partial evaluation",
-        ));
-        let batching_context =
-            BatchingContext::<_, ArrayIrBatching>::new(TestContext::new(), TestValue::Array(Array::scalar(2_i64)));
-        assert!(matches!(
-            TestWrite::new().batch(&batching_context, &EmptyRegionDriver, &[]),
-            Err(BatchingError::UnsupportedOperation { message })
-                if message == "`reference_write` must be discharged before batching",
-        ));
-        assert!(matches!(
-            TestSwap::new().batch(&batching_context, &EmptyRegionDriver, &[]),
-            Err(BatchingError::UnsupportedOperation { message })
-                if message == "`reference_swap` must be discharged before batching",
-        ));
-        assert!(matches!(
-            TestWrite::new().jvp(&TestContext::new(), &EmptyRegionDriver, &[]),
-            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "`reference_write` must be discharged before differentiation",
-        ));
-        assert!(matches!(
-            TestSwap::new().jvp(&TestContext::new(), &EmptyRegionDriver, &[]),
-            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "`reference_swap` must be discharged before differentiation",
-        ));
+        // Under the `Stage` placement every reference operation stages regardless of operand knowledge: the live state
+        // is untouched, the write produces nothing, and the swap's previous value is an unknown of the residual
+        // program.
+        let live = ArrayReference::new(Array::scalar(1.0_f32));
+        let reference = PartialEvaluationValue::known(TestValue::Reference(live.clone()));
+        let replacement = PartialEvaluationValue::known(TestValue::Array(Array::scalar(2.0_f32)));
+        let staging =
+            PartialEvaluationContext::new_with_reference_placement(TestContext::new(), ReferencePlacement::Stage);
+        assert!(
+            staging
+                .fold_or_residualize(
+                    TestOperation::ReferenceWrite(TestWrite::new()),
+                    Vec::new(),
+                    &[reference.clone(), replacement.clone()]
+                )
+                .unwrap()
+                .is_empty()
+        );
+        let swapped = staging
+            .fold_or_residualize(
+                TestOperation::ReferenceSwap(TestSwap::new()),
+                Vec::new(),
+                &[reference.clone(), replacement.clone()],
+            )
+            .unwrap();
+        assert_eq!(swapped.len(), 1);
+        assert!(swapped[0].is_unknown());
+        assert_eq!(live.read(), Ok(Array::scalar(1.0_f32)));
+
+        // Under the default `Execute` placement all-known reference operations fold: they run against the live state in
+        // program order and the swap's previous value is known.
+        let executing = PartialEvaluationContext::new(TestContext::new());
+        assert!(
+            executing
+                .fold_or_residualize(
+                    TestOperation::ReferenceWrite(TestWrite::new()),
+                    Vec::new(),
+                    &[reference.clone(), replacement.clone()]
+                )
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(live.read(), Ok(Array::scalar(2.0_f32)));
+        let swapped = executing
+            .fold_or_residualize(
+                TestOperation::ReferenceSwap(TestSwap::new()),
+                Vec::new(),
+                &[reference, PartialEvaluationValue::known(TestValue::Array(Array::scalar(3.0_f32)))],
+            )
+            .unwrap();
+        assert_eq!(swapped.len(), 1);
+        assert_eq!(swapped[0].as_known(), Some(&TestValue::Array(Array::scalar(2.0_f32))));
+        assert_eq!(live.read(), Ok(Array::scalar(3.0_f32)));
+    }
+
+    #[test]
+    fn test_array_ir_reference_write_and_swap_reject_unscoped_transposition() {
+        // The stores transpose through the cotangent accumulator of their reference operand, which only a transposition
+        // context scoped to the instruction being transposed can resolve, so a detached context rejects them.
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let value_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let inputs = [PartialValue::Unknown(reference_type), PartialValue::Unknown(value_type.clone())];
         assert!(matches!(
             TestWrite::new().transpose(
-                &mut TracingContext::<TestValue, TestOperation>::new(),
+                &mut TranspositionContext::new(TracingContext::<TestValue, TestOperation>::new()),
                 &EmptyRegionDriver,
-                &[],
+                &inputs,
                 &[],
             ),
-            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "operation `reference_write` is not transposable",
+            Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
+                if message == "operand 0 has no reference root in a transposition context that is not scoped to a \
+                    reference-carrying instruction",
         ));
+        let context = TracingContext::<TestValue, TestOperation>::new();
+        let cotangent = context.input(value_type);
         assert!(matches!(
             TestSwap::new().transpose(
-                &mut TracingContext::<TestValue, TestOperation>::new(),
+                &mut TranspositionContext::new(context.clone()),
                 &EmptyRegionDriver,
-                &[],
-                &[],
+                &inputs,
+                &[MaybeZero::Value(cotangent)],
             ),
-            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "operation `reference_swap` is not transposable",
+            Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
+                if message == "operand 0 has no reference root in a transposition context that is not scoped to a \
+                    reference-carrying instruction",
         ));
     }
 
@@ -1333,11 +1670,13 @@ mod tests {
                         axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 4, 1)],
                     },
                     input.clone(),
+                    &[],
                 )?;
                 reapply_array_reference_view(
                     input.context(),
-                    &ArrayReferenceViewTransform::Index { axis: 0, index: 1 },
+                    &ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) },
                     sliced,
+                    &[],
                 )
             },
             root_type,
@@ -1355,6 +1694,48 @@ mod tests {
                 in (%2)
             "}
             .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_reapply_array_reference_view_rejects_symbolic_indices_and_symbol_count_mismatches() {
+        type TestContext = TracingContext<TestValue, TestOperation>;
+
+        // Reapplication receives exactly one value per symbol of the description, and no array operation can stage a
+        // symbolic index yet, even when its coordinate value is supplied.
+        let root_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])));
+        let coordinate_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let error = TestContext::trace(
+            |inputs: Vec<Tracer<TestContext>>| {
+                let r#static = ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) };
+                reapply_array_reference_view(inputs[0].context(), &r#static, inputs[0].clone(), &inputs[1..])
+            },
+            vec![root_type.clone(), coordinate_type.clone()],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ProgramError::MalformedProgram(
+                "reapplying reference view `Index { axis: 0, index: Static(1) }` requires 0 symbol values but \
+                 received 1"
+                    .to_string(),
+            ),
+        );
+        let error = TestContext::trace(
+            |inputs: Vec<Tracer<TestContext>>| {
+                let symbolic =
+                    ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Symbolic(ViewSymbol::Operand(1)) };
+                reapply_array_reference_view(inputs[0].context(), &symbolic, inputs[0].clone(), &inputs[1..])
+            },
+            vec![root_type, coordinate_type],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ProgramError::UnsupportedOperation {
+                message: "no array operation reapplies a symbolic reference index until dynamic indexing is supported"
+                    .to_string(),
+            },
         );
     }
 
@@ -1593,7 +1974,73 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_reference_program_boundary_validation_rejects_before_external_mutation() {
+    fn test_array_ir_reference_jvp_read_modify_write() {
+        // The tangent of a read-modify-write is the tangent reference's contents plus the update's tangent, and both
+        // the primal and the tangent references observe their respective stores.
+        let reference = TestValue::Array(Array::vector(vec![1.0_f32, 2.0])).reference_new().unwrap();
+        let tangent_reference = TestValue::Array(Array::vector(vec![0.5_f32, 0.25])).reference_new().unwrap();
+        let (primal, tangent) =
+            differentiate_at((reference.clone(), TestValue::Array(Array::vector(vec![3.0_f32, 4.0]))))
+                .jvp::<TestValue, _, _>(
+                    (tangent_reference.clone(), TestValue::Array(Array::vector(vec![5.0_f32, 6.0]))),
+                    |(reference, value)| {
+                        reference.add_update(&value)?;
+                        reference.read()
+                    },
+                )
+                .unwrap();
+        assert_eq!(primal, TestValue::Array(Array::vector(vec![4.0_f32, 6.0])));
+        assert_eq!(tangent, TestValue::Array(Array::vector(vec![5.5_f32, 6.25])));
+        assert_eq!(reference.read(), Ok(TestValue::Array(Array::vector(vec![4.0_f32, 6.0]))));
+        assert_eq!(tangent_reference.read(), Ok(TestValue::Array(Array::vector(vec![5.5_f32, 6.25]))));
+    }
+
+    #[test]
+    fn test_array_ir_reference_program_jvp_matches_discharged_program() {
+        // A program that allocates, writes, reads, accumulates into, and freezes a local reference has the same fused
+        // JVP boundary and values as its discharged reference-free equivalent.
+        let array_type = ArrayType::new_static(DataType::F32, [2]);
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let initial = builder.add_input(array_type.clone().into());
+        let replacement = builder.add_input(array_type.into());
+        let reference = builder.add_instruction(TestNew::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        builder.add_instruction(TestWrite::new(), Vec::new(), vec![reference, replacement], None).unwrap();
+        let read = builder.add_instruction(TestRead::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        builder.add_instruction(TestAddUpdate::new(), Vec::new(), vec![reference, initial], None).unwrap();
+        let frozen = builder.add_instruction(TestFreeze::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![read, frozen], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        let jvp = program.jvp().unwrap();
+        let discharged = program
+            .clone()
+            .discharge_references::<ArrayReferenceDischarge>(0)
+            .unwrap()
+            .into_program_without_external_references()
+            .unwrap();
+        let discharged_jvp = discharged.jvp().unwrap();
+        assert_eq!(jvp.input_types(), discharged_jvp.input_types());
+        assert_eq!(jvp.output_types(), discharged_jvp.output_types());
+
+        let inputs = vec![
+            TestValue::Array(Array::vector(vec![1.0_f32, 2.0])),
+            TestValue::Array(Array::vector(vec![3.0_f32, 4.0])),
+            TestValue::Array(Array::vector(vec![5.0_f32, 6.0])),
+            TestValue::Array(Array::vector(vec![7.0_f32, 8.0])),
+        ];
+        let expected = vec![
+            TestValue::Array(Array::vector(vec![3.0_f32, 4.0])),
+            TestValue::Array(Array::vector(vec![4.0_f32, 6.0])),
+            TestValue::Array(Array::vector(vec![7.0_f32, 8.0])),
+            TestValue::Array(Array::vector(vec![12.0_f32, 14.0])),
+        ];
+        assert_eq!(jvp.interpret(inputs.clone()), Ok(expected.clone()));
+        assert_eq!(discharged_jvp.interpret(inputs), Ok(expected));
+    }
+
+    #[test]
+    fn test_array_ir_reference_program_replay_binds_external_references() {
         let array_type = ArrayType::new_static(DataType::F32, [2]);
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let external = builder.add_input(ReferenceType::new(array_type.clone()).into());
@@ -1605,15 +2052,11 @@ mod tests {
 
         let initial = TestValue::Array(Array::vector(vec![1.0_f32, 2.0]));
         let reference = initial.reference_new().unwrap();
-        assert_eq!(
-            program.interpret(vec![reference.clone(), TestValue::Array(Array::vector(vec![3.0_f32, 4.0]))]),
-            Err(ProgramError::UnsupportedOperation {
-                message: "program replay cannot bind external reference `input 0`; use a stateful \
-                          compilation domain"
-                    .to_string(),
-            }),
-        );
-        assert_eq!(reference.read(), Ok(initial));
+        let outputs = program
+            .interpret(vec![reference.clone(), TestValue::Array(Array::vector(vec![3.0_f32, 4.0]))])
+            .unwrap();
+        assert_eq!(outputs, vec![reference.clone()]);
+        assert_eq!(reference.read(), Ok(TestValue::Array(Array::vector(vec![3.0_f32, 4.0]))));
     }
 
     #[test]

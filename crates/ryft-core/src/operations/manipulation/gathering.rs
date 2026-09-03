@@ -12,8 +12,8 @@ use crate::batching::{
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    LinearCallOperation, MemberDifferentiableOperation, TransposableOperation, TranspositionDriver,
-    jvp_projected_operation,
+    LinearCallOperation, MemberDifferentiableOperation, TransposableOperation, TranspositionContext,
+    TranspositionDriver, jvp_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -598,11 +598,13 @@ where
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        context: &mut TracingContext<V, O>,
+        context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        // The rule stages into the tracing context only, so the transposition context is narrowed once up front.
+        let context: &mut TracingContext<V, O> = context;
         check_count!("input", inputs, 2, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         match &outputs[0] {
@@ -1274,7 +1276,7 @@ mod tests {
     impl<V: Value<Type = ArrayType>> TransposableOperation<V, TestGatherOperation<V>> for TestGatherOperation<V> {
         fn transpose<D: TranspositionDriver<V, TestGatherOperation<V>>>(
             &self,
-            context: &mut TracingContext<V, TestGatherOperation<V>>,
+            context: &mut TranspositionContext<'_, V, TestGatherOperation<V>>,
             driver: &D,
             inputs: &[PartialValue<Tracer<TracingContext<V, TestGatherOperation<V>>>>],
             outputs: &[MaybeZero<Tracer<TracingContext<V, TestGatherOperation<V>>>>],

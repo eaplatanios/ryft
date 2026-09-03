@@ -5,20 +5,35 @@
 use std::borrow::Cow;
 use std::sync::LazyLock;
 
+use crate::batching::{
+    BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
+};
 use crate::contexts::{Context, Domain};
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
+};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_non_transposable_operation};
+use crate::macros::check_count;
+use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
+use crate::programs::atoms::MaybeZero;
 use crate::programs::effects::{Effect, Effects};
 use crate::programs::operations::Operation;
 use crate::programs::references::discharge::{
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
     ReferenceDischargeableOperation,
 };
+use crate::programs::references::operations::{ReferenceAddUpdate, ReferenceNew};
 use crate::programs::references::semantics::{ReferenceAccessMode, ReferenceInput, ReferenceOperationSemantics};
 use crate::programs::references::types::ReferenceType;
+use crate::programs::references::views::ReferenceViewOperation;
 use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError};
+use crate::programs::types::{Type, TypeError, Typed};
+use crate::programs::values::Value;
+use crate::tracing::{Tracer, TracingContext};
+
+use super::forwarded_tangent;
 
 /// Canonical operation name for [`ReferenceReadOperation`].
 pub const REFERENCE_READ_OPERATION_NAME: &str = "reference_read";
@@ -113,21 +128,101 @@ where
     }
 }
 
-impl_unsupported_reference_transforms!(ReferenceReadOperation);
+impl<T, U, C> PartiallyEvaluatableOperation<C> for ReferenceReadOperation<T, U>
+where
+    T: Type,
+    U: Type,
+    C: Context<Type = U, Operation: From<ReferenceReadOperation<T, U>>>,
+{
+    // The default partial-evaluation behavior applies: the primitive's ordered-state effect is placed centrally
+    // before any operation rule runs.
+}
 
-impl_non_transposable_operation!(
-    <T, U> ReferenceReadOperation<T, U>
-    where
-        T: Type,
-        U: Type,
-);
+impl<T, U, C> DifferentiableOperation<C> for ReferenceReadOperation<T, U>
+where
+    T: Type,
+    U: DifferentiableType,
+    ReferenceReadOperation<T, U>: Operation<Type = U>,
+    C: Context<Type = U, Value: ReferenceRead<C::Value>>,
+{
+    // Reading a reference reads its tangent reference alongside. A plumbing reference (i.e., a reference dual whose
+    // tangent is a symbolic zero) carries no tangent reference, so the value read from it has a symbolic zero tangent.
+    fn jvp<D: DifferentiationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        check_count!("input", inputs, 1, ProgramError);
+        let primal = inputs[0].primal().read()?;
+        Ok(vec![forwarded_tangent(&inputs[0], primal, ReferenceRead::read)?])
+    }
+}
+
+impl<T, U, C, P> BatchableOperation<C, P> for ReferenceReadOperation<T, U>
+where
+    T: Type,
+    U: Type,
+    ReferenceReadOperation<T, U>: Operation<Type = U>,
+    C: Context<Type = U, Value: ReferenceRead<C::Value>>,
+    P: BatchingPolicy<C>,
+{
+    // A read yields the packed referent, batched at the reference's own axis (or replicated with the reference).
+    fn batch<D: BatchingDriver<C, P>>(
+        &self,
+        _context: &BatchingContext<C, P>,
+        _driver: &D,
+        inputs: &[P::Batch],
+    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+        check_count!("input", inputs, 1, ProgramError);
+        Ok(vec![P::batch(P::value(&inputs[0]).read()?, P::batch_axis(&inputs[0]))?].into())
+    }
+}
+
+impl<T, U, V, O> TransposableOperation<V, O> for ReferenceReadOperation<T, U>
+where
+    T: Type,
+    U: DifferentiableType,
+    ReferenceReadOperation<T, U>: Operation<Type = U>,
+    V: Value<Type = U>,
+    O: ReferenceViewOperation<Type = U> + ResidualZeroProvider<U>,
+    Tracer<TracingContext<V, O>>:
+        ReferenceNew<Tracer<TracingContext<V, O>>> + ReferenceAddUpdate<Tracer<TracingContext<V, O>>>,
+{
+    // A read is the identity map from the referenced state to its result, so its transpose accumulates the result's
+    // cotangent into the cotangent reference of the read root, viewed exactly as the operand views it. The reference
+    // operand carries no value cotangent of its own; its state cotangent lives in that accumulator.
+    fn transpose<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TranspositionContext<'_, V, O>,
+        _driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        check_count!("input", inputs, 1, ProgramError);
+        check_count!("output", outputs, 1, ProgramError);
+        if let MaybeZero::Value(cotangent) = &outputs[0] {
+            context.cotangent_reference(0)?.add_update(cotangent)?;
+        }
+        Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)])
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        Array, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType,
+        DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
+    };
+    use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
+    use crate::contexts::EagerContext;
+    use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
+    use crate::programs::references::operations::ReferenceNew;
     use crate::programs::references::operations::tests::*;
     use crate::programs::regions::EmptyRegionDriver;
+    use crate::programs::types::Typed;
 
     use super::*;
 
@@ -181,5 +276,66 @@ mod tests {
                 "reference discharge expected a reference to read but received a value".to_string(),
             )),
         );
+    }
+
+    #[test]
+    fn test_reference_read_operation_jvp() {
+        type TestValue = ArrayIrValue<Array>;
+
+        let context = DifferentiationContext::new(EagerContext::<TestValue, ArrayIrOperation<Array>>::new());
+        let reference = TestValue::Array(Array::vector(vec![1.0_f32, 2.0])).reference_new().unwrap();
+        let tangent_reference = TestValue::Array(Array::vector(vec![3.0_f32, 4.0])).reference_new().unwrap();
+
+        // Reading an active reference reads its tangent reference alongside.
+        let input = DifferentiationTracer::new(
+            DifferentiationDual::new(reference.clone(), tangent_reference).unwrap(),
+            context.clone(),
+        );
+        let outputs = context.bind(ReferenceReadOperation::new(), Vec::new(), &[input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].primal(), &TestValue::Array(Array::vector(vec![1.0_f32, 2.0])));
+        assert_eq!(outputs[0].tangent().as_value(), Some(&TestValue::Array(Array::vector(vec![3.0_f32, 4.0]))));
+
+        // Reading a plumbing reference yields a symbolic zero tangent of the referent's tangent type.
+        let input =
+            DifferentiationTracer::new(DifferentiationDual::new_with_zero_tangent(reference).unwrap(), context.clone());
+        let outputs = context.bind(ReferenceReadOperation::new(), Vec::new(), &[input]).unwrap();
+        assert_eq!(outputs[0].primal(), &TestValue::Array(Array::vector(vec![1.0_f32, 2.0])));
+        assert!(matches!(
+            outputs[0].tangent(),
+            MaybeZero::Zero(r#type) if *r#type == ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2])),
+        ));
+    }
+
+    #[test]
+    fn test_reference_read_operation_batching() {
+        type TestValue = ArrayIrValue<Array>;
+
+        let extent = TestValue::Dimension(
+            DimensionValue::new(DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())), 2)
+                .unwrap(),
+        );
+        let context = BatchingContext::<_, ArrayIrBatching>::new(
+            EagerContext::<TestValue, ArrayIrOperation<Array>>::new(),
+            extent,
+        );
+        let packed_type = ArrayType::new_static(DataType::F32, [3, 2]);
+        let packed = TestValue::Array(Array::from_f64s(packed_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        let reference = packed.reference_new().unwrap();
+
+        // Reading a batched reference yields the packed referent at the reference's batch axis.
+        let input =
+            BatchingTracer::new(context.clone(), ArrayIrBatch::new(reference.clone(), BatchAxis::new(1)).unwrap());
+        let outputs = context.bind(ReferenceReadOperation::new(), Vec::new(), &[input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::new(1));
+        assert_eq!(outputs[0].batch().value(), &packed);
+        assert_eq!(outputs[0].r#type().as_ref(), &ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3])));
+
+        // Reading a replicated reference stays replicated.
+        let input = BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(reference));
+        let outputs = context.bind(ReferenceReadOperation::new(), Vec::new(), &[input]).unwrap();
+        assert_eq!(outputs[0].batch().batch_axis(), BatchAxis::replicated());
+        assert_eq!(outputs[0].batch().value(), &packed);
     }
 }
