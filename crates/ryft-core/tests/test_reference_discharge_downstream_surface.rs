@@ -35,7 +35,7 @@ use ryft_core::{
     ReferenceDischargeableType, ReferenceInput, ReferenceOperationSemantics, ReferenceOutput, ReferenceSource,
     ReferenceType, ReferenceViewOperation, ReferenceViewPath, ReferenceViewValidationError, RegionId, RegionInterface,
     RegionSlot, Trace, Tracer, TracingContext, Type, TypeError, Typed, Value, ValueId,
-    discharge_reference_free_operation,
+    discharge_reference_free_operation, validate_reference_boundary,
 };
 
 /// Destination universe of the downstream programs. Its dispatch domain is the constant-only eager context, which is
@@ -967,4 +967,12 @@ fn test_downstream_view_operation_records_output_indices_and_distinct_paths() {
                 %3:register = register.read %2
             in (%3)"},
     );
+}
+
+#[test]
+fn test_downstream_value_reports_no_reference_identity_by_default() {
+    // The register family never holds a live reference handle, so the defaulted `Value::reference_id` answers `None`
+    // and the canonical boundary validator accepts its values without any family-specific override.
+    assert_eq!(RegisterValue(3).reference_id(), None);
+    assert_eq!(validate_reference_boundary([RegisterValue(1), RegisterValue(2)].iter(), std::iter::empty()), Ok(()));
 }

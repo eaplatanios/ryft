@@ -920,7 +920,12 @@ mod tests {
         assert_eq!(
             validate_kernel_body(program.entry_region_ref(), &contract).err(),
             Some(KernelValidationError::Analysis(ArrayReferenceAnalysisError::Analysis(
-                ReferenceAnalysisError::ReferenceConstant { region: RegionId::new(0), atom: AtomId::new(0) },
+                ReferenceAnalysisError::CaptureOutOfScope {
+                    region: RegionId::new(0),
+                    atom: AtomId::new(0),
+                    capture_index: 0,
+                    capture_count: 0,
+                },
             ))),
         );
     }

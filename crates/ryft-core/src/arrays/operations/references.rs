@@ -1319,6 +1319,38 @@ mod tests {
     }
 
     #[test]
+    fn test_reapply_array_reference_view_stages_the_view_over_another_reference() {
+        type TestContext = TracingContext<TestValue, TestOperation>;
+
+        // Reapplication rebuilds a view description over a different reference of compatible geometry (here a fresh
+        // input standing in for a tangent or cotangent root) through the family's own view operations.
+        let root_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3, 4])));
+        let (output_type, program) = TestContext::trace(
+            |input| {
+                let sliced = reapply_array_reference_view(
+                    input.context(),
+                    &ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 4, 1)] },
+                    input.clone(),
+                )?;
+                reapply_array_reference_view(input.context(), &ArrayReferenceViewTransform::Index { axis: 0, index: 1 }, sliced)
+            },
+            root_type,
+        )
+        .unwrap();
+        assert_eq!(output_type, ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [4]))));
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:ref<f32[3,4]> .
+                let %1:ref<f32[2,4]> = reference_slice %0 [axes=[0:1:3:1]]
+                    %2:ref<f32[4]> = reference_index %1 [axis=0, index=1]
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
     fn test_array_ir_projected_reference_capabilities_bind_through_parent() {
         type TestContext = TracingContext<TestValue, TestOperation>;
         type TestTracer = Tracer<TestContext>;

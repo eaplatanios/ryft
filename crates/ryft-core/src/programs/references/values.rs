@@ -2677,7 +2677,7 @@ mod tests {
         assert_eq!(
             validate_reference_boundary([reference.clone()].iter(), [reference.clone(), reference.clone()].iter()),
             Err(ReferenceBoundaryError::Aliased {
-                position: ReferenceBoundaryPosition::Capture(1),
+                position: ReferenceBoundaryPosition::Capture(0),
                 other: ReferenceBoundaryPosition::Input(0),
             }),
         );

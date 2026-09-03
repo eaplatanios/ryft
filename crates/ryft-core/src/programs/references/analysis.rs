@@ -3333,4 +3333,66 @@ mod tests {
                     && message == "the capture prefix of 4 inputs exceeds the region's 3 inputs",
         ));
     }
+
+    #[test]
+    fn test_region_ref_reference_analysis_retains_and_shares_one_analysis_per_closure() {
+        let program = fixture();
+        let retained = program.entry_region_ref().reference_analysis(1).unwrap();
+        assert_eq!(*retained, ReferenceAnalysis::new(program.entry_region_ref(), 1).unwrap());
+
+        // Repeated requests, including through the program-level accessor and through a clone that shares the region
+        // arena, are served the retained artifact (under `debug_assertions` each hit also re-derives and compares the
+        // analysis), while an independently built program derives its own.
+        assert!(Arc::ptr_eq(&retained, &program.entry_region_ref().reference_analysis(1).unwrap()));
+        assert!(Arc::ptr_eq(&retained, &program.reference_analysis(1).unwrap()));
+        assert!(Arc::ptr_eq(&retained, &program.clone().reference_analysis(1).unwrap()));
+        assert!(!Arc::ptr_eq(&retained, &fixture().reference_analysis(1).unwrap()));
+    }
+
+    #[test]
+    fn test_region_ref_reference_analysis_keys_entries_by_capture_count_and_does_not_retain_failures() {
+        let program = fixture();
+        let failure = program.reference_analysis(0).unwrap_err();
+        assert!(matches!(failure, ReferenceAnalysisError::CaptureOutOfScope { capture_count: 0, .. }));
+        assert_eq!(program.reference_analysis(0).unwrap_err(), failure);
+        assert!(program.reference_analysis(1).is_ok());
+    }
+
+    #[test]
+    fn test_region_ref_reference_analysis_is_retained_for_a_value_family_without_captures() {
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let reference = builder.add_input(reference_type);
+        let value =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![value], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let root = ReferenceRoot::RegionInput { region: RegionId::new(0), input_index: 0 };
+        let retained = program.reference_analysis(0).unwrap();
+        assert!(Arc::ptr_eq(&retained, &program.reference_analysis(0).unwrap()));
+        assert_eq!(retained.roots().collect::<Vec<_>>(), vec![root]);
+        assert_eq!(retained.access_modes(root).collect::<Vec<_>>(), vec![ReferenceAccessMode::Read]);
+    }
+
+    #[test]
+    fn test_region_ref_reference_analysis_derives_a_fresh_entry_for_a_rebased_import() {
+        // A closure-copying import keeps the source region's transform cache but renumbers the attached regions, so the
+        // records of the retained analysis would name the wrong identifiers. The closure's region identifiers are part
+        // of the cache key, which is what makes the rebased copy derive its own analysis.
+        let first = while_program(false);
+        let retained = first.entry_region_ref().reference_analysis(0).unwrap();
+        let mut builder = TestBuilder::new();
+        builder.import_program(fixture());
+        let imported = builder.import_program(first.clone());
+        let program = build(builder, Vec::new());
+        let rebased = program.region_ref(imported).unwrap();
+        let derived = rebased.reference_analysis(0).unwrap();
+        assert!(!Arc::ptr_eq(&derived, &retained));
+        assert_ne!(derived.region(), retained.region());
+        assert_eq!(*derived, ReferenceAnalysis::new(rebased, 0).unwrap());
+
+        // The source program keeps its own retained artifact, because only the imported copy was rebased.
+        assert!(Arc::ptr_eq(&first.entry_region_ref().reference_analysis(0).unwrap(), &retained));
+    }
 }
