@@ -1,11 +1,14 @@
 //! Array view overlay over the generic program-level reference analysis.
 //!
-//! [`ArrayReferenceAnalysis`] runs the generic [`ReferenceAnalysis`] over a [`Region`](crate::Region) closure whose
-//! values are typed by [`ArrayIrType`] and derives, exactly once per reference-typed value, the [`ArrayReferenceView`]
+//! [`ArrayReferenceAnalysis`] is the array instantiation of the value-family-generic
+//! [`ReferenceViewAnalysis`](crate::ReferenceViewAnalysis): it runs the generic
+//! [`ReferenceAnalysis`](crate::ReferenceAnalysis) over a [`Region`](crate::Region) closure whose values are typed by
+//! [`ArrayIrType`](crate::ArrayIrType) and derives, exactly once per reference-typed value, the [`ArrayReferenceView`]
 //! that maps the value's canonical root to the coordinates the value selects. The generic analysis owns roots, alias
-//! edges, accesses, capture scopes, nested-region bindings, and lifetime rules; this overlay adds only array geometry,
-//! recovered from the alias edges through [`ArrayReferenceViewOperation::reference_view_transform`] rather than by
-//! re-walking index and slice operations by name.
+//! edges, accesses, capture scopes, nested-region bindings, and lifetime rules; the generic overlay adds the view
+//! geometry, recovered from the alias edges through the operation family's
+//! [`ReferenceViewOperation`](crate::ReferenceViewOperation) contract rather than by re-walking index and slice
+//! operations by name; and this module only names the array specialization and its view-flavored accessors.
 //!
 //! The resulting view table is the one authoritative source of view geometry for every consumer of a validated
 //! program: kernel-boundary validation, diagnostics, and lowering all read the same table instead of re-deriving views
@@ -16,225 +19,57 @@
 //!
 //! # View Derivation
 //!
-//! Views are derived in program order from the generic alias edges. Every root handle (a region input, an
-//! allocation, a capture constant, or a provenance-forwarded region output) maps to [`ArrayReferenceView::root`].
-//! An identity edge copies the view of its source. A view edge composes the aliasing operation's
-//! [`ArrayReferenceViewTransform`](crate::ArrayReferenceViewTransform) onto the view of its source and re-derives
-//! the output referent through its [`output_type`](crate::ArrayReferenceViewTransform::output_type), rejecting an
-//! operation that declares a view alias but exposes no transform, a transform that is invalid for the source
-//! referent, and a declared output referent that differs from the derived one. Nested region inputs are separate
-//! roots of the generic analysis and therefore map to [`ArrayReferenceView::root`], which is consistent with the
-//! root-only boundary rule the generic analysis enforces: the region that needs a view recreates it from the carried
-//! root.
+//! Every root handle (a region input, an allocation, a capture constant, or a provenance-forwarded region output) maps
+//! to [`ArrayReferenceView::root`]. An identity edge copies the view of its source. A view edge composes the aliasing
+//! operation's [`ArrayReferenceViewTransform`](crate::ArrayReferenceViewTransform) onto the view of its source after
+//! validating it with [`validate_array_reference_view`](crate::validate_array_reference_view), rejecting an operation
+//! that declares a view alias but describes none, a transform that is invalid for the source referent, and a declared
+//! output referent that differs from the derived one. Nested region inputs are separate roots of the generic analysis
+//! and therefore map to [`ArrayReferenceView::root`], which is consistent with the root-only boundary rule the generic
+//! analysis enforces: the region that needs a view recreates it from the carried root.
 
-use std::collections::{BTreeMap, BTreeSet};
+// TODO(eaplatanios): Review this module.
 
-use thiserror::Error;
-
-use crate::arrays::operations::ArrayReferenceViewOperation;
-use crate::arrays::reference_views::ArrayReferenceView;
-use crate::arrays::types::arrays::ArrayType;
-use crate::arrays::types::ir::ArrayIrType;
-use crate::programs::{
-    AtomId, InstructionId, ProgramError, ReferenceAliasKind, ReferenceAnalysis, ReferenceAnalysisError, RegionRef,
-    Typed, Value, ValueId,
-};
+use crate::arrays::reference_views::{ArrayReferenceView, ArrayReferenceViewTransform};
+use crate::programs::{ReferenceViewAnalysis, ReferenceViewAnalysisError, ValueId};
 
 /// Error produced by [`ArrayReferenceAnalysis`] when the generic reference analysis fails or when a derived view
-/// cannot be reconciled with the program's declared reference types.
-#[derive(Clone, Debug, PartialEq, Eq, Error)]
-pub enum ArrayReferenceAnalysisError {
-    /// The generic reference analysis rejected the region closure.
-    #[error(transparent)]
-    Analysis(#[from] ReferenceAnalysisError),
+/// cannot be reconciled with the program's declared reference types. This is the generic
+/// [`ReferenceViewAnalysisError`], whose view variants carry the array transform diagnostics produced by
+/// [`validate_array_reference_view`](crate::validate_array_reference_view).
+pub type ArrayReferenceAnalysisError = ReferenceViewAnalysisError;
 
-    /// An operation declares a view alias in its reference semantics but exposes no view transform.
-    #[error("operation `{operation}` at {instruction} derives a reference view but exposes no view transform")]
-    MissingViewTransform {
-        /// Name of the operation.
-        operation: &'static str,
-
-        /// Instruction applying the operation.
-        instruction: InstructionId,
-    },
-
-    /// A view operation declares an output referent type that differs from the referent its transform derives from
-    /// the source referent.
-    #[error(
-        "operation `{operation}` at {instruction} declares view referent type `{actual}` but its transform derives \
-         referent type `{expected}` from the source view"
-    )]
-    ViewTypeMismatch {
-        /// Name of the operation.
-        operation: &'static str,
-
-        /// Instruction applying the operation.
-        instruction: InstructionId,
-
-        /// Referent type derived by the operation's transform.
-        expected: String,
-
-        /// Referent type declared by the operation's output.
-        actual: String,
-    },
-
-    /// A view operation's transform cannot be applied to the referent type of its source view.
-    #[error("operation `{operation}` at {instruction} composes an invalid view transform: {message}")]
-    InvalidViewComposition {
-        /// Name of the operation.
-        operation: &'static str,
-
-        /// Instruction applying the operation.
-        instruction: InstructionId,
-
-        /// Description of why the transform is invalid for the source referent.
-        message: String,
-    },
-}
-
-impl From<ArrayReferenceAnalysisError> for ProgramError {
-    #[inline]
-    fn from(error: ArrayReferenceAnalysisError) -> Self {
-        ProgramError::MalformedProgram(error.to_string())
-    }
-}
-
-/// Generic [`ReferenceAnalysis`] of an array-typed [`Region`](crate::Region) closure together with the
-/// [`ArrayReferenceView`] of every reference-typed value in that closure. This is the one authoritative view table
-/// that consumers of a validated program (kernel-boundary validation, diagnostics, and lowering) read instead of
-/// re-walking index and slice operations, and like the generic analysis it is kernel-owned validation infrastructure
-/// that consumers invoke explicitly rather than a standing whole-program lint.
+/// Generic [`ReferenceAnalysis`](crate::ReferenceAnalysis) of an array-typed [`Region`](crate::Region) closure
+/// together with the [`ArrayReferenceView`] of every reference-typed value in that closure: the array instantiation of
+/// [`ReferenceViewAnalysis`]. This is the one authoritative view table that consumers of a validated program
+/// (kernel-boundary validation, diagnostics, and lowering) read instead of re-walking index and slice operations, and
+/// like the generic analysis it is kernel-owned validation infrastructure that consumers invoke explicitly rather than
+/// a standing whole-program lint.
 ///
 /// Every reference-typed value of the closure has exactly one view. Root handles and nested region inputs map to
 /// [`ArrayReferenceView::root`], identity aliases copy the view of their source, and view aliases compose the
-/// aliasing operation's [`ArrayReferenceViewTransform`](crate::ArrayReferenceViewTransform) onto the view of their
-/// source. The view of a value composed with the referent type of its root therefore reproduces exactly the referent
-/// type the program declares for that value, which the analysis verifies while deriving the table.
-#[derive(Clone, Debug)]
-pub struct ArrayReferenceAnalysis {
-    /// Generic analysis of the closure.
-    analysis: ReferenceAnalysis,
-
-    /// View of every reference-typed value of the closure, in canonical value order.
-    views: BTreeMap<ValueId, ArrayReferenceView>,
-}
+/// aliasing operation's [`ArrayReferenceViewTransform`] onto the view of their source. The view of a value composed
+/// with the referent type of its root therefore reproduces exactly the referent type the program declares for that
+/// value, which the analysis verifies while deriving the table. Construct it with [`ReferenceViewAnalysis::new`]
+/// (uncached) or through [`RegionRef::reference_view_analysis`](crate::RegionRef::reference_view_analysis)
+/// (retained), and read it through [`view`](Self::view) and [`views`](Self::views) or the generic
+/// [`path`](ReferenceViewAnalysis::path) and [`paths`](ReferenceViewAnalysis::paths).
+pub type ArrayReferenceAnalysis = ReferenceViewAnalysis<ArrayReferenceViewTransform>;
 
 impl ArrayReferenceAnalysis {
-    /// Analyzes the complete closure of `region` and derives the [`ArrayReferenceView`] of every reference-typed value
-    /// in it. Refer to the documentation of [`ReferenceAnalysis::new`] for the meaning of `capture_count` and
-    /// `capture_index_of`.
-    ///
-    /// # Errors
-    ///
-    /// Returns the [`ReferenceAnalysisError`] of the generic analysis when the closure violates the reference model,
-    /// and otherwise the first view derivation failure in program order: an operation declaring a view alias without
-    /// exposing a transform, a transform that is invalid for its source referent, or a declared output referent that
-    /// differs from the derived one.
-    pub fn new<V: Value<Type = ArrayIrType>, O: ArrayReferenceViewOperation>(
-        region: RegionRef<'_, V, O>,
-        capture_count: usize,
-        capture_index_of: fn(&V) -> Option<usize>,
-    ) -> Result<Self, ArrayReferenceAnalysisError> {
-        let analysis = ReferenceAnalysis::new(region, capture_count, capture_index_of)?;
-        let mut views = BTreeMap::new();
-
-        // Every region of the closure is visited once. The generic analysis records alias edges from already-resolved
-        // values of the same region, so deriving the views of a region's inputs and constants first and those of its
-        // instruction outputs in program order always finds the source view already derived.
-        let mut pending = vec![region.id()];
-        let mut visited = BTreeSet::new();
-        while let Some(region_id) = pending.pop() {
-            if !visited.insert(region_id) {
-                continue;
-            }
-            // The generic analysis resolved every attached region of the closure, so the lookup cannot fail here.
-            let current = region.with_id(region_id).unwrap();
-            let atoms = current.atoms();
-            let value_id = |atom: AtomId| ValueId::new(region_id, atom);
-            let referent = |atom: AtomId| match atoms[atom.index()].r#type().as_ref() {
-                ArrayIrType::Reference(reference) => Some(reference.referent().clone()),
-                _ => None,
-            };
-
-            // Every non-alias reference-typed atom (a region input, a capture constant, an allocation, or a forwarded
-            // region output) is a complete-value handle. Only reference-typed atoms resolve to a root in the generic
-            // analysis, so `root_of` doubles as the reference-typed test.
-            for (index, _) in atoms.iter().enumerate() {
-                let value = value_id(AtomId::new(index));
-                if analysis.root_of(value).is_some() && analysis.alias(value).is_none() {
-                    views.insert(value, ArrayReferenceView::root());
-                }
-            }
-
-            for (index, instruction) in current.instructions().iter().enumerate() {
-                let id = InstructionId::new(region_id, index);
-                for output in instruction.outputs().iter().copied() {
-                    let value = value_id(output);
-                    let Some(edge) = analysis.alias(value) else {
-                        continue;
-                    };
-                    let source = &views[&edge.source()];
-                    let view = match edge.kind() {
-                        ReferenceAliasKind::Identity => source.clone(),
-                        ReferenceAliasKind::View => {
-                            let operation = instruction.operation();
-                            let name = operation.name();
-                            let Some(transform) = operation.reference_view_transform() else {
-                                return Err(ArrayReferenceAnalysisError::MissingViewTransform {
-                                    operation: name,
-                                    instruction: id,
-                                });
-                            };
-                            // Both ends of an alias edge are reference-typed values of this region, so both referents
-                            // exist.
-                            let source_referent: ArrayType = referent(edge.source().atom()).unwrap();
-                            let actual = referent(output).unwrap();
-                            let expected = transform.output_type(&source_referent).map_err(|error| {
-                                ArrayReferenceAnalysisError::InvalidViewComposition {
-                                    operation: name,
-                                    instruction: id,
-                                    message: error.to_string(),
-                                }
-                            })?;
-                            if expected != actual {
-                                return Err(ArrayReferenceAnalysisError::ViewTypeMismatch {
-                                    operation: name,
-                                    instruction: id,
-                                    expected: expected.to_string(),
-                                    actual: actual.to_string(),
-                                });
-                            }
-                            source.with_transform_unchecked(transform)
-                        }
-                    };
-                    views.insert(value, view);
-                }
-                pending.extend(instruction.regions().iter().copied());
-            }
-        }
-
-        Ok(Self { analysis, views })
-    }
-
-    /// Returns the generic [`ReferenceAnalysis`] of the closure.
-    #[inline]
-    pub fn analysis(&self) -> &ReferenceAnalysis {
-        &self.analysis
-    }
-
     /// Returns the [`ArrayReferenceView`] mapping the root of the reference-typed `value` to the coordinates it
     /// selects, or [`None`] when `value` is not a reference-typed value of the closure. Root handles and nested region
     /// inputs map to [`ArrayReferenceView::root`].
     #[inline]
     pub fn view(&self, value: ValueId) -> Option<&ArrayReferenceView> {
-        self.views.get(&value)
+        self.path(value)
     }
 
     /// Returns the [`ArrayReferenceView`] of every reference-typed value of the closure, in canonical [`ValueId`]
     /// order.
     #[inline]
     pub fn views(&self) -> impl Iterator<Item = (ValueId, &ArrayReferenceView)> + '_ {
-        self.views.iter().map(|(value, view)| (*value, view))
+        self.paths()
     }
 }
 
@@ -248,18 +83,23 @@ mod tests {
     use crate::arrays::arrays::Array;
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{
-        ArrayIrOperation, REFERENCE_INDEX_OPERATION_NAME, ReferenceIndexOperation, ReferenceSliceOperation,
+        ArrayIrOperation, ArrayReferenceViewOperation, REFERENCE_INDEX_OPERATION_NAME, ReferenceIndexOperation,
+        ReferenceSliceOperation, reapply_array_reference_view,
     };
-    use crate::arrays::reference_views::ArrayReferenceViewTransform;
+    use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::data::DataType;
+    use crate::arrays::types::ir::ArrayIrType;
+    use crate::contexts::Context;
     use crate::operations::{
         ConditionOperation, ReshapeOperation, SliceOperation, UpdateSliceOperation, WhileOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{
-        Effects, Instruction, Operation, ProgramBuilder, ReferenceAccessMode, ReferenceAliasEdge,
-        ReferenceFreezeOperation, ReferenceOperationSemantics, ReferenceOutput, ReferenceReadOperation, ReferenceRoot,
-        ReferenceSource, ReferenceType, ReferenceWriteOperation, RegionId, RegionInterface, TypeError,
+        AtomId, Effects, Instruction, InstructionId, Operation, ProgramBuilder, ProgramError, ReferenceAccessMode,
+        ReferenceAliasEdge, ReferenceAliasKind, ReferenceAnalysisError, ReferenceFreezeOperation,
+        ReferenceOperationSemantics, ReferenceOutput, ReferenceReadOperation, ReferenceRoot, ReferenceSource,
+        ReferenceType, ReferenceViewOperation, ReferenceViewValidationError, ReferenceWriteOperation, RegionId,
+        RegionInterface, TypeError,
     };
 
     use super::*;
@@ -295,7 +135,7 @@ mod tests {
             ArrayReferenceAnalysisError::Analysis(analysis)
         );
         assert_eq!(
-            ArrayReferenceAnalysisError::MissingViewTransform { operation: "view", instruction: id(0, 2) }.to_string(),
+            ArrayReferenceAnalysisError::MissingView { operation: "view", instruction: id(0, 2) }.to_string(),
             "operation `view` at ^0[2] derives a reference view but exposes no view transform",
         );
         assert_eq!(
@@ -320,10 +160,7 @@ mod tests {
              bounds for rank 2",
         );
         assert_eq!(
-            ProgramError::from(ArrayReferenceAnalysisError::MissingViewTransform {
-                operation: "view",
-                instruction: id(0, 2),
-            }),
+            ProgramError::from(ArrayReferenceAnalysisError::MissingView { operation: "view", instruction: id(0, 2) }),
             ProgramError::MalformedProgram(
                 "operation `view` at ^0[2] derives a reference view but exposes no view transform".to_string(),
             ),
@@ -357,7 +194,7 @@ mod tests {
             )
             .unwrap();
 
-        let analysis = ArrayReferenceAnalysis::new(program.entry_region_ref(), 0, |_| None).unwrap();
+        let analysis = ArrayReferenceAnalysis::new(program.entry_region_ref(), 0).unwrap();
         let root = ReferenceRoot::RegionInput { region: RegionId::new(0), input_index: 0 };
         let row_view = ArrayReferenceView::root()
             .with_transform_unchecked(ArrayReferenceViewTransform::Slice { axes: row_axes.clone() });
@@ -437,10 +274,10 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![outputs[0]], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        let analysis = ArrayReferenceAnalysis::new(program.entry_region_ref(), 0, |_| None).unwrap();
+        let analysis = ArrayReferenceAnalysis::new(program.entry_region_ref(), 0).unwrap();
         assert_eq!(
             analysis.analysis().alias(value(2, 3)),
-            Some(ReferenceAliasEdge::new(id(2, 0), value(2, 1), ReferenceAliasKind::Identity, false)),
+            Some(ReferenceAliasEdge::new(id(2, 0), 1, value(2, 1), ReferenceAliasKind::Identity, false)),
         );
         assert_eq!(analysis.view(value(2, 1)), Some(&ArrayReferenceView::root()));
         assert_eq!(analysis.view(value(2, 3)), Some(&ArrayReferenceView::root()));
@@ -492,7 +329,7 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![row], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        let analysis = ArrayReferenceAnalysis::new(program.entry_region_ref(), 0, |_| None).unwrap();
+        let analysis = ArrayReferenceAnalysis::new(program.entry_region_ref(), 0).unwrap();
         let root = ReferenceRoot::RegionInput { region: RegionId::new(2), input_index: 1 };
         assert_eq!(analysis.view(value(2, 1)), Some(&ArrayReferenceView::root()));
         assert_eq!(analysis.view(value(0, 0)), Some(&ArrayReferenceView::root()));
@@ -537,7 +374,7 @@ mod tests {
         let program =
             builder.build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
         assert_eq!(
-            ArrayReferenceAnalysis::new(program.entry_region_ref(), 0, |_| None).err(),
+            ArrayReferenceAnalysis::new(program.entry_region_ref(), 0).err(),
             Some(ArrayReferenceAnalysisError::ViewTypeMismatch {
                 operation: REFERENCE_INDEX_OPERATION_NAME,
                 instruction: id(0, 0),
@@ -599,6 +436,45 @@ mod tests {
             }
         }
 
+        impl From<ReferenceIndexOperation> for ViewlessOperation {
+            fn from(operation: ReferenceIndexOperation) -> Self {
+                Self::Native(operation.into())
+            }
+        }
+
+        impl From<ReferenceSliceOperation> for ViewlessOperation {
+            fn from(operation: ReferenceSliceOperation) -> Self {
+                Self::Native(operation.into())
+            }
+        }
+
+        impl ReferenceViewOperation for ViewlessOperation {
+            type View = ArrayReferenceViewTransform;
+
+            fn reference_view(&self, output_index: usize) -> Option<ArrayReferenceViewTransform> {
+                match self {
+                    Self::Native(operation) => operation.reference_view(output_index),
+                    Self::View => None,
+                }
+            }
+
+            fn validate_view(
+                view: &ArrayReferenceViewTransform,
+                source: &ArrayIrType,
+                output: &ArrayIrType,
+            ) -> Result<(), ReferenceViewValidationError> {
+                TestOperation::validate_view(view, source, output)
+            }
+
+            fn reapply_view<C: Context<Type = ArrayIrType, Operation = Self>>(
+                context: &C,
+                view: &ArrayReferenceViewTransform,
+                source: C::Value,
+            ) -> Result<C::Value, ProgramError> {
+                reapply_array_reference_view(context, view, source)
+            }
+        }
+
         impl ArrayReferenceViewOperation for ViewlessOperation {
             fn from_reference_reshape(operation: ReshapeOperation) -> Self {
                 Self::Native(TestOperation::from_reference_reshape(operation))
@@ -610,13 +486,6 @@ mod tests {
 
             fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self {
                 Self::Native(TestOperation::from_reference_update_slice(operation))
-            }
-
-            fn reference_view_transform(&self) -> Option<ArrayReferenceViewTransform> {
-                match self {
-                    Self::Native(operation) => operation.reference_view_transform(),
-                    Self::View => None,
-                }
             }
         }
 
@@ -635,11 +504,8 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
-            ArrayReferenceAnalysis::new(program.entry_region_ref(), 0, |_| None).err(),
-            Some(ArrayReferenceAnalysisError::MissingViewTransform {
-                operation: "viewless_view",
-                instruction: id(0, 0)
-            }),
+            ArrayReferenceAnalysis::new(program.entry_region_ref(), 0).err(),
+            Some(ArrayReferenceAnalysisError::MissingView { operation: "viewless_view", instruction: id(0, 0) }),
         );
     }
 
@@ -658,7 +524,7 @@ mod tests {
         let program =
             builder.build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
         assert_eq!(
-            ArrayReferenceAnalysis::new(program.entry_region_ref(), 0, |_| None).err(),
+            ArrayReferenceAnalysis::new(program.entry_region_ref(), 0).err(),
             Some(ArrayReferenceAnalysisError::InvalidViewComposition {
                 operation: REFERENCE_INDEX_OPERATION_NAME,
                 instruction: id(0, 0),
@@ -678,7 +544,7 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
             .unwrap();
         assert_eq!(
-            ArrayReferenceAnalysis::new(program.entry_region_ref(), 0, |_| None).err(),
+            ArrayReferenceAnalysis::new(program.entry_region_ref(), 0).err(),
             Some(ArrayReferenceAnalysisError::Analysis(ReferenceAnalysisError::ConsumeExternal {
                 operation: "reference_freeze",
                 instruction: id(0, 0),
@@ -697,7 +563,7 @@ mod tests {
         let program = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let analysis = ArrayReferenceAnalysis::new(program.entry_region_ref(), 0, |_| None).unwrap();
+        let analysis = ArrayReferenceAnalysis::new(program.entry_region_ref(), 0).unwrap();
         let root = ReferenceRoot::RegionInput { region: RegionId::new(0), input_index: 0 };
         assert_eq!(analysis.analysis().region(), RegionId::new(0));
         assert_eq!(analysis.analysis().roots().collect::<Vec<_>>(), vec![root]);
@@ -716,7 +582,7 @@ mod tests {
         let program = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let analysis = ArrayReferenceAnalysis::new(program.entry_region_ref(), 0, |_| None).unwrap();
+        let analysis = ArrayReferenceAnalysis::new(program.entry_region_ref(), 0).unwrap();
         assert_eq!(analysis.view(value(0, 0)), Some(&ArrayReferenceView::root()));
         assert_eq!(
             analysis.view(value(0, 1)),
@@ -741,7 +607,7 @@ mod tests {
         let program = builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        let analysis = ArrayReferenceAnalysis::new(program.entry_region_ref(), 0, |_| None).unwrap();
+        let analysis = ArrayReferenceAnalysis::new(program.entry_region_ref(), 0).unwrap();
         let element_view = ArrayReferenceView::root()
             .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 0, index: 1 });
         assert_eq!(

@@ -96,6 +96,7 @@ use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedF
 use crate::programs::{
     BindingRegionDriver, EmptyRegionDriver, Operation, OperationProjection, Program, ProgramError, Provenance,
     ProvenanceScope, RegionDriver, RegionRef, Type, TypeError, Typed, Value, ValueProjection,
+    validate_reference_boundary,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -1658,6 +1659,7 @@ pub trait Batch: Context {
         output_batch_axes: OutputBatchAxes,
         batch_axis: Specification,
     ) -> Result<O::To<Self::Value>, BatchingError> {
+        validate_reference_boundary(input.parameters(), std::iter::empty()).map_err(ProgramError::from)?;
         let input_structure = input.parameter_structure();
         let inputs = input.into_parameters().collect::<Vec<_>>();
 

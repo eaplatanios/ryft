@@ -851,6 +851,39 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
         self.arena.effects(self.id).unwrap()
     }
 
+    /// Returns the [`RegionId`] of every [`Region`] in this [`Region`]'s complete attached region closure, in
+    /// root-inclusive first-encounter structural order: this region first, then the regions attached by its
+    /// instructions in instruction and attachment order, each followed recursively by its own closure before the next
+    /// attachment is visited (i.e., a pre-order depth-first traversal). Region attachments form a Directed Acyclic
+    /// Graph (DAG), so a region reachable through several paths appears once, at its first encounter, and no path is
+    /// expanded twice.
+    ///
+    /// Two closures that yield the same sequence assign the same identifiers to the same structural positions,
+    /// which is what lets an artifact that records concrete region, instruction, and value identifiers (e.g., a
+    /// [`ReferenceAnalysis`](crate::ReferenceAnalysis)) be keyed by this sequence in a retained transform cache that
+    /// is shared across topology-preserving imports.
+    pub fn region_ids_in_closure(self) -> Vec<RegionId> {
+        // Attachments are pushed in reverse so that the last-in-first-out worklist pops them in instruction and
+        // attachment order, which makes the emitted sequence the pre-order first-encounter sequence described above.
+        let mut visited = vec![false; self.arena.len()];
+        let mut order = Vec::new();
+        let mut pending = vec![self.id];
+        while let Some(region_id) = pending.pop() {
+            let Some(visited) = visited.get_mut(region_id.index()) else {
+                continue;
+            };
+            if std::mem::replace(visited, true) {
+                continue;
+            }
+            order.push(region_id);
+            let region = RegionRef::new(self.arena, region_id).unwrap();
+            let attached = region.instructions().iter().flat_map(|instruction| instruction.regions().iter().copied());
+            let attached = attached.collect::<Vec<_>>();
+            pending.extend(attached.into_iter().rev());
+        }
+        order
+    }
+
     /// Returns every [`Instruction`] in this [`Region`]'s complete attached region closure, paired with its source
     /// [`InstructionId`]. Every attached region is traversed regardless of [`RegionRole`], so dormant transformation
     /// rules are included, and shared descendants are visited once. Instructions of one region are yielded in program
@@ -1858,6 +1891,74 @@ mod tests {
         SharedDescendantFixture { program, first_root, second_root }
     }
 
+    /// Diamond-shaped closure: `root` attaches `first` and `second`, both of which attach the same `shared` region.
+    /// Returns the arena together with `[shared, first, second, root]`.
+    fn diamond_closure_arena() -> (RegionArena<Array, TestRegionOperation>, [RegionId; 4]) {
+        let shared = RegionId::new(0);
+        let first = RegionId::new(1);
+        let second = RegionId::new(2);
+        let root = RegionId::new(3);
+        let shared_slot = const { &[RegionSlot::computation("shared")] };
+        let regions = vec![
+            Region::<Array, TestRegionOperation>::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![
+                    Instruction::new(
+                        TestRegionOperation::Effectful(Effect::OrderedIo),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                    Instruction::new(
+                        TestRegionOperation::Effectful(Effect::OrderedState),
+                        Vec::new(),
+                        Vec::new(),
+                        Vec::new(),
+                    ),
+                ],
+            ),
+            Region::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![Instruction::new(
+                    TestRegionOperation::WithRegions(shared_slot),
+                    Vec::new(),
+                    Vec::new(),
+                    vec![shared],
+                )],
+            ),
+            Region::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![Instruction::new(
+                    TestRegionOperation::WithRegions(shared_slot),
+                    Vec::new(),
+                    Vec::new(),
+                    vec![shared],
+                )],
+            ),
+            Region::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![Instruction::new(
+                    TestRegionOperation::WithRegions(
+                        const { &[RegionSlot::computation("first"), RegionSlot::rule("second")] },
+                    ),
+                    Vec::new(),
+                    Vec::new(),
+                    vec![first, second],
+                )],
+            ),
+        ];
+        let arena = RegionArena::from_regions(regions).unwrap();
+        (arena, [shared, first, second, root])
+    }
+
     #[test]
     fn test_region_type_identity_signature_classifies_forwarded_and_fresh_definitions() {
         let boundary = StructuralIdentity::new("boundary");
@@ -2048,69 +2149,19 @@ mod tests {
     }
 
     #[test]
+    fn test_region_ref_region_ids_in_closure() {
+        // Pre-order first-encounter order: the root, then its first attachment and that attachment's closure, then the
+        // second attachment, whose shared descendant was already encountered and is not repeated.
+        let (arena, [shared, first, second, root]) = diamond_closure_arena();
+        assert_eq!(RegionRef::new(&arena, root).unwrap().region_ids_in_closure(), vec![root, first, shared, second]);
+        assert_eq!(RegionRef::new(&arena, first).unwrap().region_ids_in_closure(), vec![first, shared]);
+        assert_eq!(RegionRef::new(&arena, shared).unwrap().region_ids_in_closure(), vec![shared]);
+    }
+
+    #[test]
     fn test_region_ref_instructions_in_closure() {
-        let shared = RegionId::new(0);
-        let first = RegionId::new(1);
-        let second = RegionId::new(2);
-        let root = RegionId::new(3);
+        let (arena, [shared, first, second, root]) = diamond_closure_arena();
         let shared_slot = const { &[RegionSlot::computation("shared")] };
-        let regions = vec![
-            Region::<Array, TestRegionOperation>::new(
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                vec![
-                    Instruction::new(
-                        TestRegionOperation::Effectful(Effect::OrderedIo),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                    ),
-                    Instruction::new(
-                        TestRegionOperation::Effectful(Effect::OrderedState),
-                        Vec::new(),
-                        Vec::new(),
-                        Vec::new(),
-                    ),
-                ],
-            ),
-            Region::new(
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                vec![Instruction::new(
-                    TestRegionOperation::WithRegions(shared_slot),
-                    Vec::new(),
-                    Vec::new(),
-                    vec![shared],
-                )],
-            ),
-            Region::new(
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                vec![Instruction::new(
-                    TestRegionOperation::WithRegions(shared_slot),
-                    Vec::new(),
-                    Vec::new(),
-                    vec![shared],
-                )],
-            ),
-            Region::new(
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                vec![Instruction::new(
-                    TestRegionOperation::WithRegions(
-                        const { &[RegionSlot::computation("first"), RegionSlot::rule("second")] },
-                    ),
-                    Vec::new(),
-                    Vec::new(),
-                    vec![first, second],
-                )],
-            ),
-        ];
-        let arena = RegionArena::from_regions(regions).unwrap();
         let mut instructions = RegionRef::new(&arena, root)
             .unwrap()
             .instructions_in_closure()

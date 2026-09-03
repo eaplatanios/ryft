@@ -74,6 +74,10 @@
 //!   edges, accesses, capture scopes, root-only region boundaries, lifetime validation, and per-instruction transitive
 //!   access summaries. It is kernel-owned validation infrastructure invoked explicitly by its consumers rather than a
 //!   standing lint on every program.
+//! - `views.rs` defines the value-family-generic static view contract [`ReferenceViewOperation`] (owned per-edge view
+//!   descriptions, their type-level validation, and their reapplication to a transformed reference) and the retained
+//!   [`ReferenceViewAnalysis`] overlay that composes those descriptions into one [`ReferenceViewPath`] per
+//!   reference-typed value of a closure.
 //! - `operations/` defines the six generic primitives in separate modules together with their value-level
 //!   capabilities: allocation ([`ReferenceNew`]), immutable reads ([`ReferenceRead`]), write-only replacement
 //!   ([`ReferenceWrite`]), swapping ([`ReferenceSwap`]), ordered additive updates ([`ReferenceAddUpdate`]), and
@@ -114,9 +118,14 @@
 //!    atomic replacement semantics across its alias family.
 //! 3. Discharge validates the complete rewrite it observes, including use after consumption, unbound allocations,
 //!    invalid structured-region threading, escaping local allocations, and surviving references in a claimed full result.
+//! 4. [`validate_reference_boundary`] checks the concrete values bound at every public transform boundary (eager
+//!    differentiation, batching, and jit staging) for runtime aliasing by [`ReferenceId`]: the same allocation at two
+//!    positions, a reference both captured and passed, and values that misreport their identity.
 //!
-//! These checks are complementary. Construction sees the source call, the eager reference sees runtime aliases and
-//! concurrency, and discharge sees the state-threading transformation and complete attached-region closure.
+//! These checks are complementary. Construction sees the source call but only atoms and declared semantics, so it
+//! cannot detect two positions bound to the same runtime allocation; the eager reference sees runtime aliases and
+//! concurrency; discharge sees the state-threading transformation and complete attached-region closure; and the
+//! boundary validator sees the live values a transform is about to bind.
 
 // TODO(eaplatanios): Review this module.
 
@@ -176,6 +185,7 @@ mod operations;
 mod semantics;
 mod types;
 mod values;
+mod views;
 
 pub use analysis::{
     ReferenceAccess, ReferenceAliasEdge, ReferenceAnalysis, ReferenceAnalysisError, ReferenceRegionInputBinding,
@@ -202,10 +212,14 @@ pub use semantics::{
 };
 pub use types::{ReferenceType, ReferenceTypeRefinements};
 pub use values::{
-    PreparedReferenceReplacement, ReadyOrPendingReferenceGuard, ReadyReferenceGuard, Reference, ReferenceCompletion,
-    ReferenceCompletionBackend, ReferenceGeneration, ReferenceId, ReferenceObservation,
-    ReferenceReplacementPreparation, ReferenceReplacementTransaction, TakenReferenceGuard,
-    ValidatedPendingReplacementTransaction,
+    PreparedReferenceReplacement, ReadyOrPendingReferenceGuard, ReadyReferenceGuard, Reference, ReferenceBoundaryError,
+    ReferenceBoundaryPosition, ReferenceCompletion, ReferenceCompletionBackend, ReferenceGeneration, ReferenceId,
+    ReferenceObservation, ReferenceReplacementPreparation, ReferenceReplacementTransaction, TakenReferenceGuard,
+    ValidatedPendingReplacementTransaction, validate_reference_boundary,
+};
+pub use views::{
+    ReferenceViewAnalysis, ReferenceViewAnalysisError, ReferenceViewOperation, ReferenceViewPath,
+    ReferenceViewValidationError,
 };
 
 #[cfg(test)]

@@ -39,8 +39,8 @@ use crate::programs::{
     ReferenceAliasKind, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
     ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
     ReferenceNewOperation, ReferenceOperationSemantics, ReferenceOutput, ReferenceRead, ReferenceReadOperation,
-    ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation, RegionInterface,
-    TypeError, Typed, Value, ValueProjection,
+    ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceViewValidationError, ReferenceWrite,
+    ReferenceWriteOperation, RegionInterface, TypeError, Typed, Value, ValueProjection,
 };
 
 /// Canonical operation name for [`ReferenceIndexOperation`].
@@ -406,6 +406,68 @@ macro_rules! impl_unsupported_reference_view_transforms {
 
 impl_unsupported_reference_view_transforms!(ReferenceIndexOperation);
 impl_unsupported_reference_view_transforms!(ReferenceSliceOperation);
+
+/// Validates one [`ArrayReferenceViewTransform`] as a step from the reference type `source` to the reference type
+/// `output`. This is the array family's
+/// [`ReferenceViewOperation::validate_view`](crate::programs::ReferenceViewOperation::validate_view) rule, shared by
+/// every operation family that embeds the array view operations: the transform's
+/// [`output_type`](ArrayReferenceViewTransform::output_type) must be defined for the source referent and must equal
+/// the output referent exactly.
+///
+/// # Errors
+///
+/// Returns [`ReferenceViewValidationError::InvalidComposition`] when either type is not a reference type or the
+/// transform cannot be applied to the source referent, and [`ReferenceViewValidationError::TypeMismatch`] when the
+/// derived referent differs from the declared one.
+pub fn validate_array_reference_view(
+    view: &ArrayReferenceViewTransform,
+    source: &ArrayIrType,
+    output: &ArrayIrType,
+) -> Result<(), ReferenceViewValidationError> {
+    let invalid = |error: TypeError| ReferenceViewValidationError::InvalidComposition { message: error.to_string() };
+    let source = <&ReferenceType<ArrayType>>::try_from(source).map_err(invalid)?;
+    let output = <&ReferenceType<ArrayType>>::try_from(output).map_err(invalid)?;
+    let expected = view.output_type(source.referent()).map_err(invalid)?;
+    if expected != *output.referent() {
+        return Err(ReferenceViewValidationError::TypeMismatch {
+            expected: expected.to_string(),
+            actual: output.referent().to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Stages one [`ArrayReferenceViewTransform`] over the reference `source` through `context` and returns the derived
+/// reference. This is the array family's
+/// [`ReferenceViewOperation::reapply_view`](crate::programs::ReferenceViewOperation::reapply_view) rule, shared by
+/// every operation family that embeds the array view operations: an [`Index`](ArrayReferenceViewTransform::Index)
+/// transform stages a [`ReferenceIndexOperation`] and a [`Slice`](ArrayReferenceViewTransform::Slice) transform
+/// stages a [`ReferenceSliceOperation`], through the same conversions the eager array reference views use.
+///
+/// # Errors
+///
+/// Propagates the staging error of `context`, and returns [`ProgramError::InvalidOutputCount`] when the staged view
+/// does not produce exactly one value.
+pub fn reapply_array_reference_view<C>(
+    context: &C,
+    view: &ArrayReferenceViewTransform,
+    source: C::Value,
+) -> Result<C::Value, ProgramError>
+where
+    C: Context<Type = ArrayIrType>,
+    C::Operation: From<ReferenceIndexOperation> + From<ReferenceSliceOperation>,
+{
+    let mut outputs = match view {
+        ArrayReferenceViewTransform::Index { axis, index } => {
+            context.bind(ReferenceIndexOperation::new(*axis, *index), Vec::new(), std::slice::from_ref(&source))?
+        }
+        ArrayReferenceViewTransform::Slice { axes } => {
+            context.bind(ReferenceSliceOperation::new(axes.clone()), Vec::new(), std::slice::from_ref(&source))?
+        }
+    };
+    check_count!("output", outputs, 1, ProgramError);
+    Ok(outputs.remove(0))
+}
 
 impl<V: Value<Type = ArrayIrType>> ReferenceNew<V> for V
 where

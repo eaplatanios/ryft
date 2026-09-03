@@ -25,6 +25,7 @@ use crate::programs::{
     Atom, AtomId, BindingRegionDriver, Effect, EmptyRegionDriver, MaybeZero, Operation, OperationProjection, Program,
     ProgramBuilder, ProgramError, ProjectedValue, Provenance, ProvenanceScope, Region, RegionDriver, RegionRef,
     RegionReplayMappings, ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
+    validate_reference_boundary,
 };
 use crate::tracing::{Tracer, TracerState, TracingContext};
 
@@ -1936,6 +1937,8 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
             .into());
         }
 
+        validate_reference_boundary(primal.parameters(), capture.parameters()).map_err(ProgramError::from)?;
+
         // Active inputs receive the caller-provided tangents. Captures share the same transform context but receive
         // only structural zero tangents, so they affect primal evaluation without affecting differentiation.
         let context = DifferentiationContext::new(self.clone());
@@ -2013,6 +2016,8 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
         if primal.parameters().next().is_none() {
             return Err(DifferentiationError::EmptyInput);
         }
+
+        validate_reference_boundary(primal.parameters(), capture.parameters()).map_err(ProgramError::from)?;
 
         let input_structure = primal.parameter_structure();
         let input_values = primal.into_parameters().collect::<Vec<_>>();
@@ -2377,8 +2382,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
-        DimensionBounds, DimensionVariable, Shape,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType,
+        Dimension, DimensionBounds, DimensionVariable, Shape,
     };
     use crate::contexts::tests::{
         ProjectedMemberOperation, ProjectedMemberType, ProjectedMemberValue, ProjectedProgramOperation,
@@ -3617,5 +3622,51 @@ mod tests {
         let (primal, tangent) = output.into_parts();
         assert_eq!(primal, ProjectedProgramValue::Third(ProjectedMemberValue::<2>(11)));
         assert!(matches!(tangent, MaybeZero::Zero(ProjectedProgramType::Third(ProjectedMemberType::<2>)),));
+    }
+
+    #[test]
+    fn test_forward_mode_differentiate_jvp_rejects_aliased_reference_inputs() {
+        // The canonical boundary validator runs on the concrete inputs before any tracer exists, so the same allocation
+        // at two input positions is rejected before the differentiation context could observe it.
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
+        let error = differentiate_at((reference.clone(), reference.clone()))
+            .jvp((reference.clone(), reference), |(first, _): (_, _)| Ok(first))
+            .unwrap_err();
+        assert_eq!(
+            error,
+            DifferentiationError::Program(ProgramError::InvalidArgument {
+                message: "input 1 and input 0 bind the same reference allocation".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_forward_mode_differentiate_jvp_rejects_a_reference_that_is_both_captured_and_passed() {
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
+        let error = differentiate_at(reference.clone())
+            .with_captures(reference.clone())
+            .jvp(reference, |input, _| Ok(input))
+            .unwrap_err();
+        assert_eq!(
+            error,
+            DifferentiationError::Program(ProgramError::InvalidArgument {
+                message: "capture 0 and input 0 bind the same reference allocation".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_forward_mode_differentiate_linearize_rejects_aliased_reference_inputs() {
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
+        let error = differentiate_at((reference.clone(), reference))
+            .linearize(|(first, _): (_, _)| Ok(first))
+            .err()
+            .unwrap();
+        assert_eq!(
+            error,
+            DifferentiationError::Program(ProgramError::InvalidArgument {
+                message: "input 1 and input 0 bind the same reference allocation".to_string(),
+            }),
+        );
     }
 }

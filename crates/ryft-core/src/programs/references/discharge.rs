@@ -114,9 +114,10 @@
 //! Discharge is currently the only route from reference state into the generic transforms: differentiation,
 //! batching, partial evaluation, etc. reject a program that still contains references, and callers discharge first.
 //! Reference-typed carries and outputs of structured operations are supported when the operation states their identity,
-//! partial discharge may preserve internal allocations, and a `while` operation condition may not mutate references.
-//! Dynamic, gathered, or strided views, uninitialized references, and running transforms directly over references are
-//! not supported.
+//! partial discharge may preserve internal allocations, and a `while` operation whose condition mutates references is
+//! rotated into "do-while form" (i.e., the condition runs once before the loop and again at the tail of the body)
+//! unless the loop declares an iteration bound. Dynamic, gathered, or strided views, uninitialized references, and
+//! running transforms directly over references are not supported.
 //!
 //! # End-to-End Flow
 //!
@@ -1415,7 +1416,7 @@ impl ReferenceDischargeRegionSummary {
         region_index: usize,
         region: RegionRef<'_, V, O>,
         inputs: &[Option<ReferenceDischargeAllocationId>],
-        captures: &ReferenceDischargeCaptureScope<V>,
+        captures: &ReferenceDischargeCaptureScope,
     ) -> Result<Self, ProgramError> {
         check_count!("input", inputs, region.input_ids().len(), ProgramError);
         let captures =
@@ -2437,7 +2438,7 @@ pub struct ReferenceDischargeContext<C: Domain, P: ReferenceDischargePolicy<C>> 
     environment: Rc<RefCell<ReferenceDischargeEnvironment<P::Referent, C::Value>>>,
 
     /// Refer to the documentation of [`Self::captures`].
-    captures: ReferenceDischargeCaptureScope<C::Constant>,
+    captures: ReferenceDischargeCaptureScope,
 
     /// Refer to the documentation of [`Self::targets`].
     targets: ReferenceDischargeTargets,
@@ -2475,7 +2476,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     /// sharing its [`ReferenceDischargeEnvironment`]. An isolated region rebuild reaches its own scope this way because
     /// the temporary environment creates the allocations that scope binds only after its boundary is threaded.
     #[inline]
-    pub fn with_captures(&self, captures: ReferenceDischargeCaptureScope<C::Constant>) -> Self
+    pub fn with_captures(&self, captures: ReferenceDischargeCaptureScope) -> Self
     where
         C: Clone,
     {
@@ -2495,7 +2496,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     /// Returns the [`ReferenceDischargeCaptureScope`] that this context discharges under, which binds the allocations
     /// named by the capture prefix of its scope. A region that inherits its parent's capture prefix discharges under
     /// the same scope, while a region rebuilt in isolation reconstructs the scope from its temporary environment.
-    pub const fn captures(&self) -> &ReferenceDischargeCaptureScope<C::Constant> {
+    pub const fn captures(&self) -> &ReferenceDischargeCaptureScope {
         &self.captures
     }
 
@@ -3537,36 +3538,28 @@ enum ReferenceDischargeAllocationState<V> {
 /// every region boundary (inherited by default, and replaced by a fresh prefix wherever an operation declares one
 /// through [`Operation::region_capture_input_count`]).
 ///
-/// Recognizing a capture is a _constant-family_ question, and the interpreter deliberately serves families that are
-/// not capture-bearing at all, so the resolver is a function pointer supplied by the entry point that knows the family
-/// rather than a [`CaptureConstant`] bound on the whole architecture. The [`Default`] scope recognizes nothing and
-/// binds nothing, which is exactly the behavior of a program that has no captures.
-pub struct ReferenceDischargeCaptureScope<Constant> {
-    /// Function that returns the capture index/position that a constant names, or [`None`] when it is a non-reference
-    /// constant of its family.
-    capture_index_of: fn(&Constant) -> Option<usize>,
-
+/// Recognizing a capture is a _constant-family_ question answered by [`Value::capture_index`], so the scope itself only
+/// records which allocation each capture position binds. The [`Default`] scope binds nothing, which is exactly the
+/// behavior of a program that has no captures.
+#[derive(Clone, Debug)]
+pub struct ReferenceDischargeCaptureScope {
     /// Refer to the documentation of [`Self::allocations`].
     allocations: Rc<[Option<ReferenceDischargeAllocationId>]>,
 }
 
-impl<Constant> ReferenceDischargeCaptureScope<Constant> {
+impl ReferenceDischargeCaptureScope {
     /// Creates a new [`ReferenceDischargeCaptureScope`].
     #[inline]
-    pub fn new(
-        capture_index_of: fn(&Constant) -> Option<usize>,
-        allocations: Vec<Option<ReferenceDischargeAllocationId>>,
-    ) -> Self {
-        Self { capture_index_of, allocations: allocations.into() }
+    pub fn new(allocations: Vec<Option<ReferenceDischargeAllocationId>>) -> Self {
+        Self { allocations: allocations.into() }
     }
 
-    /// Returns a clone of this [`ReferenceDischargeCaptureScope`] with the same capture index resolver but over a
-    /// different set of bound allocations. This is how a nested [`Region`](crate::Region)'s scope and an isolated
-    /// rebuild's remapped [`ReferenceDischargeCaptureScope`] are built without restating the constant family's
-    /// recognition rule.
+    /// Returns a [`ReferenceDischargeCaptureScope`] over a different set of bound allocations. This is how a nested
+    /// [`Region`](crate::Region)'s scope and an isolated rebuild's remapped [`ReferenceDischargeCaptureScope`] are
+    /// built.
     #[inline]
     pub fn with_allocations(&self, allocations: Vec<Option<ReferenceDischargeAllocationId>>) -> Self {
-        Self { capture_index_of: self.capture_index_of, allocations: allocations.into() }
+        Self { allocations: allocations.into() }
     }
 
     /// Returns the [`ReferenceDischargeCaptureScope`] to use when discharging a nested [`Region`](crate::Region). When
@@ -3619,32 +3612,15 @@ impl<Constant> ReferenceDischargeCaptureScope<Constant> {
     /// resolve is a non-reference constant of its family, and a reference-typed one that no scope resolves is rejected
     /// where it is lifted.
     #[inline]
-    pub fn resolve(&self, constant: &Constant) -> Option<ReferenceDischargeAllocationId> {
-        (self.capture_index_of)(constant).and_then(|index| self.allocations.get(index).copied().flatten())
+    pub fn resolve<Constant: Value>(&self, constant: &Constant) -> Option<ReferenceDischargeAllocationId> {
+        constant.capture_index().and_then(|index| self.allocations.get(index).copied().flatten())
     }
 }
 
-impl<Constant> Default for ReferenceDischargeCaptureScope<Constant> {
+impl Default for ReferenceDischargeCaptureScope {
     #[inline]
     fn default() -> Self {
-        Self { capture_index_of: |_| None, allocations: Rc::from([]) }
-    }
-}
-
-impl<Constant> Clone for ReferenceDischargeCaptureScope<Constant> {
-    #[inline]
-    fn clone(&self) -> Self {
-        Self { capture_index_of: self.capture_index_of, allocations: Rc::clone(&self.allocations) }
-    }
-}
-
-impl<Constant> Debug for ReferenceDischargeCaptureScope<Constant> {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("ReferenceDischargeCaptureScope")
-            .field("allocations", &self.allocations)
-            .finish_non_exhaustive()
+        Self { allocations: Rc::from([]) }
     }
 }
 
@@ -3690,11 +3666,9 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
         O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
         for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
     {
-        ReferenceDischargeResult::try_from(self.discharge_references_helper::<P>(
-            capture_count,
-            |_| None,
-            ReferenceDischargeTargets::everything(),
-        )?)
+        ReferenceDischargeResult::try_from(
+            self.discharge_references_helper::<P>(capture_count, ReferenceDischargeTargets::everything())?,
+        )
     }
 
     /// Rewrites every [`Reference`](crate::Reference) in a capture-lifted [`Program`] as explicit immutable state and
@@ -3729,11 +3703,9 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
         O: ReferenceDischargeableOperation<TracingContext<V, O>, P>,
         for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
     {
-        ReferenceDischargeResult::try_from(self.discharge_references_helper::<P>(
-            capture_count,
-            CaptureConstant::capture_index,
-            ReferenceDischargeTargets::everything(),
-        )?)
+        ReferenceDischargeResult::try_from(
+            self.discharge_references_helper::<P>(capture_count, ReferenceDischargeTargets::everything())?,
+        )
     }
 
     /// Rewrites the selected/targeted [`Reference`](crate::Reference)s as explicit immutable state while preserving
@@ -3782,7 +3754,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
         for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
     {
         let targets = ReferenceDischargeTargets::from_targets(&self, capture_count, targets)?;
-        self.discharge_references_helper::<P>(capture_count, |_| None, targets)
+        self.discharge_references_helper::<P>(capture_count, targets)
     }
 
     /// Rewrites the selected/targeted [`Reference`](crate::Reference)s of a capture-lifted [`Program`] as explicit
@@ -3818,19 +3790,17 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
         for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t V::Type>,
     {
         let targets = ReferenceDischargeTargets::from_targets(&self, capture_count, targets)?;
-        self.discharge_references_helper::<P>(capture_count, CaptureConstant::capture_index, targets)
+        self.discharge_references_helper::<P>(capture_count, targets)
     }
 
-    /// Performs the shared partial-discharge rewrite for one validated target selection. `capture_index_of` resolves
-    /// reference-typed capture constants when the input is capture-lifted; programs without lifted captures provide a
-    /// resolver that matches no constant. The function always returns a [`PartialReferenceDischargeResult`].
-    /// Full-discharge entry points select every reference and then validate the result through
-    /// [`ReferenceDischargeResult::try_from`].
+    /// Performs the shared partial-discharge rewrite for one validated target selection. Reference-typed capture
+    /// constants of a capture-lifted input are resolved through [`Value::capture_index`]. The function always returns
+    /// a [`PartialReferenceDischargeResult`]. Full-discharge entry points select every reference and then validate the
+    /// result through [`ReferenceDischargeResult::try_from`].
     ///
     /// # Parameters
     ///
     ///   - `capture_count`: Number of leading inputs that originated in the source program's capture table.
-    ///   - `capture_index_of`: Function returning the capture position named by a stored constant.
     ///   - `targets`: Reference targets to discharge; every allocation they omit is preserved.
     ///
     /// # Errors
@@ -3839,7 +3809,6 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
     fn discharge_references_helper<P: ReferenceDischargePolicy<TracingContext<V, O>>>(
         self,
         capture_count: usize,
-        capture_index_of: fn(&V) -> Option<usize>,
         targets: ReferenceDischargeTargets,
     ) -> Result<PartialReferenceDischargeResult<V, O>, ProgramError>
     where
@@ -3905,8 +3874,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
             // The capture scope can only be established once the prefix has bound its allocations, and it is what lets
             // a nested region resolve the caller references it names through capture constants rather than through its
             // own boundary.
-            let context =
-                context.with_captures(ReferenceDischargeCaptureScope::new(capture_index_of, capture_allocations));
+            let context = context.with_captures(ReferenceDischargeCaptureScope::new(capture_allocations));
 
             let regions = [self];
             let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
@@ -3917,7 +3885,8 @@ impl<V: Value, O: Operation<Type = V::Type>> Program<V, O, Vec<V>, Vec<V>> {
         };
 
         let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-        let program = builder.build(output_ids, vec![Placeholder; input_count], vec![Placeholder; output_ids.len()])?;
+        let output_placeholders = vec![Placeholder; output_ids.len()];
+        let program = builder.build(output_ids, vec![Placeholder; input_count], output_placeholders)?;
         PartialReferenceDischargeResult::new(program, capture_count, output_count, external_reference_bindings)
     }
 
@@ -4446,6 +4415,17 @@ mod tests {
         fn execution_domain(&self) -> Self::ExecutionDomain {
             EagerContext::new()
         }
+
+        fn capture_index(&self) -> Option<usize> {
+            // Capture seam for the prototype universe, which has no capture constants of its own: a reference-typed
+            // constant names the capture position given by its referent length. The seam is the only universe-specific
+            // part of capture resolution, so supplying one here exercises every branch of it without inventing a second
+            // constant family.
+            match self {
+                Self::Reference(r#type) => Some(r#type.referent().length),
+                Self::List(_) => None,
+            }
+        }
     }
 
     impl Add for ListIrValue {
@@ -4920,16 +4900,6 @@ mod tests {
             })
             .collect::<Vec<_>>();
         builder.build(outputs, vec![Placeholder; input_count], vec![Placeholder; output_count]).unwrap()
-    }
-
-    /// Capture seam for the prototype universe, which has no capture constants of its own: a reference-typed constant
-    /// names the capture position given by its referent length. The seam is the only universe-specific part of capture
-    /// resolution, so supplying one here exercises every branch of it without inventing a second constant family.
-    fn list_capture_position(constant: &ListIrValue) -> Option<usize> {
-        match constant {
-            ListIrValue::Reference(r#type) => Some(r#type.referent().length),
-            ListIrValue::List(_) => None,
-        }
     }
 
     /// Capture-constant family used by the capture-aware transform tests.
@@ -6113,7 +6083,7 @@ mod tests {
         let reads = builder
             .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![observed], Vec::<Placeholder>::new(), vec![Placeholder])
             .unwrap();
-        let scope = ReferenceDischargeCaptureScope::<ListIrValue>::default();
+        let scope = ReferenceDischargeCaptureScope::default();
         assert_eq!(
             ReferenceDischargeRegionSummary::new(&ListOperation::Call, 0, reads.entry_region_ref(), &[], &scope),
             Err(ProgramError::MalformedProgram(format!(
@@ -6169,10 +6139,7 @@ mod tests {
                 .unwrap(),
         );
         let allocation = allocated.try_as_reference("the captured allocation").unwrap().allocation_id();
-        let context = context.with_captures(ReferenceDischargeCaptureScope::new(
-            list_capture_position,
-            vec![None, None, Some(allocation)],
-        ));
+        let context = context.with_captures(ReferenceDischargeCaptureScope::new(vec![None, None, Some(allocation)]));
 
         // The enclosing policy accepts writes only. Capture reachability still sizes the boundary, while the exact
         // access summary remains empty because neither closure semantically accesses the allocation.
@@ -6230,10 +6197,11 @@ mod tests {
         );
         let preserved_allocation =
             preserved.try_as_reference("the preserved captured allocation").unwrap().allocation_id();
-        let preserved_context = preserved_context.with_captures(ReferenceDischargeCaptureScope::new(
-            list_capture_position,
-            vec![None, None, Some(preserved_allocation)],
-        ));
+        let preserved_context = preserved_context.with_captures(ReferenceDischargeCaptureScope::new(vec![
+            None,
+            None,
+            Some(preserved_allocation),
+        ]));
         let preserved_summary = ReferenceDischargeRegionSummary::new(
             &SingleModeRegionOperation(ReferenceAccessMode::Write),
             0,
@@ -6492,10 +6460,7 @@ mod tests {
                 .unwrap(),
         );
         let allocation = allocated.try_as_reference("the captured allocation").unwrap().allocation_id();
-        let context = context.with_captures(ReferenceDischargeCaptureScope::new(
-            list_capture_position,
-            vec![None, None, Some(allocation)],
-        ));
+        let context = context.with_captures(ReferenceDischargeCaptureScope::new(vec![None, None, Some(allocation)]));
 
         // The summary reports the capture-scoped access in caller-allocation terms, which is what sizes the boundary.
         let summary = context.region_summary(&ListOperation::Call, 0, program.entry_region_ref(), &[]).unwrap();
@@ -7591,10 +7556,7 @@ mod tests {
             context.bind_discharged(pair.clone(), ListIrValue::List(vec![1, 2])).unwrap(),
         );
         let allocation = allocated.try_as_reference("the captured allocation").unwrap().allocation_id();
-        let scoped = context.with_captures(ReferenceDischargeCaptureScope::new(
-            list_capture_position,
-            vec![None, None, Some(allocation)],
-        ));
+        let scoped = context.with_captures(ReferenceDischargeCaptureScope::new(vec![None, None, Some(allocation)]));
 
         let lifted = scoped.lift(ListIrValue::Reference(pair.clone())).unwrap();
         let reference = lifted.try_as_reference("the resolved capture").unwrap();
@@ -7775,11 +7737,11 @@ mod tests {
         );
         let allocation = allocated.try_as_reference("the captured allocation").unwrap().allocation_id();
 
-        let empty = ReferenceDischargeCaptureScope::<ListIrValue>::default();
+        let empty = ReferenceDischargeCaptureScope::default();
         assert_eq!(empty.allocations(), &[]);
         assert_eq!(empty.resolve(&ListIrValue::Reference(ReferenceType::new(ListType { length: 2 }))), None);
 
-        let scope = ReferenceDischargeCaptureScope::new(list_capture_position, vec![None, None, Some(allocation)]);
+        let scope = ReferenceDischargeCaptureScope::new(vec![None, None, Some(allocation)]);
         assert_eq!(scope.allocations(), &[None, None, Some(allocation)]);
         assert_eq!(
             scope.resolve(&ListIrValue::Reference(ReferenceType::new(ListType { length: 2 }))),
@@ -7810,7 +7772,7 @@ mod tests {
             .bind_discharged(ReferenceType::new(ListType { length: 3 }), ListIrValue::List(vec![1, 2, 3]))
             .unwrap()
             .allocation_id();
-        let scope = ReferenceDischargeCaptureScope::new(list_capture_position, vec![Some(first)]);
+        let scope = ReferenceDischargeCaptureScope::new(vec![Some(first)]);
         let region = RegionId::new(7);
 
         // A region without its own capture prefix inherits the scope unchanged, while a declared prefix rebinds the
@@ -7838,10 +7800,10 @@ mod tests {
             .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
             .unwrap()
             .allocation_id();
-        let scope = ReferenceDischargeCaptureScope::new(list_capture_position, vec![None, Some(allocation)]);
+        let scope = ReferenceDischargeCaptureScope::new(vec![None, Some(allocation)]);
         assert_eq!(
             format!("{scope:?}"),
-            format!("ReferenceDischargeCaptureScope {{ allocations: [None, Some({allocation:?})], .. }}"),
+            format!("ReferenceDischargeCaptureScope {{ allocations: [None, Some({allocation:?})] }}"),
         );
     }
 
@@ -8461,10 +8423,7 @@ mod tests {
                 .unwrap(),
         );
         let allocation = allocated.try_as_reference("the capture-scoped allocation").unwrap().allocation_id();
-        let context = context.with_captures(ReferenceDischargeCaptureScope::new(
-            list_capture_position,
-            vec![None, None, Some(allocation)],
-        ));
+        let context = context.with_captures(ReferenceDischargeCaptureScope::new(vec![None, None, Some(allocation)]));
         let regions = [program];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
 
@@ -8493,10 +8452,7 @@ mod tests {
             context.bind_preserved(reference_type, destination_reference.clone()).unwrap(),
         );
         let allocation = preserved.try_as_reference("the preserved capture-scoped allocation").unwrap().allocation_id();
-        let context = context.with_captures(ReferenceDischargeCaptureScope::new(
-            list_capture_position,
-            vec![None, None, Some(allocation)],
-        ));
+        let context = context.with_captures(ReferenceDischargeCaptureScope::new(vec![None, None, Some(allocation)]));
         let regions = [program];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
 

@@ -151,7 +151,10 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
     /// construction could otherwise record the misuse and surface it only much later). Replay and rebuild paths that
     /// re-append instructions already accepted once use [`add_instruction_unchecked`](Self::add_instruction_unchecked)
     /// instead, which is also the hatch for tests that deliberately construct malformed programs for testing validation
-    /// checks.
+    /// checks. This validation is structural. It sees atoms and declared reference semantics, never live values, so it
+    /// cannot detect two inputs or captures bound to the same runtime allocation. That runtime aliasing is rejected by
+    /// [`validate_reference_boundary`](crate::validate_reference_boundary) at the public transform boundaries that bind
+    /// concrete values.
     ///
     /// The recorded [`Instruction`] carries the provided non-semantic [`Provenance`], with [`None`] recording
     /// unknown provenance.

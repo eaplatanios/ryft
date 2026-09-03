@@ -5910,6 +5910,26 @@ mod tests {
     }
 
     #[test]
+    fn test_batch_rejects_aliased_reference_inputs() {
+        // The canonical boundary validator runs before the batching policy packs the inputs, so aliasing is reported
+        // ahead of the policy's own reference rejection.
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
+        let result: Result<ArrayIrValue<Array>, BatchingError> = batch(
+            |(first, _): (_, _)| Ok(first),
+            (reference.clone(), reference),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            None,
+        );
+        assert_eq!(
+            result,
+            Err(BatchingError::Program(ProgramError::InvalidArgument {
+                message: "input 1 and input 0 bind the same reference allocation".to_string(),
+            })),
+        );
+    }
+
+    #[test]
     fn test_array_ir_materialize_output_rejects_replicated_reference() -> Result<(), ProgramError> {
         type Parent = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 

@@ -16,8 +16,8 @@ use crate::arrays::types::dimensions::{Dimension, Shape};
 use crate::operations::{Add, Reshape, Slice, UpdateSlice};
 use crate::parameters::Parameter;
 use crate::programs::{
-    ProgramError, ReadyOrPendingReferenceGuard, Reference, ReferenceError, ReferenceId, ReferenceType, Type, TypeError,
-    TypeIdentityRenaming, Typed, Value,
+    ProgramError, ReadyOrPendingReferenceGuard, Reference, ReferenceError, ReferenceId, ReferenceType,
+    ReferenceViewPath, Type, TypeError, TypeIdentityRenaming, Typed, Value,
 };
 
 /// Error produced by an invalid eager array-reference view operation.
@@ -244,59 +244,44 @@ impl ArrayReferenceViewTransform {
     }
 }
 
-/// Immutable coordinate mapping between a shared array-reference root and one derived handle.
+/// Immutable coordinate mapping between a shared array-reference root and one derived handle: the array
+/// specialization of the generic [`ReferenceViewPath`], whose descriptions are [`ArrayReferenceViewTransform`]s.
 ///
-/// The mapping stores validated [`ArrayReferenceViewTransform`] values in root-to-handle order. The empty mapping is
-/// the identity view and denotes the complete root. Each additional transform is applied to the preceding view, so
+/// The mapping stores validated transforms in root-to-handle order. The empty mapping ([`root`](Self::root)) is the
+/// identity view and denotes the complete root. Each additional transform is applied to the preceding view, so
 /// indexing or slicing an already-derived [`ArrayReference`] composes onto the same shared root rather than creating
 /// another mutable resource.
 ///
 /// This type is structural metadata only: it owns neither the referenced array nor its resource identity, liveness,
-/// or synchronization state. [`ArrayReference`] pairs it with a handle to the shared reference allocation. The view
-/// determines that handle's referent type and selected coordinates; mutations reconstruct the root by applying the
-/// inverse update of each transform in reverse order. Consequently, overlapping handles may select the same root
-/// coordinates and observe one another's ordered mutations, while equality and hashing distinguish different
-/// transform sequences.
+/// or synchronization state. [`ArrayReference`] pairs it with a handle to the shared reference allocation, and the
+/// array view overlay ([`ArrayReferenceAnalysis`](crate::ArrayReferenceAnalysis)) records one per reference-typed
+/// program value. The view determines that handle's referent type and selected coordinates; mutations reconstruct
+/// the root by applying the inverse update of each transform in reverse order. Consequently, overlapping handles may
+/// select the same root coordinates and observe one another's ordered mutations, while equality and hashing
+/// distinguish different transform sequences.
 ///
 /// Views currently support composed static indexing and static unit-stride slicing. Derived views cannot themselves
 /// cross attached-region or external runtime state boundaries: pass the root handle across the boundary and recreate
 /// the view within the destination scope.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, Parameter)]
-pub struct ArrayReferenceView {
-    /// Validated transforms applied from the root outward.
-    transforms: Vec<ArrayReferenceViewTransform>,
-}
+pub type ArrayReferenceView = ReferenceViewPath<ArrayReferenceViewTransform>;
 
 impl ArrayReferenceView {
-    /// Returns an identity view of a root reference.
-    pub const fn root() -> Self {
-        Self { transforms: Vec::new() }
-    }
-
     /// Returns the ordered transforms applied from the root outward.
     #[inline]
     pub fn transforms(&self) -> &[ArrayReferenceViewTransform] {
-        self.transforms.as_slice()
-    }
-
-    /// Returns whether this mapping denotes the complete root.
-    #[inline]
-    pub fn is_root(&self) -> bool {
-        self.transforms.is_empty()
+        self.views()
     }
 
     /// Returns the exact view type derived from `root_type`.
     pub fn output_type(&self, root_type: &ArrayType) -> Result<ArrayType, TypeError> {
-        self.transforms
+        self.transforms()
             .iter()
             .try_fold(root_type.clone(), |r#type, transform| transform.output_type(&r#type))
     }
 
     /// Appends a transform whose local input/output types were already validated by the caller.
     pub(crate) fn with_transform_unchecked(&self, transform: ArrayReferenceViewTransform) -> Self {
-        let mut transforms = self.transforms.clone();
-        transforms.push(transform);
-        Self { transforms }
+        self.with_view(transform)
     }
 
     /// Applies the complete mapping to one root snapshot.
@@ -305,7 +290,7 @@ impl ArrayReferenceView {
         A: Value<Type = ArrayType> + Reshape + Slice,
     {
         let mut carrier = EagerViewCarrier(PhantomData);
-        self.transforms
+        self.transforms()
             .iter()
             .try_fold(root.clone(), |value, transform| transform.apply_in(&mut carrier, &value))
     }
@@ -327,9 +312,9 @@ impl ArrayReferenceView {
         carrier: &mut C,
         root: C::Value,
     ) -> Result<Vec<C::Value>, ProgramError> {
-        let mut intermediates = Vec::with_capacity(self.transforms.len() + 1);
+        let mut intermediates = Vec::with_capacity(self.transforms().len() + 1);
         intermediates.push(root);
-        for transform in &self.transforms {
+        for transform in self.transforms() {
             let child = transform.apply_in(carrier, intermediates.last().unwrap())?;
             intermediates.push(child);
         }
@@ -343,16 +328,17 @@ impl ArrayReferenceView {
         intermediates: &[C::Value],
         replacement: C::Value,
     ) -> Result<C::Value, ProgramError> {
-        if intermediates.len() != self.transforms.len() {
+        let transforms = self.transforms();
+        if intermediates.len() != transforms.len() {
             return Err(ProgramError::MalformedProgram(format!(
                 "reference view reconstruction requires {} parent snapshots but received {}",
-                self.transforms.len(),
+                transforms.len(),
                 intermediates.len(),
             )));
         }
         let mut reconstructed = replacement;
-        for transform_index in (0..self.transforms.len()).rev() {
-            reconstructed = self.transforms[transform_index].replace_in(
+        for transform_index in (0..transforms.len()).rev() {
+            reconstructed = transforms[transform_index].replace_in(
                 carrier,
                 &intermediates[transform_index],
                 &reconstructed,
@@ -374,7 +360,7 @@ impl ArrayReferenceView {
         // The traversal always pushes the root itself first, so the chain is never empty and its last snapshot is
         // the value this view selects.
         let previous = intermediates.last().unwrap().clone();
-        let reconstructed = self.reconstruct_in(carrier, &intermediates[..self.transforms.len()], replacement)?;
+        let reconstructed = self.reconstruct_in(carrier, &intermediates[..self.transforms().len()], replacement)?;
         Ok((previous, reconstructed))
     }
 
@@ -389,12 +375,13 @@ impl ArrayReferenceView {
         root: C::Value,
         replacement: C::Value,
     ) -> Result<C::Value, ProgramError> {
-        if self.transforms.is_empty() {
+        let transforms = self.transforms();
+        if transforms.is_empty() {
             return Ok(replacement);
         }
-        let mut intermediates = Vec::with_capacity(self.transforms.len());
+        let mut intermediates = Vec::with_capacity(transforms.len());
         intermediates.push(root);
-        for transform in &self.transforms[..self.transforms.len() - 1] {
+        for transform in &transforms[..transforms.len() - 1] {
             let child = transform.apply_in(carrier, intermediates.last().unwrap())?;
             intermediates.push(child);
         }

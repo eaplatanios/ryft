@@ -14,6 +14,7 @@ use crate::programs::ProgramError;
 use crate::programs::atoms::AtomId;
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::operations::{Operation, OperationProjection};
+use crate::programs::references::ReferenceId;
 use crate::programs::regions::{RegionId, RegionRef};
 use crate::programs::types::{Type, TypeError, Typed};
 use crate::tracing::Tracer;
@@ -174,6 +175,29 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
     ) -> Result<(), ProgramError> {
         let _ = region;
         Ok(())
+    }
+
+    /// Returns the capture-table position that this value names when it is a compact reference to a runtime value in
+    /// the surrounding capture table (e.g., a [`CaptureReference`]), or [`None`] for every other value, including
+    /// immediate constants that carry their own data. This is the one canonical capture query: capture validation,
+    /// dead-capture elimination, capture lifting, reference discharge, and reference analysis all resolve captures
+    /// through it, so a constant family that can name captures must override it, and families that cannot leave the
+    /// default, which returns [`None`].
+    #[inline]
+    fn capture_index(&self) -> Option<usize> {
+        None
+    }
+
+    /// Returns the process-local [`ReferenceId`] of the mutable reference allocation that this value is a live handle
+    /// to, or [`None`] when it is not a live reference handle. Runtime alias validation at public transform boundaries
+    /// uses this identity to detect one allocation arriving at two positions of a flattened signature, which
+    /// [`Type::is_reference`] cannot see because it identifies references structurally only. Exactly the concrete
+    /// runtime handles report an identity: a staged tracer reports [`None`] even when its type is a reference, and a
+    /// reference-typed value whose family does not override this function is rejected by that validation instead of
+    /// being silently accepted. The default returns [`None`].
+    #[inline]
+    fn reference_id(&self) -> Option<ReferenceId> {
+        None
     }
 }
 
@@ -434,6 +458,16 @@ where
     #[inline]
     fn execution_domain(&self) -> Self::ExecutionDomain {
         ProjectedContext::new(self.value.execution_domain())
+    }
+
+    #[inline]
+    fn capture_index(&self) -> Option<usize> {
+        self.value.capture_index()
+    }
+
+    #[inline]
+    fn reference_id(&self) -> Option<ReferenceId> {
+        self.value.reference_id()
     }
 }
 

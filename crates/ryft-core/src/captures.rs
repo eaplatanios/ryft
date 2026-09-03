@@ -150,6 +150,11 @@ impl<T: Type> Value for CaptureReference<T> {
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
         Ok(Self::new(self.index, self.r#type.rename_identities(renaming)?))
     }
+
+    #[inline]
+    fn capture_index(&self) -> Option<usize> {
+        Some(self.index)
+    }
 }
 
 impl<T: Type + From<P>, P: Type> ValueProjection<P> for CaptureReference<T>
@@ -188,29 +193,21 @@ where
 /// concrete data out of reusable staged intermediate representation) or an _immediate_ that carries its own host-sized
 /// data and therefore never participates in capture bookkeeping. Backends that stage host-sized payloads directly
 /// (e.g., a first-class dimension extent staged inside a manual `shard_map` region, where no capture table is
-/// reachable) model their constant family as a sum of the two and report [`None`] from
-/// [`capture_index`](Self::capture_index) for the immediate variants.
+/// reachable) model their constant family as a sum of the two and report [`None`] from [`Value::capture_index`] for
+/// the immediate variants.
 ///
-/// Capture validation, dead-capture elimination, and capture lifting are all expressed through this trait, and so
-/// extending a constant family with immediates preserves the capture-table invariant that [`ClosedProgram`] upholds.
-/// Every such family must be able to represent a plain capture reference, which is what
-/// [`CapturingContext::capture`] hands back when a trace registers a runtime value.
+/// Capture validation, dead-capture elimination, and capture lifting are all expressed through [`Value::capture_index`]
+/// together with this trait's renumbering function, and so extending a constant family to support both captured and
+/// directly stored values preserves the capture-table invariant that [`ClosedProgram`] upholds. Every such family must
+/// be able to represent a plain capture reference, which is what [`CapturingContext::capture`] hands back when a trace
+/// registers a runtime value.
 pub trait CaptureConstant: Value + From<CaptureReference<Self::Type>> {
-    /// Returns the capture-table index that this constant references, or [`None`] when it is an immediate payload
-    /// that carries its own data.
-    fn capture_index(&self) -> Option<usize>;
-
     /// Returns this constant with its capture-table index replaced by the result of applying `map` to it. Immediate
     /// payloads carry no index and are returned unchanged.
     fn map_capture_index<F: FnOnce(usize) -> usize>(&self, map: F) -> Self;
 }
 
 impl<T: Type> CaptureConstant for CaptureReference<T> {
-    #[inline]
-    fn capture_index(&self) -> Option<usize> {
-        Some(self.index)
-    }
-
     #[inline]
     fn map_capture_index<F: FnOnce(usize) -> usize>(&self, map: F) -> Self {
         Self::new(map(self.index), self.r#type.clone())
@@ -1116,6 +1113,13 @@ mod tests {
                     Self::Immediate(value) => Ok(Self::Immediate(value.rename_type_identities(renaming)?)),
                 }
             }
+
+            fn capture_index(&self) -> Option<usize> {
+                match self {
+                    Self::Captured(value) => Some(value.index()),
+                    Self::Immediate(_) => None,
+                }
+            }
         }
 
         impl From<CaptureReference<ArrayType>> for TestConstant {
@@ -1125,13 +1129,6 @@ mod tests {
         }
 
         impl CaptureConstant for TestConstant {
-            fn capture_index(&self) -> Option<usize> {
-                match self {
-                    Self::Captured(value) => Some(value.index()),
-                    Self::Immediate(_) => None,
-                }
-            }
-
             fn map_capture_index<F: FnOnce(usize) -> usize>(&self, map: F) -> Self {
                 match self {
                     Self::Captured(value) => Self::Captured(value.map_capture_index(map)),

@@ -1,7 +1,10 @@
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
+
+use thiserror::Error;
 
 use ryft_macros::Parameter;
 
@@ -1380,6 +1383,133 @@ impl<'g, V: Value> ValidatedPendingReplacementTransaction<'g, V> {
     }
 }
 
+/// Error produced by [`validate_reference_boundary`] when the live values bound at a public transform boundary alias
+/// one another or misreport their runtime reference identity.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum ReferenceBoundaryError {
+    /// A reference-typed value reports no [`ReferenceId`]. The validator fails closed here so that a value family
+    /// cannot bypass alias validation by leaving [`Value::reference_id`] at its default.
+    #[error("{position} has reference type `{type_name}` but reports no runtime reference identity")]
+    MissingIdentity {
+        /// Boundary position of the offending value.
+        position: ReferenceBoundaryPosition,
+
+        /// Rendered type of the offending value.
+        type_name: String,
+    },
+
+    /// A value whose type is not a reference reports a [`ReferenceId`].
+    #[error("{position} has non-reference type `{type_name}` but reports a runtime reference identity")]
+    UnexpectedIdentity {
+        /// Boundary position of the offending value.
+        position: ReferenceBoundaryPosition,
+
+        /// Rendered type of the offending value.
+        type_name: String,
+    },
+
+    /// Two boundary positions bind handles to the same reference allocation.
+    #[error("{position} and {other} bind the same reference allocation")]
+    Aliased {
+        /// Later of the two aliasing positions in boundary order.
+        position: ReferenceBoundaryPosition,
+
+        /// Earlier of the two aliasing positions in boundary order.
+        other: ReferenceBoundaryPosition,
+    },
+}
+
+impl From<ReferenceBoundaryError> for ProgramError {
+    #[inline]
+    fn from(error: ReferenceBoundaryError) -> Self {
+        ProgramError::InvalidArgument { message: error.to_string() }
+    }
+}
+
+/// Position of one live value in the flattened signature validated by [`validate_reference_boundary`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ReferenceBoundaryPosition {
+    /// Flattened public input at the provided index.
+    Input(usize),
+
+    /// Flattened capture at the provided index.
+    Capture(usize),
+}
+
+impl Display for ReferenceBoundaryPosition {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Input(index) => write!(formatter, "input {index}"),
+            Self::Capture(index) => write!(formatter, "capture {index}"),
+        }
+    }
+}
+
+/// Validates the live values bound at a public transform boundary against runtime reference aliasing. This is the one
+/// canonical validator that every public flattened binding boundary invokes on its concrete values before wrapping
+/// them in staged tracers: differentiation (i.e., `jvp` and `linearize`, which `vjp` and the gradient and Jacobian
+/// entry points build on), batching, and Just-In-Time (JIT) compilation each have their own boundary, and each calls
+/// this function over the flattened inputs and captures it receives. It rejects the same [`ReferenceId`] at two
+/// positions, whether both are inputs, both are captures, or one reference is both captured and passed, because every
+/// transform rule assumes that distinct boundary positions denote distinct allocations. It fails closed: a value whose
+/// type is a reference but which reports no identity through [`Value::reference_id`] is rejected, so a third-party
+/// value family cannot bypass the check by omitting that override, and a non-reference-typed value that reports an
+/// identity is rejected as well.
+///
+/// Internal [`Context::bind`](crate::Context::bind) calls are not validated, and aliasing between nested-region inputs
+/// is the responsibility of [`ReferenceAnalysis`](crate::ReferenceAnalysis). The validator must run on concrete values:
+/// a reference-typed staged tracer normally reports no identity and would be rejected here.
+///
+/// # Parameters
+///
+///   - `inputs`: Flattened public inputs in signature order.
+///   - `captures`: Flattened captures in capture-table order.
+///
+/// # Errors
+///
+/// Returns the [`ReferenceBoundaryError`] for the first violation in boundary order (inputs before captures).
+pub fn validate_reference_boundary<'v, V: 'v + Value, I: IntoIterator<Item = &'v V>, C: IntoIterator<Item = &'v V>>(
+    inputs: I,
+    captures: C,
+) -> Result<(), ReferenceBoundaryError> {
+    let positions = inputs
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| (ReferenceBoundaryPosition::Input(index), value))
+        .chain(
+            captures
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| (ReferenceBoundaryPosition::Capture(index), value)),
+        );
+    let mut seen = HashMap::new();
+    for (position, value) in positions {
+        let is_reference = value.r#type().is_reference();
+        match value.reference_id() {
+            None if is_reference => {
+                return Err(ReferenceBoundaryError::MissingIdentity {
+                    position,
+                    type_name: value.r#type().to_string(),
+                });
+            }
+            None => {}
+            Some(_) if !is_reference => {
+                return Err(ReferenceBoundaryError::UnexpectedIdentity {
+                    position,
+                    type_name: value.r#type().to_string(),
+                });
+            }
+            Some(id) => {
+                if let Some(other) = seen.insert(id, position) {
+                    return Err(ReferenceBoundaryError::Aliased { position, other });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
@@ -1395,9 +1525,11 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrValue, ArrayReference, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
+        Array, ArrayIrType, ArrayIrValue, ArrayReference, ArrayType, DataType, Dimension, DimensionBounds,
+        DimensionVariable, Shape,
     };
     use crate::captures::CaptureReference;
+    use crate::contexts::EagerContext;
     use crate::operations::Add;
 
     use super::*;
@@ -1472,6 +1604,45 @@ mod tests {
         fn is_ready(&self) -> Result<bool, Arc<str>> {
             let state = self.state.0.lock().unwrap();
             state.result.clone().map_or(Ok(false), |result| result.map(|_| true))
+        }
+    }
+
+    /// Value whose type and reported identity are chosen independently, so that the fail-closed rules of
+    /// [`validate_reference_boundary`] can be exercised without a value family that violates them naturally.
+    #[derive(Clone, Debug, PartialEq, Parameter)]
+    struct DetachedValue {
+        r#type: ArrayIrType,
+        identity: Option<ArrayReference<Array>>,
+    }
+
+    impl Display for DetachedValue {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(formatter, "detached")
+        }
+    }
+
+    impl Typed for DetachedValue {
+        type Type = ArrayIrType;
+
+        fn r#type(&self) -> Cow<'_, ArrayIrType> {
+            Cow::Borrowed(&self.r#type)
+        }
+    }
+
+    impl Value for DetachedValue {
+        type DispatchDomain = EagerContext<Self>;
+        type ExecutionDomain = EagerContext<Self>;
+
+        fn dispatch_domain(&self) -> EagerContext<Self> {
+            EagerContext::new()
+        }
+
+        fn execution_domain(&self) -> EagerContext<Self> {
+            EagerContext::new()
+        }
+
+        fn reference_id(&self) -> Option<ReferenceId> {
+            self.identity.as_ref().map(ArrayReference::id)
         }
     }
 
@@ -2449,5 +2620,94 @@ mod tests {
         cumulative = ReferenceCompletion::joined([cumulative]);
         assert!(completed_states.iter().all(|state| state.upgrade().is_none()));
         assert_eq!(cumulative.r#await(), Ok(()));
+    }
+
+    #[test]
+    fn test_reference_boundary_error_display() {
+        let position = ReferenceBoundaryPosition::Input(1);
+        let other = ReferenceBoundaryPosition::Capture(0);
+        assert_eq!(
+            ReferenceBoundaryError::MissingIdentity { position, type_name: "ref<f32[]>".to_string() }.to_string(),
+            "input 1 has reference type `ref<f32[]>` but reports no runtime reference identity",
+        );
+        assert_eq!(
+            ReferenceBoundaryError::UnexpectedIdentity { position: other, type_name: "f32[]".to_string() }.to_string(),
+            "capture 0 has non-reference type `f32[]` but reports a runtime reference identity",
+        );
+        assert_eq!(
+            ReferenceBoundaryError::Aliased { position, other }.to_string(),
+            "input 1 and capture 0 bind the same reference allocation",
+        );
+        assert_eq!(
+            ProgramError::from(ReferenceBoundaryError::Aliased { position, other }),
+            ProgramError::InvalidArgument {
+                message: "input 1 and capture 0 bind the same reference allocation".to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_validate_reference_boundary_accepts_distinct_references_and_values() {
+        let inputs = [
+            ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32))),
+            ArrayIrValue::Array(Array::scalar(2.0_f32)),
+            ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32))),
+        ];
+        let captures = [ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)))];
+        assert_eq!(validate_reference_boundary(inputs.iter(), captures.iter()), Ok(()));
+        assert_eq!(validate_reference_boundary(inputs.iter(), std::iter::empty()), Ok(()));
+    }
+
+    #[test]
+    fn test_validate_reference_boundary_rejects_the_same_reference_at_two_inputs() {
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
+        let inputs = [reference.clone(), ArrayIrValue::Array(Array::scalar(2.0_f32)), reference];
+        assert_eq!(
+            validate_reference_boundary(inputs.iter(), std::iter::empty()),
+            Err(ReferenceBoundaryError::Aliased {
+                position: ReferenceBoundaryPosition::Input(2),
+                other: ReferenceBoundaryPosition::Input(0),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_validate_reference_boundary_rejects_a_reference_that_is_both_captured_and_passed() {
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
+        assert_eq!(
+            validate_reference_boundary([reference.clone()].iter(), [reference.clone(), reference.clone()].iter()),
+            Err(ReferenceBoundaryError::Aliased {
+                position: ReferenceBoundaryPosition::Capture(1),
+                other: ReferenceBoundaryPosition::Input(0),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_validate_reference_boundary_rejects_a_reference_typed_value_without_identity() {
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let detached = DetachedValue { r#type: reference_type, identity: None };
+        assert_eq!(
+            validate_reference_boundary(std::iter::empty(), [detached].iter()),
+            Err(ReferenceBoundaryError::MissingIdentity {
+                position: ReferenceBoundaryPosition::Capture(0),
+                type_name: "ref<f32[]>".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_validate_reference_boundary_rejects_a_non_reference_value_reporting_an_identity() {
+        let detached = DetachedValue {
+            r#type: ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+            identity: Some(ArrayReference::new(Array::scalar(1.0_f32))),
+        };
+        assert_eq!(
+            validate_reference_boundary([detached].iter(), std::iter::empty()),
+            Err(ReferenceBoundaryError::UnexpectedIdentity {
+                position: ReferenceBoundaryPosition::Input(0),
+                type_name: "f32[]".to_string(),
+            }),
+        );
     }
 }

@@ -12,6 +12,10 @@
 //! [`ReferenceDischargePolicy`] and not [`ReferenceAccumulationPolicy`](ryft_core::ReferenceAccumulationPolicy), and
 //! still discharges every program that reads, writes, or swaps. Only a program containing `reference_add_update` would
 //! fail to discharge for it, and it would fail at compile time, scoped to exactly that operation.
+//!
+//! The one view in the universe, `register.halves`, exists only to exercise the generic static view contract
+//! ([`ReferenceViewOperation`]) from downstream position: it is a two-output view whose outputs carry two distinct
+//! descriptions, it has no discharge rule, and the discharge universe above stays view-less.
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
@@ -22,14 +26,16 @@ use pretty_assertions::assert_eq;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    Context, Domain, EagerContext, Effect, Effects, ExternalReferenceBinding, InterpretableOperation,
-    InterpretationDriver, NoIdentity, Operation, OutputRegionProvenance, Parameter, Placeholder, Program,
-    ProgramBuilder, ProgramError, RecursiveReferenceDischargeDriver, ReferenceAccessMode, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary,
-    ReferenceDischargeRegionStateInsertion, ReferenceDischargeResult, ReferenceDischargeTarget,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceInput,
-    ReferenceOperationSemantics, ReferenceOutput, ReferenceSource, ReferenceType, RegionInterface, RegionSlot, Trace,
-    Tracer, TracingContext, Type, TypeError, Typed, Value, discharge_reference_free_operation,
+    AtomId, Context, Domain, EagerContext, Effect, Effects, ExternalReferenceBinding, InstructionId,
+    InterpretableOperation, InterpretationDriver, NoIdentity, Operation, OutputRegionProvenance, Parameter,
+    Placeholder, Program, ProgramBuilder, ProgramError, RecursiveReferenceDischargeDriver, ReferenceAccessMode,
+    ReferenceAliasEdge, ReferenceAliasKind, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionStateInsertion,
+    ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    ReferenceDischargeableType, ReferenceInput, ReferenceOperationSemantics, ReferenceOutput, ReferenceSource,
+    ReferenceType, ReferenceViewOperation, ReferenceViewPath, ReferenceViewValidationError, RegionId, RegionInterface,
+    RegionSlot, Trace, Tracer, TracingContext, Type, TypeError, Typed, Value, ValueId,
+    discharge_reference_free_operation,
 };
 
 /// Destination universe of the downstream programs. Its dispatch domain is the constant-only eager context, which is
@@ -224,6 +230,7 @@ enum RegisterOperation {
     Swap,
     Freeze,
     Call,
+    Halves,
 }
 
 impl Display for RegisterOperation {
@@ -244,6 +251,7 @@ impl Operation for RegisterOperation {
             Self::Swap => "register.swap",
             Self::Freeze => "register.freeze",
             Self::Call => "register.call",
+            Self::Halves => "register.halves",
         }
     }
 
@@ -300,6 +308,10 @@ impl Operation for RegisterOperation {
                 check_count!("input", input_types, 2, TypeError);
                 Ok(vec![RegisterIrType::Register(referent()?)])
             }
+            Self::Halves => {
+                check_count!("input", input_types, 1, TypeError);
+                Ok(vec![RegisterIrType::Reference(ReferenceType::new(referent()?)); 2])
+            }
             Self::Call => match region_interfaces.first() {
                 Some(interface) => Ok(interface.output_types().to_vec()),
                 None => Err(TypeError::invalid("`register.call` expects one callee region")),
@@ -333,14 +345,72 @@ impl Operation for RegisterOperation {
             // A structured operation declares no operation-local reference semantics: its accesses are summarized
             // transitively from the region closure it attaches.
             Self::Call => Cow::Borrowed(ReferenceOperationSemantics::empty()),
+            // Both halves are narrowing views of the one operand.
+            Self::Halves => Cow::Owned(ReferenceOperationSemantics::new(
+                Vec::new(),
+                vec![
+                    ReferenceOutput::Alias { output_index: 0, input_index: 0, kind: ReferenceAliasKind::View },
+                    ReferenceOutput::Alias { output_index: 1, input_index: 0, kind: ReferenceAliasKind::View },
+                ],
+            )),
         }
     }
 
     fn effects(&self) -> Effects {
         match self {
-            Self::Negate => Effects::PURE,
+            Self::Negate | Self::Halves => Effects::PURE,
             _ => Effects::single(Effect::OrderedState),
         }
+    }
+}
+
+/// View description of the downstream universe: which half of a register a `register.halves` output selects.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+enum RegisterHalf {
+    Low,
+    High,
+}
+
+// The static view contract from downstream position: one owned description per view output, a type-level check that
+// only requires both ends to be register references (a half of a register is still a register), and reapplication
+// that stages the two-output view and keeps the described half.
+impl ReferenceViewOperation for RegisterOperation {
+    type View = RegisterHalf;
+
+    fn reference_view(&self, output_index: usize) -> Option<RegisterHalf> {
+        match (self, output_index) {
+            (Self::Halves, 0) => Some(RegisterHalf::Low),
+            (Self::Halves, 1) => Some(RegisterHalf::High),
+            _ => None,
+        }
+    }
+
+    fn validate_view(
+        _view: &RegisterHalf,
+        source: &RegisterIrType,
+        output: &RegisterIrType,
+    ) -> Result<(), ReferenceViewValidationError> {
+        for r#type in [source, output] {
+            if !r#type.is_reference() {
+                return Err(ReferenceViewValidationError::InvalidComposition {
+                    message: format!("expected a register reference but got `{type}`"),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn reapply_view<C: Context<Type = RegisterIrType, Operation = Self>>(
+        context: &C,
+        view: &RegisterHalf,
+        source: C::Value,
+    ) -> Result<C::Value, ProgramError> {
+        let mut outputs = context.bind(Self::Halves, Vec::new(), std::slice::from_ref(&source))?;
+        check_count!("output", outputs, 2, ProgramError);
+        Ok(outputs.swap_remove(match view {
+            RegisterHalf::Low => 0,
+            RegisterHalf::High => 1,
+        }))
     }
 }
 
@@ -410,6 +480,10 @@ where
                 let reference = inputs[0].try_as_reference("a reference to freeze")?;
                 Ok(vec![ReferenceDischargeValue::Value(context.consume(reference)?)])
             }
+            // The view exists only for the static view contract; the view-less discharge policy has no alias for it.
+            Self::Halves => Err(ProgramError::UnsupportedOperation {
+                message: format!("`{}` has no discharge rule in the register universe", self.name()),
+            }),
             // The hand-rolled structured widening a backend-owned region operation performs: summarize the closure,
             // widen the boundary with the reached state, rebuild the region in isolation, validate the result
             // against the summary's predictions, and merge every published successor state back. This is the same
@@ -829,5 +903,65 @@ fn test_downstream_partial_targets_reach_an_internal_allocation_inside_a_structu
                 },
             ]
             in (%1)"},
+    );
+}
+
+#[test]
+fn test_downstream_view_operation_records_output_indices_and_distinct_paths() {
+    // `f(register) = (read(low half), read(high half))`: one two-output view whose outputs are two distinct views of
+    // the same root, exercised through the generic static view contract from downstream position.
+    let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
+    let reference = builder.add_input(RegisterIrType::Reference(ReferenceType::new(RegisterType)));
+    let halves = builder.add_instruction(RegisterOperation::Halves, Vec::new(), vec![reference], None).unwrap().to_vec();
+    let low = builder.add_instruction(RegisterOperation::Read, Vec::new(), vec![halves[0]], None).unwrap()[0];
+    let high = builder.add_instruction(RegisterOperation::Read, Vec::new(), vec![halves[1]], None).unwrap()[0];
+    let program = builder
+        .build::<Vec<RegisterValue>, Vec<RegisterValue>>(vec![low, high], vec![Placeholder], vec![Placeholder; 2])
+        .unwrap();
+
+    // The contract itself: exactly the two view outputs are described, each by its own half.
+    assert_eq!(RegisterOperation::Halves.reference_view(0), Some(RegisterHalf::Low));
+    assert_eq!(RegisterOperation::Halves.reference_view(1), Some(RegisterHalf::High));
+    assert_eq!(RegisterOperation::Halves.reference_view(2), None);
+    assert_eq!(RegisterOperation::Read.reference_view(0), None);
+
+    // The overlay records which output defines each alias edge and asks the operation for exactly that description, so
+    // the two paths differ while the root keeps the empty path and the read outputs have none.
+    let analysis = program.entry_region_ref().reference_view_analysis(0).unwrap();
+    let value = |atom: usize| ValueId::new(RegionId::new(0), AtomId::new(atom));
+    let halves_instruction = InstructionId::new(RegionId::new(0), 0);
+    assert_eq!(
+        analysis.analysis().alias(value(1)),
+        Some(ReferenceAliasEdge::new(halves_instruction, 0, value(0), ReferenceAliasKind::View, true)),
+    );
+    assert_eq!(
+        analysis.analysis().alias(value(2)),
+        Some(ReferenceAliasEdge::new(halves_instruction, 1, value(0), ReferenceAliasKind::View, true)),
+    );
+    assert_eq!(analysis.path(value(0)), Some(&ReferenceViewPath::root()));
+    assert_eq!(analysis.path(value(1)), Some(&ReferenceViewPath::root().with_view(RegisterHalf::Low)));
+    assert_eq!(analysis.path(value(2)), Some(&ReferenceViewPath::root().with_view(RegisterHalf::High)));
+    assert_eq!(analysis.path(value(3)), None);
+    assert_eq!(analysis.path(value(4)), None);
+
+    // Reapplication stages the view over another register reference and keeps the described half, which the traced
+    // program then reads.
+    let (_, reapplied): (_, Program<_, _, Vec<RegisterValue>, Vec<RegisterValue>>) =
+        EagerContext::<RegisterValue, RegisterOperation>::trace(
+            |inputs: Vec<Tracer<TracingContext<RegisterValue, RegisterOperation>>>| {
+                let context = inputs[0].context().clone();
+                let high = RegisterOperation::reapply_view(&context, &RegisterHalf::High, inputs[0].clone())?;
+                context.bind(RegisterOperation::Read, Vec::new(), std::slice::from_ref(&high))
+            },
+            vec![RegisterIrType::Reference(ReferenceType::new(RegisterType))],
+        )
+        .unwrap();
+    assert_eq!(
+        reapplied.to_string(),
+        indoc! {"
+            lambda %0:ref<register> .
+            let %1:ref<register>, %2:ref<register> = register.halves %0
+                %3:register = register.read %2
+            in (%3)"},
     );
 }

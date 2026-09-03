@@ -12,7 +12,7 @@ use crate::arrays::types::ir::ArrayIrType;
 use crate::contexts::EagerContext;
 use crate::parameters::Parameter;
 use crate::programs::{
-    Concretizable, Operation, ProgramError, ReferenceSource, ReferenceType, RegionRef, Type, TypeError,
+    Concretizable, Operation, ProgramError, ReferenceId, ReferenceSource, ReferenceType, RegionRef, Type, TypeError,
     TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 
@@ -133,6 +133,14 @@ impl<A: Value<Type = ArrayType>> Value for ArrayIrValue<A> {
             }
         }
         Ok(())
+    }
+
+    #[inline]
+    fn reference_id(&self) -> Option<ReferenceId> {
+        match self {
+            Self::Array(_) | Self::Dimension(_) => None,
+            Self::Reference(value) => Some(value.id()),
+        }
     }
 }
 

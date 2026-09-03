@@ -35,7 +35,7 @@ pub use operations::{
     ArrayIrOperation, ArrayIrOperations, ArrayOperation, ArrayOperations, ArrayReferenceViewOperation,
     ArrayTracingContext, DimensionOperation, DimensionOperations, DimensionTracingContext,
     REFERENCE_INDEX_OPERATION_NAME, REFERENCE_SLICE_OPERATION_NAME, ReferenceIndex, ReferenceIndexOperation,
-    ReferenceSlice, ReferenceSliceOperation,
+    ReferenceSlice, ReferenceSliceOperation, reapply_array_reference_view, validate_array_reference_view,
 };
 pub use reference_analysis::{ArrayReferenceAnalysis, ArrayReferenceAnalysisError};
 pub use reference_discharge::ArrayReferenceDischarge;

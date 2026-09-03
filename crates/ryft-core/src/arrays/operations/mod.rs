@@ -64,8 +64,9 @@ use crate::operations::{
 use crate::programs::{
     MaybeZero, Operation, OperationProjection, ProgramError, ReferenceAddUpdate, ReferenceAddUpdateOperation,
     ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
-    ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Type,
-    TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
+    ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceViewOperation,
+    ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation, Type, TypeError, TypeIdentityPosition,
+    Typed, Value, ValueProjection,
 };
 use crate::tracing::TracingContext;
 use crate::tracing_v2::RematerializeOperation;
@@ -97,7 +98,7 @@ pub(crate) use math::ElementExtremum;
 // TODO(eaplatanios): This seems a bit weirdly placed.
 pub use references::{
     REFERENCE_INDEX_OPERATION_NAME, REFERENCE_SLICE_OPERATION_NAME, ReferenceIndex, ReferenceIndexOperation,
-    ReferenceSlice, ReferenceSliceOperation,
+    ReferenceSlice, ReferenceSliceOperation, reapply_array_reference_view, validate_array_reference_view,
 };
 
 /// Reusable [`Operation`] enum for ordinary staged programs over arrays.
@@ -553,7 +554,14 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 /// operations into a closed operation family it does not otherwise know the shape of, so core array IR and
 /// backend-owned supersets share one traversal without matching operation names.
 ///
-pub trait ArrayReferenceViewOperation: Operation<Type = ArrayIrType> + Sized {
+/// The static view contract itself (which outputs are views, their [`ArrayReferenceViewTransform`] descriptions, their
+/// type-level validation, and their reapplication to a transformed reference) is the family's
+/// [`ReferenceViewOperation`] implementation, which this trait refines to the array universe so that the array view
+/// overlay ([`ArrayReferenceAnalysis`](crate::ArrayReferenceAnalysis)) and the array discharge policy share one
+/// bound. The three constructors here stage array-valued operations over *discharged* values and are discharge-only.
+pub trait ArrayReferenceViewOperation:
+    ReferenceViewOperation<Type = ArrayIrType, View = ArrayReferenceViewTransform>
+{
     /// Wraps a canonical homogeneous array reshape for reference-view staging.
     fn from_reference_reshape(operation: ReshapeOperation) -> Self;
 
@@ -562,16 +570,36 @@ pub trait ArrayReferenceViewOperation: Operation<Type = ArrayIrType> + Sized {
 
     /// Wraps a canonical homogeneous array update-slice for reference-view staging.
     fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self;
+}
 
-    /// Returns the [`ArrayReferenceViewTransform`] that this operation composes onto the view of its aliased input,
-    /// or [`None`] when the operation derives no view. Exactly the operations whose
-    /// [`reference_semantics`](Operation::reference_semantics) declare a
-    /// [`ReferenceOutput::Alias`](crate::ReferenceOutput::Alias) output of kind
-    /// [`ReferenceAliasKind::View`](crate::ReferenceAliasKind::View) return [`Some`], so the array view overlay
-    /// ([`ArrayReferenceAnalysis`](crate::ArrayReferenceAnalysis)) can recover the geometry of every derived view from
-    /// the generic alias edges without matching operation names, and can reject an operation that declares a view
-    /// alias while exposing no transform.
-    fn reference_view_transform(&self) -> Option<ArrayReferenceViewTransform>;
+impl<A: Value<Type = ArrayType>> ReferenceViewOperation for ArrayIrOperation<A> {
+    type View = ArrayReferenceViewTransform;
+
+    fn reference_view(&self, output_index: usize) -> Option<ArrayReferenceViewTransform> {
+        // The two view derivations are the only members whose reference semantics declare a view alias, and each
+        // declares it at its single output.
+        match self {
+            Self::ReferenceIndex(operation) if output_index == 0 => Some(operation.transform()),
+            Self::ReferenceSlice(operation) if output_index == 0 => Some(operation.transform()),
+            _ => None,
+        }
+    }
+
+    fn validate_view(
+        view: &ArrayReferenceViewTransform,
+        source: &ArrayIrType,
+        output: &ArrayIrType,
+    ) -> Result<(), ReferenceViewValidationError> {
+        validate_array_reference_view(view, source, output)
+    }
+
+    fn reapply_view<C: Context<Type = ArrayIrType, Operation = Self>>(
+        context: &C,
+        view: &ArrayReferenceViewTransform,
+        source: C::Value,
+    ) -> Result<C::Value, ProgramError> {
+        reapply_array_reference_view(context, view, source)
+    }
 }
 
 impl<A: Value<Type = ArrayType>> ArrayReferenceViewOperation for ArrayIrOperation<A> {
@@ -585,14 +613,6 @@ impl<A: Value<Type = ArrayType>> ArrayReferenceViewOperation for ArrayIrOperatio
 
     fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self {
         Self::Array(ArrayOperation::UpdateSlice(operation))
-    }
-
-    fn reference_view_transform(&self) -> Option<ArrayReferenceViewTransform> {
-        match self {
-            Self::ReferenceIndex(operation) => Some(operation.transform()),
-            Self::ReferenceSlice(operation) => Some(operation.transform()),
-            _ => None,
-        }
     }
 }
 

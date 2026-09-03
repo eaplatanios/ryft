@@ -13,7 +13,9 @@ use crate::macros::{check_builders, check_count};
 use crate::operations::Constant;
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::programs::transforms::{Transform, TransformCache};
-use crate::programs::{CalleeRegionDriver, Operation, Program, ProgramError, ReferenceCompletion, Typed, Value};
+use crate::programs::{    CalleeRegionDriver, Operation, Program, ProgramError, ReferenceCompletion, Typed, Value,
+    validate_reference_boundary,
+};
 use crate::specialization::SpecializationCacheEntry;
 use crate::tracing::{DomainTracingContext, Tracer};
 
@@ -1655,6 +1657,7 @@ where
         Parameterized<CompilationTracer<D>, To<D::Type> = Output, To<D::Constant> = Output::To<D::Constant>>,
     NormalizeOutput: FnOnce(&D::Options, Vec<D::Type>) -> Result<Vec<D::Type>, D::Error>,
 {
+    validate_reference_boundary(std::iter::empty(), captures.iter()).map_err(ProgramError::from)?;
     let context = DomainTracingContext::<D, D::Value>::new();
     let capture_table = context.captures().clone();
     let builder = context.builder().clone();

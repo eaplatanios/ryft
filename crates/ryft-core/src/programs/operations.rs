@@ -630,17 +630,24 @@ pub trait Operation: Clone {
     ///     return A
     /// ```
     ///
-    /// The condition therefore permits [`ReferenceAccessMode::Read`] through its input. It rejects
-    /// [`ReferenceAccessMode::Write`], [`ReferenceAccessMode::ReadWrite`], [`ReferenceAccessMode::Accumulate`],
-    /// and [`ReferenceAccessMode::Consume`]. A `while` implementation consequently reports:
+    /// The condition returns only its predicate, so it has no state output through which an updated `A` could be
+    /// published directly. Reference discharge nevertheless accepts a mutating condition by rotating the loop into
+    /// "do-while form" where the condition is discharged once before the loop to produce the initial predicate and
+    /// apply its effects, the predicate becomes a trailing carry, and the rebuilt body runs the original body followed
+    /// by the original condition, publishing the condition's updates through the body's state carries. The condition
+    /// therefore permits [`ReferenceAccessMode::Read`], [`ReferenceAccessMode::Write`],
+    /// [`ReferenceAccessMode::ReadWrite`], and [`ReferenceAccessMode::Accumulate`] through its input and rejects only
+    /// [`ReferenceAccessMode::Consume`], because a consumed allocation has no successor state for a carry to hold.
+    /// A `while` implementation consequently reports:
     ///
     /// ```text
-    /// condition + read:  true
-    /// condition + write: false
-    /// body + write:      true
+    /// condition + read:    true
+    /// condition + write:   true
+    /// condition + consume: false
+    /// body + write:        true
     /// ```
     ///
-    /// A mutating condition would be invalid:
+    /// A condition that mutates and then exits is therefore valid and loses no update:
     ///
     /// ```text
     /// condition(A):
@@ -648,9 +655,9 @@ pub trait Operation: Clone {
     ///     return false
     /// ```
     ///
-    /// When that condition returns `false`, the loop exits without invoking the body. Because the condition returns
-    /// only the predicate, it has no state output through which the updated `A` could be published. The body does
-    /// return its state carries, so it retains the permissive default.
+    /// When that condition returns `false`, the loop exits without invoking the body, and the swap it performed is
+    /// still visible because it ran once before the rotated loop. The body does return its state carries, so it
+    /// retains the permissive default.
     ///
     /// The policy does not restrict references allocated and consumed entirely within the region. For example, a
     /// condition may allocate, update, read, and freeze a temporary reference because that root never enters through

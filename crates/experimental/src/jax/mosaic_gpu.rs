@@ -342,7 +342,7 @@ fn serialize_mosaic_gpu_module(module: &Module<'_, '_>) -> Result<Vec<u8>, Error
 /// Parses serialized Mosaic GPU kernel bytecode without text conversion and validates its serde version.
 fn parse_mosaic_gpu_kernel<'c, 't>(context: &'c Context<'t>, kernel: &[u8]) -> Result<Module<'c, 't>, Error> {
     context.allow_unregistered_dialects();
-    let module = context.parse_module_bytes(kernel)?;
+    let module = context.parse_module_from_bytes(kernel)?;
     validate_mosaic_gpu_serde_version(&module)?;
     Ok(module)
 }
