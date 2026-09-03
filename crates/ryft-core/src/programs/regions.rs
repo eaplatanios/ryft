@@ -859,9 +859,13 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     /// expanded twice.
     ///
     /// Two closures that yield the same sequence assign the same identifiers to the same structural positions,
-    /// which is what lets an artifact that records concrete region, instruction, and value identifiers (e.g., a
-    /// [`ReferenceAnalysis`](crate::ReferenceAnalysis)) be keyed by this sequence in a retained transform cache that
-    /// is shared across topology-preserving imports.
+    /// which lets an artifact that records concrete region, instruction, and value identifiers (e.g., a
+    /// [`ReferenceAnalysis`](crate::ReferenceAnalysis)) be keyed by this sequence in a retained transform cache. The
+    /// sequence alone does not guarantee that a cache hit names the same bodies, since two arenas may file different
+    /// bodies under the same identifiers. The guarantee comes from the sealing rule of the region transform cache where
+    /// re-sealing a region that attaches any descendant mints a fresh cache, and only closure-preserving imports, which
+    /// carry every attached body over up to a topology-preserving renumbering, keep the cache. Within one cache, equal
+    /// sequences therefore denote the same closure contents.
     pub fn region_ids_in_closure(self) -> Vec<RegionId> {
         // Attachments are pushed in reverse so that the last-in-first-out worklist pops them in instruction and
         // attachment order, which makes the emitted sequence the pre-order first-encounter sequence described above.
@@ -968,6 +972,17 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
             || self
                 .instructions_in_closure()
                 .any(|(_, instruction)| !instruction.operation().reference_semantics().is_empty())
+    }
+
+    /// Returns whether any [`Instruction`] in this [`Region`]'s complete attached region closure accesses a reference
+    /// (i.e., whether its [`Operation`] declares at least one reference input). Pure allocations, reference-typed
+    /// boundaries, and reference-typed constants are not accesses, and so a closure that only mints or forwards
+    /// references will result in `false` even though [`Self::contains_references_in_closure`] will return `true` for
+    /// it. Every attached region is traversed regardless of [`RegionRole`], and shared descendants are  visited once.
+    #[inline]
+    pub fn contains_reference_accesses_in_closure(self) -> bool {
+        self.instructions_in_closure()
+            .any(|(_, instruction)| !instruction.operation().reference_semantics().inputs().is_empty())
     }
 
     /// Returns whether `predicate` holds for any [`Region`] in this root's complete attached region closure, applying
@@ -1614,7 +1629,7 @@ mod tests {
     use crate::programs::effects::Effect;
     use crate::programs::identities::TypeIdentity;
     use crate::programs::programs::Program;
-    use crate::programs::references::ReferenceType;
+    use crate::programs::references::{ReferenceNewOperation, ReferenceReadOperation, ReferenceType};
     use crate::tests::TestRegionOperation;
 
     use super::*;
@@ -2146,6 +2161,31 @@ mod tests {
         let reference_arena = RegionArena::from_regions(vec![reference_region]).unwrap();
         let reference_region = RegionRef::new(&reference_arena, RegionId::new(0)).unwrap();
         assert!(reference_region.contains_references_in_closure());
+
+        // The access-specific query ignores reference-typed boundaries and pure allocations and answers true only
+        // once an instruction accesses a reference.
+        assert!(!region.contains_reference_accesses_in_closure());
+        assert!(!reference_region.contains_reference_accesses_in_closure());
+        let lifecycle = |read: bool| {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let input = builder.add_input(ArrayType::scalar(DataType::F64).into());
+            let mut output =
+                builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+            if read {
+                output =
+                    builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![output], None).unwrap()[0];
+            }
+            builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![output],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        assert!(lifecycle(false).entry_region_ref().contains_references_in_closure());
+        assert!(!lifecycle(false).entry_region_ref().contains_reference_accesses_in_closure());
+        assert!(lifecycle(true).entry_region_ref().contains_reference_accesses_in_closure());
     }
 
     #[test]
