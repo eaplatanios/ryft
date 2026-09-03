@@ -23,10 +23,15 @@ pub enum Effect {
     /// effects may execute in any order.
     UnorderedIo,
 
-    /// Observable access to unresolved mutable state. Stateful operations must be validated and either discharged
-    /// before stateless lowering or handled by a state-aware backend. References are one source of this effect, but
-    /// generic consumers must not infer a particular state representation from the effect class. Keeping state distinct
-    /// from I/O also prevents generic transforms from treating mutation like an external I/O effect.
+    /// Observable access to mutable state whose execution order relative to other [`OrderedState`](Self::OrderedState)
+    /// effects on the same state is observable and must be preserved. This effect _orders_ and does not gate
+    /// transforms. Partial evaluation, linearization, and differentiation place stateful operations by the ordered
+    /// effect frontier documented in [`partial`](crate::partial) instead of rejecting them, while dead-code elimination
+    /// keeps them alive unless the operation declares itself
+    /// [_removable when unused_](crate::Operation::is_removable_when_unused). Stateful operations must still be either
+    /// discharged before stateless lowering or handled by a state-aware backend. References are one source of this
+    /// effect, but generic consumers must not infer a particular state representation from the effect class. Keeping
+    /// state distinct from I/O also prevents generic transforms from treating mutation like an external I/O effect.
     OrderedState,
 }
 
