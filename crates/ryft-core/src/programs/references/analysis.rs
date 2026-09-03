@@ -3366,7 +3366,11 @@ mod tests {
         let value =
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(vec![value], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![value],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
             .unwrap();
         let root = ReferenceRoot::RegionInput { region: RegionId::new(0), input_index: 0 };
         let retained = program.reference_analysis(0).unwrap();
@@ -3379,20 +3383,38 @@ mod tests {
     fn test_region_ref_reference_analysis_derives_a_fresh_entry_for_a_rebased_import() {
         // A closure-copying import keeps the source region's transform cache but renumbers the attached regions, so the
         // records of the retained analysis would name the wrong identifiers. The closure's region identifiers are part
-        // of the cache key, which is what makes the rebased copy derive its own analysis.
-        let first = while_program(false);
-        let retained = first.entry_region_ref().reference_analysis(0).unwrap();
-        let mut builder = TestBuilder::new();
-        builder.import_program(fixture());
-        let imported = builder.import_program(first.clone());
-        let program = build(builder, Vec::new());
-        let rebased = program.region_ref(imported).unwrap();
-        let derived = rebased.reference_analysis(0).unwrap();
-        assert!(!Arc::ptr_eq(&derived, &retained));
-        assert_ne!(derived.region(), retained.region());
-        assert_eq!(*derived, ReferenceAnalysis::new(rebased, 0).unwrap());
+        // of the cache key, which is what makes a renumbered copy derive its own analysis while a copy that keeps the
+        // source identifiers is still served the retained one.
+        let mut callee = TestBuilder::new();
+        let reference = callee.add_input(reference_type(0));
+        let read = callee.add_instruction(TestOperation::Read, Vec::new(), vec![reference], None).unwrap()[0];
+        let callee = build(callee, vec![read]);
+        let mut entry = TestBuilder::new();
+        let callee = entry.import_region(callee.entry_region_ref());
+        let reference = entry.add_input(reference_type(0));
+        let read = entry.add_instruction(TestOperation::Call, vec![callee], vec![reference], None).unwrap()[0];
+        let source = build(entry, vec![read]);
+        let retained = source.entry_region_ref().reference_analysis(0).unwrap();
 
-        // The source program keeps its own retained artifact, because only the imported copy was rebased.
-        assert!(Arc::ptr_eq(&first.entry_region_ref().reference_analysis(0).unwrap(), &retained));
+        let mut wrapper = TestBuilder::new();
+        let same_identifiers = wrapper.import_region(source.entry_region_ref());
+        let renumbered = wrapper.import_region(source.entry_region_ref());
+        let reference = wrapper.add_input(reference_type(0));
+        wrapper.add_instruction(TestOperation::Call, vec![same_identifiers], vec![reference], None).unwrap();
+        wrapper.add_instruction(TestOperation::Call, vec![renumbered], vec![reference], None).unwrap();
+        let wrapper = build(wrapper, Vec::new());
+        assert_eq!(same_identifiers, source.entry_region_ref().id());
+        assert_ne!(renumbered, source.entry_region_ref().id());
+
+        let same = wrapper.region_ref(same_identifiers).unwrap().reference_analysis(0).unwrap();
+        assert!(Arc::ptr_eq(&same, &retained));
+        let derived = wrapper.region_ref(renumbered).unwrap().reference_analysis(0).unwrap();
+        assert!(!Arc::ptr_eq(&derived, &retained));
+        assert_eq!(derived.region(), renumbered);
+        assert_eq!(*derived, ReferenceAnalysis::new(wrapper.region_ref(renumbered).unwrap(), 0).unwrap());
+        assert_ne!(derived.roots().collect::<Vec<_>>(), retained.roots().collect::<Vec<_>>());
+
+        // The source program keeps its own retained artifact, because only the copies were imported.
+        assert!(Arc::ptr_eq(&source.entry_region_ref().reference_analysis(0).unwrap(), &retained));
     }
 }

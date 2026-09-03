@@ -13,7 +13,8 @@ use crate::macros::{check_builders, check_count};
 use crate::operations::Constant;
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::programs::transforms::{Transform, TransformCache};
-use crate::programs::{    CalleeRegionDriver, Operation, Program, ProgramError, ReferenceCompletion, Typed, Value,
+use crate::programs::{
+    CalleeRegionDriver, Operation, Program, ProgramError, ReferenceCompletion, Typed, Value,
     validate_reference_boundary,
 };
 use crate::specialization::SpecializationCacheEntry;

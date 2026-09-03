@@ -1329,10 +1329,16 @@ mod tests {
             |input| {
                 let sliced = reapply_array_reference_view(
                     input.context(),
-                    &ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 4, 1)] },
+                    &ArrayReferenceViewTransform::Slice {
+                        axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 4, 1)],
+                    },
                     input.clone(),
                 )?;
-                reapply_array_reference_view(input.context(), &ArrayReferenceViewTransform::Index { axis: 0, index: 1 }, sliced)
+                reapply_array_reference_view(
+                    input.context(),
+                    &ArrayReferenceViewTransform::Index { axis: 0, index: 1 },
+                    sliced,
+                )
             },
             root_type,
         )
@@ -1341,9 +1347,11 @@ mod tests {
         assert_eq!(
             program.to_string(),
             indoc! {"
-                lambda %0:ref<f32[3,4]> .
-                let %1:ref<f32[2,4]> = reference_slice %0 [axes=[0:1:3:1]]
-                    %2:ref<f32[4]> = reference_index %1 [axis=0, index=1]
+                lambda %0:ref<f32[3, 4]> .
+                let %1:ref<f32[2, 4]> = reference_slice [
+                    axes=[ArraySliceAxis { start: 1, size: 2, stride: 1 }, ArraySliceAxis { start: 0, size: 4, stride: 1 }],
+                ] %0
+                    %2:ref<f32[4]> = reference_index [axis=0, index=1] %1
                 in (%2)
             "}
             .trim_end(),
