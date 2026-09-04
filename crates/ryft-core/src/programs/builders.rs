@@ -8,13 +8,15 @@ use crate::macros::check_count;
 use crate::parameters::{Parameter, Parameterized};
 use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId};
+use crate::programs::effects::{ReferenceAccessMode, ReferenceAliasKind};
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::instructions::Instruction;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::provenance::Provenance;
-use crate::programs::references::{ReferenceAccessMode, ReferenceAliasKind, ReferenceOutput};
-use crate::programs::regions::{Region, RegionArena, RegionId, RegionInterface, RegionRef, reachable_region_mask};
+use crate::programs::regions::{
+    Region, RegionArena, RegionId, RegionInterface, RegionRef, RegionRole, reachable_region_mask,
+};
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
 
@@ -151,7 +153,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
     /// construction could otherwise record the misuse and surface it only much later). Replay and rebuild paths that
     /// re-append instructions already accepted once use [`add_instruction_unchecked`](Self::add_instruction_unchecked)
     /// instead, which is also the hatch for tests that deliberately construct malformed programs for testing validation
-    /// checks. This validation is structural. It sees atoms and declared reference semantics, never live values, so it
+    /// checks. This validation is structural. It sees atoms and declared reference effects, never live values, so it
     /// cannot detect two inputs or captures bound to the same runtime allocation. That runtime aliasing is rejected by
     /// [`validate_reference_boundary`](crate::validate_reference_boundary) at the public transform boundaries that bind
     /// concrete values.
@@ -194,14 +196,14 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
                     RegionInterface::new(
                         region.input_types(),
                         region.output_types(),
-                        self.regions.effects(*region_id).unwrap(),
+                        self.regions.effects(*region_id).unwrap().classes(),
                     )
                 })
                 .collect()
         };
         let output_types = operation.infer_output_types(input_types.as_slice(), region_interfaces.as_slice())?;
-        let semantics = operation.reference_semantics();
-        semantics.validate_arity(operation.name(), inputs.len(), output_types.len())?;
+        let effects = operation.effects();
+        effects.validate_application(operation.name(), input_types.as_slice(), output_types.as_slice())?;
 
         // A region-carrying operation must state how references cross its boundaries, because reference analysis and
         // discharge resolve reference identity through these hooks rather than by inspecting region bodies. Checking
@@ -220,6 +222,15 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
                 )));
             }
 
+            // The reference-typed inputs of a dormant rule region are bound by the transform that instantiates the
+            // rule (e.g., the forward tail and cotangent destinations of a rematerialized call) rather than by this
+            // application's inputs, so, exactly as the reference analysis does, the check skips rule regions.
+            if operation.region_role(region_index) == Some(RegionRole::Rule) {
+                continue;
+            }
+
+            // Every reference-typed region input must name the operation input from which it originates.
+            // The provenance also distinguishes an unchanged handle from a view created at the boundary.
             for (input_index, input_type) in region_input_types.iter().enumerate() {
                 if input_type.is_reference() && operation.input_region_provenance(region_index, input_index).is_none() {
                     return Err(ProgramError::MalformedProgram(format!(
@@ -235,7 +246,8 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
 
         if !regions.is_empty() {
             for (output_index, output_type) in output_types.iter().enumerate() {
-                let declared = semantics.outputs().into_iter().any(|output| output.output_index() == output_index)
+                let declared = effects.allocation_output_indices().any(|index| index == output_index)
+                    || effects.reference_aliases().iter().any(|alias| alias.output_index() == output_index)
                     || operation.reference_output_identity_input(output_index).is_some()
                     || !operation.output_region_provenance(output_index).is_empty();
                 if output_type.is_reference() && !declared {
@@ -257,11 +269,11 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
 
         // The accepted application is read back off the instruction just appended, which borrows a different field of
         // this builder than the lifetime state does, so recording needs neither a clone of the operation nor of its
-        // operand list. It runs for an application that declares reference semantics and for one that merely names a
-        // reference-typed value, because a region-carrying operation carrying a reference through its boundary
+        // operand list. It runs for an application that declares reference effects or aliases and for one that merely
+        // names a reference-typed value, because a region-carrying operation carrying a reference through its boundary
         // declares nothing and is recognized only by its identity-forwarding hook.
         let instruction = self.instructions.last().unwrap();
-        let contains_references = !instruction.operation().reference_semantics().is_empty()
+        let contains_references = instruction.operation().effects().has_reference_declarations()
             || instruction
                 .inputs
                 .iter()
@@ -614,13 +626,13 @@ impl ReferenceLifetimes {
             return Ok(());
         }
         let name = operation.name();
-        let semantics = operation.reference_semantics();
-        for access in semantics.inputs() {
-            let Some(atom) = inputs.get(access.input_index()) else {
+        let effects = operation.effects();
+        for (input_index, mode) in effects.accesses() {
+            let Some(atom) = inputs.get(input_index) else {
                 continue;
             };
             let edge = self.aliases.get(atom);
-            if access.mode().is_consuming() && edge.is_some_and(|edge| edge.narrows) {
+            if mode.is_consuming() && edge.is_some_and(|edge| edge.narrows) {
                 return Err(ProgramError::MalformedProgram(format!(
                     "`{name}` consumes a derived reference view, but consumption invalidates the whole alias \
                      family; consume the root handle instead",
@@ -631,7 +643,7 @@ impl ReferenceLifetimes {
                 return Err(ProgramError::MalformedProgram(format!(
                     "`{}` {} a reference whose alias family `{}` already consumed",
                     name,
-                    match access.mode() {
+                    match mode {
                         ReferenceAccessMode::Read => "reads",
                         ReferenceAccessMode::Write => "writes",
                         ReferenceAccessMode::ReadWrite => "reads and writes",
@@ -647,10 +659,10 @@ impl ReferenceLifetimes {
 
     /// Records the consumptions and alias edges performed by one accepted application.
     fn record<O: Operation>(&mut self, operation: &O, inputs: &[AtomId], outputs: &[AtomId]) {
-        let semantics = operation.reference_semantics();
-        for access in semantics.inputs() {
-            if access.mode().is_consuming()
-                && let Some(atom) = inputs.get(access.input_index())
+        let effects = operation.effects();
+        for (input_index, mode) in effects.accesses() {
+            if mode.is_consuming()
+                && let Some(atom) = inputs.get(input_index)
             {
                 let root = self.root(*atom);
                 self.consumed.insert(root, operation.name());
@@ -664,11 +676,11 @@ impl ReferenceLifetimes {
                 self.alias(output_atom, *input_atom, false);
             }
         }
-        for output in semantics.outputs() {
-            if let ReferenceOutput::Alias { output_index, input_index, kind } = *output
-                && let (Some(output_atom), Some(input_atom)) = (outputs.get(output_index), inputs.get(input_index))
+        for alias in effects.reference_aliases() {
+            if let (Some(output_atom), Some(input_atom)) =
+                (outputs.get(alias.output_index()), inputs.get(alias.input_index()))
             {
-                self.alias(*output_atom, *input_atom, kind == ReferenceAliasKind::View);
+                self.alias(*output_atom, *input_atom, alias.kind() == ReferenceAliasKind::View);
             }
         }
     }
@@ -719,18 +731,18 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
+        Array, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds,
+        DimensionVariable, Shape,
     };
     use crate::captures::CaptureReference;
     use crate::operations::{AddOperation, NegOperation};
     use crate::parameters::{Parameter, Placeholder};
+    use crate::programs::effects::{Effects, OperationEffects, ReferenceAlias, ReferenceEffect};
     use crate::programs::identities::NoIdentity;
     use crate::programs::instructions::InstructionId;
     use crate::programs::provenance::ProvenanceScope;
-    use crate::programs::references::{
-        ReferenceAccessMode, ReferenceInput, ReferenceOperationSemantics, ReferenceOutput,
-    };
-    use crate::programs::regions::RegionSlot;
+    use crate::programs::references::ReferenceType;
+    use crate::programs::regions::{InputRegionProvenance, RegionSlot};
     use crate::programs::types::TypeError;
     use crate::programs::values::ValueId;
     use crate::tests::TestRegionOperation;
@@ -1471,12 +1483,14 @@ mod tests {
     }
 
     #[test]
-    fn test_program_builder_rejects_invalid_reference_semantics_before_mutation() {
+    fn test_program_builder_rejects_invalid_effect_declaration_before_mutation() {
+        // One operation stands in for every malformed declaration: its effect declaration is a payload,
+        // so the same fixture can name an out-of-range position or a non-reference endpoint.
         #[derive(Clone)]
-        struct InvalidReferenceOperation;
+        struct InvalidReferenceOperation(OperationEffects);
 
         impl Operation for InvalidReferenceOperation {
-            type Type = ArrayType;
+            type Type = ArrayIrType;
 
             fn name(&self) -> &'static str {
                 "test.invalid_reference"
@@ -1484,33 +1498,75 @@ mod tests {
 
             fn infer_output_types(
                 &self,
-                input_types: &[ArrayType],
-                _region_interfaces: &[RegionInterface<ArrayType>],
-            ) -> Result<Vec<ArrayType>, TypeError> {
+                input_types: &[ArrayIrType],
+                _region_interfaces: &[RegionInterface<ArrayIrType>],
+            ) -> Result<Vec<ArrayIrType>, TypeError> {
                 Ok(input_types.to_vec())
             }
 
-            fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
-                Cow::Owned(ReferenceOperationSemantics::new(
-                    vec![ReferenceInput::new(1, ReferenceAccessMode::Read)],
-                    Vec::new(),
-                ))
+            fn effects(&self) -> Cow<'_, OperationEffects> {
+                Cow::Borrowed(&self.0)
             }
         }
 
-        let mut builder = ProgramBuilder::<Array, InvalidReferenceOperation>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F32));
+        let read = |input_index| {
+            OperationEffects::new(
+                Effects::PURE,
+                vec![ReferenceEffect::Access { input_index, mode: ReferenceAccessMode::Read }],
+                Vec::new(),
+            )
+        };
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, InvalidReferenceOperation>::new();
+        let array = builder.add_input(ArrayIrType::from(ArrayType::scalar(DataType::F32)));
+        let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
         let atom_count = builder.atoms.len();
         let instruction_count = builder.instructions.len();
+
+        // An out-of-range position is rejected before the builder is mutated.
         assert_eq!(
-            builder.add_instruction(InvalidReferenceOperation, Vec::new(), vec![input], None),
+            builder.add_instruction(InvalidReferenceOperation(read(1)), Vec::new(), vec![reference], None),
             Err(ProgramError::MalformedProgram(
                 "operation `test.invalid_reference` names an accessed input 1 but the application input count is 1"
                     .to_string(),
             )),
         );
+
+        // A declared endpoint must be reference-typed: an access to an array operand, an allocation classifying
+        // an array result, and an alias of an array operand are all rejected.
+        assert_eq!(
+            builder.add_instruction(InvalidReferenceOperation(read(0)), Vec::new(), vec![array], None),
+            Err(ProgramError::MalformedProgram(
+                "operation `test.invalid_reference` names an accessed input 0 but it has non-reference type `f32[]`"
+                    .to_string(),
+            )),
+        );
+        let allocation =
+            OperationEffects::new(Effects::PURE, vec![ReferenceEffect::Allocate { output_index: 0 }], Vec::new());
+        assert_eq!(
+            builder.add_instruction(InvalidReferenceOperation(allocation), Vec::new(), vec![array], None),
+            Err(ProgramError::MalformedProgram(
+                "operation `test.invalid_reference` classifies output 0 but it has non-reference type `f32[]`"
+                    .to_string(),
+            )),
+        );
+        let alias = OperationEffects::new(
+            Effects::PURE,
+            Vec::new(),
+            vec![ReferenceAlias::new(0, 1, ReferenceAliasKind::Identity)],
+        );
+        assert_eq!(
+            builder.add_instruction(InvalidReferenceOperation(alias), Vec::new(), vec![reference, array], None),
+            Err(ProgramError::MalformedProgram(
+                "operation `test.invalid_reference` names an aliased input 1 but it has non-reference type `f32[]`"
+                    .to_string(),
+            )),
+        );
         assert_eq!(builder.atoms.len(), atom_count);
         assert_eq!(builder.instructions.len(), instruction_count);
+
+        // A well-typed declaration is accepted.
+        let outputs = builder.add_instruction(InvalidReferenceOperation(read(0)), Vec::new(), vec![reference], None);
+        assert_eq!(outputs.map(|outputs| outputs.len()), Ok(1));
     }
 
     #[test]
@@ -1559,10 +1615,12 @@ mod tests {
             }
         }
 
+        /// `ViewRegion` creates a boundary view of every operand for the corresponding region input.
         #[derive(Clone, Debug)]
         enum HookOperation {
             Allocate,
             Region { capture_input_count: Option<usize> },
+            ViewRegion,
         }
 
         impl Operation for HookOperation {
@@ -1572,20 +1630,32 @@ mod tests {
                 match self {
                     Self::Allocate => "test.allocate",
                     Self::Region { .. } => "test.region",
+                    Self::ViewRegion => "test.view_region",
                 }
             }
 
             fn region_slots(&self) -> &'static [RegionSlot] {
                 match self {
                     Self::Allocate => &[],
-                    Self::Region { .. } => const { &[RegionSlot::computation("body")] },
+                    Self::Region { .. } | Self::ViewRegion => const { &[RegionSlot::computation("body")] },
                 }
             }
 
             fn region_capture_input_count(&self, _region_index: usize) -> Option<usize> {
                 match self {
-                    Self::Allocate => None,
+                    Self::Allocate | Self::ViewRegion => None,
                     Self::Region { capture_input_count } => *capture_input_count,
+                }
+            }
+
+            fn input_region_provenance(
+                &self,
+                _region_index: usize,
+                input_index: usize,
+            ) -> Option<InputRegionProvenance> {
+                match self {
+                    Self::ViewRegion => Some(InputRegionProvenance::View { input_index }),
+                    _ => None,
                 }
             }
 
@@ -1596,17 +1666,18 @@ mod tests {
             ) -> Result<Vec<HookType>, TypeError> {
                 match self {
                     Self::Allocate => Ok(vec![HookType::Reference]),
-                    Self::Region { .. } => Ok(region_interfaces[0].output_types().to_vec()),
+                    Self::Region { .. } | Self::ViewRegion => Ok(region_interfaces[0].output_types().to_vec()),
                 }
             }
 
-            fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
+            fn effects(&self) -> Cow<'_, OperationEffects> {
                 match self {
-                    Self::Allocate => Cow::Owned(ReferenceOperationSemantics::new(
+                    Self::Allocate => Cow::Owned(OperationEffects::new(
+                        Effects::PURE,
+                        vec![ReferenceEffect::Allocate { output_index: 0 }],
                         Vec::new(),
-                        vec![ReferenceOutput::Allocation { output_index: 0 }],
                     )),
-                    Self::Region { .. } => Cow::Borrowed(ReferenceOperationSemantics::empty()),
+                    Self::Region { .. } | Self::ViewRegion => Cow::Borrowed(OperationEffects::empty()),
                 }
             }
         }
@@ -1684,6 +1755,23 @@ mod tests {
                 )
                 .is_ok()
         );
+
+        // A reference-typed region input may be a view that the operation creates from one of its own inputs.
+        let mut region_builder = ProgramBuilder::<HookValue, HookOperation>::new();
+        region_builder.add_input(HookType::Reference);
+        let payload = region_builder.add_input(HookType::Value);
+        let viewing_region = region_builder
+            .build::<Vec<HookValue>, Vec<HookValue>>(vec![payload], vec![Placeholder, Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<HookValue, HookOperation>::new();
+        let sealed = builder.import_region(viewing_region.entry_region_ref());
+        let reference = builder.add_input(HookType::Reference);
+        let payload = builder.add_input(HookType::Value);
+        assert!(
+            builder
+                .add_instruction(HookOperation::ViewRegion, vec![sealed], vec![reference, payload], None,)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -1694,7 +1782,7 @@ mod tests {
         #[derive(Clone)]
         struct TestReferenceOperation {
             name: &'static str,
-            semantics: ReferenceOperationSemantics,
+            effects: OperationEffects,
             forwarded: Option<(usize, usize)>,
         }
 
@@ -1713,8 +1801,8 @@ mod tests {
                 Ok(input_types.to_vec())
             }
 
-            fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
-                Cow::Borrowed(&self.semantics)
+            fn effects(&self) -> Cow<'_, OperationEffects> {
+                Cow::Borrowed(&self.effects)
             }
 
             fn reference_output_identity_input(&self, output_index: usize) -> Option<usize> {
@@ -1724,22 +1812,24 @@ mod tests {
 
         let access = |name, mode| TestReferenceOperation {
             name,
-            semantics: ReferenceOperationSemantics::new(vec![ReferenceInput::new(0, mode)], Vec::new()),
+            effects: OperationEffects::new(
+                Effects::PURE,
+                vec![ReferenceEffect::Access { input_index: 0, mode }],
+                Vec::new(),
+            ),
             forwarded: None,
         };
         let alias = |name, kind| TestReferenceOperation {
             name,
-            semantics: ReferenceOperationSemantics::new(
-                Vec::new(),
-                vec![ReferenceOutput::Alias { output_index: 0, input_index: 0, kind }],
-            ),
+            effects: OperationEffects::new(Effects::PURE, Vec::new(), vec![ReferenceAlias::new(0, 0, kind)]),
             forwarded: None,
         };
         let allocation = TestReferenceOperation {
             name: "reference_new",
-            semantics: ReferenceOperationSemantics::new(
+            effects: OperationEffects::new(
+                Effects::PURE,
+                vec![ReferenceEffect::Allocate { output_index: 0 }],
                 Vec::new(),
-                vec![ReferenceOutput::Allocation { output_index: 0 }],
             ),
             forwarded: None,
         };
@@ -1810,14 +1900,15 @@ mod tests {
         ));
 
         // Structured identity forwarding joins the output to its operand's family without declaring reference
-        // semantics. Independent roots remain live, and out-of-range access indices remain the arity owner's concern.
+        // effects. Independent roots remain live, and out-of-range access indices remain the arity owner's concern.
         let mut lifetimes = ReferenceLifetimes::default();
         let carry = AtomId::new(6);
         let carrier = TestReferenceOperation {
             name: "while",
-            semantics: ReferenceOperationSemantics::default(),
+            effects: OperationEffects::empty().clone(),
             forwarded: Some((0, 0)),
         };
+
         lifetimes.record(&carrier, &[root], &[carry]);
         lifetimes.record(&freeze, &[root], &[]);
         assert!(matches!(
