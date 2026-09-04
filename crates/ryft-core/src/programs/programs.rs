@@ -8,7 +8,7 @@ use crate::macros::check_count;
 use crate::parameters::{Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId};
-use crate::programs::effects::Effects;
+use crate::programs::effects::EffectsSummary;
 use crate::programs::identities::{TypeIdentityRenaming, TypeIdentitySignature};
 use crate::programs::instructions::{Instruction, InstructionId};
 use crate::programs::operations::Operation;
@@ -444,23 +444,23 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
         Ok(live_sets)
     }
 
-    /// Returns the [`Effect`](crate::Effect) classes reachable from this [`Program`]'s entry region, or
-    /// [`Effects::PURE`] for programs with no instructions. Because attached regions live in the same arena,
-    /// nested-computation effects are visible through higher-order boundaries. Attached
+    /// Returns the [`EffectsSummary`] of this [`Program`]'s entry region. The summary combines the effect classes and
+    /// unused-result observability of the entry region's instructions and all attached computation regions. Attached
     /// [`RegionRole::Rule`](crate::RegionRole::Rule) regions are excluded because they are dormant during ordinary
-    /// interpretation. The per-[`Instruction`] counterpart to this function is [`Self::instruction_effects`].
+    /// interpretation. Use [`EffectsSummary::classes`] when only the aggregate [`Effects`](crate::Effects) are needed.
+    /// The per-[`Instruction`] counterpart to this function is [`Self::instruction_effects`].
     #[inline]
-    pub fn effects(&self) -> Effects {
+    pub fn effects(&self) -> EffectsSummary {
         self.entry_region_ref().effects()
     }
 
-    /// Returns the [`Effect`](crate::Effect) classes of the [`Instruction`] at the provided [`InstructionId`]. That is
-    /// defined as the union of its [`Operation`]'s intrinsic [`Operation::effects`] and the recursively derived effects
-    /// of attached [`RegionRole::Computation`](crate::RegionRole::Computation) regions. Consulting only the operation's
+    /// Returns the [`EffectsSummary`] of the [`Instruction`] at the provided [`InstructionId`]. The summary combines
+    /// the instruction's intrinsic [`Operation::effects`] declaration with the recursively derived summaries of
+    /// attached [`RegionRole::Computation`](crate::RegionRole::Computation) regions. Consulting only the operation's
     /// intrinsic effects would be unsound for control-flow and call operations, while unconditionally including
     /// transform-only rule regions would incorrectly make the ordinary computation effectful.
     #[inline]
-    pub fn instruction_effects(&self, id: InstructionId) -> Result<Effects, ProgramError> {
+    pub fn instruction_effects(&self, id: InstructionId) -> Result<EffectsSummary, ProgramError> {
         self.region_ref(id.region())?.instruction_effects(id.index())
     }
 
@@ -645,10 +645,12 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     }
 
     /// Returns a simplified version of this [`Program`] with dead constants and [`Instruction`]s that do not contribute
-    /// to the [`Program`]'s output removed. [`Instruction`]s whose operations are not [`Effects::PURE`] are kept alive
-    /// (together with the instructions producing their inputs) even when no program output consumes their results, in
-    /// their original relative order, so that simplification never eliminates or reorders observable
-    /// [`Effect`](crate::Effect)s.
+    /// to the [`Program`]'s output removed. [`Instruction`]s with an observable consequence when unused (e.g., explicit
+    /// assertion, I/O, or opaque state effects, or reference accesses, whether intrinsic or in an attached computation
+    /// region) are kept alive together with the instructions producing their inputs even when no program output
+    /// consumes their results, in their original relative order, so that simplification never eliminates or reorders
+    /// observable [`Effect`](crate::Effect)s. A reference allocation that nothing accesses has no such consequence and
+    /// is removed like pure work when none of its outputs is used, together with its dead alias family.
     pub fn simplified(&self) -> Result<Self, ProgramError>
     where
         O: Clone,
@@ -686,9 +688,9 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                 // instruction order before the outputs, so that instructions with observable effects survive even
                 // when dead and ordered effects keep their relative order.
                 for (instruction_index, instruction) in region.instructions.iter().enumerate() {
-                    if self
+                    if !self
                         .instruction_effects(InstructionId::new(RegionId::new(region_index), instruction_index))?
-                        .is_pure()
+                        .has_observable_effects_when_unused()
                     {
                         continue;
                     }
@@ -792,10 +794,9 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
                     .iter()
                     .enumerate()
                     .filter(|(instruction_index, _)| {
-                        !self
-                            .instruction_effects(InstructionId::new(RegionId::new(region_index), *instruction_index))
+                        self.instruction_effects(InstructionId::new(RegionId::new(region_index), *instruction_index))
                             .unwrap()
-                            .is_pure()
+                            .has_observable_effects_when_unused()
                     })
                     .map(|(instruction_index, instruction)| (instruction_index, instruction.outputs().to_vec()))
                     .collect::<Vec<_>>()
@@ -1216,7 +1217,9 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
             .iter()
             .enumerate()
             .filter(|(instruction_index, _)| {
-                !self.instruction_effects(InstructionId::new(self.entry, *instruction_index)).unwrap().is_pure()
+                self.instruction_effects(InstructionId::new(self.entry, *instruction_index))
+                    .unwrap()
+                    .has_observable_effects_when_unused()
             })
             .map(|(instruction_index, _)| instruction_index)
             .collect::<Vec<_>>();
@@ -2020,7 +2023,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
-        DimensionBounds, DimensionVariable, Shape,
+        DimensionBounds, DimensionVariable, ReferenceIndexOperation, Shape,
     };
     use crate::macros::check_count;
     use crate::operations::{
@@ -2029,10 +2032,13 @@ mod tests {
     };
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
-    use crate::programs::effects::{Effect, Effects};
+    use crate::programs::effects::{Effect, Effects, OperationEffects, ReferenceEffect};
     use crate::programs::operations::OperationFormatter;
     use crate::programs::provenance::{Provenance, ProvenanceScope};
-    use crate::programs::regions::RegionSlot;
+    use crate::programs::references::{
+        ReferenceNewOperation, ReferenceReadOperation, ReferenceType, ReferenceWriteOperation,
+    };
+    use crate::programs::regions::{RegionInterface, RegionSlot};
     use crate::programs::types::TypeError;
     use crate::tests::{TestOrderedStateOperation, TestRegionOperation};
 
@@ -2092,8 +2098,8 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn effects(&self) -> Effects {
-            Effects::single(Effect::OrderedIo)
+        fn effects(&self) -> Cow<'_, OperationEffects> {
+            Cow::Owned(OperationEffects::explicit(Effects::single(Effect::OrderedIo)))
         }
     }
 
@@ -2130,8 +2136,12 @@ mod tests {
             Ok(input_types.to_vec())
         }
 
-        fn effects(&self) -> Effects {
-            if matches!(self, Self::Effectful) { Effects::single(Effect::OrderedIo) } else { Effects::PURE }
+        fn effects(&self) -> Cow<'_, OperationEffects> {
+            Cow::Owned(OperationEffects::explicit(if matches!(self, Self::Effectful) {
+                Effects::single(Effect::OrderedIo)
+            } else {
+                Effects::PURE
+            }))
         }
     }
 
@@ -2836,7 +2846,9 @@ mod tests {
         // The pure program above reports no effects, and simplification removed its dead `add` as asserted. Effectful
         // instructions, in contrast, are kept alive by simplification even when they are dead code: nothing consumes
         // the print's output below, so only its effect keeps it in the simplified program.
-        assert_eq!(program.effects(), Effects::PURE);
+        let effects = program.effects();
+        assert_eq!(effects.classes(), Effects::PURE);
+        assert!(!effects.has_observable_effects_when_unused());
         let build = || {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
             let input = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -2846,7 +2858,9 @@ mod tests {
             builder.build::<Array, Array>(vec![doubled], Placeholder, Placeholder).unwrap()
         };
         let effectful = build();
-        assert_eq!(effectful.effects(), Effects::single(Effect::OrderedIo));
+        let effects = effectful.effects();
+        assert_eq!(effects.classes(), Effects::single(Effect::OrderedIo));
+        assert!(effects.has_observable_effects_when_unused());
         let expected = indoc! {"
             lambda %0:f64[] .
             let %1:f64[] = print [label=x] %0
@@ -2919,6 +2933,204 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected,
         );
+    }
+
+    #[test]
+    fn test_program_simplified_removes_unused_reference_new_but_keeps_reference_read() {
+        type TestValue = ArrayIrValue<Array>;
+        type TestOperation = ArrayIrOperation<Array>;
+
+        // Create a program with two allocations: one that nothing accesses and one whose (unused) read is retained.
+        // An allocation has no observable consequence when unused, so the first allocation disappears, while a read
+        // does and is retained, which keeps the allocation it reads alive as its dependency.
+        let build_program = || {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap();
+            let read = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![read], None).unwrap();
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![input], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let expected = indoc! {"
+            lambda %0:f32[] .
+            let %1:ref<f32[]> = reference_new %0
+                %2:f32[] = reference_read %1
+            in (%0)
+        "}
+        .trim_end();
+        assert_eq!(build_program().simplified().unwrap().to_string(), expected);
+        assert_eq!(build_program().into_simplified().unwrap().to_string(), expected);
+    }
+
+    #[test]
+    fn test_program_simplified_roots_reference_accesses_but_not_allocations() {
+        type TestValue = ArrayIrValue<Array>;
+        type TestOperation = ArrayIrOperation<Array>;
+
+        // Dead-code elimination roots an output-dead instruction exactly when its effect summary has an observable
+        // consequence when unused. Allocations and aliases do not (i.e., the allocation nothing touches and the
+        // allocation whose only user is a dead view disappear together with that view). Accesses do, whatever their
+        // mode (i.e., the unused read and the write, which has no outputs at all, are retained, and each keeps the
+        // allocation it accesses alive as its dependency). A live allocation is retained by ordinary liveness.
+        let build_program = || {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let scalar = builder.add_input(ArrayType::scalar(DataType::F32).into());
+            let vector = builder.add_input(ArrayType::new_static(DataType::F32, [3]).into());
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![scalar], None).unwrap();
+            let viewed =
+                builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![vector], None).unwrap()[0];
+            builder.add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![viewed], None).unwrap();
+            let read =
+                builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![scalar], None).unwrap()[0];
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![read], None).unwrap();
+            let written =
+                builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![scalar], None).unwrap()[0];
+            builder
+                .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![written, scalar], None)
+                .unwrap();
+            let live =
+                builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![scalar], None).unwrap()[0];
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![live], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let names = |program: Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>| {
+            program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>()
+        };
+        let expected = vec!["reference_new", "reference_read", "reference_new", "reference_write", "reference_new"];
+        assert_eq!(names(build_program().simplified().unwrap()), expected);
+        assert_eq!(names(build_program().into_simplified().unwrap()), expected);
+    }
+
+    #[test]
+    fn test_program_simplified_composes_nested_effect_summaries() {
+        type TestValue = ArrayIrValue<Array>;
+
+        // A region-carrying operation whose own declaration is allocation-only, so that whether an output-dead
+        // application is retained is decided entirely by the summaries of its attached regions. `Effectful`
+        // supplies each explicit effect class for the bodies and `Native` supplies the reference primitives.
+        #[derive(Clone, Debug)]
+        enum TestOperation {
+            Native(ArrayIrOperation<Array>),
+            Effectful(Effect),
+            AllocateWith(&'static [RegionSlot]),
+        }
+
+        impl<O: Into<ArrayIrOperation<Array>>> From<O> for TestOperation {
+            fn from(operation: O) -> Self {
+                Self::Native(operation.into())
+            }
+        }
+
+        impl Operation for TestOperation {
+            type Type = ArrayIrType;
+
+            fn name(&self) -> &'static str {
+                match self {
+                    Self::Native(operation) => operation.name(),
+                    Self::Effectful(_) => "effectful",
+                    Self::AllocateWith(_) => "allocate_with",
+                }
+            }
+
+            fn region_slots(&self) -> &'static [RegionSlot] {
+                match self {
+                    Self::Native(_) | Self::Effectful(_) => &[],
+                    Self::AllocateWith(slots) => slots,
+                }
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayIrType],
+                region_interfaces: &[RegionInterface<ArrayIrType>],
+            ) -> Result<Vec<ArrayIrType>, TypeError> {
+                match self {
+                    Self::Native(operation) => operation.infer_output_types(input_types, region_interfaces),
+                    Self::Effectful(_) => Ok(input_types.to_vec()),
+                    Self::AllocateWith(_) => match input_types {
+                        [ArrayIrType::Array(r#type)] => Ok(vec![ReferenceType::new(r#type.clone()).into()]),
+                        _ => Err(TypeError::invalid("`allocate_with` expects one array input")),
+                    },
+                }
+            }
+
+            fn effects(&self) -> Cow<'_, OperationEffects> {
+                match self {
+                    Self::Native(operation) => operation.effects(),
+                    Self::Effectful(effect) => Cow::Owned(OperationEffects::explicit(Effects::single(*effect))),
+                    Self::AllocateWith(_) => Cow::Owned(OperationEffects::new(
+                        Effects::PURE,
+                        vec![ReferenceEffect::Allocate { output_index: 0 }],
+                        Vec::new(),
+                    )),
+                }
+            }
+        }
+
+        // Builds a body over one scalar input whose instructions are appended by `populate`, then attaches it to an
+        // output-dead `allocate_with` application in the declared slot and returns the simplified instruction names.
+        let simplified =
+            |slots: &'static [RegionSlot], populate: &dyn Fn(&mut ProgramBuilder<TestValue, TestOperation>, AtomId)| {
+                let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+                let body_input = body_builder.add_input(ArrayType::scalar(DataType::F32).into());
+                populate(&mut body_builder, body_input);
+                let body = body_builder
+                    .build::<Vec<TestValue>, Vec<TestValue>>(vec![body_input], vec![Placeholder], vec![Placeholder])
+                    .unwrap();
+                let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+                let body = builder.import_region(body.entry_region_ref());
+                let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
+                builder.add_instruction(TestOperation::AllocateWith(slots), vec![body], vec![input], None).unwrap();
+                let program = builder
+                    .build::<Vec<TestValue>, Vec<TestValue>>(vec![input], vec![Placeholder], vec![Placeholder])
+                    .unwrap();
+                let simplified = program.simplified().unwrap();
+                let into_simplified = program.into_simplified().unwrap();
+                assert_eq!(simplified.to_string(), into_simplified.to_string());
+                simplified
+                    .instructions()
+                    .iter()
+                    .map(|instruction| instruction.operation().name())
+                    .collect::<Vec<_>>()
+            };
+        const COMPUTATION: &[RegionSlot] = &[RegionSlot::computation("body")];
+        const RULE: &[RegionSlot] = &[RegionSlot::rule("rule")];
+        let effectful = |effect| {
+            move |builder: &mut ProgramBuilder<TestValue, TestOperation>, input: AtomId| {
+                builder.add_instruction(TestOperation::Effectful(effect), Vec::new(), vec![input], None).unwrap();
+            }
+        };
+
+        // An allocation-only application over a pure or allocation-only computation has no observable consequence when
+        // unused and is removed as a whole, together with its attached region.
+        assert_eq!(simplified(COMPUTATION, &|_, _| {}), Vec::<&str>::new());
+        assert_eq!(
+            simplified(COMPUTATION, &|builder, input| {
+                builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap();
+            }),
+            Vec::<&str>::new(),
+        );
+
+        // Any observable nested effect retains the enclosing application even though its own declaration is
+        // discardable (I/O, an assertion, opaque state, and a reference access inside the computation region).
+        assert_eq!(simplified(COMPUTATION, &effectful(Effect::OrderedIo)), vec!["allocate_with"]);
+        assert_eq!(simplified(COMPUTATION, &effectful(Effect::UnorderedIo)), vec!["allocate_with"]);
+        assert_eq!(simplified(COMPUTATION, &effectful(Effect::OrderedAssertion)), vec!["allocate_with"]);
+        assert_eq!(simplified(COMPUTATION, &effectful(Effect::OrderedState)), vec!["allocate_with"]);
+        assert_eq!(
+            simplified(COMPUTATION, &|builder, input| {
+                let reference =
+                    builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap();
+            }),
+            vec!["allocate_with"],
+        );
+
+        // A dormant rule region is not executed by the application, so its effects do not retain it.
+        assert_eq!(simplified(RULE, &effectful(Effect::OrderedIo)), Vec::<&str>::new());
     }
 
     #[test]
@@ -3310,7 +3522,7 @@ mod tests {
         let (filtered, live) = effectful.filtered(&[input], &[output], &[]).unwrap();
         assert_eq!(live, vec![0]);
         assert_eq!(filtered.instructions().len(), 2);
-        assert_eq!(filtered.effects(), Effects::single(Effect::OrderedIo));
+        assert_eq!(filtered.effects().classes(), Effects::single(Effect::OrderedIo));
 
         // Zero-output effects are preserved explicitly because they have no result atom that can serve as a root.
         let mut builder = ProgramBuilder::<Array, ZeroOutputEffectOperation>::new();
@@ -3320,6 +3532,42 @@ mod tests {
         let (filtered, live) = effectful.filtered(&[input], &[], &[]).unwrap();
         assert_eq!(live, vec![0]);
         assert_eq!(filtered.instructions().len(), 1);
+    }
+
+    #[test]
+    fn test_program_filtered_removes_unused_reference_new_but_keeps_reference_read() {
+        type TestValue = ArrayIrValue<Array>;
+        type TestOperation = ArrayIrOperation<Array>;
+
+        // Liveness analysis roots the same instructions as simplification: an allocation that nothing accesses has no
+        // observable consequence when unused and is pruned, while an unused read does and is retained together with the
+        // allocation it reads, for both the borrowing and the consuming projection.
+        let build_program = || {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap();
+            let read = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![read], None).unwrap();
+            let program = builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![input], vec![Placeholder], vec![Placeholder])
+                .unwrap();
+            (program, input)
+        };
+        let expected = indoc! {"
+            lambda %0:f32[] .
+            let %1:ref<f32[]> = reference_new %0
+                %2:f32[] = reference_read %1
+            in (%0)
+        "}
+        .trim_end();
+        let (program, input) = build_program();
+        let (filtered, live) = program.filtered(&[input], &[input], &[]).unwrap();
+        assert_eq!(live, vec![0]);
+        assert_eq!(filtered.to_string(), expected);
+        let (program, input) = build_program();
+        let (filtered, live) = program.into_filtered(&[input], &[input], &[]).unwrap();
+        assert_eq!(live, vec![0]);
+        assert_eq!(filtered.to_string(), expected);
     }
 
     #[test]
@@ -3672,12 +3920,15 @@ mod tests {
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let entry = program.entry();
-        assert_eq!(
-            program.instruction_effects(InstructionId::new(entry, 0)).unwrap(),
-            Effects::single(Effect::OrderedState),
-        );
-        assert_eq!(program.instruction_effects(InstructionId::new(entry, 1)).unwrap(), Effects::PURE);
-        assert_eq!(program.effects(), Effects::single(Effect::OrderedState));
+        let effects = program.instruction_effects(InstructionId::new(entry, 0)).unwrap();
+        assert_eq!(effects.classes(), Effects::single(Effect::OrderedState));
+        assert!(effects.has_observable_effects_when_unused());
+        let effects = program.instruction_effects(InstructionId::new(entry, 1)).unwrap();
+        assert_eq!(effects.classes(), Effects::PURE);
+        assert!(!effects.has_observable_effects_when_unused());
+        let effects = program.effects();
+        assert_eq!(effects.classes(), Effects::single(Effect::OrderedState));
+        assert!(effects.has_observable_effects_when_unused());
 
         // Effects in transform-only rule regions are dormant during ordinary execution and therefore do not make the
         // containing instruction or program effectful.
@@ -3693,7 +3944,11 @@ mod tests {
         let output =
             builder.add_instruction(DormantRegionOperation::Dormant, vec![dormant], vec![input], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
-        assert_eq!(program.instruction_effects(InstructionId::new(program.entry(), 0)).unwrap(), Effects::PURE);
-        assert_eq!(program.effects(), Effects::PURE);
+        let effects = program.instruction_effects(InstructionId::new(program.entry(), 0)).unwrap();
+        assert_eq!(effects.classes(), Effects::PURE);
+        assert!(!effects.has_observable_effects_when_unused());
+        let effects = program.effects();
+        assert_eq!(effects.classes(), Effects::PURE);
+        assert!(!effects.has_observable_effects_when_unused());
     }
 }
