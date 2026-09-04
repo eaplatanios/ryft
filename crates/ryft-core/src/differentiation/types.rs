@@ -11,7 +11,7 @@ use crate::operations::{
     Slice, Transpose, TransposeOperation, Zero,
 };
 use crate::parameters::ParameterPath;
-use crate::programs::{ProgramError, ProvenanceScope, RegionRef, Type, TypeError, Typed, Value};
+use crate::programs::{ProgramError, ProvenanceScope, ReferenceType, RegionRef, Type, TypeError, Typed, Value};
 use crate::tracing::TracingContext;
 
 /// A [`Type`] whose forward perturbations and reverse adjoints carry well-defined differential representations.
@@ -102,6 +102,31 @@ impl DifferentiableType for DataType {
     }
 }
 
+// A reference's differential representations are references over the referent's differential representations (i.e.,
+// the tangent of `ref<T>` is `ref<tangent(T)>` and the cotangent is `ref<cotangent(T)>`). Forward mode differentiation
+// threads a tangent reference beside every active primal reference and reverse mode differentiation accumulates into
+// a cotangent reference, so both keep the referent's identity-based aliasing rather than snapshotting its contents.
+impl<T: DifferentiableType> DifferentiableType for ReferenceType<T> {
+    #[inline]
+    fn is_zero_space(&self) -> bool {
+        // A reference type is never zero-space, even over a zero-space referent such as `ref<zero[]>`, because a
+        // reference names an allocation with persistent identity and cannot be materialized from its type alone.
+        // Reporting `false` keeps a concrete boundary slot for every reference leaf, so the caller always supplies
+        // the tangent reference or cotangent destination and no transform boundary ever has to produce a reference.
+        false
+    }
+
+    #[inline]
+    fn tangent(&self) -> Result<Self, DifferentiationError> {
+        Ok(Self::new(self.referent().tangent()?))
+    }
+
+    #[inline]
+    fn cotangent(&self) -> Result<Self, DifferentiationError> {
+        Ok(Self::new(self.referent().cotangent()?))
+    }
+}
+
 impl DifferentiableType for ArrayType {
     #[inline]
     fn is_zero_space(&self) -> bool {
@@ -133,11 +158,7 @@ impl DifferentiableType for ArrayIrType {
         match self {
             Self::Array(r#type) => r#type.is_zero_space(),
             Self::Dimension(_) => true,
-            Self::Reference(_) => {
-                // A reference is not itself a differential value. Returning `false` avoids misclassifying it as a
-                // structural zero. `Self::tangent` and `Self::cotangent` provide the authoritative rejection.
-                false
-            }
+            Self::Reference(r#type) => r#type.is_zero_space(),
         }
     }
 
@@ -151,7 +172,7 @@ impl DifferentiableType for ArrayIrType {
                 // has one canonical backend representation.
                 Ok(Self::Array(ArrayType::scalar(DataType::Zero)))
             }
-            Self::Reference(_) => Err(DifferentiationError::UndefinedTangentType { primal_type: self.to_string() }),
+            Self::Reference(r#type) => Ok(Self::Reference(r#type.tangent()?)),
         }
     }
 
@@ -164,7 +185,7 @@ impl DifferentiableType for ArrayIrType {
                 // member prevents a zero value from being mistaken for a first-class dimension.
                 Ok(Self::Array(ArrayType::scalar(DataType::Zero)))
             }
-            Self::Reference(_) => Err(DifferentiationError::UndefinedCotangentType { primal_type: self.to_string() }),
+            Self::Reference(r#type) => Ok(Self::Reference(r#type.cotangent()?)),
         }
     }
 }
@@ -964,15 +985,39 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_type_reference_tangent_and_cotangent_are_undefined() {
-        let r#type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(F32)));
-        let primal_type = r#type.to_string();
+    fn test_reference_type_differential_representations() {
+        // A reference's differential representations wrap the referent's, so a widened element representation and
+        // swapped cotangent sharding axes carry over from the referent unchanged.
+        let differentiable = ReferenceType::new(ArrayType::new(F32, Shape::new(vec![Dimension::Static(4)])));
+        assert!(!differentiable.is_zero_space());
+        assert_eq!(differentiable.tangent(), Ok(differentiable.clone()));
+        assert_eq!(differentiable.cotangent(), Ok(differentiable));
+        let widened = ReferenceType::new(ArrayType::scalar(F8E8M0FNU));
+        assert_eq!(widened.tangent(), Ok(ReferenceType::new(ArrayType::scalar(F32))));
+        assert_eq!(widened.cotangent(), Ok(ReferenceType::new(ArrayType::scalar(F32))));
+
+        // A reference over a zero-space referent is still not zero-space itself: it keeps a concrete boundary slot
+        // because no zero reference can be materialized from its type alone.
+        let non_differentiable = ReferenceType::new(ArrayType::scalar(I32));
+        assert!(!non_differentiable.is_zero_space());
+        assert_eq!(non_differentiable.tangent(), Ok(ReferenceType::new(ArrayType::scalar(Zero))));
+        assert_eq!(non_differentiable.cotangent(), Ok(ReferenceType::new(ArrayType::scalar(Zero))));
+        assert!(!non_differentiable.tangent().unwrap().is_zero_space());
+    }
+
+    #[test]
+    fn test_array_ir_type_reference_tangent_and_cotangent() {
+        let r#type = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(F32, [4])));
         assert!(!r#type.is_zero_space());
-        assert_eq!(
-            r#type.tangent(),
-            Err(DifferentiationError::UndefinedTangentType { primal_type: primal_type.clone() }),
-        );
-        assert_eq!(r#type.cotangent(), Err(DifferentiationError::UndefinedCotangentType { primal_type }));
+        assert_eq!(r#type.tangent(), Ok(r#type.clone()));
+        assert_eq!(r#type.cotangent(), Ok(r#type));
+
+        let non_differentiable = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(I32)));
+        let zero_reference = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(Zero)));
+        assert!(!non_differentiable.is_zero_space());
+        assert!(!zero_reference.is_zero_space());
+        assert_eq!(non_differentiable.tangent(), Ok(zero_reference.clone()));
+        assert_eq!(non_differentiable.cotangent(), Ok(zero_reference));
     }
 
     #[test]
