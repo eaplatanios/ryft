@@ -8,7 +8,7 @@
 //! [`RegionRef`] borrows a root together with its complete source arena. It supports inspection without cloning and
 //! can materialize the reachable region graph as an owned [`Program`] through [`RegionRef::to_program`]. Regions are
 //! sealed before attachment to an [`Instruction`]/[`Program`], and so borrowed views remain immutable and recursively
-//! derived metadata such as [`Effects`] cannot become stale.
+//! derived metadata such as [`EffectClasses`] cannot become stale.
 //!
 //! [`RegionInterface`] is the type-and-effect summary passed to [`Operation::infer_output_types`]. It deliberately
 //! exposes a region boundary without exposing the region body. [`InputRegionProvenance`] describes how an attached
@@ -34,7 +34,7 @@ use crate::parameters::{Parameter, Placeholder};
 use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId};
 use crate::programs::builders::ProgramBuilder;
-use crate::programs::effects::{Effect, EffectOccurrence, Effects, EffectsSummary};
+use crate::programs::effects::{EffectClass, EffectClassOccurrence, EffectClasses, EffectsSummary};
 use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature};
 use crate::programs::instructions::{Instruction, InstructionId};
 use crate::programs::operations::Operation;
@@ -518,8 +518,8 @@ enum TransformCachePolicy {
 
 /// Append-only arena of sealed [`Region`]s and their immutable derived metadata. [`RegionId`]s are stable indexes into
 /// this arena. A region may reference only entries that precede it, allowing construction to validate and derive
-/// recursive metadata like [`Effects`] and [`TypeIdentitySignature`]s in one ascending pass. Built [`Program`]s retain
-/// this arena without exposing mutable access to either regions or metadata.
+/// recursive metadata like [`EffectClasses`] and [`TypeIdentitySignature`]s in one ascending pass. Built [`Program`]s
+/// retain this arena without exposing mutable access to either regions or metadata.
 #[derive(Clone, Debug)]
 pub struct RegionArena<V: Typed + Parameter, O> {
     /// Sealed [`Region`]s and their derived metadata, in [`RegionId`] order.
@@ -652,7 +652,7 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionArena<V, O> {
     /// Appends every sealed [`Region`] in `other` to this [`RegionArena`], rebasing its internal [`RegionId`]
     /// references by this arena's original length, and returns that offset. The derived metadata remains valid because
     /// rebasing preserves the complete source graph's topology and does not change any region boundary, [`Operation`],
-    /// [`Effect`](crate::Effect), or [`TypeIdentity`](crate::TypeIdentity).
+    /// [`EffectClass`], or [`TypeIdentity`](crate::TypeIdentity).
     pub fn append(&mut self, mut other: Self) -> usize {
         let offset = self.regions.len();
         for region in &mut other.regions {
@@ -933,24 +933,28 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
         })
     }
 
-    /// Returns the operations in this region's complete attached region closure that intrinsically carry `effect`.
-    /// Each occurrence retains its source [`InstructionId`], and shared descendants are visited once. Attached region
-    /// effects are inspected through their own operations rather than attributed to the enclosing carrier.
+    /// Returns the operations in this region's complete attached region closure that intrinsically carry the provided
+    /// [`EffectClass`]. Each occurrence retains its source [`InstructionId`], and shared descendants are visited once.
+    /// Attached region effects are inspected through their own operations rather than attributed to the enclosing
+    /// carrier.
     #[inline]
-    pub fn effect_occurrences_in_closure(self, effect: Effect) -> impl Iterator<Item = EffectOccurrence<'r, O>> {
+    pub fn effect_occurrences_in_closure(
+        self,
+        effect_class: EffectClass,
+    ) -> impl Iterator<Item = EffectClassOccurrence<'r, O>> {
         self.instructions_in_closure()
-            .filter(move |(_, instruction)| instruction.operation().effects().classes().contains(effect))
-            .map(|(id, instruction)| EffectOccurrence::new(id, instruction.operation()))
+            .filter(move |(_, instruction)| instruction.operation().effects().classes().contains(effect_class))
+            .map(|(id, instruction)| EffectClassOccurrence::new(id, instruction.operation()))
     }
 
     /// Returns `true` if any instruction in this [`Region`]'s complete attached region closure (dormant rule regions
-    /// included) carries the provided [`Effect`]. [`RegionRef::effects`] deliberately excludes dormant rule regions
-    /// because merely attaching a rule does not execute it, but transforms that may activate those rules later (most
-    /// importantly, differentiation, which replays custom-derivative rule regions) must also account for effects
+    /// included) carries the provided [`EffectClass`]. [`RegionRef::effects`] deliberately excludes dormant rule
+    /// regions because merely attaching a rule does not execute it, but transforms that may activate those rules later
+    /// (most importantly, differentiation, which replays custom-derivative rule regions) must also account for effects
     /// hidden inside them at any nesting depth, and consult this closure-wide scan instead.
     #[inline]
-    pub fn contains_effect_in_closure(self, effect: Effect) -> bool {
-        self.any_region_in_closure(|region| region.effects().classes().contains(effect))
+    pub fn contains_effect_in_closure(self, effect_class: EffectClass) -> bool {
+        self.any_region_in_closure(|region| region.effects().classes().contains(effect_class))
     }
 
     /// Returns whether any [`Atom`] in this [`Region`]'s complete attached region closure is accepted by `predicate`.
@@ -1085,12 +1089,13 @@ impl<V: Value, O: Operation<Type = V::Type>> Clone for RegionRef<'_, V, O> {
 #[serde(rename_all = "snake_case")]
 pub enum RegionRole {
     /// The [`Region`] may execute as part of ordinary interpretation, such as a control-flow bodies, callees, or primal
-    /// computations. Its recursively derived [`Effects`] are consequently observable effects of the owning operation.
+    /// computations. Its recursively derived [`EffectClasses`] are consequently observable effects of the owning
+    /// operation.
     Computation,
 
     /// The [`Region`] represents a dormant transformation rule, such as a custom derivative or rematerialization rule.
-    /// It is consumed by a transform rather than ordinary interpretation and so its [`Effects`] do not belong to the
-    /// owning computation.
+    /// It is consumed by a transform rather than ordinary interpretation and so its [`EffectClasses`] do not belong to
+    /// the owning computation.
     Rule,
 }
 
@@ -1118,9 +1123,9 @@ impl RegionSlot {
 
 /// Read-only boundary summary of a sealed [`Region`], as seen by [`Operation`] type inference. A [`RegionInterface`]
 /// preserves the exact [`Region::input_ids`] and [`Region::output_ids`] order and carries the region's recursively
-/// derived [`Effects`], so that region-carrying operations can validate and consume the boundary contracts of their
-/// attached regions (e.g., a condition operation checking that its branches agree, or a while operation rejecting an
-/// effectful body when its predicate is batched) without ever seeing the region contents. [`ProgramBuilder`]s derive
+/// derived [`EffectClasses`], so that region-carrying operations can validate and consume the boundary contracts of
+/// their attached regions (e.g., a condition operation checking that its branches agree, or a while operation rejecting
+/// an effectful body when its predicate is batched) without ever seeing the region contents. [`ProgramBuilder`]s derive
 /// [`RegionInterface`]s from their own region arenas immediately before invoking [`Operation::infer_output_types`] and
 /// never store them. Final [`Program`] validation independently derives them again so that callers cannot inject stale
 /// interface metadata into an [`Instruction`]. Note, though, that constructing a [`RegionInterface`] directly is still
@@ -1134,14 +1139,14 @@ pub struct RegionInterface<T: Type> {
     /// [`Type`]s derived from the [`Region`]'s output [`Atom`]s, in [`Region::output_ids`] order.
     output_types: Vec<T>,
 
-    /// [`Effects`] of the [`Region`], derived recursively from its [`Instruction`]s and their attached regions.
-    effects: Effects,
+    /// [`EffectClasses`] of the [`Region`], derived recursively from its [`Instruction`]s and their attached regions.
+    effects: EffectClasses,
 }
 
 impl<T: Type> RegionInterface<T> {
     /// Creates a new [`RegionInterface`].
     #[inline]
-    pub fn new(input_types: Vec<T>, output_types: Vec<T>, effects: Effects) -> Self {
+    pub fn new(input_types: Vec<T>, output_types: Vec<T>, effects: EffectClasses) -> Self {
         Self { input_types, output_types, effects }
     }
 
@@ -1157,10 +1162,10 @@ impl<T: Type> RegionInterface<T> {
         &self.output_types
     }
 
-    /// Returns the [`Effects`] of the [`Region`], derived recursively from its [`Instruction`]s
+    /// Returns the [`EffectClasses`] of the [`Region`], derived recursively from its [`Instruction`]s
     /// and their attached regions.
     #[inline]
-    pub fn effects(&self) -> Effects {
+    pub fn effects(&self) -> EffectClasses {
         self.effects
     }
 }
@@ -1658,7 +1663,7 @@ mod tests {
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
-    use crate::programs::effects::Effect;
+    use crate::programs::effects::EffectClass;
     use crate::programs::identities::TypeIdentity;
     use crate::programs::programs::Program;
     use crate::programs::references::{ReferenceNewOperation, ReferenceReadOperation, ReferenceType};
@@ -1953,13 +1958,13 @@ mod tests {
                 Vec::new(),
                 vec![
                     Instruction::new(
-                        TestRegionOperation::Effectful(Effect::OrderedIo),
+                        TestRegionOperation::Effectful(EffectClass::OrderedIo),
                         Vec::new(),
                         Vec::new(),
                         Vec::new(),
                     ),
                     Instruction::new(
-                        TestRegionOperation::Effectful(Effect::OrderedState),
+                        TestRegionOperation::Effectful(EffectClass::OrderedState),
                         Vec::new(),
                         Vec::new(),
                         Vec::new(),
@@ -2161,7 +2166,8 @@ mod tests {
     fn test_region_arena_effects() {
         let (arena, [_, _, _, root]) = diamond_closure_arena();
         let summary = arena.effects(root).unwrap();
-        let expected_classes = Effects::single(Effect::OrderedIo).union(Effects::single(Effect::OrderedState));
+        let expected_classes =
+            EffectClasses::single(EffectClass::OrderedIo).union(EffectClasses::single(EffectClass::OrderedState));
         assert_eq!(summary.classes(), expected_classes);
         assert!(summary.has_observable_effects_when_unused());
         assert_eq!(arena.effects(RegionId::new(arena.len())), None);
@@ -2172,7 +2178,7 @@ mod tests {
         let mut body_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let body_input = body_builder.add_input(ArrayType::scalar(DataType::F64));
         let body_output = body_builder
-            .add_instruction(TestRegionOperation::Effectful(Effect::OrderedIo), Vec::new(), vec![body_input], None)
+            .add_instruction(TestRegionOperation::Effectful(EffectClass::OrderedIo), Vec::new(), vec![body_input], None)
             .unwrap()[0];
         let body = body_builder
             .build::<Vec<Array>, Vec<Array>>(vec![body_output], vec![Placeholder], vec![Placeholder])
@@ -2196,8 +2202,11 @@ mod tests {
         assert_eq!(arena.len(), 2);
         assert_eq!(arena.iter().count(), 2);
         assert_eq!(arena[body.index()].input_types(), vec![ArrayType::scalar(DataType::F64)]);
-        assert_eq!(program.region_ref(body).unwrap().effects().classes(), Effects::single(Effect::OrderedIo));
-        assert_eq!(program.entry_region_ref().effects().classes(), Effects::single(Effect::OrderedIo));
+        assert_eq!(
+            program.region_ref(body).unwrap().effects().classes(),
+            EffectClasses::single(EffectClass::OrderedIo)
+        );
+        assert_eq!(program.entry_region_ref().effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
         assert!(std::ptr::eq(
             program.entry_region_ref().type_identity_signature(),
             program.entry_region_ref().type_identity_signature(),
@@ -2271,7 +2280,7 @@ mod tests {
         let interface = region.interface();
         assert_eq!(interface.input_types(), &[ArrayType::scalar(DataType::F64)]);
         assert_eq!(interface.output_types(), &[ArrayType::scalar(DataType::F64)]);
-        assert_eq!(interface.effects(), Effects::PURE);
+        assert_eq!(interface.effects(), EffectClasses::NONE);
 
         // Closure-wide atom queries inspect the root and its reused descendant, accept both atoms and their types,
         // and return false when no matching type or reference occurs anywhere in that closure.
@@ -2325,7 +2334,8 @@ mod tests {
         // and preserves the public observability information used to decide whether unused work may be discarded.
         let (arena, [_, _, _, root]) = diamond_closure_arena();
         let summary = RegionRef::new(&arena, root).unwrap().instruction_effects(0).unwrap();
-        let expected_classes = Effects::single(Effect::OrderedIo).union(Effects::single(Effect::OrderedState));
+        let expected_classes =
+            EffectClasses::single(EffectClass::OrderedIo).union(EffectClasses::single(EffectClass::OrderedState));
         assert_eq!(summary.classes(), expected_classes);
         assert!(summary.has_observable_effects_when_unused());
 
@@ -2337,7 +2347,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
                 vec![Instruction::new(
-                    TestRegionOperation::Effectful(Effect::OrderedIo),
+                    TestRegionOperation::Effectful(EffectClass::OrderedIo),
                     Vec::new(),
                     Vec::new(),
                     Vec::new(),
@@ -2357,12 +2367,12 @@ mod tests {
         ])
         .unwrap();
         let summary = RegionRef::new(&arena, dormant).unwrap().instruction_effects(0).unwrap();
-        assert_eq!(summary.classes(), Effects::PURE);
+        assert_eq!(summary.classes(), EffectClasses::NONE);
         assert!(!summary.has_observable_effects_when_unused());
 
         let program = program_with_reused_region();
         let summary = program.entry_region_ref().instruction_effects(0).unwrap();
-        assert_eq!(summary.classes(), Effects::PURE);
+        assert_eq!(summary.classes(), EffectClasses::NONE);
         assert!(!summary.has_observable_effects_when_unused());
 
         let error = ProgramError::MalformedProgram(format!(
@@ -2395,8 +2405,8 @@ mod tests {
         assert_eq!(
             instructions,
             vec![
-                (InstructionId::new(shared, 0), TestRegionOperation::Effectful(Effect::OrderedIo)),
-                (InstructionId::new(shared, 1), TestRegionOperation::Effectful(Effect::OrderedState)),
+                (InstructionId::new(shared, 0), TestRegionOperation::Effectful(EffectClass::OrderedIo)),
+                (InstructionId::new(shared, 1), TestRegionOperation::Effectful(EffectClass::OrderedState)),
                 (InstructionId::new(first, 0), TestRegionOperation::WithRegions(shared_slot)),
                 (InstructionId::new(second, 0), TestRegionOperation::WithRegions(shared_slot)),
                 (
@@ -2420,8 +2430,18 @@ mod tests {
             Vec::new(),
             Vec::new(),
             vec![
-                Instruction::new(TestRegionOperation::Effectful(Effect::OrderedIo), Vec::new(), Vec::new(), Vec::new()),
-                Instruction::new(TestRegionOperation::Effectful(Effect::OrderedIo), Vec::new(), Vec::new(), Vec::new()),
+                Instruction::new(
+                    TestRegionOperation::Effectful(EffectClass::OrderedIo),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
+                Instruction::new(
+                    TestRegionOperation::Effectful(EffectClass::OrderedIo),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                ),
             ],
         )];
         const DEPTH: usize = 64;
@@ -2443,16 +2463,16 @@ mod tests {
         }
         let arena = RegionArena::from_regions(regions).unwrap();
         let top = RegionRef::new(&arena, RegionId::new(DEPTH)).unwrap();
-        assert!(top.effects().classes().is_pure());
-        assert!(top.contains_effect_in_closure(Effect::OrderedIo));
-        assert!(!top.contains_effect_in_closure(Effect::OrderedState));
-        let occurrences = top.effect_occurrences_in_closure(Effect::OrderedIo).collect::<Vec<_>>();
+        assert!(top.effects().classes().is_empty());
+        assert!(top.contains_effect_in_closure(EffectClass::OrderedIo));
+        assert!(!top.contains_effect_in_closure(EffectClass::OrderedState));
+        let occurrences = top.effect_occurrences_in_closure(EffectClass::OrderedIo).collect::<Vec<_>>();
         assert_eq!(occurrences.len(), 2);
         assert_eq!(occurrences[0].instruction(), InstructionId::new(RegionId::new(0), 0));
         assert_eq!(occurrences[1].instruction(), InstructionId::new(RegionId::new(0), 1));
-        assert!(matches!(occurrences[0].operation(), TestRegionOperation::Effectful(Effect::OrderedIo)));
-        assert!(matches!(occurrences[1].operation(), TestRegionOperation::Effectful(Effect::OrderedIo)));
-        assert_eq!(top.effect_occurrences_in_closure(Effect::OrderedState).count(), 0);
+        assert!(matches!(occurrences[0].operation(), TestRegionOperation::Effectful(EffectClass::OrderedIo)));
+        assert!(matches!(occurrences[1].operation(), TestRegionOperation::Effectful(EffectClass::OrderedIo)));
+        assert_eq!(top.effect_occurrences_in_closure(EffectClass::OrderedState).count(), 0);
     }
 
     #[test]

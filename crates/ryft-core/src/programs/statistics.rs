@@ -295,7 +295,7 @@ mod tests {
     use crate::operations::{ADD_OPERATION_NAME, Sin};
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
-    use crate::programs::effects::Effect;
+    use crate::programs::effects::EffectClass;
     use crate::programs::regions::RegionSlot;
     use crate::tests::TestRegionOperation;
 
@@ -369,7 +369,7 @@ mod tests {
         let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
         builder
-            .add_instruction(TestRegionOperation::Effectful(Effect::OrderedIo), vec![], vec![input], None)
+            .add_instruction(TestRegionOperation::Effectful(EffectClass::OrderedIo), vec![], vec![input], None)
             .unwrap();
         let program: Program<Array, TestRegionOperation, Vec<Array>, Vec<Array>> =
             builder.build(vec![], vec![Placeholder], vec![]).unwrap();

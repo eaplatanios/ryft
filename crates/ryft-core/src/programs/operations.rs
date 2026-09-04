@@ -2,7 +2,7 @@ use std::borrow::Cow;
 
 use crate::parameters::Parameterized;
 use crate::programs::ProgramError;
-use crate::programs::effects::{OperationEffects, ReferenceAccessMode};
+use crate::programs::effects::{Effects, ReferenceAccessMode};
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::programs::{Program, ProgramRenderingMode};
 
@@ -680,12 +680,12 @@ pub trait Operation: Clone {
     }
 
     /// Returns the complete operation-local effect declaration of this [`Operation`] that contains its explicit
-    /// [`Effect`](crate::Effect) classes, its [`ReferenceEffect`](crate::ReferenceEffect)s (allocations and accesses),
-    /// and its [`ReferenceAlias`](crate::ReferenceAlias)es, all expressed in this operation's operand/result index
-    /// space. Refer to the documentation of [`OperationEffects`] for the semantics and per-operation examples. This is
-    /// the single declaration from which the aggregate [`Effects`](crate::Effects) classes consumed by transforms and
-    /// lowering (via [`OperationEffects::classes`]), the reference facts consumed by reference analysis and discharge,
-    /// and the retention decision of dead-code elimination are derived.
+    /// [`EffectClass`](crate::EffectClass)es, its [`ReferenceEffect`](crate::ReferenceEffect)s (allocations and
+    /// accesses), and its [`ReferenceAlias`](crate::ReferenceAlias)es, all expressed in this operation's operand/result
+    /// index space. Refer to the documentation of [`Effects`] for the semantics and per-operation examples. This is
+    /// the single declaration from which the aggregate [`EffectClasses`](crate::EffectClasses) consumed by transforms
+    /// and lowering (via [`Effects::classes`]), the reference facts consumed by reference analysis and discharge, and
+    /// the retention decision of dead-code elimination are derived.
     ///
     /// The empty default is correct for pure operations that do not themselves create, alias, or access references.
     /// This declaration describes only effects produced directly by the operation; it does not include effects from
@@ -703,8 +703,8 @@ pub trait Operation: Clone {
     /// _or_ borrow declarations stored in their own payloads (e.g., custom-call or kernel operations with
     /// payload-dependent effects) without cloning on every query.
     #[inline]
-    fn effects(&self) -> Cow<'_, OperationEffects> {
-        Cow::Borrowed(OperationEffects::empty())
+    fn effects(&self) -> Cow<'_, Effects> {
+        Cow::Borrowed(Effects::empty())
     }
 
     /// Returns this [`Operation`] after simultaneously renaming any [`TypeIdentity`](crate::TypeIdentity)s stored
@@ -826,7 +826,7 @@ impl<O: Operation> Operation for Box<O> {
     }
 
     #[inline]
-    fn effects(&self) -> Cow<'_, OperationEffects> {
+    fn effects(&self) -> Cow<'_, Effects> {
         self.as_ref().effects()
     }
 
@@ -1072,7 +1072,7 @@ mod tests {
     use crate::differentiation::StopGradientOperation;
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
-    use crate::programs::effects::{Effect, Effects, ReferenceEffect};
+    use crate::programs::effects::{EffectClass, EffectClasses, ReferenceEffect};
 
     use super::*;
 
@@ -1137,9 +1137,9 @@ mod tests {
             region_index == 0 && mode == ReferenceAccessMode::Read
         }
 
-        fn effects(&self) -> Cow<'_, OperationEffects> {
-            Cow::Owned(OperationEffects::new(
-                Effects::single(Effect::OrderedIo),
+        fn effects(&self) -> Cow<'_, Effects> {
+            Cow::Owned(Effects::new(
+                EffectClasses::single(EffectClass::OrderedIo),
                 vec![ReferenceEffect::Allocate { output_index: 0 }],
                 Vec::new(),
             ))
@@ -1230,8 +1230,8 @@ mod tests {
         );
         assert_eq!(operation.infer_output_types(&[], &[]), Ok(Vec::new()));
         let region_interfaces = [
-            RegionInterface::new(vec![DataType::F32], vec![DataType::F64], Effects::PURE),
-            RegionInterface::new(vec![DataType::I32], vec![DataType::I64], Effects::PURE),
+            RegionInterface::new(vec![DataType::F32], vec![DataType::F64], EffectClasses::NONE),
+            RegionInterface::new(vec![DataType::I32], vec![DataType::I64], EffectClasses::NONE),
         ];
 
         assert_eq!(operation.region_slots(), &[]);
@@ -1250,13 +1250,13 @@ mod tests {
         assert!(operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Write));
         assert!(operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::ReadWrite));
         assert!(!operation.is_zero(0));
-        assert_eq!(operation.effects().classes(), Effects::PURE);
+        assert_eq!(operation.effects().classes(), EffectClasses::NONE);
         assert!(operation.rename_type_identities(&TypeIdentityRenaming::new()).is_ok());
         assert_eq!(std::fmt::from_fn(|formatter| operation.render(formatter, 0)).to_string(), "stop_gradient");
 
         // Check that `Box<O>` forwards every method rather than silently falling back to a trait default.
         let operation = Box::new(ForwardingOperation::<DataType> { renamed: false, marker: PhantomData });
-        let region_interfaces = [RegionInterface::new(vec![DataType::F32], vec![DataType::F64], Effects::PURE)];
+        let region_interfaces = [RegionInterface::new(vec![DataType::F32], vec![DataType::F64], EffectClasses::NONE)];
 
         assert_eq!(operation.name(), "forwarding");
         assert_eq!(operation.region_slots(), &[RegionSlot::computation("body")]);
@@ -1296,7 +1296,7 @@ mod tests {
         assert_eq!(operation.effects().reference_effects(), &[ReferenceEffect::Allocate { output_index: 0 }]);
         assert_eq!(
             operation.effects().classes(),
-            Effects::single(Effect::OrderedIo).union(Effects::single(Effect::OrderedState)),
+            EffectClasses::single(EffectClass::OrderedIo).union(EffectClasses::single(EffectClass::OrderedState)),
         );
         assert_eq!(
             operation.rename_type_identities(&TypeIdentityRenaming::new()),
@@ -1314,7 +1314,7 @@ mod tests {
         let region_interfaces = [RegionInterface::new(
             vec![ArrayIrType::from(input_type.clone())],
             vec![ArrayIrType::from(region_output_type.clone())],
-            Effects::single(Effect::OrderedIo),
+            EffectClasses::single(EffectClass::OrderedIo),
         )];
         assert_eq!(
             infer_projected_operation_region_input_types(&operation, &input_types, &region_interfaces),

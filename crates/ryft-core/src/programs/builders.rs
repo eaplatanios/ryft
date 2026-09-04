@@ -737,7 +737,7 @@ mod tests {
     use crate::captures::CaptureReference;
     use crate::operations::{AddOperation, NegOperation};
     use crate::parameters::{Parameter, Placeholder};
-    use crate::programs::effects::{Effects, OperationEffects, ReferenceAlias, ReferenceEffect};
+    use crate::programs::effects::{EffectClasses, Effects, ReferenceAlias, ReferenceEffect};
     use crate::programs::identities::NoIdentity;
     use crate::programs::instructions::InstructionId;
     use crate::programs::provenance::ProvenanceScope;
@@ -1095,7 +1095,7 @@ mod tests {
         let mapped = program.map_operations(|operation| Ok(operation.clone())).unwrap();
         assert_eq!(mapped.regions().len(), 2);
         assert_eq!(mapped.instructions()[0].regions(), &[sealed]);
-        assert!(program.effects().classes().is_pure());
+        assert!(program.effects().classes().is_empty());
 
         // The region-aware rebuild paths preserve regions. Simplification keeps the live region-carrying instruction
         // and its region, filtering projects the entry boundary while passing regions through, and relocation imports
@@ -1487,7 +1487,7 @@ mod tests {
         // One operation stands in for every malformed declaration: its effect declaration is a payload,
         // so the same fixture can name an out-of-range position or a non-reference endpoint.
         #[derive(Clone)]
-        struct InvalidReferenceOperation(OperationEffects);
+        struct InvalidReferenceOperation(Effects);
 
         impl Operation for InvalidReferenceOperation {
             type Type = ArrayIrType;
@@ -1504,14 +1504,14 @@ mod tests {
                 Ok(input_types.to_vec())
             }
 
-            fn effects(&self) -> Cow<'_, OperationEffects> {
+            fn effects(&self) -> Cow<'_, Effects> {
                 Cow::Borrowed(&self.0)
             }
         }
 
         let read = |input_index| {
-            OperationEffects::new(
-                Effects::PURE,
+            Effects::new(
+                EffectClasses::NONE,
                 vec![ReferenceEffect::Access { input_index, mode: ReferenceAccessMode::Read }],
                 Vec::new(),
             )
@@ -1541,7 +1541,7 @@ mod tests {
             )),
         );
         let allocation =
-            OperationEffects::new(Effects::PURE, vec![ReferenceEffect::Allocate { output_index: 0 }], Vec::new());
+            Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }], Vec::new());
         assert_eq!(
             builder.add_instruction(InvalidReferenceOperation(allocation), Vec::new(), vec![array], None),
             Err(ProgramError::MalformedProgram(
@@ -1549,8 +1549,8 @@ mod tests {
                     .to_string(),
             )),
         );
-        let alias = OperationEffects::new(
-            Effects::PURE,
+        let alias = Effects::new(
+            EffectClasses::NONE,
             Vec::new(),
             vec![ReferenceAlias::new(0, 1, ReferenceAliasKind::Identity)],
         );
@@ -1670,14 +1670,14 @@ mod tests {
                 }
             }
 
-            fn effects(&self) -> Cow<'_, OperationEffects> {
+            fn effects(&self) -> Cow<'_, Effects> {
                 match self {
-                    Self::Allocate => Cow::Owned(OperationEffects::new(
-                        Effects::PURE,
+                    Self::Allocate => Cow::Owned(Effects::new(
+                        EffectClasses::NONE,
                         vec![ReferenceEffect::Allocate { output_index: 0 }],
                         Vec::new(),
                     )),
-                    Self::Region { .. } | Self::ViewRegion => Cow::Borrowed(OperationEffects::empty()),
+                    Self::Region { .. } | Self::ViewRegion => Cow::Borrowed(Effects::empty()),
                 }
             }
         }
@@ -1782,7 +1782,7 @@ mod tests {
         #[derive(Clone)]
         struct TestReferenceOperation {
             name: &'static str,
-            effects: OperationEffects,
+            effects: Effects,
             forwarded: Option<(usize, usize)>,
         }
 
@@ -1801,7 +1801,7 @@ mod tests {
                 Ok(input_types.to_vec())
             }
 
-            fn effects(&self) -> Cow<'_, OperationEffects> {
+            fn effects(&self) -> Cow<'_, Effects> {
                 Cow::Borrowed(&self.effects)
             }
 
@@ -1812,8 +1812,8 @@ mod tests {
 
         let access = |name, mode| TestReferenceOperation {
             name,
-            effects: OperationEffects::new(
-                Effects::PURE,
+            effects: Effects::new(
+                EffectClasses::NONE,
                 vec![ReferenceEffect::Access { input_index: 0, mode }],
                 Vec::new(),
             ),
@@ -1821,16 +1821,12 @@ mod tests {
         };
         let alias = |name, kind| TestReferenceOperation {
             name,
-            effects: OperationEffects::new(Effects::PURE, Vec::new(), vec![ReferenceAlias::new(0, 0, kind)]),
+            effects: Effects::new(EffectClasses::NONE, Vec::new(), vec![ReferenceAlias::new(0, 0, kind)]),
             forwarded: None,
         };
         let allocation = TestReferenceOperation {
             name: "reference_new",
-            effects: OperationEffects::new(
-                Effects::PURE,
-                vec![ReferenceEffect::Allocate { output_index: 0 }],
-                Vec::new(),
-            ),
+            effects: Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }], Vec::new()),
             forwarded: None,
         };
         let read = access("reference_read", ReferenceAccessMode::Read);
@@ -1903,11 +1899,8 @@ mod tests {
         // effects. Independent roots remain live, and out-of-range access indices remain the arity owner's concern.
         let mut lifetimes = ReferenceLifetimes::default();
         let carry = AtomId::new(6);
-        let carrier = TestReferenceOperation {
-            name: "while",
-            effects: OperationEffects::empty().clone(),
-            forwarded: Some((0, 0)),
-        };
+        let carrier =
+            TestReferenceOperation { name: "while", effects: Effects::empty().clone(), forwarded: Some((0, 0)) };
 
         lifetimes.record(&carrier, &[root], &[carry]);
         lifetimes.record(&freeze, &[root], &[]);

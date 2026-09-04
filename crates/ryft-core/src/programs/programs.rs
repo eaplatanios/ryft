@@ -447,8 +447,8 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     /// Returns the [`EffectsSummary`] of this [`Program`]'s entry region. The summary combines the effect classes and
     /// unused-result observability of the entry region's instructions and all attached computation regions. Attached
     /// [`RegionRole::Rule`](crate::RegionRole::Rule) regions are excluded because they are dormant during ordinary
-    /// interpretation. Use [`EffectsSummary::classes`] when only the aggregate [`Effects`](crate::Effects) are needed.
-    /// The per-[`Instruction`] counterpart to this function is [`Self::instruction_effects`].
+    /// interpretation. Use [`EffectsSummary::classes`] when only the aggregate [`EffectClasses`](crate::EffectClasses)
+    /// are needed. The per-[`Instruction`] counterpart to this function is [`Self::instruction_effects`].
     #[inline]
     pub fn effects(&self) -> EffectsSummary {
         self.entry_region_ref().effects()
@@ -649,8 +649,8 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     /// assertion, I/O, or opaque state effects, or reference accesses, whether intrinsic or in an attached computation
     /// region) are kept alive together with the instructions producing their inputs even when no program output
     /// consumes their results, in their original relative order, so that simplification never eliminates or reorders
-    /// observable [`Effect`](crate::Effect)s. A reference allocation that nothing accesses has no such consequence and
-    /// is removed like pure work when none of its outputs is used, together with its dead alias family.
+    /// observable [`EffectClass`](crate::EffectClass)es. A reference allocation that nothing accesses has no such
+    /// consequence and is removed like pure work when none of its outputs is used, together with its dead alias family.
     pub fn simplified(&self) -> Result<Self, ProgramError>
     where
         O: Clone,
@@ -773,8 +773,8 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     /// contribute to the [`Program`]'s output removed. Unlike [`Self::simplified`], this method moves live [`Atom`]s,
     /// [`Instruction`]s, and parameter structures into the returned [`Program`] instead of cloning them. This avoids
     /// copying constants and operations that are discarded during simplification. The behavior of [`Self::simplified`]
-    /// around [`Effects`] applies here too. [`Instruction`]s whose operations are not [`Effects::PURE`] survive in
-    /// their original relative order even when no program output consumes their outputs.
+    /// around effects applies here too: instructions with effects that remain observable when their outputs are unused
+    /// survive in their original relative order even when no program output consumes those outputs.
     pub fn into_simplified(self) -> Result<Self, ProgramError> {
         let expected_input_count = self.input_structure.parameter_count();
         check_count!("input", self.input_ids(), expected_input_count, ProgramError);
@@ -2032,7 +2032,7 @@ mod tests {
     };
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
-    use crate::programs::effects::{Effect, Effects, OperationEffects, ReferenceEffect};
+    use crate::programs::effects::{EffectClass, EffectClasses, Effects, ReferenceEffect};
     use crate::programs::operations::OperationFormatter;
     use crate::programs::provenance::{Provenance, ProvenanceScope};
     use crate::programs::references::{
@@ -2101,8 +2101,8 @@ mod tests {
             Ok(Vec::new())
         }
 
-        fn effects(&self) -> Cow<'_, OperationEffects> {
-            Cow::Owned(OperationEffects::explicit(Effects::single(Effect::OrderedIo)))
+        fn effects(&self) -> Cow<'_, Effects> {
+            Cow::Owned(Effects::explicit(EffectClasses::single(EffectClass::OrderedIo)))
         }
     }
 
@@ -2139,11 +2139,11 @@ mod tests {
             Ok(input_types.to_vec())
         }
 
-        fn effects(&self) -> Cow<'_, OperationEffects> {
-            Cow::Owned(OperationEffects::explicit(if matches!(self, Self::Effectful) {
-                Effects::single(Effect::OrderedIo)
+        fn effects(&self) -> Cow<'_, Effects> {
+            Cow::Owned(Effects::explicit(if matches!(self, Self::Effectful) {
+                EffectClasses::single(EffectClass::OrderedIo)
             } else {
-                Effects::PURE
+                EffectClasses::NONE
             }))
         }
     }
@@ -2850,7 +2850,7 @@ mod tests {
         // instructions, in contrast, are kept alive by simplification even when they are dead code: nothing consumes
         // the print's output below, so only its effect keeps it in the simplified program.
         let effects = program.effects();
-        assert_eq!(effects.classes(), Effects::PURE);
+        assert_eq!(effects.classes(), EffectClasses::NONE);
         assert!(!effects.has_observable_effects_when_unused());
         let build = || {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -2862,7 +2862,7 @@ mod tests {
         };
         let effectful = build();
         let effects = effectful.effects();
-        assert_eq!(effects.classes(), Effects::single(Effect::OrderedIo));
+        assert_eq!(effects.classes(), EffectClasses::single(EffectClass::OrderedIo));
         assert!(effects.has_observable_effects_when_unused());
         let expected = indoc! {"
             lambda %0:f64[] .
@@ -3009,7 +3009,7 @@ mod tests {
         #[derive(Clone, Debug)]
         enum TestOperation {
             Native(ArrayIrOperation<Array>),
-            Effectful(Effect),
+            Effectful(EffectClass),
             AllocateWith(&'static [RegionSlot]),
         }
 
@@ -3052,12 +3052,12 @@ mod tests {
                 }
             }
 
-            fn effects(&self) -> Cow<'_, OperationEffects> {
+            fn effects(&self) -> Cow<'_, Effects> {
                 match self {
                     Self::Native(operation) => operation.effects(),
-                    Self::Effectful(effect) => Cow::Owned(OperationEffects::explicit(Effects::single(*effect))),
-                    Self::AllocateWith(_) => Cow::Owned(OperationEffects::new(
-                        Effects::PURE,
+                    Self::Effectful(effect) => Cow::Owned(Effects::explicit(EffectClasses::single(*effect))),
+                    Self::AllocateWith(_) => Cow::Owned(Effects::new(
+                        EffectClasses::NONE,
                         vec![ReferenceEffect::Allocate { output_index: 0 }],
                         Vec::new(),
                     )),
@@ -3111,10 +3111,10 @@ mod tests {
 
         // Any observable nested effect retains the enclosing application even though its own declaration is
         // discardable (I/O, an assertion, opaque state, and a reference access inside the computation region).
-        assert_eq!(simplified(COMPUTATION, &effectful(Effect::OrderedIo)), vec!["allocate_with"]);
-        assert_eq!(simplified(COMPUTATION, &effectful(Effect::UnorderedIo)), vec!["allocate_with"]);
-        assert_eq!(simplified(COMPUTATION, &effectful(Effect::OrderedAssertion)), vec!["allocate_with"]);
-        assert_eq!(simplified(COMPUTATION, &effectful(Effect::OrderedState)), vec!["allocate_with"]);
+        assert_eq!(simplified(COMPUTATION, &effectful(EffectClass::OrderedIo)), vec!["allocate_with"]);
+        assert_eq!(simplified(COMPUTATION, &effectful(EffectClass::UnorderedIo)), vec!["allocate_with"]);
+        assert_eq!(simplified(COMPUTATION, &effectful(EffectClass::OrderedAssertion)), vec!["allocate_with"]);
+        assert_eq!(simplified(COMPUTATION, &effectful(EffectClass::OrderedState)), vec!["allocate_with"]);
         assert_eq!(
             simplified(COMPUTATION, &|builder, input| {
                 let reference =
@@ -3125,7 +3125,7 @@ mod tests {
         );
 
         // A dormant rule region is not executed by the application, so its effects do not retain it.
-        assert_eq!(simplified(RULE, &effectful(Effect::OrderedIo)), Vec::<&str>::new());
+        assert_eq!(simplified(RULE, &effectful(EffectClass::OrderedIo)), Vec::<&str>::new());
     }
 
     #[test]
@@ -3144,7 +3144,12 @@ mod tests {
         let mut effectful_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let effectful_input = effectful_builder.add_input(ArrayType::scalar(DataType::F64));
         let effectful_output = effectful_builder
-            .add_instruction(TestRegionOperation::Effectful(Effect::OrderedIo), Vec::new(), vec![effectful_input], None)
+            .add_instruction(
+                TestRegionOperation::Effectful(EffectClass::OrderedIo),
+                Vec::new(),
+                vec![effectful_input],
+                None,
+            )
             .unwrap()[0];
         let effectful_program = effectful_builder
             .build::<Vec<Array>, Vec<Array>>(vec![effectful_output], vec![Placeholder], vec![Placeholder])
@@ -3517,7 +3522,7 @@ mod tests {
         let (filtered, live) = effectful.filtered(&[input], &[output], &[]).unwrap();
         assert_eq!(live, vec![0]);
         assert_eq!(filtered.instructions().len(), 2);
-        assert_eq!(filtered.effects().classes(), Effects::single(Effect::OrderedIo));
+        assert_eq!(filtered.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
 
         // Zero-output effects are preserved explicitly because they have no result atom that can serve as a root.
         let mut builder = ProgramBuilder::<Array, ZeroOutputEffectOperation>::new();
@@ -3890,7 +3895,12 @@ mod tests {
         let mut region_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let region_input = region_builder.add_input(ArrayType::scalar(DataType::F64));
         let region_output = region_builder
-            .add_instruction(TestRegionOperation::Effectful(Effect::OrderedState), Vec::new(), vec![region_input], None)
+            .add_instruction(
+                TestRegionOperation::Effectful(EffectClass::OrderedState),
+                Vec::new(),
+                vec![region_input],
+                None,
+            )
             .unwrap()[0];
         let region_program = region_builder
             .build::<Vec<Array>, Vec<Array>>(vec![region_output], vec![Placeholder], vec![Placeholder])
@@ -3913,16 +3923,16 @@ mod tests {
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         let entry = program.entry();
         let effects = program.instruction_effects(InstructionId::new(entry, 0)).unwrap();
-        assert_eq!(effects.classes(), Effects::single(Effect::OrderedState));
+        assert_eq!(effects.classes(), EffectClasses::single(EffectClass::OrderedState));
         assert!(effects.has_observable_effects_when_unused());
         let effects = program.instruction_effects(InstructionId::new(entry, 1)).unwrap();
-        assert_eq!(effects.classes(), Effects::PURE);
+        assert_eq!(effects.classes(), EffectClasses::NONE);
         assert!(!effects.has_observable_effects_when_unused());
         let effects = program.effects();
-        assert_eq!(effects.classes(), Effects::single(Effect::OrderedState));
+        assert_eq!(effects.classes(), EffectClasses::single(EffectClass::OrderedState));
         assert!(effects.has_observable_effects_when_unused());
 
-        // Effects in transform-only rule regions are dormant during ordinary execution and therefore do not make the
+        // EffectClasses in transform-only rule regions are dormant during ordinary execution and therefore do not make the
         // containing instruction or program effectful.
         let mut rule_builder = ProgramBuilder::<Array, DormantRegionOperation>::new();
         let rule_input = rule_builder.add_input(ArrayType::scalar(DataType::F64));
@@ -3937,10 +3947,10 @@ mod tests {
             builder.add_instruction(DormantRegionOperation::Dormant, vec![dormant], vec![input], None).unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         let effects = program.instruction_effects(InstructionId::new(program.entry(), 0)).unwrap();
-        assert_eq!(effects.classes(), Effects::PURE);
+        assert_eq!(effects.classes(), EffectClasses::NONE);
         assert!(!effects.has_observable_effects_when_unused());
         let effects = program.effects();
-        assert_eq!(effects.classes(), Effects::PURE);
+        assert_eq!(effects.classes(), EffectClasses::NONE);
         assert!(!effects.has_observable_effects_when_unused());
     }
 }
