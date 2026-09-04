@@ -11,8 +11,9 @@
 //! derived metadata such as [`Effects`] cannot become stale.
 //!
 //! [`RegionInterface`] is the type-and-effect summary passed to [`Operation::infer_output_types`]. It deliberately
-//! exposes a region boundary without exposing the region body. [`OutputRegionProvenance`] describes when an operation
-//! output originates from an attached-region output (as opposed to it originating directly from that [`Instruction`]).
+//! exposes a region boundary without exposing the region body. [`InputRegionProvenance`] describes how an attached
+//! region input originates from an operation input, while [`OutputRegionProvenance`] describes when an operation
+//! output originates from an attached-region output rather than directly from that [`Instruction`].
 //!
 //! Operation rules receive application-scoped structural access to attached [`Region`]s through [`RegionDriver`]s.
 //! Binding applications obtain their complete ordered region sequence from [`BindingRegionDriver`], which can provide
@@ -33,7 +34,7 @@ use crate::parameters::{Parameter, Placeholder};
 use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId};
 use crate::programs::builders::ProgramBuilder;
-use crate::programs::effects::{Effect, EffectOccurrence, Effects};
+use crate::programs::effects::{Effect, EffectOccurrence, Effects, EffectsSummary};
 use crate::programs::identities::{TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature};
 use crate::programs::instructions::{Instruction, InstructionId};
 use crate::programs::operations::Operation;
@@ -352,14 +353,14 @@ impl<V: Typed + Parameter, O> Region<V, O> {
 
 /// Sealed [`Region`] stored together with metadata derived from its immutable contents and already-sealed descendants.
 /// Keeping the metadata in the same arena entry makes it impossible for a published [`RegionArena`] to pair a region
-/// with stale [`Effects`] or with a [`TypeIdentitySignature`] derived from a different region.
+/// with a stale [`EffectsSummary`] or with a [`TypeIdentitySignature`] derived from a different region.
 #[derive(Clone, Debug)]
 pub struct RegionWithMetadata<V: Typed + Parameter, O> {
     /// Immutable computation [`Region`].
     region: Region<V, O>,
 
-    /// Recursively derived observable [`Effects`] of `region`.
-    effects: Effects,
+    /// Recursively derived [`EffectsSummary`] of `region`.
+    effects: EffectsSummary,
 
     /// Structurally closed [`TypeIdentitySignature`] of `region`.
     type_identity_signature: TypeIdentitySignature<<V::Type as Type>::Identity>,
@@ -465,37 +466,37 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionWithMetadata<V, O> {
             }
         }
 
-        let effects =
-            region
-                .instructions
-                .iter()
-                .try_fold(Effects::PURE, |effects, instruction| -> Result<_, ProgramError> {
-                    let region_slots = instruction.operation().region_slots();
-                    instruction.operation().validate_region_count(instruction.regions().len())?;
-                    instruction.regions().iter().copied().enumerate().try_fold(
-                        effects.union(instruction.operation().effects()),
-                        |effects, (region_index, nested_region)| {
-                            let nested_effects = sealed_regions
-                                .get(nested_region.index())
-                                .map(|nested_region| nested_region.effects)
-                                .ok_or_else(|| {
-                                    ProgramError::MalformedProgram(format!(
-                                        "instruction references region {nested_region} which has not been sealed yet",
-                                    ))
-                                })?;
+        let effects = region.instructions.iter().try_fold(
+            EffectsSummary::PURE,
+            |effects, instruction| -> Result<_, ProgramError> {
+                let region_slots = instruction.operation().region_slots();
+                instruction.operation().validate_region_count(instruction.regions().len())?;
+                instruction.regions().iter().copied().enumerate().try_fold(
+                    effects.union(instruction.operation().effects().summary()),
+                    |effects, (region_index, nested_region)| {
+                        let nested_effects = sealed_regions
+                            .get(nested_region.index())
+                            .map(|nested_region| nested_region.effects)
+                            .ok_or_else(|| {
+                                ProgramError::MalformedProgram(format!(
+                                    "instruction references region {nested_region} which has not been sealed yet",
+                                ))
+                            })?;
 
-                            // Only computation regions may execute as part of the owning operation, so their
-                            // effects are observable and must propagate outward. Rule regions are dormant transform
-                            // definitions. Merely attaching one does not execute it and therefore must not make the
-                            // owning computation effectful.
-                            Ok(if region_slots[region_index].role == RegionRole::Computation {
-                                effects.union(nested_effects)
-                            } else {
-                                effects
-                            })
-                        },
-                    )
-                })?;
+                        // Only computation regions may execute as part of the owning operation, so their effects
+                        // are observable and must propagate outward. Rule regions are dormant transform definitions.
+                        // Merely attaching one does not execute it and therefore must not make the owning computation
+                        // effectful. Because the union retains the observable-when-unused bit of either side, an outer
+                        // operation can never suppress an observable nested effect.
+                        Ok(if region_slots[region_index].role == RegionRole::Computation {
+                            effects.union(nested_effects)
+                        } else {
+                            effects
+                        })
+                    },
+                )
+            },
+        )?;
         let type_identity_signature = region.type_identity_signature()?;
         Ok(Self { region, effects, type_identity_signature })
     }
@@ -577,9 +578,11 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionArena<V, O> {
         self.into_iter()
     }
 
-    /// Returns the [`Effects`] of the [`Region`] with the provided [`RegionId`] in this [`RegionArena`].
+    /// Returns the recursively derived [`EffectsSummary`] of the [`Region`] with the provided [`RegionId`] in this
+    /// [`RegionArena`]. The returned summary accounts for the region's instructions and their attached computation
+    /// regions, while excluding dormant rule regions.
     #[inline]
-    pub fn effects(&self, id: RegionId) -> Option<Effects> {
+    pub fn effects(&self, id: RegionId) -> Option<EffectsSummary> {
         self.regions.get(id.index()).map(|region| region.effects)
     }
 
@@ -806,10 +809,12 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
         self.region().instructions()
     }
 
-    /// Returns the observable effects of the [`Instruction`] at `instruction_index`, combining its operation's
-    /// intrinsic effects with the recursively derived effects of attached computation regions. Dormant rule regions
-    /// are excluded according to their declared [`RegionRole`].
-    pub fn instruction_effects(self, instruction_index: usize) -> Result<Effects, ProgramError> {
+    /// Returns the [`EffectsSummary`] of the [`Instruction`] at `instruction_index`, combining its operation's
+    /// intrinsic summary with the recursively derived summaries of attached computation regions. Dormant rule regions
+    /// are excluded according to their declared [`RegionRole`]. Because the union retains the observable-when-unused
+    /// property of either side, the summary of an instruction whose intrinsic declaration is discardable (e.g.,
+    /// allocation-only) still retains it when any nested computation has an observable consequence.
+    pub fn instruction_effects(self, instruction_index: usize) -> Result<EffectsSummary, ProgramError> {
         let instruction = self.instructions().get(instruction_index).ok_or_else(|| {
             ProgramError::MalformedProgram(format!(
                 "instruction index {instruction_index} is out of range for region {}",
@@ -817,7 +822,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
             ))
         })?;
         instruction.regions().iter().copied().enumerate().try_fold(
-            instruction.operation().effects(),
+            instruction.operation().effects().summary(),
             |effects, (region_index, attached)| {
                 let attached_effects = self
                     .arena
@@ -842,12 +847,13 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     where
         O: Operation<Type = V::Type>,
     {
-        RegionInterface::new(self.input_types(), self.output_types(), self.effects())
+        RegionInterface::new(self.input_types(), self.output_types(), self.effects().classes())
     }
 
-    /// Returns the recursively derived [`Effects`] of the rooted [`Region`].
+    /// Returns the recursively derived [`EffectsSummary`] of the rooted [`Region`]. The resulting summary accounts for
+    /// the region's instructions and their attached computation regions, while excluding dormant rule regions.
     #[inline]
-    pub fn effects(self) -> Effects {
+    pub fn effects(self) -> EffectsSummary {
         self.arena.effects(self.id).unwrap()
     }
 
@@ -933,7 +939,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     #[inline]
     pub fn effect_occurrences_in_closure(self, effect: Effect) -> impl Iterator<Item = EffectOccurrence<'r, O>> {
         self.instructions_in_closure()
-            .filter(move |(_, instruction)| instruction.operation().effects().contains(effect))
+            .filter(move |(_, instruction)| instruction.operation().effects().classes().contains(effect))
             .map(|(id, instruction)| EffectOccurrence::new(id, instruction.operation()))
     }
 
@@ -944,7 +950,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     /// hidden inside them at any nesting depth, and consult this closure-wide scan instead.
     #[inline]
     pub fn contains_effect_in_closure(self, effect: Effect) -> bool {
-        self.any_region_in_closure(|region| region.effects().contains(effect))
+        self.any_region_in_closure(|region| region.effects().classes().contains(effect))
     }
 
     /// Returns whether any [`Atom`] in this [`Region`]'s complete attached region closure is accepted by `predicate`.
@@ -963,26 +969,28 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
         self.contains_atom_in_closure(|atom| predicate(atom.r#type().as_ref()))
     }
 
-    /// Returns whether this [`Region`]'s complete attached region closure contains a reference-typed [`Atom`] or an
-    /// [`Operation`] with nonempty reference semantics. Every attached region is traversed regardless of
-    /// [`RegionRole`], and shared descendants are visited once.
+    /// Returns whether this [`Region`]'s complete attached region closure contains a reference-typed [`Atom`]
+    /// or an [`Operation`] whose effects declare at least one [`ReferenceEffect`](crate::ReferenceEffect) or
+    /// [`ReferenceAlias`](crate::ReferenceAlias). Every attached region is traversed regardless of [`RegionRole`],
+    /// and shared descendants are visited once.
     #[inline]
     pub fn contains_references_in_closure(self) -> bool {
         self.contains_atom_type_in_closure(Type::is_reference)
             || self
                 .instructions_in_closure()
-                .any(|(_, instruction)| !instruction.operation().reference_semantics().is_empty())
+                .any(|(_, instruction)| instruction.operation().effects().has_reference_declarations())
     }
 
-    /// Returns whether any [`Instruction`] in this [`Region`]'s complete attached region closure accesses a reference
-    /// (i.e., whether its [`Operation`] declares at least one reference input). Pure allocations, reference-typed
-    /// boundaries, and reference-typed constants are not accesses, and so a closure that only mints or forwards
-    /// references will result in `false` even though [`Self::contains_references_in_closure`] will return `true` for
-    /// it. Every attached region is traversed regardless of [`RegionRole`], and shared descendants are  visited once.
+    /// Returns whether any [`Instruction`] in this [`Region`]'s attached region closure accesses a reference (i.e.,
+    /// whether its [`Operation`] declares at least one [`ReferenceEffect::Access`](crate::ReferenceEffect::Access)).
+    /// Pure allocations, aliases, reference-typed boundaries, and reference-typed constants are not accesses, and
+    /// so a closure that only mints or forwards references will result in `false` even though
+    /// [`Self::contains_references_in_closure`] will return `true` for it. Every attached region
+    /// is traversed regardless of [`RegionRole`], and shared descendants are visited once.
     #[inline]
     pub fn contains_reference_accesses_in_closure(self) -> bool {
         self.instructions_in_closure()
-            .any(|(_, instruction)| !instruction.operation().reference_semantics().inputs().is_empty())
+            .any(|(_, instruction)| instruction.operation().effects().has_accesses())
     }
 
     /// Returns whether `predicate` holds for any [`Region`] in this root's complete attached region closure, applying
@@ -1570,6 +1578,30 @@ pub struct InstantiatedRegionMapping<T: Type> {
     pub destination_region: RegionId,
 }
 
+/// Describes how one input of a [`Region`] attached to an [`Operation`] originates from an input of that operation.
+/// The [`Operation::input_region_provenance`] function identifies the attached region and its input. The `input_index`
+/// stored here always identifies the source in the parent operation's input list. Despite the related name, this is
+/// unrelated to the non-semantic diagnostic [`Provenance`](crate::Provenance) recorded on instructions. This type
+/// instead describes real dataflow that transforms rely on.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum InputRegionProvenance {
+    /// The attached region receives the operation input itself, preserving the complete value and, for a reference,
+    /// its complete handle identity.
+    Forwarded {
+        /// Index of the source in the parent operation's input list.
+        input_index: usize,
+    },
+
+    /// The operation derives a view of its input for the attached region. For a reference-typed region input,
+    /// the view preserves the source reference's allocation identity while selecting only part of its stored value.
+    /// The operation family describes that selection through
+    /// [`ReferenceViewOperation::region_input_view`](crate::ReferenceViewOperation::region_input_view).
+    View {
+        /// Index of the source in the parent operation's input list.
+        input_index: usize,
+    },
+}
+
 /// Identifies one attached [`Region`] output that may produce an [`Operation`] output. Provenance is relative to an
 /// [`Operation`] application: [`region_index`](Self::region_index) selects an entry from [`Instruction::regions`],
 /// and [`output_index`](Self::output_index) selects an output of that attached region. Refer to
@@ -2126,6 +2158,105 @@ mod tests {
     }
 
     #[test]
+    fn test_region_arena_effects() {
+        let (arena, [_, _, _, root]) = diamond_closure_arena();
+        let summary = arena.effects(root).unwrap();
+        let expected_classes = Effects::single(Effect::OrderedIo).union(Effects::single(Effect::OrderedState));
+        assert_eq!(summary.classes(), expected_classes);
+        assert!(summary.has_observable_effects_when_unused());
+        assert_eq!(arena.effects(RegionId::new(arena.len())), None);
+    }
+
+    #[test]
+    fn test_region_arena_retains_derived_metadata() {
+        let mut body_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let body_input = body_builder.add_input(ArrayType::scalar(DataType::F64));
+        let body_output = body_builder
+            .add_instruction(TestRegionOperation::Effectful(Effect::OrderedIo), Vec::new(), vec![body_input], None)
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![body_output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let body = builder.import_program(body);
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
+                vec![body],
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+
+        let arena = program.regions();
+        assert_eq!(arena.len(), 2);
+        assert_eq!(arena.iter().count(), 2);
+        assert_eq!(arena[body.index()].input_types(), vec![ArrayType::scalar(DataType::F64)]);
+        assert_eq!(program.region_ref(body).unwrap().effects().classes(), Effects::single(Effect::OrderedIo));
+        assert_eq!(program.entry_region_ref().effects().classes(), Effects::single(Effect::OrderedIo));
+        assert!(std::ptr::eq(
+            program.entry_region_ref().type_identity_signature(),
+            program.entry_region_ref().type_identity_signature(),
+        ));
+    }
+
+    #[test]
+    fn test_region_arena_sealing_retains_transform_caches_only_for_identity_rebuilds() {
+        let program = program_with_reused_region();
+        let leaf_artifact = program.region_ref(RegionId::new(0)).unwrap().retained_identity_transform();
+        let root_artifact = program.entry_region_ref().retained_identity_transform();
+        let root = program.entry_region().clone();
+        let leaf = program.regions().get(RegionId::new(0)).unwrap().clone();
+
+        // Sealing a region that attaches nothing keeps its retained artifacts, because its transforms depend only on
+        // contents it carries itself. That is what preserves sharing for the leaf callees that are shared in practice.
+        let mut arena = RegionArena::new();
+        let leaf_id = arena.push(leaf.clone()).unwrap();
+        let artifact = RegionRef::new(&arena, leaf_id).unwrap().retained_identity_transform();
+        assert!(Arc::ptr_eq(&artifact, &leaf_artifact));
+
+        // Sealing a region that attaches a descendant starts with no retained artifacts, because the sealing arena is
+        // what decides which body each attached identifier names, and a different body means different transforms.
+        let root_id = arena.push(root.clone()).unwrap();
+        let artifact = RegionRef::new(&arena, root_id).unwrap().retained_identity_transform();
+        assert!(!Arc::ptr_eq(&artifact, &root_artifact));
+
+        // The preserving path is the opt-out for re-sealing that provably keeps the region's reachable closure, which
+        // is how closure-copying imports and faithful whole-arena rebuilds keep their retained transforms.
+        let mut arena = RegionArena::new();
+        arena.push_preserving_transform_cache(leaf).unwrap();
+        let root_id = arena.push_preserving_transform_cache(root.clone()).unwrap();
+        let artifact = RegionRef::new(&arena, root_id).unwrap().retained_identity_transform();
+        assert!(Arc::ptr_eq(&artifact, &root_artifact));
+    }
+
+    #[test]
+    fn test_region_arena_rejects_unsealed_region_reference() {
+        let input = AtomId::new(0);
+        let output = AtomId::new(1);
+        let region: Region<Array, TestRegionOperation> = Region::new(
+            vec![Atom::Variable(ArrayType::scalar(DataType::F64)), Atom::Variable(ArrayType::scalar(DataType::F64))],
+            vec![input],
+            vec![output],
+            vec![Instruction::new(
+                TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
+                vec![input],
+                vec![output],
+                vec![RegionId::new(0)],
+            )],
+        );
+        assert!(matches!(
+            RegionArena::from_regions(vec![region]),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "instruction references region ^0 which has not been sealed yet",
+        ));
+    }
+
+    #[test]
     fn test_region_ref() {
         let program = program_with_reused_region();
         let region = program.entry_region_ref();
@@ -2186,6 +2317,59 @@ mod tests {
         assert!(lifecycle(false).entry_region_ref().contains_references_in_closure());
         assert!(!lifecycle(false).entry_region_ref().contains_reference_accesses_in_closure());
         assert!(lifecycle(true).entry_region_ref().contains_reference_accesses_in_closure());
+    }
+
+    #[test]
+    fn test_region_ref_instruction_effects() {
+        // The summary includes effects from recursively reachable computation regions, excludes dormant rule regions,
+        // and preserves the public observability information used to decide whether unused work may be discarded.
+        let (arena, [_, _, _, root]) = diamond_closure_arena();
+        let summary = RegionRef::new(&arena, root).unwrap().instruction_effects(0).unwrap();
+        let expected_classes = Effects::single(Effect::OrderedIo).union(Effects::single(Effect::OrderedState));
+        assert_eq!(summary.classes(), expected_classes);
+        assert!(summary.has_observable_effects_when_unused());
+
+        let effectful = RegionId::new(0);
+        let dormant = RegionId::new(1);
+        let arena = RegionArena::from_regions(vec![
+            Region::<Array, TestRegionOperation>::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![Instruction::new(
+                    TestRegionOperation::Effectful(Effect::OrderedIo),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )],
+            ),
+            Region::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![Instruction::new(
+                    TestRegionOperation::WithRegions(const { &[RegionSlot::rule("rule")] }),
+                    Vec::new(),
+                    Vec::new(),
+                    vec![effectful],
+                )],
+            ),
+        ])
+        .unwrap();
+        let summary = RegionRef::new(&arena, dormant).unwrap().instruction_effects(0).unwrap();
+        assert_eq!(summary.classes(), Effects::PURE);
+        assert!(!summary.has_observable_effects_when_unused());
+
+        let program = program_with_reused_region();
+        let summary = program.entry_region_ref().instruction_effects(0).unwrap();
+        assert_eq!(summary.classes(), Effects::PURE);
+        assert!(!summary.has_observable_effects_when_unused());
+
+        let error = ProgramError::MalformedProgram(format!(
+            "instruction index 2 is out of range for region {}",
+            program.entry(),
+        ));
+        assert_eq!(program.entry_region_ref().instruction_effects(2), Err(error));
     }
 
     #[test]
@@ -2259,7 +2443,7 @@ mod tests {
         }
         let arena = RegionArena::from_regions(regions).unwrap();
         let top = RegionRef::new(&arena, RegionId::new(DEPTH)).unwrap();
-        assert!(top.effects().is_pure());
+        assert!(top.effects().classes().is_pure());
         assert!(top.contains_effect_in_closure(Effect::OrderedIo));
         assert!(!top.contains_effect_in_closure(Effect::OrderedState));
         let occurrences = top.effect_occurrences_in_closure(Effect::OrderedIo).collect::<Vec<_>>();
@@ -2269,95 +2453,6 @@ mod tests {
         assert!(matches!(occurrences[0].operation(), TestRegionOperation::Effectful(Effect::OrderedIo)));
         assert!(matches!(occurrences[1].operation(), TestRegionOperation::Effectful(Effect::OrderedIo)));
         assert_eq!(top.effect_occurrences_in_closure(Effect::OrderedState).count(), 0);
-    }
-
-    #[test]
-    fn test_region_arena_retains_derived_metadata() {
-        let mut body_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
-        let body_input = body_builder.add_input(ArrayType::scalar(DataType::F64));
-        let body_output = body_builder
-            .add_instruction(TestRegionOperation::Effectful(Effect::OrderedIo), Vec::new(), vec![body_input], None)
-            .unwrap()[0];
-        let body = body_builder
-            .build::<Vec<Array>, Vec<Array>>(vec![body_output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
-        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
-        let body = builder.import_program(body);
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder
-            .add_instruction(
-                TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
-                vec![body],
-                vec![input],
-                None,
-            )
-            .unwrap()[0];
-        let program =
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-
-        let arena = program.regions();
-        assert_eq!(arena.len(), 2);
-        assert_eq!(arena.iter().count(), 2);
-        assert_eq!(arena[body.index()].input_types(), vec![ArrayType::scalar(DataType::F64)]);
-        assert_eq!(program.region_ref(body).unwrap().effects(), Effects::single(Effect::OrderedIo));
-        assert_eq!(program.entry_region_ref().effects(), Effects::single(Effect::OrderedIo));
-        assert!(std::ptr::eq(
-            program.entry_region_ref().type_identity_signature(),
-            program.entry_region_ref().type_identity_signature(),
-        ));
-    }
-
-    #[test]
-    fn test_region_arena_sealing_retains_transform_caches_only_for_identity_rebuilds() {
-        let program = program_with_reused_region();
-        let leaf_artifact = program.region_ref(RegionId::new(0)).unwrap().retained_identity_transform();
-        let root_artifact = program.entry_region_ref().retained_identity_transform();
-        let root = program.entry_region().clone();
-        let leaf = program.regions().get(RegionId::new(0)).unwrap().clone();
-
-        // Sealing a region that attaches nothing keeps its retained artifacts, because its transforms depend only on
-        // contents it carries itself. That is what preserves sharing for the leaf callees that are shared in practice.
-        let mut arena = RegionArena::new();
-        let leaf_id = arena.push(leaf.clone()).unwrap();
-        let artifact = RegionRef::new(&arena, leaf_id).unwrap().retained_identity_transform();
-        assert!(Arc::ptr_eq(&artifact, &leaf_artifact));
-
-        // Sealing a region that attaches a descendant starts with no retained artifacts, because the sealing arena is
-        // what decides which body each attached identifier names, and a different body means different transforms.
-        let root_id = arena.push(root.clone()).unwrap();
-        let artifact = RegionRef::new(&arena, root_id).unwrap().retained_identity_transform();
-        assert!(!Arc::ptr_eq(&artifact, &root_artifact));
-
-        // The preserving path is the opt-out for re-sealing that provably keeps the region's reachable closure, which
-        // is how closure-copying imports and faithful whole-arena rebuilds keep their retained transforms.
-        let mut arena = RegionArena::new();
-        arena.push_preserving_transform_cache(leaf).unwrap();
-        let root_id = arena.push_preserving_transform_cache(root.clone()).unwrap();
-        let artifact = RegionRef::new(&arena, root_id).unwrap().retained_identity_transform();
-        assert!(Arc::ptr_eq(&artifact, &root_artifact));
-    }
-
-    #[test]
-    fn test_region_arena_rejects_unsealed_region_reference() {
-        let input = AtomId::new(0);
-        let output = AtomId::new(1);
-        let region: Region<Array, TestRegionOperation> = Region::new(
-            vec![Atom::Variable(ArrayType::scalar(DataType::F64)), Atom::Variable(ArrayType::scalar(DataType::F64))],
-            vec![input],
-            vec![output],
-            vec![Instruction::new(
-                TestRegionOperation::WithRegions(const { &[crate::RegionSlot::computation("body")] }),
-                vec![input],
-                vec![output],
-                vec![RegionId::new(0)],
-            )],
-        );
-        assert!(matches!(
-            RegionArena::from_regions(vec![region]),
-            Err(ProgramError::MalformedProgram(message))
-                if message == "instruction references region ^0 which has not been sealed yet",
-        ));
     }
 
     #[test]

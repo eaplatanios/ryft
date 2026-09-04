@@ -1,11 +1,11 @@
-//! Value-family-generic static view contract and the view-path overlay over the structural [`ReferenceAnalysis`].
+//! Value-family-generic view contract and the view-path overlay over the structural [`ReferenceAnalysis`].
 //!
 //! The generic analysis records *that* a reference-typed value is a narrowing view of its root, through
 //! [`ReferenceAliasEdge`](crate::programs::references::ReferenceAliasEdge)s of kind
 //! [`ReferenceAliasKind::View`], but it deliberately stores no geometry: what a view selects is a property of the
 //! value family (an array view is an index or slice, a downstream family may split a register into halves). This
-//! module lifts that geometry into one static contract, [`ReferenceViewOperation`], that an operation family
-//! implements once, and one overlay, [`ReferenceViewAnalysis`], that composes the per-edge descriptions into a
+//! module lifts that geometry into one contract, [`ReferenceViewOperation`], that an operation family implements
+//! once, and one overlay, [`ReferenceViewAnalysis`], that composes the per-edge descriptions into a
 //! [`ReferenceViewPath`] for every reference-typed value. Transforms that rebuild references (tangent, cotangent, and
 //! residual reconstruction) consult the overlay and reapply descriptions through the same contract, so no transform
 //! ever matches view operations by name and the array family's `reference_index` and `reference_slice` are not
@@ -59,7 +59,26 @@
 //! path that selects a slot by one instruction's operand and a path that selects a slot by the same operand agree,
 //! while two different operands, or an operand against a static coordinate, may overlap. The query is what lets a
 //! transform admit two handles of one root side by side only when they are provably disjoint (e.g., a stacked
-//! reference operand of a `scan` viewed per iteration next to a carry of the same root).
+//! reference operand of a `scan` viewed per iteration next to a carry of the same root). The `scan` discharge rule is
+//! the first consumer: it rejects any other handle of the stack's allocation inside the body unless the query proves
+//! it disjoint from the per-iteration view. Dynamic indexing will use the same query as its may-alias oracle.
+//!
+//! # Boundary Views
+//!
+//! Views are ordinarily created by instruction outputs and never cross an attached-region boundary: a nested region
+//! input with [`InputRegionProvenance::Forwarded`](crate::InputRegionProvenance::Forwarded) provenance is a complete
+//! handle of a caller root and carries the empty path. The one exception is a view that the attaching operation itself
+//! creates for a region input, such as the per-iteration slice a `scan` presents its body for a reference-typed stacked
+//! operand. The operation declares the source input with
+//! [`InputRegionProvenance::View`](crate::InputRegionProvenance::View) through
+//! [`Operation::input_region_provenance`] and describes the view through
+//! [`ReferenceViewOperation::region_input_view`]; the analysis records the nested input as a view of that input
+//! (refer to the "Boundaries" section of the `analysis` module documentation) and closes its
+//! [`Iteration`](ViewSymbol::Iteration) symbol over the *attached region* rather than over the attaching
+//! instruction, so a shared region attached by several instructions has one path per nested input. Boundary views are
+//! created by their operation and never reapplied: `reapply_view` rejects an `Iteration` symbol, and a transform that
+//! restates the operation (the fused forward pass, the reversed scan of transposition, the batched scan) restates the
+//! boundary view with it.
 
 // TODO(eaplatanios): Review this module.
 
@@ -74,12 +93,13 @@ use crate::batching::{BatchAxis, BatchedOutputs, BatchingContext, BatchingError,
 use crate::contexts::Context;
 use crate::parameters::Parameter;
 use crate::programs::ProgramError;
+use crate::programs::effects::ReferenceAliasKind;
 use crate::programs::instructions::InstructionId;
 use crate::programs::operations::Operation;
 use crate::programs::references::analysis::{
     ReferenceAliasOrigin, ReferenceAnalysis, ReferenceAnalysisError, ReferenceAnalysisTransformArguments, ReferenceRoot,
 };
-use crate::programs::references::semantics::{ReferenceAliasKind, ReferenceOutput};
+
 use crate::programs::regions::{Region, RegionId, RegionRef};
 use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::types::{Type, Typed};
@@ -115,7 +135,7 @@ pub enum ReferenceViewAnalysisError {
     #[error(transparent)]
     Analysis(#[from] ReferenceAnalysisError),
 
-    /// An operation declares a view alias in its reference semantics but describes no view for that output.
+    /// An operation declares a view alias in its effects but describes no view for that output.
     #[error("operation `{operation}` at {instruction} derives a reference view but exposes no view transform")]
     MissingView {
         /// Name of the operation.
@@ -191,8 +211,8 @@ pub enum ReferenceViewAnalysisError {
         output_index: usize,
     },
 
-    /// An operation declares through [`Operation::region_input_view_source`] that a region input is a boundary view
-    /// it creates but describes no view for that input.
+    /// An operation declares [`InputRegionProvenance::View`](crate::InputRegionProvenance::View) for a region input but
+    /// describes no view for that input.
     #[error(
         "operation `{operation}` at {instruction} creates a boundary view for input {input_index} of region \
          {region_index} but exposes no view transform"
@@ -333,17 +353,20 @@ pub trait ReferenceViewOperation: Operation {
     type View: ReferenceView<Type = Self::Type>;
 
     /// Returns the description of the view this operation derives at output `output_index`, or [`None`] when that
-    /// output is not a view. Exactly the outputs whose [`reference_semantics`](Operation::reference_semantics) declare
-    /// a [`ReferenceOutput::Alias`](crate::programs::references::ReferenceOutput::Alias) of kind
-    /// [`ReferenceAliasKind::View`] return [`Some`]; an operation that declares such an alias but returns [`None`] is
-    /// rejected by the overlay with [`ReferenceViewAnalysisError::MissingView`]. An output description may name
-    /// [`ViewSymbol::Operand`] symbols but never [`ViewSymbol::Iteration`].
+    /// output is not a view. Exactly the outputs whose [`effects`](Operation::effects) declare a
+    /// [`ReferenceAlias`](crate::programs::effects::ReferenceAlias) of kind [`ReferenceAliasKind::View`] return
+    /// [`Some`]; an operation that declares such an alias but returns [`None`] is rejected by the overlay with
+    /// [`ReferenceViewAnalysisError::MissingView`]. An output description may name [`ViewSymbol::Operand`] symbols but
+    /// never [`ViewSymbol::Iteration`].
     fn reference_view(&self, output_index: usize) -> Option<Self::View>;
 
-    /// Returns the description of the view this operation creates for the reference-typed input `input_index` of its
-    /// attached region `region_index` (e.g., the per-iteration slice of a stacked reference operand), or [`None`] when
-    /// that input is a complete handle of a caller root. Such a view is created by the operation at the region
-    /// boundary, so its description may name [`ViewSymbol::Iteration`]. The default describes no boundary views.
+    /// Returns the description of the view this operation creates for reference-typed input `input_index` of its
+    /// attached region `region_index`, such as the per-iteration slice of a stacked reference input. The corresponding
+    /// [`Operation::input_region_provenance`] must return
+    /// [`InputRegionProvenance::View`](crate::InputRegionProvenance::View), whose `input_index` names the source in the
+    /// operation's input list. Such a view is created by the operation at the region boundary, so its description may
+    /// name [`ViewSymbol::Iteration`]. Returns [`None`] when the region input is forwarded unchanged or is not
+    /// reference-typed; the default describes no boundary views.
     fn region_input_view(&self, region_index: usize, input_index: usize) -> Option<Self::View> {
         let _ = (region_index, input_index);
         None
@@ -501,10 +524,10 @@ impl<View, Binding> Default for ReferenceViewPath<View, Binding> {
 impl<View: Parameter, Binding: Parameter> Parameter for ReferenceViewPath<View, Binding> {}
 
 /// Batches one reference-view operation of the family of `C` through the [`ReferenceView`] contract: the shared
-/// [`BatchableOperation`](crate::batching::BatchableOperation) rule of every operation whose reference semantics
-/// declare only [`View`](ReferenceAliasKind::View) aliases of one source operand.
+/// [`BatchableOperation`](crate::batching::BatchableOperation) rule of every operation whose effects declare only
+/// [`View`](ReferenceAliasKind::View) aliases of one source operand.
 ///
-/// The rule reads the operation's [`reference_semantics`](Operation::reference_semantics) to find the single source
+/// The rule reads the operation's [`effects`](Operation::effects) to find the single source
 /// operand and the view outputs, requires every other operand (the coordinate operands named by the views' symbols) to
 /// be replicated, and then, for each view output in output order, moves the source's batch axis through the description
 /// with [`ReferenceView::batch`] and binds the batched description over the packed source through
@@ -539,16 +562,22 @@ where
     let operation = C::Operation::from(operation.clone());
     let name = operation.name();
     let unsupported = |message: String| BatchingError::UnsupportedOperation { message };
-    let semantics = operation.reference_semantics();
+    let effects = operation.effects();
+    let not_a_view = |output_index: usize| {
+        unsupported(format!(
+            "`{name}` has reference output {output_index} that is not a view, so it cannot batch as a view operation",
+        ))
+    };
+    if let Some(output_index) = effects.allocation_output_indices().next() {
+        return Err(not_a_view(output_index));
+    }
     let mut source_index = None;
-    let mut output_indices = Vec::with_capacity(semantics.outputs().len());
-    for output in semantics.outputs() {
-        let ReferenceOutput::Alias { output_index, input_index, kind: ReferenceAliasKind::View } = *output else {
-            return Err(unsupported(format!(
-                "`{name}` has reference output {} that is not a view, so it cannot batch as a view operation",
-                output.output_index(),
-            )));
-        };
+    let mut output_indices = Vec::with_capacity(effects.reference_aliases().len());
+    for alias in effects.reference_aliases() {
+        let (output_index, input_index) = (alias.output_index(), alias.input_index());
+        if alias.kind() != ReferenceAliasKind::View {
+            return Err(not_a_view(output_index));
+        }
         match source_index {
             None => source_index = Some(input_index),
             Some(source_index) if source_index == input_index => {}
@@ -627,9 +656,9 @@ where
 /// or a forwarded region output) has the empty path, an identity alias copies the path of its source, and a view alias
 /// copies the path of its source and appends the description its producing operation reports for that edge's output,
 /// after that description was validated against the source and output reference types. Nested region inputs are
-/// separate roots of the structural analysis: an input forwarded as a complete handle (identity provenance) carries
-/// the empty path, and an input the attaching operation creates as a boundary view (declared through
-/// [`Operation::region_input_view_source`]) carries the single step that operation reports through
+/// separate roots of the structural analysis: an input forwarded as a complete handle carries the empty path, and an
+/// input the attaching operation creates as a boundary view (declared through the `View` variant returned by
+/// [`Operation::input_region_provenance`]) carries the single step that operation reports through
 /// [`ReferenceViewOperation::region_input_view`], closed over the attached region, so its
 /// [`Iteration`](ViewSymbol::Iteration) symbol binds to that region and the path is the same for every attachment of a
 /// shared region. Either way the path is relative to the nested input itself, not to the caller root it is bound to.
@@ -944,16 +973,17 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::atoms::AtomId;
     use crate::programs::builders::ProgramBuilder;
-    use crate::programs::effects::Effects;
+    use crate::programs::effects::{Effects, OperationEffects, ReferenceAlias};
     use crate::programs::instructions::Instruction;
     use crate::programs::programs::Program;
     use crate::programs::references::analysis::{ReferenceAliasEdge, ReferenceAliasOrigin};
     use crate::programs::references::operations::{
         ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceWriteOperation,
     };
-    use crate::programs::references::semantics::{ReferenceOperationSemantics, ReferenceOutput};
     use crate::programs::references::types::ReferenceType;
-    use crate::programs::regions::{OutputRegionProvenance, RegionId, RegionInterface, RegionSlot};
+    use crate::programs::regions::{
+        InputRegionProvenance, OutputRegionProvenance, RegionId, RegionInterface, RegionSlot,
+    };
     use crate::programs::types::TypeError;
 
     use super::*;
@@ -1091,19 +1121,11 @@ mod tests {
             }
         }
 
-        fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
+        fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
             match self {
                 Self::Native(operation) => operation.input_region_provenance(region_index, input_index),
                 Self::Symbolic(_) => None,
                 Self::UndescribedScan(operation) => operation.input_region_provenance(region_index, input_index),
-            }
-        }
-
-        fn region_input_view_source(&self, region_index: usize, input_index: usize) -> Option<usize> {
-            match self {
-                Self::Native(operation) => operation.region_input_view_source(region_index, input_index),
-                Self::Symbolic(_) => None,
-                Self::UndescribedScan(operation) => operation.region_input_view_source(region_index, input_index),
             }
         }
 
@@ -1123,21 +1145,14 @@ mod tests {
             }
         }
 
-        fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
-            match self {
-                Self::Native(operation) => operation.reference_semantics(),
-                Self::Symbolic(_) => Cow::Owned(ReferenceOperationSemantics::new(
-                    Vec::new(),
-                    vec![ReferenceOutput::Alias { output_index: 0, input_index: 0, kind: ReferenceAliasKind::View }],
-                )),
-                Self::UndescribedScan(operation) => operation.reference_semantics(),
-            }
-        }
-
-        fn effects(&self) -> Effects {
+        fn effects(&self) -> Cow<'_, OperationEffects> {
             match self {
                 Self::Native(operation) => operation.effects(),
-                Self::Symbolic(_) => Effects::PURE,
+                Self::Symbolic(_) => Cow::Owned(OperationEffects::new(
+                    Effects::PURE,
+                    Vec::new(),
+                    vec![ReferenceAlias::new(0, 0, ReferenceAliasKind::View)],
+                )),
                 Self::UndescribedScan(operation) => operation.effects(),
             }
         }
@@ -1592,24 +1607,14 @@ mod tests {
                 }
             }
 
-            fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
-                match self {
-                    Self::Native(operation) => operation.reference_semantics(),
-                    Self::View => Cow::Owned(ReferenceOperationSemantics::new(
-                        Vec::new(),
-                        vec![ReferenceOutput::Alias {
-                            output_index: 0,
-                            input_index: 0,
-                            kind: ReferenceAliasKind::View,
-                        }],
-                    )),
-                }
-            }
-
-            fn effects(&self) -> Effects {
+            fn effects(&self) -> Cow<'_, OperationEffects> {
                 match self {
                     Self::Native(operation) => operation.effects(),
-                    Self::View => Effects::PURE,
+                    Self::View => Cow::Owned(OperationEffects::new(
+                        Effects::PURE,
+                        Vec::new(),
+                        vec![ReferenceAlias::new(0, 0, ReferenceAliasKind::View)],
+                    )),
                 }
             }
         }
