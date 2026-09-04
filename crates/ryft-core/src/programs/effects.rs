@@ -335,15 +335,15 @@ pub enum ReferenceAliasKind {
 /// by input index, then allocations sorted by output index, and aliases sorted by output index. Two declarations with
 /// the same facts therefore compare equal, and iteration order is deterministic for diagnostics and analysis records.
 ///
-/// # Explicit Effect Classes
+/// # Directly Declared Effect Classes
 ///
-/// The explicit classes are the [`EffectClass`]es the operation author lists directly: assertions, I/O, and _opaque_
+/// The declared classes are the [`EffectClass`]es the operation author lists directly: assertions, I/O, and _opaque_
 /// ordered state that has no structured reference description. [`Self::classes`] additionally derives
 /// [`EffectClass::OrderedState`] from the presence of any [`ReferenceEffect`], so an operation with reference effects
 /// must list `OrderedState` explicitly only for genuinely opaque state, never to classify its reference effects. That
 /// convention cannot be enforced here, because a redundant class is indistinguishable from an operation that has both
 /// a structured access and opaque state, and it is not harmless: partial evaluation reads
-/// [`Self::has_explicit_class`] for `OrderedState` as unrooted state and places such an operation conservatively against
+/// [`Self::declares`] for `OrderedState` as unrooted state and places such an operation conservatively against
 /// every ordering frontier key.
 ///
 /// # Examples
@@ -352,47 +352,47 @@ pub enum ReferenceAliasKind {
 ///
 /// ```text
 /// reference_new(x) -> r
-///     explicit   = NONE
+///     declared   = NONE
 ///     references = [Allocate { output_index: 0 }]
 ///     aliases    = []
 ///
 /// reference_read(r) -> x
-///     explicit   = NONE
+///     declared   = NONE
 ///     references = [Access { input_index: 0, mode: Read }]
 ///     aliases    = []
 ///
 /// reference_write(r, x) -> ()
-///     explicit   = NONE
+///     declared   = NONE
 ///     references = [Access { input_index: 0, mode: Write }]
 ///     aliases    = []
 ///
 /// reference_swap(r, x) -> old
-///     explicit   = NONE
+///     declared   = NONE
 ///     references = [Access { input_index: 0, mode: ReadWrite }]
 ///     aliases    = []
 ///
 /// reference_add_update(r, x) -> ()
-///     explicit   = NONE
+///     declared   = NONE
 ///     references = [Access { input_index: 0, mode: Accumulate }]
 ///     aliases    = []
 ///
 /// reference_freeze(r) -> x
-///     explicit   = NONE
+///     declared   = NONE
 ///     references = [Access { input_index: 0, mode: Consume }]
 ///     aliases    = []
 ///
 /// reference_index(r, axis, index) -> view
-///     explicit   = NONE
+///     declared   = NONE
 ///     references = []
 ///     aliases    = [ReferenceAlias { output_index: 0, input_index: 0, kind: View }]
 ///
 /// reference_slice(r, axes) -> view
-///     explicit   = NONE
+///     declared   = NONE
 ///     references = []
 ///     aliases    = [ReferenceAlias { output_index: 0, input_index: 0, kind: View }]
 ///
 /// print(x) -> ()
-///     explicit   = {OrderedIo}
+///     declared   = {OrderedIo}
 ///     references = []
 ///     aliases    = []
 /// ```
@@ -403,9 +403,9 @@ pub enum ReferenceAliasKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Effects {
     /// Effect classes listed directly by the operation author.
-    explicit_classes: EffectClasses,
+    declared: EffectClasses,
 
-    /// [`EffectsSummary`] derived once at construction from `explicit_classes` and `reference_effects`.
+    /// [`EffectsSummary`] derived once at construction from `declared` and `reference_effects`.
     summary: EffectsSummary,
 
     /// [`ReferenceEffect`]s in canonical order. Single Static Assignment (SSA) value (i.e., non-reference) inputs and
@@ -431,7 +431,7 @@ impl Effects {
     /// Index ranges cannot be checked here because the declaration carries no arity information; the program builder
     /// validates them against each instruction's actual operand/result arity.
     pub fn new(
-        explicit_classes: EffectClasses,
+        declared: EffectClasses,
         mut reference_effects: Vec<ReferenceEffect>,
         mut reference_aliases: Vec<ReferenceAlias>,
     ) -> Self {
@@ -478,16 +478,16 @@ impl Effects {
 
         let has_access = reference_effects.iter().any(|effect| matches!(effect, ReferenceEffect::Access { .. }));
         let classes = if reference_effects.is_empty() {
-            explicit_classes
+            declared
         } else {
-            explicit_classes.union(EffectClasses::single(EffectClass::OrderedState))
+            declared.union(EffectClasses::single(EffectClass::OrderedState))
         };
         let summary =
-            EffectsSummary { classes, has_observable_effects_when_unused: !explicit_classes.is_empty() || has_access };
-        Self { explicit_classes, summary, reference_effects, reference_aliases }
+            EffectsSummary { classes, has_observable_effects_when_unused: !declared.is_empty() || has_access };
+        Self { declared, summary, reference_effects, reference_aliases }
     }
 
-    /// Creates a new [`Effects`] declaration that consists only of the provided explicit effect classes,
+    /// Creates a new [`Effects`] declaration that consists only of the provided directly declared effect classes,
     /// which is the declaration of assertion, I/O, and opaque-state operations that neither create, alias, nor access
     /// references.
     #[inline]
@@ -502,9 +502,9 @@ impl Effects {
         &EMPTY_EFFECTS
     }
 
-    /// Returns the aggregate [`EffectClasses`] of the declaring [`Operation`](crate::Operation): its explicit classes
-    /// unioned with [`EffectClass::OrderedState`] when it declares at least one [`ReferenceEffect`]. Aliases contribute
-    /// no class.
+    /// Returns the aggregate [`EffectClasses`] of the declaring [`Operation`](crate::Operation): its directly declared
+    /// classes unioned with [`EffectClass::OrderedState`] when it declares at least one [`ReferenceEffect`]. Aliases
+    /// contribute no class.
     #[inline]
     pub fn classes(&self) -> EffectClasses {
         self.summary.classes
@@ -521,8 +521,8 @@ impl Effects {
     /// which is unrooted and touches every ordering frontier key, from structured reference state, which is rooted in
     /// the declared reference operands.
     #[inline]
-    pub fn has_explicit_class(&self, effect_class: EffectClass) -> bool {
-        self.explicit_classes.contains(effect_class)
+    pub fn declares(&self, effect_class: EffectClass) -> bool {
+        self.declared.contains(effect_class)
     }
 
     /// Returns the [`ReferenceEffect`]s of the declaring [`Operation`](crate::Operation) in canonical order: accesses
@@ -637,7 +637,7 @@ impl Effects {
 // Shared empty declaration returned by `Effects::empty` so that the `Operation` trait default can hand out a borrow
 // without allocating (`Vec::new` is `const`, so this static needs no lazy initialization).
 static EMPTY_EFFECTS: Effects = Effects {
-    explicit_classes: EffectClasses::NONE,
+    declared: EffectClasses::NONE,
     summary: EffectsSummary::PURE,
     reference_effects: Vec::new(),
     reference_aliases: Vec::new(),
@@ -839,7 +839,7 @@ mod tests {
         let empty = Effects::empty();
         assert_eq!(empty.classes(), EffectClasses::NONE);
         assert!(empty.is_pure());
-        assert!(!empty.has_explicit_class(EffectClass::OrderedState));
+        assert!(!empty.declares(EffectClass::OrderedState));
         assert_eq!(empty.reference_effects(), &[]);
         assert_eq!(empty.reference_aliases(), &[]);
         assert_eq!(empty.accesses().collect::<Vec<_>>(), Vec::<(usize, ReferenceAccessMode)>::new());
@@ -850,13 +850,13 @@ mod tests {
         assert_eq!(empty, &Effects::new(EffectClasses::NONE, vec![], vec![]));
         assert_eq!(empty, &Effects::explicit(EffectClasses::NONE));
 
-        // Explicit classes are reported as both explicit and aggregate, and any nonempty explicit class is observable
-        // when unused.
+        // Directly declared classes are also part of the aggregate, and any nonempty directly declared class set is
+        // observable when unused.
         let io = Effects::explicit(EffectClasses::single(EffectClass::OrderedIo));
         assert_eq!(io.classes(), EffectClasses::single(EffectClass::OrderedIo));
         assert!(!io.is_pure());
-        assert!(io.has_explicit_class(EffectClass::OrderedIo));
-        assert!(!io.has_explicit_class(EffectClass::OrderedState));
+        assert!(io.declares(EffectClass::OrderedIo));
+        assert!(!io.declares(EffectClass::OrderedState));
         assert!(!io.has_reference_declarations());
         assert!(io.summary().has_observable_effects_when_unused());
 
@@ -864,7 +864,7 @@ mod tests {
         let allocation = Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }], vec![]);
         assert_eq!(allocation.classes(), EffectClasses::single(EffectClass::OrderedState));
         assert!(!allocation.is_pure());
-        assert!(!allocation.has_explicit_class(EffectClass::OrderedState));
+        assert!(!allocation.declares(EffectClass::OrderedState));
         assert_eq!(allocation.reference_effects(), &[ReferenceEffect::Allocate { output_index: 0 }]);
         assert_eq!(allocation.allocation_output_indices().collect::<Vec<_>>(), vec![0]);
         assert_eq!(allocation.accesses().collect::<Vec<_>>(), Vec::<(usize, ReferenceAccessMode)>::new());
@@ -880,7 +880,7 @@ mod tests {
             vec![],
         );
         assert_eq!(read.classes(), EffectClasses::single(EffectClass::OrderedState));
-        assert!(!read.has_explicit_class(EffectClass::OrderedState));
+        assert!(!read.declares(EffectClass::OrderedState));
         assert_eq!(read.accesses().collect::<Vec<_>>(), vec![(0, ReferenceAccessMode::Read)]);
         assert!(read.has_accesses());
 
@@ -898,8 +898,8 @@ mod tests {
         assert!(view.has_reference_declarations());
         assert_eq!(view.summary(), EffectsSummary::PURE);
 
-        // A mixed declaration composes conservatively: explicit opaque state stays distinguishable from the derived
-        // class, and one observable component retains the whole application.
+        // A mixed declaration composes conservatively: directly declared opaque state stays distinguishable from the
+        // derived class, and one observable component retains the whole application.
         let mixed = Effects::new(
             EffectClasses::single(EffectClass::OrderedState)
                 .union(EffectClasses::single(EffectClass::OrderedAssertion)),
@@ -911,9 +911,9 @@ mod tests {
             EffectClasses::single(EffectClass::OrderedState)
                 .union(EffectClasses::single(EffectClass::OrderedAssertion)),
         );
-        assert!(mixed.has_explicit_class(EffectClass::OrderedState));
-        assert!(mixed.has_explicit_class(EffectClass::OrderedAssertion));
-        assert!(!mixed.has_explicit_class(EffectClass::OrderedIo));
+        assert!(mixed.declares(EffectClass::OrderedState));
+        assert!(mixed.declares(EffectClass::OrderedAssertion));
+        assert!(!mixed.declares(EffectClass::OrderedIo));
         assert!(mixed.summary().has_observable_effects_when_unused());
 
         // Equality distinguishes distinct declarations and clones compare equal.
