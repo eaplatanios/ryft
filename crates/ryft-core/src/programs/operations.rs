@@ -2,11 +2,13 @@ use std::borrow::Cow;
 
 use crate::parameters::Parameterized;
 use crate::programs::ProgramError;
-use crate::programs::effects::Effects;
+use crate::programs::effects::{OperationEffects, ReferenceAccessMode};
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::programs::{Program, ProgramRenderingMode};
-use crate::programs::references::{ReferenceAccessMode, ReferenceOperationSemantics};
-use crate::programs::regions::{OutputRegionProvenance, RegionInterface, RegionRole, RegionSlot};
+
+use crate::programs::regions::{
+    InputRegionProvenance, OutputRegionProvenance, RegionInterface, RegionRole, RegionSlot,
+};
 use crate::programs::types::{Type, TypeError};
 use crate::programs::values::Value;
 
@@ -514,18 +516,23 @@ pub trait Operation: Clone {
         region_interfaces: &[RegionInterface<Self::Type>],
     ) -> Result<Vec<Self::Type>, TypeError>;
 
-    /// Returns the parent [`Instruction`](crate::Instruction) input that directly supplies `input_index` of attached
-    /// [`Region`](crate::Region) at index `region_index`. [`None`] means that the region input is not a direct
-    /// forwarding of one instruction input and may instead be derived by the operation, such as a sliced scan element.
+    /// Returns how input `input_index` of the attached [`Region`](crate::Region) at `region_index` originates from an
+    /// input of this operation. [`InputRegionProvenance::Forwarded`] means the region receives the complete operation
+    /// input unchanged. [`InputRegionProvenance::View`] means the operation derives a view of that input for the
+    /// region, such as the per-iteration slice of a stacked `scan` input. The `input_index` stored in either variant
+    /// names the source in this operation's input list. The function argument of the same name identifies the
+    /// destination in the attached region's input list.
     ///
     /// This is the input side counterpart of [`Self::output_region_provenance`]. Together they describe value flow
     /// across an operation's attached region boundary. For example, for a condition with inputs `(predicate, value)`,
     /// branch input `0` comes from instruction input `1`, while instruction output `0` may come from output `0` of
     /// either branch. Analyses use the input relation to carry identities and canonical resource roots into nested
-    /// regions without guessing from equal types or matching positions. The default is correct when no region input
-    /// directly forwards an instruction input.
+    /// regions without guessing from equal types or matching positions. For a reference view, the operation family
+    /// describes the view itself through
+    /// [`ReferenceViewOperation::region_input_view`](crate::ReferenceViewOperation::region_input_view).
+    /// The default is correct when no region input originates from an operation input.
     #[inline]
-    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
         let _ = (region_index, input_index);
         None
     }
@@ -665,39 +672,39 @@ pub trait Operation: Clone {
     ///
     /// This function does not describe how values enter the region; use [`Self::input_region_provenance`] for that.
     /// It also does not describe reference accesses performed intrinsically by this operation. Instead, use
-    /// [`Self::reference_semantics`] for those.
+    /// [`Self::effects`] for those.
     #[inline]
     fn allows_reference_access_through_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
         let _ = (region_index, mode);
         true
     }
 
-    /// Returns this operation's local [`ReferenceOperationSemantics`] (i.e., output root/alias classification and input
-    /// accesses) in operand/result index space. Refer to the documentation of [`ReferenceOperationSemantics`] for more
-    /// information and per-operation examples. The empty default is correct for operations that do not themselves
-    /// create, alias, or access references. [`Region`](crate::Region)-bearing operations (e.g., loops and conditionals)
-    /// also keep the empty default even when their nested programs touch references. Like [`Operation::effects`] versus
-    /// [`Program::effects`], this descriptor is _intrinsic_ to the operation, and program-level reference analysis is
-    /// responsible for recursing into attached regions rather than trusting per-instruction descriptors alone. The
-    /// returned [`Cow`] borrows at `self`'s lifetime so implementations can hand out shared static descriptors _or_
-    /// borrow descriptors stored in their own payloads (e.g., custom-call or kernel operations with payload-dependent
-    /// semantics) without cloning on every query.
+    /// Returns the complete operation-local effect declaration of this [`Operation`] that contains its explicit
+    /// [`Effect`](crate::Effect) classes, its [`ReferenceEffect`](crate::ReferenceEffect)s (allocations and accesses),
+    /// and its [`ReferenceAlias`](crate::ReferenceAlias)es, all expressed in this operation's operand/result index
+    /// space. Refer to the documentation of [`OperationEffects`] for the semantics and per-operation examples. This is
+    /// the single declaration from which the aggregate [`Effects`](crate::Effects) classes consumed by transforms and
+    /// lowering (via [`OperationEffects::classes`]), the reference facts consumed by reference analysis and discharge,
+    /// and the retention decision of dead-code elimination are derived.
     ///
-    /// This descriptor covers reference behavior intrinsic to the operation itself. Operations whose attached regions
-    /// establish capture namespaces, require outputs to preserve entering reference identities, or restrict accesses
-    /// to entering roots must additionally implement [`Self::region_capture_input_count`],
-    /// [`Self::reference_output_identity_input`], or [`Self::allows_reference_access_through_region_input`],
-    /// respectively.
+    /// The empty default is correct for pure operations that do not themselves create, alias, or access references.
+    /// This declaration describes only effects produced directly by the operation; it does not include effects from
+    /// attached [`Region`](crate::Region)s. Region sealing incorporates effects from attached computation regions into
+    /// region metadata, which is what [`Program::effects`] reports, while program-level reference analysis traverses
+    /// attached regions directly. Consequently, region-bearing operations such as loops and conditionals can keep the
+    /// empty default even when their nested programs are effectful or access references.
+    ///
+    /// Contracts describing how references cross an operation's region boundaries are also separate from this effect
+    /// declaration. Use [`Self::region_capture_input_count`] to establish a region's capture namespace,
+    /// [`Self::reference_output_identity_input`] to state that an output preserves an entering reference identity, and
+    /// [`Self::allows_reference_access_through_region_input`] to restrict which entering roots a region may access.
+    ///
+    /// The returned [`Cow`] borrows at `self`'s lifetime so implementations can hand out shared static declarations
+    /// _or_ borrow declarations stored in their own payloads (e.g., custom-call or kernel operations with
+    /// payload-dependent effects) without cloning on every query.
     #[inline]
-    fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
-        Cow::Borrowed(ReferenceOperationSemantics::empty())
-    }
-
-    /// Returns the observable [`Effect`](crate::Effect) classes of this [`Operation`]. Refer to the documentation of
-    /// [`Effects`] and [`Effect`](crate::Effect) for the semantics.
-    #[inline]
-    fn effects(&self) -> Effects {
-        Effects::PURE
+    fn effects(&self) -> Cow<'_, OperationEffects> {
+        Cow::Borrowed(OperationEffects::empty())
     }
 
     /// Returns this [`Operation`] after simultaneously renaming any [`TypeIdentity`](crate::TypeIdentity)s stored
@@ -789,7 +796,7 @@ impl<O: Operation> Operation for Box<O> {
     }
 
     #[inline]
-    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
         self.as_ref().input_region_provenance(region_index, input_index)
     }
 
@@ -819,12 +826,7 @@ impl<O: Operation> Operation for Box<O> {
     }
 
     #[inline]
-    fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
-        self.as_ref().reference_semantics()
-    }
-
-    #[inline]
-    fn effects(&self) -> Effects {
+    fn effects(&self) -> Cow<'_, OperationEffects> {
         self.as_ref().effects()
     }
 
@@ -1070,8 +1072,7 @@ mod tests {
     use crate::differentiation::StopGradientOperation;
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
-    use crate::programs::effects::Effect;
-    use crate::programs::references::ReferenceOutput;
+    use crate::programs::effects::{Effect, Effects, ReferenceEffect};
 
     use super::*;
 
@@ -1112,8 +1113,8 @@ mod tests {
             Ok(input_types.iter().chain(region_interfaces[0].output_types()).cloned().collect())
         }
 
-        fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
-            (region_index == 0).then_some(input_index + 1)
+        fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
+            (region_index == 0).then_some(InputRegionProvenance::Forwarded { input_index: input_index + 1 })
         }
 
         fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
@@ -1136,15 +1137,12 @@ mod tests {
             region_index == 0 && mode == ReferenceAccessMode::Read
         }
 
-        fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
-            Cow::Owned(ReferenceOperationSemantics::new(
+        fn effects(&self) -> Cow<'_, OperationEffects> {
+            Cow::Owned(OperationEffects::new(
+                Effects::single(Effect::OrderedIo),
+                vec![ReferenceEffect::Allocate { output_index: 0 }],
                 Vec::new(),
-                vec![ReferenceOutput::Allocation { output_index: 0 }],
             ))
-        }
-
-        fn effects(&self) -> Effects {
-            Effects::single(Effect::OrderedIo)
         }
 
         fn rename_type_identities(&self, _renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {
@@ -1252,7 +1250,7 @@ mod tests {
         assert!(operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Write));
         assert!(operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::ReadWrite));
         assert!(!operation.is_zero(0));
-        assert_eq!(operation.effects(), Effects::PURE);
+        assert_eq!(operation.effects().classes(), Effects::PURE);
         assert!(operation.rename_type_identities(&TypeIdentityRenaming::new()).is_ok());
         assert_eq!(std::fmt::from_fn(|formatter| operation.render(formatter, 0)).to_string(), "stop_gradient");
 
@@ -1275,7 +1273,7 @@ mod tests {
             operation.infer_region_input_types(&[DataType::F32], &region_interfaces),
             Ok(vec![Some(vec![DataType::F32])]),
         );
-        assert_eq!(operation.input_region_provenance(0, 2), Some(3));
+        assert_eq!(operation.input_region_provenance(0, 2), Some(InputRegionProvenance::Forwarded { input_index: 3 }),);
         assert_eq!(operation.input_region_provenance(1, 2), None);
         assert_eq!(
             operation.infer_output_types(&[DataType::F32], &region_interfaces),
@@ -1295,9 +1293,11 @@ mod tests {
         assert!(!operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::Write));
         assert!(!operation.allows_reference_access_through_region_input(0, ReferenceAccessMode::ReadWrite));
         assert!(!operation.allows_reference_access_through_region_input(1, ReferenceAccessMode::Read));
-        let semantics = operation.reference_semantics();
-        assert_eq!(semantics.outputs(), &[ReferenceOutput::Allocation { output_index: 0 }]);
-        assert_eq!(operation.effects(), Effects::single(Effect::OrderedIo));
+        assert_eq!(operation.effects().reference_effects(), &[ReferenceEffect::Allocate { output_index: 0 }]);
+        assert_eq!(
+            operation.effects().classes(),
+            Effects::single(Effect::OrderedIo).union(Effects::single(Effect::OrderedState)),
+        );
         assert_eq!(
             operation.rename_type_identities(&TypeIdentityRenaming::new()),
             Ok(Box::new(ForwardingOperation::<DataType> { renamed: true, marker: PhantomData })),
