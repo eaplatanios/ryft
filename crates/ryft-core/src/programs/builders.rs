@@ -1095,7 +1095,7 @@ mod tests {
         let mapped = program.map_operations(|operation| Ok(operation.clone())).unwrap();
         assert_eq!(mapped.regions().len(), 2);
         assert_eq!(mapped.instructions()[0].regions(), &[sealed]);
-        assert!(program.effects().is_pure());
+        assert!(program.effects().classes().is_pure());
 
         // The region-aware rebuild paths preserve regions. Simplification keeps the live region-carrying instruction
         // and its region, filtering projects the entry boundary while passing regions through, and relocation imports

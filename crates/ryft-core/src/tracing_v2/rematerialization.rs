@@ -74,9 +74,9 @@ use crate::operations::{AddOperation, DotOperation, TagOperation, TransferToMemo
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{
-    Atom, AtomId, Effect, Effects, InstructionId, Operation, OperationFormatter, OutputRegionProvenance, Program,
-    ProgramBuilder, ProgramError, ReferenceAccessMode, ReferenceAnalysis, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary,
+    Atom, AtomId, Effect, Effects, InputRegionProvenance, InstructionId, Operation, OperationFormatter,
+    OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceAccessMode, ReferenceAnalysis,
+    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary,
     ReferenceDischargeRegionStateInsertion, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceRoot,
     Region, RegionId, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueId,
 };
@@ -372,13 +372,14 @@ impl<T: DifferentiableType> Operation for RematerializeOperation<T> {
     }
 
     #[inline]
-    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
         // The primal and forward regions receive the operands positionally. The backward and tangent regions receive
         // only the leading non-differentiated operands positionally; the rest of their boundaries is bound by the
         // forward tail and by the transform that consumes the rule, not by the operands directly.
         match region_index {
-            0 | 1 => Some(input_index),
-            2 | 3 => (input_index < self.non_differentiated_count).then_some(input_index),
+            0 | 1 => Some(InputRegionProvenance::Forwarded { input_index }),
+            2 | 3 => (input_index < self.non_differentiated_count)
+                .then_some(InputRegionProvenance::Forwarded { input_index }),
             _ => None,
         }
     }
@@ -1797,7 +1798,7 @@ impl PrimalReferenceAccesses {
         // is accessing local roots. Instruction-level effects include the recursively derived effects of attached
         // computation regions, so an effect inside a nested body (e.g., a print in a scan body) also forces the save.
         for index in 0..instruction_count {
-            let effects = primal.instruction_effects(InstructionId::new(primal.entry(), index)).unwrap();
+            let effects = primal.instruction_effects(InstructionId::new(primal.entry(), index)).unwrap().classes();
             accesses.recomputable.push(
                 effects.is_pure()
                     || (!accesses.external[index]
@@ -2728,6 +2729,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::borrow::Cow;
     use std::fmt::Debug;
     use std::rc::Rc;
 
@@ -2747,8 +2749,8 @@ mod tests {
     use crate::operations::{Cos, Dot, DotDimensionNumbers, MulOperation, ScanOperation, Sin, Tag};
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::{
-        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
-        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceType, RegionRole,
+        OperationEffects, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
+        ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceType, RegionRole,
     };
     use crate::tests::TestOrderedStateOperation;
 
@@ -4565,11 +4567,11 @@ mod tests {
                 })
             }
 
-            fn effects(&self) -> Effects {
-                match self {
+            fn effects(&self) -> Cow<'_, OperationEffects> {
+                Cow::Owned(OperationEffects::explicit(match self {
                     Self::Effectful => Effects::single(Effect::OrderedIo),
                     _ => Effects::PURE,
-                }
+                }))
             }
         }
 

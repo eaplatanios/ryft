@@ -138,7 +138,10 @@ pub mod values;
 
 pub use atoms::{Atom, AtomId, MaybeZero};
 pub use builders::ProgramBuilder;
-pub use effects::{Effect, EffectOccurrence, Effects};
+pub use effects::{
+    Effect, EffectOccurrence, Effects, EffectsSummary, OperationEffects, ReferenceAccessMode, ReferenceAlias,
+    ReferenceAliasKind, ReferenceEffect,
+};
 pub use identities::{NoIdentity, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature};
 pub use instructions::{Instruction, InstructionId};
 pub use operations::{
@@ -148,30 +151,32 @@ pub use operations::{
 pub use programs::{FlatProgram, Program, ProgramLiveSets, ProgramRenderingMode};
 pub use provenance::{Provenance, ProvenanceScope, ProvenanceState};
 pub use references::{
-    ExternalReferenceBinding, PartialReferenceDischargeResult, PreparedReferenceReplacement,
+    ExternalReferenceBinding, NoBinding, PartialReferenceDischargeResult, PreparedReferenceReplacement,
     REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME,
     REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME,
     ReadyOrPendingReferenceGuard, ReadyReferenceGuard, RecursiveReferenceDischargeDriver, Reference, ReferenceAccess,
-    ReferenceAccessMode, ReferenceAccumulationPolicy, ReferenceAddUpdate, ReferenceAddUpdateOperation,
-    ReferenceAliasEdge, ReferenceAliasKind, ReferenceAnalysis, ReferenceAnalysisError, ReferenceBoundaryError,
-    ReferenceBoundaryPosition, ReferenceCompletion, ReferenceCompletionBackend, ReferenceDischargeAllocationId,
+    ReferenceAccumulationPolicy, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAliasEdge,
+    ReferenceAliasOrigin, ReferenceAnalysis, ReferenceAnalysisError, ReferenceBoundaryError, ReferenceBoundaryPosition,
+    ReferenceCompletion, ReferenceCompletionBackend, ReferenceDischargeAllocationId,
     ReferenceDischargeBoundaryWidening, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeReference, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionResult,
-    ReferenceDischargeRegionStateInsertion, ReferenceDischargeRegionSummary, ReferenceDischargeResult,
-    ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType,
-    ReferenceError, ReferenceFreeze, ReferenceFreezeOperation, ReferenceGeneration, ReferenceId, ReferenceInput,
-    ReferenceNew, ReferenceNewOperation, ReferenceObservation, ReferenceOperationSemantics, ReferenceOutput,
-    ReferenceRead, ReferenceReadOperation, ReferenceRegionInputBinding, ReferenceReplacementPreparation,
-    ReferenceReplacementTransaction, ReferenceRoot, ReferenceSource, ReferenceSwap, ReferenceSwapOperation,
-    ReferenceTransitiveAccess, ReferenceType, ReferenceTypeRefinements, ReferenceViewAnalysis,
-    ReferenceViewAnalysisError, ReferenceViewOperation, ReferenceViewPath, ReferenceViewValidationError,
-    ReferenceWrite, ReferenceWriteOperation, TakenReferenceGuard, ValidatedPendingReplacementTransaction,
-    discharge_positional_region_operation, discharge_reference_free_operation, validate_reference_boundary,
+    ReferenceDischargeReference, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionInput,
+    ReferenceDischargeRegionResult, ReferenceDischargeRegionStateInsertion, ReferenceDischargeRegionSummary,
+    ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    ReferenceDischargeableType, ReferenceError, ReferenceFreeze, ReferenceFreezeOperation, ReferenceGeneration,
+    ReferenceId, ReferenceNew, ReferenceNewOperation, ReferenceObservation, ReferenceRead, ReferenceReadOperation,
+    ReferenceRegionInputBinding, ReferenceReplacementPreparation, ReferenceReplacementTransaction, ReferenceRoot,
+    ReferenceSource, ReferenceSwap, ReferenceSwapOperation, ReferenceTransitiveAccess, ReferenceType,
+    ReferenceTypeRefinements, ReferenceView, ReferenceViewAnalysis, ReferenceViewAnalysisError, ReferenceViewOperation,
+    ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation,
+    TakenReferenceGuard, ValidatedPendingReplacementTransaction, ViewOverlap, ViewSymbol, ViewSymbolBinding,
+    batch_reference_view_operation, discharge_positional_region_operation, discharge_reference_free_operation,
+    validate_differentiation_boundary, validate_reference_boundary,
 };
 pub use regions::{
     BindingRegionDriver, CalleeRegionDriver, DestinationRegionMapping, EagerInterpretationValidation,
-    EmptyRegionDriver, OutputRegionProvenance, Region, RegionArena, RegionArenaIterator, RegionDriver, RegionId,
-    RegionInterface, RegionRef, RegionReplayMappings, RegionRole, RegionSlot, RegionWithMetadata, ReplayRegionDriver,
+    EmptyRegionDriver, InputRegionProvenance, OutputRegionProvenance, Region, RegionArena, RegionArenaIterator,
+    RegionDriver, RegionId, RegionInterface, RegionRef, RegionReplayMappings, RegionRole, RegionSlot,
+    RegionWithMetadata, ReplayRegionDriver,
 };
 pub use statistics::{AttachedRegionStatistics, ProgramStatistics, RegionStatistics};
 pub use transforms::{Transform, TransformArtifact, TransformCache};

@@ -2044,6 +2044,9 @@ mod tests {
 
     use super::*;
 
+    type TestValue = ArrayIrValue<Array>;
+    type TestIrOperation = ArrayIrOperation<Array>;
+
     #[derive(Clone, Debug)]
     struct LongMetadataOperation;
 
@@ -2937,14 +2940,11 @@ mod tests {
 
     #[test]
     fn test_program_simplified_removes_unused_reference_new_but_keeps_reference_read() {
-        type TestValue = ArrayIrValue<Array>;
-        type TestOperation = ArrayIrOperation<Array>;
-
         // Create a program with two allocations: one that nothing accesses and one whose (unused) read is retained.
         // An allocation has no observable consequence when unused, so the first allocation disappears, while a read
         // does and is retained, which keeps the allocation it reads alive as its dependency.
         let build_program = || {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let mut builder = ProgramBuilder::<TestValue, TestIrOperation>::new();
             let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
             builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap();
             let read = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
@@ -2966,16 +2966,13 @@ mod tests {
 
     #[test]
     fn test_program_simplified_roots_reference_accesses_but_not_allocations() {
-        type TestValue = ArrayIrValue<Array>;
-        type TestOperation = ArrayIrOperation<Array>;
-
         // Dead-code elimination roots an output-dead instruction exactly when its effect summary has an observable
         // consequence when unused. Allocations and aliases do not (i.e., the allocation nothing touches and the
         // allocation whose only user is a dead view disappear together with that view). Accesses do, whatever their
         // mode (i.e., the unused read and the write, which has no outputs at all, are retained, and each keeps the
         // allocation it accesses alive as its dependency). A live allocation is retained by ordinary liveness.
         let build_program = || {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let mut builder = ProgramBuilder::<TestValue, TestIrOperation>::new();
             let scalar = builder.add_input(ArrayType::scalar(DataType::F32).into());
             let vector = builder.add_input(ArrayType::new_static(DataType::F32, [3]).into());
             builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![scalar], None).unwrap();
@@ -2996,7 +2993,7 @@ mod tests {
                 .build::<Vec<TestValue>, Vec<TestValue>>(vec![live], vec![Placeholder; 2], vec![Placeholder])
                 .unwrap()
         };
-        let names = |program: Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>| {
+        let names = |program: Program<TestValue, TestIrOperation, Vec<TestValue>, Vec<TestValue>>| {
             program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>()
         };
         let expected = vec!["reference_new", "reference_read", "reference_new", "reference_write", "reference_new"];
@@ -3006,8 +3003,6 @@ mod tests {
 
     #[test]
     fn test_program_simplified_composes_nested_effect_summaries() {
-        type TestValue = ArrayIrValue<Array>;
-
         // A region-carrying operation whose own declaration is allocation-only, so that whether an output-dead
         // application is retained is decided entirely by the summaries of its attached regions. `Effectful`
         // supplies each explicit effect class for the bodies and `Native` supplies the reference primitives.
@@ -3536,14 +3531,11 @@ mod tests {
 
     #[test]
     fn test_program_filtered_removes_unused_reference_new_but_keeps_reference_read() {
-        type TestValue = ArrayIrValue<Array>;
-        type TestOperation = ArrayIrOperation<Array>;
-
         // Liveness analysis roots the same instructions as simplification: an allocation that nothing accesses has no
         // observable consequence when unused and is pruned, while an unused read does and is retained together with the
         // allocation it reads, for both the borrowing and the consuming projection.
         let build_program = || {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let mut builder = ProgramBuilder::<TestValue, TestIrOperation>::new();
             let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
             builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap();
             let read = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];

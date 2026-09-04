@@ -797,7 +797,7 @@ pub(crate) mod tests {
     };
     use crate::differentiation::{
         DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-        DifferentiationTracer, TransposableOperation, TranspositionDriver,
+        DifferentiationTracer, TransposableOperation, TranspositionContext, TranspositionDriver,
     };
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::check_count;
@@ -1113,7 +1113,7 @@ pub(crate) mod tests {
     {
         fn transpose<D: TranspositionDriver<V, O>>(
             &self,
-            _context: &mut TracingContext<V, O>,
+            _context: &mut TranspositionContext<'_, V, O>,
             _driver: &D,
             inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
             outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
