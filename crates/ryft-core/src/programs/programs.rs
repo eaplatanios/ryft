@@ -3056,11 +3056,14 @@ mod tests {
                 match self {
                     Self::Native(operation) => operation.effects(),
                     Self::Effectful(effect) => Cow::Owned(Effects::explicit(EffectClasses::single(*effect))),
-                    Self::AllocateWith(_) => Cow::Owned(Effects::new(
-                        EffectClasses::NONE,
-                        vec![ReferenceEffect::Allocate { output_index: 0 }],
-                        Vec::new(),
-                    )),
+                    Self::AllocateWith(_) => Cow::Owned(
+                        Effects::new(
+                            EffectClasses::NONE,
+                            vec![ReferenceEffect::Allocate { output_index: 0 }],
+                            Vec::new(),
+                        )
+                        .unwrap(),
+                    ),
                 }
             }
         }

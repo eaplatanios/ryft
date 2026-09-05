@@ -19,14 +19,14 @@ use crate::operations::Zero;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
-use crate::programs::effects::{Effect, Effects};
+use crate::programs::effects::{EffectClasses, Effects, ReferenceAccessMode, ReferenceEffect};
 use crate::programs::operations::Operation;
 use crate::programs::references::discharge::{
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
     ReferenceDischargeableOperation,
 };
-use crate::programs::references::operations::ReferenceSwap;
-use crate::programs::references::semantics::{ReferenceAccessMode, ReferenceInput, ReferenceOperationSemantics};
+use crate::programs::references::operations::ReferenceSwapOperation;
+
 use crate::programs::references::types::ReferenceType;
 use crate::programs::references::views::ReferenceViewOperation;
 use crate::programs::regions::RegionInterface;
@@ -45,8 +45,13 @@ pub trait ReferenceWrite<Replacement = Self>: Sized {
     fn write(&self, replacement: &Replacement) -> Result<(), ProgramError>;
 }
 
-static REFERENCE_WRITE_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> = LazyLock::new(|| {
-    ReferenceOperationSemantics::new(vec![ReferenceInput::new(0, ReferenceAccessMode::Write)], Vec::new())
+static REFERENCE_WRITE_OPERATION_EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
+    Effects::new(
+        EffectClasses::NONE,
+        vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Write }],
+        Vec::new(),
+    )
+    .unwrap()
 });
 
 define_reference_primitive_payload!(
@@ -90,13 +95,8 @@ where
     }
 
     #[inline]
-    fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
-        Cow::Borrowed(&REFERENCE_WRITE_OPERATION_SEMANTICS)
-    }
-
-    #[inline]
-    fn effects(&self) -> Effects {
-        Effects::single(Effect::OrderedState)
+    fn effects(&self) -> Cow<'_, Effects> {
+        Cow::Borrowed(&REFERENCE_WRITE_OPERATION_EFFECTS)
     }
 }
 
@@ -157,7 +157,7 @@ where
     T: Type,
     U: DifferentiableType,
     ReferenceWriteOperation<T, U>: Operation<Type = U>,
-    C: Context<Type = U, Value: ReferenceWrite<C::Value>> + Zero<C::Value>,
+    C: Context<Type = U, Operation: From<ReferenceWriteOperation<T, U>> + ResidualZeroProvider<U>> + Zero<C::Value>,
 {
     // The replacement's tangent is stored into the tangent reference exactly as the primal replacement is stored into
     // the primal reference. The tangent pairing is resolved before either store so that a rejected plumbing store
@@ -170,10 +170,21 @@ where
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
         let stored = stored_tangents(REFERENCE_WRITE_OPERATION_NAME, &inputs[0], &inputs[1])?;
-        inputs[0].primal().write(inputs[1].primal())?;
+        context.bind(*self, Vec::new(), &[inputs[0].primal().clone(), inputs[1].primal().clone()])?;
         if let Some((tangent_reference, tangent)) = stored {
             // A zero replacement tangent is instantiated because the tangent reference must observe the store.
-            tangent_reference.write(&tangent.materialize(context)?)?;
+            context.bind(
+                *self,
+                Vec::new(),
+                &[
+                    tangent_reference.clone(),
+                    C::Operation::materialize_zero_from_residual_sources(
+                        context,
+                        tangent,
+                        std::iter::once(inputs[1].primal()),
+                    )?,
+                ],
+            )?;
         }
         Ok(Vec::new())
     }
@@ -184,7 +195,7 @@ where
     T: Type,
     U: Type,
     ReferenceWriteOperation<T, U>: Operation<Type = U>,
-    C: Context<Type = U, Value: ReferenceWrite<C::Value>>,
+    C: Context<Type = U, Operation: From<ReferenceWriteOperation<T, U>>>,
     P: BatchingPolicy<C>,
 {
     // The replacement is aligned with the reference's fixed batch axis before the packed store.
@@ -197,7 +208,9 @@ where
         check_count!("input", inputs, 2, ProgramError);
         let replacement =
             align_stored_batch(context, driver, REFERENCE_WRITE_OPERATION_NAME, &inputs[0], inputs[1].clone())?;
-        P::value(&inputs[0]).write(P::value(&replacement))?;
+        context
+            .parent()
+            .bind(*self, Vec::new(), &[P::value(&inputs[0]).clone(), P::value(&replacement).clone()])?;
         Ok(Vec::new().into())
     }
 }
@@ -208,8 +221,8 @@ where
     U: DifferentiableType,
     ReferenceWriteOperation<T, U>: Operation<Type = U>,
     V: Value<Type = U>,
-    O: ReferenceViewOperation<Type = U> + ResidualZeroProvider<U>,
-    Tracer<TracingContext<V, O>>: ReferenceSwap<Tracer<TracingContext<V, O>>, Tracer<TracingContext<V, O>>>,
+    O: ReferenceViewOperation<Type = U> + ResidualZeroProvider<U> + From<ReferenceSwapOperation<T, U>>,
+    ReferenceSwapOperation<T, U>: Operation<Type = U>,
 {
     // A write is a swap whose previous contents are discarded, so its transpose is the swap transpose with a zero
     // output cotangent: the cotangent reference is reset to zero (the pre-execution state no longer flows into
@@ -232,9 +245,12 @@ where
         let zero = O::materialize_zero_from_residual_sources(
             &**context,
             MaybeZero::Zero(value_cotangent_type),
-            inputs.iter().filter_map(PartialValue::as_known),
+            context
+                .geometry_sources()
+                .chain(inputs.iter().filter_map(PartialValue::as_known))
+                .chain(std::iter::once(&accumulator)),
         )?;
-        let previous = accumulator.swap(&zero)?;
+        let previous = context.bind(ReferenceSwapOperation::new(), Vec::new(), &[accumulator, zero])?.remove(0);
         Ok(vec![reference_cotangent, MaybeZero::Value(previous)])
     }
 }
@@ -250,11 +266,14 @@ mod tests {
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::EagerContext;
     use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
+    use crate::programs::effects::EffectClass;
     use crate::programs::references::operations::tests::*;
     use crate::programs::references::operations::{ReferenceNew, ReferenceRead};
     use crate::programs::regions::EmptyRegionDriver;
 
     use super::*;
+
+    type TestIrValue = ArrayIrValue<Array>;
 
     #[test]
     fn test_reference_write_operation() {
@@ -265,9 +284,12 @@ mod tests {
 
         assert_parameter_roundtrip(Write::new());
         assert_eq!(Write::new().to_string(), REFERENCE_WRITE_OPERATION_NAME);
-        assert_eq!(Write::new().effects(), Effects::single(Effect::OrderedState));
-        assert_eq!(Write::new().reference_semantics().outputs(), &[]);
-        assert_eq!(Write::new().reference_semantics().inputs(), &[ReferenceInput::new(0, ReferenceAccessMode::Write)],);
+        assert_eq!(Write::new().effects().classes(), EffectClasses::single(EffectClass::OrderedState));
+        assert_eq!(
+            Write::new().effects().reference_effects(),
+            &[ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Write }]
+        );
+        assert_eq!(Write::new().effects().reference_aliases(), &[]);
 
         assert_eq!(
             ReferenceWriteOperation::<TestReferent, WriteUniverse>::new().infer_output_types(
@@ -296,7 +318,7 @@ mod tests {
             Write::new().infer_output_types(&[reference.clone(), reference.clone()], &[]),
             Err(TypeError::invalid("expected value type but got reference type")),
         );
-        let region = RegionInterface::new(Vec::new(), Vec::new(), Effects::PURE);
+        let region = RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE);
         assert_eq!(
             Write::new().infer_output_types(&[reference, value], std::slice::from_ref(&region)),
             Err(TypeError::invalid("expected 0 regions but got 1")),
@@ -312,7 +334,7 @@ mod tests {
         let initial = TestValue::new(REFERENT, 4);
         let allocated =
             ReferenceDischargeValue::from(context.bind_discharged(ReferenceType::new(REFERENT), initial).unwrap());
-        let reference = allocated.try_as_reference("the allocated allocation").unwrap().clone();
+        let reference = allocated.try_as_reference("the allocated reference").unwrap().clone();
         let inputs = vec![
             ReferenceDischargeValue::Reference(reference.clone()),
             ReferenceDischargeValue::Value(TestValue::new(REFERENT, 9)),
@@ -339,11 +361,9 @@ mod tests {
 
     #[test]
     fn test_reference_write_operation_jvp() {
-        type TestValue = ArrayIrValue<Array>;
-
-        let context = DifferentiationContext::new(EagerContext::<TestValue, ArrayIrOperation<Array>>::new());
-        let reference = TestValue::Array(Array::vector(vec![1.0_f32, 2.0])).reference_new().unwrap();
-        let tangent_reference = TestValue::Array(Array::vector(vec![3.0_f32, 4.0])).reference_new().unwrap();
+        let context = DifferentiationContext::new(EagerContext::<TestIrValue, ArrayIrOperation<Array>>::new());
+        let reference = TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0])).reference_new().unwrap();
+        let tangent_reference = TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0])).reference_new().unwrap();
         let active = DifferentiationTracer::new(
             DifferentiationDual::new(reference.clone(), tangent_reference.clone()).unwrap(),
             context.clone(),
@@ -352,25 +372,25 @@ mod tests {
         // A live replacement tangent is written into the tangent reference alongside the primal replacement.
         let replacement = DifferentiationTracer::new(
             DifferentiationDual::new(
-                TestValue::Array(Array::vector(vec![5.0_f32, 6.0])),
-                TestValue::Array(Array::vector(vec![7.0_f32, 8.0])),
+                TestIrValue::Array(Array::vector(vec![5.0_f32, 6.0])),
+                TestIrValue::Array(Array::vector(vec![7.0_f32, 8.0])),
             )
             .unwrap(),
             context.clone(),
         );
         let outputs = context.bind(ReferenceWriteOperation::new(), Vec::new(), &[active.clone(), replacement]).unwrap();
         assert!(outputs.is_empty());
-        assert_eq!(reference.read(), Ok(TestValue::Array(Array::vector(vec![5.0_f32, 6.0]))));
-        assert_eq!(tangent_reference.read(), Ok(TestValue::Array(Array::vector(vec![7.0_f32, 8.0]))));
+        assert_eq!(reference.read(), Ok(TestIrValue::Array(Array::vector(vec![5.0_f32, 6.0]))));
+        assert_eq!(tangent_reference.read(), Ok(TestIrValue::Array(Array::vector(vec![7.0_f32, 8.0]))));
 
         // A symbolic zero replacement tangent is instantiated so that the tangent reference observes the store.
         let replacement = DifferentiationTracer::new(
-            DifferentiationDual::new_with_zero_tangent(TestValue::Array(Array::vector(vec![9.0_f32, 10.0]))).unwrap(),
+            DifferentiationDual::new_with_zero_tangent(TestIrValue::Array(Array::vector(vec![9.0_f32, 10.0]))).unwrap(),
             context.clone(),
         );
         context.bind(ReferenceWriteOperation::new(), Vec::new(), &[active, replacement]).unwrap();
-        assert_eq!(reference.read(), Ok(TestValue::Array(Array::vector(vec![9.0_f32, 10.0]))));
-        assert_eq!(tangent_reference.read(), Ok(TestValue::Array(Array::vector(vec![0.0_f32, 0.0]))));
+        assert_eq!(reference.read(), Ok(TestIrValue::Array(Array::vector(vec![9.0_f32, 10.0]))));
+        assert_eq!(tangent_reference.read(), Ok(TestIrValue::Array(Array::vector(vec![0.0_f32, 0.0]))));
 
         // A plumbing reference accepts a replacement without a live tangent and records no tangent store.
         let plumbing = DifferentiationTracer::new(
@@ -378,18 +398,19 @@ mod tests {
             context.clone(),
         );
         let replacement = DifferentiationTracer::new(
-            DifferentiationDual::new_with_zero_tangent(TestValue::Array(Array::vector(vec![11.0_f32, 12.0]))).unwrap(),
+            DifferentiationDual::new_with_zero_tangent(TestIrValue::Array(Array::vector(vec![11.0_f32, 12.0])))
+                .unwrap(),
             context.clone(),
         );
         context.bind(ReferenceWriteOperation::new(), Vec::new(), &[plumbing.clone(), replacement]).unwrap();
-        assert_eq!(reference.read(), Ok(TestValue::Array(Array::vector(vec![11.0_f32, 12.0]))));
-        assert_eq!(tangent_reference.read(), Ok(TestValue::Array(Array::vector(vec![0.0_f32, 0.0]))));
+        assert_eq!(reference.read(), Ok(TestIrValue::Array(Array::vector(vec![11.0_f32, 12.0]))));
+        assert_eq!(tangent_reference.read(), Ok(TestIrValue::Array(Array::vector(vec![0.0_f32, 0.0]))));
 
         // A live replacement tangent has no tangent reference to land in, and the rejection precedes the primal store.
         let replacement = DifferentiationTracer::new(
             DifferentiationDual::new(
-                TestValue::Array(Array::vector(vec![13.0_f32, 14.0])),
-                TestValue::Array(Array::vector(vec![15.0_f32, 16.0])),
+                TestIrValue::Array(Array::vector(vec![13.0_f32, 14.0])),
+                TestIrValue::Array(Array::vector(vec![15.0_f32, 16.0])),
             )
             .unwrap(),
             context.clone(),
@@ -399,28 +420,27 @@ mod tests {
             error.downcast_custom::<DifferentiationError>(),
             Some(&DifferentiationError::PlumbingReferenceTangent { operation: REFERENCE_WRITE_OPERATION_NAME }),
         );
-        assert_eq!(reference.read(), Ok(TestValue::Array(Array::vector(vec![11.0_f32, 12.0]))));
+        assert_eq!(reference.read(), Ok(TestIrValue::Array(Array::vector(vec![11.0_f32, 12.0]))));
     }
 
     #[test]
     fn test_reference_write_operation_batching() {
-        type TestValue = ArrayIrValue<Array>;
-
-        let extent = TestValue::Dimension(
+        let extent = TestIrValue::Dimension(
             DimensionValue::new(DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())), 2)
                 .unwrap(),
         );
         let context = BatchingContext::<_, ArrayIrBatching>::new(
-            EagerContext::<TestValue, ArrayIrOperation<Array>>::new(),
+            EagerContext::<TestIrValue, ArrayIrOperation<Array>>::new(),
             extent,
         );
         let packed_type = ArrayType::new_static(DataType::F32, [2, 3]);
-        let reference = TestValue::Array(Array::from_f64s(packed_type.clone(), vec![0.0; 6])).reference_new().unwrap();
+        let reference =
+            TestIrValue::Array(Array::from_f64s(packed_type.clone(), vec![0.0; 6])).reference_new().unwrap();
         let batched =
             BatchingTracer::new(context.clone(), ArrayIrBatch::new(reference.clone(), BatchAxis::new(0)).unwrap());
 
         // A replacement mapped at the reference's batch axis is stored packed.
-        let aligned = TestValue::Array(Array::from_f64s(packed_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        let aligned = TestIrValue::Array(Array::from_f64s(packed_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
         let replacement =
             BatchingTracer::new(context.clone(), ArrayIrBatch::new(aligned.clone(), BatchAxis::new(0)).unwrap());
         let outputs =
@@ -431,40 +451,40 @@ mod tests {
         // A replicated replacement is broadcast along the reference's batch axis.
         let replacement = BatchingTracer::new(
             context.clone(),
-            ArrayIrBatch::replicated(TestValue::Array(Array::vector(vec![7.0_f32, 8.0, 9.0]))),
+            ArrayIrBatch::replicated(TestIrValue::Array(Array::vector(vec![7.0_f32, 8.0, 9.0]))),
         );
         context.bind(ReferenceWriteOperation::new(), Vec::new(), &[batched.clone(), replacement]).unwrap();
         assert_eq!(
             reference.read(),
-            Ok(TestValue::Array(Array::from_f64s(packed_type.clone(), vec![7.0, 8.0, 9.0, 7.0, 8.0, 9.0]))),
+            Ok(TestIrValue::Array(Array::from_f64s(packed_type.clone(), vec![7.0, 8.0, 9.0, 7.0, 8.0, 9.0]))),
         );
 
         // A replacement mapped at another axis is moved to the reference's batch axis.
         let transposed_type = ArrayType::new_static(DataType::F32, [3, 2]);
-        let transposed = TestValue::Array(Array::from_f64s(transposed_type, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]));
+        let transposed = TestIrValue::Array(Array::from_f64s(transposed_type, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]));
         let replacement =
             BatchingTracer::new(context.clone(), ArrayIrBatch::new(transposed, BatchAxis::new(1)).unwrap());
         context.bind(ReferenceWriteOperation::new(), Vec::new(), &[batched, replacement]).unwrap();
         assert_eq!(
             reference.read(),
-            Ok(TestValue::Array(Array::from_f64s(packed_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))),
+            Ok(TestIrValue::Array(Array::from_f64s(packed_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))),
         );
 
         // A replicated replacement is stored plainly into a replicated reference, while a batched replacement has no
         // batch axis to land in and the user is told to batch the reference instead.
-        let unbatched = TestValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0])).reference_new().unwrap();
+        let unbatched = TestIrValue::Array(Array::vector(vec![0.0_f32, 0.0, 0.0])).reference_new().unwrap();
         let replicated = BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(unbatched.clone()));
         let replacement = BatchingTracer::new(
             context.clone(),
-            ArrayIrBatch::replicated(TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]))),
+            ArrayIrBatch::replicated(TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]))),
         );
         context
             .bind(ReferenceWriteOperation::new(), Vec::new(), &[replicated.clone(), replacement])
             .unwrap();
-        assert_eq!(unbatched.read(), Ok(TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]))));
+        assert_eq!(unbatched.read(), Ok(TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]))));
         let replacement = BatchingTracer::new(
             context.clone(),
-            ArrayIrBatch::new(TestValue::Array(Array::from_f64s(packed_type, vec![0.0; 6])), BatchAxis::new(0))
+            ArrayIrBatch::new(TestIrValue::Array(Array::from_f64s(packed_type, vec![0.0; 6])), BatchAxis::new(0))
                 .unwrap(),
         );
         let error = context.bind(ReferenceWriteOperation::new(), Vec::new(), &[replicated, replacement]).unwrap_err();
@@ -476,6 +496,6 @@ mod tests {
                     .to_string(),
             }),
         );
-        assert_eq!(unbatched.read(), Ok(TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]))));
+        assert_eq!(unbatched.read(), Ok(TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]))));
     }
 }

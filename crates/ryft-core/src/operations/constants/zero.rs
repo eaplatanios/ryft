@@ -161,7 +161,8 @@ impl<A: Value<Type = ArrayType>> ZeroOperationProvider<ArrayIrType> for ArrayIrO
             }
             ArrayIrType::Reference(r#type) => {
                 return Err(TypeError::invalid(format!(
-                    "cannot materialize a zero for reference type `{}`; references must be discharged first",
+                    "cannot materialize a zero for reference type `{}`; a reference denotes an allocation and has \
+                     no zero value, so tangent and cotangent references are allocated by the differentiation rules",
                     r#type,
                 ))
                 .into());
@@ -379,8 +380,9 @@ mod tests {
             )),
         );
 
-        // First-class dimensions and references are not algebraic values. In particular, a reference cannot be
-        // replaced by a zero of its referent type; it must be discharged before construction.
+        // First-class dimensions and references are not algebraic values. In particular, a reference cannot be replaced
+        // by a zero of its referent type. The differentiation rules allocate tangent and cotangent references instead
+        // of ever materializing a zero reference.
         assert_eq!(
             ArrayIrOperation::<Array>::zero_operation(ArrayIrType::Dimension(DimensionType::new(size))).unwrap_err(),
             ProgramError::Type(TypeError::invalid("cannot materialize a zero for a first-class dimension type")),
@@ -389,7 +391,8 @@ mod tests {
         assert_eq!(
             ArrayIrOperation::<Array>::zero_operation(ArrayIrType::Reference(reference_type.clone())).unwrap_err(),
             ProgramError::Type(TypeError::invalid(format!(
-                "cannot materialize a zero for reference type `{reference_type}`; references must be discharged first",
+                "cannot materialize a zero for reference type `{reference_type}`; a reference denotes an allocation \
+                 and has no zero value, so tangent and cotangent references are allocated by the differentiation rules",
             ))),
         );
     }
@@ -440,14 +443,19 @@ mod tests {
                                values exist only in array programs over `ArrayIrOperation`",
         ));
 
-        // Composite eager zero materialization delegates array members and rejects first-class dimensions.
+        // Composite eager zero materialization delegates array members and rejects first-class dimensions and
+        // references. A reference names an allocation with persistent identity and cannot be conjured from its type.
         let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        assert_eq!(context.zero(&ArrayIrType::Array(output_type)), Ok(ArrayIrValue::Array(expected)));
+        assert_eq!(context.zero(&ArrayIrType::Array(output_type.clone())), Ok(ArrayIrValue::Array(expected)));
         let dimension_type =
             ArrayIrType::Dimension(DimensionType::new(DimensionVariable::new("size", DimensionBounds::unbounded())));
         assert_eq!(
             context.zero(&dimension_type),
             Err(ProgramError::Type(TypeError::invalid("expected array type but got dimension type"))),
+        );
+        assert_eq!(
+            context.zero(&ArrayIrType::Reference(ReferenceType::new(output_type))),
+            Err(ProgramError::Type(TypeError::invalid("expected array type but got reference type"))),
         );
     }
 

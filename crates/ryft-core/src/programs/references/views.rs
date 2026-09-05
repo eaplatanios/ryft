@@ -892,6 +892,7 @@ impl<View> ReferenceViewAnalysis<View> {
         let current = region.with_id(root.region()).ok()?;
         let atom = match root {
             ReferenceRoot::RegionInput { input_index, .. } => *current.input_ids().get(input_index)?,
+            ReferenceRoot::Constant { value } => value.atom(),
             ReferenceRoot::Allocation { instruction, output_index } => {
                 *current.instructions().get(instruction.index())?.outputs().get(output_index)?
             }
@@ -973,7 +974,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::atoms::AtomId;
     use crate::programs::builders::ProgramBuilder;
-    use crate::programs::effects::{Effects, OperationEffects, ReferenceAlias};
+    use crate::programs::effects::{EffectClasses, Effects, ReferenceAlias};
     use crate::programs::instructions::Instruction;
     use crate::programs::programs::Program;
     use crate::programs::references::analysis::{ReferenceAliasEdge, ReferenceAliasOrigin};
@@ -1145,14 +1146,17 @@ mod tests {
             }
         }
 
-        fn effects(&self) -> Cow<'_, OperationEffects> {
+        fn effects(&self) -> Cow<'_, Effects> {
             match self {
                 Self::Native(operation) => operation.effects(),
-                Self::Symbolic(_) => Cow::Owned(OperationEffects::new(
-                    Effects::PURE,
-                    Vec::new(),
-                    vec![ReferenceAlias::new(0, 0, ReferenceAliasKind::View)],
-                )),
+                Self::Symbolic(_) => Cow::Owned(
+                    Effects::new(
+                        EffectClasses::NONE,
+                        Vec::new(),
+                        vec![ReferenceAlias::new(0, 0, ReferenceAliasKind::View)],
+                    )
+                    .unwrap(),
+                ),
                 Self::UndescribedScan(operation) => operation.effects(),
             }
         }
@@ -1607,14 +1611,17 @@ mod tests {
                 }
             }
 
-            fn effects(&self) -> Cow<'_, OperationEffects> {
+            fn effects(&self) -> Cow<'_, Effects> {
                 match self {
                     Self::Native(operation) => operation.effects(),
-                    Self::View => Cow::Owned(OperationEffects::new(
-                        Effects::PURE,
-                        Vec::new(),
-                        vec![ReferenceAlias::new(0, 0, ReferenceAliasKind::View)],
-                    )),
+                    Self::View => Cow::Owned(
+                        Effects::new(
+                            EffectClasses::NONE,
+                            Vec::new(),
+                            vec![ReferenceAlias::new(0, 0, ReferenceAliasKind::View)],
+                        )
+                        .unwrap(),
+                    ),
                 }
             }
         }

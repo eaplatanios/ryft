@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use crate::arrays::differentiation::ExactShape;
 use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
 use crate::arrays::types::arrays::ArrayType;
@@ -8,7 +10,9 @@ use crate::differentiation::ResidualZeroProvider;
 use crate::operations::{
     DimensionSizeOperation, IotaOperation, OneOperation, ZeroLikeOperation, ZeroOperation, ZeroOperationProvider,
 };
-use crate::programs::{AtomId, Operation, ProgramBuilder, ProgramError, Typed, Value};
+use crate::programs::{AtomId, Operation, ProgramBuilder, ProgramError, ReferenceReadOperation, Typed, Value};
+
+// TODO(eaplatanios): Review this module.
 
 impl<A: Value<Type = ArrayType>> From<ZeroOperation<ArrayType>> for ArrayIrOperation<A> {
     #[inline]
@@ -89,7 +93,7 @@ impl<A: Value<Type = ArrayType>> From<IotaOperation<ArrayType>> for ArrayIrOpera
 // families, which their `Self`-typed builder and context parameters cannot express. Do not fold them into the trait
 // implementation.
 impl<A: Value<Type = ArrayType>> ArrayIrOperation<A> {
-    /// Captures the runtime extents needed to materialize a disconnected cotangent zero from the primal `source`.
+    /// Captures the runtime extents needed to materialize a cotangent zero from the ordinary primal `source`.
     pub fn capture_zero_residuals<
         V: Value<Type = ArrayIrType>,
         O: Operation<Type = ArrayIrType> + From<DimensionSizeOperation>,
@@ -100,23 +104,13 @@ impl<A: Value<Type = ArrayType>> ArrayIrOperation<A> {
     ) -> Result<Vec<AtomId>, ProgramError> {
         let r#type = <&ArrayType>::try_from(r#type)?;
         let (_, first_axes) = ExactShape::for_residual_zero(r#type.shape());
-        if first_axes.is_empty() {
-            return Ok(Vec::new());
-        }
-        let source_type = builder
-            .atoms()
-            .get(source.index())
-            .ok_or(ProgramError::UnboundAtomId { id: source })?
-            .r#type()
-            .into_owned();
-        let source_type = <&ArrayType>::try_from(&source_type)?;
         // Reading only each identity's first source axis establishes the same deduplicated residual ordering used by
         // zero construction, including when several axes share one identity.
         first_axes
             .into_iter()
             .map(|(axis, _)| {
                 Ok(builder.add_instruction(
-                    DimensionSizeOperation::new(source_type, axis)?,
+                    DimensionSizeOperation::new(r#type, axis)?,
                     Vec::new(),
                     vec![source],
                     None,
@@ -126,11 +120,17 @@ impl<A: Value<Type = ArrayType>> ArrayIrOperation<A> {
     }
 
     /// Captures the one extent named by `residual_type` from `source`, or [`None`] when `source`'s type does not carry
-    /// that [`DimensionVariable`]. A first-class dimension of exactly the residual type already _is_ the extent and is
-    /// reused without staging anything, while an array carrying the variable on some axis contributes a
-    /// [`DimensionSizeOperation`] read of that axis. The source's type is inspected before anything is staged,
-    /// so a candidate that does not carry the variable leaves no instruction behind.
-    pub fn capture_zero_residual_value<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>>(
+    /// that [`DimensionVariable`](crate::arrays::DimensionVariable). A first-class dimension of exactly the residual
+    /// type already _is_ the extent and is reused without staging anything. An array carrying the variable on an axis
+    /// contributes a [`DimensionSizeOperation`] read of that axis. A reference carrying the variable is read first
+    /// and contributes the extent of its referent. The source's type is inspected before anything is staged, so a
+    /// candidate that does not carry the variable leaves no instruction behind.
+    pub fn capture_zero_residual_value<
+        C: Context<
+                Type = ArrayIrType,
+                Operation: From<DimensionSizeOperation> + From<ReferenceReadOperation<ArrayType, ArrayIrType>>,
+            >,
+    >(
         context: &C,
         source: &C::Value,
         residual_type: &ArrayIrType,
@@ -139,29 +139,36 @@ impl<A: Value<Type = ArrayType>> ArrayIrOperation<A> {
             return Ok(None);
         };
         let variable = residual_type.variable();
-        match source.r#type().as_ref() {
-            ArrayIrType::Dimension(source_type) if source_type.variable() == variable => Ok(Some(source.clone())),
-            ArrayIrType::Dimension(_) => Ok(None),
-            ArrayIrType::Reference(_) => Ok(None),
-            ArrayIrType::Array(source_type) => {
-                let axis =
-                    source_type.shape().dimensions().iter().position(
-                        |dimension| matches!(dimension, Dimension::Dynamic(candidate) if candidate == variable),
-                    );
-                match axis {
-                    None => Ok(None),
-                    Some(axis) => Ok(Some(
-                        context
-                            .bind(
-                                DimensionSizeOperation::new(source_type, axis)?,
-                                Vec::new(),
-                                std::slice::from_ref(source),
-                            )?
-                            .remove(0),
-                    )),
-                }
+        let source_type = source.r#type();
+        let array_type = match source_type.as_ref() {
+            ArrayIrType::Dimension(source_type) => {
+                return Ok((source_type.variable() == variable).then(|| source.clone()));
             }
-        }
+            ArrayIrType::Reference(reference) => reference.referent(),
+            ArrayIrType::Array(array_type) => array_type,
+        };
+        let Some(axis) = array_type
+            .shape()
+            .dimensions()
+            .iter()
+            .position(|dimension| matches!(dimension, Dimension::Dynamic(candidate) if candidate == variable))
+        else {
+            return Ok(None);
+        };
+        let source = if matches!(source_type.as_ref(), ArrayIrType::Reference(_)) {
+            Cow::Owned(context.bind(ReferenceReadOperation::new(), Vec::new(), std::slice::from_ref(source))?.remove(0))
+        } else {
+            Cow::Borrowed(source)
+        };
+        Ok(Some(
+            context
+                .bind(
+                    DimensionSizeOperation::new(array_type, axis)?,
+                    Vec::new(),
+                    std::slice::from_ref(source.as_ref()),
+                )?
+                .remove(0),
+        ))
     }
 
     /// Returns the canonical zero operation for `r#type` and expands one explicit extent residual per distinct dynamic
@@ -196,8 +203,7 @@ impl<A: Value<Type = ArrayType>> ResidualZeroProvider<ArrayIrType> for ArrayIrOp
                 let (_, first_axes) = ExactShape::for_residual_zero(r#type.shape());
                 first_axes.into_iter().map(|(_, variable)| DimensionType::new(variable).into()).collect()
             }
-            ArrayIrType::Dimension(_) => Vec::new(),
-            ArrayIrType::Reference(_) => Vec::new(),
+            ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => Vec::new(),
         }
     }
 
@@ -240,6 +246,7 @@ mod tests {
     use crate::arrays::encoding::{i4, u4};
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
+    use crate::arrays::reference_views::ArrayReference;
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
@@ -253,7 +260,7 @@ mod tests {
     use crate::contexts::{Context, Domain, EagerContext, StagingContext};
     use crate::differentiation::{
         DifferentiableType, ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate,
-        StopGradientOperation, TransposableOperation, differentiate_at,
+        StopGradientOperation, TransposableOperation, TranspositionContext, differentiate_at,
     };
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
@@ -263,7 +270,8 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{
-        AtomId, EmptyRegionDriver, MaybeZero, ProgramBuilder, ProgramError, TypeError, Typed, ValueProjection,
+        AtomId, EmptyRegionDriver, MaybeZero, ProgramBuilder, ProgramError, ReferenceType, TypeError, Typed,
+        ValueProjection,
     };
     use crate::tracing::TracingContext;
 
@@ -922,11 +930,11 @@ mod tests {
             ArrayIrOperation::<Array>::from(OneOperation::new(output_type.clone())),
             ArrayIrOperation::<Array>::from(IotaOperation::new(output_type.clone(), 0).unwrap()),
         ] {
-            let mut context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
             let output_cotangent = context.input(output_type.clone().into());
             let cotangents = operation
                 .transpose(
-                    &mut context,
+                    &mut TranspositionContext::new(context.clone()),
                     &EmptyRegionDriver,
                     &[PartialValue::Unknown(extent_type.clone().into())],
                     &[MaybeZero::Value(output_cotangent)],
@@ -1095,7 +1103,8 @@ mod tests {
             context.vjp(|inputs: Vec<_>, ()| Ok(vec![inputs[1].clone()]), vec![dynamic, scalar], ()).unwrap();
         assert_eq!(pullback.residuals().len(), 1);
         assert!(matches!(pullback.residuals()[0].r#type().as_ref(), ArrayIrType::Dimension(_)));
-        let zero = pullback.program().instructions().last().unwrap();
+        let transposed = pullback.transposed_program(&[]).unwrap();
+        let zero = transposed.instructions().last().unwrap();
         assert!(matches!(zero.operation(), ArrayIrOperation::Zero(_)));
         assert_eq!(zero.inputs(), &[AtomId::new(1)]);
 
@@ -1241,5 +1250,45 @@ mod tests {
         );
         assert_eq!(dimension.r#type().as_ref(), &dimension_type);
         assert_eq!(context.builder().borrow().instructions().len(), 1);
+    }
+
+    #[test]
+    fn test_capture_zero_residual_value_reference() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(2, Some(8)).unwrap());
+        let dimension_type = DimensionType::new(extent.clone());
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let reference = context.input(ReferenceType::new(array_type).into());
+
+        // A candidate with no matching dimension must not read the reference or stage an extent query.
+        let unrelated = DimensionType::new(DimensionVariable::new("other", DimensionBounds::unbounded())).into();
+        assert_eq!(ArrayIrOperation::<Array>::capture_zero_residual_value(&context, &reference, &unrelated), Ok(None));
+        assert!(context.builder().borrow().instructions().is_empty());
+
+        let dimension = ArrayIrOperation::<Array>::capture_zero_residual_value(
+            &context,
+            &reference,
+            &dimension_type.clone().into(),
+        )
+        .unwrap()
+        .unwrap();
+        let program = context
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![dimension.atom_id().unwrap()],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let reference = ArrayReference::new(Array::vector(vec![3.0_f32, 5.0, 7.0]));
+        let outputs = program.interpret(vec![ArrayIrValue::Reference(reference.clone())]).unwrap();
+        let [ArrayIrValue::Dimension(dimension)] = outputs.as_slice() else {
+            panic!("expected one dimension residual");
+        };
+        assert_eq!(dimension.extent(), 3);
+        assert_eq!(dimension.r#type().extent(), Some(3));
+        assert_eq!(reference.read(), Ok(Array::vector(vec![3.0_f32, 5.0, 7.0])));
     }
 }

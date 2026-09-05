@@ -13,7 +13,7 @@ use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
     ElementwiseDerivativeAlignment, LinearCallOperation, MemberDifferentiableOperation, TransposableOperation,
-    TranspositionDriver, jvp_projected_operation,
+    TranspositionContext, TranspositionDriver, jvp_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -411,23 +411,23 @@ impl<C: Domain<Type = ArrayType, Value: Reduce>> InterpretableOperation<C> for R
     }
 }
 
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
+// Partial evaluation defers to the default fold-or-residualize behavior of
+// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
 impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for ReduceOperation where
     C::Operation: From<ReduceOperation>
 {
 }
 
-/// Batching rule for [`ReduceOperation`]: the reduced axes are expressed in the per-item coordinate system, so the
-/// rule lifts them past the inserted batch dimension with `lift_reduce_axes` and re-interprets the lifted reduction
-/// over the physical batched value, with a requested output sharding gaining the mapped axis's sharding at the new
-/// output batch axis position (mirroring the dot batching rule).
-///
-/// Reducing a bounded ragged axis away is the one array rule that legitimately consumes an operand's per-item extents:
-/// [`RaggedArrayBatchingPolicy::mask_reduction_input`] first replaces the padding along that axis with the reduction's
-/// identity, so the result no longer depends on those extents. The rule reports each such
-/// [`DimensionVariable`](crate::arrays::DimensionVariable) as its [`BatchedOutputs`] evidence, which is how the
-/// carrier-invariant validation boundary tells a deliberate consumption apart from a silently dropped extent.
+// Batching rule for [`ReduceOperation`]: the reduced axes are expressed in the per-item coordinate system, so the
+// rule lifts them past the inserted batch dimension with `lift_reduce_axes` and re-interprets the lifted reduction
+// over the physical batched value, with a requested output sharding gaining the mapped axis's sharding at the new
+// output batch axis position (mirroring the dot batching rule).
+//
+// Reducing a bounded ragged axis away is the one array rule that legitimately consumes an operand's per-item extents:
+// [`RaggedArrayBatchingPolicy::mask_reduction_input`] first replaces the padding along that axis with the reduction's
+// identity, so the result no longer depends on those extents. The rule reports each such
+// [`DimensionVariable`](crate::arrays::DimensionVariable) as its [`BatchedOutputs`] evidence, which is how the
+// carrier-invariant validation boundary tells a deliberate consumption apart from a silently dropped extent.
 impl<C: Context<Type = ArrayType>, P: RaggedArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
     for ReduceOperation
 where
@@ -545,16 +545,16 @@ pub fn lift_reduce_axes(axes: &[usize], batch_axis: usize) -> (Vec<usize>, usize
     (lifted, output_batch_axis)
 }
 
-/// Forward-mode rule for [`ReduceOperation`]. The additive reductions ([`Sum`](ReductionKind::Sum) /
-/// [`Mean`](ReductionKind::Mean)) are linear in the operand, so the tangent is the same reduction applied to the
-/// operand tangent. [`Max`](ReductionKind::Max) / [`Min`](ReductionKind::Min) route their tangent through a
-/// primal-domain argmax mask: the tangent of `reduce_max(x)` along the reduced axes is `reduce_sum(mask * Δx)`, where
-/// `mask` equals `1` exactly at the per-reduction extremal positions (ties split evenly, matching the JAX convention).
-/// The mask is staged capture-free as ordinary primal operations — a `compare` of the operand primal against the
-/// broadcast-back reduced value, followed by an ordinary `mul` against the operand tangent — so no residual factor is
-/// captured. [`Any`](ReductionKind::Any) / [`All`](ReductionKind::All) are Boolean reductions with no tangent and are
-/// rejected with [`UnsupportedOperation`](ProgramError::UnsupportedOperation). The shared all-zero fast path handles a
-/// zero operand tangent before this rule is consulted, so the operand tangent reaching every supported case is live.
+// Forward-mode rule for [`ReduceOperation`]. The additive reductions ([`Sum`](ReductionKind::Sum) /
+// [`Mean`](ReductionKind::Mean)) are linear in the operand, so the tangent is the same reduction applied to the
+// operand tangent. [`Max`](ReductionKind::Max) / [`Min`](ReductionKind::Min) route their tangent through a
+// primal-domain argmax mask: the tangent of `reduce_max(x)` along the reduced axes is `reduce_sum(mask * Δx)`, where
+// `mask` equals `1` exactly at the per-reduction extremal positions (ties split evenly, matching the JAX convention).
+// The mask is staged capture-free as ordinary primal operations — a `compare` of the operand primal against the
+// broadcast-back reduced value, followed by an ordinary `mul` against the operand tangent — so no residual factor is
+// captured. [`Any`](ReductionKind::Any) / [`All`](ReductionKind::All) are Boolean reductions with no tangent and are
+// rejected with [`UnsupportedOperation`](ProgramError::UnsupportedOperation). The shared all-zero fast path handles a
+// zero operand tangent before this rule is consulted, so the operand tangent reaching every supported case is live.
 impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for ReduceOperation
 where
     C::Operation: From<ReduceOperation>
@@ -623,10 +623,10 @@ where
     }
 }
 
-/// Parent-context JVP rule for [`ReduceOperation`]. Fully static reductions delegate to the homogeneous projected
-/// rule. Dynamically shaped numeric reductions retain their exact input extents as ordinary residual values so their
-/// transpose can broadcast cotangents back to the runtime input shape. Maximum and minimum additionally retain the
-/// normalized extremum mask, while mean computes its divisor from the retained reduced-axis extents.
+// Parent-context JVP rule for [`ReduceOperation`]. Fully static reductions delegate to the homogeneous projected
+// rule. Dynamically shaped numeric reductions retain their exact input extents as ordinary residual values so their
+// transpose can broadcast cotangents back to the runtime input shape. Maximum and minimum additionally retain the
+// normalized extremum mask, while mean computes its divisor from the retained reduced-axis extents.
 impl<C> MemberDifferentiableOperation<C> for ReduceOperation
 where
     C: Context<Type = ArrayIrType>,
@@ -874,18 +874,18 @@ where
     }
 }
 
-/// Transpose (vector-Jacobian product) for a [`ReduceOperation`].
-///
-/// For a `Sum` reduction, the cotangent of the input is the output cotangent broadcast back to
-/// the input shape — singleton-broadcasting over each reduced axis. For a `Mean` reduction, the
-/// same broadcast-back result is additionally scaled by `1 / N` where `N` is the product of the
-/// reduced axis extents. `Max`/`Min` would need an argmax-style gather to route the cotangent
-/// only to the element that produced the reduction's output, and `Any`/`All` are not
-/// differentiable.
-///
-/// Both replications need every reduced extent, so a reduced axis whose extent is only known at run time is rejected
-/// here and served by [`MemberDifferentiableOperation::jvp_in_parent`] instead: linearization retains those extents as
-/// first-class dimension residuals and stages the replication as a mixed broadcast against them.
+// Transpose (vector-Jacobian product) for a [`ReduceOperation`].
+//
+// For a `Sum` reduction, the cotangent of the input is the output cotangent broadcast back to
+// the input shape — singleton-broadcasting over each reduced axis. For a `Mean` reduction, the
+// same broadcast-back result is additionally scaled by `1 / N` where `N` is the product of the
+// reduced axis extents. `Max`/`Min` would need an argmax-style gather to route the cotangent
+// only to the element that produced the reduction's output, and `Any`/`All` are not
+// differentiable.
+//
+// Both replications need every reduced extent, so a reduced axis whose extent is only known at run time is rejected
+// here and served by [`MemberDifferentiableOperation::jvp_in_parent`] instead: linearization retains those extents as
+// first-class dimension residuals and stages the replication as a mixed broadcast against them.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ReduceOperation
 where
     O: Operation<Type = ArrayType>
@@ -895,7 +895,7 @@ where
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        context: &mut TracingContext<V, O>,
+        context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -1000,9 +1000,9 @@ pub trait Reduce: Sized {
     }
 }
 
-/// Any context-carrying value reduces by binding a [`ReduceOperation`] through its own context. The
-/// `From<ReduceOperation>` bound makes this disjoint from the eager value types (whose context operation is
-/// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
+// Any context-carrying value reduces by binding a [`ReduceOperation`] through its own context. The
+// `From<ReduceOperation>` bound makes this disjoint from the eager value types (whose context operation is
+// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
 impl<V: Value<Type = ArrayType>> Reduce for V
 where
     V::DispatchDomain: Context<Type = ArrayType>,
@@ -1493,13 +1493,13 @@ mod tests {
         let input_shape = Shape::new(vec![Dimension::Static(4)]);
         let input_type = ArrayType::new(DataType::F64, input_shape.clone());
         let cotangent_type = ArrayType::scalar(DataType::F64);
-        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let transpose_builder = context.builder().clone();
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(cotangent_type);
         let output_cotangent = context.tracer(output_cotangent_atom, None);
         let contribution = ReduceOperation::new(vec![0], ReductionKind::Mean)
             .transpose(
-                &mut context,
+                &mut TranspositionContext::new(context.clone()),
                 &crate::programs::regions::EmptyRegionDriver,
                 &[PartialValue::Unknown(input_type)],
                 &[MaybeZero::Value(output_cotangent)],
@@ -1536,7 +1536,7 @@ mod tests {
 
         let input_shape = Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(2)]);
         let input_type = ArrayType::new(DataType::F64, input_shape.clone());
-        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = {
             let atom = context.builder().borrow_mut().add_input(ArrayType::scalar(DataType::F64));
             context.tracer(atom, None)
@@ -1544,7 +1544,7 @@ mod tests {
 
         assert!(matches!(
             ReduceOperation::new(vec![0, 1], ReductionKind::Mean).transpose(
-                &mut context,
+                &mut TranspositionContext::new(context.clone()),
                 &crate::programs::regions::EmptyRegionDriver,
                 &[PartialValue::Unknown(input_type)],
                 &[MaybeZero::Value(output_cotangent)],
@@ -1566,7 +1566,7 @@ mod tests {
             DataType::F64,
             Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(2), Dimension::Static(0)]),
         );
-        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = {
             let atom = context.builder().borrow_mut().add_input(ArrayType::scalar(DataType::F64));
             context.tracer(atom, None)
@@ -1574,7 +1574,7 @@ mod tests {
 
         let contributions = ReduceOperation::new(vec![0, 1, 2], ReductionKind::Mean)
             .transpose(
-                &mut context,
+                &mut TranspositionContext::new(context.clone()),
                 &crate::programs::regions::EmptyRegionDriver,
                 &[PartialValue::Unknown(input_type.clone())],
                 &[MaybeZero::Value(output_cotangent)],
@@ -1593,7 +1593,7 @@ mod tests {
         // Direct transposition observes no primal value, so the reduced axis's runtime extent is unavailable and the
         // replication cannot be staged. Both additive kinds report that instead of failing inside broadcast inference.
         for kind in [ReductionKind::Sum, ReductionKind::Mean] {
-            let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+            let context = TracingContext::<Array, ArrayOperation<Array>>::new();
             let output_cotangent = {
                 let atom = context
                     .builder()
@@ -1603,7 +1603,7 @@ mod tests {
             };
             assert!(matches!(
                 ReduceOperation::new(vec![0], kind).transpose(
-                    &mut context,
+                    &mut TranspositionContext::new(context.clone()),
                     &crate::programs::regions::EmptyRegionDriver,
                     &[PartialValue::Unknown(input_type.clone())],
                     &[MaybeZero::Value(output_cotangent)],

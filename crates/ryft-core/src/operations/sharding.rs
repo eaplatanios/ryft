@@ -1,16 +1,16 @@
 //! Sharding-control operations: [`ReshardOperation`] and [`ShardingConstraintOperation`].
 //!
 //! Both operations are unary, leave the array value and its shape/data type untouched, and carry a target
-//! [`Sharding`](crate::arrays::Sharding). They differ in *how that sharding relates to the type system* and *which mesh
-//! axis types they govern* — a distinction mirroring JAX's split between
+//! [`Sharding`]. They differ in how that sharding relates to the type system and which mesh axis types they govern,
+//! mirroring JAX's split between
 //! [`jax.sharding.reshard`](https://docs.jax.dev/en/latest/jax.sharding.html) and
 //! [`jax.lax.with_sharding_constraint`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.with_sharding_constraint.html):
 //!
 //! - [`ReshardOperation`] performs a **type-level sharding transition** over
 //!   [`Explicit`](crate::arrays::MeshAxisType::Explicit) and [`Manual`](crate::arrays::MeshAxisType::Manual)
-//!   mesh axes. Type inference *replaces* the output's [`Sharding`](crate::arrays::Sharding) with the requested one, so
-//!   the new sharding is tracked by the type system, dualized under transposition (the cotangent is resharded to the
-//!   cotangent dual of the input's sharding), and validated against the operand. It rejects requests that name
+//!   mesh axes. Type inference *replaces* the output's [`Sharding`] with the requested one, so the new sharding is
+//!   tracked by the type system, dualized under transposition (the cotangent is resharded to the cotangent dual of the
+//!   input's sharding), and validated against the operand. It rejects requests that name
 //!   [`Auto`](crate::arrays::MeshAxisType::Auto) axes (those are the compiler's to place — use a
 //!   [`ShardingConstraintOperation`] instead).
 //!
@@ -25,8 +25,7 @@
 //! Both lower to the same backend sharding-constraint operation (the [`Shardy`](https://openxla.org/shardy)
 //! `sdy.sharding_constraint` in the XLA backend); the only difference at the boundary is whether the type system
 //! tracked the result. The operations themselves are backend-agnostic — they carry a
-//! [`Sharding`](crate::arrays::Sharding) and have purely type-level and autodiff semantics — and each backend decides
-//! how to lower them.
+//! [`Sharding`] and have purely type-level and autodiff semantics — and each backend decides how to lower them.
 
 // TODO(eaplatanios): Review this module.
 
@@ -175,9 +174,9 @@ pub trait Reshard: Clone {
     }
 }
 
-/// Any context-carrying value reshards by binding a [`ReshardOperation`] through its own context. The
-/// `From<ReshardOperation>` bound makes this disjoint from the eager value types (whose context operation is
-/// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
+// Any context-carrying value reshards by binding a [`ReshardOperation`] through its own context. The
+// `From<ReshardOperation>` bound makes this disjoint from the eager value types (whose context operation is
+// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
 impl<V: Value<Type = ArrayType>> Reshard for V
 where
     V::DispatchDomain: Context<Type = ArrayType>,
@@ -258,8 +257,8 @@ impl_differentiable_operation! {
     },
 }
 
-/// Batching rule for [`ReshardOperation`]. The lifted reshard's target sharding gains the mapped axis's sharding
-/// (derived from the batched inputs via [`ArrayBatch::sharding_for_inputs`]) at the new batch dimension.
+// Batching rule for [`ReshardOperation`]. The lifted reshard's target sharding gains the mapped axis's sharding
+// (derived from the batched inputs via [`ArrayBatch::sharding_for_inputs`]) at the new batch dimension.
 impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
     for ReshardOperation
 where
@@ -388,10 +387,10 @@ pub trait ConstrainSharding: Clone {
     }
 }
 
-/// Any context-carrying value constrains its sharding by binding a [`ShardingConstraintOperation`] through its own
-/// context. The `From<ShardingConstraintOperation>` bound makes this disjoint from the eager value types (whose
-/// context operation is `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete
-/// implementations.
+// Any context-carrying value constrains its sharding by binding a [`ShardingConstraintOperation`] through its own
+// context. The `From<ShardingConstraintOperation>` bound makes this disjoint from the eager value types (whose
+// context operation is `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete
+// implementations.
 impl<V: Value<Type = ArrayType>> ConstrainSharding for V
 where
     V::DispatchDomain: Context<Type = ArrayType>,
@@ -467,10 +466,10 @@ impl_differentiable_operation! {
     },
 }
 
-/// Batching rule for [`ShardingConstraintOperation`]. The lifted hint gains a [`ShardingDimension::Unconstrained`]
-/// entry at the new batch dimension: the hint governs only the compiler-propagated auto axes, so the new dimension
-/// is left open for the backend to fill rather than pinned to a derived or replicated entry (matching JAX's
-/// `with_sharding_constraint` batcher, which inserts `PartitionSpec.UNCONSTRAINED`).
+// Batching rule for [`ShardingConstraintOperation`]. The lifted hint gains a [`ShardingDimension::Unconstrained`]
+// entry at the new batch dimension: the hint governs only the compiler-propagated auto axes, so the new dimension
+// is left open for the backend to fill rather than pinned to a derived or replicated entry (matching JAX's
+// `with_sharding_constraint` batcher, which inserts `PartitionSpec.UNCONSTRAINED`).
 impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
     for ShardingConstraintOperation
 where
@@ -647,7 +646,7 @@ mod tests {
                 move |x| Ok(x.reshard(&target))
             })
             .unwrap();
-        let (pullback, _residuals) = pullback.into_parts();
+        let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
 
         let staged = pullback
             .instructions()
@@ -726,7 +725,7 @@ mod tests {
                 move |x| Ok(x.constrain_sharding(&hint))
             })
             .unwrap();
-        let (pullback, _residuals) = pullback.into_parts();
+        let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
         let staged = pullback
             .instructions()
             .iter()

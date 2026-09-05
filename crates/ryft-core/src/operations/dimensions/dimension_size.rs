@@ -256,10 +256,10 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>> Pa
 
 impl_reference_free_dischargeable_operation!(DimensionSizeOperation);
 
-/// Batching reads the same logical array axis after accounting for an inserted packed batch axis. An ordinary static
-/// or dynamic axis produces shared shape metadata and remains replicated. A bounded ragged axis instead returns its
-/// per-item extent array as the mapped dimension carrier, preserving the logical dimension identity rather than
-/// exposing its packed storage bound.
+// Batching reads the same logical array axis after accounting for an inserted packed batch axis. An ordinary static
+// or dynamic axis produces shared shape metadata and remains replicated. A bounded ragged axis instead returns its
+// per-item extent array as the mapped dimension carrier, preserving the logical dimension identity rather than
+// exposing its packed storage bound.
 impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>> BatchableOperation<C, ArrayIrBatching>
     for DimensionSizeOperation
 {
@@ -330,7 +330,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::{
-        Effects, Operation, ProgramBuilder, RegionInterface, TypeIdentityPosition, TypeIdentityRenaming,
+        EffectClasses, Operation, ProgramBuilder, RegionInterface, TypeIdentityPosition, TypeIdentityRenaming,
     };
     use crate::tracing::TracingContext;
 
@@ -416,7 +416,7 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(
                 &[dynamic_type.clone().into()],
-                &[RegionInterface::new(Vec::new(), Vec::new(), Effects::PURE)],
+                &[RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE)],
             ),
             Err(TypeError::invalid("expected 0 regions but got 1")),
         );

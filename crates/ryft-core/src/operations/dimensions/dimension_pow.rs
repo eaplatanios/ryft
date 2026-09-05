@@ -2,6 +2,8 @@ use crate::arrays::{DimensionBounds, DimensionError, DimensionType, MAX_DIMENSIO
 use crate::macros::{define_arithmetic_dimension_capability, define_arithmetic_dimension_operation};
 use crate::parameters::Parameter;
 
+// TODO(eaplatanios): Review this module.
+
 use super::{bounds_overflow, checked_power, maximum_extent, representable_extent_range};
 
 /// Canonical operation name for [`DimensionPowOperation`].

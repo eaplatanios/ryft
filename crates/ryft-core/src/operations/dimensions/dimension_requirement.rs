@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::Display;
 
 use ryft_macros::Parameter;
@@ -11,9 +12,11 @@ use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
 };
 use crate::programs::{
-    Concretizable, Effect, Effects, Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError,
-    TypeIdentityRenaming, Typed, Value,
+    Concretizable, EffectClass, EffectClasses, Effects, Operation, OperationFormatter, ProgramError, RegionInterface,
+    Type, TypeError, TypeIdentityRenaming, Typed, Value,
 };
+
+// TODO(eaplatanios): Review this module.
 
 /// Canonical operation name for an equality [`DimensionRequirementOperation`].
 pub const DIMENSION_REQUIRE_EQUAL_OPERATION_NAME: &str = "dimension_require_equal";
@@ -478,13 +481,13 @@ impl Operation for DimensionRequirementOperation {
         Ok(Vec::new())
     }
 
-    fn effects(&self) -> Effects {
-        match self.prove_from_types() {
-            DimensionRequirementProof::Proven => Effects::PURE,
+    fn effects(&self) -> Cow<'_, Effects> {
+        Cow::Owned(Effects::explicit(match self.prove_from_types() {
+            DimensionRequirementProof::Proven => EffectClasses::NONE,
             DimensionRequirementProof::Disproven(_) | DimensionRequirementProof::Inconclusive => {
-                Effects::single(Effect::OrderedAssertion)
+                EffectClasses::single(EffectClass::OrderedAssertion)
             }
-        }
+        }))
     }
 
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
@@ -657,7 +660,7 @@ mod tests {
         assert_eq!(equal.left_type(), &shared);
         assert_eq!(equal.right_type(), Some(&shared));
         assert_eq!(equal.infer_output_types(&[shared.clone(), shared.clone()], &[]), Ok(Vec::new()),);
-        assert_eq!(equal.effects(), Effects::PURE);
+        assert_eq!(equal.effects().classes(), EffectClasses::NONE);
         assert_eq!(equal.to_string(), DIMENSION_REQUIRE_EQUAL_OPERATION_NAME);
 
         let low = DimensionType::new(DimensionVariable::new("low", DimensionBounds::new(0, Some(4)).unwrap()));
@@ -676,7 +679,7 @@ mod tests {
             DimensionType::new(DimensionVariable::new("overlapping", DimensionBounds::new(2, Some(7)).unwrap()));
         let equal = DimensionRequirementOperation::equal(&low, &overlapping);
         assert_eq!(equal.infer_output_types(&[low.clone(), overlapping.clone()], &[]), Ok(Vec::new()),);
-        assert_eq!(equal.effects(), Effects::single(Effect::OrderedAssertion));
+        assert_eq!(equal.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
 
         let required_bounds = DimensionBounds::new(2, Some(8)).unwrap();
         let bounds = DimensionRequirementOperation::bounds(&overlapping, required_bounds);
@@ -719,7 +722,7 @@ mod tests {
         let program = builder
             .build::<Vec<DimensionValue>, Vec<DimensionValue>>(Vec::new(), vec![Placeholder, Placeholder], Vec::new())
             .unwrap();
-        assert_eq!(program.effects(), Effects::single(Effect::OrderedAssertion));
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
         let simplified = program.simplified().unwrap();
         assert_eq!(
             simplified
@@ -763,7 +766,7 @@ mod tests {
             .partially_evaluate(&[PartialValue::Unknown(left.clone()), PartialValue::Unknown(right.clone())])
             .unwrap();
         assert_eq!(residual.program().instructions().len(), 1);
-        assert_eq!(residual.program().effects(), Effects::single(Effect::OrderedAssertion));
+        assert_eq!(residual.program().effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
 
         let passing = equality
             .partially_evaluate(&[
@@ -827,7 +830,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![DIMENSION_MUL_OPERATION_NAME, DIMENSION_REQUIRE_DIVISIBLE_BY_OPERATION_NAME],
         );
-        assert_eq!(residual.program().effects(), Effects::single(Effect::OrderedAssertion));
+        assert_eq!(residual.program().effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
     }
 
     #[test]
@@ -872,7 +875,7 @@ mod tests {
             program.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
             vec![DIMENSION_REQUIRE_LESS_THAN_OR_EQUAL_OPERATION_NAME, DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME],
         );
-        assert_eq!(program.effects(), Effects::single(Effect::OrderedAssertion));
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
 
         // Relocating the program into a fresh region preserves the assertion order and every requirement diagnostic.
         let mut builder = ProgramBuilder::<DimensionValue, DimensionOperation<DimensionValue>>::new();
@@ -886,7 +889,7 @@ mod tests {
             imported.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
             vec![DIMENSION_REQUIRE_LESS_THAN_OR_EQUAL_OPERATION_NAME, DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME],
         );
-        assert_eq!(imported.effects(), Effects::single(Effect::OrderedAssertion));
+        assert_eq!(imported.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
         let error = imported
             .interpret(vec![DimensionValue::new(left, 7).unwrap(), DimensionValue::new(right, 3).unwrap()])
             .unwrap_err();

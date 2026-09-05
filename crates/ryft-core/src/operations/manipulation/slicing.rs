@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::Display;
 
 use crate::arrays::{
@@ -28,8 +29,8 @@ use crate::operations::manipulation::transposition::Transpose;
 use crate::operations::sharding::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    Effect, Effects, MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface,
-    TypeError, Typed, Value, ValueProjection,
+    EffectClass, EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError,
+    RegionInterface, TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -171,8 +172,8 @@ impl Operation for DynamicShapeSliceOperation {
     /// declared bounds prove the relationship; this conservative effect classification ensures transforms preserve
     /// the potentially failing check in every other case.
     #[inline]
-    fn effects(&self) -> Effects {
-        Effects::single(Effect::OrderedAssertion)
+    fn effects(&self) -> Cow<'_, Effects> {
+        Cow::Owned(Effects::explicit(EffectClasses::single(EffectClass::OrderedAssertion)))
     }
 
     fn infer_output_types(
@@ -216,9 +217,9 @@ impl Operation for DynamicShapeSliceOperation {
     }
 }
 
-/// Eager interpretation of [`DynamicShapeSliceOperation`] resolves its first-class start and size operands and then
-/// delegates to the array value's ordinary static [`Slice`] implementation. Staged contexts bind the operation
-/// directly and therefore do not call this rule.
+// Eager interpretation of [`DynamicShapeSliceOperation`] resolves its first-class start and size operands and then
+// delegates to the array value's ordinary static [`Slice`] implementation. Staged contexts bind the operation
+// directly and therefore do not call this rule.
 impl<C> InterpretableOperation<C> for DynamicShapeSliceOperation
 where
     C: Domain<Type = ArrayIrType>,
@@ -291,8 +292,8 @@ where
     }
 }
 
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
+// Partial evaluation defers to the default fold-or-residualize behavior of
+// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
 impl<C: Context<Type = ArrayIrType>> PartiallyEvaluatableOperation<C> for DynamicShapeSliceOperation where
     C::Operation: From<DynamicShapeSliceOperation>
 {
@@ -300,8 +301,8 @@ impl<C: Context<Type = ArrayIrType>> PartiallyEvaluatableOperation<C> for Dynami
 
 impl_reference_free_dischargeable_operation!(DynamicShapeSliceOperation);
 
-/// Forward-mode rule for [`DynamicShapeSliceOperation`]. The array operand is linear while the first-class starts and
-/// sizes are discrete shape metadata, so the primal and materialized array tangent are sliced with the same geometry.
+// Forward-mode rule for [`DynamicShapeSliceOperation`]. The array operand is linear while the first-class starts and
+// sizes are discrete shape metadata, so the primal and materialized array tangent are sliced with the same geometry.
 impl<C> DifferentiableOperation<C> for DynamicShapeSliceOperation
 where
     C: Context<Type = ArrayIrType> + Zero<C::Value>,
@@ -332,10 +333,10 @@ where
     }
 }
 
-/// Reverse-mode differentiation of [`DynamicShapeSliceOperation`] is not yet supported. Its transpose must scatter a
-/// possibly strided dynamic-size cotangent into an input whose own runtime extents may need to be retained as linear
-/// residuals; returning an explicit error preserves that requirement instead of silently producing an incorrect
-/// cotangent.
+// Reverse-mode differentiation of [`DynamicShapeSliceOperation`] is not yet supported. Its transpose must scatter a
+// possibly strided dynamic-size cotangent into an input whose own runtime extents may need to be retained as linear
+// residuals; returning an explicit error preserves that requirement instead of silently producing an incorrect
+// cotangent.
 impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> TransposableOperation<V, O>
     for DynamicShapeSliceOperation
 {
@@ -355,9 +356,9 @@ impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> Transposabl
     }
 }
 
-/// Batching rule for [`DynamicShapeSliceOperation`]. First-class starts and sizes must remain replicated because
-/// per-item slice geometry requires a ragged representation. A mapped array axis is inserted into the slice geometry
-/// with start zero, the transform's exact extent, and unit stride.
+// Batching rule for [`DynamicShapeSliceOperation`]. First-class starts and sizes must remain replicated because
+// per-item slice geometry requires a ragged representation. A mapped array axis is inserted into the slice geometry
+// with start zero, the transform's exact extent, and unit stride.
 impl<C> BatchableOperation<C, ArrayIrBatching> for DynamicShapeSliceOperation
 where
     C: Context<
@@ -523,16 +524,16 @@ impl<C: Domain<Type = ArrayType, Value: Slice>> InterpretableOperation<C> for Sl
     }
 }
 
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
+// Partial evaluation defers to the default fold-or-residualize behavior of
+// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
 impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for SliceOperation where
     C::Operation: From<SliceOperation>
 {
 }
 
-/// Forward-mode rule for [`SliceOperation`]: slicing is a linear map, so the primal output is the slice of the
-/// operand primal and the tangent is the same slice of the operand tangent. A zero operand tangent yields a typed zero
-/// output tangent.
+// Forward-mode rule for [`SliceOperation`]: slicing is a linear map, so the primal output is the slice of the
+// operand primal and the tangent is the same slice of the operand tangent. A zero operand tangent yields a typed zero
+// output tangent.
 impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for SliceOperation
 where
     C::Operation: From<SliceOperation>,
@@ -555,8 +556,8 @@ where
     }
 }
 
-/// Projected array IR JVP rule for [`SliceOperation`]. A dynamically shaped operand retains its exact extents as
-/// ordinary residual values; a static operand delegates to the homogeneous projected rule.
+// Projected array IR JVP rule for [`SliceOperation`]. A dynamically shaped operand retains its exact extents as
+// ordinary residual values; a static operand delegates to the homogeneous projected rule.
 impl<C> MemberDifferentiableOperation<C> for SliceOperation
 where
     C: Context<Type = ArrayIrType>,
@@ -662,30 +663,30 @@ where
     }
 }
 
-/// Transpose (vector-Jacobian product) for a [`SliceOperation`].
-///
-/// The forward map extracts a (possibly strided) block, so its pullback scatters the output cotangent back into the
-/// positions the forward map read, with the strategy split on the strides:
-///
-///   - **Unit strides** read a contiguous block, so the pullback writes the cotangent into a zero array of the input
-///     type at the same static offsets: `cotangent ↦ update_slice(zeros(input_type), cotangent, start_indices)`.
-///   - **Non-unit strides** read every `strides[d]`-th element, so the pullback pads the cotangent with a zero
-///     scalar at exactly the inverse geometry: `edge_padding_low[d] = start_indices[d]`,
-///     `interior_padding[d] = strides[d] - 1`, and `edge_padding_high[d]` covers the rest of the input extent
-///     (everything after the last element the forward slice covered). For example, slicing `[0..6)` with `start = 1`
-///     and `stride = 2` reads positions `1`, `3`, and `5`, and the pullback pads the cotangent of length `3` with
-///     `low = 1`, `interior = 1`, and `high = 0`, scattering its elements back to positions `1`, `3`, and `5` of a
-///     zero-filled length-`6` array.
-///
-/// Symbolic-zero cotangents propagate unchanged.
-///
-/// **Contract:** this homogeneous rule requires a statically shaped input on both strategies. Each writes into a zero
-/// of the input's cotangent type (or reconstructs its extents), and the homogeneous [`ArrayType`] operation family owns
-/// no first-class dimension operations, so it has no constructor that can supply a runtime extent. A dynamically shaped
-/// input is therefore rejected here with an exact diagnostic. Mixed [`ArrayIrType`](crate::ArrayIrType) programs are
-/// unaffected: the [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation) rule above routes a
-/// dynamically shaped slice into a residual-carrying [`LinearCallOperation`] whose transpose region rebuilds the same
-/// zero from the retained exact extents.
+// Transpose (vector-Jacobian product) for a [`SliceOperation`].
+//
+// The forward map extracts a (possibly strided) block, so its pullback scatters the output cotangent back into the
+// positions the forward map read, with the strategy split on the strides:
+//
+//   - **Unit strides** read a contiguous block, so the pullback writes the cotangent into a zero array of the input
+//     type at the same static offsets: `cotangent ↦ update_slice(zeros(input_type), cotangent, start_indices)`.
+//   - **Non-unit strides** read every `strides[d]`-th element, so the pullback pads the cotangent with a zero
+//     scalar at exactly the inverse geometry: `edge_padding_low[d] = start_indices[d]`,
+//     `interior_padding[d] = strides[d] - 1`, and `edge_padding_high[d]` covers the rest of the input extent
+//     (everything after the last element the forward slice covered). For example, slicing `[0..6)` with `start = 1`
+//     and `stride = 2` reads positions `1`, `3`, and `5`, and the pullback pads the cotangent of length `3` with
+//     `low = 1`, `interior = 1`, and `high = 0`, scattering its elements back to positions `1`, `3`, and `5` of a
+//     zero-filled length-`6` array.
+//
+// Symbolic-zero cotangents propagate unchanged.
+//
+// **Contract:** this homogeneous rule requires a statically shaped input on both strategies. Each writes into a zero
+// of the input's cotangent type (or reconstructs its extents), and the homogeneous [`ArrayType`] operation family owns
+// no first-class dimension operations, so it has no constructor that can supply a runtime extent. A dynamically shaped
+// input is therefore rejected here with an exact diagnostic. Mixed [`ArrayIrType`](crate::ArrayIrType) programs are
+// unaffected: the [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation) rule above routes a
+// dynamically shaped slice into a residual-carrying [`LinearCallOperation`] whose transpose region rebuilds the same
+// zero from the retained exact extents.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for SliceOperation
 where
     O: Operation<Type = ArrayType>
@@ -782,8 +783,8 @@ where
     }
 }
 
-/// Batching rule for [`SliceOperation`]: a batched operand keeps its batch axis by slicing it fully, so the lifted
-/// operation inserts start index `0`, limit `axis_size`, and stride `1` at the batch axis position.
+// Batching rule for [`SliceOperation`]: a batched operand keeps its batch axis by slicing it fully, so the lifted
+// operation inserts start index `0`, limit `axis_size`, and stride `1` at the batch axis position.
 impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for SliceOperation
 where
     SliceOperation: InterpretableOperation<C>,
@@ -1022,9 +1023,9 @@ impl Slice for ArrayType {
     }
 }
 
-/// Any context-carrying value slices by binding a [`SliceOperation`] through its own context. The
-/// `From<SliceOperation>` bound makes this disjoint from the eager value types (whose context operation is
-/// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
+// Any context-carrying value slices by binding a [`SliceOperation`] through its own context. The
+// `From<SliceOperation>` bound makes this disjoint from the eager value types (whose context operation is
+// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
 impl<V: Value<Type = ArrayType>> Slice for V
 where
     V::DispatchDomain: Context<Type = ArrayType>,
@@ -1108,16 +1109,16 @@ impl<C: Domain<Type = ArrayType, Value: UpdateSlice>> InterpretableOperation<C> 
     }
 }
 
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
+// Partial evaluation defers to the default fold-or-residualize behavior of
+// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
 impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for UpdateSliceOperation where
     C::Operation: From<UpdateSliceOperation>
 {
 }
 
-/// Forward-mode rule for [`UpdateSliceOperation`]: the operation is jointly linear in its operand and update, so
-/// the tangent updates the operand tangent with the update tangent at the same static start indices. A zero operand and
-/// update tangent yields a typed zero output tangent.
+// Forward-mode rule for [`UpdateSliceOperation`]: the operation is jointly linear in its operand and update, so
+// the tangent updates the operand tangent with the update tangent at the same static start indices. A zero operand and
+// update tangent yields a typed zero output tangent.
 impl<C: Context<Type = ArrayType> + Zero<C::Value>> DifferentiableOperation<C> for UpdateSliceOperation
 where
     C::Operation: From<UpdateSliceOperation>,
@@ -1144,13 +1145,13 @@ where
     }
 }
 
-/// Transpose (vector-Jacobian product) for an [`UpdateSliceOperation`].
-///
-/// The forward map overwrites a block of the input with the update, so its pullback splits the output cotangent into
-/// two contributions: the input cotangent is the cotangent with the update window zeroed
-/// (`update_slice(cotangent, zeros(update_type), start_indices)`) and the update cotangent is the static slice of
-/// the cotangent at the update window (`slice(cotangent, start_indices, start_indices + update_shape)`).
-/// Symbolic-zero cotangents propagate unchanged.
+// Transpose (vector-Jacobian product) for an [`UpdateSliceOperation`].
+//
+// The forward map overwrites a block of the input with the update, so its pullback splits the output cotangent into
+// two contributions: the input cotangent is the cotangent with the update window zeroed
+// (`update_slice(cotangent, zeros(update_type), start_indices)`) and the update cotangent is the static slice of
+// the cotangent at the update window (`slice(cotangent, start_indices, start_indices + update_shape)`).
+// Symbolic-zero cotangents propagate unchanged.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for UpdateSliceOperation
 where
     O: Operation<Type = ArrayType> + From<SliceOperation> + From<UpdateSliceOperation> + From<ZeroOperation<ArrayType>>,
@@ -1205,9 +1206,9 @@ where
     }
 }
 
-/// Batching rule for [`UpdateSliceOperation`]: the input and update operands are aligned on one physical batch axis
-/// (replicated operands are broadcast to gain it), and the lifted operation inserts start index `0` at that axis
-/// so each batch item updates its own block.
+// Batching rule for [`UpdateSliceOperation`]: the input and update operands are aligned on one physical batch axis
+// (replicated operands are broadcast to gain it), and the lifted operation inserts start index `0` at that axis
+// so each batch item updates its own block.
 impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
     for UpdateSliceOperation
 where
@@ -1358,9 +1359,9 @@ impl UpdateSlice for ArrayType {
     }
 }
 
-/// Any context-carrying value updates a slice by binding an [`UpdateSliceOperation`] through its own context. The
-/// `From<UpdateSliceOperation>` bound makes this disjoint from the eager value types (whose context operation is
-/// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
+// Any context-carrying value updates a slice by binding an [`UpdateSliceOperation`] through its own context. The
+// `From<UpdateSliceOperation>` bound makes this disjoint from the eager value types (whose context operation is
+// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
 impl<V: Value<Type = ArrayType>> UpdateSlice for V
 where
     V::DispatchDomain: Context<Type = ArrayType>,
@@ -1451,16 +1452,16 @@ impl<C: Domain<Type = ArrayType, Value: DynamicSlice>> InterpretableOperation<C>
     }
 }
 
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
+// Partial evaluation defers to the default fold-or-residualize behavior of
+// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
 impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DynamicSliceOperation where
     C::Operation: From<DynamicSliceOperation>
 {
 }
 
-/// Forward-mode rule for [`DynamicSliceOperation`]: `dynamic_slice` is linear in the operand, and the scalar
-/// start indices are non-differentiated primal operand edges, so the tangent slices the operand tangent at the same
-/// primal start indices. A zero operand tangent yields a typed zero output tangent.
+// Forward-mode rule for [`DynamicSliceOperation`]: `dynamic_slice` is linear in the operand, and the scalar
+// start indices are non-differentiated primal operand edges, so the tangent slices the operand tangent at the same
+// primal start indices. A zero operand tangent yields a typed zero output tangent.
 impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for DynamicSliceOperation
 where
     C::Operation: From<DynamicSliceOperation>,
@@ -1484,9 +1485,9 @@ where
     }
 }
 
-/// Projected array IR JVP rule for [`DynamicSliceOperation`]. A dynamically shaped operand retains its exact
-/// extents and scalar start indices as ordinary residual values; a static operand delegates to the homogeneous
-/// projected rule.
+// Projected array IR JVP rule for [`DynamicSliceOperation`]. A dynamically shaped operand retains its exact
+// extents and scalar start indices as ordinary residual values; a static operand delegates to the homogeneous
+// projected rule.
 impl<C> MemberDifferentiableOperation<C> for DynamicSliceOperation
 where
     C: Context<Type = ArrayIrType>,
@@ -1575,21 +1576,21 @@ where
     }
 }
 
-/// Batching rule for [`DynamicSliceOperation`].
-///
-/// Replicated start indices keep the structural fast path: a batched operand keeps its batch axis by slicing it
-/// fully, so the lifted operation inserts size `axis_size` at the batch axis position and a zero start index for it,
-/// derived from an existing index operand via [`ZeroLike`] so the inserted index carries the same scalar integer
-/// type. Rank-0 operands have no index operands to donate a zero index, but a rank-0 dynamic slice is the identity
-/// map, so the batched operand passes through unchanged.
-///
-/// Batch-varying (batched) start indices cannot ride along structurally — every batch item needs its own slice origin
-/// while the lifted operation reads one origin for all batch items — so the rule falls back to per-item expansion via
-/// `batch_by_item_expansion`: each batch item's operand (when batched; a replicated operand is used whole) and start
-/// indices are extracted, sliced dynamically per item, and restacked along a fresh leading batch axis (the result's
-/// batch axis is `0` even when the operand carried its batch axis elsewhere). The expansion stages `O(batch_size)`
-/// operations — a gather-based rule is an explicit non-goal — and behaves identically in eager and tracing contexts
-/// because it only goes through the value capability traits.
+// Batching rule for [`DynamicSliceOperation`].
+//
+// Replicated start indices keep the structural fast path: a batched operand keeps its batch axis by slicing it
+// fully, so the lifted operation inserts size `axis_size` at the batch axis position and a zero start index for it,
+// derived from an existing index operand via [`ZeroLike`] so the inserted index carries the same scalar integer
+// type. Rank-0 operands have no index operands to donate a zero index, but a rank-0 dynamic slice is the identity
+// map, so the batched operand passes through unchanged.
+//
+// Batch-varying (batched) start indices cannot ride along structurally — every batch item needs its own slice origin
+// while the lifted operation reads one origin for all batch items — so the rule falls back to per-item expansion via
+// `batch_by_item_expansion`: each batch item's operand (when batched; a replicated operand is used whole) and start
+// indices are extracted, sliced dynamically per item, and restacked along a fresh leading batch axis (the result's
+// batch axis is `0` even when the operand carried its batch axis elsewhere). The expansion stages `O(batch_size)`
+// operations — a gather-based rule is an explicit non-goal — and behaves identically in eager and tracing contexts
+// because it only goes through the value capability traits.
 impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for DynamicSliceOperation
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
@@ -1744,9 +1745,9 @@ impl DynamicSlice for ArrayType {
     }
 }
 
-/// Any context-carrying value dynamic-slices by binding a [`DynamicSliceOperation`] through its own context. The
-/// `From<DynamicSliceOperation>` bound makes this disjoint from the eager value types (whose context operation is
-/// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
+// Any context-carrying value dynamic-slices by binding a [`DynamicSliceOperation`] through its own context. The
+// `From<DynamicSliceOperation>` bound makes this disjoint from the eager value types (whose context operation is
+// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
 impl<V: Value<Type = ArrayType>> DynamicSlice for V
 where
     V::DispatchDomain: Context<Type = ArrayType>,
@@ -1825,17 +1826,17 @@ impl<C: Domain<Type = ArrayType, Value: DynamicUpdateSlice>> InterpretableOperat
     }
 }
 
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
+// Partial evaluation defers to the default fold-or-residualize behavior of
+// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
 impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DynamicUpdateSliceOperation where
     C::Operation: From<DynamicUpdateSliceOperation>
 {
 }
 
-/// Forward-mode rule for [`DynamicUpdateSliceOperation`]: `dynamic_update_slice` is jointly linear in the operand
-/// and the update, while the scalar start indices are non-differentiated primal operand edges, so the tangent updates
-/// the operand tangent with the update tangent at the same primal start indices. A zero operand and update tangent
-/// yields a typed zero output tangent.
+// Forward-mode rule for [`DynamicUpdateSliceOperation`]: `dynamic_update_slice` is jointly linear in the operand
+// and the update, while the scalar start indices are non-differentiated primal operand edges, so the tangent updates
+// the operand tangent with the update tangent at the same primal start indices. A zero operand and update tangent
+// yields a typed zero output tangent.
 impl<C: Context<Type = ArrayType> + Zero<C::Value>> DifferentiableOperation<C> for DynamicUpdateSliceOperation
 where
     C::Operation: From<DynamicUpdateSliceOperation>,
@@ -1865,9 +1866,9 @@ where
     }
 }
 
-/// Projected array IR JVP rule for [`DynamicUpdateSliceOperation`]. Dynamically shaped operands retain their
-/// exact extents and scalar start indices as ordinary residual values; fully static operands delegate to the
-/// homogeneous projected rule.
+// Projected array IR JVP rule for [`DynamicUpdateSliceOperation`]. Dynamically shaped operands retain their
+// exact extents and scalar start indices as ordinary residual values; fully static operands delegate to the
+// homogeneous projected rule.
 impl<C> MemberDifferentiableOperation<C> for DynamicUpdateSliceOperation
 where
     C: Context<Type = ArrayIrType>,
@@ -2050,21 +2051,21 @@ where
     }
 }
 
-/// Batching rule for [`DynamicUpdateSliceOperation`].
-///
-/// Replicated start indices keep the structural fast path: the input and update operands are aligned on one
-/// physical batch axis (replicated operands are broadcast to gain it), and the lifted operation inserts a zero
-/// start index for that axis, derived from an existing index operand via [`ZeroLike`] so the inserted index carries
-/// the same scalar integer type. Rank-0 operands have no index operands to donate a zero index, but a rank-0 dynamic
-/// update-slice replaces the operand with the update entirely, so the update operand passes through unchanged.
-///
-/// Batch-varying (batched) start indices cannot ride along structurally — every batch item needs its own update origin
-/// while the lifted operation reads one origin for all batch items — so the rule falls back to per-item expansion via
-/// `batch_by_item_expansion`: each batch item's input, update, and start indices are extracted (replicated operands
-/// are used whole), updated per item, and restacked along a fresh leading batch axis (the result's batch axis is `0`
-/// even when the operands carried their batch axes elsewhere). The expansion stages `O(batch_size)` operations — a
-/// scatter-based rule is an explicit non-goal — and behaves identically in eager and tracing contexts because it
-/// only goes through the value capability traits.
+// Batching rule for [`DynamicUpdateSliceOperation`].
+//
+// Replicated start indices keep the structural fast path: the input and update operands are aligned on one
+// physical batch axis (replicated operands are broadcast to gain it), and the lifted operation inserts a zero
+// start index for that axis, derived from an existing index operand via [`ZeroLike`] so the inserted index carries
+// the same scalar integer type. Rank-0 operands have no index operands to donate a zero index, but a rank-0 dynamic
+// update-slice replaces the operand with the update entirely, so the update operand passes through unchanged.
+//
+// Batch-varying (batched) start indices cannot ride along structurally — every batch item needs its own update origin
+// while the lifted operation reads one origin for all batch items — so the rule falls back to per-item expansion via
+// `batch_by_item_expansion`: each batch item's input, update, and start indices are extracted (replicated operands
+// are used whole), updated per item, and restacked along a fresh leading batch axis (the result's batch axis is `0`
+// even when the operands carried their batch axes elsewhere). The expansion stages `O(batch_size)` operations — a
+// scatter-based rule is an explicit non-goal — and behaves identically in eager and tracing contexts because it
+// only goes through the value capability traits.
 impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for DynamicUpdateSliceOperation
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
@@ -2235,10 +2236,10 @@ impl DynamicUpdateSlice for ArrayType {
     }
 }
 
-/// Any context-carrying value dynamic-update-slices by binding a [`DynamicUpdateSliceOperation`] through its own
-/// context. The `From<DynamicUpdateSliceOperation>` bound makes this disjoint from the eager value types (whose
-/// context operation is `ConstantOperation`), so it covers the transform tracers without conflicting with the
-/// concrete implementations.
+// Any context-carrying value dynamic-update-slices by binding a [`DynamicUpdateSliceOperation`] through its own
+// context. The `From<DynamicUpdateSliceOperation>` bound makes this disjoint from the eager value types (whose
+// context operation is `ConstantOperation`), so it covers the transform tracers without conflicting with the
+// concrete implementations.
 impl<V: Value<Type = ArrayType>> DynamicUpdateSlice for V
 where
     V::DispatchDomain: Context<Type = ArrayType>,
@@ -2253,21 +2254,21 @@ where
     }
 }
 
-/// Partition-aware transpose rule for the primal [`DynamicSliceOperation`]. The scalar integer start indices
-/// (operands 1 onward) have no tangent space, so in a valid pushforward they are the known operands and the sliced
-/// operand (operand 0) is the linear one. The forward map `t ↦ dynamic_slice(t, start_indices, sizes)` transposes by
-/// scattering the output cotangent back into a zero array of the operand type at the same start indices, i.e. a
-/// dynamic update-slice at those indices. The transpose reads the known start indices from the pullback boundary and
-/// stages an ordinary [`DynamicUpdateSliceOperation`], so linearization retains the indices as regular SSA residuals.
-/// The start indices receive structural zeros, and a zero output cotangent stays a structural zero.
-///
-/// **Contract:** this homogeneous rule requires a statically shaped operand. The update target is a zero of the
-/// operand's cotangent type, and the homogeneous [`ArrayType`] operation family owns no first-class dimension
-/// operations, so it has no constructor that can supply a runtime extent for that zero. A dynamically shaped operand
-/// is therefore rejected here with an exact diagnostic. Mixed [`ArrayIrType`](crate::ArrayIrType) programs are
-/// unaffected: the [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation) rule above routes a
-/// dynamically shaped dynamic slice into a residual-carrying [`LinearCallOperation`] whose transpose region rebuilds
-/// the same zero from the retained exact extents.
+// Partition-aware transpose rule for the primal [`DynamicSliceOperation`]. The scalar integer start indices
+// (operands 1 onward) have no tangent space, so in a valid pushforward they are the known operands and the sliced
+// operand (operand 0) is the linear one. The forward map `t ↦ dynamic_slice(t, start_indices, sizes)` transposes by
+// scattering the output cotangent back into a zero array of the operand type at the same start indices, i.e. a
+// dynamic update-slice at those indices. The transpose reads the known start indices from the pullback boundary and
+// stages an ordinary [`DynamicUpdateSliceOperation`], so linearization retains the indices as regular SSA residuals.
+// The start indices receive structural zeros, and a zero output cotangent stays a structural zero.
+//
+// **Contract:** this homogeneous rule requires a statically shaped operand. The update target is a zero of the
+// operand's cotangent type, and the homogeneous [`ArrayType`] operation family owns no first-class dimension
+// operations, so it has no constructor that can supply a runtime extent for that zero. A dynamically shaped operand
+// is therefore rejected here with an exact diagnostic. Mixed [`ArrayIrType`](crate::ArrayIrType) programs are
+// unaffected: the [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation) rule above routes a
+// dynamically shaped dynamic slice into a residual-carrying [`LinearCallOperation`] whose transpose region rebuilds
+// the same zero from the retained exact extents.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for DynamicSliceOperation
 where
     O: Operation<Type = ArrayType> + From<ZeroOperation<ArrayType>> + From<DynamicUpdateSliceOperation>,
@@ -2330,15 +2331,15 @@ fn read_known_start_indices<V: Value<Type = ArrayType>, O: Operation<Type = Arra
         .collect()
 }
 
-/// Partition-aware transpose rule for the primal [`DynamicUpdateSliceOperation`]. The scalar integer start indices
-/// (operands 2 onward) have no tangent space, so in a valid pushforward they are the known operands and the input and
-/// update (operands 0 and 1) are the linear ones. The forward map
-/// `(t, u) ↦ dynamic_update_slice(t, u, start_indices)` splits the output cotangent into two contributions at the
-/// same start indices: the input cotangent is the cotangent with the update window zeroed (a dynamic update-slice
-/// writing zeros at the indices) and the update cotangent is the dynamic slice of the cotangent at the update window.
-/// The transpose reads the known start indices from the pullback boundary and stages ordinary dynamic slicing
-/// operations, so linearization retains the indices as regular SSA residuals. The start indices receive structural
-/// zeros, and a zero output cotangent stays a structural zero.
+// Partition-aware transpose rule for the primal [`DynamicUpdateSliceOperation`]. The scalar integer start indices
+// (operands 2 onward) have no tangent space, so in a valid pushforward they are the known operands and the input and
+// update (operands 0 and 1) are the linear ones. The forward map
+// `(t, u) ↦ dynamic_update_slice(t, u, start_indices)` splits the output cotangent into two contributions at the
+// same start indices: the input cotangent is the cotangent with the update window zeroed (a dynamic update-slice
+// writing zeros at the indices) and the update cotangent is the dynamic slice of the cotangent at the update window.
+// The transpose reads the known start indices from the pullback boundary and stages ordinary dynamic slicing
+// operations, so linearization retains the indices as regular SSA residuals. The start indices receive structural
+// zeros, and a zero output cotangent stays a structural zero.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for DynamicUpdateSliceOperation
 where
     O: Operation<Type = ArrayType>
@@ -2648,7 +2649,7 @@ mod tests {
 
         assert_eq!(operation.name(), "dynamic_shape_slice");
         assert_eq!(operation.strides(), &[1, 2]);
-        assert_eq!(operation.effects(), Effects::single(Effect::OrderedAssertion));
+        assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
         assert_eq!(format!("{operation}"), "dynamic_shape_slice [strides=[1, 2]]");
     }
 

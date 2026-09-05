@@ -3,6 +3,9 @@
 //! The user-facing semantics and example live on [`DimensionFromScalar`]. The operation records the produced
 //! [`DimensionType`] directly so its identity and authoritative bounds remain one structural SSA definition.
 
+// TODO(eaplatanios): Review this module.
+
+use std::borrow::Cow;
 use std::fmt::Display;
 
 use ryft_macros::Parameter;
@@ -26,8 +29,9 @@ use crate::operations::{
 use crate::parameters::{Parameter, Placeholder};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    Effect, Effects, Operation, OperationFormatter, OperationProjection, ProgramBuilder, ProgramError, ProjectedValue,
-    RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    EffectClass, EffectClasses, Effects, Operation, OperationFormatter, OperationProjection, ProgramBuilder,
+    ProgramError, ProjectedValue, RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value,
+    ValueProjection,
 };
 
 /// Canonical operation name for [`DimensionFromScalarOperation`].
@@ -175,8 +179,8 @@ impl Operation for DimensionFromScalarOperation {
     }
 
     #[inline]
-    fn effects(&self) -> Effects {
-        Effects::single(Effect::OrderedAssertion)
+    fn effects(&self) -> Cow<'_, Effects> {
+        Cow::Owned(Effects::explicit(EffectClasses::single(EffectClass::OrderedAssertion)))
     }
 
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
@@ -212,10 +216,10 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionFromScalarOperation
 
 impl_reference_free_dischargeable_operation!(DimensionFromScalarOperation);
 
-/// Batching converts a mapped scalar array into one checked extent per batch item. The extents remain ordinary packed
-/// integer SSA data and are exposed as a mapped dimension only through [`ArrayIrBatch`]; no raggedness is added to
-/// [`ArrayIrType`]. A carry-free scan applies this ordered-assertion gateway to every scalar and converts each checked
-/// dimension back to scalar data for packing, so the gateway's bounds diagnostics remain exact.
+// Batching converts a mapped scalar array into one checked extent per batch item. The extents remain ordinary packed
+// integer SSA data and are exposed as a mapped dimension only through [`ArrayIrBatch`]; no raggedness is added to
+// [`ArrayIrType`]. A carry-free scan applies this ordered-assertion gateway to every scalar and converts each checked
+// dimension back to scalar data for packing, so the gateway's bounds diagnostics remain exact.
 impl<C> BatchableOperation<C, ArrayIrBatching> for DimensionFromScalarOperation
 where
     C: Context<Type = ArrayIrType>,
@@ -292,7 +296,7 @@ mod tests {
         DimensionOperation, DimensionValue, MAX_DIMENSION_EXTENT, Shape,
     };
     use crate::contexts::{Context, EagerContext, StagingContext};
-    use crate::differentiation::TransposableOperation;
+    use crate::differentiation::{TransposableOperation, TranspositionContext};
     use crate::macros::check_operation_partial_evaluation;
     use crate::operations::dimensions::dimension_requirement::{
         DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME, DimensionRequirementOperation,
@@ -300,7 +304,7 @@ mod tests {
     use crate::operations::manipulation::broadcasting::DynamicBroadcastOperation;
     use crate::operations::math::sin::SinOperation;
     use crate::parameters::Placeholder;
-    use crate::programs::{Effects, EmptyRegionDriver, Program, ProgramBuilder, RegionInterface};
+    use crate::programs::{EffectClasses, EmptyRegionDriver, Program, ProgramBuilder, RegionInterface};
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -317,7 +321,7 @@ mod tests {
         program
             .instructions()
             .iter()
-            .filter(|instruction| instruction.operation().effects().contains(Effect::OrderedAssertion))
+            .filter(|instruction| instruction.operation().effects().classes().contains(EffectClass::OrderedAssertion))
             .map(|instruction| instruction.operation().name())
             .collect()
     }
@@ -332,7 +336,7 @@ mod tests {
         assert_eq!(operation.name(), DIMENSION_FROM_SCALAR_OPERATION_NAME);
         assert_eq!(operation.result_type(), &DimensionType::new(variable.clone()));
         assert_eq!(operation.to_string(), "dimension_from_scalar [bounds=[0, 9)]");
-        assert_eq!(operation.effects(), Effects::single(Effect::OrderedAssertion));
+        assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
         assert_eq!(
             operation.infer_output_types(std::slice::from_ref(&scalar_type), &[]),
             Ok(vec![operation.result_type().clone().into()]),
@@ -373,7 +377,7 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(
                 std::slice::from_ref(&scalar_type),
-                &[RegionInterface::new(Vec::new(), Vec::new(), Effects::PURE)],
+                &[RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE)],
             ),
             Err(TypeError::invalid("expected 0 regions but got 1")),
         );
@@ -553,14 +557,14 @@ mod tests {
         assert_eq!(jvp.input_ids().len(), 1);
         assert_eq!(jvp.output_ids().len(), 1);
 
-        let mut transposition_context = TestContext::new();
+        let transposition_context = TestContext::new();
         assert!(matches!(
             <DimensionFromScalarOperation as TransposableOperation<
                 ArrayIrValue<Array>,
                 ArrayIrOperation<Array>,
             >>::transpose(
                 &operation,
-                &mut transposition_context,
+                &mut TranspositionContext::new(transposition_context.clone()),
                 &EmptyRegionDriver,
                 &[],
                 &[],
@@ -612,7 +616,7 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        assert_eq!(program.effects(), Effects::single(Effect::OrderedAssertion));
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
         assert_eq!(
             assertion_operation_names(&program),
             vec![DIMENSION_FROM_SCALAR_OPERATION_NAME, DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME],
@@ -622,7 +626,7 @@ mod tests {
         // no tangent, so neither assertion may be duplicated into a tangent computation or reordered against the
         // other by the interleaved dual program.
         let jvp = program.jvp().unwrap();
-        assert_eq!(jvp.effects(), Effects::single(Effect::OrderedAssertion));
+        assert_eq!(jvp.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
         assert_eq!(
             assertion_operation_names(&jvp),
             vec![DIMENSION_FROM_SCALAR_OPERATION_NAME, DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME],
@@ -632,12 +636,12 @@ mod tests {
         // stay in the primal sub-program in their original order, and the compact linear tangent sub-program is left
         // pure: it consumes the checked extent as an ordinary residual instead of re-asserting it.
         let linearization = program.linearize().unwrap();
-        assert_eq!(linearization.primal().effects(), Effects::single(Effect::OrderedAssertion));
+        assert_eq!(linearization.primal().effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
         assert_eq!(
             assertion_operation_names(linearization.primal()),
             vec![DIMENSION_FROM_SCALAR_OPERATION_NAME, DIMENSION_REQUIRE_BOUNDS_OPERATION_NAME],
         );
-        assert_eq!(linearization.tangent().effects(), Effects::PURE);
+        assert_eq!(linearization.tangent().effects().classes(), EffectClasses::NONE);
         assert_eq!(assertion_operation_names(linearization.tangent()), Vec::<&str>::new());
     }
 

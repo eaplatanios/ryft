@@ -16,6 +16,8 @@ use crate::programs::{
     Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, TypeError, Typed, Value,
 };
 
+// TODO(eaplatanios): Review this module.
+
 /// Canonical element type used when first-class dimensions become ordinary array data.
 ///
 /// Although dimensions are nonnegative, Ryft represents compiled dimension SSA as signed 64-bit integers and caps
@@ -141,9 +143,9 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>
 
 impl_reference_free_dischargeable_operation!(DimensionToScalarOperation);
 
-/// Batching converts a replicated first-class dimension into one replicated scalar array. A mapped dimension already
-/// stores its per-item extents as packed integer array data on the batch carrier, so conversion exposes that same value
-/// as a mapped scalar array without staging another operation.
+// Batching converts a replicated first-class dimension into one replicated scalar array. A mapped dimension already
+// stores its per-item extents as packed integer array data on the batch carrier, so conversion exposes that same value
+// as a mapped scalar array without staging another operation.
 impl<C: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>> BatchableOperation<C, ArrayIrBatching>
     for DimensionToScalarOperation
 {
@@ -182,10 +184,10 @@ mod tests {
         Array, ArrayIrOperation, ArrayIrValue, DimensionBounds, DimensionValue, DimensionVariable, MAX_DIMENSION_EXTENT,
     };
     use crate::contexts::{Context, EagerContext, StagingContext};
-    use crate::differentiation::TransposableOperation;
+    use crate::differentiation::{TransposableOperation, TranspositionContext};
     use crate::macros::check_operation_partial_evaluation;
     use crate::parameters::Placeholder;
-    use crate::programs::{Effects, EmptyRegionDriver, ProgramBuilder, RegionInterface};
+    use crate::programs::{EffectClasses, EmptyRegionDriver, ProgramBuilder, RegionInterface};
     use crate::tracing::TracingContext;
 
     use super::*;
@@ -208,7 +210,7 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(
                 &[dimension_type.clone().into()],
-                &[RegionInterface::new(Vec::new(), Vec::new(), Effects::PURE)],
+                &[RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE)],
             ),
             Err(TypeError::invalid("expected 0 regions but got 1")),
         );
@@ -325,14 +327,14 @@ mod tests {
         assert!(pullback.input_ids().is_empty());
         assert!(pullback.output_ids().is_empty());
 
-        let mut transposition_context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let transposition_context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         assert!(matches!(
             <DimensionToScalarOperation as TransposableOperation<
                 ArrayIrValue<Array>,
                 ArrayIrOperation<Array>,
             >>::transpose(
                 &operation,
-                &mut transposition_context,
+                &mut TranspositionContext::new(transposition_context.clone()),
                 &EmptyRegionDriver,
                 &[],
                 &[],

@@ -148,7 +148,8 @@ impl<A: Value<Type = ArrayType>> OneOperationProvider<ArrayIrType> for ArrayIrOp
             }
             ArrayIrType::Reference(r#type) => {
                 return Err(TypeError::invalid(format!(
-                    "cannot materialize a one for reference type `{}`; references must be discharged first",
+                    "cannot materialize a one for reference type `{}`; a reference denotes an allocation and has \
+                     no one value, so tangent and cotangent references are allocated by the differentiation rules",
                     r#type,
                 ))
                 .into());
@@ -359,8 +360,9 @@ mod tests {
             )),
         );
 
-        // First-class dimensions and references are not algebraic values. In particular, a reference cannot be
-        // replaced by a one of its referent type; it must be discharged before construction.
+        // First-class dimensions and references are not algebraic values. In particular, a reference cannot be replaced
+        // by a one of its referent type. The differentiation rules allocate tangent and cotangent references instead of
+        // ever materializing a one reference.
         assert_eq!(
             ArrayIrOperation::<Array>::one_operation(ArrayIrType::Dimension(DimensionType::new(size))).unwrap_err(),
             ProgramError::Type(TypeError::invalid("cannot materialize a one for a first-class dimension type")),
@@ -369,7 +371,8 @@ mod tests {
         assert_eq!(
             ArrayIrOperation::<Array>::one_operation(ArrayIrType::Reference(reference_type.clone())).unwrap_err(),
             ProgramError::Type(TypeError::invalid(format!(
-                "cannot materialize a one for reference type `{reference_type}`; references must be discharged first",
+                "cannot materialize a one for reference type `{reference_type}`; a reference denotes an allocation \
+                 and has no one value, so tangent and cotangent references are allocated by the differentiation rules",
             ))),
         );
     }

@@ -1138,11 +1138,14 @@ mod tests {
         }
 
         fn effects(&self) -> Cow<'_, Effects> {
-            Cow::Owned(Effects::new(
-                EffectClasses::single(EffectClass::OrderedIo),
-                vec![ReferenceEffect::Allocate { output_index: 0 }],
-                Vec::new(),
-            ))
+            Cow::Owned(
+                Effects::new(
+                    EffectClasses::single(EffectClass::OrderedIo),
+                    vec![ReferenceEffect::Allocate { output_index: 0 }],
+                    Vec::new(),
+                )
+                .unwrap(),
+            )
         }
 
         fn rename_type_identities(&self, _renaming: &TypeIdentityRenaming<T::Identity>) -> Result<Self, TypeError> {

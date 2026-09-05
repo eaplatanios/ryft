@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::Display;
 use std::marker::PhantomData;
 
@@ -7,7 +8,8 @@ use crate::macros::{check_count, impl_differentiable_elementwise_operation};
 use crate::operations::ElementwiseOperation;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    Effect, Effects, Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError, Value,
+    EffectClass, EffectClasses, Effects, Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError,
+    Value,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -19,7 +21,7 @@ pub const PRINT_OPERATION_NAME: &str = "print";
 /// [`jax.debug.print`](https://docs.jax.dev/en/latest/debugging/print_breakpoint.html). Refer to the documentation of
 /// [`Print`] for more information.
 ///
-/// This is ryft's first operation with observable effects: [`Operation::effects`] reports [`Effect::OrderedIo`], so
+/// This is ryft's first operation with observable effects: [`Operation::effects`] reports [`EffectClass::OrderedIo`], so
 /// program transforms never eliminate it as dead code (even when nothing consumes its output) and preserve its
 /// execution order relative to other ordered-I/O operations. Partial evaluation places it by input known-ness like
 /// any other operation — an all-known print folds into the known side (printing at partial-evaluation time under an
@@ -82,8 +84,8 @@ impl<T: Type> Operation for PrintOperation<T> {
     }
 
     #[inline]
-    fn effects(&self) -> Effects {
-        Effects::single(Effect::OrderedIo)
+    fn effects(&self) -> Cow<'_, Effects> {
+        Cow::Owned(Effects::explicit(EffectClasses::single(EffectClass::OrderedIo)))
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -112,10 +114,10 @@ impl<C: Domain> InterpretableOperation<C> for PrintOperation<C::Type> {
     }
 }
 
-/// Partial evaluation defers to the default behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate): the print folds into the known side when its
-/// input is known and residualizes otherwise, with dead-code elimination keeping residual prints alive because
-/// [`Operation::effects`] is not [`Effects::PURE`].
+// Partial evaluation defers to the default behavior of
+// [`Program::partially_evaluate`](crate::Program::partially_evaluate): the print folds into the known side when its
+// input is known and residualizes otherwise, with dead-code elimination keeping residual prints alive because
+// [`Operation::effects`] is not pure.
 impl<C: Context> PartiallyEvaluatableOperation<C> for PrintOperation<C::Type> where
     C::Operation: From<PrintOperation<C::Type>>
 {
@@ -123,17 +125,17 @@ impl<C: Context> PartiallyEvaluatableOperation<C> for PrintOperation<C::Type> wh
 
 /// Represents the ability to print values in programs with labels. [`Print`] stages a [`PrintOperation`], which is
 /// effectively an identity function that prints its input to standard error when executed. Because the staged
-/// operation reports [`Effect::OrderedIo`], the print survives dead-code elimination and keeps its execution order
+/// operation reports [`EffectClass::OrderedIo`], the print survives dead-code elimination and keeps its execution order
 /// relative to other prints.
 pub trait Print: Sized {
     /// Returns this value unchanged while printing it to standard error with `label`.
     fn print(self, label: &str) -> Self;
 }
 
-/// Any context-carrying value prints by binding a [`PrintOperation`] through its own context. The
-/// `From<PrintOperation<V::Type>>` bound makes this disjoint from the eager value types (whose context operation is
-/// [`ConstantOperation`](crate::operations::constants::ConstantOperation)), so it covers the transform tracers
-/// without conflicting with concrete implementations.
+// Any context-carrying value prints by binding a [`PrintOperation`] through its own context. The
+// `From<PrintOperation<V::Type>>` bound makes this disjoint from the eager value types (whose context operation is
+// [`ConstantOperation`](crate::operations::constants::ConstantOperation)), so it covers the transform tracers
+// without conflicting with concrete implementations.
 impl<V: Value> Print for V
 where
     V::DispatchDomain: Context<Operation: From<PrintOperation<V::Type>>>,
@@ -178,7 +180,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
 
         assert_eq!(operation.label(), "x");
-        assert_eq!(operation.effects(), Effects::single(Effect::OrderedIo));
+        assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
         assert_eq!(Operation::infer_output_types(&operation, &[scalar_type.clone()], &[]), Ok(vec![scalar_type]));
         assert_eq!(operation.to_string(), "print [label=x]");
     }
@@ -215,7 +217,7 @@ mod tests {
             program.instructions()[0].operation(),
             ArrayOperation::Print(operation) if operation.label() == "x",
         ));
-        assert_eq!(program.effects(), Effects::single(Effect::OrderedIo));
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
     }
 
     #[test]

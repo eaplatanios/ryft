@@ -3,8 +3,10 @@
 //! Control-flow operations are universe-neutral: their differentiation and lowering rules describe how residuals are
 //! stored across time and how bounded-while state is stacked, without knowing what a program value is. This module
 //! supplies the array universe's answers to those questions, where a value may be ordinary array data, a first-class
-//! runtime dimension, or an unresolved array reference. Arrays and dimensions define temporal storage; references
-//! must be discharged before any residual stacking or transformed control-flow execution.
+//! runtime dimension, or an array reference. Arrays and dimensions define temporal storage; a reference never does,
+//! because the transforms thread references through loops as carries and never save them as residuals. The eager
+//! `while` interpreter selects reference carries wholesale under a scalar predicate and rejects a batched predicate
+//! over distinct reference carries, since effectful state has no per-item value to mask.
 
 use std::sync::Arc;
 
@@ -12,7 +14,7 @@ use crate::arrays::addressing::ArrayAddressing;
 use crate::arrays::arrays::Array;
 use crate::arrays::broadcasting::Broadcastable;
 use crate::arrays::ir::ArrayIrValue;
-use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
+use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, ReferenceIndex};
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{Dimension, DimensionType, Shape};
@@ -41,7 +43,9 @@ impl TemporalResidualType for ArrayIrType {
             Self::Array(r#type) => Self::Array(r#type.clone()),
             Self::Dimension(_) => Self::Array(ArrayType::scalar(RUNTIME_DIMENSION_DATA_TYPE)),
             Self::Reference(_) => {
-                return Err(TypeError::invalid("references must be discharged before temporal residual storage"));
+                return Err(TypeError::invalid(
+                    "a reference cannot be stored as a temporal residual; references are threaded as carries",
+                ));
             }
         })
     }
@@ -56,7 +60,9 @@ where
             ArrayIrType::Array(_) => None,
             ArrayIrType::Dimension(_) => Some(Self::from(DimensionToScalarOperation)),
             ArrayIrType::Reference(_) => {
-                return Err(TypeError::invalid("references must be discharged before temporal residual storage"));
+                return Err(TypeError::invalid(
+                    "a reference cannot be stored as a temporal residual; references are threaded as carries",
+                ));
             }
         })
     }
@@ -68,7 +74,9 @@ where
                 Some(Self::from(DimensionFromScalarOperation::new(r#type.variable().clone())))
             }
             ArrayIrType::Reference(_) => {
-                return Err(TypeError::invalid("references must be discharged before temporal residual storage"));
+                return Err(TypeError::invalid(
+                    "a reference cannot be stored as a temporal residual; references are threaded as carries",
+                ));
             }
         })
     }
@@ -189,9 +197,22 @@ impl<A: Value<Type = ArrayType> + WhilePredicate> WhilePredicate for ArrayIrValu
                 }
                 Ok(Self::Dimension(if predicate.concretize()? { on_true.clone() } else { on_false.clone() }))
             }
-            (Self::Reference(_), Self::Reference(_)) => Err(ProgramError::UnsupportedOperation {
-                message: "references must be discharged before while predicate selection".to_string(),
-            }),
+            (Self::Reference(on_true), Self::Reference(on_false)) => {
+                // A reference carry has one state per allocation rather than one per batch item, so it is never
+                // masked: identical carries (the common loop-invariant case) need no selection, a scalar predicate
+                // selects one carry wholesale, and a batched predicate over distinct carries has no per-item meaning.
+                if on_true == on_false {
+                    return Ok(Self::Reference(on_true.clone()));
+                }
+                if predicate.r#type().rank() != 0 {
+                    return Err(ProgramError::UnsupportedOperation {
+                        message: "a batched while predicate cannot select between distinct reference carries per \
+                                  batch item; reference state has one value per allocation"
+                            .to_string(),
+                    });
+                }
+                Ok(Self::Reference(if predicate.concretize()? { on_true.clone() } else { on_false.clone() }))
+            }
             _ => Err(TypeError::invalid(format!(
                 "while predicate cannot select between mismatched state types {} and {}",
                 on_true.r#type().as_ref(),
@@ -272,11 +293,14 @@ where
             iteration_inputs.extend(
                 stacks
                     .iter()
-                    .map(|stack| {
-                        Ok(ArrayIrValue::Array(read_scan_iteration(
+                    .map(|stack| match stack {
+                        // A stacked reference enters the body as the per-iteration view of its leading axis, which
+                        // is the eager static view sharing the root's storage, so body mutations reach the referent.
+                        ArrayIrValue::Reference(_) => stack.reference_index(0, iteration),
+                        _ => Ok(ArrayIrValue::Array(read_scan_iteration(
                             <ArrayIrValue<A> as ValueProjection<ArrayType>>::projected(stack)?,
                             iteration,
-                        )?))
+                        )?)),
                     })
                     .collect::<Result<Vec<_>, ProgramError>>()?,
             );
@@ -352,9 +376,9 @@ impl Select for Array {
     }
 }
 
-/// Batched while-predicate semantics for [`Array`]: `any_true` reduces the whole Boolean payload with `or`, and
-/// `mask_select` broadcasts the predicate against the operands along its leading (prefix) axes, so predicate item `i`
-/// masks the contiguous per-item block of `on_true` / `on_false` elements it governs.
+// Batched while-predicate semantics for [`Array`]: `any_true` reduces the whole Boolean payload with `or`, and
+// `mask_select` broadcasts the predicate against the operands along its leading (prefix) axes, so predicate item `i`
+// masks the contiguous per-item block of `on_true` / `on_false` elements it governs.
 impl crate::operations::control_flow::WhilePredicate for Array {
     fn any_true(&self) -> Result<bool, ProgramError> {
         if !self.r#type().data_type().is_boolean() {
@@ -410,7 +434,7 @@ mod tests {
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
-    use crate::arrays::reference_views::ArrayReference;
+    use crate::arrays::reference_views::{ArrayReference, ArrayReferenceViewTransform, ViewIndex};
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
@@ -419,13 +443,16 @@ mod tests {
     use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::differentiation::{ForwardModeDifferentiate, StopGradientOperation};
     use crate::operations::{
-        AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, DimensionFromScalarOperation,
+        Add, AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, DimensionFromScalarOperation,
         DynamicBroadcastOperation, DynamicReshapeOperation, MulOperation, ReduceOperation, ReductionKind,
         ScanOperation, Select, WhileOperation, WhilePredicate, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
-    use crate::programs::{Program, ProgramBuilder, ProgramError, Typed};
+    use crate::programs::{
+        Program, ProgramBuilder, ProgramError, ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceType,
+        Typed,
+    };
     use crate::tracing::TracingContext;
 
     type TestValue = ArrayIrValue<Array>;
@@ -882,6 +909,87 @@ mod tests {
         let mut pullback_inputs = vec![array(Array::vector(vec![1.0, 1.0, 1.0]))];
         pullback_inputs.extend(residuals);
         assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![array(Array::vector(vec![2.0, 2.0, 2.0]))]));
+    }
+
+    #[test]
+    fn test_composite_scan_interprets_stacked_reference_operands_as_per_iteration_views() {
+        /// Builds a program over `[carry, stack]` that applies `operation` to a body which accumulates the carry into
+        /// the per-iteration slice reference and then folds the updated slice into the carry, and that returns the
+        /// final carry.
+        fn scanned(
+            operation: ScanOperation<TestValue>,
+            length: usize,
+        ) -> Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>> {
+            let scalar_type = ArrayType::scalar(DataType::F32);
+            let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let carry = body_builder.add_input(scalar_type.clone().into());
+            let element = body_builder.add_input(ReferenceType::new(scalar_type.clone()).into());
+            body_builder
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![element, carry], None)
+                .unwrap();
+            let current = body_builder
+                .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![element], None)
+                .unwrap()[0];
+            let next_carry = body_builder
+                .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, current], None)
+                .unwrap()[0];
+            let body = body_builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![next_carry], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap();
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let body = builder.import_program(body);
+            let initial = builder.add_input(scalar_type.into());
+            let stack = builder.add_input(ReferenceType::new(ArrayType::new_static(DataType::F32, [length])).into());
+            let final_carry = builder.add_instruction(operation, vec![body], vec![initial, stack], None).unwrap()[0];
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![final_carry], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        }
+
+        /// Evaluates the unrolled recurrence eagerly, indexing `stack` in the requested iteration order.
+        fn unrolled(stack: &ArrayReference<Array>, iterations: &[usize]) -> Result<Vec<TestValue>, ProgramError> {
+            let mut carry = Array::scalar(1.0f32);
+            for &iteration in iterations {
+                let element = stack.with_transform(ArrayReferenceViewTransform::Index {
+                    axis: 0,
+                    index: ViewIndex::Static(iteration),
+                })?;
+                element.add_update(&carry)?;
+                carry = carry.add(&element.read()?)?;
+            }
+            Ok(vec![array(carry)])
+        }
+
+        // A stacked reference operand enters each iteration as the eager static view of its leading axis, so the body
+        // mutates the caller's referent in place exactly as the eager recurrence does, and the final carry observes
+        // every updated slice.
+        let scanned_stack = ArrayReference::new(Array::vector(vec![1.0f32, 2.0, 3.0]));
+        let unrolled_stack = ArrayReference::new(Array::vector(vec![1.0f32, 2.0, 3.0]));
+        let outputs = scanned(ScanOperation::new(1, 3), 3)
+            .interpret(vec![array(Array::scalar(1.0f32)), TestValue::Reference(scanned_stack.clone())]);
+        assert_eq!(outputs, Ok(vec![array(Array::scalar(19.0f32))]));
+        assert_eq!(unrolled(&unrolled_stack, &[0, 1, 2]), outputs);
+        assert_eq!(scanned_stack.read(), Ok(Array::vector(vec![2.0f32, 5.0, 11.0])));
+        assert_eq!(unrolled_stack.read(), scanned_stack.read());
+
+        // A reversed scan visits the slices from the last to the first.
+        let reversed_stack = ArrayReference::new(Array::vector(vec![1.0f32, 2.0, 3.0]));
+        let unrolled_reversed_stack = ArrayReference::new(Array::vector(vec![1.0f32, 2.0, 3.0]));
+        let outputs = scanned(ScanOperation::new(1, 3).with_reverse(true), 3)
+            .interpret(vec![array(Array::scalar(1.0f32)), TestValue::Reference(reversed_stack.clone())]);
+        assert_eq!(outputs, Ok(vec![array(Array::scalar(25.0f32))]));
+        assert_eq!(unrolled(&unrolled_reversed_stack, &[2, 1, 0]), outputs);
+        assert_eq!(reversed_stack.read(), Ok(Array::vector(vec![13.0f32, 7.0, 4.0])));
+        assert_eq!(unrolled_reversed_stack.read(), reversed_stack.read());
+
+        // A zero-length scan runs no iteration, so the carry passes through and the referent is never touched.
+        let empty_stack = ArrayReference::new(Array::vector(Vec::<f32>::new()));
+        assert_eq!(
+            scanned(ScanOperation::new(1, 0), 0)
+                .interpret(vec![array(Array::scalar(1.0f32)), TestValue::Reference(empty_stack.clone())]),
+            Ok(vec![array(Array::scalar(1.0f32))]),
+        );
+        assert_eq!(empty_stack.read(), Ok(Array::vector(Vec::<f32>::new())));
     }
 
     #[test]
@@ -1580,13 +1688,22 @@ mod tests {
         assert_eq!(selected.elements::<u16>(), Ok(vec![0xaaaa, 0xbbbb, 0x3333, 0x4444]));
         assert_eq!(selected.storage_bytes(), [0x33, 0x33, 0x44, 0x44, 0, 0, 0xaa, 0xaa, 0xbb, 0xbb]);
 
-        let predicate = ArrayIrValue::Array(Array::scalar(true));
+        // Reference carries are selected wholesale by a scalar predicate: the handle itself is selected, never its
+        // contents, so the selected carry aliases the chosen input.
         let on_true = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
         let on_false = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(2.0_f32)));
+        assert_eq!(ArrayIrValue::Array(Array::scalar(true)).mask_select(&on_true, &on_false), Ok(on_true.clone()));
+        assert_eq!(ArrayIrValue::Array(Array::scalar(false)).mask_select(&on_true, &on_false), Ok(on_false.clone()));
+
+        // A batched predicate cannot mask a reference per item, so it accepts only identical carries.
+        let predicate = ArrayIrValue::Array(Array::vector(vec![false, true]));
+        assert_eq!(predicate.mask_select(&on_true, &on_true), Ok(on_true.clone()));
         assert_eq!(
             predicate.mask_select(&on_true, &on_false),
             Err(ProgramError::UnsupportedOperation {
-                message: "references must be discharged before while predicate selection".to_string(),
+                message: "a batched while predicate cannot select between distinct reference carries per batch item; \
+                          reference state has one value per allocation"
+                    .to_string(),
             }),
         );
     }

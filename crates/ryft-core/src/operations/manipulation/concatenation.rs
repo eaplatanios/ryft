@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::marker::PhantomData;
@@ -30,8 +31,8 @@ use crate::operations::manipulation::slicing::{DynamicShapeSliceOperation, Slice
 use crate::operations::manipulation::transposition::Transpose;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    Effect, Effects, MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface,
-    Type, TypeError, Typed, Value, ValueProjection,
+    EffectClass, EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError,
+    RegionInterface, Type, TypeError, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -173,8 +174,12 @@ impl Operation for ConcatenateOperation<ArrayIrType> {
     }
 
     #[inline]
-    fn effects(&self) -> Effects {
-        if self.requires_runtime_assertion { Effects::single(Effect::OrderedAssertion) } else { Effects::PURE }
+    fn effects(&self) -> Cow<'_, Effects> {
+        Cow::Owned(Effects::explicit(if self.requires_runtime_assertion {
+            EffectClasses::single(EffectClass::OrderedAssertion)
+        } else {
+            EffectClasses::NONE
+        }))
     }
 
     #[inline]
@@ -379,9 +384,9 @@ impl_differentiable_operation! {
     },
 }
 
-/// Forward-mode rule for mixed array IR concatenation. The trailing result-extent operand is an ordinary
-/// non-differentiated shape value. Static input cotangent shapes replay the mixed concatenate directly; dynamic input
-/// shapes are retained as explicit residuals so the transpose can slice the output cotangent at runtime offsets.
+// Forward-mode rule for mixed array IR concatenation. The trailing result-extent operand is an ordinary
+// non-differentiated shape value. Static input cotangent shapes replay the mixed concatenate directly; dynamic input
+// shapes are retained as explicit residuals so the transpose can slice the output cotangent at runtime offsets.
 impl<C> DifferentiableOperation<C> for ConcatenateOperation<ArrayIrType>
 where
     C: Context<Type = ArrayIrType> + Zero<C::Value>,
@@ -529,14 +534,14 @@ where
     }
 }
 
-/// Direct transposition rule for mixed array IR concatenation. The explicit result extent receives a structural-zero
-/// cotangent and each array cotangent is sliced out of the output cotangent at its cumulative offset along the
-/// concatenated axis. Fully static operands delegate that slicing to the homogeneous array pullback. Operands with a
-/// dynamic extent on a *non-concatenated* axis are sliced directly in the composite universe instead, reading each
-/// such extent off the live output cotangent, which repeats the operand's dimension identity on every preserved axis.
-/// A dynamic extent on the *concatenated* axis is the one geometry this boundary does not already hold, because the
-/// per-operand offsets are then runtime sums, so that case requires linearization instead, which retains those input
-/// extents as explicit residuals through [`DifferentiableOperation::jvp`].
+// Direct transposition rule for mixed array IR concatenation. The explicit result extent receives a structural-zero
+// cotangent and each array cotangent is sliced out of the output cotangent at its cumulative offset along the
+// concatenated axis. Fully static operands delegate that slicing to the homogeneous array pullback. Operands with a
+// dynamic extent on a *non-concatenated* axis are sliced directly in the composite universe instead, reading each
+// such extent off the live output cotangent, which repeats the operand's dimension identity on every preserved axis.
+// A dynamic extent on the *concatenated* axis is the one geometry this boundary does not already hold, because the
+// per-operand offsets are then runtime sums, so that case requires linearization instead, which retains those input
+// extents as explicit residuals through [`DifferentiableOperation::jvp`].
 impl<V, O> TransposableOperation<V, O> for ConcatenateOperation<ArrayIrType>
 where
     V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -740,8 +745,8 @@ where
     }
 }
 
-/// Batching rule for mixed [`ConcatenateOperation<ArrayIrType>`] instructions. The trailing result extent stays
-/// replicated, while array operands are aligned on one physical mapped axis before concatenation.
+// Batching rule for mixed [`ConcatenateOperation<ArrayIrType>`] instructions. The trailing result extent stays
+// replicated, while array operands are aligned on one physical mapped axis before concatenation.
 impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatching> for ConcatenateOperation<ArrayIrType>
 where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -1175,7 +1180,7 @@ mod tests {
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::parameters::Placeholder;
-    use crate::programs::{Effect, Effects, EmptyRegionDriver, ProgramBuilder, ProgramError, Typed};
+    use crate::programs::{EffectClass, EffectClasses, EmptyRegionDriver, ProgramBuilder, ProgramError, Typed};
 
     use super::*;
 
@@ -1186,8 +1191,8 @@ mod tests {
         assert_eq!(operation.axis(), 0);
         assert_eq!(mixed_operation.name(), CONCATENATE_OPERATION_NAME);
         assert_eq!(operation.to_string(), "concatenate [axis=0]");
-        assert_eq!(mixed_operation.effects(), Effects::single(Effect::OrderedAssertion));
-        assert_eq!(operation.effects(), Effects::PURE);
+        assert_eq!(mixed_operation.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
+        assert_eq!(operation.effects().classes(), EffectClasses::NONE);
         let infer = |input_types: &[ArrayIrType]| mixed_operation.infer_output_types(input_types, &[]);
 
         let first_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1), Dimension::Static(2)]));
@@ -1196,12 +1201,12 @@ mod tests {
         let static_input_types = [first_type.clone().into(), second_type.clone().into(), four.clone().into()];
         let proven_operation = ConcatenateOperation::<ArrayIrType>::from_input_types(-2, &static_input_types).unwrap();
         assert_eq!(proven_operation.axis(), 0);
-        assert_eq!(proven_operation.effects(), Effects::PURE);
+        assert_eq!(proven_operation.effects().classes(), EffectClasses::NONE);
         assert_ne!(proven_operation, mixed_operation);
         let round_tripped = ConcatenateOperation::<ArrayIrType>::from(ConcatenateOperation::<ArrayType>::from(
             proven_operation.clone(),
         ));
-        assert_eq!(round_tripped.effects(), Effects::single(Effect::OrderedAssertion));
+        assert_eq!(round_tripped.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
         assert_ne!(round_tripped, proven_operation);
         assert_eq!(
             proven_operation.infer_output_types(&static_input_types, &[]),
@@ -1235,7 +1240,7 @@ mod tests {
         let dynamic_input_types =
             [dynamic_left.clone().into(), dynamic_right.clone().into(), DimensionType::new(result.clone()).into()];
         let dynamic_operation = ConcatenateOperation::<ArrayIrType>::from_input_types(0, &dynamic_input_types).unwrap();
-        assert_eq!(dynamic_operation.effects(), Effects::single(Effect::OrderedAssertion));
+        assert_eq!(dynamic_operation.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
         assert_eq!(
             dynamic_operation.infer_output_types(&dynamic_input_types, &[]),
             Ok(vec![

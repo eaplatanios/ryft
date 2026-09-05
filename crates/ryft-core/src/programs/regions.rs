@@ -1045,6 +1045,29 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
         self.arena.transform_cache(self.id).unwrap()
     }
 
+    /// Returns this [`RegionRef`] and its executable [`RegionRole::Computation`] descendants, visiting shared regions
+    /// once and excluding dormant rule regions at every region attachment. Instruction order within a region is
+    /// unchanged, while the relative order of distinct regions is unspecified.
+    pub fn computation_regions(self) -> impl Iterator<Item = Self> {
+        let mut visited = vec![false; self.arena.len()];
+        let mut pending = vec![self.id];
+        std::iter::from_fn(move || {
+            while let Some(id) = pending.pop() {
+                if std::mem::replace(&mut visited[id.index()], true) {
+                    continue;
+                }
+                let region = Self::new(self.arena, id).unwrap();
+                for instruction in region.instructions() {
+                    pending.extend(instruction.regions().iter().copied().enumerate().filter_map(|(index, id)| {
+                        (instruction.operation().region_role(index) == Some(RegionRole::Computation)).then_some(id)
+                    }));
+                }
+                return Some(region);
+            }
+            None
+        })
+    }
+
     /// Materializes this borrowed [`Region`] and its complete reachable region closure as a [`Program`]. Descendant
     /// sharing is preserved within the resulting [`Program`], meaning that if several [`Instruction`]s in the reachable
     /// closure point at the same source [`RegionId`], the resulting program contains one copied descendant and all
@@ -1526,8 +1549,7 @@ impl<V: Value, O: Operation<Type = V::Type>> BindingRegionDriver<V, O> for Repla
 /// by all [`ReplayRegionDriver`]s created while replaying one source [`Region`] arena. It maintains a separate
 /// [`DestinationRegionMapping`] for every live destination [`ProgramBuilder`] so repeated roots and shared
 /// descendants retain their identity across [`Instruction`] applications without mixing the unrelated identifier
-/// spaces of different builders. Refer to [`ReplayRegionDriver::mappings`] for more information on how this is
-/// used and why it is necessary.
+/// spaces of different builders.
 pub struct RegionReplayMappings<V: Value, O: Operation<Type = V::Type>> {
     /// Per-destination [`DestinationRegionMapping`]s accumulated during a replay.
     destinations: RefCell<Vec<DestinationRegionMapping<V, O>>>,
@@ -1550,8 +1572,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Default for RegionReplayMappings<V,
 
 /// Source-to-destination [`RegionId`] mapping for one live destination [`ProgramBuilder`] participating in a
 /// [`Region`] replay. [`RegionReplayMappings`] owns one of these values per destination because [`RegionId`]s are local
-/// to their owning arenas. Refer to [`ReplayRegionDriver::mappings`] for more information on how this is used and why
-/// it is necessary.
+/// to their owning arenas.
 pub struct DestinationRegionMapping<V: Value, O: Operation<Type = V::Type>> {
     /// Weak identity of the destination [`ProgramBuilder`]. Weak ownership prevents replay bookkeeping from keeping
     /// a completed builder alive or interfering with trace finalization through `Rc::try_unwrap`.
@@ -2498,6 +2519,55 @@ mod tests {
             RegionRef::new(program.regions(), RegionId::new(42)),
             Err(ProgramError::MalformedProgram(message)) if message == "region ^42 is out of range",
         ));
+    }
+
+    #[test]
+    fn test_region_ref_computation_regions() {
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F32));
+        let output = builder
+            .add_instruction(TestRegionOperation::Effectful(EffectClass::OrderedState), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let rule = builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let rule = builder.import_region(rule.entry_region_ref());
+        let input = builder.add_input(ArrayType::scalar(DataType::F32));
+        let output = builder
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::rule("rule")] }),
+                vec![rule],
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let body = builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let mut builder = ProgramBuilder::<Array, TestRegionOperation>::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let input = builder.add_input(ArrayType::scalar(DataType::F32));
+        let output = builder
+            .add_instruction(
+                TestRegionOperation::WithRegions(const { &[RegionSlot::computation("body")] }),
+                vec![body],
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert_eq!(
+            program.entry_region_ref().computation_regions().map(|region| region.id()).collect::<Vec<_>>(),
+            vec![program.entry(), body],
+        );
+        assert!(!program.effects().has_explicit_ordered_state());
+
+        let (arena, [leaf, left, _, root]) = diamond_closure_arena();
+        let mut regions = RegionRef::new(&arena, root)
+            .unwrap()
+            .computation_regions()
+            .map(|region| region.id())
+            .collect::<Vec<_>>();
+        regions.sort();
+        assert_eq!(regions, vec![leaf, left, root]);
     }
 
     #[test]

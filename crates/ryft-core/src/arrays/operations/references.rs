@@ -19,6 +19,7 @@ use ryft_macros::Parameter;
 
 use crate::arrays::addressing::ArraySliceAxis;
 use crate::arrays::ir::ArrayIrValue;
+use crate::arrays::operations::ArrayOperation;
 use crate::arrays::reference_views::{ArrayReference, ArrayReferenceView, ArrayReferenceViewTransform, ViewIndex};
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::ir::ArrayIrType;
@@ -37,13 +38,14 @@ use crate::parameters::Parameter;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::references::forwarded_tangent;
 use crate::programs::{
-    MaybeZero, Operation, OperationFormatter, ProgramError, ProjectedValue, ReferenceAddUpdate,
-    ReferenceAddUpdateOperation, ReferenceAliasKind, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceFreeze,
-    ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceOperationSemantics, ReferenceOutput,
-    ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceView,
-    ReferenceViewOperation, ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation, RegionInterface,
-    TypeError, Typed, Value, ValueProjection, ViewSymbol, batch_reference_view_operation,
+    EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, ProgramError, ProjectedValue, ReferenceAddUpdate,
+    ReferenceAddUpdateOperation, ReferenceAddUpdateOperationProvider, ReferenceAlias, ReferenceAliasKind,
+    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
+    ReferenceNewOperationProvider, ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation,
+    ReferenceType, ReferenceView, ReferenceViewOperation, ReferenceViewValidationError, ReferenceWrite,
+    ReferenceWriteOperation, RegionInterface, TypeError, Typed, Value, ValueProjection, ViewSymbol,
+    batch_reference_view_operation,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -122,12 +124,10 @@ where
     }
 }
 
-// Both view operations preserve the canonical allocation without accessing its state.
-static REFERENCE_VIEW_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> = LazyLock::new(|| {
-    ReferenceOperationSemantics::new(
-        Vec::new(),
-        vec![ReferenceOutput::Alias { output_index: 0, input_index: 0, kind: ReferenceAliasKind::View }],
-    )
+// Both view operations preserve the canonical allocation without accessing its state, so they declare one view alias
+// and no effect class.
+static REFERENCE_VIEW_OPERATION_EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
+    Effects::new(EffectClasses::NONE, Vec::new(), vec![ReferenceAlias::new(0, 0, ReferenceAliasKind::View)]).unwrap()
 });
 
 /// Infers the derived reference type produced by one allocation-preserving view transform.
@@ -188,8 +188,8 @@ impl Operation for ReferenceIndexOperation {
     }
 
     #[inline]
-    fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
-        Cow::Borrowed(&REFERENCE_VIEW_OPERATION_SEMANTICS)
+    fn effects(&self) -> Cow<'_, Effects> {
+        Cow::Borrowed(&REFERENCE_VIEW_OPERATION_EFFECTS)
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -259,8 +259,8 @@ impl Operation for ReferenceSliceOperation {
     }
 
     #[inline]
-    fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
-        Cow::Borrowed(&REFERENCE_VIEW_OPERATION_SEMANTICS)
+    fn effects(&self) -> Cow<'_, Effects> {
+        Cow::Borrowed(&REFERENCE_VIEW_OPERATION_EFFECTS)
     }
 
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
@@ -578,6 +578,33 @@ where
     Ok(outputs.remove(0))
 }
 
+// Array operation families share their canonical allocation and accumulation payloads with generic transforms.
+impl<O: Operation<Type = ArrayIrType> + From<ReferenceNewOperation<ArrayType, ArrayIrType>>>
+    ReferenceNewOperationProvider<ArrayIrType> for O
+{
+    fn reference_new_operation() -> Self {
+        ReferenceNewOperation::new().into()
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType> + From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType>>>
+    ReferenceAddUpdateOperationProvider<ArrayIrType> for O
+{
+    fn reference_add_update_operation() -> Result<Self, ProgramError> {
+        Ok(ReferenceAddUpdateOperation::new().into())
+    }
+}
+
+// Homogeneous array families can return or ignore cotangents, but their type universe contains no references.
+impl<V: Value<Type = ArrayType>> ReferenceAddUpdateOperationProvider<ArrayType> for ArrayOperation<V> {
+    fn reference_add_update_operation() -> Result<Self, ProgramError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: "the homogeneous array operation family cannot accumulate into a reference destination"
+                .to_string(),
+        })
+    }
+}
+
 impl<V: Value<Type = ArrayIrType>> ReferenceNew<V> for V
 where
     V::DispatchDomain: Context<Type = ArrayIrType>,
@@ -859,7 +886,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, ReferencePlacement};
     use crate::programs::{
-        Effect, Effects, EmptyRegionDriver, ProgramBuilder, ProgramError, REFERENCE_NEW_OPERATION_NAME,
+        EffectClass, EffectClasses, EmptyRegionDriver, ProgramBuilder, ProgramError, REFERENCE_NEW_OPERATION_NAME,
         REFERENCE_READ_OPERATION_NAME, ReferenceError, TypeError, ViewSymbol,
     };
     use crate::tracing::{Tracer, TracingContext};
@@ -889,11 +916,9 @@ mod tests {
             Err(TypeError::invalid("expected reference type but got array type")),
         );
         assert!(index.effects().is_pure());
-        assert_eq!(
-            index.reference_semantics().outputs(),
-            &[ReferenceOutput::Alias { output_index: 0, input_index: 0, kind: ReferenceAliasKind::View }],
-        );
-        assert!(index.reference_semantics().inputs().is_empty());
+        assert_eq!(index.effects().reference_aliases(), &[ReferenceAlias::new(0, 0, ReferenceAliasKind::View)]);
+        assert_eq!(index.effects().reference_effects(), &[]);
+
         assert_eq!(index.transform(), ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) });
         assert_eq!(index.to_string(), "reference_index [axis=0, index=1]");
 
@@ -1537,7 +1562,7 @@ mod tests {
             "}
             .trim_end(),
         );
-        assert_eq!(program.effects(), Effects::single(Effect::OrderedState));
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedState));
     }
 
     #[test]
@@ -1652,7 +1677,7 @@ mod tests {
             "}
             .trim_end(),
         );
-        assert_eq!(program.effects(), Effects::single(Effect::OrderedState));
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedState));
     }
 
     #[test]
@@ -1970,7 +1995,7 @@ mod tests {
         );
         assert_eq!(eager_outputs, expected);
         assert_eq!(program.interpret(inputs), Ok(expected));
-        assert_eq!(program.effects(), Effects::single(Effect::OrderedState));
+        assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedState));
     }
 
     #[test]

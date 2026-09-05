@@ -89,9 +89,9 @@ impl<T: Type> Display for CompareOperation<T> {
     }
 }
 
-/// Homogeneous comparison contract: the two operands are broadcast together and the broadcasted element type is
-/// replaced by [`DataType::Boolean`]. This covers every element-bearing type universe, including [`DataType`] and
-/// [`ArrayType`].
+// Homogeneous comparison contract: the two operands are broadcast together and the broadcasted element type is
+// replaced by [`DataType::Boolean`]. This covers every element-bearing type universe, including [`DataType`] and
+// [`ArrayType`].
 impl<T: Broadcastable + ElementType> Operation for CompareOperation<T> {
     type Type = T;
 
@@ -128,8 +128,8 @@ impl<T: Broadcastable + ElementType> Operation for CompareOperation<T> {
     }
 }
 
-/// Composite comparison contract: both operands are first-class dimensions and the predicate is ordinary rank-zero
-/// Boolean array data rather than another dimension value.
+// Composite comparison contract: both operands are first-class dimensions and the predicate is ordinary rank-zero
+// Boolean array data rather than another dimension value.
 impl Operation for CompareOperation<ArrayIrType> {
     type Type = ArrayIrType;
 
@@ -195,8 +195,8 @@ impl_reference_free_dischargeable_operation!(<T> CompareOperation<T> where T: Ty
 impl_non_differentiable_operation!(<T> CompareOperation<T> where T: Type);
 impl_non_transposable_operation!(<T> CompareOperation<T> where T: Type);
 
-/// Batching rule for first-class dimension comparison. Dimension operands describe one shared array shape and must
-/// therefore remain replicated; their Boolean array result is replicated ordinary data.
+// Batching rule for first-class dimension comparison. Dimension operands describe one shared array shape and must
+// therefore remain replicated; their Boolean array result is replicated ordinary data.
 impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatching> for CompareOperation<ArrayIrType>
 where
     C::Operation: From<CompareOperation<ArrayIrType>>,
@@ -225,8 +225,8 @@ where
 /// Represents the ability to perform a pairwise comparison between two values. For array values,
 /// `left.compare(right, direction)` produces a Boolean-valued result whose `i`-th element is the result of comparing
 /// the `i`-th elements of `left` and `right` according to `direction`. The input arrays must have broadcast-compatible
-/// shapes and promotable [`DataType`](crate::arrays::DataType)s. The result has
-/// [`DataType::Boolean`](crate::arrays::DataType::Boolean) and the broadcasted shape of the two input arrays.
+/// shapes and promotable [`DataType`]s. The result has [`DataType::Boolean`] and the broadcasted shape of the two
+/// input arrays.
 ///
 /// First-class dimensions use the same comparison operation but return ordinary rank-zero Boolean array data. This
 /// keeps the predicate available to selection and control-flow operations without making the result a dimension:
@@ -324,14 +324,14 @@ mod tests {
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
-        DifferentiationError, DifferentiationTracer, TransposableOperation, differentiate_at,
+        DifferentiationError, DifferentiationTracer, TransposableOperation, TranspositionContext, differentiate_at,
     };
     use crate::macros::{check_operation_batching, check_operation_partial_evaluation};
     use crate::operations::constants::zero_like::ZeroLike;
     use crate::operations::control_flow::select::Select;
     use crate::parameters::Placeholder;
     use crate::programs::{
-        Effects, EmptyRegionDriver, ProgramBuilder, ProgramError, RegionInterface, Typed, ValueProjection,
+        EffectClasses, EmptyRegionDriver, ProgramBuilder, ProgramError, RegionInterface, Typed, ValueProjection,
     };
     use crate::tracing::{Tracer, TracingContext};
 
@@ -430,7 +430,7 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(
                 &[left.into(), right.into()],
-                &[RegionInterface::new(Vec::new(), Vec::new(), Effects::PURE)],
+                &[RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE)],
             ),
             Err(TypeError::invalid("expected 0 regions but got 1")),
         );
@@ -590,14 +590,14 @@ mod tests {
         assert_eq!(jvp.output_ids().len(), 1);
 
         let operation = ArrayIrOperation::<Array>::from(CompareOperation::new(ComparisonDirection::LessThan));
-        let mut transposition_context = TestContext::new();
+        let transposition_context = TestContext::new();
         assert!(matches!(
             <ArrayIrOperation<Array> as TransposableOperation<
                 ArrayIrValue<Array>,
                 ArrayIrOperation<Array>,
             >>::transpose(
                 &operation,
-                &mut transposition_context,
+                &mut TranspositionContext::new(transposition_context.clone()),
                 &EmptyRegionDriver,
                 &[],
                 &[],

@@ -9,7 +9,7 @@ use crate::arrays::{
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionDriver};
+use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionContext, TranspositionDriver};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_reference_free_dischargeable_operation};
 use crate::operations::constants::constant::ConstantOperation;
@@ -85,10 +85,10 @@ impl Display for RandomAlgorithm {
 /// single input is the generator state (see [`RandomAlgorithm::state_type`]), and the two outputs are the advanced
 /// state followed by the generated bits at the declared output type. Randomness is functional: the same state
 /// always produces the same bits, and drawing again requires threading the advanced state (or deriving fresh states
-/// with [`split_key`]) — there is no hidden generator state.
+/// with [`Random::split_key`]) — there is no hidden generator state.
 ///
 /// The output element type must be an unsigned-integer type (`ui8`, `ui16`, `ui32`, or `ui64`); distributions over
-/// floating-point values are compositions on top of the raw bits (see [`uniform`](RngBitGenerator::uniform)).
+/// floating-point values are compositions on top of the raw bits (see [`Random::uniform`]).
 /// The declared output must not be sharded (each shard would otherwise see the same bits; derive per-shard states
 /// inside `shard_map` instead). The homogeneous array contract requires a static output shape. In an
 /// [`ArrayIrType`] graph, a bounded dynamic bits axis instead has one trailing first-class dimension operand;
@@ -97,8 +97,9 @@ impl Display for RandomAlgorithm {
 /// than logical element count, which is observably incorrect.
 ///
 /// Both outputs are discrete, so differentiation assigns structural-zero tangents and transposition is rejected.
-/// Homogeneous array batching of a *mapped* state (one state per batch item, e.g. derived with [`split_key`]) stages
-/// one carry-free [`ScanOperation`] over the per-item states, so each batch item draws its own bits from its own state.
+/// Homogeneous array batching of a *mapped* state (one state per batch item, e.g. derived with [`Random::split_key`])
+/// stages one carry-free [`ScanOperation`] over the per-item states, so each batch item draws its own bits from its
+/// own state.
 /// Composite array IR batching remains unsupported because the scan must retain first-class extent operands across
 /// its region boundary. Batching a *replicated* state is rejected in either contract because every batch item would see
 /// the same state and draw identical bits. The reference array backend implements both
@@ -189,8 +190,8 @@ fn validate_rng_bit_generator_types(
     Ok(())
 }
 
-/// Homogeneous bit-generation contract: the single input is the generator state and the declared bits output must be
-/// statically shaped.
+// Homogeneous bit-generation contract: the single input is the generator state and the declared bits output must be
+// statically shaped.
 impl Operation for RngBitGeneratorOperation<ArrayType> {
     type Type = ArrayType;
 
@@ -224,8 +225,8 @@ impl Operation for RngBitGeneratorOperation<ArrayType> {
     }
 }
 
-/// Composite bit-generation contract: the generator state is followed by one explicit first-class extent operand per
-/// dynamic bits axis, each of which must define the dimension variable that the declared bits axis refers to.
+// Composite bit-generation contract: the generator state is followed by one explicit first-class extent operand per
+// dynamic bits axis, each of which must define the dimension variable that the declared bits axis refers to.
 impl Operation for RngBitGeneratorOperation<ArrayIrType> {
     type Type = ArrayIrType;
 
@@ -294,14 +295,14 @@ impl_reference_free_dischargeable_operation!(<T> RngBitGeneratorOperation<T> whe
 
 impl_non_differentiable_operation!(<T> RngBitGeneratorOperation<T> where T: Type);
 
-/// Random bits are discrete and therefore never form a linear map that can be transposed.
+// Random bits are discrete and therefore never form a linear map that can be transposed.
 impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>> TransposableOperation<V, O> for RngBitGeneratorOperation<T>
 where
     RngBitGeneratorOperation<T>: Operation<Type = T>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        _context: &mut TracingContext<V, O>,
+        _context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -315,17 +316,17 @@ where
     }
 }
 
-/// Batching rule for [`RngBitGeneratorOperation`]. A state mapped at some batch axis is realigned to batch axis 0
-/// (a `[b, state_width]` stack of per-item states for both [`ThreeFry`](RandomAlgorithm::ThreeFry) and
-/// [`Philox`](RandomAlgorithm::Philox)) and one carry-free [`ScanOperation`] is staged over it, whose body binds this
-/// same operation on a single per-item state: iteration `i` consumes state row `i` and yields that item's advanced
-/// state and bits, and the scan stacks them into the mapped `[b, state_width]` advanced states and `[b, ...]` bits,
-/// both at batch axis 0. Each batch item therefore draws exactly the bits its own state would produce unbatched, the
-/// staged program's size stays independent of the batch size, and the rule composes with nested batching because the
-/// scan is bound through the parent context (an enclosing batching context batches the staged scan structurally).
-///
-/// A *replicated* state is rejected: every batch item would see the same state and silently draw identical,
-/// correlated bits, so callers derive one state per batch item with [`split_key`] and map over the states instead.
+// Batching rule for [`RngBitGeneratorOperation`]. A state mapped at some batch axis is realigned to batch axis 0
+// (a `[b, state_width]` stack of per-item states for both [`ThreeFry`](RandomAlgorithm::ThreeFry) and
+// [`Philox`](RandomAlgorithm::Philox)) and one carry-free [`ScanOperation`] is staged over it, whose body binds this
+// same operation on a single per-item state: iteration `i` consumes state row `i` and yields that item's advanced
+// state and bits, and the scan stacks them into the mapped `[b, state_width]` advanced states and `[b, ...]` bits,
+// both at batch axis 0. Each batch item therefore draws exactly the bits its own state would produce unbatched, the
+// staged program's size stays independent of the batch size, and the rule composes with nested batching because the
+// scan is bound through the parent context (an enclosing batching context batches the staged scan structurally).
+//
+// A *replicated* state is rejected: every batch item would see the same state and silently draw identical,
+// correlated bits, so callers derive one state per batch item with [`split_key`] and map over the states instead.
 impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
     for RngBitGeneratorOperation<ArrayType>
 where
@@ -374,9 +375,9 @@ where
     }
 }
 
-/// Composite batching rule for [`RngBitGeneratorOperation`]. Replicated first-class output extents become invariant
-/// scan carries, while one mapped state row is consumed per iteration. This preserves one independently advanced state
-/// and one dynamically shaped bits value per batch item without duplicating the generator state.
+// Composite batching rule for [`RngBitGeneratorOperation`]. Replicated first-class output extents become invariant
+// scan carries, while one mapped state row is consumed per iteration. This preserves one independently advanced state
+// and one dynamically shaped bits value per batch item without duplicating the generator state.
 impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatching> for RngBitGeneratorOperation<ArrayIrType>
 where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -458,10 +459,10 @@ pub trait RngBitGenerator: Sized {
     ) -> Result<(Self, Self), ProgramError>;
 }
 
-/// Any context-carrying value generates bits by binding an [`RngBitGeneratorOperation`] through its own context.
-/// The `From<RngBitGeneratorOperation<ArrayType>>` bound makes this disjoint from the eager reference value types (whose
-/// context operation is [`ConstantOperation`](crate::operations::constants::ConstantOperation)), so it covers the
-/// transform tracers and backend-owned values without conflicting with concrete implementations.
+// Any context-carrying value generates bits by binding an [`RngBitGeneratorOperation`] through its own context.
+// The `From<RngBitGeneratorOperation<ArrayType>>` bound makes this disjoint from the eager reference value types (whose
+// context operation is [`ConstantOperation`](crate::operations::constants::ConstantOperation)), so it covers the
+// transform tracers and backend-owned values without conflicting with concrete implementations.
 impl<V: Value<Type = ArrayType>> RngBitGenerator for V
 where
     V::DispatchDomain: Context<Operation: From<RngBitGeneratorOperation<ArrayType>>>,

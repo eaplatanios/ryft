@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::Display;
 use std::marker::PhantomData;
 
@@ -26,8 +27,8 @@ use crate::operations::manipulation::transposition::{Transpose, TransposeOperati
 use crate::parameters::Placeholder;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    Effect, Effects, Operation, OperationFormatter, OperationProjection, ProgramBuilder, ProgramError, RegionInterface,
-    Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+    EffectClass, EffectClasses, Effects, Operation, OperationFormatter, OperationProjection, ProgramBuilder,
+    ProgramError, RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 
 /// Canonical operation name for [`CustomCallOperation`].
@@ -530,7 +531,7 @@ struct CustomCallRaggedInput<'a, V> {
 /// supports one ragged axis per operand and one ragged batching level; differentiation remains governed by the same
 /// custom JVP/VJP wrappers as dense calls.
 /// Marking the call as side-effecting via [`with_side_effect`](Self::with_side_effect)
-/// reports [`Effect::OrderedIo`], which keeps the call alive through dead-code elimination and preserves its
+/// reports [`EffectClass::OrderedIo`], which keeps the call alive through dead-code elimination and preserves its
 /// execution order relative to other ordered effects; the lowered custom call is then also marked
 /// `has_side_effect = true` so the XLA compiler never elides or reorders it.
 ///
@@ -541,7 +542,7 @@ struct CustomCallRaggedInput<'a, V> {
 /// attributes, and an effect flag. A backend supports the operation by providing (1) a process- or client-level
 /// registry that resolves target names to executable kernels at execution time, (2) a calling convention that
 /// hands the kernel its input buffers, output buffers matching the declared output types, and the decoded
-/// attributes, and (3) an execution engine that honors [`Effect::OrderedIo`] for side-effecting calls. Backends
+/// attributes, and (3) an execution engine that honors [`EffectClass::OrderedIo`] for side-effecting calls. Backends
 /// that cannot execute foreign kernels (like the reference array backend) reject interpretation with a clear
 /// error instead of guessing.
 ///
@@ -1402,8 +1403,12 @@ impl Operation for CustomCallOperation<ArrayType> {
     }
 
     #[inline]
-    fn effects(&self) -> Effects {
-        if self.has_side_effect { Effects::single(Effect::OrderedIo) } else { Effects::PURE }
+    fn effects(&self) -> Cow<'_, Effects> {
+        Cow::Owned(Effects::explicit(if self.has_side_effect {
+            EffectClasses::single(EffectClass::OrderedIo)
+        } else {
+            EffectClasses::NONE
+        }))
     }
 
     fn rename_type_identities(
@@ -1464,8 +1469,12 @@ impl Operation for CustomCallOperation<ArrayIrType> {
     }
 
     #[inline]
-    fn effects(&self) -> Effects {
-        if self.has_side_effect { Effects::single(Effect::OrderedIo) } else { Effects::PURE }
+    fn effects(&self) -> Cow<'_, Effects> {
+        Cow::Owned(Effects::explicit(if self.has_side_effect {
+            EffectClasses::single(EffectClass::OrderedIo)
+        } else {
+            EffectClasses::NONE
+        }))
     }
 
     fn rename_type_identities(&self, renaming: &TypeIdentityRenaming<DimensionVariable>) -> Result<Self, TypeError> {
@@ -1491,7 +1500,7 @@ impl<C: Domain<Type = ArrayType, Value: CustomCall>> InterpretableOperation<C> f
 
 // Partial evaluation defers to the default fold-or-residualize behavior of `Program::partially_evaluate`. An all-known
 // custom call folds into the known side (executing there only if the known-side context can run foreign kernels), and a
-// side-effecting residual call survives dead-code elimination because `Operation::effects` is not `Effects::PURE`.
+// side-effecting residual call survives dead-code elimination because `Operation::effects` is not `EffectClasses::NONE`.
 impl<T: Type, C: Context<Type = T, Operation: From<CustomCallOperation<T>>>> PartiallyEvaluatableOperation<C>
     for CustomCallOperation<T>
 where
@@ -1525,33 +1534,33 @@ impl_differentiable_operation! {
     transpose = @nonlinear,
 }
 
-/// Homogeneous-array batching rule for [`CustomCallOperation`]. A foreign kernel is opaque, so Ryft cannot derive how
-/// a batch axis threads through it. A call whose operands are *all replicated* is nevertheless bound unchanged through
-/// the parent context and reports replicated outputs, matching JAX, which only invokes a batching rule once some
-/// operand is actually mapped.
-///
-/// That all-replicated shortcut is sound *for this operation specifically* because a custom call is region-free by
-/// construction: [`Operation::infer_output_types`] rejects every attached region, so the kernel is a leaf whose only
-/// observable inputs are its operands. A foreign kernel therefore cannot observe the transform's named axis, and
-/// running it unchanged over replicated operands computes exactly what each batch item would have computed on its
-/// own. The shortcut must never be generalized to region-carrying operations, because a region can contain a
-/// named-axis operation whose value differs per batch item even when every operand of the enclosing instruction is
-/// replicated. `.tasks/plan_custom_derivative_batching_axis_parity.md` records the JAX fixture pinning that
-/// counterexample (`vmap` with `in_axes=None`, an explicit extent, and a named-axis index still produces
-/// `[0, 1, 2]`), which is why the custom-derivative wrappers always batch their regions structurally.
-///
-/// A mapped operand is instead governed by the call's own [`CustomCallBatching`] behavior:
-/// [`Rejected`](CustomCallBatching::Rejected) reports a [`BatchingError::UnsupportedOperation`] naming that operand
-/// and its mapped axis, [`Sequential`](CustomCallBatching::Sequential) stages one [`ScanOperation`] whose body
-/// performs a single unbatched call (mapped operands realigned to batch axis `0` and sliced per iteration, replicated
-/// operands threaded as invariant carries), and [`BroadcastAll`](CustomCallBatching::BroadcastAll) aligns every
-/// operand to batch axis `0` and rebinds one call whose declared outputs gain the same leading batch dimension. Both
-/// mapped behaviors keep the staged program's size independent of the batch extent and compose with nested batching,
-/// because the rewritten instruction is bound through the parent context and carries the same behavior selection.
-///
-/// [`Sequential`](CustomCallBatching::Sequential) requires a statically known mapped extent: the scan trip count is a
-/// host `usize` in this universe. The mixed [`ArrayIrType`] rule below owns the dynamic-extent case, where the trip
-/// count is a first-class dimension operand.
+// Homogeneous-array batching rule for [`CustomCallOperation`]. A foreign kernel is opaque, so Ryft cannot derive how
+// a batch axis threads through it. A call whose operands are *all replicated* is nevertheless bound unchanged through
+// the parent context and reports replicated outputs, matching JAX, which only invokes a batching rule once some
+// operand is actually mapped.
+//
+// That all-replicated shortcut is sound *for this operation specifically* because a custom call is region-free by
+// construction: [`Operation::infer_output_types`] rejects every attached region, so the kernel is a leaf whose only
+// observable inputs are its operands. A foreign kernel therefore cannot observe the transform's named axis, and
+// running it unchanged over replicated operands computes exactly what each batch item would have computed on its
+// own. The shortcut must never be generalized to region-carrying operations, because a region can contain a
+// named-axis operation whose value differs per batch item even when every operand of the enclosing instruction is
+// replicated. `.tasks/plan_custom_derivative_batching_axis_parity.md` records the JAX fixture pinning that
+// counterexample (`vmap` with `in_axes=None`, an explicit extent, and a named-axis index still produces
+// `[0, 1, 2]`), which is why the custom-derivative wrappers always batch their regions structurally.
+//
+// A mapped operand is instead governed by the call's own [`CustomCallBatching`] behavior:
+// [`Rejected`](CustomCallBatching::Rejected) reports a [`BatchingError::UnsupportedOperation`] naming that operand
+// and its mapped axis, [`Sequential`](CustomCallBatching::Sequential) stages one [`ScanOperation`] whose body
+// performs a single unbatched call (mapped operands realigned to batch axis `0` and sliced per iteration, replicated
+// operands threaded as invariant carries), and [`BroadcastAll`](CustomCallBatching::BroadcastAll) aligns every
+// operand to batch axis `0` and rebinds one call whose declared outputs gain the same leading batch dimension. Both
+// mapped behaviors keep the staged program's size independent of the batch extent and compose with nested batching,
+// because the rewritten instruction is bound through the parent context and carries the same behavior selection.
+//
+// [`Sequential`](CustomCallBatching::Sequential) requires a statically known mapped extent: the scan trip count is a
+// host `usize` in this universe. The mixed [`ArrayIrType`] rule below owns the dynamic-extent case, where the trip
+// count is a first-class dimension operand.
 impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
     for CustomCallOperation<ArrayType>
 where
@@ -1692,20 +1701,20 @@ where
     }
 }
 
-/// Mixed array/dimension batching rule for [`CustomCallOperation`]. It applies the same all-replicated shortcut and
-/// the same [`CustomCallBatching`] behaviors as the homogeneous rule above, with two composite-universe additions.
-///
-/// Every trailing first-class output-extent operand must be replicated: a per-batch-item extent would make the call's
-/// results ragged, which the array IR cannot represent. An extent-free call whose mapped extent is statically known is
-/// exactly the homogeneous contract, so it delegates to the projected homogeneous rule through
-/// [`batch_projected_operation`]. A dynamic mapped extent stays here, because a first-class dimension is not an array
-/// value and therefore cannot cross the projected array boundary as a scan trip count or a broadcast extent.
-///
-/// [`Sequential`](CustomCallBatching::Sequential) threads the replicated extents as leading invariant scan carries and
-/// consumes the mapped rows one per iteration, so the body's call sees exactly the per-item extents it declared.
-/// [`BroadcastAll`](CustomCallBatching::BroadcastAll) instead rebinds one call whose declared outputs gain the mapped
-/// batch dimension, prepending the transform's extent value to each output's trailing extent group when that batch
-/// dimension is itself dynamic.
+// Mixed array/dimension batching rule for [`CustomCallOperation`]. It applies the same all-replicated shortcut and
+// the same [`CustomCallBatching`] behaviors as the homogeneous rule above, with two composite-universe additions.
+//
+// Every trailing first-class output-extent operand must be replicated: a per-batch-item extent would make the call's
+// results ragged, which the array IR cannot represent. An extent-free call whose mapped extent is statically known is
+// exactly the homogeneous contract, so it delegates to the projected homogeneous rule through
+// [`batch_projected_operation`]. A dynamic mapped extent stays here, because a first-class dimension is not an array
+// value and therefore cannot cross the projected array boundary as a scan trip count or a broadcast extent.
+//
+// [`Sequential`](CustomCallBatching::Sequential) threads the replicated extents as leading invariant scan carries and
+// consumes the mapped rows one per iteration, so the body's call sees exactly the per-item extents it declared.
+// [`BroadcastAll`](CustomCallBatching::BroadcastAll) instead rebinds one call whose declared outputs gain the mapped
+// batch dimension, prepending the transform's extent value to each output's trailing extent group when that batch
+// dimension is itself dynamic.
 impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatching> for CustomCallOperation<ArrayIrType>
 where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -1908,10 +1917,10 @@ pub trait CustomCall: Sized {
         Self: 'a;
 }
 
-/// Any context-carrying value calls foreign kernels by binding a [`CustomCallOperation<ArrayType>`] through its own
-/// context. The conversion bound makes this disjoint from the eager reference value types (whose context operation is
-/// [`ConstantOperation`]), so it covers the transform tracers and
-/// backend-owned values without conflicting with concrete implementations.
+// Any context-carrying value calls foreign kernels by binding a [`CustomCallOperation<ArrayType>`] through its own
+// context. The conversion bound makes this disjoint from the eager reference value types (whose context operation is
+// [`ConstantOperation`]), so it covers the transform tracers and
+// backend-owned values without conflicting with concrete implementations.
 impl<V: Value<Type = ArrayType>> CustomCall for V
 where
     V::DispatchDomain: Context<Operation: From<CustomCallOperation<ArrayType>>>,
@@ -1956,7 +1965,7 @@ mod tests {
         ProgramBatchingOutputAxesPolicy,
     };
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::{DifferentiationError, TransposableOperation};
+    use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionContext};
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::{BindingRegionDriver, EmptyRegionDriver, ProgramBuilder, Provenance, ProvenanceScope};
@@ -2107,7 +2116,7 @@ mod tests {
         assert_eq!(operation.input_output_aliases(), &[CustomCallInputOutputAlias::new(0, 0)]);
         assert!(operation.has_side_effect());
         assert_eq!(operation.name(), CUSTOM_CALL_OPERATION_NAME);
-        assert_eq!(operation.effects(), Effects::single(Effect::OrderedIo));
+        assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
         assert_eq!(operation.infer_output_types(&[vector_type()], &[]), Ok(vec![vector_type()]),);
         // Long attribute lists wrap onto one line per field.
         assert_eq!(
@@ -2127,7 +2136,7 @@ mod tests {
         );
 
         let pure = CustomCallOperation::new("ryft.test.add_one", vec![vector_type()]);
-        assert_eq!(pure.effects(), Effects::PURE);
+        assert_eq!(pure.effects().classes(), EffectClasses::NONE);
         assert_eq!(pure.to_string(), "custom_call [target=ryft.test.add_one]");
         let roundtrip =
             CustomCallOperation::<ArrayType>::from(CustomCallOperation::<ArrayIrType>::from(operation.clone()));
@@ -3374,9 +3383,14 @@ mod tests {
                         with `CustomCallOperation::with_batching`",
         ));
 
-        let mut transposition_context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let transposition_context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         assert!(matches!(
-            operation.transpose(&mut transposition_context, &EmptyRegionDriver, &[], &[]),
+            operation.transpose(
+                &mut TranspositionContext::new(transposition_context.clone()),
+                &EmptyRegionDriver,
+                &[],
+                &[],
+            ),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "operation `custom_call` is not transposable",
         ));
@@ -3442,7 +3456,7 @@ mod tests {
         assert_eq!(output_axes, vec![BatchAxis::new(0)]);
         // The staged program keeps exactly one call, inside a three-trip scan body: the side effect therefore occurs
         // three times in iteration order rather than once over a batch-prefixed buffer.
-        assert_eq!(batched.effects(), Effects::single(Effect::OrderedIo));
+        assert_eq!(batched.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
         assert_eq!(
             batched.to_string(),
             indoc! {"
@@ -3779,7 +3793,7 @@ mod tests {
     }
 
     /// Side-effect occurrence counts differ between the two behaviors, which is exactly why the selection is
-    /// explicit. Both stage a single call instruction and both keep the call's [`Effect::OrderedIo`], so neither is
+    /// explicit. Both stage a single call instruction and both keep the call's [`EffectClass::OrderedIo`], so neither is
     /// eliminated or reordered, but `Sequential` executes it once per batch item through the scan's ordered trips
     /// while `BroadcastAll` executes it exactly once over batch-prefixed buffers.
     #[test]
@@ -3807,7 +3821,11 @@ mod tests {
 
             let rendered = batched.to_string();
             assert_eq!(rendered.matches(CUSTOM_CALL_OPERATION_NAME).count(), 1, "{behavior}: {rendered}");
-            assert_eq!(batched.effects(), Effects::single(Effect::OrderedIo), "{behavior}: {rendered}");
+            assert_eq!(
+                batched.effects().classes(),
+                EffectClasses::single(EffectClass::OrderedIo),
+                "{behavior}: {rendered}"
+            );
             if matches!(behavior, CustomCallBatching::Sequential { .. }) {
                 assert!(rendered.contains("scan [carry_count=0, length=3, reverse=false]"), "{rendered}");
             } else {

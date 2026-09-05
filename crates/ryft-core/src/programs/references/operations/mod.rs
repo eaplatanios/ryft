@@ -221,9 +221,14 @@ mod reference_read;
 mod reference_swap;
 mod reference_write;
 
-pub use reference_add_update::{REFERENCE_ADD_UPDATE_OPERATION_NAME, ReferenceAddUpdate, ReferenceAddUpdateOperation};
+pub use reference_add_update::{
+    REFERENCE_ADD_UPDATE_OPERATION_NAME, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+    ReferenceAddUpdateOperationProvider,
+};
 pub use reference_freeze::{REFERENCE_FREEZE_OPERATION_NAME, ReferenceFreeze, ReferenceFreezeOperation};
-pub use reference_new::{REFERENCE_NEW_OPERATION_NAME, ReferenceNew, ReferenceNewOperation};
+pub use reference_new::{
+    REFERENCE_NEW_OPERATION_NAME, ReferenceNew, ReferenceNewOperation, ReferenceNewOperationProvider,
+};
 pub use reference_read::{REFERENCE_READ_OPERATION_NAME, ReferenceRead, ReferenceReadOperation};
 pub use reference_swap::{REFERENCE_SWAP_OPERATION_NAME, ReferenceSwap, ReferenceSwapOperation};
 pub use reference_write::{REFERENCE_WRITE_OPERATION_NAME, ReferenceWrite, ReferenceWriteOperation};
@@ -248,7 +253,6 @@ pub(crate) mod tests {
         ReferenceAccumulationPolicy, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargeReference,
         ReferenceDischargeableOperation, ReferenceDischargeableType, discharge_reference_free_operation,
     };
-    use crate::programs::references::semantics::ReferenceOperationSemantics;
     use crate::programs::references::types::ReferenceType;
     use crate::programs::regions::{EmptyRegionDriver, RegionInterface};
     use crate::programs::types::{Type, TypeError};
@@ -809,21 +813,9 @@ pub(crate) mod tests {
             }
         }
 
-        fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
+        fn effects(&self) -> Cow<'_, Effects> {
             match self {
-                Self::Add => Cow::Borrowed(ReferenceOperationSemantics::empty()),
-                Self::New(operation) => operation.reference_semantics(),
-                Self::Read(operation) => operation.reference_semantics(),
-                Self::Write(operation) => operation.reference_semantics(),
-                Self::Swap(operation) => operation.reference_semantics(),
-                Self::AddUpdate(operation) => operation.reference_semantics(),
-                Self::Freeze(operation) => operation.reference_semantics(),
-            }
-        }
-
-        fn effects(&self) -> Effects {
-            match self {
-                Self::Add => Effects::PURE,
+                Self::Add => Cow::Borrowed(Effects::empty()),
                 Self::New(operation) => operation.effects(),
                 Self::Read(operation) => operation.effects(),
                 Self::Write(operation) => operation.effects(),
@@ -1058,11 +1050,11 @@ pub(crate) mod tests {
     /// Allocates a reference containing `payload` through the allocation discharge rule.
     ///
     /// Returns the discharge context together with the handle denoting the new allocation.
-    pub(crate) fn allocated_allocation(payload: i64) -> (TestDischargeContext, TestDischargeReference) {
+    pub(crate) fn allocated_reference(payload: i64) -> (TestDischargeContext, TestDischargeReference) {
         let context = TestDischargeContext::new(TestDestination::new());
         let initial = ReferenceDischargeValue::Value(TestValue::new(REFERENT, payload));
         let allocated = New::new().discharge_references(&context, &EmptyRegionDriver, &[initial]).unwrap();
-        let reference = allocated[0].try_as_reference("the allocated allocation").unwrap().clone();
+        let reference = allocated[0].try_as_reference("the allocated reference").unwrap().clone();
         (context, reference)
     }
 

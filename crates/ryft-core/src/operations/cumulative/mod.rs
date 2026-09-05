@@ -367,7 +367,7 @@ where
         |value: DecompositionTracer<C>| associative_scan(&value, axis, reverse, &combine),
         primal.r#type().into_owned(),
     )?;
-    let fused = driver.jvp_program(decomposition.entry_region_ref())?;
+    let fused = driver.jvp_program(decomposition.entry_region_ref(), &[true])?;
     let mut outputs = fused.interpret_in_context(context, vec![primal.clone(), tangent.clone()])?;
     check_count!("output", outputs, 2, ProgramError);
     let output_tangent = outputs.remove(1);

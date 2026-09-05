@@ -19,7 +19,8 @@ use crate::batching::{
 use crate::contexts::{Context, Domain, ProjectedContext, ValueResolution};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    MemberDifferentiableOperation, TransposableOperation, TranspositionDriver, jvp_projected_operation,
+    MemberDifferentiableOperation, TransposableOperation, TranspositionContext, TranspositionDriver,
+    jvp_projected_operation,
 };
 use crate::interpretation::{
     InterpretableOperation, InterpretationDriver, MemberInterpretableOperation, interpret_projected_operation,
@@ -785,7 +786,7 @@ where
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        context: &mut TracingContext<V, O>,
+        context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],

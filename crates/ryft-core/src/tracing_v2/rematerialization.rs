@@ -74,7 +74,7 @@ use crate::operations::{AddOperation, DotOperation, TagOperation, TransferToMemo
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{
-    Atom, AtomId, Effect, Effects, InputRegionProvenance, InstructionId, Operation, OperationFormatter,
+    Atom, AtomId, EffectClass, EffectClasses, InputRegionProvenance, InstructionId, Operation, OperationFormatter,
     OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceAccessMode, ReferenceAnalysis,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary,
     ReferenceDischargeRegionStateInsertion, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceRoot,
@@ -423,9 +423,9 @@ impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for Remateri
     }
 }
 
-/// Partial evaluation defers to the default fold-or-residualize behavior of [`Program::partially_evaluate`] for a
-/// [`RematerializeOperation`]: a call with all-known operands folds by interpreting its primal, and otherwise
-/// residualizes unchanged.
+// Partial evaluation defers to the default fold-or-residualize behavior of [`Program::partially_evaluate`] for a
+// [`RematerializeOperation`]: a call with all-known operands folds by interpreting its primal, and otherwise
+// residualizes unchanged.
 impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for RematerializeOperation<C::Type> where
     C::Operation: From<RematerializeOperation<C::Type>>
 {
@@ -508,30 +508,30 @@ where
     }
 }
 
-/// Capture-free forward-mode (JVP) rule for [`RematerializeOperation`]: replays the derived forward and tangent
-/// programs through the active context, staging their operations in the shared builder.
-///
-/// Both derived programs are ordinary primal-enum programs, so the rule replays them through
-/// [`Program::interpret_in_context`](crate::Program::interpret_in_context):
-///
-///   1. The forward program maps `inputs -> (outputs..., forward_tail...)`, where the tail is the region inputs
-///      followed by the policy-saved residuals. Replaying it on the dual primals yields the primal outputs and the
-///      forward tail; the tail is split off after the primal outputs.
-///   2. The tangent program maps `(non_differentiated..., forward_tail..., differentiated_input_tangents...) ->
-///      output_tangents`, exactly the leading non-differentiated operands and the forward tail followed by the
-///      differentiated inputs' tangents (per [`RematerializeOperation::new`]'s signature validation), so those leading
-///      operands and the tail are passed ahead of the dual tangents and replayed to produce the output tangents. The
-///      tangent program
-///      recomputes any unsaved residuals from the tail internally, so no residual reconstruction is needed here.
-///   3. Each primal output is paired with its staged output tangent into a [`DifferentiationDual`].
-///
-/// Because both replayed programs are straight-line primal-enum operations referencing the staged tracers directly,
-/// the rule introduces no symbolic capture and the enclosing partial-evaluation split discovers the residual
-/// operand edges structurally — so
-/// this is a leaf rule needing no nested differentiation or linearization request, and reverse mode transposes the
-/// replayed recompute-and-pushforward operations like any other straight-line
-/// tangent program. The [`prevent_cse`](RematerializeOperation::prevent_cse) optimization-barrier hint is
-/// dropped in the forward (it is a backend lowering hint with no value-level semantics).
+// Capture-free forward-mode (JVP) rule for [`RematerializeOperation`]: replays the derived forward and tangent
+// programs through the active context, staging their operations in the shared builder.
+//
+// Both derived programs are ordinary primal-enum programs, so the rule replays them through
+// [`Program::interpret_in_context`](crate::Program::interpret_in_context):
+//
+//   1. The forward program maps `inputs -> (outputs..., forward_tail...)`, where the tail is the region inputs
+//      followed by the policy-saved residuals. Replaying it on the dual primals yields the primal outputs and the
+//      forward tail; the tail is split off after the primal outputs.
+//   2. The tangent program maps `(non_differentiated..., forward_tail..., differentiated_input_tangents...) ->
+//      output_tangents`, exactly the leading non-differentiated operands and the forward tail followed by the
+//      differentiated inputs' tangents (per [`RematerializeOperation::new`]'s signature validation), so those leading
+//      operands and the tail are passed ahead of the dual tangents and replayed to produce the output tangents. The
+//      tangent program
+//      recomputes any unsaved residuals from the tail internally, so no residual reconstruction is needed here.
+//   3. Each primal output is paired with its staged output tangent into a [`DifferentiationDual`].
+//
+// Because both replayed programs are straight-line primal-enum operations referencing the staged tracers directly,
+// the rule introduces no symbolic capture and the enclosing partial-evaluation split discovers the residual
+// operand edges structurally — so
+// this is a leaf rule needing no nested differentiation or linearization request, and reverse mode transposes the
+// replayed recompute-and-pushforward operations like any other straight-line
+// tangent program. The [`prevent_cse`](RematerializeOperation::prevent_cse) optimization-barrier hint is
+// dropped in the forward (it is a backend lowering hint with no value-level semantics).
 impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperation<C>
     for RematerializeOperation<C::Type>
 where
@@ -614,22 +614,22 @@ where
 
 crate::impl_non_transposable_operation!(<T> RematerializeOperation<T> where T: DifferentiableType);
 
-/// Batching rule for [`RematerializeOperation`]. The primal and forward regions receive the wrapper operands' existing
-/// axes, forward-tail residuals retain their natural axes, and the tangent region receives the non-differentiated
-/// operands' axes, those residual axes, and the differentiated operands' tangent axes. Corresponding primal, forward,
-/// and tangent outputs are reconciled to one axis. The backward region receives the non-differentiated, residual, and
-/// reconciled output-cotangent axes, and mapped cotangents for replicated primal inputs are summed back to
-/// replication. Rebuilding all four regions keeps the rematerialization boundary and its `prevent_cse` policy intact
-/// without imposing a wrapper-wide axis position.
-///
-/// The batching policy owns the boundary shape of its structurally batched programs.
-/// [`BatchingPolicy::adapt_batched_program`](crate::BatchingPolicy::adapt_batched_program) adapts each batched
-/// region back to the plain rematerialization region boundary, and any
-/// [`BatchingPolicy::boundary_operands`](crate::BatchingPolicy::boundary_operands) (e.g., a composite program's
-/// first-class mapped extent) become additional leading
-/// [non-differentiated](RematerializeOperation::non_differentiated_count) operands of the batched call, which is
-/// precisely the operand role those bookkeeping values play: every region consumes them and none of them carries a
-/// derivative.
+// Batching rule for [`RematerializeOperation`]. The primal and forward regions receive the wrapper operands' existing
+// axes, forward-tail residuals retain their natural axes, and the tangent region receives the non-differentiated
+// operands' axes, those residual axes, and the differentiated operands' tangent axes. Corresponding primal, forward,
+// and tangent outputs are reconciled to one axis. The backward region receives the non-differentiated, residual, and
+// reconciled output-cotangent axes, and mapped cotangents for replicated primal inputs are summed back to
+// replication. Rebuilding all four regions keeps the rematerialization boundary and its `prevent_cse` policy intact
+// without imposing a wrapper-wide axis position.
+//
+// The batching policy owns the boundary shape of its structurally batched programs.
+// [`BatchingPolicy::adapt_batched_program`](crate::BatchingPolicy::adapt_batched_program) adapts each batched
+// region back to the plain rematerialization region boundary, and any
+// [`BatchingPolicy::boundary_operands`](crate::BatchingPolicy::boundary_operands) (e.g., a composite program's
+// first-class mapped extent) become additional leading
+// [non-differentiated](RematerializeOperation::non_differentiated_count) operands of the batched call, which is
+// precisely the operand role those bookkeeping values play: every region consumes them and none of them carries a
+// derivative.
 impl<T: DifferentiableType, C: Context<Type = T>, P: CotangentBatchingPolicy<C>> BatchableOperation<C, P>
     for RematerializeOperation<T>
 where
@@ -1764,9 +1764,6 @@ struct PrimalReferenceAccesses {
     /// into [`mutations`](Self::mutations).
     local_roots: Vec<Vec<usize>>,
 
-    /// Per entry instruction, whether it accesses an external root.
-    external: Vec<bool>,
-
     /// Per local root, the entry instructions that define or mutate it (its allocation and every non-read access), in
     /// program order.
     mutations: Vec<Vec<usize>>,
@@ -1783,77 +1780,59 @@ impl PrimalReferenceAccesses {
         primal: &Program<V, O, Vec<V>, Vec<V>>,
         analysis: Option<&ReferenceAnalysis>,
     ) -> Self {
-        let instruction_count = primal.instructions().len();
-        let mut accesses = Self {
-            local_roots: vec![Vec::new(); instruction_count],
-            external: vec![false; instruction_count],
-            mutations: Vec::new(),
-            recomputable: Vec::with_capacity(instruction_count),
-        };
-        if let Some(analysis) = analysis {
-            accesses.record_accesses(primal, analysis);
-        }
-
-        // An instruction is recomputable when it is pure, or when it is an ordered-state instruction whose only effect
-        // is accessing local roots. Instruction-level effects include the recursively derived effects of attached
-        // computation regions, so an effect inside a nested body (e.g., a print in a scan body) also forces the save.
-        for index in 0..instruction_count {
-            let effects = primal.instruction_effects(InstructionId::new(primal.entry(), index)).unwrap().classes();
-            accesses.recomputable.push(
-                effects.is_pure()
-                    || (!accesses.external[index]
-                        && !accesses.local_roots[index].is_empty()
-                        && effects == Effects::single(Effect::OrderedState)),
-            );
-        }
-        accesses
-    }
-
-    /// Records into `self` which local and external roots every entry instruction of `primal` accesses and where each
-    /// local root is mutated, according to `analysis`.
-    fn record_accesses<V: Value, O: Operation<Type = V::Type>>(
-        &mut self,
-        primal: &Program<V, O, Vec<V>, Vec<V>>,
-        analysis: &ReferenceAnalysis,
-    ) {
         let entry = primal.entry();
+        let instruction_count = primal.instructions().len();
+        let mut local_roots = vec![Vec::new(); instruction_count];
+        let mut mutations = Vec::new();
+        let mut recomputable = Vec::with_capacity(instruction_count);
 
-        // The allocation defines the root's state, so it heads the root's mutation list, and the allocating
-        // instruction accesses the root so that it counts as a reference lifecycle instruction rather than as an
-        // opaque ordered one.
+        // The allocation defines the root's state, so it heads the root's mutation list. Recording it as a local
+        // access also distinguishes a reference lifecycle from an unrelated ordered-state operation.
         let mut slots = HashMap::new();
-        for root in analysis.roots() {
+        for root in analysis.into_iter().flat_map(ReferenceAnalysis::roots) {
             let ReferenceRoot::Allocation { instruction, .. } = root else {
                 continue;
             };
             if instruction.region() != entry {
                 continue;
             }
-            let slot = self.mutations.len();
-            self.mutations.push(vec![instruction.index()]);
-            self.local_roots[instruction.index()].push(slot);
+            let slot = mutations.len();
+            mutations.push(vec![instruction.index()]);
+            local_roots[instruction.index()].push(slot);
             slots.insert(root, slot);
         }
 
-        // Transitive access summaries are expressed in the entry namespace, so every root they name is either an
-        // entry allocation or an entry input, and every access recorded there happened at or below this instruction.
-        for index in 0..primal.instructions().len() {
-            let Some(access) = analysis.transitive_access(InstructionId::new(entry, index)) else {
-                continue;
-            };
-            for (root, modes) in access.accesses() {
-                let Some(slot) = slots.get(root).copied() else {
-                    self.external[index] = true;
-                    continue;
-                };
-                if !self.local_roots[index].contains(&slot) {
-                    self.local_roots[index].push(slot);
-                }
-                if modes.iter().any(|mode| *mode != ReferenceAccessMode::Read) {
-                    self.mutations[slot].push(index);
+        for (index, roots) in local_roots.iter_mut().enumerate() {
+            let instruction = InstructionId::new(entry, index);
+            let mut accesses_external_root = false;
+            // Transitive accesses use the entry namespace, including accesses inside attached computation regions.
+            if let Some(access) = analysis.and_then(|analysis| analysis.transitive_access(instruction)) {
+                for (root, modes) in access.accesses() {
+                    let Some(slot) = slots.get(root).copied() else {
+                        accesses_external_root = true;
+                        continue;
+                    };
+                    if !roots.contains(&slot) {
+                        roots.push(slot);
+                    }
+                    if modes.iter().any(|mode| *mode != ReferenceAccessMode::Read) {
+                        mutations[slot].push(index);
+                    }
                 }
             }
+
+            // Only pure instructions and state confined to known local roots may be recomputed. Nested I/O and
+            // explicit ordered state also appear in this summary, so neither can be hidden by local reference access.
+            let effects = primal.instruction_effects(instruction).unwrap();
+            recomputable.push(
+                effects.classes().is_empty()
+                    || (!effects.has_explicit_ordered_state()
+                        && !accesses_external_root
+                        && !roots.is_empty()
+                        && effects.classes() == EffectClasses::single(EffectClass::OrderedState)),
+            );
         }
+        Self { local_roots, mutations, recomputable }
     }
 
     /// Returns whether recompute slices may copy the entry instruction at `index`: whether it is pure, or an
@@ -2203,17 +2182,7 @@ where
         source_input_positions[input.index()] = Some(position);
     }
     let mut relocation: Vec<Option<AtomId>> = vec![None; source.atoms().len()];
-    let source_region_ids = source
-        .instructions()
-        .iter()
-        .flat_map(|instruction| instruction.regions().iter().copied())
-        .collect::<Vec<_>>();
-    let source_regions = source_region_ids
-        .iter()
-        .map(|region| source.region_ref(*region))
-        .collect::<Result<Vec<_>, ProgramError>>()?;
-    let relocated_regions = builder.import_regions(source_regions.as_slice())?;
-    let region_relocation = source_region_ids.into_iter().zip(relocated_regions).collect::<HashMap<_, _>>();
+    let mut source_region_remapping = HashMap::new();
     let lookup = |atom: AtomId,
                   relocation: &mut Vec<Option<AtomId>>,
                   resolver: &mut PrimalSliceResolver<'_, V, O>,
@@ -2243,9 +2212,7 @@ where
             .regions()
             .iter()
             .map(|region| {
-                region_relocation.get(region).copied().ok_or_else(|| {
-                    ProgramError::MalformedProgram(format!("region {region} was not imported during relocation"))
-                })
+                Ok(builder.import_region_with_remapping(source.region_ref(*region)?, &mut source_region_remapping))
             })
             .collect::<Result<Vec<_>, ProgramError>>()?;
         let outputs = builder
@@ -2749,7 +2716,7 @@ mod tests {
     use crate::operations::{Cos, Dot, DotDimensionNumbers, MulOperation, ScanOperation, Sin, Tag};
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::{
-        OperationEffects, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
+        Effects, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
         ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceType, RegionRole,
     };
     use crate::tests::TestOrderedStateOperation;
@@ -4514,7 +4481,7 @@ mod tests {
     fn test_invalid_storage_operations_return_structured_errors() {
         use std::fmt::Display;
 
-        use crate::programs::{Effect, Effects};
+        use crate::programs::{EffectClass, EffectClasses};
 
         /// Malformed storage operation shape exercised by this test.
         #[derive(Copy, Clone, Debug)]
@@ -4567,10 +4534,10 @@ mod tests {
                 })
             }
 
-            fn effects(&self) -> Cow<'_, OperationEffects> {
-                Cow::Owned(OperationEffects::explicit(match self {
-                    Self::Effectful => Effects::single(Effect::OrderedIo),
-                    _ => Effects::PURE,
+            fn effects(&self) -> Cow<'_, Effects> {
+                Cow::Owned(Effects::explicit(match self {
+                    Self::Effectful => EffectClasses::single(EffectClass::OrderedIo),
+                    _ => EffectClasses::NONE,
                 }))
             }
         }
@@ -4798,6 +4765,189 @@ mod tests {
             &HashSet::new(),
             &mut HashSet::new(),
             read,
+        ));
+    }
+
+    #[test]
+    fn test_primal_reference_accesses_rejects_mixed_opaque_state() {
+        use crate::programs::{ReferenceEffect, RegionInterface, RegionSlot};
+
+        /// Operations exposing opaque state either beside a local reference access or inside an attached region.
+        #[derive(Clone, Debug)]
+        enum MixedStateOperation {
+            /// Allocates a fresh local reference.
+            Allocate,
+
+            /// Accesses its reference operand and independently performs opaque state effects.
+            Mixed,
+
+            /// Executes an attached computation region.
+            Call,
+
+            /// Reads its reference operand while retaining a dormant derivative region.
+            ReadWithRule,
+        }
+
+        impl Operation for MixedStateOperation {
+            type Type = ArrayIrType;
+
+            fn name(&self) -> &'static str {
+                match self {
+                    Self::Allocate => "allocate",
+                    Self::Mixed => "mixed_state",
+                    Self::Call => "call",
+                    Self::ReadWithRule => "read_with_rule",
+                }
+            }
+
+            fn region_slots(&self) -> &'static [RegionSlot] {
+                match self {
+                    Self::Call => const { &[RegionSlot::computation("body")] },
+                    Self::ReadWithRule => const { &[RegionSlot::rule("derivative")] },
+                    _ => &[],
+                }
+            }
+
+            fn infer_output_types(
+                &self,
+                _inputs: &[ArrayIrType],
+                _regions: &[RegionInterface<ArrayIrType>],
+            ) -> Result<Vec<ArrayIrType>, TypeError> {
+                let scalar = ArrayType::scalar(DataType::F32);
+                Ok(vec![match self {
+                    Self::Allocate => ReferenceType::new(scalar).into(),
+                    _ => scalar.into(),
+                }])
+            }
+
+            fn input_region_provenance(
+                &self,
+                _region_index: usize,
+                input_index: usize,
+            ) -> Option<InputRegionProvenance> {
+                Some(InputRegionProvenance::Forwarded { input_index })
+            }
+
+            fn effects(&self) -> Cow<'_, Effects> {
+                Cow::Owned(match self {
+                    Self::Allocate => Effects::new(
+                        EffectClasses::NONE,
+                        vec![ReferenceEffect::Allocate { output_index: 0 }],
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                    Self::Mixed => Effects::new(
+                        EffectClasses::single(EffectClass::OrderedState),
+                        vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::ReadWrite }],
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                    Self::ReadWithRule => Effects::new(
+                        EffectClasses::NONE,
+                        vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                    Self::Call => return Cow::Borrowed(Effects::empty()),
+                })
+            }
+        }
+
+        // Aggregate OrderedState alone cannot distinguish an extra opaque effect from local reference mutation.
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, MixedStateOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let reference =
+            builder.add_instruction(MixedStateOperation::Allocate, Vec::new(), vec![input], None).unwrap()[0];
+        let output = builder.add_instruction(MixedStateOperation::Mixed, Vec::new(), vec![reference], None).unwrap()[0];
+        let primal = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let analysis = primal.reference_analysis(0).unwrap();
+        let accesses = PrimalReferenceAccesses::new(&primal, Some(&analysis));
+        assert!(!residual_slice_is_recomputable(
+            &primal,
+            &accesses,
+            &primal.instruction_by_output(),
+            &HashSet::new(),
+            &mut HashSet::new(),
+            output,
+        ));
+        let mut destination = ProgramBuilder::new();
+        let input = destination.add_input(ArrayType::scalar(DataType::F32).into());
+        let mut resolver = PrimalSliceResolver::new(&primal, &accesses, &[input]);
+        assert!(matches!(
+            resolver.resolve(output, &mut destination),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "rematerialization attempted to recompute the non-pure operation `mixed_state`",
+        ));
+
+        // The same distinction survives an executable region boundary whose reference input denotes a caller-local
+        // root. An explicit opaque effect in that region still prevents copying the complete parent instruction.
+        let mut body = ProgramBuilder::<ArrayIrValue<Array>, MixedStateOperation>::new();
+        let reference = body.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
+        let output = body.add_instruction(MixedStateOperation::Mixed, Vec::new(), vec![reference], None).unwrap()[0];
+        let body = body
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, MixedStateOperation>::new();
+        let body_id = builder.import_region(body.entry_region_ref());
+        let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let reference =
+            builder.add_instruction(MixedStateOperation::Allocate, Vec::new(), vec![input], None).unwrap()[0];
+        let output =
+            builder.add_instruction(MixedStateOperation::Call, vec![body_id], vec![reference], None).unwrap()[0];
+        let primal = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let analysis = primal.reference_analysis(0).unwrap();
+        let accesses = PrimalReferenceAccesses::new(&primal, Some(&analysis));
+        assert!(!residual_slice_is_recomputable(
+            &primal,
+            &accesses,
+            &primal.instruction_by_output(),
+            &HashSet::new(),
+            &mut HashSet::new(),
+            output,
+        ));
+
+        // Attaching that body as dormant derivative metadata does not execute its opaque effect. The instruction's
+        // actual local read and its preceding allocation remain a recomputable lifecycle.
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, MixedStateOperation>::new();
+        let body_id = builder.import_region(body.entry_region_ref());
+        let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let reference =
+            builder.add_instruction(MixedStateOperation::Allocate, Vec::new(), vec![input], None).unwrap()[0];
+        let output = builder
+            .add_instruction(MixedStateOperation::ReadWithRule, vec![body_id], vec![reference], None)
+            .unwrap()[0];
+        let primal = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let analysis = primal.reference_analysis(0).unwrap();
+        let accesses = PrimalReferenceAccesses::new(&primal, Some(&analysis));
+        assert!(residual_slice_is_recomputable(
+            &primal,
+            &accesses,
+            &primal.instruction_by_output(),
+            &HashSet::new(),
+            &mut HashSet::new(),
+            output,
         ));
     }
 

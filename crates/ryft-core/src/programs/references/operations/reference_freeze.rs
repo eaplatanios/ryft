@@ -18,14 +18,14 @@ use crate::macros::check_count;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::ProgramError;
 use crate::programs::atoms::MaybeZero;
-use crate::programs::effects::{Effect, Effects};
+use crate::programs::effects::{EffectClasses, Effects, ReferenceAccessMode, ReferenceEffect};
 use crate::programs::operations::Operation;
 use crate::programs::references::discharge::{
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
     ReferenceDischargeableOperation,
 };
-use crate::programs::references::operations::{ReferenceAddUpdate, ReferenceNew};
-use crate::programs::references::semantics::{ReferenceAccessMode, ReferenceInput, ReferenceOperationSemantics};
+use crate::programs::references::operations::{ReferenceAddUpdateOperationProvider, ReferenceNewOperationProvider};
+
 use crate::programs::references::types::ReferenceType;
 use crate::programs::references::views::ReferenceViewOperation;
 use crate::programs::regions::RegionInterface;
@@ -76,8 +76,13 @@ pub trait ReferenceFreeze<Output = Self>: Sized {
     fn freeze(self) -> Result<Output, ProgramError>;
 }
 
-static REFERENCE_FREEZE_OPERATION_SEMANTICS: LazyLock<ReferenceOperationSemantics> = LazyLock::new(|| {
-    ReferenceOperationSemantics::new(vec![ReferenceInput::new(0, ReferenceAccessMode::Consume)], Vec::new())
+static REFERENCE_FREEZE_OPERATION_EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
+    Effects::new(
+        EffectClasses::NONE,
+        vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Consume }],
+        Vec::new(),
+    )
+    .unwrap()
 });
 
 define_reference_primitive_payload!(
@@ -112,13 +117,8 @@ where
     }
 
     #[inline]
-    fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
-        Cow::Borrowed(&REFERENCE_FREEZE_OPERATION_SEMANTICS)
-    }
-
-    #[inline]
-    fn effects(&self) -> Effects {
-        Effects::single(Effect::OrderedState)
+    fn effects(&self) -> Cow<'_, Effects> {
+        Cow::Borrowed(&REFERENCE_FREEZE_OPERATION_EFFECTS)
     }
 }
 
@@ -182,7 +182,7 @@ where
     T: Type,
     U: DifferentiableType,
     ReferenceFreezeOperation<T, U>: Operation<Type = U>,
-    C: Context<Type = U, Value: ReferenceFreeze<C::Value>>,
+    C: Context<Type = U, Operation: From<ReferenceFreezeOperation<T, U>>>,
 {
     // Freezing a reference freezes its tangent reference alongside, so the final value pairs with the final tangent
     // contents. A plumbing reference carries no tangent reference, so its final value has a symbolic zero tangent. The
@@ -190,13 +190,15 @@ where
     // an already-built application over borrowed duals, and a clone names the same allocation.
     fn jvp<D: DifferentiationDriver<C>>(
         &self,
-        _context: &C,
+        context: &C,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
-        let primal = inputs[0].primal().clone().freeze()?;
-        Ok(vec![forwarded_tangent(&inputs[0], primal, |tangent_reference| tangent_reference.clone().freeze())?])
+        let primal = context.bind(*self, Vec::new(), std::slice::from_ref(inputs[0].primal()))?.remove(0);
+        Ok(vec![forwarded_tangent(&inputs[0], primal, |reference| {
+            Ok(context.bind(*self, Vec::new(), std::slice::from_ref(reference))?.remove(0))
+        })?])
     }
 }
 
@@ -205,18 +207,22 @@ where
     T: Type,
     U: Type,
     ReferenceFreezeOperation<T, U>: Operation<Type = U>,
-    C: Context<Type = U, Value: ReferenceFreeze<C::Value>>,
+    C: Context<Type = U, Operation: From<ReferenceFreezeOperation<T, U>>>,
     P: BatchingPolicy<C>,
 {
     // Freezing yields the final packed referent, batched at the reference's own axis.
     fn batch<D: BatchingDriver<C, P>>(
         &self,
-        _context: &BatchingContext<C, P>,
+        context: &BatchingContext<C, P>,
         _driver: &D,
         inputs: &[P::Batch],
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![P::batch(P::value(&inputs[0]).clone().freeze()?, P::batch_axis(&inputs[0]))?].into())
+        Ok(vec![P::batch(
+            context.parent().bind(*self, Vec::new(), std::slice::from_ref(P::value(&inputs[0])))?.remove(0),
+            P::batch_axis(&inputs[0]),
+        )?]
+        .into())
     }
 }
 
@@ -226,9 +232,10 @@ where
     U: DifferentiableType,
     ReferenceFreezeOperation<T, U>: Operation<Type = U>,
     V: Value<Type = U>,
-    O: ReferenceViewOperation<Type = U> + ResidualZeroProvider<U>,
-    Tracer<TracingContext<V, O>>:
-        ReferenceNew<Tracer<TracingContext<V, O>>> + ReferenceAddUpdate<Tracer<TracingContext<V, O>>>,
+    O: ReferenceViewOperation<Type = U>
+        + ResidualZeroProvider<U>
+        + ReferenceNewOperationProvider<U>
+        + ReferenceAddUpdateOperationProvider<U>,
 {
     // A freeze reads the final state and consumes the allocation, so its transpose accumulates the frozen value's
     // cotangent into the root's cotangent reference exactly like a read. The cotangent reference stays live for the
@@ -243,7 +250,8 @@ where
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         if let MaybeZero::Value(cotangent) = &outputs[0] {
-            context.cotangent_reference(0)?.add_update(cotangent)?;
+            let reference = context.cotangent_reference(0)?;
+            context.bind(O::reference_add_update_operation()?, Vec::new(), &[reference, cotangent.clone()])?;
         }
         Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)])
     }
@@ -260,12 +268,15 @@ mod tests {
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::EagerContext;
     use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
+    use crate::programs::effects::EffectClass;
     use crate::programs::references::operations::tests::*;
     use crate::programs::references::operations::{ReferenceNew, ReferenceRead};
     use crate::programs::regions::EmptyRegionDriver;
     use crate::programs::types::Typed;
 
     use super::*;
+
+    type TestIrValue = ArrayIrValue<Array>;
 
     #[test]
     fn test_reference_freeze_operation() {
@@ -275,12 +286,12 @@ mod tests {
 
         assert_parameter_roundtrip(Freeze::new());
         assert_eq!(Freeze::new().to_string(), REFERENCE_FREEZE_OPERATION_NAME);
-        assert_eq!(Freeze::new().effects(), Effects::single(Effect::OrderedState));
-        assert_eq!(Freeze::new().reference_semantics().outputs(), &[]);
+        assert_eq!(Freeze::new().effects().classes(), EffectClasses::single(EffectClass::OrderedState));
         assert_eq!(
-            Freeze::new().reference_semantics().inputs(),
-            &[ReferenceInput::new(0, ReferenceAccessMode::Consume)],
+            Freeze::new().effects().reference_effects(),
+            &[ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Consume }]
         );
+        assert_eq!(Freeze::new().effects().reference_aliases(), &[]);
 
         let minimal_reference = ReadFreezeUniverse::Reference(ReferenceType::new(referent));
         assert_eq!(
@@ -294,7 +305,7 @@ mod tests {
             Freeze::new().infer_output_types(std::slice::from_ref(&value), &[]),
             Err(TypeError::invalid("expected reference type but got value type")),
         );
-        let region = RegionInterface::new(Vec::new(), Vec::new(), Effects::PURE);
+        let region = RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE);
         assert_eq!(
             Freeze::new().infer_output_types(std::slice::from_ref(&reference), std::slice::from_ref(&region)),
             Err(TypeError::invalid("expected 0 regions but got 1")),
@@ -305,7 +316,7 @@ mod tests {
     fn test_reference_freeze_operation_reference_discharge() {
         // A freeze yields the allocation's final state and unbinds the allocation, so every later access is a
         // use-after-consume.
-        let (context, reference) = allocated_allocation(4);
+        let (context, reference) = allocated_reference(4);
         let handle = ReferenceDischargeValue::Reference(reference.clone());
         assert_eq!(
             Freeze::new().discharge_references(&context, &EmptyRegionDriver, std::slice::from_ref(&handle)),
@@ -323,11 +334,9 @@ mod tests {
 
     #[test]
     fn test_reference_freeze_operation_jvp() {
-        type TestValue = ArrayIrValue<Array>;
-
-        let context = DifferentiationContext::new(EagerContext::<TestValue, ArrayIrOperation<Array>>::new());
-        let reference = TestValue::Array(Array::vector(vec![1.0_f32, 2.0])).reference_new().unwrap();
-        let tangent_reference = TestValue::Array(Array::vector(vec![3.0_f32, 4.0])).reference_new().unwrap();
+        let context = DifferentiationContext::new(EagerContext::<TestIrValue, ArrayIrOperation<Array>>::new());
+        let reference = TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0])).reference_new().unwrap();
+        let tangent_reference = TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0])).reference_new().unwrap();
 
         // Freezing an active reference freezes its tangent reference alongside and invalidates both alias families.
         let active = DifferentiationTracer::new(
@@ -336,19 +345,19 @@ mod tests {
         );
         let outputs = context.bind(ReferenceFreezeOperation::new(), Vec::new(), &[active]).unwrap();
         assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].primal(), &TestValue::Array(Array::vector(vec![1.0_f32, 2.0])));
-        assert_eq!(outputs[0].tangent().as_value(), Some(&TestValue::Array(Array::vector(vec![3.0_f32, 4.0]))));
+        assert_eq!(outputs[0].primal(), &TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0])));
+        assert_eq!(outputs[0].tangent().as_value(), Some(&TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0]))));
         assert!(reference.read().is_err());
         assert!(tangent_reference.read().is_err());
 
         // Freezing a plumbing reference yields a symbolic zero tangent of the referent's tangent type.
-        let reference = TestValue::Array(Array::vector(vec![5.0_f32, 6.0])).reference_new().unwrap();
+        let reference = TestIrValue::Array(Array::vector(vec![5.0_f32, 6.0])).reference_new().unwrap();
         let plumbing = DifferentiationTracer::new(
             DifferentiationDual::new_with_zero_tangent(reference.clone()).unwrap(),
             context.clone(),
         );
         let outputs = context.bind(ReferenceFreezeOperation::new(), Vec::new(), &[plumbing]).unwrap();
-        assert_eq!(outputs[0].primal(), &TestValue::Array(Array::vector(vec![5.0_f32, 6.0])));
+        assert_eq!(outputs[0].primal(), &TestIrValue::Array(Array::vector(vec![5.0_f32, 6.0])));
         assert!(matches!(
             outputs[0].tangent(),
             MaybeZero::Zero(r#type) if *r#type == ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2])),
@@ -358,18 +367,16 @@ mod tests {
 
     #[test]
     fn test_reference_freeze_operation_batching() {
-        type TestValue = ArrayIrValue<Array>;
-
-        let extent = TestValue::Dimension(
+        let extent = TestIrValue::Dimension(
             DimensionValue::new(DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())), 2)
                 .unwrap(),
         );
         let context = BatchingContext::<_, ArrayIrBatching>::new(
-            EagerContext::<TestValue, ArrayIrOperation<Array>>::new(),
+            EagerContext::<TestIrValue, ArrayIrOperation<Array>>::new(),
             extent,
         );
         let packed_type = ArrayType::new_static(DataType::F32, [3, 2]);
-        let packed = TestValue::Array(Array::from_f64s(packed_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
+        let packed = TestIrValue::Array(Array::from_f64s(packed_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]));
 
         // Freezing a batched reference yields the final packed referent at the reference's batch axis.
         let reference = packed.reference_new().unwrap();

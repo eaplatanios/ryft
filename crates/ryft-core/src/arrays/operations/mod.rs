@@ -13,7 +13,7 @@ use ryft_macros::Operation;
 use crate::arrays::arrays::Array;
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::ir::ArrayIrValue;
-use crate::arrays::reference_views::ArrayReferenceViewTransform;
+use crate::arrays::reference_views::{ArrayReferenceViewTransform, ViewIndex};
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::{Dimension, DimensionType};
 use crate::arrays::types::ir::ArrayIrType;
@@ -66,7 +66,7 @@ use crate::programs::{
     ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
     ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceViewOperation,
     ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation, Type, TypeError, TypeIdentityPosition,
-    Typed, Value, ValueProjection,
+    Typed, Value, ValueProjection, ViewSymbol,
 };
 use crate::tracing::TracingContext;
 use crate::tracing_v2::RematerializeOperation;
@@ -541,7 +541,8 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     LinearCall(LinearCallOperation<ArrayIrType>),
 
     /// Composite rematerialized call whose primal, forward, backward, and tangent regions use the complete array IR
-    /// storage universe. Unresolved state remains a non-recomputable boundary and is rejected before ordinary replay.
+    /// storage universe. Local reference lifecycles inside the body are recomputed, reads of external references are
+    /// saved rather than recomputed, and bodies that mutate external references are rejected.
     Rematerialize(RematerializeOperation<ArrayIrType>),
 }
 
@@ -585,6 +586,17 @@ impl<A: Value<Type = ArrayType>> ReferenceViewOperation for ArrayIrOperation<A> 
         }
     }
 
+    fn region_input_view(&self, region_index: usize, input_index: usize) -> Option<ArrayReferenceViewTransform> {
+        // A scan body's trailing inputs are the per-iteration slices of the stacked operands: a reference-typed one is
+        // the stacked reference indexed on its leading axis by the iteration counter.
+        match self {
+            Self::Scan(operation) if region_index == 0 && input_index >= operation.carry_count() => {
+                Some(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Symbolic(ViewSymbol::Iteration) })
+            }
+            _ => None,
+        }
+    }
+
     fn validate_view(
         view: &ArrayReferenceViewTransform,
         source: &ArrayIrType,
@@ -597,8 +609,9 @@ impl<A: Value<Type = ArrayType>> ReferenceViewOperation for ArrayIrOperation<A> 
         context: &C,
         view: &ArrayReferenceViewTransform,
         source: C::Value,
+        symbols: &[C::Value],
     ) -> Result<C::Value, ProgramError> {
-        reapply_array_reference_view(context, view, source)
+        reapply_array_reference_view(context, view, source, symbols)
     }
 }
 
@@ -1064,8 +1077,9 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{
-        AtomId, Effect, Effects, EmptyRegionDriver, OperationProjection, Program, ProgramBuilder, ProgramError,
-        ReferenceType, RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+        AtomId, EffectClass, EffectClasses, EmptyRegionDriver, OperationProjection, Program, ProgramBuilder,
+        ProgramError, ReferenceType, RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value,
+        ValueProjection,
     };
     use crate::tracing::{Tracer, TracingContext};
 
@@ -1244,7 +1258,7 @@ mod tests {
         let requirement = ArrayIrOperation::<Array>::from(DimensionOperation::Requirement(
             DimensionRequirementOperation::equal(&left_type, &right_type),
         ));
-        assert_eq!(requirement.effects(), Effects::single(Effect::OrderedAssertion));
+        assert_eq!(requirement.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
 
         // Each dimension operation also lifts directly, so generic composite code never has to name the member family.
         let product = ArrayIrOperation::<Array>::from(DimensionMulOperation::new(&left_type, &right_type).unwrap());
@@ -1266,7 +1280,7 @@ mod tests {
         let interface = RegionInterface::new(
             vec![array_type.clone().into()],
             vec![array_type.clone().into()],
-            Effects::single(Effect::OrderedIo),
+            EffectClasses::single(EffectClass::OrderedIo),
         );
         let condition = ArrayIrOperation::<Array>::Condition(ConditionOperation::new());
         assert!(matches!(condition, ArrayIrOperation::Condition(_)));
@@ -1281,8 +1295,8 @@ mod tests {
             condition.infer_region_input_types(
                 &[ArrayType::scalar(DataType::Boolean).into(), array_type.clone().into()],
                 &[
-                    RegionInterface::new(vec![array_type.clone().into()], vec![], Effects::PURE),
-                    RegionInterface::new(vec![array_type.clone().into()], vec![], Effects::PURE),
+                    RegionInterface::new(vec![array_type.clone().into()], vec![], EffectClasses::NONE),
+                    RegionInterface::new(vec![array_type.clone().into()], vec![], EffectClasses::NONE),
                 ],
             ),
             Ok(vec![None, None]),
@@ -1342,7 +1356,7 @@ mod tests {
         assert_eq!(
             dynamic_one.infer_output_types(
                 &[DimensionType::new(source.clone()).into()],
-                &[RegionInterface::new(Vec::new(), Vec::new(), Effects::PURE)],
+                &[RegionInterface::new(Vec::new(), Vec::new(), EffectClasses::NONE)],
             ),
             Err(TypeError::invalid("`one` expects no regions but got 1")),
         );
@@ -1465,7 +1479,7 @@ mod tests {
         .unwrap();
         let operation = ArrayIrOperation::<Array>::Concatenate(concatenate.clone());
         assert_eq!(operation.effects(), concatenate.effects());
-        assert_eq!(operation.effects(), Effects::PURE);
+        assert_eq!(operation.effects().classes(), EffectClasses::NONE);
 
         // A dynamic axis sum remains an ordered assertion and reaches the outer family unchanged.
         let rows = DimensionVariable::new("rows", DimensionBounds::positive(Some(9)).unwrap());
@@ -1481,7 +1495,7 @@ mod tests {
         .unwrap();
         let operation = ArrayIrOperation::<Array>::Concatenate(concatenate.clone());
         assert_eq!(operation.effects(), concatenate.effects());
-        assert_eq!(operation.effects(), Effects::single(Effect::OrderedAssertion));
+        assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
 
         // A dimension requirement is likewise pure when provable and otherwise needs an ordered runtime assertion.
         // Both states must reach the composite family unchanged.
@@ -1493,13 +1507,13 @@ mod tests {
         let proven = DimensionRequirementOperation::equal(&left_type, &left_type);
         let operation = ArrayIrOperation::<Array>::from(DimensionOperation::Requirement(proven.clone()));
         assert_eq!(operation.effects(), proven.effects());
-        assert_eq!(operation.effects(), Effects::PURE);
+        assert_eq!(operation.effects().classes(), EffectClasses::NONE);
 
         // Unprovable: two distinct variables whose `[1, 9)` bounds admit both equal and unequal extents.
         let inconclusive = DimensionRequirementOperation::equal(&left_type, &right_type);
         let operation = ArrayIrOperation::<Array>::from(DimensionOperation::Requirement(inconclusive.clone()));
         assert_eq!(operation.effects(), inconclusive.effects());
-        assert_eq!(operation.effects(), Effects::single(Effect::OrderedAssertion));
+        assert_eq!(operation.effects().classes(), EffectClasses::single(EffectClass::OrderedAssertion));
     }
 
     #[test]
@@ -1724,6 +1738,34 @@ mod tests {
         assert_eq!(
             condition.interpret(&context, &EmptyRegionDriver, &[]),
             Err(ProgramError::MalformedProgram("condition interpretation requires a predicate input".to_string(),)),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_operation_region_input_view() {
+        // Only the scan member creates boundary views: every trailing body input is the per-iteration slice of the
+        // stacked operand at its position, indexed on the leading axis by the iteration counter, while carries are
+        // forwarded complete handles and no other member attaches a region with a view input.
+        let view = ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Symbolic(ViewSymbol::Iteration) };
+        let scan = TestOperation::Scan(ScanOperation::new(1, 3));
+        assert_eq!(scan.region_input_view(0, 0), None);
+        assert_eq!(scan.region_input_view(0, 1), Some(view.clone()));
+        assert_eq!(scan.region_input_view(0, 2), Some(view.clone()));
+        assert_eq!(scan.region_input_view(1, 1), None);
+        assert_eq!(TestOperation::While(WhileOperation::new()).region_input_view(0, 0), None);
+        assert_eq!(TestOperation::ReferenceIndex(ReferenceIndexOperation::new(0, 1)).region_input_view(0, 0), None);
+
+        // The pair the scan creates validates as one view step from the stacked reference to the per-iteration slice
+        // reference, and any other output referent is a type mismatch.
+        let stacked = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3, 2])));
+        let slice = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2])));
+        assert_eq!(TestOperation::validate_view(&view, &stacked, &slice), Ok(()));
+        assert_eq!(
+            TestOperation::validate_view(&view, &stacked, &stacked),
+            Err(ReferenceViewValidationError::TypeMismatch {
+                expected: "f32[2]".to_string(),
+                actual: "f32[3, 2]".to_string(),
+            }),
         );
     }
 

@@ -305,7 +305,7 @@ mod tests {
 
     use crate::arrays::{Array, ArrayIrOperation, ArrayIrValue, DimensionValue};
     use crate::contexts::EagerContext;
-    use crate::programs::{Effect, Effects, Operation, TypeError, TypeIdentityRenaming};
+    use crate::programs::{EffectClass, EffectClasses, Operation, TypeError, TypeIdentityRenaming};
     use crate::tracing::Trace;
 
     use super::*;
@@ -346,27 +346,51 @@ mod tests {
         let safe_minuend = test_dimension_type("safe_minuend", 5, 9);
         let maybe_zero = test_dimension_type("maybe_zero", 0, 5);
         let unbounded = DimensionType::new(DimensionVariable::new("unbounded", DimensionBounds::unbounded()));
-        let assertion = Effects::single(Effect::OrderedAssertion);
+        let assertion = EffectClasses::single(EffectClass::OrderedAssertion);
 
         // Arithmetic is pure exactly when operand bounds prove that its checked eager operation is total.
-        assert_eq!(DimensionAddOperation::new(&bounded_left, &bounded_right).unwrap().effects(), Effects::PURE);
-        assert_eq!(DimensionAddOperation::new(&unbounded, &bounded_right).unwrap().effects(), assertion);
-        assert_eq!(DimensionSubOperation::new(&safe_minuend, &safe_subtrahend).unwrap().effects(), Effects::PURE);
-        assert_eq!(DimensionSubOperation::new(&bounded_left, &bounded_right).unwrap().effects(), assertion);
         assert_eq!(
-            DimensionSaturatingSubOperation::new(&bounded_left, &bounded_right).unwrap().effects(),
-            Effects::PURE,
+            DimensionAddOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(),
+            EffectClasses::NONE
         );
-        assert_eq!(DimensionMulOperation::new(&bounded_left, &bounded_right).unwrap().effects(), Effects::PURE);
-        assert_eq!(DimensionMulOperation::new(&unbounded, &bounded_right).unwrap().effects(), assertion);
-        assert_eq!(DimensionPowOperation::new(&bounded_left, &bounded_right).unwrap().effects(), Effects::PURE);
-        assert_eq!(DimensionPowOperation::new(&unbounded, &bounded_right).unwrap().effects(), assertion);
-        assert_eq!(DimensionDivFloorOperation::new(&bounded_left, &bounded_right).unwrap().effects(), Effects::PURE);
-        assert_eq!(DimensionDivFloorOperation::new(&bounded_left, &maybe_zero).unwrap().effects(), assertion);
-        assert_eq!(DimensionRemOperation::new(&bounded_left, &bounded_right).unwrap().effects(), Effects::PURE);
-        assert_eq!(DimensionRemOperation::new(&bounded_left, &maybe_zero).unwrap().effects(), assertion);
-        assert_eq!(DimensionMinOperation::new(&bounded_left, &bounded_right).unwrap().effects(), Effects::PURE);
-        assert_eq!(DimensionMaxOperation::new(&bounded_left, &bounded_right).unwrap().effects(), Effects::PURE);
+        assert_eq!(DimensionAddOperation::new(&unbounded, &bounded_right).unwrap().effects().classes(), assertion);
+        assert_eq!(
+            DimensionSubOperation::new(&safe_minuend, &safe_subtrahend).unwrap().effects().classes(),
+            EffectClasses::NONE
+        );
+        assert_eq!(DimensionSubOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(), assertion);
+        assert_eq!(
+            DimensionSaturatingSubOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(),
+            EffectClasses::NONE,
+        );
+        assert_eq!(
+            DimensionMulOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(),
+            EffectClasses::NONE
+        );
+        assert_eq!(DimensionMulOperation::new(&unbounded, &bounded_right).unwrap().effects().classes(), assertion);
+        assert_eq!(
+            DimensionPowOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(),
+            EffectClasses::NONE
+        );
+        assert_eq!(DimensionPowOperation::new(&unbounded, &bounded_right).unwrap().effects().classes(), assertion);
+        assert_eq!(
+            DimensionDivFloorOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(),
+            EffectClasses::NONE
+        );
+        assert_eq!(DimensionDivFloorOperation::new(&bounded_left, &maybe_zero).unwrap().effects().classes(), assertion);
+        assert_eq!(
+            DimensionRemOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(),
+            EffectClasses::NONE
+        );
+        assert_eq!(DimensionRemOperation::new(&bounded_left, &maybe_zero).unwrap().effects().classes(), assertion);
+        assert_eq!(
+            DimensionMinOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(),
+            EffectClasses::NONE
+        );
+        assert_eq!(
+            DimensionMaxOperation::new(&bounded_left, &bounded_right).unwrap().effects().classes(),
+            EffectClasses::NONE
+        );
     }
 
     #[test]
