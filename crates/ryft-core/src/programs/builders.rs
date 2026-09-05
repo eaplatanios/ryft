@@ -14,11 +14,18 @@ use crate::programs::instructions::Instruction;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::provenance::Provenance;
+use crate::programs::references::{ReferenceIdentity, ReferenceRoot};
 use crate::programs::regions::{
-    Region, RegionArena, RegionId, RegionInterface, RegionRef, RegionRole, reachable_region_mask,
+    InputRegionProvenance, Region, RegionArena, RegionId, RegionInterface, RegionRef, RegionRole, reachable_region_mask,
 };
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
+
+/// Process-local identity of a live [`ProgramBuilder`] shared by clones of its owning context. Symbolic reference
+/// identities use it to distinguish builders whose atom or capture indices happen to coincide. Current contexts use
+/// their shared builder allocation's address. Retain that allocation while comparing identities because addresses
+/// may be reused after it is dropped.
+pub type ProgramBuilderId = usize;
 
 /// Builder for [`Program`]s. It owns the entry [`Region`] under construction (i.e., its [`Atom`]s, input [`AtomId`]s,
 /// and [`Instruction`]s), the previously added non-entry [`Region`]s together with their callee-interning state, and
@@ -112,6 +119,156 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
     pub fn region_ref(&self, id: RegionId) -> Result<RegionRef<'_, V, O>, ProgramError> {
         RegionRef::new(&self.regions, id)
             .map_err(|_| ProgramError::MalformedProgram(format!("region {id} is not part of this builder")))
+    }
+
+    /// Returns the allocation identity denoted by `atom`, following aliases and nested-region forwarding without
+    /// reading reference contents. Returns `None` when no identity can be established. A non-reference constant that
+    /// reports a runtime identity retains that identity so boundary validation can reject its inconsistent type.
+    ///
+    /// # Parameters
+    ///
+    ///   - `atom_id`: [`AtomId`] of an atom in this builder's namespace.
+    ///   - `builder_id`: Stable identity of this live builder, shared by its owning context's clones and distinct from
+    ///     other live builders. Retain the owning builder while comparing symbolic identities. Refer to
+    ///     [`ProgramBuilderId`] for the lifetime requirements of address-based identities.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unbound atom or invalid reference forwarding, including nested-region outputs that
+    /// cannot be traced to one external allocation.
+    pub fn reference_identity(
+        &self,
+        atom_id: AtomId,
+        builder_id: ProgramBuilderId,
+    ) -> Result<Option<ReferenceIdentity>, ProgramError> {
+        let value = self.atoms.get(atom_id.index()).ok_or(ProgramError::UnboundAtomId { id: atom_id })?;
+        if !value.r#type().is_reference() {
+            return Ok(value.as_constant().and_then(Value::reference_id).map(ReferenceIdentity::Runtime));
+        }
+        let (root, constant) = self.resolve_reference(atom_id)?;
+        Ok(match constant {
+            Some(value) => value
+                .capture_index()
+                .map(|index| ReferenceIdentity::Capture { builder: builder_id, index })
+                .or_else(|| value.reference_id().map(ReferenceIdentity::Runtime)),
+            None => Some(ReferenceIdentity::Staged { builder: builder_id, root }),
+        })
+    }
+
+    /// Resolves aliases and nested-region forwarding to a representative atom in this builder and, when present, the
+    /// external constant it denotes. If a nested region returns a captured constant with no corresponding caller atom,
+    /// the representative remains the region operation's result atom. Representative atoms therefore need not be
+    /// identical for aliases of the same constant. Use [`Self::reference_identity`] instead to compare allocations.
+    pub(crate) fn resolve_reference(&self, atom: AtomId) -> Result<(AtomId, Option<&V>), ProgramError> {
+        let value = self.atoms.get(atom.index()).ok_or(ProgramError::UnboundAtomId { id: atom })?;
+
+        // Follow the alias topology maintained by checked instruction appends before inspecting the producer.
+        let root = self.references.root(atom);
+        if root != atom {
+            return self.resolve_reference(root);
+        }
+
+        // Constants identify external storage directly or through an inherited capture table entry.
+        if let Some(constant) = value.as_constant() {
+            return Ok((atom, Some(constant)));
+        }
+
+        // Locate the defining instruction. An atom without a producer is already its own representative.
+        let Some((instruction, output_index)) = self.instructions.iter().find_map(|instruction| {
+            instruction.outputs().iter().position(|output| *output == atom).map(|index| (instruction, index))
+        }) else {
+            return Ok((atom, None));
+        };
+        let operation = instruction.operation();
+        let provenance = operation.output_region_provenance(output_index);
+
+        // Without region forwarding, use the operation's alias declaration. This also covers unchecked appends,
+        // which do not populate the builder's incremental alias topology. Otherwise, the result starts a new root.
+        if provenance.is_empty() {
+            if let Some(alias) =
+                operation.effects().reference_aliases().iter().find(|alias| alias.output_index() == output_index)
+            {
+                let input = instruction.inputs().get(alias.input_index()).ok_or_else(|| {
+                    ProgramError::MalformedProgram(format!(
+                        "operation `{}` has an out-of-range reference alias input",
+                        operation.name(),
+                    ))
+                })?;
+                return self.resolve_reference(*input);
+            }
+            return Ok((atom, None));
+        }
+
+        // Every possible region output must resolve to the same allocation in the caller's namespace.
+        let mut forwarded: Option<(AtomId, Option<&V>)> = None;
+        for output in provenance {
+            let region_id = instruction.regions().get(output.region_index).copied().ok_or_else(|| {
+                ProgramError::MalformedProgram(format!("operation `{}` forwards an unknown region", operation.name()))
+            })?;
+            let region = self.region_ref(region_id)?;
+
+            // Interpret captures using this attachment's explicit capture prefix, rather than assuming that every
+            // capture index refers to the caller's inherited table.
+            let analysis = region
+                .reference_analysis_with_capture_scope(operation.region_capture_input_count(output.region_index))?;
+            let resolved = match analysis.output_roots().get(output.output_index).copied().flatten() {
+                Some(ReferenceRoot::RegionInput { region: owner, input_index }) if owner == region.id() => {
+                    // Map the region input back to its caller operand. Views preserve allocation identity even
+                    // though they select different coordinates within that allocation.
+                    let input =
+                        operation.input_region_provenance(output.region_index, input_index).ok_or_else(|| {
+                            ProgramError::MalformedProgram(format!(
+                                "operation `{}` does not describe a forwarded reference input",
+                                operation.name(),
+                            ))
+                        })?;
+                    let (InputRegionProvenance::Forwarded { input_index }
+                    | InputRegionProvenance::View { input_index }) = input;
+                    let input = instruction.inputs().get(input_index).copied().ok_or_else(|| {
+                        ProgramError::MalformedProgram(format!(
+                            "operation `{}` forwards an unknown input",
+                            operation.name(),
+                        ))
+                    })?;
+                    self.resolve_reference(input)?
+                }
+                Some(ReferenceRoot::Constant { value }) => {
+                    // A nested constant may have no caller atom. Keep the result atom as its representative and
+                    // retain the constant so identity comparison can still recognize aliases of external storage.
+                    let owner = region.with_id(value.region())?;
+                    (atom, owner.atoms()[value.atom().index()].as_constant())
+                }
+                _ => {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "operation `{}` returns a reference whose allocation is not external to its region",
+                        operation.name(),
+                    )));
+                }
+            };
+
+            // Compare external constants by capture or runtime identity and compare purely symbolic roots by atom.
+            // Different result atoms can still denote the same external allocation.
+            if let Some((previous_atom, previous_constant)) = forwarded {
+                let same_constant = match (previous_constant, resolved.1) {
+                    (Some(previous), Some(current)) => {
+                        previous.capture_index().is_some_and(|index| current.capture_index() == Some(index))
+                            || previous.reference_id().is_some_and(|identity| current.reference_id() == Some(identity))
+                    }
+                    _ => false,
+                };
+                let same_atom = previous_constant.is_none() && resolved.1.is_none() && previous_atom == resolved.0;
+                if !same_constant && !same_atom {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "operation `{}` returns references from different allocations",
+                        operation.name(),
+                    )));
+                }
+            }
+            forwarded = Some(resolved);
+        }
+
+        // The empty-provenance case returned above, so a successful traversal always resolved at least one output.
+        Ok(forwarded.unwrap())
     }
 
     /// Adds an input [`Atom`] to the [`Program`] that is being built with the provided [`Type`].
@@ -742,12 +899,86 @@ mod tests {
     use crate::programs::instructions::InstructionId;
     use crate::programs::provenance::ProvenanceScope;
     use crate::programs::references::ReferenceType;
-    use crate::programs::regions::{InputRegionProvenance, RegionSlot};
+    use crate::programs::regions::{InputRegionProvenance, OutputRegionProvenance, RegionSlot};
     use crate::programs::types::TypeError;
     use crate::programs::values::ValueId;
     use crate::tests::TestRegionOperation;
 
     use super::*;
+
+    /// Call and read operations for the builder's reference provenance queries.
+    #[derive(Clone, Debug)]
+    enum ReferenceIdentityOperation {
+        /// Reads the first reference operand.
+        Read,
+
+        /// Calls one region, optionally rebinding its capture scope to a leading input prefix.
+        Call(Option<usize>),
+    }
+
+    impl Operation for ReferenceIdentityOperation {
+        type Type = ArrayIrType;
+
+        fn name(&self) -> &'static str {
+            match self {
+                Self::Read => "reference_read",
+                Self::Call(_) => "reference_call",
+            }
+        }
+
+        fn region_slots(&self) -> &'static [RegionSlot] {
+            match self {
+                Self::Call(_) => const { &[RegionSlot::computation("body")] },
+                Self::Read => &[],
+            }
+        }
+
+        fn infer_output_types(
+            &self,
+            inputs: &[ArrayIrType],
+            regions: &[RegionInterface<ArrayIrType>],
+        ) -> Result<Vec<ArrayIrType>, TypeError> {
+            match self {
+                Self::Call(_) => Ok(regions[0].output_types().to_vec()),
+                Self::Read => match &inputs[0] {
+                    ArrayIrType::Reference(reference) => Ok(vec![reference.referent().clone().into()]),
+                    _ => Err(TypeError::invalid("expected a reference")),
+                },
+            }
+        }
+
+        fn effects(&self) -> Cow<'_, Effects> {
+            match self {
+                Self::Read => Cow::Owned(
+                    Effects::new(
+                        EffectClasses::NONE,
+                        vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                ),
+                Self::Call(_) => Cow::Borrowed(Effects::empty()),
+            }
+        }
+
+        fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
+            Some(InputRegionProvenance::Forwarded { input_index })
+        }
+
+        fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
+            match self {
+                Self::Call(_) => vec![OutputRegionProvenance { region_index: 0, output_index }],
+                Self::Read => Vec::new(),
+            }
+        }
+
+        fn region_capture_input_count(&self, _region_index: usize) -> Option<usize> {
+            match self {
+                Self::Call(scope) => *scope,
+                Self::Read => None,
+            }
+        }
+    }
 
     #[test]
     fn test_program_builder() {
@@ -1163,6 +1394,86 @@ mod tests {
     }
 
     #[test]
+    fn test_program_builder_reference_identity() {
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let mut child = ProgramBuilder::<CaptureReference<ArrayIrType>, ReferenceIdentityOperation>::new();
+        let captured = child.add_constant(CaptureReference::new(4, reference_type.clone()));
+        let child = child
+            .build::<Vec<CaptureReference<ArrayIrType>>, Vec<CaptureReference<ArrayIrType>>>(
+                vec![captured],
+                Vec::new(),
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<CaptureReference<ArrayIrType>, ReferenceIdentityOperation>::new();
+        let child = builder.import_region(child.entry_region_ref());
+        let output = builder
+            .add_instruction(ReferenceIdentityOperation::Call(None), vec![child], Vec::new(), None)
+            .unwrap()[0];
+        assert_eq!(
+            builder.reference_identity(output, 3),
+            Ok(Some(ReferenceIdentity::Capture { builder: 3, index: 4 }))
+        );
+        let direct = builder.add_constant(CaptureReference::new(4, reference_type));
+        assert_eq!(builder.reference_identity(output, 3), builder.reference_identity(direct, 3));
+        assert_ne!(builder.reference_identity(output, 3), builder.reference_identity(direct, 4));
+    }
+
+    #[test]
+    fn test_program_builder_reference_identity_rebinds_explicit_capture_prefixes() {
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let mut child = ProgramBuilder::<CaptureReference<ArrayIrType>, ReferenceIdentityOperation>::new();
+        child.add_input(reference_type.clone());
+        let captured = child.add_constant(CaptureReference::new(0, reference_type.clone()));
+        let child = child
+            .build::<Vec<CaptureReference<ArrayIrType>>, Vec<CaptureReference<ArrayIrType>>>(
+                vec![captured],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<CaptureReference<ArrayIrType>, ReferenceIdentityOperation>::new();
+        let input = builder.add_input(reference_type.clone());
+        let inherited = builder.add_constant(CaptureReference::new(0, reference_type));
+        let child = builder.import_region(child.entry_region_ref());
+        let output = builder
+            .add_instruction(ReferenceIdentityOperation::Call(Some(1)), vec![child], vec![input], None)
+            .unwrap()[0];
+        assert_eq!(
+            builder.reference_identity(output, 3),
+            Ok(Some(ReferenceIdentity::Staged { builder: 3, root: input }))
+        );
+        assert_ne!(builder.reference_identity(output, 3), builder.reference_identity(inherited, 3));
+    }
+
+    #[test]
+    fn test_program_builder_resolve_reference_with_inherited_captures() {
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let mut child = ProgramBuilder::<CaptureReference<ArrayIrType>, ReferenceIdentityOperation>::new();
+        let input = child.add_input(reference_type.clone());
+        let captured = child.add_constant(CaptureReference::new(4, reference_type.clone()));
+        child.add_instruction(ReferenceIdentityOperation::Read, Vec::new(), vec![captured], None).unwrap();
+        let child = child
+            .build::<Vec<CaptureReference<ArrayIrType>>, Vec<CaptureReference<ArrayIrType>>>(
+                vec![input],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<CaptureReference<ArrayIrType>, ReferenceIdentityOperation>::new();
+        let input = builder.add_input(reference_type);
+        let child = builder.import_region(child.entry_region_ref());
+        let forwarded = builder
+            .add_instruction(ReferenceIdentityOperation::Call(None), vec![child], vec![input], None)
+            .unwrap()[0];
+        assert_eq!(builder.resolve_reference(forwarded), Ok((input, None)));
+        assert_eq!(
+            builder.reference_identity(forwarded, 3),
+            Ok(Some(ReferenceIdentity::Staged { builder: 3, root: input }))
+        );
+    }
+
+    #[test]
     fn test_program_builder_import_regions_preserves_sharing() {
         let mut leaf_builder = ProgramBuilder::<Array, TestRegionOperation>::new();
         let leaf_input = leaf_builder.add_input(ArrayType::scalar(DataType::F64));
@@ -1515,6 +1826,7 @@ mod tests {
                 vec![ReferenceEffect::Access { input_index, mode: ReferenceAccessMode::Read }],
                 Vec::new(),
             )
+            .unwrap()
         };
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, InvalidReferenceOperation>::new();
         let array = builder.add_input(ArrayIrType::from(ArrayType::scalar(DataType::F32)));
@@ -1541,7 +1853,7 @@ mod tests {
             )),
         );
         let allocation =
-            Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }], Vec::new());
+            Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }], Vec::new()).unwrap();
         assert_eq!(
             builder.add_instruction(InvalidReferenceOperation(allocation), Vec::new(), vec![array], None),
             Err(ProgramError::MalformedProgram(
@@ -1553,7 +1865,8 @@ mod tests {
             EffectClasses::NONE,
             Vec::new(),
             vec![ReferenceAlias::new(0, 1, ReferenceAliasKind::Identity)],
-        );
+        )
+        .unwrap();
         assert_eq!(
             builder.add_instruction(InvalidReferenceOperation(alias), Vec::new(), vec![reference, array], None),
             Err(ProgramError::MalformedProgram(
@@ -1672,11 +1985,14 @@ mod tests {
 
             fn effects(&self) -> Cow<'_, Effects> {
                 match self {
-                    Self::Allocate => Cow::Owned(Effects::new(
-                        EffectClasses::NONE,
-                        vec![ReferenceEffect::Allocate { output_index: 0 }],
-                        Vec::new(),
-                    )),
+                    Self::Allocate => Cow::Owned(
+                        Effects::new(
+                            EffectClasses::NONE,
+                            vec![ReferenceEffect::Allocate { output_index: 0 }],
+                            Vec::new(),
+                        )
+                        .unwrap(),
+                    ),
                     Self::Region { .. } | Self::ViewRegion => Cow::Borrowed(Effects::empty()),
                 }
             }
@@ -1816,17 +2132,19 @@ mod tests {
                 EffectClasses::NONE,
                 vec![ReferenceEffect::Access { input_index: 0, mode }],
                 Vec::new(),
-            ),
+            )
+            .unwrap(),
             forwarded: None,
         };
         let alias = |name, kind| TestReferenceOperation {
             name,
-            effects: Effects::new(EffectClasses::NONE, Vec::new(), vec![ReferenceAlias::new(0, 0, kind)]),
+            effects: Effects::new(EffectClasses::NONE, Vec::new(), vec![ReferenceAlias::new(0, 0, kind)]).unwrap(),
             forwarded: None,
         };
         let allocation = TestReferenceOperation {
             name: "reference_new",
-            effects: Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }], Vec::new()),
+            effects: Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }], Vec::new())
+                .unwrap(),
             forwarded: None,
         };
         let read = access("reference_read", ReferenceAccessMode::Read);

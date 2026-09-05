@@ -137,9 +137,9 @@ pub mod types;
 pub mod values;
 
 pub use atoms::{Atom, AtomId, MaybeZero};
-pub use builders::ProgramBuilder;
+pub use builders::{ProgramBuilder, ProgramBuilderId};
 pub use effects::{
-    Effect, EffectOccurrence, Effects, EffectsSummary, OperationEffects, ReferenceAccessMode, ReferenceAlias,
+    EffectClass, EffectClassOccurrence, EffectClasses, Effects, EffectsSummary, ReferenceAccessMode, ReferenceAlias,
     ReferenceAliasKind, ReferenceEffect,
 };
 pub use identities::{NoIdentity, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature};
@@ -155,22 +155,23 @@ pub use references::{
     REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME,
     REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME,
     ReadyOrPendingReferenceGuard, ReadyReferenceGuard, RecursiveReferenceDischargeDriver, Reference, ReferenceAccess,
-    ReferenceAccumulationPolicy, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAliasEdge,
-    ReferenceAliasOrigin, ReferenceAnalysis, ReferenceAnalysisError, ReferenceBoundaryError, ReferenceBoundaryPosition,
-    ReferenceCompletion, ReferenceCompletionBackend, ReferenceDischargeAllocationId,
-    ReferenceDischargeBoundaryWidening, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeReference, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionInput,
-    ReferenceDischargeRegionResult, ReferenceDischargeRegionStateInsertion, ReferenceDischargeRegionSummary,
-    ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceDischargeableType, ReferenceError, ReferenceFreeze, ReferenceFreezeOperation, ReferenceGeneration,
-    ReferenceId, ReferenceNew, ReferenceNewOperation, ReferenceObservation, ReferenceRead, ReferenceReadOperation,
+    ReferenceAccumulationPolicy, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAddUpdateOperationProvider,
+    ReferenceAliasEdge, ReferenceAliasOrigin, ReferenceAnalysis, ReferenceAnalysisError, ReferenceBoundary,
+    ReferenceBoundaryError, ReferenceBoundaryPosition, ReferenceCompletion, ReferenceCompletionBackend,
+    ReferenceDischargeAllocationId, ReferenceDischargeBoundaryWidening, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeReference, ReferenceDischargeRegionBoundary,
+    ReferenceDischargeRegionInput, ReferenceDischargeRegionResult, ReferenceDischargeRegionStateInsertion,
+    ReferenceDischargeRegionSummary, ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceError, ReferenceFreeze,
+    ReferenceFreezeOperation, ReferenceGeneration, ReferenceId, ReferenceIdentity, ReferenceNew, ReferenceNewOperation,
+    ReferenceNewOperationProvider, ReferenceObservation, ReferenceRead, ReferenceReadOperation,
     ReferenceRegionInputBinding, ReferenceReplacementPreparation, ReferenceReplacementTransaction, ReferenceRoot,
     ReferenceSource, ReferenceSwap, ReferenceSwapOperation, ReferenceTransitiveAccess, ReferenceType,
     ReferenceTypeRefinements, ReferenceView, ReferenceViewAnalysis, ReferenceViewAnalysisError, ReferenceViewOperation,
     ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation,
     TakenReferenceGuard, ValidatedPendingReplacementTransaction, ViewOverlap, ViewSymbol, ViewSymbolBinding,
     batch_reference_view_operation, discharge_positional_region_operation, discharge_reference_free_operation,
-    validate_differentiation_boundary, validate_reference_boundary,
+    validate_reference_boundary,
 };
 pub use regions::{
     BindingRegionDriver, CalleeRegionDriver, DestinationRegionMapping, EagerInterpretationValidation,

@@ -1,15 +1,18 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
 use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use thiserror::Error;
 
 use ryft_macros::Parameter;
 
+use crate::contexts::Context;
 use crate::parameters::Parameter;
 use crate::programs::ProgramError;
+use crate::programs::atoms::AtomId;
+use crate::programs::builders::ProgramBuilderId;
 use crate::programs::identities::TypeIdentityRenaming;
 use crate::programs::references::ReferenceError;
 use crate::programs::references::types::ReferenceType;
@@ -18,17 +21,54 @@ use crate::programs::values::Value;
 
 /// Process-local identity shared by all aliased [`Reference`] handles backed by the same allocation. It supports alias
 /// identity checks and diagnostics within one process, carries no structural type information, and is never serialized
-/// into a program or compilation key. The identity may be reused after all handles, observations, and replacement
-/// transactions tied to that allocation are dropped.
+/// into a program or compilation key. Identities are never reused, including after the allocation is dropped, so a
+/// retained boundary can compare later arguments without keeping the original allocation alive.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ReferenceId(usize);
 
 impl ReferenceId {
-    /// Creates a [`ReferenceId`] from a live [`ReferenceHolder`] memory address.
-    #[inline]
-    fn from_address(address: usize) -> Self {
-        Self(address)
+    /// Allocates a process-local [`ReferenceId`] that cannot be reused after the corresponding reference is dropped.
+    fn new() -> Self {
+        static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+        Self(
+            NEXT_ID
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .expect("reference allocation identities exhausted"),
+        )
     }
+}
+
+/// Reference allocation identity established by a context without observing the reference's contents.
+/// Runtime identities name live storage and symbolic identities name canonical roots or captures in a live
+/// [`ProgramBuilder`](crate::ProgramBuilder). A context returning a symbolic identity must keep that builder alive and
+/// resolve every view or forwarded handle to the same identity. Unlike [`ReferenceId`], which identifies an existing
+/// runtime allocation, this type also identifies references in [`Program`](crate::Program)s that have not executed and
+/// therefore have no runtime allocation yet.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum ReferenceIdentity {
+    /// Identity of a concrete mutable allocation.
+    Runtime(ReferenceId),
+
+    /// Identifies a reference in the inherited capture table of an active [`ProgramBuilder`](crate::ProgramBuilder).
+    /// This namespace also identifies a reference returned from a nested region when no atom in the caller directly
+    /// names the captured allocation.
+    Capture {
+        /// Process-local identity of the [`ProgramBuilder`](crate::ProgramBuilder) whose context owns the inherited
+        /// capture table.
+        builder: ProgramBuilderId,
+
+        /// Position of the reference in that [`ProgramBuilder`](crate::ProgramBuilder)'s capture table.
+        index: usize,
+    },
+
+    /// Canonical reference root in an active [`ProgramBuilder`](crate::ProgramBuilder).
+    Staged {
+        /// Process-local identity of the [`ProgramBuilder`](crate::ProgramBuilder), shared by its context clones.
+        builder: ProgramBuilderId,
+
+        /// [`AtomId`] of the root [`Atom`](crate::Atom) in that [`ProgramBuilder`](crate::ProgramBuilder)'s namespace.
+        root: AtomId,
+    },
 }
 
 /// Monotonically increasing version of one [`Reference`]'s mutable state. A newly allocated reference starts at
@@ -125,6 +165,7 @@ impl<V: Value> Reference<V> {
         Ok(Self {
             handle: Arc::new(ReferenceHandle {
                 holder: Arc::new(ReferenceHolder {
+                    id: ReferenceId::new(),
                     referent_type: referent_type.clone(),
                     state: Mutex::new(ReferenceState::Ready {
                         value,
@@ -142,13 +183,13 @@ impl<V: Value> Reference<V> {
     /// Returns the process-local [`ReferenceId`] of this [`Reference`], which remains stable while any alias is alive.
     #[inline]
     pub fn id(&self) -> ReferenceId {
-        ReferenceId::from_address(Arc::as_ptr(&self.handle.holder) as usize)
+        self.handle.holder.id
     }
 
     /// Returns `true` if this handle uses the reference allocation's original type identities, and `false` otherwise.
     /// When this function returns `true`, values cross between the handle-local representation and shared reference
-    /// state without type-identity renaming. A handle produced by [`Self::rename_type_identities`] still refers to the
-    /// same reference allocation but returns `false` when that operation changes any identity.
+    /// state without type-identity renaming. A handle with renamed type identities still refers to the same reference
+    /// allocation but returns `false` when that operation changes any identity.
     #[inline]
     pub fn uses_storage_type_identities(&self) -> bool {
         self.handle.storage_to_handle.is_identity() && self.handle.handle_to_storage.is_identity()
@@ -587,7 +628,7 @@ impl<V: Value> Display for Reference<V> {
         // `ReferenceType::fmt` supplies the `ref<...>` wrapper. `Display` deliberately renders only that handle-local
         // type because the `Value` rendering contract requires deterministic outputs (that is because this rendering
         // backs diagnostics, rendered-program tests, and the debug-assertions transform-cache determinism checks), so
-        // the process-local holder address must not leak here. Runtime identity remains visible through `Debug`.
+        // the process-local allocation identity must not leak here. Runtime identity remains visible through `Debug`.
         Display::fmt(&self.handle.r#type, formatter)
     }
 }
@@ -621,7 +662,7 @@ impl<V: Value> Typed for Reference<V> {
 /// receives a new [`ReferenceHandle`] with its own [`ReferenceType`] and conversion mappings while continuing to
 /// share the same [`ReferenceHolder`] and runtime state.
 struct ReferenceHandle<V: Value> {
-    /// Shared allocation whose pointer identity defines reference equality, hashing, and [`ReferenceId`].
+    /// Shared allocation whose [`ReferenceId`] defines reference equality and hashing.
     holder: Arc<ReferenceHolder<V>>,
 
     /// [`ReferenceType`] exposed through this handle.
@@ -638,6 +679,9 @@ struct ReferenceHandle<V: Value> {
 
 /// Allocation shared by every handle in one [`Reference`] alias family.
 struct ReferenceHolder<V: Value> {
+    /// Stable process-local identity retained independently of the allocation's lifetime.
+    id: ReferenceId,
+
     /// Canonical referent [`Type`] of stored values. Identity-renamed aliases may expose a different handle-local
     /// type and convert at this allocation boundary. The canonical type is immutable and available without locking
     /// so replacement validation does not need to acquire the lifecycle mutex.
@@ -1115,7 +1159,7 @@ impl<V: Value> ReferenceObservation<V> {
 
 /// Cloneable backend-neutral token for work that reads or replaces a [`Reference`] value. A token has one immutable
 /// terminal result: success or a backend-owned failure reason. It can be polled with [`Self::is_ready`], waited on with
-/// [`Self::r#await`], and combined in dependency order with [`Self::joined`].
+/// [`Self::r#await`](Self::await), and combined in dependency order with [`Self::joined`].
 #[derive(Clone)]
 pub struct ReferenceCompletion {
     /// Private representation kept behind this public wrapper so callers cannot construct or match its variants and
@@ -1383,26 +1427,165 @@ impl<'g, V: Value> ValidatedPendingReplacementTransaction<'g, V> {
     }
 }
 
-/// Error produced by [`validate_reference_boundary`] when the live values bound at a public transform boundary alias
-/// one another or misreport their runtime reference identity.
+/// Validated reference identities at a boundary, paired with caller-defined diagnostic positions. Retaining this
+/// evidence allows later values to be checked against the original allocations in the same context.
+#[derive(Clone, Debug)]
+pub struct ReferenceBoundary<P = ReferenceBoundaryPosition> {
+    /// Canonical identities and their original positions, in validation order.
+    identities: Vec<(ReferenceIdentity, P)>,
+}
+
+impl<P: Clone> ReferenceBoundary<P> {
+    /// Checks that each reference in `values` refers to a different allocation and stores its identity and position
+    /// in a new [`ReferenceBoundary`]. Positions are caller-provided labels used to identify values in errors.
+    /// Non-reference values are checked but are not stored. Reference contents are neither read nor retained.
+    ///
+    /// Allocation identities come from [`Context::reference_identity`], so this function supports both runtime
+    /// references and references in a program being built. A reference whose allocation cannot be identified is
+    /// rejected as, without that identity, this function cannot determine whether it aliases another reference.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Context used to identify allocations. Keep its [`ProgramBuilder`](crate::ProgramBuilder) alive
+    ///     while using stored symbolic identities, since those identities are meaningful only within that builder's
+    ///     lifetime.
+    ///   - `values`: Position/value pairs, checked in iterator order.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error in iterator order: [`ReferenceBoundaryError::MissingIdentity`] if a reference has no
+    /// allocation identity, [`ReferenceBoundaryError::UnexpectedIdentity`] if a non-reference reports one, or
+    /// [`ReferenceBoundaryError::Aliased`] if two references identify the same allocation. Errors returned by the
+    /// context are wrapped in [`ReferenceBoundaryError::Resolution`].
+    pub fn new<'v, C: Context, V: IntoIterator<Item = (P, &'v C::Value)>>(
+        context: &C,
+        values: V,
+    ) -> Result<Self, ReferenceBoundaryError<P>>
+    where
+        C::Value: 'v,
+    {
+        let mut boundary = Self::default();
+        for (position, value) in values {
+            boundary.insert(position, value, context.reference_identity(value)?)?;
+        }
+        Ok(boundary)
+    }
+
+    /// Checks that each reference in `values` refers to a different allocation from every other reference in this
+    /// call and from every reference stored in this [`ReferenceBoundary`]. This function does not add the supplied
+    /// references to the boundary or read their contents, so the same boundary can validate multiple calls
+    /// independently.
+    ///
+    /// For example, if the boundary stores allocation `A`, a call containing distinct allocations `B` and `C` succeeds.
+    /// A call containing `A` is rejected, as is a call containing two handles to `B`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Context used to construct the boundary, or a clone sharing the same builder and captures.
+    ///   - `values`: Position/value pairs for this call, checked in iterator order.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error in iterator order. Each value must first satisfy the identity checks described
+    /// by [`new`](Self::new). A reference matching an earlier reference in this call produces
+    /// [`ReferenceBoundaryError::Aliased`]. A reference matching a stored allocation produces
+    /// [`ReferenceBoundaryError::AliasedRetained`]. The check against earlier values precedes the check against
+    /// stored allocations. Errors returned by the context are wrapped in [`ReferenceBoundaryError::Resolution`].
+    pub fn validate<'v, C: Context, V: IntoIterator<Item = (P, &'v C::Value)>>(
+        &self,
+        context: &C,
+        values: V,
+    ) -> Result<(), ReferenceBoundaryError<P>>
+    where
+        C::Value: 'v,
+    {
+        let mut later = Self::default();
+        for (position, value) in values {
+            let identity = context.reference_identity(value)?;
+            later.insert(position.clone(), value, identity)?;
+            if let Some(identity) = identity
+                && let Some((_, other)) = self.identities.iter().find(|(retained, _)| *retained == identity)
+            {
+                return Err(ReferenceBoundaryError::AliasedRetained { position, other: other.clone() });
+            }
+        }
+        Ok(())
+    }
+
+    /// Checks that `identity` agrees with whether `value` has a reference type, then records a reference's identity
+    /// and `position`. A reference must have an identity, and a non-reference must not have one. Non-reference values
+    /// with no identity are accepted without changing the boundary.
+    ///
+    /// Rejects an identity already stored in this boundary, reporting both its original position and `position`.
+    /// On any error, the boundary is unchanged. The caller supplies the identity; this function does not resolve it
+    /// through a context or read the reference's contents.
+    fn insert<V: Value>(
+        &mut self,
+        position: P,
+        value: &V,
+        identity: Option<ReferenceIdentity>,
+    ) -> Result<(), ReferenceBoundaryError<P>> {
+        let is_reference = value.r#type().is_reference();
+        match identity {
+            None if is_reference => {
+                Err(ReferenceBoundaryError::MissingIdentity { position, type_name: value.r#type().to_string() })
+            }
+            Some(_) if !is_reference => {
+                Err(ReferenceBoundaryError::UnexpectedIdentity { position, type_name: value.r#type().to_string() })
+            }
+            Some(identity) => {
+                if let Some((_, other)) = self.identities.iter().find(|(previous, _)| *previous == identity) {
+                    return Err(ReferenceBoundaryError::Aliased { position, other: other.clone() });
+                }
+                self.identities.push((identity, position));
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+}
+
+impl<P> Default for ReferenceBoundary<P> {
+    #[inline]
+    fn default() -> Self {
+        Self { identities: Vec::new() }
+    }
+}
+
+/// Error produced by [`ReferenceBoundary`] functions and other reference boundary validators when values bound
+/// at a public transform boundary alias one another or fail to establish a valid reference allocation identity.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
-pub enum ReferenceBoundaryError {
-    /// A reference-typed value reports no [`ReferenceId`]. The validator fails closed here so that a value family
-    /// cannot bypass alias validation by leaving [`Value::reference_id`] at its default.
-    #[error("{position} has reference type `{type_name}` but reports no runtime reference identity")]
+pub enum ReferenceBoundaryError<P = ReferenceBoundaryPosition> {
+    /// The context could not establish an allocation identity because resolution failed.
+    #[error(transparent)]
+    Resolution(#[from] ProgramError),
+
+    /// A later value aliases an allocation retained from the original boundary.
+    #[error("{position} aliases the reference allocation retained at {other}")]
+    AliasedRetained {
+        /// Position of the later value.
+        position: P,
+
+        /// Position of the retained allocation.
+        other: P,
+    },
+
+    /// A reference-typed value has no identity through [`Context::reference_identity`] or, for a concrete-value
+    /// validator, [`Value::reference_id`]. Missing proof cannot bypass alias validation.
+    #[error("{position} has reference type `{type_name}` but reports no reference allocation identity")]
     MissingIdentity {
         /// Boundary position of the offending value.
-        position: ReferenceBoundaryPosition,
+        position: P,
 
         /// Rendered type of the offending value.
         type_name: String,
     },
 
-    /// A value whose type is not a reference reports a [`ReferenceId`].
-    #[error("{position} has non-reference type `{type_name}` but reports a runtime reference identity")]
+    /// A value whose type is not a reference reports a reference allocation identity.
+    #[error("{position} has non-reference type `{type_name}` but reports a reference allocation identity")]
     UnexpectedIdentity {
         /// Boundary position of the offending value.
-        position: ReferenceBoundaryPosition,
+        position: P,
 
         /// Rendered type of the offending value.
         type_name: String,
@@ -1412,17 +1595,20 @@ pub enum ReferenceBoundaryError {
     #[error("{position} and {other} bind the same reference allocation")]
     Aliased {
         /// Later of the two aliasing positions in boundary order.
-        position: ReferenceBoundaryPosition,
+        position: P,
 
         /// Earlier of the two aliasing positions in boundary order.
-        other: ReferenceBoundaryPosition,
+        other: P,
     },
 }
 
-impl From<ReferenceBoundaryError> for ProgramError {
+impl<P: Display> From<ReferenceBoundaryError<P>> for ProgramError {
     #[inline]
-    fn from(error: ReferenceBoundaryError) -> Self {
-        ProgramError::InvalidArgument { message: error.to_string() }
+    fn from(error: ReferenceBoundaryError<P>) -> Self {
+        match error {
+            ReferenceBoundaryError::Resolution(error) => error,
+            error => ProgramError::InvalidArgument { message: error.to_string() },
+        }
     }
 }
 
@@ -1446,20 +1632,18 @@ impl Display for ReferenceBoundaryPosition {
     }
 }
 
-/// Validates the live values bound at a public transform boundary against runtime reference aliasing. This is the one
-/// canonical validator that every public flattened binding boundary invokes on its concrete values before wrapping
-/// them in staged tracers: differentiation (i.e., `jvp` and `linearize`, which `vjp` and the gradient and Jacobian
-/// entry points build on), batching, and Just-In-Time (JIT) compilation each have their own boundary, and each calls
-/// this function over the flattened inputs and captures it receives. It rejects the same [`ReferenceId`] at two
-/// positions, whether both are inputs, both are captures, or one reference is both captured and passed, because every
-/// transform rule assumes that distinct boundary positions denote distinct allocations. It fails closed: a value whose
-/// type is a reference but which reports no identity through [`Value::reference_id`] is rejected, so a third-party
-/// value family cannot bypass the check by omitting that override, and a non-reference-typed value that reports an
-/// identity is rejected as well.
+/// Validates concrete values bound at a public transform boundary against runtime reference aliasing. Batching
+/// and Just-In-Time (JIT) compilation use this function before wrapping concrete values in staged tracers. Use
+/// [`ReferenceBoundary`] to validate concrete or staged values through their context. These entry points share the same
+/// identity and alias checks. This function rejects the same [`ReferenceId`] at two positions, whether both are inputs,
+/// both are captures, or one reference is both captured and passed, because every transform rule assumes that distinct
+/// boundary positions denote distinct allocations. It fails closed meaning that a value whose type is a reference but
+/// reports no identity through [`Value::reference_id`] is rejected, so a third-party value family cannot bypass the
+/// check by omitting that override. A non-reference-typed value that reports an identity is also rejected.
 ///
-/// Internal [`Context::bind`](crate::Context::bind) calls are not validated, and aliasing between nested-region inputs
-/// is the responsibility of [`ReferenceAnalysis`](crate::ReferenceAnalysis). The validator must run on concrete values:
-/// a reference-typed staged tracer normally reports no identity and would be rejected here.
+/// Internal [`Context::bind`] calls are not validated, and aliasing between nested-region inputs is the responsibility
+/// of [`ReferenceAnalysis`](crate::ReferenceAnalysis). The validator must run on concrete values as a reference-typed
+/// staged tracer normally reports no identity and would be rejected here.
 ///
 /// # Parameters
 ///
@@ -1473,39 +1657,17 @@ pub fn validate_reference_boundary<'v, V: 'v + Value, I: IntoIterator<Item = &'v
     inputs: I,
     captures: C,
 ) -> Result<(), ReferenceBoundaryError> {
-    let positions = inputs
+    let inputs = inputs
         .into_iter()
         .enumerate()
-        .map(|(index, value)| (ReferenceBoundaryPosition::Input(index), value))
-        .chain(
-            captures
-                .into_iter()
-                .enumerate()
-                .map(|(index, value)| (ReferenceBoundaryPosition::Capture(index), value)),
-        );
-    let mut seen = HashMap::new();
-    for (position, value) in positions {
-        let is_reference = value.r#type().is_reference();
-        match value.reference_id() {
-            None if is_reference => {
-                return Err(ReferenceBoundaryError::MissingIdentity {
-                    position,
-                    type_name: value.r#type().to_string(),
-                });
-            }
-            None => {}
-            Some(_) if !is_reference => {
-                return Err(ReferenceBoundaryError::UnexpectedIdentity {
-                    position,
-                    type_name: value.r#type().to_string(),
-                });
-            }
-            Some(id) => {
-                if let Some(other) = seen.insert(id, position) {
-                    return Err(ReferenceBoundaryError::Aliased { position, other });
-                }
-            }
-        }
+        .map(|(index, value)| (ReferenceBoundaryPosition::Input(index), value));
+    let captures = captures
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| (ReferenceBoundaryPosition::Capture(index), value));
+    let mut boundary = ReferenceBoundary::default();
+    for (position, value) in inputs.chain(captures) {
+        boundary.insert(position, value, value.reference_id().map(ReferenceIdentity::Runtime))?;
     }
     Ok(())
 }
@@ -1525,12 +1687,13 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrType, ArrayIrValue, ArrayReference, ArrayType, DataType, Dimension, DimensionBounds,
-        DimensionVariable, Shape,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReference, ArrayType, DataType, Dimension,
+        DimensionBounds, DimensionVariable, ReferenceIndexOperation, Shape,
     };
     use crate::captures::CaptureReference;
-    use crate::contexts::EagerContext;
+    use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::Add;
+    use crate::tracing::{Tracer, TracerState, TracingContext};
 
     use super::*;
 
@@ -1644,6 +1807,13 @@ mod tests {
         fn reference_id(&self) -> Option<ReferenceId> {
             self.identity.as_ref().map(ArrayReference::id)
         }
+    }
+
+    #[test]
+    fn test_reference_id_is_not_reused_after_allocation_drop() {
+        let first = ArrayReference::new(Array::scalar(1.0_f32)).id();
+        let second = ArrayReference::new(Array::scalar(2.0_f32)).id();
+        assert!(first < second);
     }
 
     #[test]
@@ -2623,20 +2793,121 @@ mod tests {
     }
 
     #[test]
+    fn test_reference_boundary_new() {
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let first = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
+        let second = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(2.0_f32)));
+        let boundary = ReferenceBoundary::new(
+            &context,
+            [(ReferenceBoundaryPosition::Input(0), &first), (ReferenceBoundaryPosition::Capture(0), &second)],
+        )
+        .unwrap();
+        assert_eq!(
+            boundary.identities,
+            vec![
+                (ReferenceIdentity::Runtime(first.reference_id().unwrap()), ReferenceBoundaryPosition::Input(0)),
+                (ReferenceIdentity::Runtime(second.reference_id().unwrap()), ReferenceBoundaryPosition::Capture(0)),
+            ]
+        );
+        assert_eq!(
+            ReferenceBoundary::new(
+                &context,
+                [(ReferenceBoundaryPosition::Input(0), &first), (ReferenceBoundaryPosition::Capture(0), &first)],
+            )
+            .err(),
+            Some(ReferenceBoundaryError::Aliased {
+                position: ReferenceBoundaryPosition::Capture(0),
+                other: ReferenceBoundaryPosition::Input(0),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_reference_boundary_new_with_custom_positions() {
+        // Identity validation only needs to retain positions (formatting and equality are caller concerns).
+        #[derive(Clone)]
+        struct Position(String);
+
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let value = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
+        let Ok(boundary) = ReferenceBoundary::new(&context, [(Position("original".to_string()), &value)]) else {
+            panic!("a single reference must form a valid boundary");
+        };
+        assert!(matches!(
+            boundary.validate(&context, [(Position("later".to_string()), &value)]),
+            Err(ReferenceBoundaryError::AliasedRetained { position, other })
+                if position.0 == "later" && other.0 == "original"
+        ));
+    }
+
+    #[test]
+    fn test_reference_boundary_validate() {
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let root = context.input(ReferenceType::new(ArrayType::new_static(DataType::F32, [2])).into());
+        let view = context.bind(ReferenceIndexOperation::new(0, 0), Vec::new(), &[root.clone()]).unwrap().remove(0);
+        let boundary = ReferenceBoundary::new(&context, [("original", &root)]).unwrap();
+        assert_eq!(
+            boundary.validate(&context, [("later", &view)]),
+            Err(ReferenceBoundaryError::AliasedRetained { position: "later", other: "original" }),
+        );
+        let distinct = context.input(view.r#type().into_owned());
+        assert_eq!(boundary.validate(&context, [("later", &distinct)]), Ok(()));
+        assert_eq!(
+            boundary.validate(&context, [("first", &distinct), ("second", &distinct), ("third", &view)]),
+            Err(ReferenceBoundaryError::Aliased { position: "second", other: "first" }),
+        );
+        let foreign =
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new().input(view.r#type().into_owned());
+        assert_eq!(
+            boundary.validate(&context, [("later", &foreign)]),
+            Err(ReferenceBoundaryError::MissingIdentity { position: "later", type_name: "ref<f32[]>".to_string() }),
+        );
+        assert_eq!(
+            boundary.validate(&context, [("first", &view), ("second", &foreign)]),
+            Err(ReferenceBoundaryError::AliasedRetained { position: "first", other: "original" }),
+        );
+    }
+
+    #[test]
+    fn test_reference_boundary_resolution_errors() {
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let value = context.input(reference_type.clone().into());
+        let boundary = ReferenceBoundary::new(&context, [("original", &value)]).unwrap();
+        let poisoned = Tracer::new(context.clone(), TracerState::Poison, reference_type.into());
+        assert_eq!(
+            ReferenceBoundary::new(&context, [("original", &poisoned)]).err(),
+            Some(ReferenceBoundaryError::Resolution(ProgramError::PoisonedValue)),
+        );
+        assert_eq!(
+            boundary.validate(&context, [("later", &poisoned)]),
+            Err(ReferenceBoundaryError::Resolution(ProgramError::PoisonedValue)),
+        );
+        assert_eq!(
+            ProgramError::from(boundary.validate(&context, [("later", &poisoned)]).unwrap_err()),
+            ProgramError::PoisonedValue,
+        );
+    }
+
+    #[test]
     fn test_reference_boundary_error_display() {
         let position = ReferenceBoundaryPosition::Input(1);
         let other = ReferenceBoundaryPosition::Capture(0);
         assert_eq!(
             ReferenceBoundaryError::MissingIdentity { position, type_name: "ref<f32[]>".to_string() }.to_string(),
-            "input 1 has reference type `ref<f32[]>` but reports no runtime reference identity",
+            "input 1 has reference type `ref<f32[]>` but reports no reference allocation identity",
         );
         assert_eq!(
             ReferenceBoundaryError::UnexpectedIdentity { position: other, type_name: "f32[]".to_string() }.to_string(),
-            "capture 0 has non-reference type `f32[]` but reports a runtime reference identity",
+            "capture 0 has non-reference type `f32[]` but reports a reference allocation identity",
         );
         assert_eq!(
             ReferenceBoundaryError::Aliased { position, other }.to_string(),
             "input 1 and capture 0 bind the same reference allocation",
+        );
+        assert_eq!(
+            ReferenceBoundaryError::AliasedRetained { position, other }.to_string(),
+            "input 1 aliases the reference allocation retained at capture 0",
         );
         assert_eq!(
             ProgramError::from(ReferenceBoundaryError::Aliased { position, other }),
@@ -2644,6 +2915,11 @@ mod tests {
                 message: "input 1 and capture 0 bind the same reference allocation".to_string(),
             },
         );
+        let resolution = ProgramError::MalformedProgram("reference producer is invalid".to_string());
+        let error = ReferenceBoundaryError::<&str>::from(resolution.clone());
+        assert_eq!(error, ReferenceBoundaryError::Resolution(resolution.clone()));
+        assert_eq!(error.to_string(), resolution.to_string());
+        assert_eq!(ProgramError::from(error), resolution);
     }
 
     #[test]

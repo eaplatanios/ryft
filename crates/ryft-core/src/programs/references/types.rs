@@ -340,6 +340,7 @@ mod tests {
         assert!(!declared_type.is_compatible_with(&static_two));
         assert!(!static_two.is_compatible_with(&static_three));
         assert!(static_two.is_reference());
+        assert_eq!(Type::referent(&static_two), None);
         assert!(!static_two.is_scalar());
         assert!(!static_two.is_complex());
         assert_eq!(static_two.to_string(), "ref<static<2>>");
