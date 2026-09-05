@@ -80,7 +80,7 @@ use crate::macros::{check_builders, check_count};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily, Placeholder};
 use crate::programs::{
     AtomId, BindingRegionDriver, Operation, Program, ProgramBuilder, ProgramError, ProjectedValue, Provenance,
-    ProvenanceScope, ProvenanceState, Type, TypeError, Typed, Value, ValueProjection,
+    ProvenanceScope, ProvenanceState, ReferenceIdentity, Type, TypeError, Typed, Value, ValueProjection,
 };
 
 /// State carried by a [`Tracer`] that indicates whether this tracer is _live_ and has a corresponding
@@ -576,16 +576,6 @@ impl<V: Value, O: Operation<Type = V::Type>, C> Context for TracingContext<V, O,
     }
 
     #[inline]
-    fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
-        self.provenance.invoke_with_origin(origin, function)
-    }
-
-    #[inline]
-    fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
-        self.provenance.invoke_with_scope(scope, function)
-    }
-
-    #[inline]
     fn resolve(&self, value: &Tracer<Self>) -> ValueResolution<V> {
         if !Rc::ptr_eq(self.builder(), value.context().builder()) {
             return ValueResolution::Opaque;
@@ -597,6 +587,24 @@ impl<V: Value, O: Operation<Type = V::Type>, C> Context for TracingContext<V, O,
             Some(constant) => ValueResolution::Constant(constant.clone()),
             None => ValueResolution::Staged(atom_id),
         }
+    }
+
+    #[inline]
+    fn reference_identity(&self, value: &Tracer<Self>) -> Result<Option<ReferenceIdentity>, ProgramError> {
+        if !Rc::ptr_eq(self.builder(), value.context().builder()) {
+            return Ok(None);
+        }
+        self.builder().borrow().reference_identity(value.atom_id()?, Rc::as_ptr(self.builder()) as usize)
+    }
+
+    #[inline]
+    fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
+        self.provenance.invoke_with_origin(origin, function)
+    }
+
+    #[inline]
+    fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
+        self.provenance.invoke_with_scope(scope, function)
     }
 }
 
@@ -806,16 +814,6 @@ impl<C: Context> Context for NestedTracingContext<C> {
     }
 
     #[inline]
-    fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
-        self.provenance.invoke_with_origin(origin, function)
-    }
-
-    #[inline]
-    fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
-        self.provenance.invoke_with_scope(scope, function)
-    }
-
-    #[inline]
     fn resolve(&self, value: &Tracer<Self>) -> ValueResolution<C::Constant> {
         if !Rc::ptr_eq(self.builder(), value.context().builder()) {
             return ValueResolution::Opaque;
@@ -827,6 +825,24 @@ impl<C: Context> Context for NestedTracingContext<C> {
             Some(constant) => ValueResolution::Constant(constant.clone()),
             None => ValueResolution::Staged(atom_id),
         }
+    }
+
+    #[inline]
+    fn reference_identity(&self, value: &Tracer<Self>) -> Result<Option<ReferenceIdentity>, ProgramError> {
+        if !Rc::ptr_eq(self.builder(), value.context().builder()) {
+            return Ok(None);
+        }
+        self.builder().borrow().reference_identity(value.atom_id()?, Rc::as_ptr(self.builder()) as usize)
+    }
+
+    #[inline]
+    fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
+        self.provenance.invoke_with_origin(origin, function)
+    }
+
+    #[inline]
+    fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
+        self.provenance.invoke_with_scope(scope, function)
     }
 }
 
@@ -1046,7 +1062,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType,
+        Dimension, DimensionBounds, DimensionVariable, ReferenceIndexOperation, Shape,
     };
     use crate::axes::NamedAxes;
     use crate::captures::{CaptureReference, CapturingContext};
@@ -1054,7 +1071,9 @@ mod tests {
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::{AddOperation, NegOperation, OneLike, OneOperation, Sin, ZeroLike, ZeroOperation};
     use crate::parameters::Placeholder;
-    use crate::programs::{AtomId, Operation, ProgramError, RegionInterface, TypeError, Typed};
+    use crate::programs::{
+        AtomId, Operation, ProgramError, ReferenceBoundary, ReferenceType, RegionInterface, TypeError, Typed,
+    };
 
     use super::*;
 
@@ -1476,6 +1495,26 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_tracing_context_reference_identity() {
+        let context = DomainTracingContext::<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>::new();
+        let root = context.input(ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2]))));
+        let view = context.bind(ReferenceIndexOperation::new(0, 0), Vec::new(), &[root.clone()]).unwrap().remove(0);
+        assert_eq!(context.reference_identity(&view), context.reference_identity(&root));
+        assert!(matches!(
+            ReferenceBoundary::new(&context, [("input 0", &root), ("input 1", &view)]).map_err(ProgramError::from),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "input 1 and input 0 bind the same reference allocation",
+        ));
+        let other = context.input(root.r#type().into_owned());
+        assert_ne!(context.reference_identity(&root).unwrap(), context.reference_identity(&other).unwrap());
+        let scalar = context.input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
+        assert_eq!(context.reference_identity(&scalar), Ok(None));
+        let reference = ArrayReference::new(Array::scalar(2.0_f32));
+        let constant = context.constant(ArrayIrValue::Reference(reference.clone()));
+        assert_eq!(context.reference_identity(&constant), Ok(Some(ReferenceIdentity::Runtime(reference.id()))));
     }
 
     #[test]

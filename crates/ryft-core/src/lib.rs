@@ -34,10 +34,11 @@ pub use arrays::{
     REFERENCE_INDEX_OPERATION_NAME, REFERENCE_SLICE_OPERATION_NAME, RaggedArrayBatchingPolicy, RaggedAxis,
     RaggedMaskIdentity, ReferenceIndex, ReferenceIndexOperation, ReferenceSlice, ReferenceSliceOperation,
     ReplicatedDimensionBatchingPolicy, Shape, Sharding, ShardingDimension, ShardingError, ShardingVisualization,
-    StaticArrayBatchingPolicy, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, bf16, decode_elements,
-    decode_logical_bytes, encode_elements, encode_logical_bytes, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3,
-    f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, f16, i1, i2, i4, materialize_array_tangent,
-    reapply_array_reference_view, u1, u2, u4, validate_array_reference_view, validate_storage_bytes,
+    StaticArrayBatchingPolicy, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, ViewIndex, bf16,
+    decode_elements, decode_logical_bytes, encode_elements, encode_logical_bytes, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4,
+    f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, f16, i1, i2, i4,
+    materialize_array_tangent, reapply_array_reference_view, u1, u2, u4, validate_array_reference_view,
+    validate_storage_bytes,
 };
 pub use axes::{AXIS_INDEX_OPERATION_NAME, Axes, Axis, AxisError, AxisIndex, AxisIndexOperation, NamedAxes, NamedAxis};
 pub use batching::{
@@ -59,19 +60,20 @@ pub use compilation::{
 };
 pub use contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext, ValueResolution};
 pub use differentiation::{
-    BinaryElementwiseJvpOperands, BroadcastDerivativeAlignment, CotangentBatchingPolicy, CustomJvp, CustomJvpOperation,
-    CustomVjp, CustomVjpOperation, DenseDifferentiableType, DerivativeTransform, DifferentiableOperation,
-    DifferentiableType, Differentiate, DifferentiationBuilder, DifferentiationBuilderContext,
+    BinaryElementwiseJvpOperands, BroadcastDerivativeAlignment, CotangentBatchingPolicy, CotangentDestination,
+    CotangentDestinationKind, CotangentReferenceAccumulator, CotangentSeed, CustomJvp, CustomJvpOperation, CustomVjp,
+    CustomVjpOperation, DenseDifferentiableType, DerivativeTransform, DifferentiableOperation, DifferentiableType,
+    Differentiate, DifferentiationBoundaryPosition, DifferentiationBuilder, DifferentiationBuilderContext,
     DifferentiationBuilderExecutionContext, DifferentiationBuilderLinearityMode, DifferentiationContext,
     DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationParameterRole,
     DifferentiationTracer, ElementwiseDerivativeAlignment, ForwardModeDifferentiate, Hessian, HessianBlock,
     HolomorphicLinearity, Jacobian, JacobianBlock, LinearCallOperation, Linearization, LinearizationTracer,
-    MemberDifferentiableOperation, Pullback, Pushforward, RealLinearity, ResidualZeroProvider,
-    ReverseModeDifferentiate, STOP_GRADIENT_OPERATION_NAME, StopGradient, StopGradientOperation, StopGradients,
-    TransposableOperation, TranspositionDriver, UnaryElementwiseJvpOperands, WithAuxiliaryOutput, WithCapture,
-    WithContext, WithoutAuxiliaryOutput, WithoutCapture, WithoutContext, binary_elementwise_jvp, custom_jvp,
-    custom_vjp, differentiate_at, jvp_projected_operation, transpose_mixed_operation, transpose_projected_operation,
-    unary_elementwise_jvp,
+    MemberDifferentiableOperation, Pullback, Pushforward, RealLinearity, ReferenceOperandCotangents,
+    ResidualZeroProvider, ReverseModeDifferentiate, STOP_GRADIENT_OPERATION_NAME, StopGradient, StopGradientOperation,
+    StopGradients, TransposableOperation, TranspositionContext, TranspositionDriver, UnaryElementwiseJvpOperands,
+    WithAuxiliaryOutput, WithCapture, WithContext, WithoutAuxiliaryOutput, WithoutCapture, WithoutContext,
+    binary_elementwise_jvp, custom_jvp, custom_vjp, differentiate_at, jvp_projected_operation,
+    reference_operand_cotangents, transpose_mixed_operation, transpose_projected_operation, unary_elementwise_jvp,
 };
 pub use errors::{CustomError, Error, MaybeFallible};
 pub use interpretation::{
@@ -164,34 +166,38 @@ pub use partial::{
 };
 pub use programs::{
     Atom, AtomId, AttachedRegionStatistics, BindingRegionDriver, CalleeRegionDriver, Concretizable,
-    DestinationRegionMapping, EagerInterpretationValidation, Effect, EffectOccurrence, Effects, EmptyRegionDriver,
-    ExternalReferenceBinding, FlatProgram, Instruction, InstructionId, MaybeZero, MemberOperation, NoIdentity,
-    Operation, OperationFormatter, OperationProjection, OperationProvider, OutputRegionProvenance, ParameterProjection,
-    PartialReferenceDischargeResult, PreparedReferenceReplacement, Program, ProgramBuilder, ProgramError,
-    ProgramLiveSets, ProgramRenderingMode, ProgramStatistics, ProjectedValue, Provenance, ProvenanceScope,
-    ProvenanceState, REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME,
+    DestinationRegionMapping, EagerInterpretationValidation, EffectClass, EffectClassOccurrence, EffectClasses,
+    Effects, EffectsSummary, EmptyRegionDriver, ExternalReferenceBinding, FlatProgram, InputRegionProvenance,
+    Instruction, InstructionId, MaybeZero, MemberOperation, NoBinding, NoIdentity, Operation, OperationFormatter,
+    OperationProjection, OperationProvider, OutputRegionProvenance, ParameterProjection,
+    PartialReferenceDischargeResult, PreparedReferenceReplacement, Program, ProgramBuilder, ProgramBuilderId,
+    ProgramError, ProgramLiveSets, ProgramRenderingMode, ProgramStatistics, ProjectedValue, Provenance,
+    ProvenanceScope, ProvenanceState, REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME,
     REFERENCE_NEW_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME,
     REFERENCE_WRITE_OPERATION_NAME, ReadyOrPendingReferenceGuard, ReadyReferenceGuard,
     RecursiveReferenceDischargeDriver, Reference, ReferenceAccess, ReferenceAccessMode, ReferenceAccumulationPolicy,
-    ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAliasEdge, ReferenceAliasKind, ReferenceAnalysis,
-    ReferenceAnalysisError, ReferenceBoundaryError, ReferenceBoundaryPosition, ReferenceCompletion,
+    ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAddUpdateOperationProvider, ReferenceAlias,
+    ReferenceAliasEdge, ReferenceAliasKind, ReferenceAliasOrigin, ReferenceAnalysis, ReferenceAnalysisError,
+    ReferenceBoundary, ReferenceBoundaryError, ReferenceBoundaryPosition, ReferenceCompletion,
     ReferenceCompletionBackend, ReferenceDischargeAllocationId, ReferenceDischargeBoundaryWidening,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeReference,
-    ReferenceDischargeRegionBoundary, ReferenceDischargeRegionResult, ReferenceDischargeRegionStateInsertion,
-    ReferenceDischargeRegionSummary, ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceError, ReferenceFreeze,
-    ReferenceFreezeOperation, ReferenceGeneration, ReferenceId, ReferenceInput, ReferenceNew, ReferenceNewOperation,
-    ReferenceObservation, ReferenceOperationSemantics, ReferenceOutput, ReferenceRead, ReferenceReadOperation,
-    ReferenceRegionInputBinding, ReferenceReplacementPreparation, ReferenceReplacementTransaction, ReferenceRoot,
-    ReferenceSource, ReferenceSwap, ReferenceSwapOperation, ReferenceTransitiveAccess, ReferenceType,
-    ReferenceTypeRefinements, ReferenceViewAnalysis, ReferenceViewAnalysisError, ReferenceViewOperation,
-    ReferenceViewPath, ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation, Region, RegionArena,
-    RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionRef, RegionReplayMappings, RegionRole,
-    RegionSlot, RegionStatistics, RegionWithMetadata, ReplayRegionDriver, TakenReferenceGuard, Transform,
-    TransformArtifact, TransformCache, Type, TypeError, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming,
-    TypeIdentitySignature, TypeRefinements, Typed, ValidatedPendingReplacementTransaction, Value, ValueId,
-    ValueProjection, discharge_positional_region_operation, discharge_reference_free_operation,
-    infer_projected_operation_output_types, infer_projected_operation_region_input_types, validate_reference_boundary,
+    ReferenceDischargeRegionBoundary, ReferenceDischargeRegionInput, ReferenceDischargeRegionResult,
+    ReferenceDischargeRegionStateInsertion, ReferenceDischargeRegionSummary, ReferenceDischargeResult,
+    ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType,
+    ReferenceEffect, ReferenceError, ReferenceFreeze, ReferenceFreezeOperation, ReferenceGeneration, ReferenceId,
+    ReferenceIdentity, ReferenceNew, ReferenceNewOperation, ReferenceNewOperationProvider, ReferenceObservation,
+    ReferenceRead, ReferenceReadOperation, ReferenceRegionInputBinding, ReferenceReplacementPreparation,
+    ReferenceReplacementTransaction, ReferenceRoot, ReferenceSource, ReferenceSwap, ReferenceSwapOperation,
+    ReferenceTransitiveAccess, ReferenceType, ReferenceTypeRefinements, ReferenceView, ReferenceViewAnalysis,
+    ReferenceViewAnalysisError, ReferenceViewOperation, ReferenceViewPath, ReferenceViewStep,
+    ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation, Region, RegionArena, RegionArenaIterator,
+    RegionDriver, RegionId, RegionInterface, RegionRef, RegionReplayMappings, RegionRole, RegionSlot, RegionStatistics,
+    RegionWithMetadata, ReplayRegionDriver, TakenReferenceGuard, Transform, TransformArtifact, TransformCache, Type,
+    TypeError, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature, TypeRefinements, Typed,
+    ValidatedPendingReplacementTransaction, Value, ValueId, ValueProjection, ViewOverlap, ViewSymbol,
+    ViewSymbolBinding, batch_reference_view_operation, discharge_positional_region_operation,
+    discharge_reference_free_operation, infer_projected_operation_output_types,
+    infer_projected_operation_region_input_types, validate_reference_boundary,
 };
 pub use specialization::{
     ReentrantSpecializationError, SpecializationCache, SpecializationCacheEntry, SpecializationCacheError,
@@ -206,12 +212,15 @@ pub use tracing_v2::rematerialization::{REMATERIALIZE_OPERATION_NAME, Rematerial
 #[cfg(test)]
 pub(crate) mod tests {
     use std::any::TypeId;
+    use std::borrow::Cow;
     use std::cell::Cell;
+
     use std::convert::Infallible;
     use std::fmt::Debug;
     use std::sync::{Arc, Weak};
 
     use crate::arrays::{Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType};
+    use crate::axes::Axis;
     use crate::batching::{
         BatchAxis, BatchingContext, BatchingDriver, BatchingError, ProgramBatchingOutputAxesPolicy,
         RecursiveBatchingDriver, RecursiveBatchingPolicy,
@@ -222,10 +231,12 @@ pub(crate) mod tests {
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::transforms::{RegionTransformCache, RegionTransformRegistry};
     use crate::programs::{
-        Effect, Effects, Operation, Program, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceFreezeOperation,
-        ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation, ReferenceType, Region, RegionDriver,
-        RegionInterface, RegionRef, RegionSlot, Transform, TransformArtifact, TypeError, Typed, Value,
+        EffectClass, EffectClasses, Effects, Operation, Program, ProgramBuilder, ReferenceAddUpdateOperation,
+        ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation, ReferenceType,
+        Region, RegionDriver, RegionInterface, RegionRef, RegionSlot, Transform, TransformArtifact, TypeError, Typed,
+        Value,
     };
+
     use crate::specialization::SpecializationCacheStatistics;
 
     /// Test [`Operation`] with declared attached-region slots, used to exercise the [`Region`](crate::Region) machinery
@@ -240,7 +251,7 @@ pub(crate) mod tests {
         Add,
 
         /// Region-free unary identity stand-in with the declared observable effect.
-        Effectful(Effect),
+        Effectful(EffectClass),
 
         /// Region-carrying operation declaring its region slots. Its inferred output types are the first attached
         /// region's output types, which pins that region interfaces are derived and delivered during inference.
@@ -293,11 +304,11 @@ pub(crate) mod tests {
             }
         }
 
-        fn effects(&self) -> Effects {
-            match self {
-                Self::Add | Self::WithRegions(_) => Effects::PURE,
-                Self::Effectful(effect) => Effects::single(*effect),
-            }
+        fn effects(&self) -> Cow<'_, Effects> {
+            Cow::Owned(Effects::explicit(match self {
+                Self::Add | Self::WithRegions(_) => EffectClasses::NONE,
+                Self::Effectful(effect) => EffectClasses::single(*effect),
+            }))
         }
     }
 
@@ -331,8 +342,12 @@ pub(crate) mod tests {
             Ok(input_types.to_vec())
         }
 
-        fn effects(&self) -> Effects {
-            if matches!(self, Self::State(_)) { Effects::single(Effect::OrderedState) } else { Effects::PURE }
+        fn effects(&self) -> Cow<'_, Effects> {
+            Cow::Owned(Effects::explicit(if matches!(self, Self::State(_)) {
+                EffectClasses::single(EffectClass::OrderedState)
+            } else {
+                EffectClasses::NONE
+            }))
         }
     }
 
@@ -403,6 +418,15 @@ pub(crate) mod tests {
             inputs: &[P::Batch],
         ) -> Result<P::Batch, BatchingError> {
             P::restore_batch(value, batch_axis, r#type, inputs)
+        }
+
+        fn align_batch_axis(
+            &self,
+            context: &BatchingContext<C, P>,
+            batch: P::Batch,
+            axis: Axis,
+        ) -> Result<P::Batch, BatchingError> {
+            P::align_batch_axis(context, batch, axis)
         }
     }
 
@@ -500,24 +524,21 @@ pub(crate) mod tests {
     }
 
     /// Builds the canonical array IR test program whose whole-array state crosses a [`ConditionOperation`] boundary,
-    /// shared by the transform adapters that must discharge local references before transforming. The program takes
-    /// a Boolean predicate and an `f32[]` initial value, allocates one local reference from that initial value, and
-    /// passes the reference into a condition whose branches access it with unequal modes. The `true` branch accumulates
-    /// `1.0` and reads the reference, while the `false` branch swaps in `9.0` and yields the replaced value. Its two
-    /// outputs are the condition's snapshot followed by the frozen final state, so a discharged program must thread
-    /// identical state through both branches and keep both public outputs interpretable. On `[true, 4.0]` the outputs
-    /// are `[5.0, 5.0]`, and on `[false, 4.0]` they are `[4.0, 9.0]`.
+    /// shared by tests comparing direct reference transforms with explicit discharge. The program takes a Boolean
+    /// predicate and an `f32[]` initial value, allocates one local reference from that initial value, and passes the
+    /// reference into a condition whose branches access it with unequal modes. The `true` branch accumulates `1.0` and
+    /// reads the reference, while the `false` branch swaps in `9.0` and yields the replaced value. Its two outputs are
+    /// the condition's snapshot followed by the frozen final state, so a discharged program must thread identical state
+    /// through both branches and keep both public outputs interpretable. On `[true, 4.0]` the outputs are `[5.0, 5.0]`,
+    /// and on `[false, 4.0]` they are `[4.0, 9.0]`.
     pub(crate) fn test_condition_program()
     -> Program<ArrayIrValue<Array>, ArrayIrOperation<Array>, Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>> {
-        type TestValue = ArrayIrValue<Array>;
-        type TestOperation = ArrayIrOperation<Array>;
-
         let scalar_type = ArrayType::scalar(DataType::F32);
         let reference_type = ReferenceType::new(scalar_type.clone());
 
-        let mut true_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let mut true_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let reference = true_builder.add_input(reference_type.clone().into());
-        let update = true_builder.add_constant(TestValue::Array(Array::scalar(1.0_f32)));
+        let update = true_builder.add_constant(ArrayIrValue::Array(Array::scalar(1.0_f32)));
         true_builder
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
             .unwrap();
@@ -525,20 +546,28 @@ pub(crate) mod tests {
             .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
             .unwrap()[0];
         let true_branch = true_builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![snapshot],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
             .unwrap();
 
-        let mut false_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let mut false_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let reference = false_builder.add_input(reference_type.into());
-        let replacement = false_builder.add_constant(TestValue::Array(Array::scalar(9.0_f32)));
+        let replacement = false_builder.add_constant(ArrayIrValue::Array(Array::scalar(9.0_f32)));
         let snapshot = false_builder
             .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement], None)
             .unwrap()[0];
         let false_branch = false_builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![snapshot],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
             .unwrap();
 
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let true_branch = builder.import_region(true_branch.entry_region_ref());
         let false_branch = builder.import_region(false_branch.entry_region_ref());
         let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
@@ -556,7 +585,11 @@ pub(crate) mod tests {
         let frozen =
             builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot, frozen], vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![snapshot, frozen],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
             .unwrap()
     }
 }

@@ -90,7 +90,7 @@ use crate::operations::ConstantOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::programs::{
     AtomId, BindingRegionDriver, EagerInterpretationValidation, Operation, OperationProjection, Program,
-    ProgramBuilder, ProgramError, Provenance, ProvenanceScope, Type, Typed, Value, ValueProjection,
+    ProgramBuilder, ProgramError, Provenance, ProvenanceScope, ReferenceIdentity, Type, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Trace, Tracer, TracerState, TracingContext};
 
@@ -199,6 +199,32 @@ pub trait Context: Domain + Clone {
     /// and terminal eager contexts return [`Provenance::unknown`] because they record no instructions.
     fn provenance(&self) -> Provenance;
 
+    /// Resolves the provided value in this [`Context`]. Refer to [`ValueResolution`] for the possible
+    /// [`ValueResolution`]s and their semantics.
+    #[inline]
+    fn resolve(&self, value: &Self::Value) -> ValueResolution<Self::Constant> {
+        let _ = value;
+        ValueResolution::Opaque
+    }
+
+    /// Resolves the allocation denoted by a reference, without reading its contents. A concrete allocation returns
+    /// its runtime identity while a symbolic allocation returns its canonical root atom in this context. Views and
+    /// forwarded handles resolve to the same root. An opaque result supplies no alias proof and is rejected at a
+    /// reference transform boundary. Transform contexts delegate this query through their underlying reference.
+    ///
+    /// Unlike [`resolve`](Self::resolve), this query identifies mutable storage rather than an individual Single Static
+    /// Assignment (SSA) value. Staging contexts must override it to establish structural root identity (being non-eager
+    /// alone is not a proof).
+    fn reference_identity(&self, value: &Self::Value) -> Result<Option<ReferenceIdentity>, ProgramError> {
+        if let Some(identity) = value.reference_id() {
+            return Ok(Some(ReferenceIdentity::Runtime(identity)));
+        }
+        Ok(match self.resolve(value) {
+            ValueResolution::Constant(value) => value.reference_id().map(ReferenceIdentity::Runtime),
+            _ => None,
+        })
+    }
+
     /// Invokes `function` with the provided [`Provenance`] entered as the active source _origin_, so that
     /// [`Instruction`](crate::Instruction)s staged inside it record that they were _generated from_ an existing
     /// instruction. An origin is where staged work **comes from**, while a scope (i.e., used by the corresponding
@@ -232,14 +258,6 @@ pub trait Context: Domain + Clone {
     /// the closure directly because they record no instructions; transform wrappers delegate to the context they stage
     /// through.
     fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R;
-
-    /// Resolves the provided value in this [`Context`]. Refer to [`ValueResolution`] for the possible
-    /// [`ValueResolution`]s and their semantics.
-    #[inline]
-    fn resolve(&self, value: &Self::Value) -> ValueResolution<Self::Constant> {
-        let _ = value;
-        ValueResolution::Opaque
-    }
 
     /// Traces `function` into a [`Program`] and interprets that program on the provided `input`. This creates an
     /// ordinary symbolic trace over this context's `(Self::Type, Self::Constant, Self::Operation)` universe through a
@@ -391,6 +409,11 @@ impl<V: Value, O: Operation<Type = V::Type> + InterpretableOperation<Self>> Cont
     }
 
     #[inline]
+    fn resolve(&self, value: &V) -> ValueResolution<V> {
+        ValueResolution::Constant(value.clone())
+    }
+
+    #[inline]
     fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, _origin: Provenance, function: F) -> R {
         function()
     }
@@ -398,11 +421,6 @@ impl<V: Value, O: Operation<Type = V::Type> + InterpretableOperation<Self>> Cont
     #[inline]
     fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, _scope: ProvenanceScope, function: F) -> R {
         function()
-    }
-
-    #[inline]
-    fn resolve(&self, value: &V) -> ValueResolution<V> {
-        ValueResolution::Constant(value.clone())
     }
 }
 
@@ -547,16 +565,6 @@ where
     }
 
     #[inline]
-    fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
-        self.parent.invoke_with_provenance_origin(origin, function)
-    }
-
-    #[inline]
-    fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
-        self.parent.invoke_with_provenance_scope(scope, function)
-    }
-
-    #[inline]
     fn resolve(&self, value: &Self::Value) -> ValueResolution<Self::Constant> {
         // Resolution must ask the parent about the original composite value. For the symbolic values that use this
         // context through `ProjectedValue`, cloning preserves the same underlying tracer or transform state.
@@ -569,6 +577,20 @@ where
             ValueResolution::Staged(atom) => ValueResolution::Staged(atom),
             ValueResolution::Opaque => ValueResolution::Opaque,
         }
+    }
+
+    fn reference_identity(&self, value: &Self::Value) -> Result<Option<ReferenceIdentity>, ProgramError> {
+        self.parent.reference_identity(&<C::Value as ValueProjection<T>>::from_projected(value.clone()))
+    }
+
+    #[inline]
+    fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
+        self.parent.invoke_with_provenance_origin(origin, function)
+    }
+
+    #[inline]
+    fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
+        self.parent.invoke_with_provenance_scope(scope, function)
     }
 }
 

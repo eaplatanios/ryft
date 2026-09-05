@@ -224,8 +224,9 @@ macro_rules! check_builders {
 ///
 /// The generated operation stores the two declared operand types and the name and bounds needed to infer one fresh
 /// result identity. The resulting program atom owns that inferred identity; the operation does not duplicate it. The
-/// generated type implements [`Operation`](crate::Operation), [`ArithmeticDimensionOperation`],
-/// [`Display`](std::fmt::Display), identity renaming, capability-based interpretation, and ordinary partial evaluation.
+/// generated type implements [`Operation`](crate::Operation),
+/// [`ArithmeticDimensionOperation`](crate::ArithmeticDimensionOperation), [`Display`](std::fmt::Display),
+/// identity renaming, capability-based interpretation, and ordinary partial evaluation.
 ///
 /// The caller supplies the operation's public documentation and name, its value-level capability and semantic method,
 /// a diagnostic result-name expression, and a bounds-transfer expression. This keeps operation structure and
@@ -350,11 +351,13 @@ macro_rules! define_arithmetic_dimension_operation {
             }
 
             #[inline]
-            fn effects(&self) -> $crate::programs::effects::Effects {
+            fn effects(&self) -> ::std::borrow::Cow<'_, $crate::programs::effects::Effects> {
                 if self.metadata.requires_runtime_assertion() {
-                    $crate::programs::effects::Effects::single($crate::programs::effects::Effect::OrderedAssertion)
+                    ::std::borrow::Cow::Owned($crate::programs::effects::Effects::explicit(
+                        $crate::programs::effects::EffectClasses::single($crate::programs::effects::EffectClass::OrderedAssertion),
+                    ))
                 } else {
-                    $crate::programs::effects::Effects::PURE
+                    ::std::borrow::Cow::Borrowed($crate::programs::effects::Effects::empty())
                 }
             }
 
@@ -1407,7 +1410,7 @@ macro_rules! impl_differentiable_operation {
         {
             fn transpose<__D: $crate::TranspositionDriver<$value, $operations>>(
                 &self,
-                $context: &mut $crate::TracingContext<$value, $operations>,
+                $context: &mut $crate::TranspositionContext<'_, $value, $operations>,
                 $driver: &__D,
                 $inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<$value, $operations>>>],
                 $outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<$value, $operations>>>],
@@ -1415,6 +1418,10 @@ macro_rules! impl_differentiable_operation {
                 Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<$value, $operations>>>>,
                 $crate::DifferentiationError,
             > {
+                // Hand-written rule bodies stage ordinary linear operations only, so the transposition context is
+                // narrowed to its tracing context through `DerefMut` before the body runs. The body consequently
+                // cannot reach the reference accumulators, which only the hand-implemented reference-aware rules use.
+                let $context: &mut $crate::TracingContext<$value, $operations> = $context;
                 let $self = self;
                 $body
             }
@@ -1570,7 +1577,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         {
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
-                _context: &mut $crate::TracingContext<__V, __O>,
+                _context: &mut $crate::TranspositionContext<'_, __V, __O>,
                 _driver: &__D,
                 inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
                 outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
@@ -1627,7 +1634,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         {
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
-                _context: &mut $crate::TracingContext<__V, __O>,
+                _context: &mut $crate::TranspositionContext<'_, __V, __O>,
                 _driver: &__D,
                 inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
                 outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
@@ -1670,7 +1677,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         {
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
-                _context: &mut $crate::TracingContext<__V, __O>,
+                _context: &mut $crate::TranspositionContext<'_, __V, __O>,
                 _driver: &__D,
                 inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
                 outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
@@ -2037,7 +2044,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         {
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
-                _context: &mut $crate::TracingContext<__V, __O>,
+                _context: &mut $crate::TranspositionContext<'_, __V, __O>,
                 _driver: &__D,
                 inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
                 outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
@@ -2144,7 +2151,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         {
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
-                _context: &mut $crate::TracingContext<__V, __O>,
+                _context: &mut $crate::TranspositionContext<'_, __V, __O>,
                 _driver: &__D,
                 inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
                 outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
@@ -2694,7 +2701,7 @@ macro_rules! impl_non_transposable_operation {
             #[inline]
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
-                _context: &mut $crate::TracingContext<__V, __O>,
+                _context: &mut $crate::TranspositionContext<'_, __V, __O>,
                 _driver: &__D,
                 _inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
                 _outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
@@ -2751,7 +2758,7 @@ macro_rules! impl_nullary_transposable_operation {
             #[inline]
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
-                _context: &mut $crate::TracingContext<__V, __O>,
+                _context: &mut $crate::TranspositionContext<'_, __V, __O>,
                 _driver: &__D,
                 inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
                 outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
@@ -4609,7 +4616,7 @@ mod tests {
     use crate::contexts::{Context, Domain, EagerContext, StagingContext};
     use crate::differentiation::{
         DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationError,
-        DifferentiationTracer, TransposableOperation,
+        DifferentiationTracer, TransposableOperation, TranspositionContext,
     };
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::{
@@ -6073,12 +6080,12 @@ mod tests {
 
         // The generic transposition shell likewise forwards the complete partial-input and cotangent slices to the
         // supplied body and preserves the driver's static dispatch.
-        let mut context = TracingContext::<Array, TestDifferentiableOperation<ArrayType>>::new();
+        let context = TracingContext::<Array, TestDifferentiableOperation<ArrayType>>::new();
         let output_cotangent = context.input(ArrayType::scalar(DataType::F32));
         let output_cotangent_id = output_cotangent.atom_id();
         let input_cotangents = TestDifferentiableOperation::<ArrayType>::new()
             .transpose(
-                &mut context,
+                &mut TranspositionContext::new(context.clone()),
                 &EmptyRegionDriver,
                 &[
                     PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
@@ -6106,13 +6113,13 @@ mod tests {
         assert_eq!(outputs[0].primal(), &Array::scalar(5.0f32));
         assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(9.0f32)));
 
-        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = context.input(ArrayType::scalar(DataType::F32));
         let output_cotangent_id = output_cotangent.atom_id();
         let input_cotangents =
             <AddOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &AddOperation::new(),
-                &mut context,
+                &mut TranspositionContext::new(context.clone()),
                 &EmptyRegionDriver,
                 &[
                     PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
@@ -6178,13 +6185,13 @@ mod tests {
     fn test_impl_differentiable_elementwise_operation_linear_negative_transposition() {
         // A negative coefficient stages a negation of the output cotangent while a positive coefficient passes it
         // through unchanged.
-        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = context.input(ArrayType::scalar(DataType::F32));
         let output_cotangent_id = output_cotangent.atom_id();
         let input_cotangents =
             <TestReversedSubOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &TestReversedSubOperation::<ArrayType>::new(),
-                &mut context,
+                &mut TranspositionContext::new(context.clone()),
                 &EmptyRegionDriver,
                 &[
                     PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
@@ -6209,13 +6216,13 @@ mod tests {
         }
 
         // Both coefficients of a `[@negative, @negative]` rule stage negations.
-        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = context.input(ArrayType::scalar(DataType::F32));
         let output_cotangent_id = output_cotangent.atom_id();
         let input_cotangents =
             <TestNegatedAddOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &TestNegatedAddOperation::<ArrayType>::new(),
-                &mut context,
+                &mut TranspositionContext::new(context.clone()),
                 &EmptyRegionDriver,
                 &[
                     PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
@@ -6281,13 +6288,13 @@ mod tests {
 
     #[test]
     fn test_impl_differentiable_elementwise_operation_symmetric_transposition_diagnostics() {
-        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = context.input(ArrayType::scalar(DataType::F32));
         let outputs = [MaybeZero::Value(output_cotangent)];
         assert!(matches!(
             <MulOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &MulOperation::new(),
-                &mut context,
+                &mut TranspositionContext::new(context.clone()),
                 &EmptyRegionDriver,
                 &[PartialValue::Unknown(ArrayType::scalar(DataType::F32)), PartialValue::Unknown(ArrayType::scalar(DataType::F32))],
                 &outputs,
@@ -6303,7 +6310,7 @@ mod tests {
         assert!(matches!(
             <MulOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &MulOperation::new(),
-                &mut context,
+                &mut TranspositionContext::new(context.clone()),
                 &EmptyRegionDriver,
                 &[PartialValue::Known(left), PartialValue::Known(right)],
                 &outputs,
@@ -6319,7 +6326,7 @@ mod tests {
         assert!(matches!(
             <MulOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &MulOperation::new(),
-                &mut context,
+                &mut TranspositionContext::new(context.clone()),
                 &EmptyRegionDriver,
                 &[PartialValue::Unknown(ArrayType::scalar(DataType::I32)), PartialValue::Known(right)],
                 &[MaybeZero::Value(output_cotangent)],
@@ -6331,13 +6338,13 @@ mod tests {
 
     #[test]
     fn test_impl_differentiable_elementwise_operation_one_sided_transposition_diagnostics() {
-        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = context.input(ArrayType::scalar(DataType::F32));
         let outputs = [MaybeZero::Value(output_cotangent)];
         assert!(matches!(
             <DivOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &DivOperation::new(),
-                &mut context,
+                &mut TranspositionContext::new(context.clone()),
                 &EmptyRegionDriver,
                 &[PartialValue::Unknown(ArrayType::scalar(DataType::F32)), PartialValue::Unknown(ArrayType::scalar(DataType::F32))],
                 &outputs,
@@ -6353,7 +6360,7 @@ mod tests {
         assert!(matches!(
             <DivOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &DivOperation::new(),
-                &mut context,
+                &mut TranspositionContext::new(context.clone()),
                 &EmptyRegionDriver,
                 &[PartialValue::Known(numerator), PartialValue::Known(denominator)],
                 &outputs,
@@ -6427,13 +6434,13 @@ mod tests {
 
     #[test]
     fn test_impl_non_transposable_operation() {
-        let mut context = TracingContext::<Array, TestUnaryOperation<ArrayType>>::new();
+        let context = TracingContext::<Array, TestUnaryOperation<ArrayType>>::new();
         let inputs: [PartialValue<Tracer<TracingContext<Array, TestUnaryOperation<ArrayType>>>>; 0] = [];
         let outputs: [MaybeZero<Tracer<TracingContext<Array, TestUnaryOperation<ArrayType>>>>; 0] = [];
         assert!(matches!(
             <TestUnaryOperation<ArrayType> as TransposableOperation<Array, TestUnaryOperation<ArrayType>>>::transpose(
                 &TestUnaryOperation::<ArrayType>::new(),
-                &mut context,
+                &mut TranspositionContext::new(context.clone()),
                 &EmptyRegionDriver,
                 &inputs,
                 &outputs,
@@ -6446,21 +6453,27 @@ mod tests {
     #[test]
     fn test_impl_nullary_transposable_operation() {
         let operation = TestNullaryOperation::<ArrayType>::new();
-        let mut context = TracingContext::<Array, TestNullaryOperation<ArrayType>>::new();
+        let context = TracingContext::<Array, TestNullaryOperation<ArrayType>>::new();
         let inputs: [PartialValue<Tracer<TracingContext<Array, TestNullaryOperation<ArrayType>>>>; 0] = [];
         let outputs =
             [MaybeZero::Zero(ArrayType::scalar(DataType::F64)), MaybeZero::Zero(ArrayType::scalar(DataType::F64))];
         let result = <TestNullaryOperation<ArrayType> as TransposableOperation<
             Array,
             TestNullaryOperation<ArrayType>,
-        >>::transpose(&operation, &mut context, &EmptyRegionDriver, &inputs, &outputs)
+        >>::transpose(
+            &operation,
+            &mut TranspositionContext::new(context.clone()),
+            &EmptyRegionDriver,
+            &inputs,
+            &outputs,
+        )
         .unwrap();
         assert!(result.is_empty());
         let input = context.input(ArrayType::scalar(DataType::F64));
         assert!(matches!(
             <TestNullaryOperation<ArrayType> as TransposableOperation<Array, TestNullaryOperation<ArrayType>>>::transpose(
                 &operation,
-                &mut context,
+                &mut TranspositionContext::new(context.clone()),
                 &EmptyRegionDriver,
                 &[PartialValue::Known(input)],
                 &outputs,
@@ -6470,7 +6483,7 @@ mod tests {
         assert!(matches!(
             <TestNullaryOperation<ArrayType> as TransposableOperation<Array, TestNullaryOperation<ArrayType>>>::transpose(
                 &operation,
-                &mut context,
+                &mut TranspositionContext::new(context.clone()),
                 &EmptyRegionDriver,
                 &inputs,
                 &[],
