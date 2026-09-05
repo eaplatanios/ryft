@@ -102,9 +102,9 @@ mod tests {
     };
     use crate::parameters::Placeholder;
     use crate::programs::{
-        AtomId, Effects, Instruction, InstructionId, Operation, ProgramBuilder, ProgramError, ReferenceAccessMode,
-        ReferenceAliasEdge, ReferenceAliasKind, ReferenceAliasOrigin, ReferenceAnalysisError, ReferenceFreezeOperation,
-        ReferenceOperationSemantics, ReferenceOutput, ReferenceReadOperation, ReferenceRoot, ReferenceSource,
+        AtomId, EffectClasses, Effects, Instruction, InstructionId, Operation, ProgramBuilder, ProgramError,
+        ReferenceAccessMode, ReferenceAlias, ReferenceAliasEdge, ReferenceAliasKind, ReferenceAliasOrigin,
+        ReferenceAnalysisError, ReferenceFreezeOperation, ReferenceReadOperation, ReferenceRoot, ReferenceSource,
         ReferenceType, ReferenceViewOperation, ReferenceViewValidationError, ReferenceWriteOperation, RegionId,
         RegionInterface, TypeError,
     };
@@ -434,24 +434,17 @@ mod tests {
                 }
             }
 
-            fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
-                match self {
-                    Self::Native(operation) => operation.reference_semantics(),
-                    Self::View => Cow::Owned(ReferenceOperationSemantics::new(
-                        Vec::new(),
-                        vec![ReferenceOutput::Alias {
-                            output_index: 0,
-                            input_index: 0,
-                            kind: ReferenceAliasKind::View,
-                        }],
-                    )),
-                }
-            }
-
-            fn effects(&self) -> Effects {
+            fn effects(&self) -> Cow<'_, Effects> {
                 match self {
                     Self::Native(operation) => operation.effects(),
-                    Self::View => Effects::PURE,
+                    Self::View => Cow::Owned(
+                        Effects::new(
+                            EffectClasses::NONE,
+                            Vec::new(),
+                            vec![ReferenceAlias::new(0, 0, ReferenceAliasKind::View)],
+                        )
+                        .unwrap(),
+                    ),
                 }
             }
         }

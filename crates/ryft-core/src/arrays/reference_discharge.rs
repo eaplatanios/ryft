@@ -33,7 +33,7 @@
 //! - **Linearization** ([`Program::linearize`](crate::Program::linearize)) is the known-ness split of the fused
 //!   forward pass: the primal accesses fold into the forward pass (mutating the primal reference at linearization
 //!   time) while the tangent accesses stage into the pushforward over the tangent reference, placed by the per-root
-//!   effect frontier of partial evaluation.
+//!   effect frontier of the dedicated linearization context.
 //! - **Reverse mode** ([`Pullback::apply_with_destinations`](crate::Pullback::apply_with_destinations)) accumulates
 //!   the state cotangent of every linear reference through a cotangent reference: a caller-supplied
 //!   [`CotangentDestination::Reference`](crate::CotangentDestination::Reference), an internal one whose final contents
@@ -42,9 +42,9 @@
 //! - **Batching** ([`batch`](crate::batch)) gives a reference a batch axis by giving its referent one, so accesses
 //!   through a mapped reference are packed per item; a replicated or captured reference accepts only replicated
 //!   stores.
-//! - **Partial evaluation** ([`Program::partially_evaluate`](crate::Program::partially_evaluate)) keeps one effect
-//!   frontier per reference root: once a mutation of a root must stage, every later access of that root stages, and a
-//!   live reference reaching the residual program is threaded as a reference rather than as a snapshot.
+//! - **Partial evaluation** ([`Program::partially_evaluate`](crate::Program::partially_evaluate)) preserves global
+//!   ordered-effect and failure order: once an ordered operation stages, every later ordered operation stages. A live
+//!   reference reaching the residual program is threaded as a reference rather than as a snapshot.
 //! - **Rematerialization** recomputes complete local reference lifecycles, saves reads of external references, and
 //!   rejects bodies that mutate an external reference or return a local one.
 //! - **Custom derivatives** admit references only as leading non-differentiated inputs, replay their rules with local
@@ -64,7 +64,10 @@
 //! Boolean-only boundary cannot. A loop with an iteration bound cannot be rotated and is rejected when its condition
 //! mutates state. No region closure of any shape may consume a caller allocation, because a consumed allocation has no
 //! successor state for a boundary to carry. Derived views do not cross any of these boundaries and must be recreated
-//! from the allocation inside the attached region.
+//! from the allocation inside the attached region. The one boundary view is the per-iteration slice a `scan` creates
+//! for a reference-typed stacked operand: discharge rewrites that operand into a stacked array operand carrying the
+//! allocation's state and, when the body writes through the slice, one stacked output holding the slices' final states,
+//! which becomes the allocation's successor state. The slice must be the only handle of its allocation inside the body.
 //!
 //! Mutation summaries are conservative: a write in either condition branch or in a loop/scan body publishes hidden
 //! final state and advances the external reference generation even when one execution takes the other branch, performs
@@ -397,10 +400,10 @@ mod tests {
     use crate::operations::{ConditionOperation, ScanOperation, WhileOperation};
     use crate::parameters::Placeholder;
     use crate::programs::{
-        Effects, ExternalReferenceBinding, Instruction, InstructionId, Operation, OutputRegionProvenance, Program,
-        ProgramBuilder, ReferenceAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver,
-        ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation,
-        ReferenceFreezeOperation, ReferenceNewOperation, ReferenceOperationSemantics, ReferenceReadOperation,
+        EffectClasses, Effects, ExternalReferenceBinding, InputRegionProvenance, Instruction, InstructionId, Operation,
+        OutputRegionProvenance, Program, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceDischargeContext,
+        ReferenceDischargeDriver, ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue,
+        ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
         ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceViewOperation, ReferenceViewValidationError,
         ReferenceWriteOperation, RegionInterface, RegionSlot, TypeError, ViewSymbol,
         discharge_positional_region_operation, discharge_reference_free_operation,
@@ -953,7 +956,7 @@ mod tests {
         );
         assert_eq!(discharged.output_count(), 3);
         assert_eq!(discharged.external_reference_bindings(), &[]);
-        assert_eq!(discharged.program().effects(), Effects::PURE);
+        assert_eq!(discharged.program().effects().classes(), EffectClasses::NONE);
     }
 
     #[test]
@@ -1994,7 +1997,7 @@ mod tests {
             .unwrap();
         let discharged = local.discharge_references(0).unwrap().into_program_without_external_references().unwrap();
         assert_eq!(discharged.output_count(), 1);
-        assert!(discharged.effects().is_pure());
+        assert!(discharged.effects().classes().is_empty());
         assert_eq!(discharged.interpret(vec![scalar(3.0)]), Ok(vec![scalar(6.0)]));
     }
 
@@ -3338,10 +3341,14 @@ mod tests {
                 }
             }
 
-            fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
+            fn input_region_provenance(
+                &self,
+                region_index: usize,
+                input_index: usize,
+            ) -> Option<InputRegionProvenance> {
                 match self {
                     Self::Native(operation) => operation.input_region_provenance(region_index, input_index),
-                    Self::Call => Some(input_index),
+                    Self::Call => Some(InputRegionProvenance::Forwarded { input_index }),
                 }
             }
 
@@ -3352,17 +3359,10 @@ mod tests {
                 }
             }
 
-            fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
-                match self {
-                    Self::Native(operation) => operation.reference_semantics(),
-                    Self::Call => Cow::Borrowed(ReferenceOperationSemantics::empty()),
-                }
-            }
-
-            fn effects(&self) -> Effects {
+            fn effects(&self) -> Cow<'_, Effects> {
                 match self {
                     Self::Native(operation) => operation.effects(),
-                    Self::Call => Effects::PURE,
+                    Self::Call => Cow::Borrowed(Effects::empty()),
                 }
             }
 
@@ -4048,6 +4048,61 @@ mod tests {
         let discharged = source.discharge_references(0).unwrap();
         assert_eq!(discharged.external_reference_bindings(), &[]);
         assert_eq!(discharged.program().interpret(vec![scalar(0.0)]), Ok(eager));
+    }
+
+    #[test]
+    fn test_scan_discharge_matches_eager_reference_execution_for_stacked_reference() {
+        // The per-iteration slice of a stacked reference operand is the one boundary view that crosses into a scan
+        // body. The discharged form must agree with eager execution on the carry, on the stacked value output, and on
+        // the allocation's state observed after the scan, which the rewrite publishes through an extra stacked output.
+        let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let carry = body_builder.add_input(scalar_type().into());
+        let slice = body_builder.add_input(ReferenceType::new(scalar_type()).into());
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![slice, carry], None)
+            .unwrap();
+        let current =
+            body_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![slice], None).unwrap()[0];
+        let doubled = body_builder
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![current, current], None)
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![current, doubled], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let initial = builder.add_input(scalar_type().into());
+        let elements = builder.add_input(ArrayType::new_static(DataType::F32, [4]).into());
+        let stack = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![elements], None).unwrap()[0];
+        let outputs = builder
+            .add_instruction(ScanOperation::<TestValue>::new(1, 4), vec![body], vec![initial, stack], None)
+            .unwrap();
+        let (final_carry, doubled) = (outputs[0], outputs[1]);
+        let frozen =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![stack], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(
+                vec![final_carry, doubled, frozen],
+                vec![Placeholder; 2],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+
+        let inputs = vec![scalar(1.0), vector(vec![1.0, 2.0, 3.0, 4.0])];
+        let eager = source.clone().interpret(inputs.clone()).unwrap();
+        assert_eq!(eager, vec![scalar(11.0), vector(vec![4.0, 8.0, 14.0, 22.0]), vector(vec![2.0, 4.0, 7.0, 11.0])]);
+        let discharged = source.discharge_references(0).unwrap();
+        assert_eq!(discharged.external_reference_bindings(), &[]);
+        assert_eq!(
+            discharged.program().output_types(),
+            vec![
+                scalar_type().into(),
+                ArrayType::new_static(DataType::F32, [4]).into(),
+                ArrayType::new_static(DataType::F32, [4]).into(),
+            ],
+        );
+        assert_eq!(discharged.program().interpret(inputs), Ok(eager));
     }
 
     #[test]

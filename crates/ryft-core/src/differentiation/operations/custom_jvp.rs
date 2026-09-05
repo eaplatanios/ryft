@@ -20,16 +20,21 @@ use crate::operations::Zero;
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    Effect, Operation, OperationFormatter, ProgramError, RegionInterface, RegionSlot, TypeError, Typed, Value,
+    InputRegionProvenance, Operation, OperationFormatter, OutputRegionProvenance, Program, ProgramError,
+    RegionInterface, RegionSlot, TypeError, Value,
 };
 use crate::tracing::{DomainTracer, Trace};
+
+use super::{
+    validate_custom_derivative_reference_boundary, validate_custom_derivative_replay, validate_non_differentiated_count,
+};
 
 /// Canonical operation name for [`CustomJvpOperation`].
 pub const CUSTOM_JVP_OPERATION_NAME: &str = "custom_jvp";
 
 /// Higher-order [`Operation`] pairing a primal program with a user-supplied Jacobian-Vector Product (JVP) program.
 /// This is an analogue to JAX's [`custom_jvp`](https://docs.jax.dev/en/latest/_autosummary/jax.custom_jvp.html).
-/// The two [`Program`](crate::Program)s are supplied as the operation's attached regions (i.e., via the
+/// The two [`Program]s are supplied as the operation's attached regions (i.e., via the
 /// [`RegionDriver`](crate::RegionDriver) passed to [`Context::bind`]) in the region order `["primal", "jvp"]`, and
 /// [`Operation::infer_output_types`] validates the interface contract between them: the JVP region's inputs are the
 /// primal inputs followed by one tangent per _differentiated_ primal input, and its outputs are the primal outputs
@@ -42,6 +47,15 @@ pub const CUSTOM_JVP_OPERATION_NAME: &str = "custom_jvp";
 /// batching policy that threads batching state through a structurally batched region's boundary (e.g., a composite
 /// universe's first-class mapped extent) reintroduces that state as additional leading non-differentiated operands
 /// of the batched call.
+///
+/// References follow the contract shared by the custom derivative operations: a reference-typed operand is accepted
+/// only in the leading non-differentiated segment, where it is _plumbing_ that both regions receive unchanged and may
+/// read or write, and no output may be a reference. An active reference operand is rejected during type inference
+/// because the rule interface defines no tangent reference for it, and a live tangent reference supplied for a
+/// plumbing operand is left untouched, since the rule declares no derivative through the state it denotes. The primal
+/// computation region receives every operand at its own position, which is the region input provenance that reference
+/// analysis consults, and its outputs are the call's outputs; the JVP region is a dormant rule that the analysis does
+/// not enter.
 ///
 /// The transforms treat a staged call as follows:
 ///
@@ -99,15 +113,7 @@ impl<T: DifferentiableType> CustomJvpOperation<T> {
     /// group, based on the value of [`Self::non_differentiated_count`].
     #[inline]
     fn split_inputs<'v, V>(&self, values: &'v [V]) -> Result<(&'v [V], &'v [V]), TypeError> {
-        let input_count = values.len();
-        if self.non_differentiated_count > input_count {
-            return Err(TypeError::invalid(format!(
-                "{} non-differentiated operand count {} exceeds input count {}",
-                self.name(),
-                self.non_differentiated_count,
-                input_count,
-            )));
-        }
+        validate_non_differentiated_count(self.name(), self.non_differentiated_count, values.len())?;
         Ok(values.split_at(self.non_differentiated_count))
     }
 }
@@ -209,7 +215,26 @@ impl<T: DifferentiableType> Operation for CustomJvpOperation<T> {
             primal_interface.input_types(),
             input_types,
         ]);
+        validate_custom_derivative_reference_boundary(
+            CUSTOM_JVP_OPERATION_NAME,
+            self.non_differentiated_count,
+            primal_input_types,
+            primal_output_types,
+        )?;
         Ok(primal_output_types.to_vec())
+    }
+
+    #[inline]
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
+        // The primal computation region receives every operand at its own position. The JVP region is a dormant rule
+        // that reference analysis does not enter, so it declares no provenance.
+        (region_index == 0).then_some(InputRegionProvenance::Forwarded { input_index })
+    }
+
+    #[inline]
+    fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
+        // Interpretation replays the primal region, whose outputs are the call's outputs one for one.
+        vec![OutputRegionProvenance { region_index: 0, output_index }]
     }
 
     #[inline]
@@ -247,10 +272,10 @@ where
     // differentiation.
 }
 
-// A custom JVP replays verbatim. Its primal region could in principle thread state but its dormant `jvp` rule region
-// would then have to carry a derivative for that mutation, which a user-supplied rule does not define, so the shared
-// reference-free rule copies both regions across unchanged and rejects the application by name if a reference reaches
-// either closure.
+// A custom JVP replays verbatim. Its regions may thread a plumbing reference operand as state, but discharging that
+// state would have to rewrite the dormant `jvp` rule region's boundary in a way the user-supplied rule does not
+// define, so the shared reference-free rule copies both regions across unchanged and rejects the application by name
+// if a reference reaches either closure. Plumbing references are therefore an eager-execution feature for now.
 impl_reference_free_dischargeable_operation!(<T> CustomJvpOperation<T> where T: DifferentiableType);
 
 impl<T: DifferentiableType, C: Context<Type = T>, P: BatchingPolicy<C>> BatchableOperation<C, P>
@@ -375,36 +400,20 @@ where
         // reverse mode can transpose the resulting linear map in `ẋ` exactly like any other tangent program, and
         // no nested differentiation request or special reverse rule is needed here.
         let jvp_region = driver.region(1)?;
+        let output_types = jvp_region.output_types();
+        let output_count = output_types.len() / 2;
+        let (_, differentiated_inputs) = self.split_inputs(inputs)?;
 
-        // The rule region is interpreted directly rather than routed through the transform rejections, so unresolved
-        // state anywhere in its attached-region closure (including dormant nested rules) must be rejected here before
-        // any of it can enter the differentiated program.
-        if jvp_region.contains_effect_in_closure(Effect::OrderedState) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!("`{CUSTOM_JVP_OPERATION_NAME}` rule regions must not contain unresolved state"),
-            }
-            .into());
-        }
-
-        let output_count = jvp_region.output_types().len() / 2;
-        let (non_differentiated_inputs, differentiated_inputs) = self.split_inputs(inputs)?;
+        // The rule region is replayed directly rather than differentiated, so the replayed operands are validated as
+        // defense in depth (refer to the documentation of `validate_custom_derivative_replay`).
+        validate_custom_derivative_replay(
+            CUSTOM_JVP_OPERATION_NAME,
+            self.non_differentiated_count,
+            context,
+            inputs,
+            &output_types[..output_count],
+        )?;
         check_count!("input", jvp_region.input_types(), inputs.len() + differentiated_inputs.len(), ProgramError);
-
-        if let Some(input) = non_differentiated_inputs
-            .iter()
-            .find(|input| !input.tangent().is_zero() && !input.tangent().r#type().is_zero_space())
-        {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "{} cannot propagate the nonzero tangent of type `{}` supplied for one of its {} leading \
-                     non-differentiated operands, because its rule has no tangent slot for them",
-                    self.name(),
-                    input.tangent().r#type(),
-                    non_differentiated_inputs.len(),
-                ),
-            }
-            .into());
-        }
 
         // The JVP region consumes `(primals..., differentiated_input_tangents...)`, so feed every dual primal followed
         // by the differentiated duals' tangents.
@@ -448,6 +457,9 @@ pub struct CustomJvp<Primal, Jvp, Inputs, Outputs> {
     /// Closure computing `(outputs, output_tangents)` from `(inputs, input_tangents)`.
     jvp: Jvp,
 
+    /// Number of leading flattened input leaves that parameterize the call without being differentiated.
+    non_differentiated_count: usize,
+
     /// Phantom marker pinning the input and output tracer-tree types named by the closure signatures. The [`Domain`]
     /// whose universe the rules are traced into is recovered from the values passed to [`CustomJvp::call`], and so the
     /// wrapper stores neither a domain value nor a domain type witness.
@@ -459,6 +471,20 @@ where
     Primal: Fn(Inputs) -> Result<Outputs, ProgramError>,
     Jvp: Fn(Inputs, Inputs) -> Result<(Outputs, Outputs), ProgramError>,
 {
+    /// Declares the leading `non_differentiated_count` flattened leaves of the input tree as non-differentiated
+    /// _plumbing_ inputs, which is the high-level counterpart of
+    /// [`CustomJvpOperation::with_non_differentiated_count`] and the analogue of JAX's `nondiff_argnums`. Plumbing
+    /// inputs reach both closures at their usual positions, and a reference-typed input is accepted only there. The
+    /// `jvp` closure keeps receiving one tangent leaf per input so that its signature mirrors the primal signature,
+    /// but the tangent leaves of plumbing inputs are placeholders that the rule must not use: a non-differentiated
+    /// input contributes no tangent slot to the staged rule, so a rule that consumes or returns such a placeholder is
+    /// rejected when it is traced. Refer to the documentation of [`custom_jvp`] for more information.
+    #[inline]
+    pub fn with_non_differentiated_count(mut self, non_differentiated_count: usize) -> Self {
+        self.non_differentiated_count = non_differentiated_count;
+        self
+    }
+
     /// Stages this custom-JVP function on the provided tracer input tree and returns its output tree, tracing the
     /// stored closures into programs specialized to the input types. Differentiation of the staged call replays the
     /// JVP rule instead of differentiating the primal body, in both forward and reverse mode.
@@ -494,17 +520,76 @@ where
         let Some(first) = input_values.first() else {
             return Err(TypeError::invalid(format!("{CUSTOM_JVP_OPERATION_NAME} requires at least one input")).into());
         };
-        let (_, primal) = D::trace(|xs| (self.primal)(xs), input_types.clone())?;
+        validate_non_differentiated_count(
+            CUSTOM_JVP_OPERATION_NAME,
+            self.non_differentiated_count,
+            input_values.len(),
+        )?;
+        let (_, primal) = D::trace(&self.primal, input_types.clone())?;
         let input_tangent_types = input_types.clone().try_map_parameters(|r#type| r#type.tangent())?;
         let (output_types, jvp) = D::trace(|(x, t)| (self.jvp)(x, t), (input_types, input_tangent_types))?;
-        let operation = D::Operation::from(CustomJvpOperation::new());
+        let jvp = without_non_differentiated_tangent_inputs(
+            jvp.into_flat_program(),
+            input_values.len(),
+            self.non_differentiated_count,
+        )?;
+        let operation =
+            D::Operation::from(CustomJvpOperation::new().with_non_differentiated_count(self.non_differentiated_count));
         // The call binds through whatever context the input values flow (a staged trace, a batching context, or a
         // JVP context), so `custom_jvp` composes under `vmap`/`jvp` — the batch/JVP rule of the bound operation fires.
         let context = first.dispatch_domain();
-        let outputs = context.bind(operation, vec![primal.to_flat_program(), jvp.to_flat_program()], &input_values)?;
+        let outputs = context.bind(operation, vec![primal.into_flat_program(), jvp], &input_values)?;
         let output_structure = output_types.0.parameter_structure();
         Ok(Parameterized::from_parameters(output_structure, outputs)?)
     }
+}
+
+/// Removes the tangent inputs that a traced JVP rule declares for the leading `non_differentiated_count` inputs. The
+/// rule closure receives one tangent per input so that its signature mirrors the primal signature, but a
+/// non-differentiated input has no tangent slot in the [`CustomJvpOperation`] contract, so its tangent input is a
+/// placeholder that the rule must ignore. The traced program has inputs `[inputs..., input_tangents...]`, and the
+/// placeholders are the tangents at positions `input_count..input_count + non_differentiated_count`, which are
+/// projected away so that the remaining boundary is exactly `[inputs..., differentiated_input_tangents...]`.
+///
+/// # Parameters
+///
+///   - `program`: Traced JVP rule program over `[inputs..., input_tangents...]`.
+///   - `input_count`: Number of primal inputs.
+///   - `non_differentiated_count`: Number of leading non-differentiated inputs whose tangent placeholders are removed.
+///
+/// # Errors
+///
+/// Returns a [`TypeError`] when the rule consumes or returns a placeholder tangent, and propagates program projection
+/// errors otherwise.
+fn without_non_differentiated_tangent_inputs<V: Value, O: Clone + Operation<Type = V::Type>>(
+    program: Program<V, O, Vec<V>, Vec<V>>,
+    input_count: usize,
+    non_differentiated_count: usize,
+) -> Result<Program<V, O, Vec<V>, Vec<V>>, ProgramError> {
+    if non_differentiated_count == 0 {
+        return Ok(program);
+    }
+    let input_ids = program.input_ids();
+    check_count!("input", input_ids, 2 * input_count, ProgramError);
+    let (primal_ids, tangent_ids) = input_ids.split_at(input_count);
+    let (placeholder_ids, differentiated_tangent_ids) = tangent_ids.split_at(non_differentiated_count);
+    for (index, placeholder) in placeholder_ids.iter().enumerate() {
+        // Attached regions are closed over their own inputs, so a use of an entry input is always a direct operand or
+        // output of the entry region.
+        let used = program.output_ids().contains(placeholder)
+            || program.instructions().iter().any(|instruction| instruction.inputs().contains(placeholder));
+        if used {
+            return Err(TypeError::invalid(format!(
+                "{CUSTOM_JVP_OPERATION_NAME} rule uses the tangent of leading non-differentiated input {index}, which \
+                 has no tangent slot because non-differentiated inputs parameterize the rule without being \
+                 differentiated",
+            ))
+            .into());
+        }
+    }
+    let kept_ids = primal_ids.iter().chain(differentiated_tangent_ids).copied().collect::<Vec<_>>();
+    let (pruned, _) = program.filtered(kept_ids.as_slice(), program.output_ids(), kept_ids.as_slice())?;
+    Ok(pruned)
 }
 
 /// Creates a [`CustomJvp`] function from a primal closure and a Jacobian-Vector Product (JVP) closure over trees of
@@ -531,20 +616,28 @@ where
 /// `log`-`sum`-`exp`, a softmax, or a normalization, where a hand-written tangent avoids the cancellation or redundant
 /// work the generic rule incurs. A single custom JVP serves **both** differentiation modes: reverse mode obtains its
 /// gradient by transposing the supplied tangent map, so the one rule composes with forward mode, reverse mode, and
-/// their higher-order combinations. Prefer it over [`custom_vjp`](crate::differentiation::custom_vjp) whenever the
-/// function is naturally forward-differentiable, and reach for [`custom_vjp`](crate::differentiation::custom_vjp) only
-/// when just the reverse rule is natural (for example implicit differentiation or adjoint solvers).
+/// their higher-order combinations. Prefer it over [`custom_vjp`](fn@crate::differentiation::custom_vjp) whenever the
+/// function is naturally forward-differentiable, and use a custom VJP only when just the reverse rule is natural (for
+/// example implicit differentiation or adjoint solvers).
 ///
 /// # Calling convention
 ///
 /// Both closures operate on [`Parameterized`] trees of [`DomainTracer`]s — `ryft`'s analogue of JAX pytrees — so `x`
-/// and `y` may each be a single tracer, a tuple, or any other parameterized structure. This high-level API does not
-/// expose JAX's `nondiff_argnums` calling convention. Static non-differentiated configuration should be captured by
-/// both closures. A dynamic typed value should remain an explicit input; its tangent is consequently present in `ẋ`,
-/// and a rule that treats the value as a parameter ignores that tangent when constructing `ẏ`. Transform-injected
-/// runtime metadata uses the lower-level
-/// [`CustomJvpOperation::non_differentiated_count`] contract instead, because it must remain an SSA operand while
-/// contributing no tangent slot.
+/// and `y` may each be a single tracer, a tuple, or any other parameterized structure. Static non-differentiated
+/// configuration should be captured by both closures. A dynamic typed value should remain an explicit input; its
+/// tangent is consequently present in `ẋ`, and a rule that treats the value as a parameter ignores that tangent when
+/// constructing `ẏ`.
+///
+/// # Non-differentiated inputs
+///
+/// [`CustomJvp::with_non_differentiated_count`] declares the leading flattened input leaves as _plumbing_ that
+/// parameterizes the call without being differentiated, the analogue of JAX's `nondiff_argnums` and the high-level
+/// face of the [`CustomJvpOperation::non_differentiated_count`] contract. Plumbing leaves reach both closures at their
+/// usual positions, and the `jvp` closure keeps receiving a full `ẋ` tree, but the tangent leaves of plumbing inputs
+/// are placeholders it must not use, because the staged rule has no tangent slot for them; a rule that consumes or
+/// returns a placeholder is rejected when it is traced. A reference-typed input is accepted only as plumbing, where
+/// both closures may read or write it, and a live tangent reference supplied for it by an enclosing transform is left
+/// untouched by the call. References may not be returned.
 ///
 /// # Parameters
 ///
@@ -567,7 +660,7 @@ where
     Primal: Fn(Inputs) -> Result<Outputs, ProgramError>,
     Jvp: Fn(Inputs, Inputs) -> Result<(Outputs, Outputs), ProgramError>,
 {
-    CustomJvp { primal, jvp, marker: PhantomData }
+    CustomJvp { primal, jvp, non_differentiated_count: 0, marker: PhantomData }
 }
 
 #[cfg(test)]
@@ -576,8 +669,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayBatch, ArrayBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType,
-        DataType, Dimension, Shape, ShardingDimension,
+        Array, ArrayBatch, ArrayBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference,
+        ArrayType, DataType, Dimension, Shape, ShardingDimension,
     };
     use crate::axes::AxisIndexOperation;
     use crate::batching::{
@@ -593,9 +686,53 @@ mod tests {
     };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
-    use crate::programs::{Effects, Program, ProgramBuilder, RegionRole};
+    use crate::programs::{
+        EffectClass, EffectClasses, FlatProgram, MaybeZero, ProgramBuilder, ReferenceAddUpdate,
+        ReferenceAddUpdateOperation, ReferenceType, RegionRole,
+    };
 
     use super::*;
+
+    /// Eager composite context whose values may be arrays or references.
+    type ArrayIrContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+    /// Builds the plumbing-reference primal `f(counters..., x) = { counters += x; x }` and the JVP rule
+    /// `jvp(counters..., x, ẋ) = { counters += x; (x, ẋ) }` over `counter_count` leading `ref<f32[]>` counters and
+    /// an `f32[]` input, so that replaying either region is observable through the counters.
+    fn counting_custom_jvp_regions(counter_count: usize) -> Vec<FlatProgram<ArrayIrContext>> {
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let mut primal = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let counters = (0..counter_count).map(|_| primal.add_input(reference_type.clone())).collect::<Vec<_>>();
+        let x = primal.add_input(scalar_type.clone());
+        for counter in counters {
+            primal
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![counter, x], None)
+                .unwrap();
+        }
+        let primal = primal
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![x],
+                vec![Placeholder; counter_count + 1],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut jvp = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let counters = (0..counter_count).map(|_| jvp.add_input(reference_type.clone())).collect::<Vec<_>>();
+        let x = jvp.add_input(scalar_type.clone());
+        let tangent = jvp.add_input(scalar_type);
+        for counter in counters {
+            jvp.add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![counter, x], None).unwrap();
+        }
+        let jvp = jvp
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![x, tangent],
+                vec![Placeholder; counter_count + 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        vec![primal, jvp]
+    }
 
     /// Returns the canonical test array type with the provided dimensions.
     fn test_type(dimensions: &[usize]) -> ArrayType {
@@ -682,6 +819,15 @@ mod tests {
         assert_eq!(operation.region_role(0), Some(RegionRole::Computation));
         assert_eq!(operation.region_role(1), Some(RegionRole::Rule));
 
+        // The primal computation region receives every operand at its own position and its outputs are the call's,
+        // while the dormant rule region declares no operand provenance.
+        assert_eq!(operation.input_region_provenance(0, 1), Some(InputRegionProvenance::Forwarded { input_index: 1 }),);
+        assert_eq!(operation.input_region_provenance(1, 1), None);
+        assert_eq!(
+            operation.output_region_provenance(0),
+            vec![OutputRegionProvenance { region_index: 0, output_index: 0 }],
+        );
+
         // The primal region receives the call inputs and the JVP region receives `(inputs..., input tangents...)`.
         let primal_interface = sin_program(&scalar).interface();
         let jvp_interface = doubled_sin_jvp_program(&scalar).interface();
@@ -704,11 +850,11 @@ mod tests {
         let primal_type = ArrayType::new(DataType::F8E8M0FNU, Shape::new(Vec::new()));
         let tangent_type = ArrayType::new(DataType::F32, Shape::new(Vec::new()));
         let differential_primal_interface =
-            RegionInterface::new(vec![primal_type.clone()], vec![primal_type.clone()], Effects::PURE);
+            RegionInterface::new(vec![primal_type.clone()], vec![primal_type.clone()], EffectClasses::NONE);
         let differential_jvp_interface = RegionInterface::new(
             vec![primal_type.clone(), tangent_type.clone()],
             vec![primal_type.clone(), tangent_type],
-            Effects::PURE,
+            EffectClasses::NONE,
         );
         assert_eq!(
             operation.infer_output_types(
@@ -1022,25 +1168,145 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_jvp_operation_rejects_unresolved_references_in_dormant_rules() {
+    fn test_custom_jvp_operation_reference_contract() {
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
-        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input_types = vec![reference_type.clone(), scalar_type.clone()];
+        let primal_interface =
+            RegionInterface::new(input_types.clone(), vec![scalar_type.clone()], EffectClasses::NONE);
+
+        // A reference operand in the leading non-differentiated segment is plumbing that both regions receive at its
+        // own position, so the rule interface carries a tangent only for the differentiated operand.
+        let jvp_interface = RegionInterface::new(
+            vec![reference_type.clone(), scalar_type.clone(), scalar_type.clone()],
+            vec![scalar_type.clone(), scalar_type.clone()],
+            EffectClasses::NONE,
+        );
+        assert_eq!(
+            CustomJvpOperation::<ArrayIrType>::new()
+                .with_non_differentiated_count(1)
+                .infer_output_types(&input_types, &[primal_interface.clone(), jvp_interface]),
+            Ok(vec![scalar_type.clone()]),
+        );
+
+        // The same operand in the differentiated segment would need a tangent reference the rule cannot define, so
+        // it is rejected even when the rule interface declares one.
+        let active_jvp_interface = RegionInterface::new(
+            vec![reference_type.clone(), scalar_type.clone(), reference_type.clone(), scalar_type.clone()],
+            vec![scalar_type.clone(), scalar_type.clone()],
+            EffectClasses::NONE,
+        );
+        assert_eq!(
+            CustomJvpOperation::<ArrayIrType>::new()
+                .infer_output_types(&input_types, &[primal_interface, active_jvp_interface]),
+            Err(TypeError::invalid(
+                "custom_jvp accepts reference inputs only in its leading non-differentiated segment; move input 0 of \
+                 type `ref<f32[]>` before the differentiated inputs"
+                    .to_string(),
+            )),
+        );
+
+        // No output may be a reference, not even a forwarded plumbing operand, because the rule would then have to
+        // produce its tangent reference.
+        let forwarding_primal_interface =
+            RegionInterface::new(input_types.clone(), vec![reference_type.clone()], EffectClasses::NONE);
+        let forwarding_jvp_interface = RegionInterface::new(
+            vec![reference_type.clone(), scalar_type.clone(), scalar_type],
+            vec![reference_type.clone(), reference_type],
+            EffectClasses::NONE,
+        );
+        assert_eq!(
+            CustomJvpOperation::<ArrayIrType>::new()
+                .with_non_differentiated_count(1)
+                .infer_output_types(&input_types, &[forwarding_primal_interface, forwarding_jvp_interface]),
+            Err(TypeError::invalid(
+                "custom_jvp cannot return a reference, but output 0 has type `ref<f32[]>`".to_string(),
+            )),
+        );
+    }
+
+    #[test]
+    fn test_custom_jvp_operation_replays_rules_with_local_reference_state() {
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let context = ArrayIrContext::new();
         let input = DifferentiationDual::new(
             ArrayIrValue::Array(Array::scalar(1.0_f32)),
             ArrayIrValue::Array(Array::scalar(1.0_f32)),
         )
         .unwrap();
 
-        // The custom-JVP guard validates the complete nested rule closure before recursively differentiating it.
+        // A rule region may allocate and use local reference state, including inside a dormant nested rule: the rule
+        // is replayed directly (the driver makes recursive differentiation an assertion failure), so its state
+        // executes like any other primitive operation and the identity rule yields the identity dual.
         let primal = array_ir_identity_program(&scalar_type);
         let jvp = nested_custom_derivative_state_program(&scalar_type, true);
-        assert!(jvp.effects().is_pure());
-        assert!(jvp.entry_region_ref().contains_effect_in_closure(Effect::OrderedState));
+        assert!(jvp.entry_region_ref().contains_effect_in_closure(EffectClass::OrderedState));
         let driver = ReferenceRuleDifferentiationDriver { programs: vec![primal, jvp] };
+        let outputs = CustomJvpOperation::<ArrayIrType>::new()
+            .jvp(&context, &driver, std::slice::from_ref(&input))
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].primal(), &ArrayIrValue::Array(Array::scalar(1.0_f32)));
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(ArrayIrValue::Array(tangent))
+            if tangent == &Array::scalar(1.0_f32)));
+    }
+
+    #[test]
+    fn test_custom_jvp_operation_threads_plumbing_references_into_its_rules() {
+        let context = ArrayIrContext::new();
+        let driver = ReferenceRuleDifferentiationDriver { programs: counting_custom_jvp_regions(1) };
+        let operation = CustomJvpOperation::<ArrayIrType>::new().with_non_differentiated_count(1);
+
+        // The plumbing counter reaches the replayed rule as the same reference and is mutated by it. Its live tangent
+        // reference is left untouched, because the rule declares no derivative through the state it denotes.
+        let counter = ArrayReference::new(Array::scalar(0.0_f32));
+        let counter_tangent = ArrayReference::new(Array::scalar(0.0_f32));
+        let inputs = [
+            DifferentiationDual::new(
+                ArrayIrValue::Reference(counter.clone()),
+                ArrayIrValue::Reference(counter_tangent.clone()),
+            )
+            .unwrap(),
+            DifferentiationDual::new(
+                ArrayIrValue::Array(Array::scalar(3.0_f32)),
+                ArrayIrValue::Array(Array::scalar(1.0_f32)),
+            )
+            .unwrap(),
+        ];
+        let outputs = operation.jvp(&context, &driver, &inputs).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].primal(), &ArrayIrValue::Array(Array::scalar(3.0_f32)));
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(ArrayIrValue::Array(tangent))
+            if tangent == &Array::scalar(1.0_f32)));
+        assert_eq!(counter.read(), Ok(Array::scalar(3.0_f32)));
+        assert_eq!(counter_tangent.read(), Ok(Array::scalar(0.0_f32)));
+
+        // A concrete replay validates the operands through the canonical boundary validator, so a reference operand
+        // that is also bound at another operand position is rejected before either rule region runs.
+        let aliased = [
+            inputs[0].clone(),
+            DifferentiationDual::new_with_zero_tangent(ArrayIrValue::Reference(counter.clone())).unwrap(),
+            inputs[1].clone(),
+        ];
+        let aliasing_driver = ReferenceRuleDifferentiationDriver { programs: counting_custom_jvp_regions(2) };
         assert!(matches!(
-            CustomJvpOperation::<ArrayIrType>::new().jvp(&context, &driver, std::slice::from_ref(&input)),
-            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "`custom_jvp` rule regions must not contain unresolved state",
+            CustomJvpOperation::<ArrayIrType>::new()
+                .with_non_differentiated_count(2)
+                .jvp(&context, &aliasing_driver, &aliased),
+            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
+                if message == "input 1 and input 0 bind the same reference allocation",
+        ));
+        assert_eq!(counter.read(), Ok(Array::scalar(3.0_f32)));
+
+        // The same operand in the differentiated segment is rejected by the replayed rule as well.
+        assert!(matches!(
+            CustomJvpOperation::<ArrayIrType>::new().jvp(&context, &driver, &inputs),
+            Err(DifferentiationError::Program(ProgramError::Type(error)))
+                if error == TypeError::invalid(
+                    "custom_jvp accepts reference inputs only in its leading non-differentiated segment; move input \
+                     0 of type `ref<f32[]>` before the differentiated inputs"
+                        .to_string(),
+                ),
         ));
     }
 
@@ -1068,6 +1334,93 @@ mod tests {
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 3.0f64.sin(), epsilon = 1e-9);
         assert_abs_diff_eq!(gradient.to_f64s()[0], 2.0 * 3.0f64.cos(), epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_custom_jvp_wrapper_threads_plumbing_references() {
+        // The leading counter is plumbing: it reaches both closures at its usual position, and the rule closure keeps
+        // receiving a full tangent tree whose counter leaf is a placeholder it leaves unused.
+        let function = custom_jvp(
+            |(counter, x): (DomainTracer<ArrayIrContext>, DomainTracer<ArrayIrContext>)| {
+                counter.add_update(&x)?;
+                Ok(x)
+            },
+            |(counter, x), (_, dx)| {
+                counter.add_update(&x)?;
+                Ok((x, dx))
+            },
+        )
+        .with_non_differentiated_count(1);
+        let counter = ArrayReference::new(Array::scalar(0.0_f32));
+        let counter_tangent = ArrayReference::new(Array::scalar(0.0_f32));
+        let (primal, tangent) = ArrayIrContext::new()
+            .jvp(
+                |(counter, x), ()| function.call((counter, x)),
+                (ArrayIrValue::Reference(counter.clone()), ArrayIrValue::Array(Array::scalar(2.0_f32))),
+                (ArrayIrValue::Reference(counter_tangent.clone()), ArrayIrValue::Array(Array::scalar(1.0_f32))),
+                (),
+            )
+            .unwrap();
+        assert_eq!(primal, ArrayIrValue::Array(Array::scalar(2.0_f32)));
+        assert_eq!(tangent, ArrayIrValue::Array(Array::scalar(1.0_f32)));
+        // Forward mode replays only the rule region, which increments the counter once and never touches its tangent.
+        assert_eq!(counter.read(), Ok(Array::scalar(2.0_f32)));
+        assert_eq!(counter_tangent.read(), Ok(Array::scalar(0.0_f32)));
+
+        // A rule that uses the placeholder tangent of a plumbing input is rejected when it is traced, because the
+        // staged rule has no tangent slot for it.
+        let function = custom_jvp(
+            |(counter, x): (DomainTracer<ArrayIrContext>, DomainTracer<ArrayIrContext>)| {
+                counter.add_update(&x)?;
+                Ok(x)
+            },
+            |(_, x), (counter_tangent, dx)| {
+                counter_tangent.add_update(&dx)?;
+                Ok((x, dx))
+            },
+        )
+        .with_non_differentiated_count(1);
+        let error = ArrayIrContext::trace(
+            |(counter, x)| function.call((counter, x)),
+            (
+                ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))),
+                ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ProgramError::Type(TypeError::invalid(
+                "custom_jvp rule uses the tangent of leading non-differentiated input 0, which has no tangent slot \
+                 because non-differentiated inputs parameterize the rule without being differentiated"
+                    .to_string(),
+            )),
+        );
+
+        // Without the declaration, the reference is an active input, which the staged operation rejects.
+        let function = custom_jvp(
+            |(counter, x): (DomainTracer<ArrayIrContext>, DomainTracer<ArrayIrContext>)| {
+                counter.add_update(&x)?;
+                Ok(x)
+            },
+            |(_, x), (_, dx)| Ok((x, dx)),
+        );
+        let error = ArrayIrContext::trace(
+            |(counter, x)| function.call((counter, x)),
+            (
+                ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))),
+                ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+            ),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            ProgramError::Type(TypeError::invalid(
+                "custom_jvp accepts reference inputs only in its leading non-differentiated segment; move input 0 of \
+                 type `ref<f32[]>` before the differentiated inputs"
+                    .to_string(),
+            )),
+        );
     }
 
     #[test]

@@ -63,8 +63,9 @@ pub enum ArrayReferenceViewError {
 ///
 /// Transforms are interpreted in order from the root outward. [`Index`](Self::Index) removes one axis at a static or
 /// symbolic coordinate; [`Slice`](Self::Slice) preserves rank and selects one static unit-stride range per axis.
-/// Traced-operand indexing of arrays and strided slicing are intentionally not represented until their inverse update
-/// semantics are supported.
+/// Only `scan` currently resolves symbolic coordinates, through its per-iteration reference slices and discharged
+/// stacked operands and outputs. Eager handles and standalone view discharge reject symbolic steps; traced reference
+/// indexing and strided slicing remain unsupported.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 #[non_exhaustive]
 pub enum ArrayReferenceViewTransform {
@@ -494,11 +495,11 @@ impl ArrayReferenceViewTransform {
 /// select the same root coordinates and observe one another's ordered mutations, while equality and hashing
 /// distinguish different transform sequences.
 ///
-/// Views currently support composed indexing (static, or symbolic where the binding admits it) and static unit-stride
-/// slicing. `Binding` is what a symbolic coordinate is closed over: the array view overlay binds program identities
-/// ([`ViewSymbolBinding`]), while eager handles only ever carry static steps and use [`NoBinding`]. Derived views
-/// cannot themselves cross attached-region or external runtime state boundaries: pass the root handle across the
-/// boundary and recreate the view within the destination scope.
+/// `Binding` supplies symbolic coordinates: [`ViewSymbolBinding`] identifies program values, the uninhabited
+/// [`NoBinding`] restricts eager handles to static steps, and `C::Value` binds discharge coordinates directly to
+/// destination values. Supported geometry is described by [`ArrayReferenceViewTransform`]. Pass root handles across
+/// attached-region and external runtime boundaries and recreate views inside the destination scope; the only boundary
+/// view is the per-iteration slice that `scan` itself creates for a reference-typed stacked operand.
 pub type ArrayReferenceView<Binding = ViewSymbolBinding> = ReferenceViewPath<ArrayReferenceViewTransform, Binding>;
 
 impl<Binding> ArrayReferenceView<Binding> {
@@ -607,9 +608,9 @@ impl ArrayReferenceView<NoBinding> {
         A: Value<Type = ArrayType> + Reshape + Slice,
     {
         let mut carrier = EagerViewCarrier(PhantomData);
-        self.steps().iter().try_fold(root.clone(), |value, step| {
-            step.view().apply_in(&mut carrier, &value, step.bindings())
-        })
+        self.steps()
+            .iter()
+            .try_fold(root.clone(), |value, step| step.view().apply_in(&mut carrier, &value, step.bindings()))
     }
 
     /// Replaces this static view and returns the reconstructed root plus its old view snapshot.
