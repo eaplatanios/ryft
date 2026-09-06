@@ -65,20 +65,23 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, ResidualZeroProvider, TransposableOperation,
+    CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationContext,
+    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, ResidualZeroProvider,
+    TransposableOperation, interpret_partitioned_jvp,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
-use crate::operations::{AddOperation, DotOperation, TagOperation, TransferToMemoryOperation, Zero};
+use crate::operations::{
+    AddOperation, DotOperation, LinearCallOperation, TagOperation, TransferToMemoryOperation, Zero,
+};
 use crate::parameters::{Parameterized, ParameterizedFamily, Placeholder};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{
     Atom, AtomId, EffectClass, EffectClasses, InputRegionProvenance, InstructionId, Operation, OperationFormatter,
     OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceAccessMode, ReferenceAnalysis,
-    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary,
-    ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceRoot,
-    Region, RegionId, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueId,
+    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, ReferenceRoot, Region, RegionId, RegionInterface, RegionSlot, Type, TypeError,
+    Typed, Value, ValueId, discharge_local_reference_regions,
 };
 use crate::tracing::{DomainTracer, Trace, TracingContext};
 
@@ -450,96 +453,21 @@ where
         driver: &D,
         inputs: &[ReferenceDischargeValue<C, P>],
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
-        let name = self.name();
-        self.validate_region_count(driver.region_count())?;
-        let is_reference =
-            |input: &ReferenceDischargeValue<C, P>| matches!(input, ReferenceDischargeValue::Reference(_));
-        if let Some(position) = inputs.iter().position(is_reference) {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "`{name}` does not thread external references through discharge, but operand {position} is a \
-                     reference; pass reference-free operands or discharge before rematerializing",
-                ),
-            });
-        }
-        // Reference-free operands leave the primal and forward boundaries reference-free, but a hand-built call may
-        // still declare reference inputs on its rule regions (through a reference-typed residual in the forward tail).
-        // Those inputs are bound by the transform that instantiates the rule rather than by any operand, so no caller
-        // allocation can be threaded into them; they are rejected here, under the operand diagnostic, instead of
-        // failing the region rebuild with an internal boundary error.
-        for index in 0..driver.region_count() {
-            if let Some(position) = driver.region(index)?.input_types().iter().position(Type::is_reference) {
-                return Err(ProgramError::UnsupportedOperation {
-                    message: format!(
-                        "`{name}` does not thread external references through discharge, but input {position} of \
-                         region {index} is a reference; pass reference-free operands or discharge before \
-                         rematerializing",
-                    ),
-                });
-            }
-        }
-        let mut regions = Vec::with_capacity(driver.region_count());
-        for index in 0..driver.region_count() {
-            let region = driver.region(index)?;
-            let declared_input_allocations = vec![None; region.input_ids().len()];
-            let summary = context.region_summary(self, index, region, declared_input_allocations.as_slice())?;
-            if let Some(allocation) = summary.reached_allocations().next() {
-                return Err(ProgramError::UnsupportedOperation {
-                    message: format!(
-                        "`{name}` does not thread external references through discharge, but its region {index} \
-                         reaches {allocation}; discharge before rematerializing",
-                    ),
-                });
-            }
-            let boundary = ReferenceDischargeRegionBoundary::new(
-                self,
-                index,
-                declared_input_allocations,
-                ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), region.input_ids().len()),
-                [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), region.output_ids().len())],
-            );
-            let result = driver.rebuild_region(context, index, &boundary)?;
-            result.validate_predicted_mutations(&[], name)?;
-            regions.push(result.into_program());
-        }
-        let operands = inputs.iter().map(|input| context.operand_value(input)).collect::<Result<Vec<_>, _>>()?;
-        let outputs = context.parent().bind(*self, regions, operands.as_slice())?;
-        Ok(outputs.into_iter().map(ReferenceDischargeValue::Value).collect())
+        discharge_local_reference_regions(self, context, driver, inputs)
     }
 }
 
-// Capture-free forward-mode (JVP) rule for [`RematerializeOperation`]: replays the derived forward and tangent
-// programs through the active context, staging their operations in the shared builder.
-//
-// Both derived programs are ordinary primal-enum programs, so the rule replays them through
-// [`Program::interpret_in_context`](crate::Program::interpret_in_context):
-//
-//   1. The forward program maps `inputs -> (outputs..., forward_tail...)`, where the tail is the region inputs
-//      followed by the policy-saved residuals. Replaying it on the dual primals yields the primal outputs and the
-//      forward tail; the tail is split off after the primal outputs.
-//   2. The tangent program maps `(non_differentiated..., forward_tail..., differentiated_input_tangents...) ->
-//      output_tangents`, exactly the leading non-differentiated operands and the forward tail followed by the
-//      differentiated inputs' tangents (per [`RematerializeOperation::new`]'s signature validation), so those leading
-//      operands and the tail are passed ahead of the dual tangents and replayed to produce the output tangents. The
-//      tangent program
-//      recomputes any unsaved residuals from the tail internally, so no residual reconstruction is needed here.
-//   3. Each primal output is paired with its staged output tangent into a [`DifferentiationDual`].
-//
-// Because both replayed programs are straight-line primal-enum operations referencing the staged tracers directly,
-// the rule introduces no symbolic capture and the enclosing partial-evaluation split discovers the residual
-// operand edges structurally — so
-// this is a leaf rule needing no nested differentiation or linearization request, and reverse mode transposes the
-// replayed recompute-and-pushforward operations like any other straight-line
-// tangent program. The [`prevent_cse`](RematerializeOperation::prevent_cse) optimization-barrier hint is
-// dropped in the forward (it is a backend lowering hint with no value-level semantics).
+// The forward region produces primal outputs and saved residuals. The tangent region and its already-derived
+// transpose form one linear call over those residuals. Keeping that boundary preserves recomputed coefficients
+// and local reference lifetimes without asking generic transposition to infer which deferred state is nonlinear.
 impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperation<C>
     for RematerializeOperation<C::Type>
 where
-    C::Operation: ResidualZeroProvider<C::Type>,
+    C::Operation: ResidualZeroProvider<C::Type> + From<LinearCallOperation<C::Type>>,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -554,7 +482,7 @@ where
         // Replay the forward region on the dual primals, recovering the primal outputs followed by the forward tail
         // (region inputs plus policy-saved residuals) that the tangent region consumes.
         let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let mut forward_outputs = forward_region.interpret_in_context(context, primal_operands)?;
+        let mut forward_outputs = forward_region.interpret_in_context(context.primal(), primal_operands)?;
         if forward_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "{} forward region produced {} outputs which is fewer than its {} primal output(s)",
@@ -589,26 +517,48 @@ where
         let mut tangent_operands =
             non_differentiated_inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         tangent_operands.extend(forward_tail);
+        let primal_residuals = tangent_operands.clone();
+        let mut tangent_operands = tangent_operands
+            .into_iter()
+            .map(|value| context.primal_to_tangent(value))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let residual_count = tangent_operands.len();
 
         // The rematerialize call takes every differentiated input tangent as a real operand, so materialize structural
         // zeros against their own primal, which names every runtime quantity a reference-bearing tangent type omits;
         // static inputs keep the nullary zero.
         for input in differentiated_inputs {
+            let source = context.primal_to_tangent(input.primal().clone())?;
             tangent_operands.push(C::Operation::materialize_zero_from_residual_sources(
-                context,
+                context.tangent(),
                 input.tangent().clone(),
-                std::iter::once(input.primal()),
+                std::iter::once(&source),
             )?);
         }
 
-        let tangent_outputs = tangent_region.interpret_in_context(context, tangent_operands)?;
+        let tangent_outputs = if differentiated_inputs.iter().any(|input| input.primal().r#type().is_reference()) {
+            // Reference cotangents use explicit destination arguments, so this boundary cannot use the ordinary
+            // linear-call transpose signature. Partition recomputation from the live tangent-reference work instead.
+            let mut known = vec![true; residual_count];
+            known.resize(tangent_operands.len(), false);
+            tangent_operands[..residual_count].clone_from_slice(&primal_residuals);
+            let partition = driver.partition_jvp_program(tangent_region, &known, &[])?;
+            interpret_partitioned_jvp(context, &partition, &tangent_operands, 0)?
+        } else {
+            context.tangent().bind(
+                LinearCallOperation::new(residual_count),
+                vec![tangent_region.to_program(), driver.region(2)?.to_program()],
+                &tangent_operands,
+            )?
+        };
         check_count!("output", tangent_outputs, output_count, ProgramError);
 
-        Ok(primal_outputs
+        primal_outputs
             .into_iter()
             .zip(tangent_outputs)
             .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
-            .collect::<Result<Vec<_>, _>>()?)
+            .collect::<Result<Vec<_>, _>>()
     }
 }
 
@@ -1004,7 +954,28 @@ impl<'a, T: Type, O: Operation<Type = T>> RematerializationCandidate<'a, T, O> {
                     ),
                 }
             })?;
-            Self::resolve_producers(program, ValueId::new(region_id, atom), producer_values, producers)?;
+            // A reconstructed region may forward a coefficient instead of producing it again. Follow its declared
+            // operand provenance back to the caller, including scan slices whose enclosing output is stacked again.
+            // A caller input still has no producer and remains unclassified.
+            let source = if let Some(input_index) = region.input_ids().iter().position(|input| *input == atom)
+                && let Some(origin) = instruction.operation().input_region_provenance(origin.region_index, input_index)
+            {
+                let (InputRegionProvenance::Forwarded { input_index } | InputRegionProvenance::View { input_index }) =
+                    origin;
+                let atom = instruction.inputs().get(input_index).copied().ok_or_else(|| {
+                    RematerializationError::UnsupportedProvenance {
+                        message: format!(
+                            "operation `{}` reported provenance selecting operand {input_index} from {} operands",
+                            instruction.operation().name(),
+                            instruction.inputs().len(),
+                        ),
+                    }
+                })?;
+                ValueId::new(value.region(), atom)
+            } else {
+                ValueId::new(region_id, atom)
+            };
+            Self::resolve_producers(program, source, producer_values, producers)?;
         }
         Ok(())
     }
@@ -3003,6 +2974,17 @@ mod tests {
                 rematerialize::<EagerContext<Array, ArrayOperation<Array>>, _, _, _>(scan_body).with_policy(policy);
             let operation = staged_operation(&function, ArrayType::scalar(DataType::F64));
             let forward_output_count = operation.forward().output_types().len();
+            // The captured row stack has a structural-zero tangent. Its unused derivative must not create a second
+            // known scan that computes dot products with zero rows.
+            assert_eq!(
+                operation
+                    .forward()
+                    .instructions()
+                    .iter()
+                    .filter(|instruction| matches!(instruction.operation(), ArrayOperation::Scan(_)))
+                    .count(),
+                1
+            );
 
             let (value, gradient) = EagerContext::<Array, ArrayOperation<Array>>::new()
                 .differentiate_at(Array::scalar(2.0))
@@ -4231,8 +4213,23 @@ mod tests {
             .add_instruction(ArrayOperation::Scan(scan), vec![body_region], vec![carry, rows], None)
             .unwrap()
             .to_vec();
+        // Partial evaluation can wrap a saved stack in a scan that only forwards each slice. Its input provenance
+        // must lead back to the original dot rather than hiding that producer at the intermediate region boundary.
+        let mut identity_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = identity_builder.add_input(ArrayType::scalar(DataType::F64));
+        let identity = identity_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let identity_region = builder.import_region(identity.entry_region_ref());
+        let forwarded = builder
+            .add_instruction(ScanOperation::new(0, 3), vec![identity_region], vec![scan_outputs[1]], None)
+            .unwrap()[0];
         let program = builder
-            .build::<Vec<Array>, Vec<Array>>(scan_outputs.clone(), vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![scan_outputs[0], scan_outputs[1], forwarded],
+                vec![Placeholder; 2],
+                vec![Placeholder; 3],
+            )
             .unwrap();
 
         let candidate =
@@ -4245,6 +4242,12 @@ mod tests {
         assert_eq!(producer.output_index(), 0, "the output index must be local to the nested dot instruction");
         assert_eq!(candidate.residual_type(), &stacked_type, "the residual type must stay the outer stacked type");
         assert_eq!(producer.output_types()[producer.output_index()], ArrayType::scalar(DataType::F64));
+        let forwarded_candidate = RematerializationCandidate::from_program_residual(&program, forwarded, stacked_type)
+            .unwrap()
+            .unwrap();
+        assert_eq!(forwarded_candidate.producers().len(), 1);
+        assert!(matches!(forwarded_candidate.producers()[0].operation(), ArrayOperation::Dot(_)));
+        assert_eq!(forwarded_candidate.producers()[0].output_index(), 0);
     }
 
     #[test]
@@ -5109,6 +5112,40 @@ mod tests {
     }
 
     #[test]
+    fn test_rematerialization_linearize_preserves_reference_boundary_and_saved_reads() {
+        let function = rematerialize::<ReferenceTestContext, _, _, _>(external_read_body);
+        let reference = ArrayReference::new(Array::scalar(2.0_f32));
+        let (value, pushforward) =
+            differentiate_at((ArrayIrValue::Reference(reference.clone()), reference_test_scalar(3.0)))
+                .linearize(|input| function.call(input))
+                .unwrap();
+        assert_eq!(value, reference_test_scalar(6.0));
+
+        // The generated rematerialization tangent region receives the saved primal reference as known plumbing
+        // and the derivative reference as an unknown input. The callable boundary rejects binding those two
+        // formal positions to the same allocation before replaying any tangent work.
+        assert!(matches!(
+            pushforward.apply((ArrayIrValue::Reference(reference.clone()), reference_test_scalar(1.0))),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "tangent 0 aliases a reference bound at the primal boundary of the differentiated function",
+        ));
+        assert_eq!(reference.read(), Ok(Array::scalar(2.0_f32)));
+
+        // External primal reads were saved during linearization, so even consuming the original allocation cannot
+        // affect a later pushforward. Only the distinct tangent reference is read on each invocation:
+        // df(r, x)[dr, dx] = dr * x + saved_read(r) * dx = 3 * dr + 2.
+        assert_eq!(reference.freeze(), Ok(Array::scalar(2.0_f32)));
+        for (direction, expected) in [(2.0_f32, 8.0_f32), (5.0, 17.0), (2.0, 8.0)] {
+            let tangent = ArrayReference::new(Array::scalar(direction));
+            assert_eq!(
+                pushforward.apply((ArrayIrValue::Reference(tangent.clone()), reference_test_scalar(1.0))),
+                Ok(reference_test_scalar(expected)),
+            );
+            assert_eq!(tangent.read(), Ok(Array::scalar(direction)));
+        }
+    }
+
+    #[test]
     fn test_rematerialization_rejects_external_reference_mutation() {
         let function = rematerialize::<ReferenceTestContext, _, _, _>(
             |(reference, x): (ReferenceTestTracer, ReferenceTestTracer)| {
@@ -5190,7 +5227,7 @@ mod tests {
             program.to_flat_program().discharge_references::<ArrayReferenceDischarge>(0),
             Err(ProgramError::UnsupportedOperation { message })
                 if message == "`rematerialize` does not thread external references through discharge, but operand 0 \
-                    is a reference; pass reference-free operands or discharge before rematerializing",
+                    is a reference; pass reference-free operands or discharge external references first",
         ));
 
         // A hand-built call over reference-free operands whose forward tail carries a reference it allocates declares
@@ -5251,7 +5288,7 @@ mod tests {
             program.discharge_references::<ArrayReferenceDischarge>(0),
             Err(ProgramError::UnsupportedOperation { message })
                 if message == "`rematerialize` does not thread external references through discharge, but input 0 of \
-                    region 2 is a reference; pass reference-free operands or discharge before rematerializing",
+                    region 2 is a reference; pass reference-free operands or discharge external references first",
         ));
     }
 
@@ -5323,9 +5360,8 @@ mod tests {
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
 
-        // Phase 0 boundary pin for bounded-while residual classification. The loop body doubles its carry, so the
-        // bounded loop's residual stacks reach the boundary; this records which producing operations the policy
-        // sees for them.
+        // Squaring the carry requires the bounded loop to store per-iteration coefficients. Policies must see the
+        // stack updates that produce those residuals, including through any scan that forwards their slices.
         let scalar_type = ArrayType::scalar(DataType::F64);
         let condition = {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
@@ -5378,8 +5414,8 @@ mod tests {
             .differentiate_at(Array::scalar(1.1))
             .value_and_gradient(|x| function.call(x).unwrap())
             .unwrap();
-        // x -> x^2 -> x^4 -> x^8 (three squarings before the predicate 1.1^8 > 8 stops the loop... the exact
-        // iteration count is loop-driven; the assertions below only require derivative consistency).
+        // At x = 1.1 the predicate stays true through all three squarings, so the iteration bound stops at x^8.
+        // Compare with direct execution to verify both the bounded value and its derivative.
         let direct = EagerContext::<Array, ArrayOperation<Array>>::new()
             .differentiate_at(Array::scalar(1.1))
             .value_and_gradient(|x| {
@@ -5399,10 +5435,13 @@ mod tests {
         let instruction = &program.instructions()[0];
         assert!(matches!(instruction.operation(), ArrayOperation::Rematerialize(_)));
         let forward = program.region_ref(instruction.regions()[1]).unwrap();
-        // Pinned boundary behavior: a bounded while keeps its residual stacks internal to the staged loop, so no
-        // while-produced residuals cross the rematerialization boundary and the policy is never consulted for them.
-        // The forward program stores only the body output and the region input.
-        assert!(names.borrow().is_empty(), "bounded-while loops contribute no residual candidates");
+        // The policy sees the stack producers, but chooses to recompute them. The forward boundary therefore keeps
+        // only the body output and original input, and the numerical assertions above verify the resulting replay.
+        assert!(
+            names.borrow().iter().any(|name| name == "dynamic_update_slice"),
+            "bounded-loop stack producers must remain visible: {:?}",
+            names.borrow(),
+        );
         assert_eq!(forward.output_types().len(), 2);
     }
 

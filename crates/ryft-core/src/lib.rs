@@ -65,14 +65,14 @@ pub use differentiation::{
     DerivativeTransform, DifferentiableOperation, DifferentiableType, Differentiate, DifferentiationBoundaryPosition,
     DifferentiationBuilder, DifferentiationBuilderContext, DifferentiationBuilderExecutionContext,
     DifferentiationBuilderLinearityMode, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationParameterRole, DifferentiationTracer, ElementwiseDerivativeAlignment,
-    ForwardModeDifferentiate, Hessian, HessianBlock, HolomorphicLinearity, Jacobian, JacobianBlock, Linearization,
-    LinearizationTracer, MemberDifferentiableOperation, Pullback, Pushforward, RealLinearity,
-    ReferenceOperandCotangents, ResidualZeroProvider, ReverseModeDifferentiate, TransposableOperation,
-    TranspositionContext, TranspositionDriver, UnaryElementwiseJvpOperands, WithAuxiliaryOutput, WithCapture,
-    WithContext, WithoutAuxiliaryOutput, WithoutCapture, WithoutContext, binary_elementwise_jvp, differentiate_at,
-    jvp_projected_operation, reference_operand_cotangents, transpose_mixed_operation, transpose_projected_operation,
-    unary_elementwise_jvp,
+    DifferentiationError, DifferentiationParameterRole, DifferentiationPolicy, DifferentiationTracer,
+    ElementwiseDerivativeAlignment, ForwardModeDifferentiate, FusedDifferentiation, Hessian, HessianBlock,
+    HolomorphicLinearity, Jacobian, JacobianBlock, Linearization, LinearizationTracer, LinearizedDifferentiation,
+    MemberDifferentiableOperation, Pullback, Pushforward, RealLinearity, ReferenceOperandCotangents,
+    ResidualZeroProvider, ReverseModeDifferentiate, TransposableOperation, TranspositionContext, TranspositionDriver,
+    UnaryElementwiseJvpOperands, WithAuxiliaryOutput, WithCapture, WithContext, WithoutAuxiliaryOutput, WithoutCapture,
+    WithoutContext, binary_elementwise_jvp, differentiate_at, jvp_projected_operation, reference_operand_cotangents,
+    transpose_mixed_operation, transpose_projected_operation, unary_elementwise_jvp,
 };
 pub use errors::{CustomError, Error, MaybeFallible};
 pub use interpretation::{

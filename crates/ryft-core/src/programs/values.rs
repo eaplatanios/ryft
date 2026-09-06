@@ -7,7 +7,7 @@ use crate::arrays::{ArrayBatch, ArrayType};
 use crate::batching::{BatchingPolicy, BatchingTracer};
 use crate::captures::CaptureReference;
 use crate::contexts::{Context, Domain, ProjectedContext};
-use crate::differentiation::DifferentiationTracer;
+use crate::differentiation::{DifferentiationPolicy, DifferentiationTracer};
 use crate::parameters::{Parameter, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialTracer, PartialValue};
 use crate::programs::ProgramError;
@@ -213,7 +213,9 @@ impl<C: Context, P: BatchingPolicy<C, Batch: Concretizable<bool>>> Concretizable
     }
 }
 
-impl<C: Context<Value: Concretizable<bool>>> Concretizable<bool> for DifferentiationTracer<C> {
+impl<C: Context<Value: Concretizable<bool>>, P: DifferentiationPolicy<C>> Concretizable<bool>
+    for DifferentiationTracer<C, P>
+{
     #[inline]
     fn concretize(&self) -> Result<bool, ProgramError> {
         // A differentiation tracer delegates concrete Boolean extraction to its primal, so host branching succeeds

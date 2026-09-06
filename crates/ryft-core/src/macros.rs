@@ -1661,27 +1661,27 @@ macro_rules! impl_differentiable_elementwise_operation {
     // structural-zero tangents and generating the standard rejecting primitive-transposition rule.
     (@non_differentiable $operation:ident $(,)?) => {
         $crate::impl_non_differentiable_operation!(
-            <__P> $operation<__P> where __P: $crate::Type
+            <__R> $operation<__R> where __R: $crate::Type
         );
         $crate::impl_non_transposable_operation!(
-            <__P> $operation<__P> where __P: $crate::Type
+            <__R> $operation<__R> where __R: $crate::Type
         );
     };
 
     // This branch implements a unary result that is constant with respect to its exemplar input. Its JVP has a
     // structural-zero tangent, while transposition returns a structural-zero cotangent shaped by that input.
     (@constant $operation:ident $(,)?) => {
-        $crate::impl_non_differentiable_operation!(<__P> $operation<__P>
-            where __P: $crate::Type);
+        $crate::impl_non_differentiable_operation!(<__R> $operation<__R>
+            where __R: $crate::Type);
 
         impl<
             __T: $crate::DifferentiableType,
-            __P: $crate::Type,
+            __R: $crate::Type,
             __V: $crate::Value<Type = __T>,
             __O: $crate::Operation<Type = __T>,
-        > $crate::TransposableOperation<__V, __O> for $operation<__P>
+        > $crate::TransposableOperation<__V, __O> for $operation<__R>
         where
-            $operation<__P>: $crate::Operation<Type = __T>,
+            $operation<__R>: $crate::Operation<Type = __T>,
         {
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
@@ -1706,7 +1706,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     // its input primal and output primal. The shared parser handles its optional unbraced JVP bounds.
     (@unary $operation:ident, $($tail:tt)*) => {
         $crate::impl_differentiable_elementwise_operation!(
-            @public_jvp [unary] [__P] $operation<__P>, $($tail)*
+            @public_jvp [unary] [__R] $operation<__R>, $($tail)*
         );
     };
 
@@ -1714,7 +1714,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     // and either a structured or custom primitive-transposition rule.
     (@binary $operation:ident, $($tail:tt)*) => {
         $crate::impl_differentiable_elementwise_operation!(
-            @public_jvp [binary] [__P] $operation<__P>, $($tail)*
+            @public_jvp [binary] [__R] $operation<__R>, $($tail)*
         );
     };
 
@@ -1727,7 +1727,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @linear_unary [positive]
-            impl<__C, __P> $operation<__P>
+            impl<__C, __R> $operation<__R>
             where {}
             transpose_type_bound { $crate::Type }
             transpose_operation_bounds {}
@@ -1743,7 +1743,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @linear_unary [negative]
-            impl<__C, __P> $operation<__P>
+            impl<__C, __R> $operation<__R>
             where {
                 <__C as $crate::Domain>::Value: ::std::ops::Neg<Output = <__C as $crate::Domain>::Value>,
             }
@@ -1761,7 +1761,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @linear_binary [positive, positive]
-            impl<__C, __P> $operation<__P>
+            impl<__C, __R> $operation<__R>
             where { ::std::ops::Add<Output = <__C as $crate::Domain>::Value> }
             transpose_operation_bounds {}
         }
@@ -1776,7 +1776,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @linear_binary [positive, negative]
-            impl<__C, __P> $operation<__P>
+            impl<__C, __R> $operation<__R>
             where {
                 ::std::ops::Neg<Output = <__C as $crate::Domain>::Value>
                     + ::std::ops::Sub<Output = <__C as $crate::Domain>::Value>
@@ -1794,7 +1794,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @linear_binary [negative, positive]
-            impl<__C, __P> $operation<__P>
+            impl<__C, __R> $operation<__R>
             where {
                 ::std::ops::Neg<Output = <__C as $crate::Domain>::Value>
                     + ::std::ops::Sub<Output = <__C as $crate::Domain>::Value>
@@ -1812,7 +1812,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     ) => {
         $crate::impl_differentiable_elementwise_operation! {
             @linear_binary [negative, negative]
-            impl<__C, __P> $operation<__P>
+            impl<__C, __R> $operation<__R>
             where {
                 ::std::ops::Add<Output = <__C as $crate::Domain>::Value>
                     + ::std::ops::Neg<Output = <__C as $crate::Domain>::Value>
