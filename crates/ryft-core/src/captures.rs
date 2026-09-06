@@ -64,7 +64,7 @@ use ryft_macros::Parameter;
 use crate::batching::{BatchableOperation, BatchingContext, RecursiveBatchingPolicy};
 use crate::contexts::{Context, EagerContext, ProjectedContext};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationContext, ResidualZeroProvider,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationPolicy, ResidualZeroProvider,
 };
 use crate::macros::check_count;
 use crate::parameters::{Parameter, Parameterized, Placeholder};
@@ -300,7 +300,7 @@ impl<C: CapturingContext<Operation: BatchableOperation<C, P>>, P: RecursiveBatch
     }
 }
 
-impl<C: CapturingContext> CapturingContext for DifferentiationContext<C>
+impl<C: CapturingContext, P: DifferentiationPolicy<C>> CapturingContext for DifferentiationContext<C, P>
 where
     C::Type: DifferentiableType,
     C::Operation: PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>

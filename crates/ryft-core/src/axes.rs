@@ -53,7 +53,7 @@ use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, D
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationContext, ResidualZeroProvider,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationPolicy, ResidualZeroProvider,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
@@ -390,7 +390,7 @@ where
     }
 }
 
-impl<C: NamedAxes> NamedAxes for DifferentiationContext<C>
+impl<C: NamedAxes, P: DifferentiationPolicy<C>> NamedAxes for DifferentiationContext<C, P>
 where
     C::Type: DifferentiableType,
     C::Operation: DifferentiableOperation<C>
