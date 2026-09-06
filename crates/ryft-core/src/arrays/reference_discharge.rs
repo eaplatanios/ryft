@@ -30,10 +30,10 @@
 //! - **Forward mode** ([`Program::jvp`](crate::Program::jvp) and [`differentiate_at`](crate::differentiate_at)) pairs
 //!   every active primal reference with a caller-supplied tangent reference and mutates both in program order; a
 //!   captured reference is plumbing with a symbolic zero tangent, and a live tangent stored into it is rejected.
-//! - **Linearization** ([`Program::linearize`](crate::Program::linearize)) is the known-ness split of the fused
-//!   forward pass: the primal accesses fold into the forward pass (mutating the primal reference at linearization
-//!   time) while the tangent accesses stage into the pushforward over the tangent reference, placed by the per-root
-//!   effect frontier of the dedicated linearization context.
+//! - **Linearization** ([`Program::linearize`](crate::Program::linearize)) places primal accesses in the forward pass
+//!   and tangent accesses in the pushforward. Primal references are updated at linearization time; tangent references
+//!   are updated when the pushforward runs. Allocations used only by a pushforward call are created afresh for that
+//! call.
 //! - **Reverse mode** ([`Pullback::apply_with_destinations`](crate::Pullback::apply_with_destinations)) accumulates
 //!   the state cotangent of every linear reference through a cotangent reference: a caller-supplied
 //!   [`CotangentDestination::Reference`](crate::CotangentDestination::Reference), an internal one whose final contents
@@ -92,8 +92,10 @@
 //! discharged.batched_with_threaded_extent(...)     // agrees with batching `program` at the same axes
 //! ```
 //!
-//! An allocation that is allocated, mutated, and consumed inside one program is discharged into ordinary array SSA, so the
-//! rewritten callable is reference-free: it reports no external-reference bindings and keeps exactly its original public
+//! An allocation that is allocated, mutated, and consumed inside one program is discharged into ordinary array SSA, so
+//! the
+//! rewritten callable is reference-free: it reports no external-reference bindings and keeps exactly its original
+//! public
 //! outputs.
 //!
 //! ```
@@ -241,7 +243,8 @@ where
     fn read(context: &C, current: &C::Value, alias: &ArrayReferenceView<C::Value>) -> Result<C::Value, ProgramError> {
         let mut intermediates = alias.intermediates_in(&mut DestinationViewCarrier(context), current.clone())?;
 
-        // The traversal always pushes the allocation itself first, so the chain is never empty and its last snapshot is the
+        // The traversal always pushes the allocation itself first, so the chain is never empty and its last snapshot is
+        // the
         // value this handle selects.
         Ok(intermediates.pop().unwrap())
     }
@@ -443,7 +446,8 @@ mod tests {
     #[test]
     fn test_flat_reference_discharge_rewrites_the_complete_flat_language() {
         // Discharge is exercised over the complete flat reference language: allocation, read, write, swap, additive
-        // update, freeze, and both composed view derivations, over a local allocation and over external allocations. Every case
+        // update, freeze, and both composed view derivations, over a local allocation and over external allocations.
+        // Every case
         // asserts the exact rewritten program before asserting behavior.
         let vector_type = ArrayType::new_static(DataType::F32, [4]);
         let pair_type = ArrayType::new_static(DataType::F32, [2]);
@@ -505,7 +509,8 @@ mod tests {
         assert_eq!(discharged.external_reference_bindings(), &[]);
         assert_eq!(discharged.program().interpret(inputs), Ok(expected));
 
-        // Two external allocations, one written and one only read, with the read reaching the second allocation first so that
+        // Two external allocations, one written and one only read, with the read reaching the second allocation first
+        // so that
         // boundary order cannot accidentally follow access order.
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference_type = ReferenceType::new(scalar_type());
@@ -536,7 +541,8 @@ mod tests {
             Ok(vec![scalar(20.0), scalar(10.0), scalar(7.0)]),
         );
 
-        // A program that only reads an external allocation keeps its source boundary exactly: the allocation enters as state and
+        // A program that only reads an external allocation keeps its source boundary exactly: the allocation enters as
+        // state and
         // publishes nothing, so no hidden output is appended.
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let external = builder.add_input(ReferenceType::new(scalar_type()).into());
@@ -606,7 +612,8 @@ mod tests {
     #[test]
     fn test_reference_discharge_reports_environment_and_boundary_failures() {
         // Discharge catches at replay time what construction-time checking catches ahead of it: an allocation that a
-        // `freeze` already consumed is reported against that exact allocation. The checked append rejects this program, so
+        // `freeze` already consumed is reported against that exact allocation. The checked append rejects this program,
+        // so
         // the stale read is assembled through the unchecked rebuild hatch to prove discharge's own guard.
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let initial = builder.add_input(scalar_type().into());
@@ -744,7 +751,8 @@ mod tests {
     fn test_array_reference_discharge_policy_stages_composed_view_accesses() {
         // The policy is the interpreter-side half of array reference discharge, so this test pins the exact
         // instruction sequence each of its three alias applications stages, over a composed index-of-slice view of a
-        // 3x3 allocation. Each access materializes the allocation-to-handle chain against the state it observes, so the chain is
+        // 3x3 allocation. Each access materializes the allocation-to-handle chain against the state it observes, so the
+        // chain is
         // restaged per access rather than shared, and a replacement and an accumulation then write their new leaf
         // back through that chain in reverse. The alias is closed over destination values, and a static chain binds
         // none of them.
@@ -1301,7 +1309,8 @@ mod tests {
         );
         assert_eq!(discharged.output_count(), 2);
 
-        // Metadata follows entry-boundary order rather than access order, and only the swapped first allocation receives a
+        // Metadata follows entry-boundary order rather than access order, and only the swapped first allocation
+        // receives a
         // hidden final-state output after the public prefix.
         assert_eq!(
             discharged.external_reference_bindings(),
@@ -1378,7 +1387,8 @@ mod tests {
         let discharged = source.clone().partially_discharge_references(0, &targets[..1]).unwrap();
 
         // The selected allocation disappeared into threaded array state, while the unselected one, its view, its swap,
-        // and its freeze all survive as the reference operations the source performed. Neither allocation is caller-owned,
+        // and its freeze all survive as the reference operations the source performed. Neither allocation is
+        // caller-owned,
         // so the mixed program reports no external-reference bindings and keeps exactly its source boundary.
         assert_eq!(discharged.output_count(), 3);
         assert_eq!(discharged.external_reference_bindings(), &[]);
@@ -1420,7 +1430,8 @@ mod tests {
 
     #[test]
     fn test_partial_reference_discharge_threads_a_preserved_allocation_through_condition_branches() {
-        // A condition's shared state boundary carries both kinds of allocation: the selected one crosses as immutable state
+        // A condition's shared state boundary carries both kinds of allocation: the selected one crosses as immutable
+        // state
         // and is widened with a published successor, while the preserved one crosses as the reference it already is,
         // at its own declared operand position, and is read inside each branch exactly as the source read it.
         let reference_type = ReferenceType::new(scalar_type());
@@ -1512,7 +1523,8 @@ mod tests {
     #[test]
     fn test_partial_reference_discharge_widens_nothing_for_a_preserved_allocation_a_region_writes() {
         // Read-only pruning and preservation meet here: the discharged reference is only read, so it gains no appended
-        // output, and the preserved reference is *written* inside a branch, which still gains it nothing, because the write
+        // output, and the preserved reference is *written* inside a branch, which still gains it nothing, because the
+        // write
         // replayed into the rebuilt branch as the operation the source performed. The condition therefore keeps its
         // source boundary exactly.
         let reference_type = ReferenceType::new(scalar_type());
@@ -1601,8 +1613,10 @@ mod tests {
     #[test]
     fn test_partial_reference_discharge_threads_a_preserved_allocation_through_nested_structured_boundaries() {
         // A rebuilt region is discharged against its own isolated environment, so a preserved reference crossing two
-        // boundaries is bound as a preserved reference of the outer fork and then threaded again into the inner one. The
-        // reference therefore reaches the innermost access as the caller's own, and the discharged reference beside it is
+        // boundaries is bound as a preserved reference of the outer fork and then threaded again into the inner one.
+        // The
+        // reference therefore reaches the innermost access as the caller's own, and the discharged reference beside it
+        // is
         // widened independently at each level.
         let reference_type = ReferenceType::new(scalar_type());
         let inner = |accumulates: bool| {
@@ -1982,7 +1996,8 @@ mod tests {
         ));
 
         // A program that allocates every allocation itself passes the gate with its boundary unchanged, because hidden
-        // final-state outputs are appended only for external allocations. The result is an ordinary reference-free array
+        // final-state outputs are appended only for external allocations. The result is an ordinary reference-free
+        // array
         // program.
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let initial = builder.add_input(scalar_type().into());
@@ -2142,7 +2157,8 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 5], vec![Placeholder; 2])
             .unwrap();
 
-        // Both branches write a different allocation, so both allocations cross the boundary; the appended final-state outputs
+        // Both branches write a different allocation, so both allocations cross the boundary; the appended final-state
+        // outputs
         // follow parent entry-boundary order rather than the order in which either branch happens to access them.
         let discharged = source.discharge_references(0).unwrap();
         assert_eq!(discharged.output_count(), 2);
@@ -2152,7 +2168,8 @@ mod tests {
         assert_eq!(discharged.external_reference_bindings()[1].source(), ReferenceSource::Input { index: 2 });
         assert_eq!(discharged.external_reference_bindings()[1].output_index(), Some(3));
 
-        // The true branch swaps only the second allocation, leaving the first allocation's final state at its entering value.
+        // The true branch swaps only the second allocation, leaving the first allocation's final state at its entering
+        // value.
         let inputs = vec![boolean(true), scalar(10.0), scalar(20.0), scalar(11.0), scalar(22.0)];
         assert_eq!(
             discharged.program().interpret(inputs),
@@ -2169,7 +2186,8 @@ mod tests {
 
     #[test]
     fn test_condition_discharge_isolates_its_branches() {
-        // Both branches accumulate a different amount into the same allocation and return the state they observe. If either
+        // Both branches accumulate a different amount into the same allocation and return the state they observe. If
+        // either
         // branch's staging leaked into the other's, the second branch would start from the first's successor state.
         let reference_type = ReferenceType::new(scalar_type());
         let branch = |amount: f32| {
@@ -2245,7 +2263,8 @@ mod tests {
 
     #[test]
     fn test_condition_discharge_rejects_a_branch_local_allocation_that_escapes() {
-        // Both branches allocate an allocation of their own and return it, so the condition's output denotes a reference its
+        // Both branches allocate an allocation of their own and return it, so the condition's output denotes a
+        // reference its
         // caller never threaded in. Merging that output would hand the caller a handle into an environment that no
         // longer exists, so the rewrite rejects it instead.
         let branch = || {
@@ -2346,7 +2365,8 @@ mod tests {
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![value], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
 
-        // The allocation is allocated and frozen inside the true branch, so no state crosses the entry boundary even though a
+        // The allocation is allocated and frozen inside the true branch, so no state crosses the entry boundary even
+        // though a
         // nested loop mutates it; the false branch never sees the allocation at all.
         let discharged = source.discharge_references(0).unwrap();
         assert_eq!(discharged.external_reference_bindings(), &[]);
@@ -2478,7 +2498,8 @@ mod tests {
             .unwrap();
 
         // Each declared carry position still exists in the rebuilt loop even though both source operands name one
-        // allocation. The allocation has one canonical state, so either carry observes the same update and only one hidden final
+        // allocation. The allocation has one canonical state, so either carry observes the same update and only one
+        // hidden final
         // state is published.
         let discharged = source.discharge_references(0).unwrap();
         assert_eq!(discharged.external_reference_bindings().len(), 1);
@@ -3144,7 +3165,8 @@ mod tests {
     fn test_read_only_loop_discharge_adds_no_final_state_output() {
         // A loop's boundaries stay symmetric — a carry position exists in the condition's and the body's boundaries or
         // in neither — but symmetry is a property of those boundaries, not a claim that the loop wrote what it carried.
-        // Nothing here writes the external allocation, so it enters as state, rides the carry, and publishes no hidden final
+        // Nothing here writes the external allocation, so it enters as state, rides the carry, and publishes no hidden
+        // final
         // state, which is what keeps its caller from publishing an unchanged value back to the reference.
         let reference_type = ReferenceType::new(scalar_type());
         let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
@@ -3200,7 +3222,8 @@ mod tests {
 
     #[test]
     fn test_read_only_condition_discharge_adds_no_final_state_output() {
-        // A closure that only reads an external allocation needs the state to enter both branches, but the allocation's value
+        // A closure that only reads an external allocation needs the state to enter both branches, but the allocation's
+        // value
         // never changes, so no branch gains a final-state result and the parent condition keeps exactly its public
         // outputs instead of carrying a dead state output.
         let reference_type = ReferenceType::new(scalar_type());
@@ -3495,7 +3518,8 @@ mod tests {
             }
         }
 
-        // The callee mutates the allocation it receives and returns only the old snapshot, so its declared boundary hides
+        // The callee mutates the allocation it receives and returns only the old snapshot, so its declared boundary
+        // hides
         // the final state that the call target needs after discharge.
         let mut callee_builder = ProgramBuilder::<TestValue, CallingOperation>::new();
         let reference = callee_builder.add_input(ReferenceType::new(scalar_type()).into());

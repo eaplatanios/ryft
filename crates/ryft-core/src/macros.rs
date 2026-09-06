@@ -4704,6 +4704,8 @@ mod tests {
         check_array_types = [@no_unreduced],
     );
 
+    impl_reference_free_dischargeable_operation!(TestUnaryOperation<ArrayType>);
+
     define_elementwise_operation!(
         @binary
         /// Binary operation used to test [`define_elementwise_operation!`].
@@ -4865,7 +4867,6 @@ mod tests {
         rule = [@negative, @negative]
     }
 
-    impl_reference_free_dischargeable_operation!(TestUnaryOperation<ArrayType>);
     impl_non_differentiable_operation!(TestUnaryOperation<ArrayType>);
     impl_non_transposable_operation!(TestUnaryOperation<ArrayType>);
     impl_non_differentiable_operation!(TestBinaryOperation<ArrayType>);

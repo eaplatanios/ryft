@@ -57,7 +57,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
-use crate::operations::{BroadcastOperation, IotaOperation, TransposeOperation};
+use crate::operations::{Broadcast, BroadcastOperation, IotaOperation, Transpose, TransposeOperation};
 use crate::parameters::Parameter;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
@@ -369,7 +369,7 @@ where
     }
 }
 
-impl<C: NamedAxes<Type = ArrayType>> NamedAxes for BatchingContext<C, ArrayBatching>
+impl<C: NamedAxes<Type = ArrayType, Value: Broadcast + Transpose>> NamedAxes for BatchingContext<C, ArrayBatching>
 where
     C::Operation: BatchableOperation<C, ArrayBatching>
         + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayBatching>

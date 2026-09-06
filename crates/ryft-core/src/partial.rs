@@ -980,7 +980,6 @@ impl<V: Value, O: Operation<Type = V::Type>, D: RegionDriver<V, O>> RegionDriver
     }
 }
 
-// TODO(eaplatanios): Review this.
 impl<C: Context, D: RegionDriver<C::Constant, C::Operation>> PartialEvaluationDriver<C>
     for RecursivePartialEvaluationDriver<'_, D>
 where
@@ -994,11 +993,20 @@ where
         inputs: Vec<PartialEvaluationValue<C::Value>>,
     ) -> Result<Vec<PartialEvaluationValue<C::Value>>, ProgramError> {
         let region = self.region(index)?;
+
+        // Inlining during ordinary specialization shares the caller's residual builder and accumulated effect
+        // ordering. It needs no separate allocation discovery or per-reference ordering analysis.
         if !self.repeated_residual {
             return context.inline_region(region, inputs, &HashSet::new(), None, None);
         }
+
+        // Analyze a staged copy using only input knownness to discover allocations that must be fresh on each
+        // residual invocation. Discard the staged programs as the replay below must use the caller's actual values.
         let knowledge = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<_>>();
         let (_, deferred_instructions) = region.partition_with_configuration(&knowledge, true, true, None)?;
+
+        // Replay into the active context, explicitly deferring the discovered allocations. Source reference roots
+        // let replay distinguish independent accesses while keeping accesses to the same state in order.
         context.inline_region(
             region,
             inputs,
@@ -1014,15 +1022,24 @@ where
         region: RegionRef<'_, C::Constant, C::Operation>,
         knowledge: &[PartialValue<C::Value>],
     ) -> Result<PartialEvaluation<C>, ProgramError> {
+        // Unlike inlining a region, constructing a separate residual program needs fresh builder and ordering
+        // state. Ordinary specialization still inherits the caller's permission to fold effectful work.
         if !self.repeated_residual {
             return region.partially_evaluate_in_context(context.parent(), knowledge, context.allow_effect_folding);
         }
+
+        // Give the nested evaluation its own residual program while folding through the same known-side parent.
+        // Stage placement keeps live reference operations residual when that parent is eager.
         let nested =
             PartialEvaluationContext::new(context.parent().clone()).with_reference_placement(ReferencePlacement::Stage);
+
         // Repeated residual calls use their own allocation placement and reference-ordering analysis. Keep the
         // fresh context's effect folding enabled so that this analysis determines which effects must be deferred.
         let known = knowledge.iter().map(PartialValue::is_known).collect::<Vec<_>>();
         let (_, deferred_instructions) = region.partition_with_configuration(&known, true, true, None)?;
+
+        // Retain actual known values and create residual inputs for unknowns. Their indices refer to the original
+        // region inputs so the returned evaluation can reconstruct its residual arguments in the correct order.
         let inputs = knowledge
             .iter()
             .enumerate()
@@ -1031,6 +1048,10 @@ where
                 PartialValue::Unknown(r#type) => nested.unknown_input(r#type.clone(), index),
             })
             .collect();
+
+        // Apply the allocation decisions to replay of the original region, using its reference analysis to preserve
+        // dependencies between accesses. The discovery pass already recorded which allocations need deferring, so
+        // this replay does not need to collect another list of residual source instructions.
         let outputs = nested.inline_region(
             region,
             inputs,
@@ -1038,6 +1059,8 @@ where
             None,
             Some(region.reference_analysis_with_constants()?.as_ref()),
         )?;
+
+        // Finalize the residual program and report how its inputs and outputs relate to the original computation.
         nested.into_evaluation(outputs)
     }
 
@@ -1047,9 +1070,15 @@ where
         region: RegionRef<'_, C::Constant, C::Operation>,
         input_known: &[bool],
     ) -> Result<PartitionedProgram<C::Constant, C::Operation>, ProgramError> {
+        // Both paths stage fresh known and residual programs without executing effects or changing the caller's
+        // accumulated ordering state. Only the programs are needed here; allocation IDs are for replaying source
+        // regions, whereas these returned programs already incorporate the allocation decisions.
         if self.repeated_residual {
+            // Let repeated-call allocation and reference-ordering analysis decide which effects can remain known,
+            // rather than inheriting a restriction intended for the caller's current residual program.
             region.partition_with_configuration(input_known, true, true, None).map(|(partition, _)| partition)
         } else {
+            // Ordinary specialization preserves the caller's effect-folding policy and uses a single partition pass.
             region
                 .partition_with_configuration(input_known, context.allow_effect_folding, false, None)
                 .map(|(partition, _)| partition)
@@ -2795,10 +2824,9 @@ mod tests {
     use crate::contexts::{Context, StagingContext};
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::{
-        AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, ConstantOperation, MulOperation,
-        NegOperation, PrintOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
-        ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, ScanOperation, SinOperation,
-        WhileOperation, Zero,
+        AddOperation, ConditionOperation, LinearCallOperation, MulOperation, NegOperation, PrintOperation,
+        ReferenceAddUpdateOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation,
+        ReferenceWriteOperation, SinOperation, SubOperation, Zero,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{
@@ -2811,8 +2839,93 @@ mod tests {
     type TestOperation = ArrayIrOperation<Array>;
     type TestCapture = CaptureReference<ArrayIrType>;
 
+    /// Builds a nested residual read followed by a write to an independently supplied reference.
+    fn reference_ordering_program() -> Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>> {
+        let reference_type: ArrayIrType = ReferenceType::new(ArrayType::scalar(DataType::F32)).into();
+        let mut branch = ProgramBuilder::<TestValue, TestOperation>::new();
+        let source = branch.add_input(reference_type.clone());
+        branch.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![source], None).unwrap();
+        let branch = branch.build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let destination = builder.add_input(reference_type.clone());
+        let source = builder.add_input(reference_type);
+        let predicate = builder.add_constant(TestValue::Array(Array::scalar(true)));
+        let zero = builder.add_constant(TestValue::Array(Array::scalar(0.0_f32)));
+        let true_branch = builder.import_program(branch.clone());
+        let false_branch = builder.import_program(branch);
+        builder
+            .add_instruction(ConditionOperation::new(), vec![true_branch, false_branch], vec![predicate, source], None)
+            .unwrap();
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![destination, zero], None)
+            .unwrap();
+        builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder; 2], Vec::new())
+            .unwrap()
+    }
+
+    /// Replays a region with optional instruction observation and returns both emitted programs for comparison.
+    fn replay_reference_ordering_program(
+        region: RegionRef<'_, TestValue, TestOperation>,
+        observations: Option<&RefCell<Vec<InstructionId>>>,
+        reference_analysis: Option<&ReferenceAnalysis>,
+    ) -> (
+        Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>,
+        Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>,
+    ) {
+        let parent = TracingContext::<TestValue, TestOperation>::new();
+        let context = PartialEvaluationContext::new(parent.clone()).with_reference_placement(ReferencePlacement::Stage);
+        let inputs = vec![
+            PartialEvaluationValue::known_input(parent.input(region.input_types()[0].clone())),
+            context.unknown_input(region.input_types()[1].clone(), 1),
+        ];
+        let outputs = context.inline_region(region, inputs, &HashSet::new(), observations, reference_analysis).unwrap();
+        assert!(outputs.is_empty());
+        let residual = context.into_evaluation(outputs).unwrap().program;
+        let known = parent
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::new())
+            .unwrap();
+        (known, residual)
+    }
+
     #[test]
-    fn test_partial_evaluation() {
+    fn test_partial_evaluation_known_reference_inputs() {
+        // Forward a mixture of known arrays, known references, and unknown references through a valid residual
+        // boundary. Only the known reference positions are reported.
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
+        let inputs = vec![
+            PartialEvaluationInput::Unknown(0),
+            PartialEvaluationInput::Known(ArrayIrValue::Array(Array::scalar(2.0_f32))),
+            PartialEvaluationInput::Known(reference.clone()),
+            PartialEvaluationInput::Unknown(1),
+            PartialEvaluationInput::Known(reference.clone()),
+        ];
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let outputs = inputs
+            .iter()
+            .map(|input| {
+                builder.add_input(match input {
+                    PartialEvaluationInput::Known(value) => value.r#type().into_owned(),
+                    PartialEvaluationInput::Unknown(_) => reference.r#type().into_owned(),
+                })
+            })
+            .collect::<Vec<_>>();
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 5], vec![Placeholder; 5])
+            .unwrap();
+        let evaluation = PartialEvaluation::<EagerContext<TestValue, TestOperation>> {
+            program,
+            inputs,
+            outputs: (0..5).map(PartialEvaluationOutput::Unknown).collect(),
+        };
+        assert_eq!(evaluation.known_reference_inputs().collect::<Vec<_>>(), vec![2, 4]);
+    }
+
+    #[test]
+    fn test_partial_evaluation_interpret() {
         // Build a residual program `g(x, r) = x * r + 3`, with `x` standing for the original program's surviving
         // unknown input and `r` for a known residual feeder carrying the folded value `2`, and pair it with an
         // original output report whose first output folded to `5`.
@@ -2841,11 +2954,11 @@ mod tests {
         assert!(matches!(
             evaluation.interpret(&context, &[]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
-        ));
+        ),);
         assert!(matches!(
             evaluation.interpret(&context, &[Array::scalar(4.0), Array::scalar(5.0)]),
             Err(ProgramError::InvalidInputCount { expected: 1, actual: 2 }),
-        ));
+        ),);
 
         // An output that references a residual output the residual program does not produce is reported as a
         // malformed program.
@@ -2859,7 +2972,7 @@ mod tests {
             Err(ProgramError::MalformedProgram(message))
                 if message == "partial evaluation output references residual output 1 but the residual program \
                     produced 1 output(s)",
-        ));
+        ),);
 
         // Under a staging known-side context, the same replay stages the residual program into the outer trace
         // instead of executing it. Its constant is lifted as a staged constant, its instructions are staged as outer
@@ -2899,70 +3012,21 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_evaluation_known_reference_inputs() {
-        // Forward a mixture of known arrays, known references, and unknown references through a valid residual
-        // boundary. Only the known reference positions are reported.
-        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
-        let inputs = vec![
-            PartialEvaluationInput::Unknown(0),
-            PartialEvaluationInput::Known(ArrayIrValue::Array(Array::scalar(2.0_f32))),
-            PartialEvaluationInput::Known(reference.clone()),
-            PartialEvaluationInput::Unknown(1),
-            PartialEvaluationInput::Known(reference.clone()),
-        ];
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let outputs = inputs
-            .iter()
-            .map(|input| {
-                builder.add_input(match input {
-                    PartialEvaluationInput::Known(value) => value.r#type().into_owned(),
-                    PartialEvaluationInput::Unknown(_) => reference.r#type().into_owned(),
-                })
-            })
-            .collect::<Vec<_>>();
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 5], vec![Placeholder; 5])
-            .unwrap();
-        let evaluation = PartialEvaluation::<EagerContext<TestValue, TestOperation>> {
-            program,
-            inputs,
-            outputs: (0..5).map(PartialEvaluationOutput::Unknown).collect(),
-        };
-        assert_eq!(evaluation.known_reference_inputs().collect::<Vec<_>>(), vec![2, 4]);
-    }
-
-    #[test]
-    fn test_effect_ordering_default() {
-        let dependencies = EffectOrdering::<usize>::default();
-        assert!(dependencies.is_empty());
-        assert!(!matches!(dependencies, EffectOrdering::Global));
-        assert!(!dependencies.conflicts(&EffectOrdering::Global));
-        assert!(!EffectOrdering::Global.conflicts(&dependencies));
-    }
-
-    #[test]
-    fn test_effect_ordering_global() {
-        let dependencies = EffectOrdering::<usize>::Global;
-        assert!(!dependencies.is_empty());
-        assert!(matches!(dependencies, EffectOrdering::Global));
-        assert!(dependencies.conflicts(&dependencies));
-        assert!(dependencies.conflicts(&EffectOrdering::PerReference(HashSet::from([1]))));
-        assert!(EffectOrdering::PerReference(HashSet::from([1])).conflicts(&dependencies));
-    }
-
-    #[test]
-    fn test_effect_ordering_per_reference() {
-        let dependencies = EffectOrdering::PerReference(HashSet::from([1, 1, 2]));
-        assert!(!dependencies.is_empty());
-        assert!(!matches!(dependencies, EffectOrdering::Global));
-        assert!(
-            matches!(&dependencies, EffectOrdering::PerReference(references) if *references == HashSet::from([1, 2]))
-        );
+    fn test_effect_ordering_is_empty() {
+        assert!(EffectOrdering::<usize>::default().is_empty());
         assert!(EffectOrdering::<usize>::PerReference(HashSet::new()).is_empty());
+        assert!(!EffectOrdering::PerReference(HashSet::from([1])).is_empty());
+        assert!(!EffectOrdering::<usize>::Global.is_empty());
     }
 
     #[test]
     fn test_effect_ordering_conflicts() {
+        let empty = EffectOrdering::<usize>::default();
+        assert!(!empty.conflicts(&EffectOrdering::Global));
+        assert!(!EffectOrdering::Global.conflicts(&empty));
+        assert!(EffectOrdering::<usize>::Global.conflicts(&EffectOrdering::Global));
+        assert!(EffectOrdering::Global.conflicts(&EffectOrdering::PerReference(HashSet::from([1]))));
+        assert!(EffectOrdering::PerReference(HashSet::from([1])).conflicts(&EffectOrdering::Global));
         let dependencies = EffectOrdering::PerReference(HashSet::from([1, 2]));
         let overlapping = EffectOrdering::PerReference(HashSet::from([2, 3]));
         let disjoint = EffectOrdering::PerReference(HashSet::from([3, 4]));
@@ -2980,13 +3044,28 @@ mod tests {
         dependencies.extend(&EffectOrdering::PerReference(HashSet::from([2, 3])));
         dependencies.extend(&EffectOrdering::default());
         assert!(
-            matches!(&dependencies, EffectOrdering::PerReference(references) if *references == HashSet::from([1, 2, 3]))
+            matches!(&dependencies, EffectOrdering::PerReference(references) if *references == HashSet::from([1, 2, 3])),
         );
         assert!(!matches!(dependencies, EffectOrdering::Global));
         dependencies.extend(&EffectOrdering::Global);
         dependencies.extend(&EffectOrdering::PerReference(HashSet::from([4])));
         assert!(matches!(dependencies, EffectOrdering::Global));
         assert!(dependencies.conflicts(&EffectOrdering::PerReference(HashSet::from([5]))));
+    }
+
+    #[test]
+    fn test_effects_summary_effect_ordering() {
+        assert!(EffectsSummary::PURE.effect_ordering([0]).is_empty());
+        let read = ReferenceReadOperation::<ArrayType, ArrayIrType>::new().effects().summary();
+        assert!(
+            matches!(read.effect_ordering([0, 1]), EffectOrdering::PerReference(roots) if roots == HashSet::from([0, 1])),
+        );
+        // Unresolved reference roots and explicitly ordered state cannot establish per-reference independence.
+        assert!(matches!(read.effect_ordering(Vec::<usize>::new()), EffectOrdering::Global));
+        let explicit = Effects::explicit(EffectClasses::single(EffectClass::OrderedState)).summary();
+        assert!(matches!(explicit.effect_ordering([0]), EffectOrdering::Global));
+        let io = Effects::explicit(EffectClasses::single(EffectClass::OrderedIo)).summary();
+        assert!(matches!(io.effect_ordering([0]), EffectOrdering::Global));
     }
 
     #[test]
@@ -3052,6 +3131,36 @@ mod tests {
     }
 
     #[test]
+    fn test_partitioned_program_has_effect_ordering_conflicts() {
+        let reference_type: ArrayIrType = ReferenceType::new(ArrayType::scalar(DataType::F32)).into();
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let known = builder.add_input(reference_type.clone());
+        let unknown = builder.add_input(reference_type);
+        let known = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![known], None).unwrap()[0];
+        let unknown =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![unknown], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![known, unknown], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        // Each emitted program numbers its single reference input as zero. Resolve them back to original boundary
+        // inputs before comparing identities; ordinary specialization still preserves their global ordering.
+        let ordinary = program.partition(&[true, false]).unwrap();
+        assert!(ordinary.has_effect_ordering_conflicts());
+        let (repeated, _) = program
+            .entry_region_ref()
+            .partition_with_configuration(&[true, false], true, true, Some(&[0]))
+            .unwrap();
+        assert!(!repeated.has_effect_ordering_conflicts());
+        assert!(!program.partition(&[false, false]).unwrap().has_effect_ordering_conflicts());
+
+        // Reconstructing through the unqualified boundary constructor carries no repeated-invocation evidence.
+        let (known, residual, input_indices, residual_inputs, outputs) = repeated.into_parts();
+        let reconstructed = PartitionedProgram::from_parts(known, residual, input_indices, residual_inputs, outputs);
+        assert!(reconstructed.has_effect_ordering_conflicts());
+    }
+
+    #[test]
     fn test_recursive_partial_evaluation_driver_partition_program() {
         let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
         let reference_type: ArrayIrType = ReferenceType::new(ArrayType::scalar(DataType::F32)).into();
@@ -3081,6 +3190,66 @@ mod tests {
         let partition = driver.partition_program(&context, regions[0].entry_region_ref(), &[true, true, true]).unwrap();
         assert_eq!(partition.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
         assert!(!context.defer_ordered_effects.get());
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_new() {
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        assert_eq!(context.reference_placement(), ReferencePlacement::Execute);
+        assert!(context.allow_effect_folding);
+        assert!(context.builder.borrow().instructions().is_empty());
+        assert!(context.inputs.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_with_reference_placement() {
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
+        let input = context.unknown_input(ArrayType::scalar(DataType::F32).into(), 0);
+        let configured = context.clone().with_reference_placement(ReferencePlacement::Stage);
+        assert_eq!(context.reference_placement(), ReferencePlacement::Execute);
+        assert_eq!(configured.reference_placement(), ReferencePlacement::Stage);
+        let restored = configured.clone().with_reference_placement(ReferencePlacement::Execute);
+        assert_eq!(restored.reference_placement(), ReferencePlacement::Execute);
+        assert_eq!(configured.reference_placement(), ReferencePlacement::Stage);
+        // Reconfiguration shares the accumulated residual state rather than starting a fresh program.
+        let outputs = configured.residualize(ReferenceNewOperation::new(), Vec::new(), &[input]).unwrap();
+        drop((context, configured));
+        let evaluation = restored.into_evaluation(outputs).unwrap();
+        assert_eq!(evaluation.inputs, vec![PartialEvaluationInput::Unknown(0)]);
+        assert_eq!(evaluation.program.instructions().len(), 1);
+        let outputs = evaluation.interpret(&EagerContext::new(), &[TestValue::Array(Array::scalar(3.0_f32))]).unwrap();
+        assert!(
+            matches!(&outputs[0], TestValue::Reference(reference) if reference.read() == Ok(Array::scalar(3.0_f32))),
+        );
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_with_allow_effect_folding() {
+        let context = PartialEvaluationContext::new(EagerContext::<TestValue, TestOperation>::new());
+        let input = context.unknown_input(ArrayType::scalar(DataType::F32).into(), 0);
+        let configured = context.clone().with_allow_effect_folding(false);
+        assert!(context.allow_effect_folding);
+        assert!(!configured.allow_effect_folding);
+        let restored = configured.clone().with_allow_effect_folding(true);
+        assert!(restored.allow_effect_folding);
+        assert!(!configured.allow_effect_folding);
+        // Enabling folding again must restore behavior, while preserving the previously created residual input.
+        let initial = PartialEvaluationValue::known(TestValue::Array(Array::scalar(2.0_f32)));
+        let allocated =
+            restored.fold_or_residualize(ReferenceNewOperation::new(), Vec::new(), &[initial.clone()]).unwrap();
+        assert!(
+            matches!(allocated[0].as_known(), Some(TestValue::Reference(reference)) if reference.read() == Ok(Array::scalar(2.0_f32))),
+        );
+        let deferred = configured.fold_or_residualize(ReferenceNewOperation::new(), Vec::new(), &[initial]).unwrap();
+        assert!(deferred[0].is_unknown());
+        drop((configured, restored));
+        let evaluation = context.into_evaluation(vec![input, deferred[0].clone()]).unwrap();
+        assert_eq!(evaluation.inputs.len(), 2);
+        let outputs = evaluation.interpret(&EagerContext::new(), &[TestValue::Array(Array::scalar(5.0_f32))]).unwrap();
+        assert_eq!(outputs[0], TestValue::Array(Array::scalar(5.0_f32)));
+        assert!(
+            matches!(&outputs[1], TestValue::Reference(reference) if reference.read() == Ok(Array::scalar(2.0_f32))),
+        );
     }
 
     #[test]
@@ -3119,6 +3288,15 @@ mod tests {
     }
 
     #[test]
+    fn test_partial_evaluation_context_parent() {
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        assert_eq!(
+            context.parent().bind(AddOperation::new(), Vec::new(), &[Array::scalar(1.0), Array::scalar(2.0)]),
+            Ok(vec![Array::scalar(3.0)]),
+        );
+    }
+
+    #[test]
     fn test_partial_evaluation_context_import_known() {
         let parent = TracingContext::<TestValue, TestOperation>::new();
         let source = PartialEvaluationContext::new(parent.clone());
@@ -3135,12 +3313,12 @@ mod tests {
             .unwrap();
         assert!(matches!(
             known.value().unwrap().materialization(),
-            PartialValueMaterialization::Input { residual_atom: Some(_) }
-        ));
+            PartialValueMaterialization::Input { residual_atom: Some(_) },
+        ),);
         let imported = target.import_known(&known).unwrap();
         assert_eq!(
             imported.value().unwrap().materialization(),
-            PartialValueMaterialization::Input { residual_atom: None }
+            PartialValueMaterialization::Input { residual_atom: None },
         );
         assert_eq!(target.import_known(&imported).unwrap(), imported);
 
@@ -3151,19 +3329,19 @@ mod tests {
 
         let unknown = PartialTracer::new(source.clone(), source.unknown_input(scalar_type.clone(), 0));
         assert!(matches!(target.import_known(&unknown), Err(ProgramError::MalformedProgram(message))
-            if message == "cannot import an unknown value from another partial-evaluation context"));
+            if message == "cannot import an unknown value from another partial-evaluation context",),);
         let other_parent = TracingContext::<TestValue, TestOperation>::new();
         let foreign = PartialTracer::new(
             PartialEvaluationContext::new(other_parent.clone()),
             PartialEvaluationValue::known(other_parent.input(scalar_type)),
         );
         assert!(matches!(target.import_known(&foreign), Err(ProgramError::MalformedProgram(message))
-            if message == "cannot import a value from a partial-evaluation context with a different parent context"));
+            if message == "cannot import a value from a partial-evaluation context with a different parent context",),);
 
         // Binding a foreign value cannot reinterpret its atom identifier in this builder, including in release builds.
         let poisoned = target.bind(AddOperation::new(), Vec::new(), &[known.clone(), known]).unwrap();
         assert!(matches!(poisoned[0].value(), Err(ProgramError::MalformedProgram(message))
-            if message == "cannot bind a value belonging to another partial-evaluation context; import known values explicitly"));
+            if message == "cannot bind a value belonging to another partial-evaluation context; import known values explicitly",),);
         assert!(target.builder.borrow().instructions().is_empty());
     }
 
@@ -3197,25 +3375,20 @@ mod tests {
         let known = source.lift(Array::scalar(3.0)).unwrap();
         assert_eq!(
             source.bind(AddOperation::new(), Vec::new(), &[known.clone()]),
-            Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 })
+            Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
         );
         let imported = target.import_known(&known).unwrap();
         assert!(matches!(imported.value(), Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 })));
         drop(imported);
         assert!(matches!(
             target.into_evaluation(Vec::new()),
-            Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 })
-        ));
+            Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
+        ),);
     }
 
     #[test]
-    fn test_partial_evaluation_context() {
+    fn test_partial_evaluation_context_fold_or_residualize() {
         let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
-        assert_eq!(
-            context.parent().bind(AddOperation::new(), Vec::new(), &[Array::scalar(1.0), Array::scalar(2.0)]),
-            Ok(vec![Array::scalar(3.0)]),
-        );
-
         // `fold_or_residualize` folds an all-known operation through the known-side context, and so its outputs
         // are known values with no residual materialization decision yet.
         let inputs =
@@ -3229,157 +3402,10 @@ mod tests {
         assert_eq!(folded[0].r#type().into_owned(), ArrayType::scalar(DataType::F64));
         assert!(matches!(folded[0].value(), PartialValue::Known(value) if *value == Array::scalar(6.0)));
 
-        // `residualize` emits the operation into the residual program, materializing each known input as a fresh
-        // residual input (i.e., atoms 0 and 1) and returning the instruction output as a residual variable
-        // (i.e., atom 2).
-        let residual = context.residualize(AddOperation::new(), Vec::new(), &inputs).unwrap();
-        assert_eq!(residual.len(), 1);
-        assert!(residual[0].is_unknown());
-        assert_eq!(residual[0].as_known(), None);
-        assert_eq!(residual[0].r#type().into_owned(), ArrayType::scalar(DataType::F64));
-        assert_eq!(
-            residual[0].materialization(),
-            PartialValueMaterialization::Variable { residual_atom: AtomId::new(2) },
-        );
-
-        // `fold_or_residualize` residualizes as soon as any input is unknown. `neg` lands in the residual program
-        // over the residual variable, producing the next residual atom.
-        let mixed = context.fold_or_residualize(NegOperation::new(), Vec::new(), &[residual[0].clone()]).unwrap();
-        assert_eq!(mixed[0].materialization(), PartialValueMaterialization::Variable { residual_atom: AtomId::new(3) });
-
-        // Materializing the same known value twice reuses the residual atom assigned on first materialization through
-        // the value's shared materialization slot, so a value consumed by several residualized instructions yields a
-        // single residual input.
-        let shared = PartialEvaluationValue::known_input(Array::scalar(4.0));
-        let first = context.residualize(NegOperation::new(), Vec::new(), &[shared.clone()]).unwrap();
-        let second = context.residualize(SinOperation::new(), Vec::new(), &[shared.clone()]).unwrap();
-        assert_eq!(
-            shared.materialization(),
-            PartialValueMaterialization::Input { residual_atom: Some(AtomId::new(4)) }
-        );
-        assert!(first[0].is_unknown() && second[0].is_unknown());
-        assert_eq!(context.inputs.borrow().len(), 3);
-
-        // `inline_program` replays a program over seed values. All-known seeds fold every instruction, lifting the
-        // program constant into the known-side context, and so the replay returns folded values.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let a = builder.add_input(ArrayType::scalar(DataType::F64));
-        let x = builder.add_input(ArrayType::scalar(DataType::F64));
-        let c = builder.add_constant(Array::scalar(1.0));
-        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![a, x], None).unwrap()[0];
-        let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![product, c], None).unwrap()[0];
-        let program =
-            builder.build::<Vec<Array>, Vec<Array>>(vec![sum], vec![Placeholder; 2], vec![Placeholder]).unwrap();
-        let outputs = context
-            .inline_program(
-                &program,
-                vec![
-                    PartialEvaluationValue::known(Array::scalar(2.0)),
-                    PartialEvaluationValue::known(Array::scalar(3.0)),
-                ],
-            )
-            .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].as_known(), Some(&Array::scalar(7.0)));
-
-        // Mixed seeds fold the known work and residualize the rest, and so the walk returns residual variables.
-        let outputs = context
-            .inline_program(&program, vec![PartialEvaluationValue::known(Array::scalar(2.0)), residual[0].clone()])
-            .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert!(outputs[0].is_unknown());
-        assert!(matches!(outputs[0].materialization(), PartialValueMaterialization::Variable { .. }));
-
-        // `inline_partitioned_program` inlines a `Program::partition` result as two boundary operations. The known
-        // side folds through the known-side context, its trailing residual-edge output feeds the residual boundary
-        // operation, and the original outputs are reassembled from the two operations' outputs. The partitioned sides
-        // of `f(a, x) = sin(a) * x` are a single `sin` and a single `mul`, and so those operations themselves serve as
-        // arity-matching boundary operations.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let a = builder.add_input(ArrayType::scalar(DataType::F64));
-        let x = builder.add_input(ArrayType::scalar(DataType::F64));
-        let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![a], None).unwrap()[0];
-        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![sine, x], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![product], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let partition = program.partition(&[true, false]).unwrap();
-        let outputs = context
-            .inline_partitioned_program(
-                partition,
-                &[PartialEvaluationValue::known(Array::scalar(2.0)), residual[0].clone()],
-                |_| (ArrayOperation::Sin(SinOperation::new()), Vec::new()),
-                |_| (ArrayOperation::Mul(MulOperation::new()), Vec::new()),
-            )
-            .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert!(outputs[0].is_unknown());
-        assert!(matches!(outputs[0].materialization(), PartialValueMaterialization::Variable { .. }));
-
-        // An all-known partitioned program folds entirely through the known-side boundary operation, and so the
-        // reassembled outputs are known values even though the (empty) residual operation is still emitted.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let a = builder.add_input(ArrayType::scalar(DataType::F64));
-        let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![a], None).unwrap()[0];
-        let program =
-            builder.build::<Vec<Array>, Vec<Array>>(vec![sine], vec![Placeholder], vec![Placeholder]).unwrap();
-        let partition = program.partition(&[true]).unwrap();
-        let outputs = context
-            .inline_partitioned_program(
-                partition,
-                &[PartialEvaluationValue::known(Array::scalar(2.0))],
-                |_| (ArrayOperation::Sin(SinOperation::new()), Vec::new()),
-                |_| (ArrayOperation::Constant(ConstantOperation::new(Array::scalar(0.0))), Vec::new()),
-            )
-            .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].as_known(), Some(&Array::scalar(2.0f64.sin())));
-
-        // `known_constant` recovers a known value's staged-constant payload. An eager known value always resolves to a
-        // constant, while under a staging known-side context only literal-backed tracers do.
-        assert_eq!(context.known_constant(&Array::scalar(5.0)), Ok(Array::scalar(5.0)));
-        let staging = ArrayTracingContext::new();
-        let staging_context = PartialEvaluationContext::new(staging.clone());
-        let symbolic = staging.input(ArrayType::scalar(DataType::F64));
-        let literal = staging.constant(Array::scalar(4.0));
-        assert_eq!(staging_context.known_constant(&literal), Ok(Array::scalar(4.0)));
-        assert!(matches!(
-            staging_context.known_constant(&symbolic),
-            Err(ProgramError::MalformedProgram(message))
-                if message == "a known value crossing into a nested residual program does not resolve to a constant \
-                    in the active known-side context",
-        ));
-
-        // `all_knowns_are_constants` checks every known feeder and folded output of a partial evaluation, which is only
-        // non-trivial under a staging known-side context where knowns can be live tracers.
-        let empty = ProgramBuilder::<Array, ArrayOperation<Array>>::new()
-            .build::<Vec<Array>, Vec<Array>>(Vec::new(), Vec::new(), Vec::new())
-            .unwrap();
-        assert!(context.all_knowns_are_constants(&PartialEvaluation::<EagerContext<Array, ArrayOperation<Array>>> {
-            program: empty.clone(),
-            inputs: vec![PartialEvaluationInput::Known(Array::scalar(1.0)), PartialEvaluationInput::Unknown(0)],
-            outputs: vec![PartialEvaluationOutput::Known(Array::scalar(2.0))],
-        }));
-        assert!(!staging_context.all_knowns_are_constants(&PartialEvaluation::<ArrayTracingContext> {
-            program: empty.clone(),
-            inputs: vec![PartialEvaluationInput::Known(symbolic.clone())],
-            outputs: Vec::new(),
-        }));
-        assert!(staging_context.all_knowns_are_constants(&PartialEvaluation::<ArrayTracingContext> {
-            program: empty,
-            inputs: vec![PartialEvaluationInput::Known(literal.clone())],
-            outputs: Vec::new(),
-        }));
-
-        // `any_known_is_symbolic` is the signal online boundary rules split on. Only a known value that does not
-        // resolve to a program constant counts, and so eager knowns and unknowns never do.
-        assert!(!context.any_known_is_symbolic(&[PartialEvaluationValue::known(Array::scalar(1.0))]));
-        assert!(!staging_context.any_known_is_symbolic(&[PartialEvaluationValue::known(literal)]));
-        assert!(staging_context.any_known_is_symbolic(&[PartialEvaluationValue::known(symbolic)]));
-        assert!(!staging_context.any_known_is_symbolic(&[PartialEvaluationValue::variable(
-            ArrayType::scalar(DataType::F64),
-            AtomId::new(0)
-        )]),);
+        let unknown = context.unknown_input(ArrayType::scalar(DataType::F64), 0);
+        let mixed = context.fold_or_residualize(NegOperation::new(), Vec::new(), &[unknown]).unwrap();
+        let evaluation = context.into_evaluation(mixed).unwrap();
+        assert_eq!(evaluation.interpret(&EagerContext::new(), &[Array::scalar(7.0)]), Ok(vec![Array::scalar(-7.0)]));
     }
 
     #[test]
@@ -3499,7 +3525,7 @@ mod tests {
             context
                 .fold_or_residualize(add_update, Vec::new(), &[reference.clone(), update])
                 .unwrap()
-                .is_empty()
+                .is_empty(),
         );
         assert_eq!(live.read(), Ok(Array::scalar(1.0_f32)));
         let allocation = TestOperation::ReferenceNew(ReferenceNewOperation::new());
@@ -3631,7 +3657,7 @@ mod tests {
             context
                 .fold_or_residualize(add_update, Vec::new(), &[reference.clone(), update])
                 .unwrap()
-                .is_empty()
+                .is_empty(),
         );
         assert_eq!(live.read(), Ok(Array::scalar(3.0_f32)));
         assert!(context.builder.borrow().instructions().is_empty());
@@ -3647,7 +3673,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_evaluation_context_residualize_records_ordering_before_emission() {
+    fn test_partial_evaluation_context_fold_or_residualize_retains_ordering_after_type_error() {
         // A write of an unknown `f64` into an `f32` reference fails at residual emission (type inference rejects the
         // mismatch) after recording that later ordered effects must remain residual, so a later all-known read of that
         // root stages instead of executing against state the failed write attempted to mutate.
@@ -3658,8 +3684,10 @@ mod tests {
         let write = TestOperation::ReferenceWrite(ReferenceWriteOperation::new());
         assert!(matches!(
             context.fold_or_residualize(write, Vec::new(), &[reference.clone(), mismatched]),
-            Err(ProgramError::Type(_)),
-        ));
+            Err(ProgramError::Type(TypeError::Invalid { message }))
+                if message == "`reference_write` replacement type `f64[]` must exactly \
+                               match reference referent type `f32[]`",
+        ),);
         let read = TestOperation::ReferenceRead(ReferenceReadOperation::new());
         let staged = context.fold_or_residualize(read, Vec::new(), &[reference]).unwrap();
         assert!(staged[0].is_unknown());
@@ -3667,139 +3695,328 @@ mod tests {
     }
 
     #[test]
-    fn test_partial_evaluation_context_residualize_records_ordering_before_emission_under_poisoning() {
-        // Under a staging known side, a known reference marked as an inline constant has no constant payload to
-        // rebuild, so residual materialization of a swap through it fails after recording its ordering restriction.
-        // `bind` defers that error by poisoning the swap's output instead of returning it, and a later all-known read
-        // is poisoned without folding into the outer program.
-        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
-        let reference_type: ArrayIrType = ReferenceType::new(ArrayType::scalar(DataType::F32)).into();
-        let outer = TracingContext::<TestValue, TestOperation>::new();
-        let reference = outer.input(reference_type);
-        let context = PartialEvaluationContext::new(outer.clone());
-        let u = PartialTracer::new(context.clone(), context.unknown_input(scalar_type, 0));
-        let malformed = PartialTracer::new(context.clone(), PartialEvaluationValue::known_constant(reference.clone()));
-        let swap = TestOperation::ReferenceSwap(ReferenceSwapOperation::new());
-        let poisoned = context.bind(swap, Vec::new(), &[malformed, u]).unwrap();
-        assert_eq!(poisoned.len(), 1);
-        assert!(matches!(poisoned[0].value(), Err(ProgramError::MalformedProgram(_))));
-        let read = TestOperation::ReferenceRead(ReferenceReadOperation::new());
-        let known = PartialTracer::new(context.clone(), PartialEvaluationValue::known(reference));
-        let later = context.bind(read, Vec::new(), &[known]).unwrap();
-        assert!(matches!(later[0].value(), Err(ProgramError::MalformedProgram(_))));
-        assert!(outer.builder().borrow().instructions().is_empty());
-    }
-
-    #[test]
-    fn test_partial_evaluation_context_reference_identity() {
-        let reference_type: ArrayIrType = ReferenceType::new(ArrayType::new_static(DataType::F32, [2])).into();
-        let outer = TracingContext::<TestValue, TestOperation>::new();
-        let parent_reference = outer.input(reference_type.clone());
-        let expected = outer.reference_identity(&parent_reference).unwrap();
-        let context = PartialEvaluationContext::new(outer);
-        let known = PartialEvaluationValue::known(parent_reference);
-        let original = PartialTracer::new(context.clone(), known.clone());
-        assert_eq!(context.reference_identity(&original), Ok(expected));
-
-        // A residual view of a known feeder must retain its parent's root identity rather than acquire the residual
-        // builder's namespace. An unknown reference input does belong to that separate namespace.
-        let operation = TestOperation::ReferenceIndex(ReferenceIndexOperation::new(0, 0));
-        let viewed = context.residualize(operation, Vec::new(), &[known]).unwrap();
-        let viewed = PartialTracer::new(context.clone(), viewed[0].clone());
-        assert_eq!(context.reference_identity(&viewed), Ok(expected));
-        let unknown = PartialTracer::new(context.clone(), context.unknown_input(reference_type, 0));
-        assert!(matches!(context.reference_identity(&unknown), Ok(Some(ReferenceIdentity::Staged { .. }))));
-        assert_ne!(context.reference_identity(&unknown).unwrap(), expected);
-
-        let value =
-            PartialTracer::new(context.clone(), context.unknown_input(ArrayType::scalar(DataType::F32).into(), 1));
-        assert_eq!(context.reference_identity(&value), Ok(None));
-    }
-
-    #[test]
-    fn test_partial_evaluation_context_reference_identity_for_captured_views() {
-        let outer = TracingContext::<TestCapture, ReferenceIndexOperation>::new();
-        let reference_type: ArrayIrType = ReferenceType::new(ArrayType::new_static(DataType::F32, [2])).into();
-        let capture = outer.constant(CaptureReference::new(0, reference_type.clone()));
-        let expected = outer.reference_identity(&capture).unwrap();
-        let context = PartialEvaluationContext::new(outer.clone());
-        let captured = PartialEvaluationValue::known_constant(capture);
-        let view = context
-            .residualize(ReferenceIndexOperation::new(0, 0), Vec::new(), &[captured.clone()])
-            .unwrap()
-            .remove(0);
-        let original = PartialTracer::new(context.clone(), captured);
-        let view = PartialTracer::new(context.clone(), view);
-        let parent_atom_count = outer.builder().borrow().atoms().len();
-        assert_eq!(context.reference_identity(&original), Ok(expected));
-        assert_eq!(context.reference_identity(&view), Ok(expected));
-        assert_eq!(context.clone().reference_identity(&view), Ok(expected));
-        assert_eq!(outer.builder().borrow().atoms().len(), parent_atom_count);
-        let other = context.lift(CaptureReference::new(1, reference_type)).unwrap();
-        assert_ne!(context.reference_identity(&other).unwrap(), expected);
+    fn test_partial_evaluation_context_residualize() {
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let inputs =
+            [PartialEvaluationValue::known(Array::scalar(2.0)), PartialEvaluationValue::known(Array::scalar(3.0))];
+        // `residualize` emits the operation into the residual program, materializing each known input as a fresh
+        // residual input (i.e., atoms 0 and 1) and returning the instruction output as a residual variable
+        // (i.e., atom 2).
+        let residual = context.residualize(AddOperation::new(), Vec::new(), &inputs).unwrap();
+        assert_eq!(residual.len(), 1);
+        assert!(residual[0].is_unknown());
+        assert_eq!(residual[0].as_known(), None);
+        assert_eq!(residual[0].r#type().into_owned(), ArrayType::scalar(DataType::F64));
         assert_eq!(
-            context.reference_identity(&other),
-            outer.reference_identity(other.value().unwrap().as_known().unwrap()),
+            residual[0].materialization(),
+            PartialValueMaterialization::Variable { residual_atom: AtomId::new(2) },
+        );
+
+        // `fold_or_residualize` residualizes as soon as any input is unknown. `neg` lands in the residual program
+        // over the residual variable, producing the next residual atom.
+        let mixed = context.fold_or_residualize(NegOperation::new(), Vec::new(), &[residual[0].clone()]).unwrap();
+        assert_eq!(mixed[0].materialization(), PartialValueMaterialization::Variable { residual_atom: AtomId::new(3) });
+
+        // Materializing the same known value twice reuses the residual atom assigned on first materialization through
+        // the value's shared materialization slot, so a value consumed by several residualized instructions yields a
+        // single residual input.
+        let shared = PartialEvaluationValue::known_input(Array::scalar(4.0));
+        let first = context.residualize(NegOperation::new(), Vec::new(), &[shared.clone()]).unwrap();
+        let second = context.residualize(SinOperation::new(), Vec::new(), &[shared.clone()]).unwrap();
+        assert_eq!(
+            shared.materialization(),
+            PartialValueMaterialization::Input { residual_atom: Some(AtomId::new(4)) },
+        );
+        assert!(first[0].is_unknown() && second[0].is_unknown());
+        assert_eq!(context.inputs.borrow().len(), 3);
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_inline_program() {
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        // `inline_program` replays a program over seed values. All-known seeds fold every instruction, lifting the
+        // program constant into the known-side context, and so the replay returns folded values.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let a = builder.add_input(ArrayType::scalar(DataType::F64));
+        let x = builder.add_input(ArrayType::scalar(DataType::F64));
+        let c = builder.add_constant(Array::scalar(1.0));
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![a, x], None).unwrap()[0];
+        let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![product, c], None).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![sum], vec![Placeholder; 2], vec![Placeholder]).unwrap();
+        let outputs = context
+            .inline_program(
+                &program,
+                vec![
+                    PartialEvaluationValue::known(Array::scalar(2.0)),
+                    PartialEvaluationValue::known(Array::scalar(3.0)),
+                ],
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].as_known(), Some(&Array::scalar(7.0)));
+
+        // Mixed seeds fold the known work and residualize the rest, and so the walk returns residual variables.
+        let outputs = context
+            .inline_program(
+                &program,
+                vec![
+                    PartialEvaluationValue::known(Array::scalar(2.0)),
+                    context.unknown_input(ArrayType::scalar(DataType::F64), 0),
+                ],
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].is_unknown());
+        assert!(matches!(outputs[0].materialization(), PartialValueMaterialization::Variable { .. }));
+
+        let evaluation = context.into_evaluation(outputs).unwrap();
+        assert_eq!(evaluation.interpret(&EagerContext::new(), &[Array::scalar(5.0)]), Ok(vec![Array::scalar(11.0)]));
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_inline_region_observation() {
+        let program = reference_ordering_program();
+        let region = program.entry_region_ref();
+        let observations = RefCell::new(Vec::new());
+        let (known, residual) = replay_reference_ordering_program(region, None, None);
+        let (observed_known, observed_residual) = replay_reference_ordering_program(region, Some(&observations), None);
+
+        // Recording source instructions must not change ordering or either emitted program. The nested read has no
+        // public outputs, so it must be recorded based on the residual instructions it emits.
+        assert_eq!(known.to_string(), observed_known.to_string());
+        assert_eq!(residual.to_string(), observed_residual.to_string());
+        assert_eq!(known.instructions().len(), 0);
+        assert_eq!(
+            *observations.borrow(),
+            vec![InstructionId::new(region.id(), 0), InstructionId::new(region.id(), 1)],
         );
     }
 
     #[test]
-    fn test_partial_evaluation_context_reference_identity_for_unresolved_inherited_capture() {
-        let reference_type: ArrayIrType = ReferenceType::new(ArrayType::scalar(DataType::F32)).into();
-        let outer = TracingContext::<TestCapture, ReferenceIndexOperation>::new();
-        let context = PartialEvaluationContext::new(outer.clone());
-        // Inherited constants enter the residual builder without being materialized through the parent context.
-        // Seed that state directly: no parent identity has been recorded for this symbolic capture.
-        let captured = context.builder.borrow_mut().add_constant(CaptureReference::new(0, reference_type.clone()));
-        let captured = PartialTracer::new(context.clone(), PartialEvaluationValue::variable(reference_type, captured));
-        assert_eq!(context.reference_identity(&captured), Ok(None));
-        assert!(outer.builder().borrow().atoms().is_empty());
+    fn test_partial_evaluation_context_inline_region_observation_with_reference_analysis() {
+        let program = reference_ordering_program();
+        let region = program.entry_region_ref();
+        let analysis = region.reference_analysis_with_constants().unwrap();
+        let observations = RefCell::new(Vec::new());
+        let (known, residual) = replay_reference_ordering_program(region, None, Some(analysis.as_ref()));
+        let (observed_known, observed_residual) =
+            replay_reference_ordering_program(region, Some(&observations), Some(analysis.as_ref()));
+
+        // Recording source instructions must not change ordering or either emitted program. The nested read has no
+        // public outputs, so it must be recorded based on the residual instructions it emits.
+        assert_eq!(known.to_string(), observed_known.to_string());
+        assert_eq!(residual.to_string(), observed_residual.to_string());
+        assert_eq!(known.instructions().len(), 1);
+        assert_eq!(*observations.borrow(), vec![InstructionId::new(region.id(), 0)]);
     }
 
     #[test]
-    fn test_partial_evaluation_context_as_context() {
-        // Over an eager known-side inner context, the partial-evaluation context is itself eager: lifted constants and
-        // all-known binds fold to known values that resolve `Constant`. A known `bool[]` also supports boolean
-        // concretization, which lets host control flow branch on known values during evaluation.
-        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
-        assert!(context.is_eager());
-        let lifted = context.lift(Array::scalar(2.0)).unwrap();
+    fn test_partial_evaluation_context_inline_region_observation_preserves_validation() {
+        let program = reference_ordering_program();
+        let region = program.entry_region_ref();
+        let analysis = region.reference_analysis_with_constants().unwrap();
+        let observations = RefCell::new(Vec::new());
+        let context = PartialEvaluationContext::new(TracingContext::<TestValue, TestOperation>::new());
+
+        // Invalid input arity is rejected before replay, regardless of observation or reference analysis.
         assert!(matches!(
+            context.inline_region(region, Vec::new(), &HashSet::new(), None, None),
+            Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
+        ),);
+        assert!(matches!(
+            context.inline_region(region, Vec::new(), &HashSet::new(), Some(&observations), None),
+            Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
+        ),);
+        assert!(matches!(
+            context.inline_region(region, Vec::new(), &HashSet::new(), None, Some(analysis.as_ref())),
+            Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
+        ),);
+        assert!(matches!(
+            context.inline_region(region, Vec::new(), &HashSet::new(), Some(&observations), Some(analysis.as_ref())),
+            Err(ProgramError::InvalidInputCount { expected: 2, actual: 0 }),
+        ),);
+        assert!(observations.borrow().is_empty());
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_inline_partitioned_program() {
+        // Partition `x - sin(a)` with `a` known. Its single-operation halves can serve as boundary operations;
+        // subtraction makes swapping the known coefficient and unknown input observable in the result.
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let a = builder.add_input(ArrayType::scalar(DataType::F64));
+        let x = builder.add_input(ArrayType::scalar(DataType::F64));
+        let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![a], None).unwrap()[0];
+        let difference = builder.add_instruction(SubOperation::new(), Vec::new(), vec![x, sine], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![difference], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let partition = program.partition(&[true, false]).unwrap();
+        let outputs = context
+            .inline_partitioned_program(
+                partition,
+                &[
+                    PartialEvaluationValue::known(Array::scalar(2.0)),
+                    context.unknown_input(ArrayType::scalar(DataType::F64), 0),
+                ],
+                |_| (ArrayOperation::Sin(SinOperation::new()), Vec::new()),
+                |_| (ArrayOperation::Sub(SubOperation::new()), Vec::new()),
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].is_unknown());
+        assert!(matches!(outputs[0].materialization(), PartialValueMaterialization::Variable { .. }));
+
+        let evaluation = context.into_evaluation(outputs).unwrap();
+        assert_eq!(
+            evaluation.inputs,
+            vec![PartialEvaluationInput::Unknown(0), PartialEvaluationInput::Known(Array::scalar(2.0_f64.sin()))],
+        );
+        assert_eq!(evaluation.outputs, vec![PartialEvaluationOutput::Unknown(0)]);
+        assert_eq!(evaluation.program.instructions()[0].inputs(), &[AtomId::new(0), AtomId::new(1)]);
+        assert_eq!(
+            evaluation.interpret(&EagerContext::new(), &[Array::scalar(5.0)]),
+            Ok(vec![Array::scalar(5.0 - 2.0_f64.sin())]),
+        );
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_inline_partitioned_program_all_known() {
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let sine = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![sine], vec![Placeholder], vec![Placeholder]).unwrap();
+        let partition = program.partition(&[true]).unwrap();
+
+        // Preserve the empty residual program's boundary with a region wrapper. It emits no outputs and is removed
+        // by finalization because it has no observable effects.
+        let outputs = context
+            .inline_partitioned_program(
+                partition,
+                &[PartialEvaluationValue::known(Array::scalar(2.0))],
+                |_| (ArrayOperation::Sin(SinOperation::new()), Vec::new()),
+                |program| (ArrayOperation::LinearCall(LinearCallOperation::new(0)), vec![program.clone(), program]),
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].as_known(), Some(&Array::scalar(2.0_f64.sin())));
+        let evaluation = context.into_evaluation(outputs).unwrap();
+        assert!(evaluation.inputs.is_empty());
+        assert_eq!(evaluation.outputs, vec![PartialEvaluationOutput::Known(Array::scalar(2.0_f64.sin()))]);
+        assert!(evaluation.program.instructions().is_empty());
+        assert!(evaluation.program.input_ids().is_empty());
+        assert!(evaluation.program.output_ids().is_empty());
+        assert_eq!(evaluation.interpret(&EagerContext::new(), &[]), Ok(vec![Array::scalar(2.0_f64.sin())]));
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_known_constant() {
+        // `known_constant` recovers a known value's staged-constant payload. An eager known value always resolves to a
+        // constant, while under a staging known-side context only literal-backed tracers do.
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        assert_eq!(context.known_constant(&Array::scalar(5.0)), Ok(Array::scalar(5.0)));
+        let staging = ArrayTracingContext::new();
+        let staging_context = PartialEvaluationContext::new(staging.clone());
+        let symbolic = staging.input(ArrayType::scalar(DataType::F64));
+        let literal = staging.constant(Array::scalar(4.0));
+        assert_eq!(staging_context.known_constant(&literal), Ok(Array::scalar(4.0)));
+        assert!(matches!(
+            staging_context.known_constant(&symbolic),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "a known value crossing into a nested residual program does not resolve to a constant \
+                    in the active known-side context",
+        ),);
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_all_knowns_are_constants() {
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let staging = ArrayTracingContext::new();
+        let staging_context = PartialEvaluationContext::new(staging.clone());
+        let symbolic = staging.input(ArrayType::scalar(DataType::F64));
+        let literal = staging.constant(Array::scalar(4.0));
+
+        // A known feeder still occupies an input of the residual program.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+
+        assert!(context.all_knowns_are_constants(&PartialEvaluation::<EagerContext<Array, ArrayOperation<Array>>> {
+            program: program.clone(),
+            inputs: vec![PartialEvaluationInput::Known(Array::scalar(1.0))],
+            outputs: vec![PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Known(Array::scalar(2.0))],
+        }),);
+
+        assert!(!staging_context.all_knowns_are_constants(&PartialEvaluation::<ArrayTracingContext> {
+            program: program.clone(),
+            inputs: vec![PartialEvaluationInput::Known(symbolic.clone())],
+            outputs: vec![PartialEvaluationOutput::Unknown(0)],
+        }),);
+
+        assert!(staging_context.all_knowns_are_constants(&PartialEvaluation::<ArrayTracingContext> {
+            program: program.clone(),
+            inputs: vec![PartialEvaluationInput::Known(literal.clone())],
+            outputs: vec![PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Known(literal)],
+        }),);
+
+        // Symbolic outputs must also reject constant-only reconstruction even when every feeder is constant.
+        assert!(!staging_context.all_knowns_are_constants(&PartialEvaluation::<ArrayTracingContext> {
+            program,
+            inputs: vec![PartialEvaluationInput::Unknown(0)],
+            outputs: vec![PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Known(symbolic)],
+        }),);
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_any_known_is_symbolic() {
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let staging = ArrayTracingContext::new();
+        let staging_context = PartialEvaluationContext::new(staging.clone());
+        let symbolic = staging.input(ArrayType::scalar(DataType::F64));
+        let literal = staging.constant(Array::scalar(4.0));
+
+        // `any_known_is_symbolic` is the signal online boundary rules split on. Only a known value that does not
+        // resolve to a program constant counts, and so eager knowns and unknowns never do.
+        assert!(!context.any_known_is_symbolic(&[PartialEvaluationValue::known(Array::scalar(1.0))]));
+        assert!(!staging_context.any_known_is_symbolic(&[PartialEvaluationValue::known(literal)]));
+        assert!(staging_context.any_known_is_symbolic(&[PartialEvaluationValue::known(symbolic)]));
+        assert!(
+            !staging_context
+                .any_known_is_symbolic(&[staging_context.unknown_input(ArrayType::scalar(DataType::F64), 0)]),
+        );
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_lift() {
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let lifted = context.lift(Array::scalar(2.0)).unwrap();
+        assert_eq!(
             lifted.value().unwrap().materialization(),
             PartialValueMaterialization::Constant { residual_atom: None },
-        ));
-        assert!(matches!(context.resolve(&lifted), ValueResolution::Constant(value) if value == Array::scalar(2.0)));
+        );
+        assert_eq!(lifted.value().unwrap().as_known(), Some(&Array::scalar(2.0)));
         let truth = context.lift(Array::scalar(true)).unwrap();
         assert_eq!(truth.concretize(), Ok(true));
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_bind() {
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let lifted = context.lift(Array::scalar(2.0)).unwrap();
         let folded = context.bind(AddOperation::new(), Vec::new(), &[lifted.clone(), lifted.clone()]).unwrap();
         assert_eq!(folded.len(), 1);
         assert_eq!(folded[0].value().unwrap().as_known(), Some(&Array::scalar(4.0)));
         assert_eq!(folded[0].r#type().into_owned(), ArrayType::scalar(DataType::F64));
-
-        // The `Zero` capability binds a nullary `ZeroOperation`, which is vacuously all-known and folds through the
-        // inner context to a known zero.
-        let zero = context.zero(&ArrayType::scalar(DataType::Boolean)).unwrap();
-        assert_eq!(zero.value().unwrap().as_known(), Some(&Array::scalar(false)));
-        assert_eq!(zero.concretize(), Ok(false));
-
-        // A mixed bind residualizes: the unknown input names a residual program variable, the known input
-        // materializes as a residual input, and the output is an unknown value that resolves `Opaque` and rejects
-        // concretizing extractions.
-        let unknown_atom = context.builder.borrow_mut().add_input(ArrayType::scalar(DataType::F64));
-        context.inputs.borrow_mut().push(PartialEvaluationInput::Unknown(0));
-        let unknown = PartialTracer::new(
-            context.clone(),
-            PartialEvaluationValue::variable(ArrayType::scalar(DataType::F64), unknown_atom),
-        );
+        // A mixed bind retains the known operand as a feeder and stages the multiplication.
+        let unknown = PartialTracer::new(context.clone(), context.unknown_input(ArrayType::scalar(DataType::F64), 0));
         let mixed = context.bind(MulOperation::new(), Vec::new(), &[folded[0].clone(), unknown.clone()]).unwrap();
         assert!(mixed[0].value().unwrap().is_unknown());
-        assert!(matches!(context.resolve(&mixed[0]), ValueResolution::Opaque));
-        assert!(matches!(mixed[0].concretize(), Err(ProgramError::Concretization { .. })));
-
-        // Finalizing the context (after dropping every stamped clone) produces the accumulated residual program:
-        // `(ẏ) = folded * ẋ` over the unknown input plus the materialized known feeder.
         let output = mixed[0].value().unwrap().clone();
-        drop((lifted, truth, folded, zero, unknown, mixed));
+        drop((lifted, folded, unknown, mixed));
         let evaluation = context.into_evaluation(vec![output]).unwrap();
         assert_eq!(
             evaluation.inputs,
@@ -3809,16 +4026,43 @@ mod tests {
         assert_eq!(
             evaluation.program.to_string(),
             indoc! {"
-                lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = mul %1 %0
-                in (%2)
-            "}
+            lambda %0:f64[], %1:f64[] .
+            let %2:f64[] = mul %1 %0
+            in (%2)
+        "}
             .trim_end(),
         );
+        assert_eq!(evaluation.interpret(&EagerContext::new(), &[Array::scalar(3.0)]), Ok(vec![Array::scalar(12.0)]));
     }
 
     #[test]
-    fn test_partial_evaluation_context_defers_bind_errors_by_poisoning() {
+    fn test_partial_evaluation_context_bind_retains_materialization_error() {
+        // A staged reference incorrectly marked as a literal has no constant payload to materialize. Binding a
+        // swap retains that error, so later reads with valid operands also fail without emitting parent work.
+        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
+        let reference_type: ArrayIrType = ReferenceType::new(ArrayType::scalar(DataType::F32)).into();
+        let outer = TracingContext::<TestValue, TestOperation>::new();
+        let reference = outer.input(reference_type);
+        let context = PartialEvaluationContext::new(outer.clone());
+        let unknown = PartialTracer::new(context.clone(), context.unknown_input(scalar_type, 0));
+        let malformed = PartialTracer::new(context.clone(), PartialEvaluationValue::known_constant(reference.clone()));
+        let swap = TestOperation::ReferenceSwap(ReferenceSwapOperation::new());
+        let poisoned = context.bind(swap, Vec::new(), &[malformed, unknown]).unwrap();
+        assert_eq!(poisoned.len(), 1);
+        assert!(matches!(poisoned[0].value(), Err(ProgramError::MalformedProgram(message))
+                if message == "residual materialization required a constant payload for a known value \
+                               that is not resolvable to a constant in the active known-side context"),);
+        let read = TestOperation::ReferenceRead(ReferenceReadOperation::new());
+        let known = PartialTracer::new(context.clone(), PartialEvaluationValue::known(reference));
+        let later = context.bind(read, Vec::new(), &[known]).unwrap();
+        assert!(matches!(later[0].value(), Err(ProgramError::MalformedProgram(message))
+                if message == "residual materialization required a constant payload for a known value \
+                               that is not resolvable to a constant in the active known-side context"),);
+        assert!(outer.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_bind_retains_mismatched_builder_error() {
         // A failed bind (in this case, folding an operation whose known inputs belong to two different traces) does
         // not return an error; it poisons its outputs so the infallible operator sugar driving closures never panics.
         // The poison propagates through later binds, resolves `Opaque`, rejects concretizing extractions with the
@@ -3897,6 +4141,504 @@ mod tests {
     }
 
     #[test]
+    fn test_partial_evaluation_context_is_eager() {
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        assert!(context.is_eager());
+        assert!(!PartialEvaluationContext::new(ArrayTracingContext::new()).is_eager());
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_provenance() {
+        let parent = ArrayTracingContext::new();
+        let (context, initial) = parent.invoke_with_provenance_scope(ProvenanceScope::new("parent"), || {
+            (PartialEvaluationContext::new(parent.clone()), parent.provenance())
+        });
+        let cloned = context.clone();
+        assert_eq!(context.provenance(), initial);
+        assert_eq!(cloned.provenance(), initial);
+        assert_eq!(parent.provenance(), Provenance::unknown());
+
+        // The residual context snapshots its parent's provenance at construction, then shares its own active state
+        // across clones. A local scope changes neither the parent nor the state restored after the scope exits.
+        context.invoke_with_provenance_scope(ProvenanceScope::new("residual"), || {
+            assert_eq!(context.provenance(), Provenance::scope(ProvenanceScope::new("residual"), initial.clone()));
+            assert_eq!(cloned.provenance(), context.provenance());
+            assert_eq!(parent.provenance(), Provenance::unknown());
+        });
+        assert_eq!(context.provenance(), initial);
+        assert_eq!(cloned.provenance(), initial);
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_resolve() {
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let lifted = context.lift(Array::scalar(2.0)).unwrap();
+        assert!(matches!(context.resolve(&lifted), ValueResolution::Constant(value) if value == Array::scalar(2.0)));
+        let unknown = PartialTracer::new(context.clone(), context.unknown_input(ArrayType::scalar(DataType::F64), 0));
+        assert!(matches!(context.resolve(&unknown), ValueResolution::Opaque));
+        assert!(matches!(unknown.concretize(), Err(ProgramError::Concretization { message })
+                if message == "cannot extract a concrete boolean from an unknown partial-evaluation value"),);
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_reference_identity() {
+        let reference_type: ArrayIrType = ReferenceType::new(ArrayType::new_static(DataType::F32, [2])).into();
+        let outer = TracingContext::<TestValue, TestOperation>::new();
+        let parent_reference = outer.input(reference_type.clone());
+        let expected = outer.reference_identity(&parent_reference).unwrap();
+        let context = PartialEvaluationContext::new(outer);
+        let known = PartialEvaluationValue::known(parent_reference);
+        let original = PartialTracer::new(context.clone(), known.clone());
+        assert_eq!(context.reference_identity(&original), Ok(expected));
+
+        // A residual view of a known feeder must retain its parent's root identity rather than acquire the residual
+        // builder's namespace. An unknown reference input does belong to that separate namespace.
+        let operation = TestOperation::ReferenceIndex(ReferenceIndexOperation::new(0, 0));
+        let viewed = context.residualize(operation, Vec::new(), &[known]).unwrap();
+        let viewed = PartialTracer::new(context.clone(), viewed[0].clone());
+        assert_eq!(context.reference_identity(&viewed), Ok(expected));
+        let unknown = PartialTracer::new(context.clone(), context.unknown_input(reference_type, 0));
+        assert!(matches!(context.reference_identity(&unknown), Ok(Some(ReferenceIdentity::Staged { .. }))));
+        assert_ne!(context.reference_identity(&unknown).unwrap(), expected);
+
+        let value =
+            PartialTracer::new(context.clone(), context.unknown_input(ArrayType::scalar(DataType::F32).into(), 1));
+        assert_eq!(context.reference_identity(&value), Ok(None));
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_reference_identity_for_captured_views() {
+        let outer = TracingContext::<TestCapture, ReferenceIndexOperation>::new();
+        let reference_type: ArrayIrType = ReferenceType::new(ArrayType::new_static(DataType::F32, [2])).into();
+        let capture = outer.constant(CaptureReference::new(0, reference_type.clone()));
+        let expected = outer.reference_identity(&capture).unwrap();
+        let context = PartialEvaluationContext::new(outer.clone());
+        let captured = PartialEvaluationValue::known_constant(capture);
+        let view = context
+            .residualize(ReferenceIndexOperation::new(0, 0), Vec::new(), &[captured.clone()])
+            .unwrap()
+            .remove(0);
+        let original = PartialTracer::new(context.clone(), captured);
+        let view = PartialTracer::new(context.clone(), view);
+        let parent_atom_count = outer.builder().borrow().atoms().len();
+        assert_eq!(context.reference_identity(&original), Ok(expected));
+        assert_eq!(context.reference_identity(&view), Ok(expected));
+        assert_eq!(context.clone().reference_identity(&view), Ok(expected));
+        assert_eq!(outer.builder().borrow().atoms().len(), parent_atom_count);
+        let other = context.lift(CaptureReference::new(1, reference_type)).unwrap();
+        assert_ne!(context.reference_identity(&other).unwrap(), expected);
+        assert_eq!(
+            context.reference_identity(&other),
+            outer.reference_identity(other.value().unwrap().as_known().unwrap()),
+        );
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_reference_identity_for_unresolved_inherited_capture() {
+        let reference_type: ArrayIrType = ReferenceType::new(ArrayType::scalar(DataType::F32)).into();
+        let outer = TracingContext::<TestCapture, ReferenceIndexOperation>::new();
+        let context = PartialEvaluationContext::new(outer.clone());
+
+        // Inherited constants enter the residual builder without being materialized through the parent context.
+        // Seed that state directly: no parent identity has been recorded for this symbolic capture.
+        let captured = context.builder.borrow_mut().add_constant(CaptureReference::new(0, reference_type.clone()));
+        let captured = PartialTracer::new(context.clone(), PartialEvaluationValue::variable(reference_type, captured));
+        assert_eq!(context.reference_identity(&captured), Ok(None));
+        assert!(outer.builder().borrow().atoms().is_empty());
+    }
+
+    #[test]
+    fn test_partial_evaluation_context_zero() {
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let zero = context.zero(&ArrayType::scalar(DataType::Boolean)).unwrap();
+        assert_eq!(zero.value().unwrap().as_known(), Some(&Array::scalar(false)));
+        assert_eq!(zero.concretize(), Ok(false));
+    }
+
+    #[test]
+    fn test_region_partition_with_configuration() {
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
+        let primal = builder.add_input(scalar_type.clone());
+        let tangent = builder.add_input(scalar_type);
+        let zero = builder.add_constant(TestValue::Array(Array::scalar(0.0_f32)));
+        let reference = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![zero], None).unwrap()[0];
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, tangent], None)
+            .unwrap();
+        let output =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![primal, output], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let (partition, deferred_instructions) = program
+            .entry_region_ref()
+            .partition_with_configuration(&[true, false], true, true, Some(&[0]))
+            .unwrap();
+
+        assert_eq!(deferred_instructions, HashSet::from([InstructionId::new(program.entry_region_ref().id(), 0)]));
+        assert_eq!(partition.outputs(), &[PartialEvaluationOutput::Known(0), PartialEvaluationOutput::Unknown(0)]);
+        assert_eq!(partition.known_reference_inputs().collect::<Vec<_>>(), Vec::<usize>::new());
+        assert_eq!(
+            partition.known_program().interpret(vec![TestValue::Array(Array::scalar(3.0_f32))]),
+            Ok(vec![TestValue::Array(Array::scalar(3.0_f32))]),
+        );
+
+        // Each invocation starts from zero, including when an earlier tangent value is used again.
+        assert_eq!(
+            partition.residual_program().interpret(vec![TestValue::Array(Array::scalar(2.0_f32))]),
+            Ok(vec![TestValue::Array(Array::scalar(2.0_f32))]),
+        );
+        assert_eq!(
+            partition.residual_program().interpret(vec![TestValue::Array(Array::scalar(5.0_f32))]),
+            Ok(vec![TestValue::Array(Array::scalar(5.0_f32))]),
+        );
+        assert_eq!(
+            partition.residual_program().interpret(vec![TestValue::Array(Array::scalar(2.0_f32))]),
+            Ok(vec![TestValue::Array(Array::scalar(2.0_f32))]),
+        );
+        assert!(
+            matches!(program.entry_region_ref().partition_with_configuration(&[true, false], true, true, Some(&[1])),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "required output 1 depends on deferred work in a repeated residual computation",),
+        );
+    }
+
+    #[test]
+    fn test_region_partition_with_configuration_preserves_failure_order() {
+        let program = reference_ordering_program();
+        let partition = program
+            .entry_region_ref()
+            .partition_with_configuration(&[true, false], true, false, None)
+            .unwrap()
+            .0;
+        let destination = ArrayReference::new(Array::scalar(2.0_f32));
+        let source = ArrayReference::new(Array::scalar(1.0_f32));
+        assert_eq!(source.freeze(), Ok(Array::scalar(1.0_f32)));
+        let known = partition.known_program().interpret(vec![TestValue::Reference(destination.clone())]).unwrap();
+        let residual_inputs = partition
+            .residual_inputs()
+            .iter()
+            .map(|input| match input {
+                PartialEvaluationInput::Unknown(index) => {
+                    assert_eq!(*index, 1);
+                    TestValue::Reference(source.clone())
+                }
+                PartialEvaluationInput::Known(index) => known[*index].clone(),
+            })
+            .collect();
+        let error = partition.residual_program().interpret(residual_inputs).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<crate::programs::ReferenceError>(),
+            Some(&crate::programs::ReferenceError::Frozen),
+        );
+        assert_eq!(destination.read(), Ok(Array::scalar(2.0_f32)));
+    }
+
+    #[test]
+    fn test_region_partition_with_configuration_allows_independent_effects_before_residual_failure() {
+        let program = reference_ordering_program();
+        let partition =
+            program.entry_region_ref().partition_with_configuration(&[true, false], true, true, None).unwrap().0;
+        let destination = ArrayReference::new(Array::scalar(2.0_f32));
+        let source = ArrayReference::new(Array::scalar(1.0_f32));
+        assert_eq!(source.freeze(), Ok(Array::scalar(1.0_f32)));
+        let known = partition.known_program().interpret(vec![TestValue::Reference(destination.clone())]).unwrap();
+        let residual_inputs = partition
+            .residual_inputs()
+            .iter()
+            .map(|input| match input {
+                PartialEvaluationInput::Unknown(index) => {
+                    assert_eq!(*index, 1);
+                    TestValue::Reference(source.clone())
+                }
+                PartialEvaluationInput::Known(index) => known[*index].clone(),
+            })
+            .collect();
+        let error = partition.residual_program().interpret(residual_inputs).unwrap_err();
+        assert_eq!(
+            error.downcast_custom::<crate::programs::ReferenceError>(),
+            Some(&crate::programs::ReferenceError::Frozen),
+        );
+        assert_eq!(destination.read(), Ok(Array::scalar(0.0_f32)));
+    }
+
+    #[test]
+    fn test_region_partition_with_configuration_repeated_residual_ignores_unused_unknown_inputs() {
+        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
+        let mut branch = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = branch.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
+        branch.add_input(scalar_type.clone());
+        let one = branch.add_constant(TestValue::Array(Array::scalar(1.0_f32)));
+        branch
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, one], None)
+            .unwrap();
+        let output =
+            branch.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let branch = branch
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let unused = builder.add_input(scalar_type);
+        let zero = builder.add_constant(TestValue::Array(Array::scalar(0.0_f32)));
+        let predicate = builder.add_constant(TestValue::Array(Array::scalar(true)));
+        let reference = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![zero], None).unwrap()[0];
+        let true_branch = builder.import_program(branch.clone());
+        let false_branch = builder.import_program(branch);
+        let output = builder
+            .add_instruction(
+                ConditionOperation::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, reference, unused],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let (partition, _) =
+            program.entry_region_ref().partition_with_configuration(&[false], true, true, Some(&[0])).unwrap();
+        assert_eq!(partition.outputs(), &[PartialEvaluationOutput::Known(0)]);
+        assert!(partition.residual_program().instructions().is_empty());
+        assert_eq!(partition.known_program().interpret(Vec::new()), Ok(vec![TestValue::Array(Array::scalar(1.0_f32))]));
+    }
+
+    #[test]
+    fn test_region_partition_with_configuration_repeated_residual_tracks_empty_output_effects() {
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let tangent = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let zero = builder.add_constant(TestValue::Array(Array::scalar(0.0_f32)));
+        let reference = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![zero], None).unwrap()[0];
+        let print = TestOperation::from(ArrayOperation::from(PrintOperation::new("deferred")));
+        builder.add_instruction(print, Vec::new(), vec![tangent], None).unwrap();
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, zero], None)
+            .unwrap();
+        let program =
+            builder.build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
+
+        // The write has known operands and no outputs. Its deferred execution must still pull the allocation into
+        // each residual call, rather than retain a reference created once by the known program.
+        let (partition, _) =
+            program.entry_region_ref().partition_with_configuration(&[false], true, true, Some(&[])).unwrap();
+        assert!(partition.known_program().instructions().is_empty());
+        assert!(partition.known_reference_inputs().next().is_none());
+        assert_eq!(
+            partition.residual_program().to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = print [label=deferred] %0
+                    %2:f32[] = const 0.0
+                    %3:ref<f32[]> = reference_new %2
+                    reference_write %3 %2
+                in ()
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_region_partition_with_configuration_repeated_residual_preserves_cross_class_order() {
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let source = builder.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
+        let tangent = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let print = TestOperation::from(ArrayOperation::from(PrintOperation::new("before_read")));
+        builder.add_instruction(print, Vec::new(), vec![tangent], None).unwrap();
+        let output = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![source], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        assert!(
+            matches!(program.entry_region_ref().partition_with_configuration(&[true, false], true, true, Some(&[0])),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "required output 0 depends on deferred work in a repeated residual computation",),
+        );
+    }
+
+    #[test]
+    fn test_region_partition_with_configuration_repeated_residual_preserves_reference_constant_order() {
+        let mut builder = ProgramBuilder::<TestCapture, ReferenceReadOperation<ArrayType, ArrayIrType>>::new();
+        let source = builder.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
+        let captured =
+            builder.add_constant(CaptureReference::new(0, ReferenceType::new(ArrayType::scalar(DataType::F32)).into()));
+        builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![source], None).unwrap();
+        let output =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![captured], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestCapture>, Vec<TestCapture>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // A captured reference and a symbolic input have different analysis roots, but that alone cannot establish
+        // their runtime independence. Keep the captured access behind the earlier deferred read.
+        assert!(matches!(
+            program.entry_region_ref().partition_with_configuration(&[false], true, true, Some(&[0])),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "required output 0 depends on deferred work in a repeated residual computation",
+        ),);
+    }
+
+    #[test]
+    fn test_region_partition_with_configuration_repeated_residual_rejects_shared_local_state() {
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let tangent = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let zero = builder.add_constant(TestValue::Array(Array::scalar(0.0_f32)));
+        let reference = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![zero], None).unwrap()[0];
+        let initial =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, tangent], None)
+            .unwrap();
+        let final_value =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(
+                vec![initial, final_value],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        // Recursive discovery preserves the initially known output. Until its ownership is explicit, keeping the
+        // allocation outside repeated execution would silently retain updates from earlier calls.
+        assert!(matches!(program.entry_region_ref().partition_with_configuration(&[false], true, true, None),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "local reference allocation contributes to both required known outputs and deferred state",),);
+    }
+
+    #[test]
+    fn test_region_partition_with_configuration_rejects_invalid_required_output() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F32));
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        assert!(matches!(
+            program.entry_region_ref().partition_with_configuration(&[true], true, true, Some(&[1])),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "required known output index 1 is out of bounds",
+        ),);
+    }
+
+    #[test]
+    fn test_region_partition_with_configuration_discovers_allocations_across_retries() {
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let update = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let zero = builder.add_constant(TestValue::Array(Array::scalar(0.0_f32)));
+        let first = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![zero], None).unwrap()[0];
+        let second = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![zero], None).unwrap()[0];
+        let read = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![second], None).unwrap()[0];
+        builder
+            .add_instruction(ArrayOperation::Print(PrintOperation::new("read")), Vec::new(), vec![read], None)
+            .unwrap();
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![first, zero], None)
+            .unwrap();
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![second, update], None)
+            .unwrap();
+        let program =
+            builder.build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
+        let region = program.entry_region_ref();
+
+        // Initially only the final write is residual, so it defers the second allocation. Replaying then defers its
+        // read and print; that print keeps the first allocation's write residual, requiring another discovery pass.
+        let (partition, deferred_instructions) =
+            region.partition_with_configuration(&[false], true, true, Some(&[])).unwrap();
+        assert_eq!(
+            deferred_instructions,
+            HashSet::from([InstructionId::new(region.id(), 0), InstructionId::new(region.id(), 1)]),
+        );
+        assert!(partition.known_program().instructions().is_empty());
+        assert_eq!(
+            partition
+                .residual_program()
+                .instructions()
+                .iter()
+                .map(|instruction| instruction.operation().name())
+                .collect::<Vec<_>>(),
+            vec!["reference_new", "reference_read", "print", "reference_new", "reference_write", "reference_write"],
+        );
+        assert_eq!(
+            partition.residual_program().interpret(vec![TestValue::Array(Array::scalar(3.0_f32))]),
+            Ok(Vec::new()),
+        );
+        assert_eq!(
+            partition.residual_program().interpret(vec![TestValue::Array(Array::scalar(5.0_f32))]),
+            Ok(Vec::new()),
+        );
+    }
+
+    #[test]
+    fn test_region_partition_with_configuration_rejects_required_output_deferred_by_retry() {
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let source = builder.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
+        let update = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let zero = builder.add_constant(TestValue::Array(Array::scalar(0.0_f32)));
+        let local = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![zero], None).unwrap()[0];
+        let initial = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![local], None).unwrap()[0];
+        builder
+            .add_instruction(ArrayOperation::Print(PrintOperation::new("initial")), Vec::new(), vec![initial], None)
+            .unwrap();
+        let output = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![source], None).unwrap()[0];
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![local, update], None)
+            .unwrap();
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        // The required read folds on the first pass. Deferring the local allocation also defers the preceding print,
+        // so preserving ordered effects makes the required read residual on the next pass.
+        assert!(matches!(
+            program.entry_region_ref().partition_with_configuration(&[true, false], true, true, Some(&[0])),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "required output 0 depends on deferred work in a repeated residual computation",
+        ),);
+    }
+
+    #[test]
+    fn test_region_partition_with_configuration_allows_shared_read_only_local_state() {
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let initial = builder.add_constant(TestValue::Array(Array::scalar(2.0_f32)));
+        let local = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let known = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![local], None).unwrap()[0];
+        builder
+            .add_instruction(ArrayOperation::Print(PrintOperation::new("input")), Vec::new(), vec![input], None)
+            .unwrap();
+        let residual =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![local], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![known, residual], vec![Placeholder], vec![Placeholder; 2])
+            .unwrap();
+
+        // The local allocation contributes to a required known output, but residual invocations only read it.
+        // It can remain on the known side and cross the boundary without accumulating state between calls.
+        let (partition, deferred_instructions) =
+            program.entry_region_ref().partition_with_configuration(&[false], true, true, Some(&[0])).unwrap();
+        assert!(deferred_instructions.is_empty());
+        assert_eq!(partition.outputs(), &[PartialEvaluationOutput::Known(0), PartialEvaluationOutput::Unknown(0)]);
+        assert_eq!(partition.known_reference_inputs().collect::<Vec<_>>(), vec![1]);
+        let known = partition.known_program().interpret(Vec::new()).unwrap();
+        assert_eq!(known[0], TestValue::Array(Array::scalar(2.0_f32)));
+        assert_eq!(
+            partition.residual_inputs(),
+            &[PartialEvaluationInput::Unknown(0), PartialEvaluationInput::Known(0)],
+        );
+        assert_eq!(
+            partition
+                .residual_program()
+                .interpret(vec![TestValue::Array(Array::scalar(3.0_f32)), known[1].clone()]),
+            Ok(vec![TestValue::Array(Array::scalar(2.0_f32))]),
+        );
+        assert_eq!(
+            partition
+                .residual_program()
+                .interpret(vec![TestValue::Array(Array::scalar(5.0_f32)), known[1].clone()]),
+            Ok(vec![TestValue::Array(Array::scalar(2.0_f32))]),
+        );
+    }
+
+    #[test]
     fn test_program_partially_evaluate() {
         // `f(a, x) = (a * a, a * a * x + 1, a * a + x)` with `a` known and `x` unknown: the `a * a` subcomputation
         // folds to a known output, its two residual consumers share one residual feeder, and the literal is rebuilt
@@ -3920,7 +4662,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             evaluation.inputs,
-            vec![PartialEvaluationInput::Unknown(1), PartialEvaluationInput::Known(Array::scalar(9.0)),]
+            vec![PartialEvaluationInput::Unknown(1), PartialEvaluationInput::Known(Array::scalar(9.0)),],
         );
         assert_eq!(
             evaluation.outputs,
@@ -3928,7 +4670,7 @@ mod tests {
                 PartialEvaluationOutput::Known(Array::scalar(9.0)),
                 PartialEvaluationOutput::Unknown(0),
                 PartialEvaluationOutput::Unknown(1),
-            ]
+            ],
         );
         assert_eq!(
             evaluation.program.to_string(),
@@ -3964,7 +4706,7 @@ mod tests {
                 PartialEvaluationOutput::Known(Array::scalar(9.0)),
                 PartialEvaluationOutput::Known(Array::scalar(37.0)),
                 PartialEvaluationOutput::Known(Array::scalar(13.0)),
-            ]
+            ],
         );
         assert!(evaluation.program.instructions().is_empty());
 
@@ -3983,7 +4725,7 @@ mod tests {
                 PartialEvaluationOutput::Unknown(0),
                 PartialEvaluationOutput::Unknown(1),
                 PartialEvaluationOutput::Unknown(2),
-            ]
+            ],
         );
         assert_eq!(
             evaluation.program.to_string(),
@@ -4019,7 +4761,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             evaluation.inputs,
-            vec![PartialEvaluationInput::Unknown(1), PartialEvaluationInput::Known(Array::scalar(2.0)),]
+            vec![PartialEvaluationInput::Unknown(1), PartialEvaluationInput::Known(Array::scalar(2.0)),],
         );
         assert_eq!(
             evaluation.program.to_string(),
@@ -4036,7 +4778,7 @@ mod tests {
         assert!(matches!(
             program.partially_evaluate(&[PartialValue::Known(Array::scalar(1.0))]),
             Err(ProgramError::InvalidInputCount { expected: 2, actual: 1 }),
-        ));
+        ),);
     }
 
     #[test]
@@ -4142,6 +4884,95 @@ mod tests {
             Ok(vec![TestValue::Array(Array::scalar(5.0_f32))]),
         );
         assert_eq!(live.read(), Ok(Array::scalar(5.0_f32)));
+    }
+
+    #[test]
+    fn test_program_partially_evaluate_in_context() {
+        // `f(a, x) = (a * a) * x + 1` with `a` known as a live tracer of an enclosing trace and `x` unknown: the known
+        // `a * a` folds by staging into the outer program, the residual program consumes its staged result through a
+        // known feeder naming the outer atom, and the literal is rebuilt inline as a residual constant.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let a = builder.add_input(ArrayType::scalar(DataType::F64));
+        let x = builder.add_input(ArrayType::scalar(DataType::F64));
+        let c = builder.add_constant(Array::scalar(1.0));
+        let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![a, a], None).unwrap()[0];
+        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![squared, x], None).unwrap()[0];
+        let shifted = builder.add_instruction(AddOperation::new(), Vec::new(), vec![scaled, c], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![shifted], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let outer = ArrayTracingContext::new();
+        let known = outer.input(ArrayType::scalar(DataType::F64));
+        let evaluation = program
+            .partially_evaluate_in_context(
+                &outer,
+                &[PartialValue::Known(known), PartialValue::Unknown(ArrayType::scalar(DataType::F64))],
+            )
+            .unwrap();
+
+        // The known feeder is a tracer naming the staged `a * a` atom of the outer program (atom 2, since the replay
+        // lifts the live program constant into the outer trace up front, before replaying any instruction).
+        assert_eq!(evaluation.inputs.len(), 2);
+        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(1)));
+        assert!(matches!(
+            &evaluation.inputs[1],
+            PartialEvaluationInput::Known(feeder) if feeder.atom_id() == Ok(AtomId::new(2)),
+        ),);
+        assert_eq!(evaluation.outputs.len(), 1);
+        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
+        assert_eq!(
+            evaluation.program.to_string(),
+            indoc! {"
+                lambda %0:f64[], %1:f64[] .
+                let %2:f64[] = mul %1 %0
+                    %3:f64[] = const 1.0
+                    %4:f64[] = add %2 %3
+                in (%4)
+            "}
+            .trim_end(),
+        );
+
+        // The outer trace accumulated the lifted literal followed by the folded known work. The literal stays dead
+        // in the outer trace because the residual program rebuilds it inline.
+        let outer_program = outer
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<Array>, Vec<Array>>(vec![AtomId::new(2)], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            outer_program.to_string(),
+            indoc! {"
+                lambda %0:f64[] .
+                let %1:f64[] = const 1.0
+                    %2:f64[] = mul %0 %0
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_program_partially_evaluate_in_context_with_residual_references() {
+        // `f(r, x) = { add_update(r, 1); write(r, x); read(r) }` over a live reference `r` and an unknown `x`.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let reference_type = ReferenceType::new(scalar_type.clone());
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = builder.add_input(reference_type.clone().into());
+        let x = builder.add_input(scalar_type.clone().into());
+        let one = builder.add_constant(TestValue::Array(Array::scalar(1.0_f32)));
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, one], None)
+            .unwrap();
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, x], None)
+            .unwrap();
+        let read =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![read], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
 
         // Under a staging known side the known update folds into the outer program, the write of the unknown value
         // stages and prevents later ordered effects from folding, and the read stages over the root as a residual
@@ -4234,14 +5065,61 @@ mod tests {
         assert_eq!(evaluation.outputs, vec![PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Unknown(1)]);
         assert_eq!(evaluation.known_reference_inputs().collect::<Vec<_>>(), vec![1, 2]);
         assert_eq!(
-            evaluation
-                .program
-                .instructions()
-                .iter()
-                .map(|instruction| instruction.operation().name())
-                .collect::<Vec<_>>(),
-            vec!["reference_write", "reference_read", "reference_read"]
+            evaluation.program.to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:ref<f32[]>, %2:ref<f32[]> .
+                let reference_write %1 %0
+                    %3:f32[] = reference_read %1
+                    %4:f32[] = reference_read %2
+                in (%3, %4)
+            "}
+            .trim_end(),
         );
+        let first = ArrayReference::new(Array::scalar(2.0_f32));
+        let second = ArrayReference::new(Array::scalar(3.0_f32));
+        assert_eq!(
+            evaluation.program.interpret(vec![
+                TestValue::Array(Array::scalar(5.0_f32)),
+                TestValue::Reference(first.clone()),
+                TestValue::Reference(second.clone()),
+            ]),
+            Ok(vec![TestValue::Array(Array::scalar(5.0_f32)), TestValue::Array(Array::scalar(3.0_f32))]),
+        );
+        assert_eq!(first.read(), Ok(Array::scalar(5.0_f32)));
+        assert_eq!(second.read(), Ok(Array::scalar(3.0_f32)));
+
+        // Specializing a false predicate selects the other root before the residual program is built.
+        let false_evaluation = program
+            .partially_evaluate_in_context(
+                &outer,
+                &[
+                    PartialValue::Known(outer.constant(TestValue::Array(Array::scalar(false)))),
+                    PartialValue::Known(a.clone()),
+                    PartialValue::Known(b.clone()),
+                    PartialValue::Unknown(scalar_type.clone().into()),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            false_evaluation.program.to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:ref<f32[]>, %2:ref<f32[]> .
+                let reference_write %1 %0
+                    %3:f32[] = reference_read %2
+                    %4:f32[] = reference_read %1
+                in (%3, %4)
+            "}
+            .trim_end(),
+        );
+
+        assert!(matches!(
+            &false_evaluation.inputs[1],
+            PartialEvaluationInput::Known(reference) if reference.atom_id() == b.atom_id(),
+        ),);
+        assert!(matches!(
+            &false_evaluation.inputs[2],
+            PartialEvaluationInput::Known(reference) if reference.atom_id() == a.atom_id(),
+        ),);
 
         // An unknown predicate residualizes the whole conditional. Its ordered effects require both later reads
         // to remain residual, regardless of which branch eventually runs.
@@ -4267,562 +5145,18 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["condition", "reference_read", "reference_read"],
         );
-    }
-
-    #[test]
-    fn test_program_partially_evaluate_residualizes_scan_with_reference_carry_whole() {
-        // `f(r, xs) = { for x in xs { add_update(r, x) }; read(r) }` with the reference carried through the scan.
-        let scalar_type = ArrayType::scalar(DataType::F32);
-        let reference_type = ReferenceType::new(scalar_type.clone());
-        let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let reference = body_builder.add_input(reference_type.clone().into());
-        let x = body_builder.add_input(scalar_type.clone().into());
-        body_builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, x], None)
-            .unwrap();
-        let body = body_builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let body = builder.import_program(body);
-        let reference = builder.add_input(reference_type.into());
-        let xs = builder.add_input(ArrayType::new_static(DataType::F32, [3]).into());
-        let reference = builder
-            .add_instruction(ScanOperation::<TestValue>::new(1, 3), vec![body], vec![reference, xs], None)
-            .unwrap()[0];
-        let read =
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![read], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-
-        // The known reference carry would let the known-ness split hoist the body's accesses on it into a known scan
-        // that runs every iteration ahead of the residual scan, reordering accesses on one root across iterations, so
-        // the scan residualizes whole and the live state stays untouched until the residual program runs.
-        let live = ArrayReference::new(Array::scalar(2.0_f32));
-        let evaluation = program
-            .partially_evaluate(&[
-                PartialValue::Known(TestValue::Reference(live.clone())),
-                PartialValue::Unknown(ArrayType::new_static(DataType::F32, [3]).into()),
-            ])
-            .unwrap();
-        assert_eq!(live.read(), Ok(Array::scalar(2.0_f32)));
-        assert_eq!(evaluation.known_reference_inputs().collect::<Vec<_>>(), vec![1]);
+        // Taking the other branch at runtime must update the second root and preserve the first root.
         assert_eq!(
-            evaluation
-                .program
-                .instructions()
-                .iter()
-                .map(|instruction| instruction.operation().name())
-                .collect::<Vec<_>>(),
-            vec!["scan", "reference_read"],
+            evaluation.program.interpret(vec![
+                TestValue::Array(Array::scalar(false)),
+                TestValue::Array(Array::scalar(7.0_f32)),
+                TestValue::Reference(first.clone()),
+                TestValue::Reference(second.clone()),
+            ]),
+            Ok(vec![TestValue::Array(Array::scalar(5.0_f32)), TestValue::Array(Array::scalar(7.0_f32))]),
         );
-        assert!(evaluation.program.input_types()[1].is_reference());
-    }
-
-    #[test]
-    fn test_program_partially_evaluate_residualizes_while_with_reference_carry_whole() {
-        // `f(n, r) = { while n > 0 { add_update(r, 1); n -= 1 }; read(r) }` with the reference carried through the
-        // loop.
-        let scalar_type = ArrayType::scalar(DataType::F32);
-        let reference_type = ReferenceType::new(scalar_type.clone());
-        let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let counter = condition_builder.add_input(scalar_type.clone().into());
-        condition_builder.add_input(reference_type.clone().into());
-        let zero = condition_builder.add_constant(TestValue::Array(Array::scalar(0.0_f32)));
-        let predicate = condition_builder
-            .add_instruction(
-                ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::GreaterThan)),
-                Vec::new(),
-                vec![counter, zero],
-                None,
-            )
-            .unwrap()[0];
-        let condition = condition_builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let counter = body_builder.add_input(scalar_type.clone().into());
-        let reference = body_builder.add_input(reference_type.clone().into());
-        let one = body_builder.add_constant(TestValue::Array(Array::scalar(1.0_f32)));
-        let step = body_builder.add_constant(TestValue::Array(Array::scalar(-1.0_f32)));
-        body_builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, one], None)
-            .unwrap();
-        let next_counter = body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![counter, step], None)
-            .unwrap()[0];
-        let body = body_builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(
-                vec![next_counter, reference],
-                vec![Placeholder; 2],
-                vec![Placeholder; 2],
-            )
-            .unwrap();
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let condition = builder.import_program(condition);
-        let body = builder.import_program(body);
-        let counter = builder.add_input(scalar_type.clone().into());
-        let reference = builder.add_input(reference_type.into());
-        let outputs = builder
-            .add_instruction(
-                WhileOperation::<ArrayIrType>::new(),
-                vec![condition, body],
-                vec![counter, reference],
-                None,
-            )
-            .unwrap()
-            .to_vec();
-        let read =
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![outputs[1]], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![read], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-
-        // A loop touching references is never pure, so neither the invariance probes nor the closed-knownness split
-        // run: the loop residualizes whole, its reference carry stays a residual reference, and the live state stays
-        // untouched until the residual program runs.
-        let live = ArrayReference::new(Array::scalar(2.0_f32));
-        let evaluation = program
-            .partially_evaluate(&[
-                PartialValue::Unknown(scalar_type.into()),
-                PartialValue::Known(TestValue::Reference(live.clone())),
-            ])
-            .unwrap();
-        assert_eq!(live.read(), Ok(Array::scalar(2.0_f32)));
-        assert_eq!(evaluation.known_reference_inputs().collect::<Vec<_>>(), vec![1]);
-        assert_eq!(
-            evaluation
-                .program
-                .instructions()
-                .iter()
-                .map(|instruction| instruction.operation().name())
-                .collect::<Vec<_>>(),
-            vec!["while", "reference_read"],
-        );
-        assert!(evaluation.program.input_types()[1].is_reference());
-    }
-
-    #[test]
-    fn test_program_partially_evaluate_after_local_reference_discharge_across_scan() {
-        let array_type = ArrayType::scalar(DataType::F32);
-        let reference_type = ReferenceType::new(array_type.clone());
-        let mut body_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let reference = body_builder.add_input(reference_type.clone().into());
-        let update = body_builder.add_constant(ArrayIrValue::Array(Array::scalar(1.0_f32)));
-        body_builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
-            .unwrap();
-        let body = body_builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![reference],
-                vec![Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input = builder.add_input(array_type.clone().into());
-        let reference =
-            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
-        let body = builder.import_region(body.entry_region_ref());
-        let reference = builder
-            .add_instruction(ScanOperation::<ArrayIrValue<Array>>::new(1, 3), vec![body], vec![reference], None)
-            .unwrap()[0];
-        let output =
-            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-        let source = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output],
-                vec![Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-
-        // Discharge turns the scan's mutated reference into an ordinary carry before partial evaluation runs, so an
-        // unknown boundary residualizes the whole three-iteration loop as a pure reference-free program.
-        let evaluation = source
-            .discharge_references(0)
-            .unwrap()
-            .into_program_without_external_references()
-            .unwrap()
-            .partially_evaluate(&[PartialValue::Unknown(array_type.into())])
-            .unwrap();
-        assert!(evaluation.program().effects().classes().is_empty());
-        assert!(!evaluation.program().entry_region_ref().contains_atom_type_in_closure(Type::is_reference));
-        assert_eq!(
-            evaluation.program().interpret(vec![ArrayIrValue::Array(Array::scalar(3.0_f32))]),
-            Ok(vec![ArrayIrValue::Array(Array::scalar(6.0_f32))]),
-        );
-    }
-
-    #[test]
-    fn test_program_partially_evaluate_in_context() {
-        // `f(a, x) = (a * a) * x + 1` with `a` known as a live tracer of an enclosing trace and `x` unknown: the known
-        // `a * a` folds by staging into the outer program, the residual program consumes its staged result through a
-        // known feeder naming the outer atom, and the literal is rebuilt inline as a residual constant.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let a = builder.add_input(ArrayType::scalar(DataType::F64));
-        let x = builder.add_input(ArrayType::scalar(DataType::F64));
-        let c = builder.add_constant(Array::scalar(1.0));
-        let squared = builder.add_instruction(MulOperation::new(), Vec::new(), vec![a, a], None).unwrap()[0];
-        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![squared, x], None).unwrap()[0];
-        let shifted = builder.add_instruction(AddOperation::new(), Vec::new(), vec![scaled, c], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![shifted], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-
-        let outer = ArrayTracingContext::new();
-        let known = outer.input(ArrayType::scalar(DataType::F64));
-        let evaluation = program
-            .partially_evaluate_in_context(
-                &outer,
-                &[PartialValue::Known(known), PartialValue::Unknown(ArrayType::scalar(DataType::F64))],
-            )
-            .unwrap();
-
-        // The known feeder is a tracer naming the staged `a * a` atom of the outer program (atom 2, since the replay
-        // lifts the live program constant into the outer trace up front, before replaying any instruction).
-        assert_eq!(evaluation.inputs.len(), 2);
-        assert!(matches!(&evaluation.inputs[0], PartialEvaluationInput::Unknown(1)));
-        assert!(matches!(
-            &evaluation.inputs[1],
-            PartialEvaluationInput::Known(feeder) if feeder.atom_id() == Ok(AtomId::new(2)),
-        ));
-        assert_eq!(evaluation.outputs.len(), 1);
-        assert!(matches!(&evaluation.outputs[0], PartialEvaluationOutput::Unknown(0)));
-        assert_eq!(
-            evaluation.program.to_string(),
-            indoc! {"
-                lambda %0:f64[], %1:f64[] .
-                let %2:f64[] = mul %1 %0
-                    %3:f64[] = const 1.0
-                    %4:f64[] = add %2 %3
-                in (%4)
-            "}
-            .trim_end(),
-        );
-
-        // The outer trace accumulated the lifted literal followed by the folded known work. The literal stays dead in
-        // the outer trace because the residual program rebuilds it inline.
-        let outer_program = outer
-            .builder()
-            .borrow()
-            .clone()
-            .build::<Vec<Array>, Vec<Array>>(vec![AtomId::new(2)], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        assert_eq!(
-            outer_program.to_string(),
-            indoc! {"
-                lambda %0:f64[] .
-                let %1:f64[] = const 1.0
-                    %2:f64[] = mul %0 %0
-                in (%2)
-            "}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_partial_evaluation_context_inline_region_observation_preserves_execution_contract() {
-        let reference_type: ArrayIrType = ReferenceType::new(ArrayType::scalar(DataType::F32)).into();
-        let mut branch = ProgramBuilder::<TestValue, TestOperation>::new();
-        let source = branch.add_input(reference_type.clone());
-        branch.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![source], None).unwrap();
-        let branch = branch.build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let destination = builder.add_input(reference_type.clone());
-        let source = builder.add_input(reference_type);
-        let predicate = builder.add_constant(TestValue::Array(Array::scalar(true)));
-        let zero = builder.add_constant(TestValue::Array(Array::scalar(0.0_f32)));
-        let true_branch = builder.import_program(branch.clone());
-        let false_branch = builder.import_program(branch);
-        builder
-            .add_instruction(ConditionOperation::new(), vec![true_branch, false_branch], vec![predicate, source], None)
-            .unwrap();
-        builder
-            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![destination, zero], None)
-            .unwrap();
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder; 2], Vec::new())
-            .unwrap();
-        let region = program.entry_region_ref();
-        let analysis = region.reference_analysis_with_constants().unwrap();
-
-        // A nested read with no public outputs must still prevent later ordered effects from folding. Observation must
-        // neither enable root-sensitive replay for ordinary specialization nor disable it for separately invoked
-        // residual work.
-        for reference_analysis in [None, Some(analysis.as_ref())] {
-            let residual_instructions = RefCell::new(Vec::new());
-            let mut programs = Vec::new();
-            for observations in [None, Some(&residual_instructions)] {
-                let parent = TracingContext::<TestValue, TestOperation>::new();
-                let context =
-                    PartialEvaluationContext::new(parent.clone()).with_reference_placement(ReferencePlacement::Stage);
-                let inputs = vec![
-                    PartialEvaluationValue::known_input(parent.input(region.input_types()[0].clone())),
-                    context.unknown_input(region.input_types()[1].clone(), 1),
-                ];
-                let outputs =
-                    context.inline_region(region, inputs, &HashSet::new(), observations, reference_analysis).unwrap();
-                assert!(outputs.is_empty());
-                let residual = context.into_evaluation(outputs).unwrap().program;
-                let known = parent
-                    .builder()
-                    .borrow()
-                    .clone()
-                    .build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::new())
-                    .unwrap();
-                assert_eq!(known.instructions().len(), usize::from(reference_analysis.is_some()));
-                programs.push((known.to_string(), residual.to_string()));
-            }
-            assert_eq!(programs[0], programs[1]);
-            let expected = if reference_analysis.is_none() {
-                vec![InstructionId::new(region.id(), 0), InstructionId::new(region.id(), 1)]
-            } else {
-                vec![InstructionId::new(region.id(), 0)]
-            };
-            assert_eq!(*residual_instructions.borrow(), expected);
-
-            // Ordinary specialization preserves the read-before-write failure order. Repeated invocation instead
-            // runs independent known work now and reports a failing residual read only when that invocation runs.
-            let (partition, _) = region
-                .partition_with_configuration(&[true, false], true, reference_analysis.is_some(), None)
-                .unwrap();
-            let destination = ArrayReference::new(Array::scalar(2.0_f32));
-            let source = ArrayReference::new(Array::scalar(1.0_f32));
-            source.freeze().unwrap();
-            let known = partition.known_program().interpret(vec![TestValue::Reference(destination.clone())]).unwrap();
-            let residual_inputs = partition
-                .residual_inputs()
-                .iter()
-                .map(|input| match input {
-                    PartialEvaluationInput::Unknown(index) => {
-                        assert_eq!(*index, 1);
-                        TestValue::Reference(source.clone())
-                    }
-                    PartialEvaluationInput::Known(index) => known[*index].clone(),
-                })
-                .collect();
-            let error = partition.residual_program().interpret(residual_inputs).unwrap_err();
-            assert_eq!(
-                error.downcast_custom::<crate::programs::ReferenceError>(),
-                Some(&crate::programs::ReferenceError::Frozen)
-            );
-            assert_eq!(
-                destination.read(),
-                Ok(Array::scalar(if reference_analysis.is_some() { 0.0_f32 } else { 2.0_f32 })),
-            );
-
-            // Supplying observations must also preserve validation failures, without recording phantom work.
-            residual_instructions.borrow_mut().clear();
-            let context = PartialEvaluationContext::new(TracingContext::<TestValue, TestOperation>::new());
-            let plain_error =
-                context.inline_region(region, Vec::new(), &HashSet::new(), None, reference_analysis).unwrap_err();
-            let recorded_error = context
-                .inline_region(region, Vec::new(), &HashSet::new(), Some(&residual_instructions), reference_analysis)
-                .unwrap_err();
-            assert!(matches!(plain_error, ProgramError::InvalidInputCount { expected: 2, actual: 0 }));
-            assert!(matches!(recorded_error, ProgramError::InvalidInputCount { expected: 2, actual: 0 }));
-            assert!(residual_instructions.borrow().is_empty());
-        }
-    }
-
-    #[test]
-    fn test_region_partition_with_configuration_repeated_residual() {
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
-        let primal = builder.add_input(scalar_type.clone());
-        let tangent = builder.add_input(scalar_type);
-        let zero = builder.add_constant(TestValue::Array(Array::scalar(0.0_f32)));
-        let reference = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![zero], None).unwrap()[0];
-        builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, tangent], None)
-            .unwrap();
-        let output =
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![primal, output], vec![Placeholder; 2], vec![Placeholder; 2])
-            .unwrap();
-        let (partition, _) = program
-            .entry_region_ref()
-            .partition_with_configuration(&[true, false], true, true, Some(&[0]))
-            .unwrap();
-        assert_eq!(partition.outputs(), &[PartialEvaluationOutput::Known(0), PartialEvaluationOutput::Unknown(0)]);
-        assert_eq!(partition.known_reference_inputs().collect::<Vec<_>>(), Vec::<usize>::new());
-        assert_eq!(
-            partition.known_program().interpret(vec![TestValue::Array(Array::scalar(3.0_f32))]),
-            Ok(vec![TestValue::Array(Array::scalar(3.0_f32))])
-        );
-        for tangent in [2.0_f32, 5.0, 2.0] {
-            assert_eq!(
-                partition.residual_program().interpret(vec![TestValue::Array(Array::scalar(tangent))]),
-                Ok(vec![TestValue::Array(Array::scalar(tangent))])
-            );
-        }
-        assert!(
-            matches!(program.entry_region_ref().partition_with_configuration(&[true, false], true, true, Some(&[1])),
-            Err(ProgramError::MalformedProgram(message))
-                if message == "required output 1 depends on deferred work in a repeated residual computation")
-        );
-    }
-
-    #[test]
-    fn test_region_partition_with_configuration_repeated_residual_ignores_unused_unknown_inputs() {
-        let scalar_type: ArrayIrType = ArrayType::scalar(DataType::F32).into();
-        let mut branch = ProgramBuilder::<TestValue, TestOperation>::new();
-        let reference = branch.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
-        branch.add_input(scalar_type.clone());
-        let one = branch.add_constant(TestValue::Array(Array::scalar(1.0_f32)));
-        branch
-            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, one], None)
-            .unwrap();
-        let output =
-            branch.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-        let branch = branch
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let unused = builder.add_input(scalar_type);
-        let zero = builder.add_constant(TestValue::Array(Array::scalar(0.0_f32)));
-        let predicate = builder.add_constant(TestValue::Array(Array::scalar(true)));
-        let reference = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![zero], None).unwrap()[0];
-        let true_branch = builder.import_program(branch.clone());
-        let false_branch = builder.import_program(branch);
-        let output = builder
-            .add_instruction(
-                ConditionOperation::new(),
-                vec![true_branch, false_branch],
-                vec![predicate, reference, unused],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let (partition, _) =
-            program.entry_region_ref().partition_with_configuration(&[false], true, true, Some(&[0])).unwrap();
-        assert_eq!(partition.outputs(), &[PartialEvaluationOutput::Known(0)]);
-        assert!(partition.residual_program().instructions().is_empty());
-        assert_eq!(partition.known_program().interpret(Vec::new()), Ok(vec![TestValue::Array(Array::scalar(1.0_f32))]));
-    }
-
-    #[test]
-    fn test_region_partition_with_configuration_repeated_residual_tracks_empty_output_effects() {
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let tangent = builder.add_input(ArrayType::scalar(DataType::F32).into());
-        let zero = builder.add_constant(TestValue::Array(Array::scalar(0.0_f32)));
-        let reference = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![zero], None).unwrap()[0];
-        let print = TestOperation::from(ArrayOperation::from(PrintOperation::new("deferred")));
-        builder.add_instruction(print, Vec::new(), vec![tangent], None).unwrap();
-        builder
-            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, zero], None)
-            .unwrap();
-        let program =
-            builder.build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
-        // The write has known operands and no outputs. Its deferred execution must still pull the allocation into
-        // each residual call, rather than retain a reference created once by the known program.
-        let (partition, _) =
-            program.entry_region_ref().partition_with_configuration(&[false], true, true, Some(&[])).unwrap();
-        assert!(partition.known_program().instructions().is_empty());
-        assert!(partition.known_reference_inputs().next().is_none());
-        assert_eq!(partition.residual_program().instructions().len(), 3);
-    }
-
-    #[test]
-    fn test_region_partition_with_configuration_repeated_residual_preserves_cross_class_order() {
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let source = builder.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
-        let tangent = builder.add_input(ArrayType::scalar(DataType::F32).into());
-        let print = TestOperation::from(ArrayOperation::from(PrintOperation::new("before_read")));
-        builder.add_instruction(print, Vec::new(), vec![tangent], None).unwrap();
-        let output = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![source], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        assert!(
-            matches!(program.entry_region_ref().partition_with_configuration(&[true, false], true, true, Some(&[0])),
-            Err(ProgramError::MalformedProgram(message))
-                if message == "required output 0 depends on deferred work in a repeated residual computation")
-        );
-    }
-
-    #[test]
-    fn test_region_partition_with_configuration_repeated_residual_preserves_reference_constant_order() {
-        let mut builder = ProgramBuilder::<TestCapture, ReferenceReadOperation<ArrayType, ArrayIrType>>::new();
-        let source = builder.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
-        let captured =
-            builder.add_constant(CaptureReference::new(0, ReferenceType::new(ArrayType::scalar(DataType::F32)).into()));
-        builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![source], None).unwrap();
-        let output =
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![captured], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<TestCapture>, Vec<TestCapture>>(vec![output], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        // A captured reference and a symbolic input have different analysis roots, but that alone cannot establish
-        // their runtime independence. Keep the captured access behind the earlier deferred read.
-        assert!(matches!(
-            program.entry_region_ref().partition_with_configuration(&[false], true, true, Some(&[0])),
-            Err(ProgramError::MalformedProgram(message))
-                if message == "required output 0 depends on deferred work in a repeated residual computation",
-        ));
-    }
-
-    #[test]
-    fn test_region_partition_with_configuration_repeated_residual_rejects_shared_local_state() {
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let tangent = builder.add_input(ArrayType::scalar(DataType::F32).into());
-        let zero = builder.add_constant(TestValue::Array(Array::scalar(0.0_f32)));
-        let reference = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![zero], None).unwrap()[0];
-        let initial =
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-        builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, tangent], None)
-            .unwrap();
-        let final_value =
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(
-                vec![initial, final_value],
-                vec![Placeholder],
-                vec![Placeholder; 2],
-            )
-            .unwrap();
-        // Recursive discovery preserves the initially known output. Until its ownership is explicit, keeping the
-        // allocation outside repeated execution would silently retain updates from earlier calls.
-        assert!(matches!(program.entry_region_ref().partition_with_configuration(&[false], true, true, None),
-            Err(ProgramError::MalformedProgram(message))
-                if message == "local reference allocation contributes to both required known outputs and deferred state"));
-    }
-
-    #[test]
-    fn test_partitioned_program_has_effect_ordering_conflicts() {
-        let reference_type: ArrayIrType = ReferenceType::new(ArrayType::scalar(DataType::F32)).into();
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let known = builder.add_input(reference_type.clone());
-        let unknown = builder.add_input(reference_type);
-        let known = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![known], None).unwrap()[0];
-        let unknown =
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![unknown], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![known, unknown], vec![Placeholder; 2], vec![Placeholder; 2])
-            .unwrap();
-
-        // Each emitted program numbers its single reference input as zero. Resolve them back to original boundary
-        // inputs before comparing identities; ordinary specialization still preserves their global ordering.
-        let ordinary = program.partition(&[true, false]).unwrap();
-        assert!(ordinary.has_effect_ordering_conflicts());
-        let (repeated, _) = program
-            .entry_region_ref()
-            .partition_with_configuration(&[true, false], true, true, Some(&[0]))
-            .unwrap();
-        assert!(!repeated.has_effect_ordering_conflicts());
-        assert!(!program.partition(&[false, false]).unwrap().has_effect_ordering_conflicts());
-
-        // Reconstructing through the unqualified boundary constructor carries no repeated-invocation evidence.
-        let (known, residual, input_indices, residual_inputs, outputs) = repeated.into_parts();
-        let reconstructed = PartitionedProgram::from_parts(known, residual, input_indices, residual_inputs, outputs);
-        assert!(reconstructed.has_effect_ordering_conflicts());
+        assert_eq!(first.read(), Ok(Array::scalar(5.0_f32)));
+        assert_eq!(second.read(), Ok(Array::scalar(7.0_f32)));
     }
 
     #[test]
@@ -4844,7 +5178,7 @@ mod tests {
         assert_eq!(partition.known_input_indices, vec![0]);
         assert_eq!(
             partition.residual_inputs,
-            vec![PartialEvaluationInput::Unknown(1), PartialEvaluationInput::Known(0),]
+            vec![PartialEvaluationInput::Unknown(1), PartialEvaluationInput::Known(0),],
         );
         assert_eq!(partition.outputs, vec![PartialEvaluationOutput::Known(0), PartialEvaluationOutput::Unknown(0)]);
         assert_eq!(
@@ -4882,7 +5216,7 @@ mod tests {
         assert!(partition.known_program.output_ids().is_empty());
         assert_eq!(
             partition.residual_inputs,
-            vec![PartialEvaluationInput::Unknown(0), PartialEvaluationInput::Unknown(1),]
+            vec![PartialEvaluationInput::Unknown(0), PartialEvaluationInput::Unknown(1),],
         );
         assert_eq!(partition.outputs, vec![PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Unknown(1)]);
 

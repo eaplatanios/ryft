@@ -16,6 +16,11 @@ Act like a high-performing senior engineer, always being concise, direct, decisi
   fix issues.
 - **Minimize Impact**: Changes should only touch what is necessary. You must always avoid introducing bugs.
 
+## General Instructions
+
+- When moving or reordering code, preserve existing `TODO` comments exactly and keep each one attached to the code it
+  annotated unless the user explicitly asks to resolve or remove it. Audit marker counts after broad mechanical moves.
+
 ## Workflow
 
 When asked to implement a change or add a new feature, you must always follow the following steps:
@@ -102,6 +107,17 @@ update this file so that they do not need to remind you again in the future.
   redundant constructor methods unless those constructors add validation or the user explicitly asks for them.
 - For small, one-off data-shaping logic used in only one or two nearby methods, prefer inlining the conversion at the
   call site instead of extracting a helper that adds indirection without meaningful reuse.
+- In `ryft-core` operation modules, group each operation as its `*_OPERATION_NAME` constant, operation type and
+  inherent/formatting implementations, then `Operation`, `ReferenceDischargeableOperation`, `InterpretableOperation`
+  using the appropriate capability, `PartiallyEvaluatableOperation`, `BatchableOperation`, `DifferentiableOperation`,
+  `TransposableOperation`, `MemberOperation`, and `MemberInterpretableOperation` implementations where applicable.
+  Follow these with the operation provider trait and its implementations, then the capability trait and its
+  implementations. Order explicit capability context implementations as `EagerContext` for `Array`, `EagerContext` for
+  `ArrayIrValue`, `ProjectedContext`, `StagingContext`, `PartialEvaluationContext`, `BatchingContext`,
+  `DifferentiationContext`, and `TranspositionContext`. Keep shared blanket implementations and substantial helper
+  submodules shared rather than duplicating them to reproduce this ordering at each call site.
+- Keep core reference validation independent of transform-specific argument roles and policies. Let callers supply
+  diagnostic positions; keep tangent/cotangent roles, validation order, and primal-boundary diagnostics in differentiation.
 - When an existing `ryft` abstraction already encodes a concept (for example, mesh axis types), do not introduce a
   parallel ad-hoc representation of the same concept in a new module. Derive semantics from the canonical
   abstraction and keep one source of truth.
@@ -286,6 +302,8 @@ update this file so that they do not need to remind you again in the future.
   documentation on the trait or implementing type, and explain implementation mechanics and invariants with ordinary
   code comments (i.e., `//`) at the beginning of the implementation or relevant method body.
 - Prefer descriptive documentation that explains semantics and edge cases and includes examples where appropriate.
+- When simplifying existing documentation, preserve its architectural rationale, invariants, and relevant API links.
+  Improve wording without discarding useful information merely to shorten the text.
 - When documenting `ryft` behavior, prefer stating the concrete semantics directly instead of saying that the code
   "matches" another system such as JAX unless the external comparison is itself the point of the documentation.
 - Link to external official documentation when relevant (e.g., for MLIR, StableHLO, PJRT, XLA, Rustonomicon, etc.).

@@ -5024,83 +5024,6 @@ mod tests {
         }
     }
 
-    /// Region-policy stand-in that permits exactly one non-consuming reference access mode.
-    #[derive(Copy, Clone, Debug)]
-    struct SingleModeRegionOperation(ReferenceAccessMode);
-
-    impl Display for SingleModeRegionOperation {
-        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str(self.name())
-        }
-    }
-
-    impl Operation for SingleModeRegionOperation {
-        type Type = ListIrType;
-
-        fn name(&self) -> &'static str {
-            "test.single_mode_region"
-        }
-
-        fn infer_output_types(
-            &self,
-            _input_types: &[ListIrType],
-            _region_interfaces: &[RegionInterface<ListIrType>],
-        ) -> Result<Vec<ListIrType>, TypeError> {
-            Ok(Vec::new())
-        }
-
-        fn allows_reference_access_through_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
-            region_index == 0 && mode == self.0
-        }
-    }
-
-    impl<C: Domain<Type = ListIrType, Value = ListIrValue>> InterpretableOperation<C> for ListOperation {
-        fn interpret<D: InterpretationDriver<C>>(
-            &self,
-            context: &C,
-            driver: &D,
-            inputs: &[ListIrValue],
-        ) -> Result<Vec<ListIrValue>, ProgramError> {
-            match self {
-                Self::Call => driver.interpret_region(context, 0, inputs.to_vec()),
-                Self::Add => {
-                    check_count!("input", inputs, 2, ProgramError);
-                    Ok(vec![inputs[0].add(&inputs[1])?])
-                }
-                Self::Select { offset, length } => {
-                    check_count!("input", inputs, 1, ProgramError);
-                    let elements = inputs[0].list()?;
-                    let selected = elements.get(*offset..offset + length).ok_or_else(|| {
-                        ProgramError::MalformedProgram(format!(
-                            "selection [{}, {}) does not fit a list of length {}",
-                            offset,
-                            offset + length,
-                            elements.len(),
-                        ))
-                    })?;
-                    Ok(vec![ListIrValue::List(selected.to_vec())])
-                }
-                Self::Splice { offset } => {
-                    check_count!("input", inputs, 2, ProgramError);
-                    let mut spliced = inputs[0].list()?.to_vec();
-                    let update = inputs[1].list()?;
-                    let length = spliced.len();
-                    let range = spliced.get_mut(*offset..offset + update.len()).ok_or_else(|| {
-                        ProgramError::MalformedProgram(format!(
-                            "splice [{offset}, {}) does not fit a list of length {length}",
-                            offset + update.len(),
-                        ))
-                    })?;
-                    range.clone_from_slice(update);
-                    Ok(vec![ListIrValue::List(spliced)])
-                }
-                _ => Err(ProgramError::UnsupportedOperation {
-                    message: format!("`{}` must be discharged before interpretation", self.name()),
-                }),
-            }
-        }
-    }
-
     // One implementation covers every prototype operation, which is why the accumulating rule's
     // `ReferenceAccumulationPolicy` requirement appears as an implementation-level bound here:
     // closed operation-enum dispatch reintroduces the union that the policy split otherwise keeps separate.
@@ -5199,6 +5122,83 @@ mod tests {
                     Ok(vec![ReferenceDischargeValue::Value(context.consume(reference)?)])
                 }
                 Self::Call => discharge_positional_region_operation(self, context, driver, inputs, 0),
+            }
+        }
+    }
+
+    /// Region-policy stand-in that permits exactly one non-consuming reference access mode.
+    #[derive(Copy, Clone, Debug)]
+    struct SingleModeRegionOperation(ReferenceAccessMode);
+
+    impl Display for SingleModeRegionOperation {
+        fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str(self.name())
+        }
+    }
+
+    impl Operation for SingleModeRegionOperation {
+        type Type = ListIrType;
+
+        fn name(&self) -> &'static str {
+            "test.single_mode_region"
+        }
+
+        fn infer_output_types(
+            &self,
+            _input_types: &[ListIrType],
+            _region_interfaces: &[RegionInterface<ListIrType>],
+        ) -> Result<Vec<ListIrType>, TypeError> {
+            Ok(Vec::new())
+        }
+
+        fn allows_reference_access_through_region_input(&self, region_index: usize, mode: ReferenceAccessMode) -> bool {
+            region_index == 0 && mode == self.0
+        }
+    }
+
+    impl<C: Domain<Type = ListIrType, Value = ListIrValue>> InterpretableOperation<C> for ListOperation {
+        fn interpret<D: InterpretationDriver<C>>(
+            &self,
+            context: &C,
+            driver: &D,
+            inputs: &[ListIrValue],
+        ) -> Result<Vec<ListIrValue>, ProgramError> {
+            match self {
+                Self::Call => driver.interpret_region(context, 0, inputs.to_vec()),
+                Self::Add => {
+                    check_count!("input", inputs, 2, ProgramError);
+                    Ok(vec![inputs[0].add(&inputs[1])?])
+                }
+                Self::Select { offset, length } => {
+                    check_count!("input", inputs, 1, ProgramError);
+                    let elements = inputs[0].list()?;
+                    let selected = elements.get(*offset..offset + length).ok_or_else(|| {
+                        ProgramError::MalformedProgram(format!(
+                            "selection [{}, {}) does not fit a list of length {}",
+                            offset,
+                            offset + length,
+                            elements.len(),
+                        ))
+                    })?;
+                    Ok(vec![ListIrValue::List(selected.to_vec())])
+                }
+                Self::Splice { offset } => {
+                    check_count!("input", inputs, 2, ProgramError);
+                    let mut spliced = inputs[0].list()?.to_vec();
+                    let update = inputs[1].list()?;
+                    let length = spliced.len();
+                    let range = spliced.get_mut(*offset..offset + update.len()).ok_or_else(|| {
+                        ProgramError::MalformedProgram(format!(
+                            "splice [{offset}, {}) does not fit a list of length {length}",
+                            offset + update.len(),
+                        ))
+                    })?;
+                    range.clone_from_slice(update);
+                    Ok(vec![ListIrValue::List(spliced)])
+                }
+                _ => Err(ProgramError::UnsupportedOperation {
+                    message: format!("`{}` must be discharged before interpretation", self.name()),
+                }),
             }
         }
     }
