@@ -8,9 +8,10 @@ use crate::arrays::types::ir::ArrayIrType;
 use crate::contexts::Context;
 use crate::differentiation::ResidualZeroProvider;
 use crate::operations::{
-    DimensionSizeOperation, IotaOperation, OneOperation, ZeroLikeOperation, ZeroOperation, ZeroOperationProvider,
+    DimensionSizeOperation, IotaOperation, OneOperation, ReferenceReadOperation, ZeroLikeOperation, ZeroOperation,
+    ZeroOperationProvider,
 };
-use crate::programs::{AtomId, Operation, ProgramBuilder, ProgramError, ReferenceReadOperation, Typed, Value};
+use crate::programs::{AtomId, Operation, ProgramBuilder, ProgramError, Typed, Value};
 
 // TODO(eaplatanios): Review this module.
 
@@ -260,12 +261,13 @@ mod tests {
     use crate::contexts::{Context, Domain, EagerContext, StagingContext};
     use crate::differentiation::{
         DifferentiableType, ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate,
-        StopGradientOperation, TransposableOperation, TranspositionContext, differentiate_at,
+        TransposableOperation, TranspositionContext, differentiate_at,
     };
     use crate::interpretation::InterpretableOperation;
     use crate::macros::check_operation_partial_evaluation;
     use crate::operations::{
-        ConstantOperation, DynamicBroadcastOperation, Iota, Mul, One, Reduce, ReductionKind, Zero, ZeroOperation,
+        ConstantOperation, DynamicBroadcastOperation, Iota, Mul, One, Reduce, ReductionKind, StopGradientOperation,
+        Zero, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;

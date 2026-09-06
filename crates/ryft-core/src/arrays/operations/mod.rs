@@ -20,9 +20,8 @@ use crate::arrays::types::ir::ArrayIrType;
 use crate::axes::AxisIndexOperation;
 use crate::contexts::{Context, ProjectedContext};
 use crate::differentiation::{
-    CustomJvpOperation, CustomVjpOperation, DifferentiableOperation, DifferentiableType, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, LinearCallOperation, MemberDifferentiableOperation,
-    ResidualZeroProvider, StopGradient, StopGradientOperation, jvp_projected_operation,
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    MemberDifferentiableOperation, ResidualZeroProvider, jvp_projected_operation,
 };
 use crate::operations::attention::{
     DotProductAttention, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
@@ -42,31 +41,31 @@ use crate::operations::{
     Ceil, CeilOperation, Compare, CompareOperation, Concatenate, ConcatenateOperation, ConditionOperation,
     ConstantOperation, ConvertElementType, ConvertElementTypeOperation, Cos, CosOperation, CumulativeLogSumExp,
     CumulativeLogSumExpOperation, CumulativeMax, CumulativeMaxOperation, CumulativeMin, CumulativeMinOperation,
-    CumulativeProduct, CumulativeProductOperation, CumulativeSum, CumulativeSumOperation, DimensionAddOperation,
-    DimensionArithmetic, DimensionDivFloorOperation, DimensionFromScalar, DimensionFromScalarOperation, DimensionMax,
-    DimensionMaxOperation, DimensionMin, DimensionMinOperation, DimensionMulOperation, DimensionPow,
-    DimensionPowOperation, DimensionRemOperation, DimensionRequirement, DimensionRequirementOperation,
-    DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize, DimensionSizeOperation,
-    DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div, DivOperation, Dot, DotOperation,
-    DynamicBroadcast, DynamicBroadcastOperation, DynamicReshape, DynamicReshapeOperation, DynamicShapeSliceOperation,
-    DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation, Erf, ErfOperation, Exp,
-    ExpOperation, Floor, FloorOperation, Gather, GatherOperation, IotaOperation, Log, Log1p, Log1pOperation, LogAddExp,
-    LogAddExpOperation, LogOperation, LogSumExp, LogSumExpOperation, Logistic, LogisticOperation, Max, MaxOperation,
-    Min, MinOperation, Mul, MulOperation, Neg, NegOperation, Not, NotOperation, OneLike, OneLikeOperation,
-    OneOperation, Or, OrOperation, Pad, PadOperation, ParallelReduceOperation, Pow, PowOperation, PrintOperation,
-    RaggedDot, RaggedDotOperation, Reduce, ReduceOperation, Rem, RemOperation, Reshape, ReshapeOperation,
-    ReshardOperation, Round, RoundOperation, Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation, ScanOperation,
-    Scatter, ScatterOperation, Select, SelectOperation, ShardingConstraintOperation, Sign, SignOperation, Sin,
-    SinOperation, Slice, SliceOperation, Sqrt, SqrtOperation, Sub, SubOperation, TagOperation, Tanh, TanhOperation,
-    TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation, WhileOperation, Xor,
-    XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    CumulativeProduct, CumulativeProductOperation, CumulativeSum, CumulativeSumOperation, CustomJvpOperation,
+    CustomVjpOperation, DimensionAddOperation, DimensionArithmetic, DimensionDivFloorOperation, DimensionFromScalar,
+    DimensionFromScalarOperation, DimensionMax, DimensionMaxOperation, DimensionMin, DimensionMinOperation,
+    DimensionMulOperation, DimensionPow, DimensionPowOperation, DimensionRemOperation, DimensionRequirement,
+    DimensionRequirementOperation, DimensionSaturatingSub, DimensionSaturatingSubOperation, DimensionSize,
+    DimensionSizeOperation, DimensionSubOperation, DimensionToScalar, DimensionToScalarOperation, Div, DivOperation,
+    Dot, DotOperation, DynamicBroadcast, DynamicBroadcastOperation, DynamicReshape, DynamicReshapeOperation,
+    DynamicShapeSliceOperation, DynamicSlice, DynamicSliceOperation, DynamicUpdateSlice, DynamicUpdateSliceOperation,
+    Erf, ErfOperation, Exp, ExpOperation, Floor, FloorOperation, Gather, GatherOperation, IotaOperation,
+    LinearCallOperation, Log, Log1p, Log1pOperation, LogAddExp, LogAddExpOperation, LogOperation, LogSumExp,
+    LogSumExpOperation, Logistic, LogisticOperation, Max, MaxOperation, Min, MinOperation, Mul, MulOperation, Neg,
+    NegOperation, Not, NotOperation, OneLike, OneLikeOperation, OneOperation, Or, OrOperation, Pad, PadOperation,
+    ParallelReduceOperation, Pow, PowOperation, PrintOperation, RaggedDot, RaggedDotOperation, Reduce, ReduceOperation,
+    ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
+    ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation,
+    ReferenceWrite, ReferenceWriteOperation, Rem, RemOperation, Reshape, ReshapeOperation, ReshardOperation, Round,
+    RoundOperation, Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation, ScanOperation, Scatter, ScatterOperation,
+    Select, SelectOperation, ShardingConstraintOperation, Sign, SignOperation, Sin, SinOperation, Slice,
+    SliceOperation, Sqrt, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, TagOperation, Tanh,
+    TanhOperation, TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
+    WhileOperation, Xor, XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::programs::{
-    MaybeZero, Operation, OperationProjection, ProgramError, ReferenceAddUpdate, ReferenceAddUpdateOperation,
-    ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
-    ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceViewOperation,
-    ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation, Type, TypeError, TypeIdentityPosition,
-    Typed, Value, ValueProjection, ViewSymbol,
+    MaybeZero, Operation, OperationProjection, ProgramError, ReferenceViewOperation, ReferenceViewValidationError,
+    Type, TypeError, TypeIdentityPosition, Typed, Value, ValueProjection, ViewSymbol,
 };
 use crate::tracing::TracingContext;
 use crate::tracing_v2::RematerializeOperation;
@@ -105,7 +104,7 @@ pub use references::{
 ///
 /// [`ArrayOperation`] is the ordinary operation enum for core tests and backend crates, pairing with [`Array`]. Most
 /// variants are thin tags around one semantic primitive defined in [`crate::operations`] or
-/// [`crate::differentiation::operations`].
+/// [`crate::operations::differentiation`].
 ///
 /// Each variant wraps exactly the backing operation struct that owns the variant's semantics (type inference,
 /// rendering, and interpretation): for example [`Zero`](Self::Zero) wraps a [`ZeroOperation`] and

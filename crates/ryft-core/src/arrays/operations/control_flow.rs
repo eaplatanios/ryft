@@ -441,18 +441,16 @@ mod tests {
     use crate::arrays::types::ir::ArrayIrType;
     use crate::arrays::types::layouts::{Layout, StridedLayout};
     use crate::contexts::{Context, EagerContext, StagingContext};
-    use crate::differentiation::{ForwardModeDifferentiate, StopGradientOperation};
+    use crate::differentiation::ForwardModeDifferentiate;
     use crate::operations::{
         Add, AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, DimensionFromScalarOperation,
         DynamicBroadcastOperation, DynamicReshapeOperation, MulOperation, ReduceOperation, ReductionKind,
-        ScanOperation, Select, WhileOperation, WhilePredicate, ZeroOperation,
+        ReferenceAddUpdateOperation, ReferenceReadOperation, ScanOperation, Select, StopGradientOperation,
+        WhileOperation, WhilePredicate, ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
-    use crate::programs::{
-        Program, ProgramBuilder, ProgramError, ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceType,
-        Typed,
-    };
+    use crate::programs::{Program, ProgramBuilder, ProgramError, ReferenceType, Typed};
     use crate::tracing::TracingContext;
 
     type TestValue = ArrayIrValue<Array>;

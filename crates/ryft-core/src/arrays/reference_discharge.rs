@@ -397,16 +397,17 @@ mod tests {
     use crate::captures::{CaptureReference, ClosedProgram};
     use crate::contexts::EagerContext;
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
-    use crate::operations::{ConditionOperation, ScanOperation, WhileOperation};
+    use crate::operations::{
+        ConditionOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
+        ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, ScanOperation, WhileOperation,
+    };
     use crate::parameters::Placeholder;
     use crate::programs::{
         EffectClasses, Effects, ExternalReferenceBinding, InputRegionProvenance, Instruction, InstructionId, Operation,
-        OutputRegionProvenance, Program, ProgramBuilder, ReferenceAddUpdateOperation, ReferenceDischargeContext,
-        ReferenceDischargeDriver, ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue,
-        ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-        ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceViewOperation, ReferenceViewValidationError,
-        ReferenceWriteOperation, RegionInterface, RegionSlot, TypeError, ViewSymbol,
-        discharge_positional_region_operation, discharge_reference_free_operation,
+        OutputRegionProvenance, Program, ProgramBuilder, ReferenceDischargeContext, ReferenceDischargeDriver,
+        ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation,
+        ReferenceSource, ReferenceType, ReferenceViewOperation, ReferenceViewValidationError, RegionInterface,
+        RegionSlot, TypeError, ViewSymbol, discharge_positional_region_operation, discharge_reference_free_operation,
     };
     use crate::tracing::{Trace, Tracer, TracingContext};
 

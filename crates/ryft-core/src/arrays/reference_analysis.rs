@@ -98,15 +98,15 @@ mod tests {
     use crate::arrays::types::ir::ArrayIrType;
     use crate::contexts::Context;
     use crate::operations::{
-        ConditionOperation, ReshapeOperation, SliceOperation, UpdateSliceOperation, WhileOperation,
+        ConditionOperation, ReferenceFreezeOperation, ReferenceReadOperation, ReferenceWriteOperation,
+        ReshapeOperation, SliceOperation, UpdateSliceOperation, WhileOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::{
         AtomId, EffectClasses, Effects, Instruction, InstructionId, Operation, ProgramBuilder, ProgramError,
         ReferenceAccessMode, ReferenceAlias, ReferenceAliasEdge, ReferenceAliasKind, ReferenceAliasOrigin,
-        ReferenceAnalysisError, ReferenceFreezeOperation, ReferenceReadOperation, ReferenceRoot, ReferenceSource,
-        ReferenceType, ReferenceViewOperation, ReferenceViewValidationError, ReferenceWriteOperation, RegionId,
-        RegionInterface, TypeError,
+        ReferenceAnalysisError, ReferenceRoot, ReferenceSource, ReferenceType, ReferenceViewOperation,
+        ReferenceViewValidationError, RegionId, RegionInterface, TypeError,
     };
 
     use super::*;

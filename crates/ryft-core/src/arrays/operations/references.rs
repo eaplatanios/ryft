@@ -33,18 +33,20 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
-use crate::operations::{Add, Reshape, Slice, UpdateSlice};
+use crate::operations::references::forwarded_tangent;
+use crate::operations::{
+    Add, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAddUpdateOperationProvider, ReferenceFreeze,
+    ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceNewOperationProvider, ReferenceRead,
+    ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Reshape,
+    Slice, UpdateSlice,
+};
 use crate::parameters::Parameter;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::references::forwarded_tangent;
 use crate::programs::{
-    EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, ProgramError, ProjectedValue, ReferenceAddUpdate,
-    ReferenceAddUpdateOperation, ReferenceAddUpdateOperationProvider, ReferenceAlias, ReferenceAliasKind,
-    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
-    ReferenceNewOperationProvider, ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation,
-    ReferenceType, ReferenceView, ReferenceViewOperation, ReferenceViewValidationError, ReferenceWrite,
-    ReferenceWriteOperation, RegionInterface, TypeError, Typed, Value, ValueProjection, ViewSymbol,
+    EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, ProgramError, ProjectedValue, ReferenceAlias,
+    ReferenceAliasKind, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceType, ReferenceView, ReferenceViewOperation,
+    ReferenceViewValidationError, RegionInterface, TypeError, Typed, Value, ValueProjection, ViewSymbol,
     batch_reference_view_operation,
 };
 use crate::tracing::{Tracer, TracingContext};
@@ -883,11 +885,12 @@ mod tests {
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::control_flow::scan::ScanOperation;
     use crate::operations::control_flow::r#while::WhileOperation;
+    use crate::operations::{REFERENCE_NEW_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, ReferencePlacement};
     use crate::programs::{
-        EffectClass, EffectClasses, EmptyRegionDriver, ProgramBuilder, ProgramError, REFERENCE_NEW_OPERATION_NAME,
-        REFERENCE_READ_OPERATION_NAME, ReferenceError, TypeError, ViewSymbol,
+        EffectClass, EffectClasses, EmptyRegionDriver, ProgramBuilder, ProgramError, ReferenceError, TypeError,
+        ViewSymbol,
     };
     use crate::tracing::{Tracer, TracingContext};
 
