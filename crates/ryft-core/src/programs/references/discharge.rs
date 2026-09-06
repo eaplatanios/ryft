@@ -111,13 +111,19 @@
 //!
 //! # Relation to Transforms
 //!
-//! Discharge is currently the only route from reference state into the generic transforms: differentiation,
-//! batching, partial evaluation, etc. reject a program that still contains references, and callers discharge first.
-//! Reference-typed carries and outputs of structured operations are supported when the operation states their identity,
-//! partial discharge may preserve internal allocations, and a `while` operation whose condition mutates references is
-//! rotated into "do-while form" (i.e., the condition runs once before the loop and again at the tail of the body)
-//! unless the loop declares an iteration bound. Dynamic, gathered, or strided views, uninitialized references, and
-//! running transforms directly over references are not supported.
+//! Discharge is the lowering and normalization route. Backend lowering requires it, because a stateless backend cannot
+//! represent a reference, and callers invoke it when they want the explicit state-passing form of a program; the
+//! transforms themselves do not. Forward mode, linearization, reverse mode (with per-input cotangent destinations),
+//! batching, partial evaluation (with global ordered-effect ordering), rematerialization, the custom-derivative
+//! operations, and `jit_call` operate on references directly, reading structural facts from the
+//! [`ReferenceAnalysis`](super::ReferenceAnalysis) cached on the region and validating runtime aliasing at their public
+//! boundaries with [`validate_reference_boundary`](super::validate_reference_boundary). The discharged program is the
+//! oracle those transforms are tested against: transforming it must agree with transforming the reference program
+//! directly. Reference-typed carries and outputs of structured operations are supported when the operation states
+//! their identity, partial discharge may preserve internal allocations, and a `while` operation whose condition mutates
+//! references is rotated into "do-while form" (i.e., the condition runs once before the loop and again at the tail of
+//! the body) unless the loop declares an iteration bound. Array views with dynamic index operands, gathered views,
+//! and uninitialized references remain unsupported.
 //!
 //! # End-to-End Flow
 //!
@@ -145,13 +151,14 @@ use crate::macros::check_count;
 use crate::parameters::{Parameterized, Placeholder};
 use crate::programs::ProgramError;
 use crate::programs::atoms::{Atom, AtomId};
+use crate::programs::effects::ReferenceAccessMode;
 use crate::programs::instructions::{Instruction, InstructionId};
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
-use crate::programs::references::semantics::{ReferenceAccessMode, ReferenceOutput};
 use crate::programs::references::types::ReferenceType;
 use crate::programs::regions::{
-    EmptyRegionDriver, RegionDriver, RegionId, RegionRef, RegionReplayMappings, ReplayRegionDriver,
+    EmptyRegionDriver, InputRegionProvenance, RegionDriver, RegionId, RegionRef, RegionReplayMappings, RegionRole,
+    ReplayRegionDriver,
 };
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
@@ -253,7 +260,7 @@ impl ReferenceDischargeTargets {
         }
 
         // Only the instructions reachable from the entry region are selectable, and only the named ones are resolved,
-        // so validating a small target set does not pay for the reference semantics of every instruction.
+        // so validating a small target set does not pay for the effect declarations of every instruction.
         let instructions = entry.instructions_in_closure().collect::<HashMap<_, _>>();
         for target in targets {
             let invalid_target = || {
@@ -271,8 +278,8 @@ impl ReferenceDischargeTargets {
                 }
                 ReferenceDischargeTarget::Internal { instruction, output_index } => {
                     let instruction = instructions.get(instruction).ok_or_else(invalid_target)?;
-                    let semantics = instruction.operation().reference_semantics();
-                    if !semantics.allocation_output_indices().any(|index| index == *output_index) {
+                    let effects = instruction.operation().effects();
+                    if !effects.allocation_output_indices().any(|index| index == *output_index) {
                         return Err(invalid_target());
                     }
                 }
@@ -295,7 +302,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     /// Returns every [`ReferenceDischargeTarget`] that this [`Program`] exposes to partial reference discharge, in a
     /// canonical ordering with the entry-boundary externals in boundary order, followed by the interior allocations
     /// ordered by instruction and output position. This is a deliberately lightweight query. It reads only the entry
-    /// boundary types and the generic [`Operation::reference_semantics`] over the attached [`Region`](crate::Region)
+    /// boundary types and the generic [`Operation::effects`] declarations over the attached [`Region`](crate::Region)
     /// closure, so it does not run the discharge rewrite or construct its environments, and callers can enumerate
     /// selectable targets without paying for either. Allocations inside nested regions are included because every
     /// allocating [`Instruction`] defines a concrete local reference wherever it occurs.
@@ -337,21 +344,14 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
             })
             .collect::<Vec<_>>();
 
-        let mut allocations = entry
-            .instructions_in_closure()
-            .flat_map(|(instruction_id, instruction)| {
-                instruction
-                    .operation()
-                    .reference_semantics()
-                    .allocation_output_indices()
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .map(move |output_index| ReferenceDischargeTarget::Internal {
-                        instruction: instruction_id,
-                        output_index,
-                    })
-            })
-            .collect::<Vec<_>>();
+        let mut allocations = Vec::new();
+        for (instruction_id, instruction) in entry.instructions_in_closure() {
+            allocations.extend(
+                instruction.operation().effects().allocation_output_indices().map(|output_index| {
+                    ReferenceDischargeTarget::Internal { instruction: instruction_id, output_index }
+                }),
+            );
+        }
 
         // Closure traversal visits regions in an unspecified order, so internal targets are sorted by instruction and
         // output position to make the enumeration reproducible for callers that persist or compare target sets.
@@ -362,12 +362,12 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
 }
 
 /// [`Reference`](crate::Reference)-free [`Program`] and external-reference bindings produced by the reference
-/// discharge transform. A full result is a [`PartialReferenceDischargeResult`] whose complete attached region closure
-/// has been proven to contain neither reference-typed atoms nor operations with reference semantics. The [`TryFrom`]
-/// implementation performs that proof and otherwise wraps the partial result unchanged. The proof examines every
-/// attached region, including dormant rule regions. It rejects the conversion with [`ProgramError::MalformedProgram`]
-/// if any reference-typed atom or operation with reference semantics remains; unrelated ordered-state operations do not
-/// prevent conversion.
+/// discharge transform. A full result is a [`PartialReferenceDischargeResult`] whose complete attached region
+/// closure has been proven to contain neither reference-typed atoms nor operations with reference declarations.
+/// The [`TryFrom`] implementation performs that proof and otherwise wraps the partial result unchanged.
+/// The proof examines every attached region, including dormant rule regions. It rejects the conversion with
+/// [`ProgramError::MalformedProgram`] if any reference-typed atom or operation with reference declarations remains.
+/// Unrelated ordered-state operations do not prevent conversion.
 #[derive(Debug)]
 pub struct ReferenceDischargeResult<V: Value, O: Operation<Type = V::Type>> {
     /// Underlying [`PartialReferenceDischargeResult`].
@@ -493,7 +493,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TryFrom<PartialReferenceDischargeRe
         // instruction position rather than the first one encountered, keeping the diagnostic reproducible.
         if let Some((instruction_id, instruction)) = entry
             .instructions_in_closure()
-            .filter(|(_, instruction)| !instruction.operation().reference_semantics().is_empty())
+            .filter(|(_, instruction)| instruction.operation().effects().has_reference_declarations())
             .min_by_key(|(instruction_id, _)| *instruction_id)
         {
             return Err(ProgramError::MalformedProgram(format!(
@@ -938,7 +938,7 @@ pub struct ReferenceDischargeReference<C: Domain, P: ReferenceDischargePolicy<C>
     /// Refer to the documentation of [`Self::allocation_id`].
     allocation_id: ReferenceDischargeAllocationId,
 
-    /// Refer to the documentation of [`Self::r#type`].
+    /// Refer to the documentation of [`Typed::r#type`](Typed::type).
     r#type: ReferenceType<P::Referent>,
 
     /// Refer to the documentation of [`Self::is_view`].
@@ -975,7 +975,9 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeReference<C, P
     /// Returns the alias that a [`ReferenceDischargePolicy`] can use to access the portion selected by this
     /// [`ReferenceDischargeReference`]. The alias always applies directly to the allocation's complete stored value.
     /// When this reference is created from another view, the alias therefore describes the portion selected by the new
-    /// reference relative to the complete stored value, rather than relative only to the input view.
+    /// reference relative to the complete stored value, rather than relative only to the input view. A view step whose
+    /// coordinates are symbolic is closed over the destination values of the operands it names when the alias is
+    /// created, so the policy resolves it from the alias alone, without an environment lookup.
     pub const fn alias(&self) -> &P::Alias {
         &self.alias
     }
@@ -1093,25 +1095,69 @@ enum ReferenceDischargeBinding<V> {
     },
 }
 
+/// Represents what a declared input of a rebuilt [`Region`](crate::Region) carries across a
+/// [`ReferenceDischargeRegionBoundary`] (i.e., a value, the complete handle of a caller allocation, or a boundary
+/// view that the attaching operation creates from a caller allocation for that region input like, for example, the
+/// per-iteration slice of a `scan` operation's stacked reference operand).
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ReferenceDischargeRegionInput {
+    /// The input carries a value and no reference.
+    Value,
+
+    /// The input is the complete handle/reference of the caller allocation, typed exactly as the allocation is.
+    /// It replays against the caller allocation's state (or preserved reference), and the region publishes that
+    /// allocation's successor state through the outputs that the boundary declares or adds for it.
+    Allocation(ReferenceDischargeAllocationId),
+
+    /// The attaching operation selects a view of this caller allocation at the region boundary. A discharged view
+    /// becomes region-local state typed by the region input. A preserved view remains a reference input. The owning
+    /// rule requests any final view state through [`ReferenceDischargeRegionOutput::View`] and integrates it into the
+    /// caller allocation. Other handles in the region must not observe overlapping state independently.
+    View(ReferenceDischargeAllocationId),
+}
+
+impl From<Option<ReferenceDischargeAllocationId>> for ReferenceDischargeRegionInput {
+    #[inline]
+    fn from(allocation: Option<ReferenceDischargeAllocationId>) -> Self {
+        match allocation {
+            None => Self::Value,
+            Some(allocation) => Self::Allocation(allocation),
+        }
+    }
+}
+
+/// Source of one added output of a rebuilt region that appears in a [`ReferenceDischargeRegionBoundary`]. When a
+/// [`ReferenceDischargeRegionBoundaryInsertion`] containing allocation IDs is converted to describe region outputs,
+/// each ID becomes an [`Allocation`](Self::Allocation) output.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum ReferenceDischargeRegionOutput {
+    /// Final state of a threaded caller allocation, or its destination reference when preserved.
+    Allocation(ReferenceDischargeAllocationId),
+
+    /// Final state of a discharged boundary view, identified by its declared region input position. The owning
+    /// operation integrates this state into the caller allocation; preserved views cannot publish explicit state.
+    View(usize),
+}
+
 /// Boundary that a structured reference discharge rule requests for one rebuilt [`Region`](crate::Region) through
 /// [`ReferenceDischargeDriver::rebuild_region`]. The rule owns the mapping from its operands onto the region's declared
-/// inputs, because that mapping is part of what the operation is. The boundary therefore states the allocation entering
-/// at each declared input position, in region order, and separately names the reference-related positions the rebuilt
-/// region gains: the allocations that enter as added inputs, the allocations it publishes as added outputs, and the
-/// position at which each group is inserted.
+/// inputs, because that mapping is part of what the operation is. The boundary therefore states what enters at each
+/// declared input position, in region order, and separately names the reference-related positions the rebuilt region
+/// gains (i.e., the allocations that enter as added inputs and the allocation or view states published by output
+/// groups). Each group specifies its insertion position in the source boundary.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReferenceDischargeRegionBoundary {
-    /// Refer to the documentation of [`Self::declared_input_allocations`].
-    declared_input_allocations: Vec<Option<ReferenceDischargeAllocationId>>,
+    /// Refer to the documentation of [`Self::declared_inputs`].
+    declared_inputs: Vec<ReferenceDischargeRegionInput>,
 
     /// Refer to the documentation of [`Self::capture_input_count`].
     capture_input_count: Option<usize>,
 
     /// Refer to the documentation of [`Self::added_inputs`].
-    added_inputs: ReferenceDischargeRegionStateInsertion,
+    added_inputs: ReferenceDischargeRegionBoundaryInsertion,
 
     /// Refer to the documentation of [`Self::added_outputs`].
-    added_outputs: ReferenceDischargeRegionStateInsertion,
+    added_outputs: Vec<ReferenceDischargeRegionBoundaryInsertion<ReferenceDischargeRegionOutput>>,
 }
 
 impl ReferenceDischargeRegionBoundary {
@@ -1127,47 +1173,53 @@ impl ReferenceDischargeRegionBoundary {
     ///   - `operation`: [`Operation`] the region is attached to, whose [`Operation::region_capture_input_count`]
     ///     declares the [`Region`](crate::Region)'s own leading capture prefix.
     ///   - `region_index`: Position of the [`Region`](crate::Region) among that [`Operation`]'s attached regions.
-    ///   - `declared_input_allocations`: Allocation entering at each declared input position, or [`None`] for a value
-    ///     input. Reference positions must come from [`ReferenceDischargeContext::operand_allocation`], which validates
-    ///     that each operand carries the complete stored value rather than a view. The length must equal the source
-    ///     region's input count, because every declared position is rebuilt.
+    ///   - `declared_inputs`: Specifies what enters at each declared input position. Allocations must come from
+    ///     [`ReferenceDischargeContext::operand_allocation`], which validates that each operand carries the complete
+    ///     stored value rather than a view. A [`View`](ReferenceDischargeRegionInput::View) position names the
+    ///     allocation the operation itself views at the boundary. The length must equal the source region's input
+    ///     count, because every declared position is rebuilt.
     ///   - `added_inputs`: Allocations the rebuilt region receives as added inputs, together with the source input
     ///     position at which they are inserted.
-    ///   - `added_outputs`: Allocations the rebuilt region publishes as added outputs, together with the source output
-    ///     position at which they are inserted.
+    ///   - `added_outputs`: Output groups in nondecreasing source output position order. Each group names caller
+    ///     allocations or declared view inputs whose states are published before that source output. Groups at the
+    ///     same position retain their supplied order and a position equal to the source output count appends the group.
     #[inline]
-    pub fn new<O: Operation>(
+    pub fn new<
+        O: Operation,
+        I: Into<ReferenceDischargeRegionInput>,
+        DeclaredInputs: IntoIterator<Item = I>,
+        AddedOutputs: IntoIterator<Item = ReferenceDischargeRegionBoundaryInsertion<ReferenceDischargeRegionOutput>>,
+    >(
         operation: &O,
         region_index: usize,
-        declared_input_allocations: Vec<Option<ReferenceDischargeAllocationId>>,
-        added_inputs: ReferenceDischargeRegionStateInsertion,
-        added_outputs: ReferenceDischargeRegionStateInsertion,
+        declared_inputs: DeclaredInputs,
+        added_inputs: ReferenceDischargeRegionBoundaryInsertion,
+        added_outputs: AddedOutputs,
     ) -> Self {
         Self {
-            declared_input_allocations,
+            declared_inputs: declared_inputs.into_iter().map(Into::into).collect(),
             capture_input_count: operation.region_capture_input_count(region_index),
             added_inputs,
-            added_outputs,
+            added_outputs: added_outputs.into_iter().collect(),
         }
     }
 
     /// Creates a [`ReferenceDischargeRegionBoundary`] whose added inputs and added outputs are the same allocations
     /// inserted at the same position. This is the loop-carry shape that `while` and `scan` operation bodies thread.
     #[inline]
-    pub fn symmetric<O: Operation>(
+    pub fn symmetric<O: Operation, I: Into<ReferenceDischargeRegionInput>, DeclaredInputs: IntoIterator<Item = I>>(
         operation: &O,
         region_index: usize,
-        declared_input_allocations: Vec<Option<ReferenceDischargeAllocationId>>,
-        state: ReferenceDischargeRegionStateInsertion,
+        declared_inputs: DeclaredInputs,
+        state: ReferenceDischargeRegionBoundaryInsertion,
     ) -> Self {
-        Self::new(operation, region_index, declared_input_allocations, state.clone(), state)
+        Self::new(operation, region_index, declared_inputs, state.clone(), [state.into()])
     }
 
-    /// Returns the [`ReferenceDischargeAllocationId`] of the allocation entering at each declared input position of
-    /// the source region, or [`None`] for a value input, in [`Region`](crate::Region) input order.
-    #[inline]
-    pub fn declared_input_allocations(&self) -> &[Option<ReferenceDischargeAllocationId>] {
-        self.declared_input_allocations.as_slice()
+    /// Returns what enters at each declared input position of the source region, in [`Region`](crate::Region) input
+    /// order.
+    pub const fn declared_inputs(&self) -> &[ReferenceDischargeRegionInput] {
+        self.declared_inputs.as_slice()
     }
 
     /// Returns the length of the [`Region`](crate::Region)'s own leading capture prefix, from
@@ -1177,52 +1229,84 @@ impl ReferenceDischargeRegionBoundary {
         self.capture_input_count
     }
 
-    /// Returns the allocations the rebuilt [`Region`](crate::Region) receives as added inputs, together with the
-    /// position in the source region's input boundary at which they are inserted. A discharged allocation enters as
-    /// immutable state and a preserved allocation enters as its destination reference.
-    pub const fn added_inputs(&self) -> &ReferenceDischargeRegionStateInsertion {
+    /// Returns the single group of inputs added to the rebuilt [`Region`](crate::Region). Its
+    /// [`sources`](ReferenceDischargeRegionBoundaryInsertion::sources) are allocation IDs identifying the values to
+    /// pass in, in order (a discharged allocation contributes its current immutable state, and a preserved allocation
+    /// contributes its destination reference). The group is inserted before its
+    /// [`position`](ReferenceDischargeRegionBoundaryInsertion::position) in the original input list.
+    pub const fn added_inputs(&self) -> &ReferenceDischargeRegionBoundaryInsertion {
         &self.added_inputs
     }
 
-    /// Returns the allocations the rebuilt [`Region`](crate::Region) publishes as added outputs, together with the
-    /// position in the source region's output boundary at which they are inserted. A discharged allocation publishes
-    /// its final state and a preserved allocation publishes its destination reference.
-    pub const fn added_outputs(&self) -> &ReferenceDischargeRegionStateInsertion {
-        &self.added_outputs
+    /// Returns the groups of outputs added to the rebuilt [`Region`](crate::Region), in insertion order.
+    /// Each group specifies one position in the original output list and an ordered list of
+    /// [`sources`](ReferenceDischargeRegionBoundaryInsertion::sources) to insert there. These sources identify the
+    /// final allocation or view states to return; they do not contain the values themselves. A preserved allocation
+    /// returns its destination reference instead of explicit state.
+    ///
+    /// Multiple groups allow outputs to be added at different positions. For example, given original outputs
+    /// `[carry, result]`, two groups could describe:
+    ///
+    /// ```text
+    /// position 1: [Allocation(A), Allocation(B)]
+    /// position 2: [View(3)]
+    /// ```
+    ///
+    /// The rebuilt outputs are `[carry, final_state_A, final_state_B, result, final_state_of_view_3]`. Here `View(3)`
+    /// identifies the view supplied at original input position 3. Both insertion positions refer to the original
+    /// output list (i.e., earlier insertions do not shift later positions). A position equal to the original output
+    /// count appends the group, and groups at the same position retain their supplied order.
+    pub const fn added_outputs(&self) -> &[ReferenceDischargeRegionBoundaryInsertion<ReferenceDischargeRegionOutput>] {
+        self.added_outputs.as_slice()
     }
 }
 
-/// One group of reference-related positions that a rebuilt [`Region`](crate::Region) gains: the allocations crossing
-/// at those positions and the position in the source region's boundary at which the group is inserted. A discharged
-/// allocation crosses as immutable state and a preserved allocation crosses as its destination reference.
+/// One consecutive group of inputs or outputs to add to a rebuilt region. The group identifies which values to insert
+/// and where to insert them in the original input or output list. Input groups contain caller allocation IDs. Output
+/// groups contain [`ReferenceDischargeRegionOutput`] sources identifying allocation or view states to return.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReferenceDischargeRegionStateInsertion {
-    /// Refer to the documentation of [`Self::allocations`].
-    allocations: Vec<ReferenceDischargeAllocationId>,
+pub struct ReferenceDischargeRegionBoundaryInsertion<T = ReferenceDischargeAllocationId> {
+    /// Refer to the documentation of [`Self::sources`].
+    sources: Vec<T>,
 
     /// Refer to the documentation of [`Self::position`].
     position: usize,
 }
 
-impl ReferenceDischargeRegionStateInsertion {
-    /// Creates a [`ReferenceDischargeRegionStateInsertion`] that inserts `allocations` at `position`.
+impl<T> ReferenceDischargeRegionBoundaryInsertion<T> {
+    /// Creates a new [`ReferenceDischargeRegionBoundaryInsertion`]. Each entry in `sources` identifies a value to insert,
+    /// in the supplied order, before `position` in the original input or output list. The sources are identifiers, not
+    /// the values themselves.
     #[inline]
-    pub fn new(allocations: Vec<ReferenceDischargeAllocationId>, position: usize) -> Self {
-        Self { allocations, position }
+    pub fn new(sources: Vec<T>, position: usize) -> Self {
+        Self { sources, position }
     }
 
-    /// Returns the [`ReferenceDischargeAllocationId`]s of the allocations crossing at this
-    /// [`ReferenceDischargeRegionStateInsertion`]'s positions, in canonical allocation order. A discharged
-    /// allocation crosses as immutable state and a preserved allocation crosses as its destination reference.
-    #[inline]
-    pub fn allocations(&self) -> &[ReferenceDischargeAllocationId] {
-        self.allocations.as_slice()
+    /// Returns the identifiers of the values to insert, in insertion order. For added inputs, each entry is a caller
+    /// allocation ID. For added outputs, each entry is a [`ReferenceDischargeRegionOutput`] identifying an allocation
+    /// or a declared view input whose final state is returned. The identifiers are resolved to values when the region
+    /// is rebuilt.
+    pub const fn sources(&self) -> &[T] {
+        self.sources.as_slice()
     }
 
-    /// Returns the position in the source [`Region`](crate::Region)'s boundary at which this
-    /// [`ReferenceDischargeRegionStateInsertion`] is inserted.
+    /// Returns the position in the original input or output list before which this group is inserted. Positions are
+    /// zero-based and are not shifted by other insertion groups. A position equal to the original list's length
+    /// appends the group.
     pub const fn position(&self) -> usize {
         self.position
+    }
+}
+
+impl From<ReferenceDischargeRegionBoundaryInsertion>
+    for ReferenceDischargeRegionBoundaryInsertion<ReferenceDischargeRegionOutput>
+{
+    #[inline]
+    fn from(insertion: ReferenceDischargeRegionBoundaryInsertion) -> Self {
+        Self::new(
+            insertion.sources.into_iter().map(ReferenceDischargeRegionOutput::Allocation).collect(),
+            insertion.position,
+        )
     }
 }
 
@@ -1248,7 +1332,8 @@ pub struct ReferenceDischargeRegionResult<V: Value, O: Operation<Type = V::Type>
 impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeRegionResult<V, O> {
     /// Returns the rebuilt [`Region`](crate::Region) [`Program`] with its reference effects discharged. Its input
     /// boundary is the source region's declared inputs with the boundary's added inputs inserted, and its output
-    /// boundary is the source region's declared outputs with the boundary's added outputs inserted.
+    /// boundary is the source region's declared outputs with the boundary's output groups inserted at their requested
+    /// positions. Allocation and view state outputs follow the order specified by those groups.
     pub const fn program(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
         &self.program
     }
@@ -1343,7 +1428,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeRegionResult<V, O
 /// Transitive reference-access summary of one region closure, expressed in the caller allocations its boundary names.
 ///
 /// This is the analysis a structured rule needs before it can size its state boundary, and it is computed entirely
-/// from generic hooks: operation-local [`Operation::reference_semantics`], the input- and output-region provenance
+/// from generic hooks: operation-local [`Operation::effects`], the input- and output-region provenance
 /// hooks, reference-output identity, and recursive summaries of nested regions. Allocations allocated inside the
 /// closure are deliberately absent: they belong to no caller and cross no boundary.
 ///
@@ -1375,7 +1460,7 @@ impl ReferenceDischargeRegionSummary {
     /// A structured rule needs this summary before it can size its state boundary: which allocations a region
     /// closure touches, and which of them it mutates, is exactly what decides how wide the rewritten operation must
     /// be. The summary is computed entirely from generic hooks, namely operation-local
-    /// [`Operation::reference_semantics`], the region-provenance hooks, reference-output identity, and recursive
+    /// [`Operation::effects`], the region-provenance hooks, reference-output identity, and recursive
     /// summaries of nested regions, so a third-party structured operation needs no companion declaration surface to
     /// be summarized. Every access mode the closure performs is validated against
     /// [`Operation::allows_reference_access_through_region_input`] before the summary is returned, and each nested
@@ -1383,10 +1468,12 @@ impl ReferenceDischargeRegionSummary {
     ///
     /// The traversal maps each reference-typed atom of the region onto the caller allocation it denotes, or onto
     /// [`None`] when the allocation was allocated inside the closure and therefore crosses no boundary. Nested
-    /// regions are entered through [`Operation::input_region_provenance`], and a structured operation's
-    /// reference-typed output is resolved either by [`Operation::reference_output_identity_input`], which states
-    /// outright which input's allocation it preserves, or by [`Operation::output_region_provenance`], which names the
-    /// region output it forwards.
+    /// [`RegionRole::Computation`] regions are entered through [`Operation::input_region_provenance`], while dormant
+    /// [`RegionRole::Rule`] regions are skipped exactly as the reference analysis and effects skip them: their
+    /// reference-typed inputs are bound by the transform that instantiates them rather than by the operands of this
+    /// instruction. A structured operation's reference-typed output is resolved either by
+    /// [`Operation::reference_output_identity_input`], which states outright which input's allocation it preserves, or
+    /// by [`Operation::output_region_provenance`], which names the computation region output it forwards.
     ///
     /// The region's own capture scope is computed from `captures` rather than supplied, because whether a region
     /// establishes a fresh capture prefix is stated by [`Operation::region_capture_input_count`]. A reference-typed
@@ -1432,9 +1519,9 @@ impl ReferenceDischargeRegionSummary {
 
         // A capture-scoped constant is seeded exactly like a boundary position. Materializing one makes its
         // allocation reachable during replay but is not itself a semantic reference read; actual accesses are
-        // recorded from operation semantics below. Which constants are materialized must agree with the dead-constant
-        // rule of `RegionRef::interpret_with`, which lifts a constant only when an instruction input or a region output
-        // uses it; diverging would thread too little (the rebuilt region fails to lift) or too much.
+        // recorded from operation effect declarations below. Which constants are materialized must agree with the
+        // dead-constant rule of `RegionRef::interpret_with`, which lifts a constant only when an instruction input or a
+        // region output uses it; diverging would thread too little (the rebuilt region fails to lift) or too much.
         let materialized_atoms = region
             .instructions()
             .iter()
@@ -1482,34 +1569,46 @@ impl ReferenceDischargeRegionSummary {
         };
         for instruction in region.instructions() {
             let nested_operation = instruction.operation();
-            let semantics = nested_operation.reference_semantics();
-            for access in semantics.inputs() {
-                let accessed = input_atom(instruction, access.input_index(), "an accessed")?;
+            let effects = nested_operation.effects();
+            for (input_index, mode) in effects.accesses() {
+                let accessed = input_atom(instruction, input_index, "an accessed")?;
                 if let Some(allocation) = resolve(&allocations, accessed, nested_operation.name())? {
-                    summary.record(allocation, access.mode(), nested_operation.name())?;
+                    summary.record(allocation, mode, nested_operation.name())?;
                 }
             }
-            for output in semantics.outputs() {
-                let defined = instruction.outputs().get(output.output_index()).copied().ok_or_else(|| {
+            let classified_output = |output_index: usize| {
+                instruction.outputs().get(output_index).copied().ok_or_else(|| {
                     ProgramError::MalformedProgram(format!(
                         "operation `{}` classifies output {} but the application has {} outputs",
                         nested_operation.name(),
-                        output.output_index(),
+                        output_index,
                         instruction.outputs().len(),
                     ))
-                })?;
-                let allocation = match output {
-                    ReferenceOutput::Allocation { .. } => None,
-                    ReferenceOutput::Alias { input_index, .. } => resolve(
-                        &allocations,
-                        input_atom(instruction, *input_index, "an aliased")?,
-                        nested_operation.name(),
-                    )?,
-                };
+                })
+            };
+            for output_index in effects.allocation_output_indices() {
+                allocations.insert(classified_output(output_index)?, None);
+            }
+            for alias in effects.reference_aliases() {
+                let defined = classified_output(alias.output_index())?;
+                let allocation = resolve(
+                    &allocations,
+                    input_atom(instruction, alias.input_index(), "an aliased")?,
+                    nested_operation.name(),
+                )?;
                 allocations.insert(defined, allocation);
             }
             let mut attached_output_allocations = Vec::with_capacity(instruction.regions().len());
             for (nested_region_index, attached) in instruction.regions().iter().copied().enumerate() {
+                // Dormant rule regions are inputs to later transforms rather than executed children of this
+                // instruction, exactly as for effects and for the reference analysis: their reference-typed inputs are
+                // bound by the transform that instantiates them rather than by this instruction's operands, so they
+                // declare no input provenance and are neither entered nor folded into this summary. The placeholder
+                // keeps region indices aligned for output provenance, which may only name computation regions.
+                if nested_operation.region_role(nested_region_index) == Some(RegionRole::Rule) {
+                    attached_output_allocations.push(Vec::new());
+                    continue;
+                }
                 let attached = region.with_id(attached)?;
                 let nested = attached
                     .input_ids()
@@ -1520,7 +1619,9 @@ impl ReferenceDischargeRegionSummary {
                         if !attached.atoms()[input.index()].r#type().is_reference() {
                             return Ok(None);
                         }
-                        let Some(supplying_index) =
+                        // A boundary view reads and writes the source input's allocation just like a forwarded handle,
+                        // so this allocation-only summary intentionally ignores the provenance variant.
+                        let Some(provenance) =
                             nested_operation.input_region_provenance(nested_region_index, input_index)
                         else {
                             return Err(ProgramError::MalformedProgram(format!(
@@ -1528,6 +1629,10 @@ impl ReferenceDischargeRegionSummary {
                                  {input_index} without declaring which input supplies it",
                                 nested_operation.name(),
                             )));
+                        };
+                        let supplying_index = match provenance {
+                            InputRegionProvenance::Forwarded { input_index }
+                            | InputRegionProvenance::View { input_index } => input_index,
                         };
                         let atom = input_atom(instruction, supplying_index, "a region")?;
                         resolve(&allocations, atom, nested_operation.name())
@@ -1924,8 +2029,9 @@ pub trait ReferenceDischargeDriver<C: Domain, P: ReferenceDischargePolicy<C>>:
     ///
     /// Use this function when the rewritten operation must keep the region attached. The operation's discharge rule
     /// supplies a [`ReferenceDischargeRegionBoundary`] describing how the caller's values and reference allocations
-    /// enter and leave the rebuilt region. After rebuilding, the rule validates the returned result, attaches its
-    /// program to the rewritten operation, and updates the caller's allocations from that operation's outputs.
+    /// enter and leave the rebuilt region. Rebuilding rejects mutated boundary views whose final states are not
+    /// published. The rule validates the returned allocation facts, attaches the program to the rewritten operation,
+    /// and updates the caller's allocations from that operation's outputs.
     ///
     /// This function and [`inline_region`](Self::inline_region) apply the same reference discharge rules to the
     /// region's instructions. The difference is where those instructions are written and where their reference
@@ -1945,9 +2051,11 @@ pub trait ReferenceDischargeDriver<C: Domain, P: ReferenceDischargePolicy<C>>:
     /// Returns [`ProgramError::InvalidInputCount`] or [`ProgramError::InvalidOutputCount`] when `boundary` does not
     /// match the region's declared boundary, and [`ProgramError::MalformedProgram`] when this application has no region
     /// at `index`, when an added allocation is also declared or is added twice, when a declared position and its
-    /// allocation disagree on being a reference or on the reference type, when an added input would land inside the
-    /// region's capture prefix, or when the region returns an allocation that `boundary` did not provide or returns
-    /// one through a view. It also propagates errors raised while discharging the region's instructions.
+    /// allocation disagree on being a reference or on the reference type, when a boundary view is declared at a value
+    /// position, is published for a preserved allocation, is mutated without publishing its final state, or enters
+    /// beside a complete handle of its allocation, when an added input would land inside the region's capture prefix,
+    /// or when the region returns an allocation that `boundary` did not provide or returns one through a view. It also
+    /// propagates errors raised while discharging the region's instructions.
     fn rebuild_region(
         &self,
         context: &ReferenceDischargeContext<C, P>,
@@ -2070,7 +2178,8 @@ where
         let region = self.region(index)?;
         let added_inputs = boundary.added_inputs();
         let added_outputs = boundary.added_outputs();
-        check_count!("input", boundary.declared_input_allocations(), region.input_ids().len(), ProgramError);
+        check_count!("input", boundary.declared_inputs(), region.input_ids().len(), ProgramError);
+
         let source_input_types = region.input_types();
         let source_input_count = source_input_types.len();
         let source_output_count = region.output_ids().len();
@@ -2082,13 +2191,47 @@ where
                 source_input_count,
             )));
         }
-        if added_outputs.position() > source_output_count {
-            return Err(ProgramError::MalformedProgram(format!(
-                "reference discharge inserts region state outputs at {} but region `{}` declares {} outputs",
-                added_outputs.position(),
-                region.id(),
-                source_output_count,
-            )));
+
+        let mut published_views = BTreeSet::new();
+        let mut previous_position = 0;
+        for group in added_outputs {
+            if group.position() > source_output_count {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "reference discharge inserts region state outputs at {} but region `{}` declares {} outputs",
+                    group.position(),
+                    region.id(),
+                    source_output_count,
+                )));
+            }
+            if group.position() < previous_position {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "reference discharge output insertion positions for region `{}` are not in nondecreasing order",
+                    region.id(),
+                )));
+            }
+            previous_position = group.position();
+            for output in group.sources() {
+                if let ReferenceDischargeRegionOutput::View(position) = output {
+                    if !matches!(
+                        boundary.declared_inputs().get(*position),
+                        Some(ReferenceDischargeRegionInput::View(_))
+                    ) {
+                        return Err(ProgramError::MalformedProgram(format!(
+                            "reference discharge publishes input {} of region `{}` as a boundary view, but it \
+                             is not a declared view input",
+                            position,
+                            region.id(),
+                        )));
+                    }
+                    if !published_views.insert(*position) {
+                        return Err(ProgramError::MalformedProgram(format!(
+                            "reference discharge publishes boundary view input {} of region `{}` more than once",
+                            position,
+                            region.id(),
+                        )));
+                    }
+                }
+            }
         }
 
         // Added state may not land inside the region's own capture prefix. The rebuilt region keeps the prefix length
@@ -2118,10 +2261,31 @@ where
                     context.targets().clone(),
                 );
 
-            let declared_allocations =
-                boundary.declared_input_allocations().iter().copied().flatten().collect::<BTreeSet<_>>();
+            // A boundary view is region-local state, so a complete handle of the same allocation entering beside it
+            // would neither observe the view's writes nor be observed by its reads.
+            let mut declared_allocations = BTreeSet::new();
+            let mut view_allocations = BTreeSet::new();
+            for input in boundary.declared_inputs() {
+                match input {
+                    ReferenceDischargeRegionInput::Value => {}
+                    ReferenceDischargeRegionInput::Allocation(allocation) => {
+                        declared_allocations.insert(*allocation);
+                    }
+                    ReferenceDischargeRegionInput::View(allocation) => {
+                        view_allocations.insert(*allocation);
+                    }
+                }
+            }
+            if let Some(allocation) = view_allocations.intersection(&declared_allocations).next() {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "reference discharge passes {} into region `{}` both as a complete handle and as a boundary view",
+                    allocation,
+                    region.id(),
+                )));
+            }
+            declared_allocations.extend(view_allocations);
             let mut added_allocations = BTreeSet::new();
-            for allocation in added_inputs.allocations() {
+            for allocation in added_inputs.sources() {
                 if declared_allocations.contains(allocation) {
                     return Err(ProgramError::MalformedProgram(format!(
                         "reference discharge adds {} to region `{}`, which already carries it at a declared input",
@@ -2175,19 +2339,20 @@ where
             // A preserved allocation occupies an added position only when an inherited capture is returned without
             // a declared operand.
             let mut declared = Vec::with_capacity(source_input_count);
+            let mut view_inputs = Vec::new();
             for position in 0..=source_input_count {
                 if position == added_inputs.position() {
-                    for allocation in added_inputs.allocations() {
+                    for allocation in added_inputs.sources() {
                         thread(*allocation)?;
                     }
                 }
-                let (Some(source_type), Some(allocation)) =
-                    (source_input_types.get(position), boundary.declared_input_allocations().get(position))
+                let (Some(source_type), Some(input)) =
+                    (source_input_types.get(position), boundary.declared_inputs().get(position))
                 else {
                     continue;
                 };
-                declared.push(match allocation {
-                    None => {
+                declared.push(match input {
+                    ReferenceDischargeRegionInput::Value => {
                         if <&ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>>::try_from(source_type).is_ok()
                         {
                             return Err(ProgramError::MalformedProgram(format!(
@@ -2198,7 +2363,7 @@ where
                         }
                         ReferenceDischargeValue::Value(destination.input(source_type.clone()))
                     }
-                    Some(allocation) => {
+                    ReferenceDischargeRegionInput::Allocation(allocation) => {
                         let Ok(source_reference_type) =
                             <&ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>>::try_from(source_type)
                         else {
@@ -2222,6 +2387,42 @@ where
                             )));
                         }
                         thread(*allocation)?
+                    }
+                    ReferenceDischargeRegionInput::View(allocation) => {
+                        let Ok(view_type) =
+                            <&ReferenceType<<P as ReferenceDischargePolicy<C>>::Referent>>::try_from(source_type)
+                        else {
+                            return Err(ProgramError::MalformedProgram(format!(
+                                "reference discharge assigns a boundary view of {} to value input {} of region `{}`",
+                                allocation,
+                                position,
+                                region.id(),
+                            )));
+                        };
+
+                        // The view is typed by the region input itself rather than by the caller allocation, and it
+                        // corresponds to no caller allocation, so it is not threaded. A discharged view is fresh
+                        // region-local state initialized from the region's input value, whose final state leaves only
+                        // through requested view outputs, and a preserved view replays through the destination
+                        // reference the region receives.
+                        if context.is_allocation_discharged(*allocation)? {
+                            let input = destination.input(C::Type::from(view_type.referent().clone()));
+                            let reference = region_context.bind_discharged(view_type.clone(), input)?;
+                            view_inputs.push((position, reference.allocation_id()));
+                            ReferenceDischargeValue::from(reference)
+                        } else {
+                            if published_views.contains(&position) {
+                                return Err(ProgramError::MalformedProgram(format!(
+                                    "reference discharge publishes the boundary view of preserved {} at input {} of \
+                                     region `{}`",
+                                    allocation,
+                                    position,
+                                    region.id(),
+                                )));
+                            }
+                            let input = destination.input(source_type.clone());
+                            ReferenceDischargeValue::from(region_context.bind_preserved(view_type.clone(), input)?)
+                        }
                     }
                 });
             }
@@ -2262,19 +2463,34 @@ where
 
             let outputs = region_context.inline_region(region, declared)?;
             check_count!("output", outputs, source_output_count, ProgramError);
-            let mut output_ids = Vec::with_capacity(source_output_count + added_outputs.allocations().len());
+            let mut output_ids = Vec::with_capacity(
+                source_output_count + added_outputs.iter().map(|group| group.sources().len()).sum::<usize>(),
+            );
             let mut output_allocations = Vec::with_capacity(source_output_count);
+            let mut groups = added_outputs.iter().peekable();
             for position in 0..=source_output_count {
-                if position == added_outputs.position() {
-                    for allocation in added_outputs.allocations() {
-                        let region_allocation =
-                            caller_to_region_allocations.get(allocation).copied().ok_or_else(|| {
-                                ProgramError::MalformedProgram(format!(
-                                    "reference discharge publishes {} from region `{}` without threading it in",
-                                    allocation,
-                                    region.id(),
-                                ))
-                            })?;
+                // Input declarations describe entering state; only these output groups decide what is published.
+                // Multiple groups at one source position retain their requested order.
+                while groups.peek().is_some_and(|group| group.position() == position) {
+                    for output in groups.next().unwrap().sources() {
+                        let region_allocation = match output {
+                            ReferenceDischargeRegionOutput::Allocation(allocation) => {
+                                caller_to_region_allocations.get(allocation).copied().ok_or_else(|| {
+                                    ProgramError::MalformedProgram(format!(
+                                        "reference discharge publishes {} from region `{}` without threading it in",
+                                        allocation,
+                                        region.id(),
+                                    ))
+                                })?
+                            }
+                            ReferenceDischargeRegionOutput::View(input) => {
+                                // Requested positions were validated before replay, and preserved views rejected
+                                // while binding inputs. Each requested view therefore has discharged local state.
+                                let (_, allocation) =
+                                    view_inputs.iter().find(|(position, _)| position == input).unwrap();
+                                *allocation
+                            }
+                        };
                         output_ids.push(region_context.allocation_value(region_allocation)?.atom_id()?);
                     }
                 }
@@ -2324,6 +2540,18 @@ where
                 }
             }
 
+            // A boundary view owns region-local state. Every mutation must leave through an explicit view output,
+            // because the caller cannot recover that state after the isolated environment is dropped.
+            for (position, region_allocation) in &view_inputs {
+                if region_context.is_mutated(*region_allocation)? && !published_views.contains(position) {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "reference discharge mutated the boundary view at input {position} of region `{}` without \
+                         publishing its final state",
+                        region.id(),
+                    )));
+                }
+            }
+
             // Only threaded *state* can have been mutated. A preserved reference's writes replayed into the rebuilt
             // region as the operations the source performed, so there is no successor state for the caller to merge.
             let mut mutated_allocations = Vec::new();
@@ -2338,7 +2566,7 @@ where
         };
         drop(destination);
 
-        let input_count = source_input_count + added_inputs.allocations().len();
+        let input_count = source_input_count + added_inputs.sources().len();
         let output_count = output_ids.len();
         let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
         let program = builder.build(output_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?;
@@ -2363,7 +2591,7 @@ where
 /// property of what the operation does with its regions and therefore belongs to the operation. Everything else replays
 /// as-is over rewritten operands. The system is consequently open over primitives: a third-party operation family
 /// participates by implementing this trait, with no companion declaration surface beyond the generic
-/// [`Operation::reference_semantics`] and region-provenance hooks it already implements.
+/// [`Operation::effects`] and region-provenance hooks it already implements.
 ///
 /// Access rules see only _discharged_ allocations. When partial discharge preserves an allocation, the dispatch path
 /// replays every region-free, access-only application over it verbatim before rule dispatch, so an access rule never
@@ -2472,9 +2700,9 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         }
     }
 
-    /// Returns this [`ReferenceDischargeContext`] discharging under a different [`ReferenceDischargeCaptureScope`],
-    /// sharing its [`ReferenceDischargeEnvironment`]. An isolated region rebuild reaches its own scope this way because
-    /// the temporary environment creates the allocations that scope binds only after its boundary is threaded.
+    /// Returns this [`ReferenceDischargeContext`] discharging under a different capture scope, sharing its allocation
+    /// environment. An isolated region rebuild reaches its own scope this way because the temporary environment creates
+    /// the allocations that scope binds only after its boundary is threaded.
     #[inline]
     pub fn with_captures(&self, captures: ReferenceDischargeCaptureScope) -> Self
     where
@@ -2493,16 +2721,16 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         &self.parent
     }
 
-    /// Returns the [`ReferenceDischargeCaptureScope`] that this context discharges under, which binds the allocations
-    /// named by the capture prefix of its scope. A region that inherits its parent's capture prefix discharges under
-    /// the same scope, while a region rebuilt in isolation reconstructs the scope from its temporary environment.
+    /// Returns the capture scope that this context discharges under, which binds the allocations named by the capture
+    /// prefix of its scope. A region that inherits its parent's capture prefix discharges under the same scope, while a
+    /// region rebuilt in isolation reconstructs the scope from its temporary environment.
     pub const fn captures(&self) -> &ReferenceDischargeCaptureScope {
         &self.captures
     }
 
-    /// Returns the [`ReferenceDischargeTargets`] that this transform rewrites into immutable state. Every allocation
-    /// they omit is preserved. Every clone and every isolated region rebuild shares the targets unchanged, because a
-    /// target names the same source program location wherever the replay reaches it.
+    /// Returns the discharge targets that this transform rewrites into immutable state. Every allocation they omit is
+    /// preserved. Every clone and every isolated region rebuild shares the targets unchanged, because a target names
+    /// the same source program location wherever the replay reaches it.
     pub const fn targets(&self) -> &ReferenceDischargeTargets {
         &self.targets
     }
@@ -2793,6 +3021,8 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     /// and exposed [`ReferenceType`]. This function creates another handle rather than binding a new allocation. The
     /// returned reference keeps the input reference's allocation identity, cannot denote the allocation's complete
     /// value, and carries `alias` as its authoritative complete view chain rather than merely its newest view step.
+    /// Any symbolic view coordinates in `alias` must already be bound to their corresponding values in the destination
+    /// context.
     ///
     /// For a discharged allocation, later accesses apply that chain to the allocation's immutable state and
     /// `replay_preserved_view_fn` is never called. For a preserved allocation, `replay_preserved_view_fn` must replay
@@ -2804,7 +3034,8 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     /// # Parameters
     ///
     ///   - `reference`: Reference value being aliased.
-    ///   - `alias`: Complete composed view chain of the alias.
+    ///   - `alias`: Complete composed view chain, including destination-context values for all symbolic view
+    ///     coordinates.
     ///   - `r#type`: Reference type the alias exposes.
     ///   - `replay_preserved_view_fn`: Function that replays the source view operation against the parent destination
     ///     reference and returns its single reference result. It is called exactly once for a preserved allocation and
@@ -2971,9 +3202,10 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         }
         match self.environment.borrow_mut().take(allocation)?.state {
             ReferenceDischargeAllocationState::Discharged { current, .. } => Ok(current),
-            ReferenceDischargeAllocationState::Preserved { .. } => Err(ProgramError::MalformedProgram(format!(
-                "reference discharge requested the discharged state of preserved {allocation}",
-            ))),
+            ReferenceDischargeAllocationState::Preserved { .. } => {
+                // The preserved case was rejected before consuming the environment entry.
+                unreachable!()
+            }
         }
     }
 
@@ -2986,14 +3218,14 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     /// Returns [`ProgramError::MalformedProgram`] when the allocation is not live or when `reference` is a view.
     fn validate_consumption(&self, reference: &ReferenceDischargeReference<C, P>) -> Result<(), ProgramError> {
         let allocation = reference.allocation_id();
-        let complete_reference_type = self.allocation_entry(allocation)?.r#type.clone();
+        let entry = self.allocation_entry(allocation)?;
         if reference.is_view() {
             return Err(ProgramError::MalformedProgram(format!(
                 "reference discharge cannot consume {} through the view `{}`; consumption yields the complete stored \
                  value, whose reference type is `{}`",
                 allocation,
                 reference.r#type(),
-                complete_reference_type,
+                entry.r#type,
             )));
         }
         Ok(())
@@ -3163,10 +3395,10 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     /// Lifts a stored [`Program`] constant into a value that can flow through reference discharge. A non-reference
     /// constant is lifted by the destination [`Context`] and wrapped as a [`ReferenceDischargeValue::Value`]. A
     /// reference-typed constant instead names an existing capture binding. This function resolves that binding through
-    /// the active [`ReferenceDischargeCaptureScope`] and returns its [`ReferenceDischargeValue::Reference`]. It never
-    /// creates another allocation for a captured reference. A reference-typed constant that the active capture scope
-    /// does not resolve is rejected because no allocation in this context represents that reference. Allowing it to
-    /// flow as an ordinary destination value would leave an untracked reference in the discharged program.
+    /// the active capture scope and returns its [`ReferenceDischargeValue::Reference`]. It never creates another
+    /// allocation for a captured reference. A reference-typed constant that the active capture scope does not resolve
+    /// is rejected because no allocation in this context represents that reference. Allowing it to flow as an ordinary
+    /// destination value would leave an untracked reference in the discharged program.
     ///
     /// # Errors
     ///
@@ -3297,19 +3529,22 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         C: Context<Type: From<ReferenceType<P::Referent>>>,
         for<'t> &'t ReferenceType<P::Referent>: TryFrom<&'t C::Type>,
     {
-        let semantics = operation.reference_semantics();
-        if semantics.inputs().is_empty() || !semantics.outputs().is_empty() {
+        let effects = operation.effects();
+        if !effects.has_accesses()
+            || effects.allocation_output_indices().next().is_some()
+            || !effects.reference_aliases().is_empty()
+        {
             return Ok(None);
         }
         let mut consumed = Vec::new();
-        for access in semantics.inputs() {
-            let Some(ReferenceDischargeValue::Reference(reference)) = inputs.get(access.input_index()) else {
+        for (input_index, mode) in effects.accesses() {
+            let Some(ReferenceDischargeValue::Reference(reference)) = inputs.get(input_index) else {
                 return Ok(None);
             };
             if reference.preserved().is_none() {
                 return Ok(None);
             }
-            if access.mode().is_consuming() {
+            if mode.is_consuming() {
                 consumed.push(reference);
             }
         }
@@ -3996,13 +4231,13 @@ impl<
 /// discharge counterpart of ordinary interpretation. The destination decides what replaying means (e.g., an eager
 /// destination executes the operation and a staging destination records it).
 ///
-/// The precondition is reference freedom, not purity in the [`Effects`](crate::Effects) sense. An operation with
-/// ordered or other effects replays here unchanged, because the replay reproduces those effects in the destination
-/// exactly as the source performed them. Attached regions are copied into the destination as they stand, which is the
-/// complete rewrite for regions that hold no state to thread. An application is rejected as soon as a reference appears
-/// among its operands or anywhere inside an attached region's closure, because how a reference boundary widens is
-/// knowledge that belongs to the operation, which must then implement its own rule. For the common case of a
-/// region-carrying operation that forwards its operands to its regions positionally, that rule is
+/// The precondition is reference freedom, not purity in the [`Effects::is_pure`](crate::Effects::is_pure) sense. An
+/// operation with ordered or other effects replays here unchanged, because the replay reproduces those effects in the
+/// destination exactly as the source performed them. Attached regions are copied into the destination as they stand,
+/// which is the complete rewrite for regions that hold no state to thread. An application is rejected as soon as a
+/// reference appears among its operands or anywhere inside an attached region's closure, because how a reference
+/// boundary widens is knowledge that belongs to the operation, which must then implement its own rule. For the common
+/// case of a region-carrying operation that forwards its operands to its regions positionally, that rule is
 /// [`discharge_positional_region_operation`].
 ///
 /// # Parameters
@@ -4160,8 +4395,8 @@ pub fn discharge_positional_region_operation<
             operation,
             index,
             forwarded_allocations.clone(),
-            ReferenceDischargeRegionStateInsertion::new(entering.to_vec(), forwarded.len()),
-            ReferenceDischargeRegionStateInsertion::new(leaving.clone(), source_output_count),
+            ReferenceDischargeRegionBoundaryInsertion::new(entering.to_vec(), forwarded.len()),
+            [ReferenceDischargeRegionBoundaryInsertion::new(leaving.clone(), source_output_count).into()],
         );
         let result = driver.rebuild_region(context, index, &boundary)?;
         result.validate_predicted_mutations(widening.published(), name)?;
@@ -4218,23 +4453,26 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceDischarge, ArrayType, DataType,
+    };
     use crate::captures::CaptureReference;
     use crate::contexts::EagerContext;
+    use crate::differentiation::CustomVjpOperation;
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-    use crate::operations::Add;
+    use crate::operations::{Add, ConditionOperation};
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::ProgramError;
     use crate::programs::atoms::AtomId;
     use crate::programs::builders::ProgramBuilder;
-    use crate::programs::effects::{Effect, Effects};
+    use crate::programs::effects::{
+        EffectClass, EffectClasses, Effects, ReferenceAccessMode, ReferenceAlias, ReferenceAliasKind, ReferenceEffect,
+    };
     use crate::programs::identities::NoIdentity;
     use crate::programs::instructions::{Instruction, InstructionId};
     use crate::programs::operations::Operation;
     use crate::programs::programs::ProgramRenderingMode;
     use crate::programs::provenance::{Provenance, ProvenanceScope};
-    use crate::programs::references::semantics::{
-        ReferenceAccessMode, ReferenceAliasKind, ReferenceInput, ReferenceOperationSemantics, ReferenceOutput,
-    };
     use crate::programs::references::types::ReferenceType;
     use crate::programs::regions::{EmptyRegionDriver, OutputRegionProvenance, RegionId, RegionInterface, RegionSlot};
     use crate::programs::types::{Type, TypeError, Typed};
@@ -4564,8 +4802,9 @@ mod tests {
             }
         }
 
-        fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
-            (matches!(self, Self::Call) && region_index == 0).then_some(input_index)
+        fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
+            (matches!(self, Self::Call) && region_index == 0)
+                .then_some(InputRegionProvenance::Forwarded { input_index })
         }
 
         fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
@@ -4660,49 +4899,33 @@ mod tests {
             }
         }
 
-        fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
-            let semantics = match self {
+        fn effects(&self) -> Cow<'_, Effects> {
+            let access = |mode| {
+                Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Access { input_index: 0, mode }], Vec::new())
+                    .unwrap()
+            };
+            let effects = match self {
                 Self::ReferenceNew => {
-                    ReferenceOperationSemantics::new(Vec::new(), vec![ReferenceOutput::Allocation { output_index: 0 }])
+                    Effects::new(EffectClasses::NONE, vec![ReferenceEffect::Allocate { output_index: 0 }], Vec::new())
+                        .unwrap()
                 }
-                Self::Slice { .. } => ReferenceOperationSemantics::new(
+                Self::Slice { .. } => Effects::new(
+                    EffectClasses::NONE,
                     Vec::new(),
-                    vec![ReferenceOutput::Alias { output_index: 0, input_index: 0, kind: ReferenceAliasKind::View }],
-                ),
-                Self::Read => ReferenceOperationSemantics::new(
-                    vec![ReferenceInput::new(0, ReferenceAccessMode::Read)],
-                    Vec::new(),
-                ),
-                Self::Write => ReferenceOperationSemantics::new(
-                    vec![ReferenceInput::new(0, ReferenceAccessMode::Write)],
-                    Vec::new(),
-                ),
-                Self::Swap => ReferenceOperationSemantics::new(
-                    vec![ReferenceInput::new(0, ReferenceAccessMode::ReadWrite)],
-                    Vec::new(),
-                ),
-                Self::AddUpdate => ReferenceOperationSemantics::new(
-                    vec![ReferenceInput::new(0, ReferenceAccessMode::Accumulate)],
-                    Vec::new(),
-                ),
-                Self::Freeze => ReferenceOperationSemantics::new(
-                    vec![ReferenceInput::new(0, ReferenceAccessMode::Consume)],
-                    Vec::new(),
-                ),
-                Self::Add | Self::Select { .. } | Self::Splice { .. } | Self::UnreportedFreeze | Self::Call => {
-                    return Cow::Borrowed(ReferenceOperationSemantics::empty());
+                    vec![ReferenceAlias::new(0, 0, ReferenceAliasKind::View)],
+                )
+                .unwrap(),
+                Self::Read => access(ReferenceAccessMode::Read),
+                Self::Write => access(ReferenceAccessMode::Write),
+                Self::Swap => access(ReferenceAccessMode::ReadWrite),
+                Self::AddUpdate => access(ReferenceAccessMode::Accumulate),
+                Self::Freeze => access(ReferenceAccessMode::Consume),
+                Self::UnreportedFreeze => Effects::explicit(EffectClasses::single(EffectClass::OrderedState)),
+                Self::Add | Self::Select { .. } | Self::Splice { .. } | Self::Call => {
+                    return Cow::Borrowed(Effects::empty());
                 }
             };
-            Cow::Owned(semantics)
-        }
-
-        fn effects(&self) -> Effects {
-            match self {
-                Self::Add | Self::Select { .. } | Self::Splice { .. } | Self::Slice { .. } | Self::Call => {
-                    Effects::PURE
-                }
-                _ => Effects::single(Effect::OrderedState),
-            }
+            Cow::Owned(effects)
         }
     }
 
@@ -5334,18 +5557,16 @@ mod tests {
                 Ok(input_types.to_vec())
             }
 
-            fn reference_semantics(&self) -> Cow<'_, ReferenceOperationSemantics> {
-                match self {
-                    Self::OrderedIo => Cow::Borrowed(ReferenceOperationSemantics::empty()),
-                    Self::RetainedReference => Cow::Owned(ReferenceOperationSemantics::new(
-                        vec![ReferenceInput::new(0, ReferenceAccessMode::Read)],
+            fn effects(&self) -> Cow<'_, Effects> {
+                Cow::Owned(match self {
+                    Self::OrderedIo => Effects::explicit(EffectClasses::single(EffectClass::OrderedIo)),
+                    Self::RetainedReference => Effects::new(
+                        EffectClasses::single(EffectClass::OrderedIo),
+                        vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
                         Vec::new(),
-                    )),
-                }
-            }
-
-            fn effects(&self) -> Effects {
-                Effects::single(Effect::OrderedIo)
+                    )
+                    .unwrap(),
+                })
             }
         }
 
@@ -5369,7 +5590,7 @@ mod tests {
         )))
         .unwrap();
         assert_eq!(discharged.output_count(), 1);
-        assert!(discharged.program().effects().contains(Effect::OrderedIo));
+        assert!(discharged.program().effects().classes().contains(EffectClass::OrderedIo));
 
         // A surviving reference-typed value is disqualifying wherever it appears, including on the boundary.
         assert_eq!(
@@ -5385,12 +5606,27 @@ mod tests {
         );
 
         // A retained reference operation is disqualifying even when every value in the program is non-reference.
+        // Checked construction refuses such an application outright, because its declared access names a non-reference
+        // operand, so the program is assembled unchecked: the proof's independent declaration scan exists precisely for
+        // programs that bypassed construction-time validation.
+        let retained = {
+            let list = ListIrType::List(ListType { length: 2 });
+            let mut builder = ProgramBuilder::<ListCapture, ProofOperation>::new();
+            let input = builder.add_input(list.clone());
+            let value = builder.add_instruction(ProofOperation::OrderedIo, Vec::new(), vec![input], None).unwrap()[0];
+            let output = builder.add_variable(list);
+            builder.add_instruction_unchecked(Instruction::new(
+                ProofOperation::RetainedReference,
+                vec![value],
+                vec![output],
+                Vec::new(),
+            ));
+            builder
+                .build::<Vec<ListCapture>, Vec<ListCapture>>(vec![output], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
         assert_eq!(
-            ReferenceDischargeResult::try_from(partial(program(
-                &[ProofOperation::OrderedIo, ProofOperation::RetainedReference],
-                ListIrType::List(ListType { length: 2 }),
-            )))
-            .unwrap_err(),
+            ReferenceDischargeResult::try_from(partial(retained)).unwrap_err(),
             ProgramError::MalformedProgram(
                 "reference discharge program retains reference operation `test.retained_reference` at `^0[1]` and \
                  cannot form a full discharge"
@@ -5779,26 +6015,32 @@ mod tests {
             &ListOperation::Call,
             0,
             vec![Some(first), None],
-            ReferenceDischargeRegionStateInsertion::new(vec![second], 1),
-            ReferenceDischargeRegionStateInsertion::new(vec![first, second], 2),
+            ReferenceDischargeRegionBoundaryInsertion::new(vec![second], 1),
+            [ReferenceDischargeRegionBoundaryInsertion::new(vec![first, second], 2).into()],
         );
-        assert_eq!(boundary.declared_input_allocations(), &[Some(first), None]);
+        assert_eq!(
+            boundary.declared_inputs(),
+            &[ReferenceDischargeRegionInput::Allocation(first), ReferenceDischargeRegionInput::Value],
+        );
         assert_eq!(boundary.capture_input_count(), None);
-        assert_eq!(boundary.added_inputs().allocations(), &[second]);
+        assert_eq!(boundary.added_inputs().sources(), &[second]);
         assert_eq!(boundary.added_inputs().position(), 1);
-        assert_eq!(boundary.added_outputs().allocations(), &[first, second]);
-        assert_eq!(boundary.added_outputs().position(), 2);
+        assert_eq!(
+            boundary.added_outputs()[0].sources(),
+            &[ReferenceDischargeRegionOutput::Allocation(first), ReferenceDischargeRegionOutput::Allocation(second)]
+        );
+        assert_eq!(boundary.added_outputs()[0].position(), 2);
 
         let symmetric = ReferenceDischargeRegionBoundary::symmetric(
             &ListOperation::Call,
             0,
             vec![Some(first)],
-            ReferenceDischargeRegionStateInsertion::new(vec![second], 1),
+            ReferenceDischargeRegionBoundaryInsertion::new(vec![second], 1),
         );
-        assert_eq!(symmetric.added_inputs().allocations(), &[second]);
+        assert_eq!(symmetric.added_inputs().sources(), &[second]);
         assert_eq!(symmetric.added_inputs().position(), 1);
-        assert_eq!(symmetric.added_outputs().allocations(), &[second]);
-        assert_eq!(symmetric.added_outputs().position(), 1);
+        assert_eq!(symmetric.added_outputs()[0].sources(), &[ReferenceDischargeRegionOutput::Allocation(second)]);
+        assert_eq!(symmetric.added_outputs()[0].position(), 1);
     }
 
     #[test]
@@ -5833,8 +6075,8 @@ mod tests {
             &ListOperation::Call,
             0,
             vec![Some(allocation), None],
-            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 2),
-            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 2),
+            ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 2),
+            [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 2)],
         );
         let result = driver.rebuild_region(&context, 0, &boundary).unwrap();
 
@@ -6166,8 +6408,8 @@ mod tests {
             &ListOperation::Call,
             0,
             vec![None],
-            ReferenceDischargeRegionStateInsertion::new(vec![allocation], 1),
-            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 0),
+            ReferenceDischargeRegionBoundaryInsertion::new(vec![allocation], 1),
+            [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 0)],
         );
         let result = driver.rebuild_region(&context, 0, &boundary).unwrap();
         assert_eq!(
@@ -6214,6 +6456,76 @@ mod tests {
         assert_eq!(widening.threaded(), &BTreeSet::new());
         assert_eq!(widening.entering(), &[preserved_allocation]);
         assert_eq!(widening.published(), &[]);
+    }
+
+    #[test]
+    fn test_reference_discharge_region_summary_new_skips_dormant_rule_regions() {
+        // A custom VJP call threads a plumbing reference into its dormant forward and backward rules, whose
+        // reference-typed inputs are bound by the transform that instantiates them and therefore declare no input
+        // provenance. Summarizing a condition branch containing such a call skips those rules exactly as the reference
+        // analysis does, so discharging the program reaches the call's own discharge rule, which reports that a
+        // reference-carrying custom VJP has no rule, instead of failing on the undeclared provenance.
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let identity = |input_types: Vec<ArrayIrType>, output_positions: Vec<usize>| {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let inputs = input_types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
+            let outputs = output_positions.iter().map(|position| inputs[*position]).collect::<Vec<_>>();
+            builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    outputs,
+                    vec![Placeholder; input_types.len()],
+                    vec![Placeholder; output_positions.len()],
+                )
+                .unwrap()
+        };
+        let rules = [
+            identity(vec![reference_type.clone(), scalar_type.clone()], vec![1]),
+            identity(vec![reference_type.clone(), scalar_type.clone()], vec![1, 0]),
+            identity(vec![reference_type.clone(), reference_type.clone(), scalar_type.clone()], vec![2]),
+        ];
+        let branch = {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let regions = rules.iter().map(|rule| builder.import_region(rule.entry_region_ref())).collect();
+            let stash = builder.add_input(reference_type.clone());
+            let x = builder.add_input(scalar_type.clone());
+            let operation = CustomVjpOperation::<ArrayIrType>::new().with_non_differentiated_count(1);
+            let output = builder
+                .add_instruction(ArrayIrOperation::CustomVjp(operation), regions, vec![stash, x], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![output],
+                    vec![Placeholder; 2],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let branch = builder.import_region(branch.entry_region_ref());
+        let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
+        let stash = builder.add_input(reference_type);
+        let x = builder.add_input(scalar_type);
+        let output = builder
+            .add_instruction(
+                ArrayIrOperation::Condition(ConditionOperation::new()),
+                vec![branch, branch],
+                vec![predicate, stash, x],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 3],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(matches!(
+            program.discharge_references::<ArrayReferenceDischarge>(0),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "`custom_vjp` carries reference state but has no reference discharge rule",
+        ));
     }
 
     #[test]
@@ -6280,9 +6592,9 @@ mod tests {
         let boundary = ReferenceDischargeRegionBoundary::new(
             &ListOperation::Call,
             0,
-            Vec::new(),
-            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 0),
-            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 0),
+            Vec::<ReferenceDischargeRegionInput>::new(),
+            ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 0),
+            [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 0)],
         );
 
         assert_eq!(
@@ -6387,8 +6699,8 @@ mod tests {
             &ListOperation::Call,
             0,
             vec![Some(allocation)],
-            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 0),
-            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 1),
+            ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 0),
+            [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 1)],
         );
         let result = driver.rebuild_region(&context, 0, &boundary).unwrap();
 
@@ -6473,9 +6785,9 @@ mod tests {
         let boundary = ReferenceDischargeRegionBoundary::new(
             &ListOperation::Call,
             0,
-            Vec::new(),
-            ReferenceDischargeRegionStateInsertion::new(vec![allocation], 0),
-            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 0),
+            Vec::<ReferenceDischargeRegionInput>::new(),
+            ReferenceDischargeRegionBoundaryInsertion::new(vec![allocation], 0),
+            [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 0)],
         );
         let result = driver.rebuild_region(&context, 0, &boundary).unwrap();
         assert_eq!(
@@ -6491,6 +6803,284 @@ mod tests {
         // The caller environment is untouched: the rebuilt region read its own threaded copy of the state.
         assert_eq!(context.discharged_state(allocation), Ok(ListIrValue::List(vec![1, 2])));
         assert_eq!(context.is_mutated(allocation), Ok(false));
+    }
+
+    #[test]
+    fn test_recursive_reference_discharge_driver_rebuild_region_output_groups() {
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let view = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 1 })));
+        builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
+        let update = builder.add_constant(ListIrValue::List(vec![5]));
+        builder.add_instruction(ListOperation::AddUpdate, Vec::new(), vec![view, update], None).unwrap();
+        let snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![view], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let region_id = program.entry_region_ref().id();
+        let regions = [program];
+        let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
+        let context = ListDischargeContext::new(ListDestination::new());
+        let viewed = context
+            .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 7]))
+            .unwrap()
+            .allocation_id();
+        let whole = context
+            .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![2, 3]))
+            .unwrap()
+            .allocation_id();
+        let declared = [ReferenceDischargeRegionInput::View(viewed), ReferenceDischargeRegionInput::Allocation(whole)];
+
+        // A view output can precede declared outputs. Allocation and view outputs share one insertion mechanism,
+        // and separate groups at the same position retain their supplied order.
+        let boundary = ReferenceDischargeRegionBoundary::new(
+            &ListOperation::Call,
+            0,
+            declared,
+            ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 2),
+            [
+                ReferenceDischargeRegionBoundaryInsertion::new(vec![ReferenceDischargeRegionOutput::View(0)], 0),
+                ReferenceDischargeRegionBoundaryInsertion::new(
+                    vec![ReferenceDischargeRegionOutput::Allocation(whole)],
+                    0,
+                ),
+            ],
+        );
+        let result = driver.rebuild_region(&context, 0, &boundary).unwrap();
+        assert_eq!(
+            result.program().interpret(vec![ListIrValue::List(vec![1]), ListIrValue::List(vec![2, 3])]),
+            Ok(vec![ListIrValue::List(vec![6]), ListIrValue::List(vec![2, 3]), ListIrValue::List(vec![6])]),
+        );
+        assert_eq!(result.output_allocations(), &[None]);
+        assert_eq!(context.discharged_state(viewed), Ok(ListIrValue::List(vec![1, 7])));
+
+        // Output requests must name declared view inputs, not whole-allocation inputs or nonexistent positions.
+        let boundary = ReferenceDischargeRegionBoundary::new(
+            &ListOperation::Call,
+            0,
+            declared,
+            ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 2),
+            [ReferenceDischargeRegionBoundaryInsertion::new(vec![ReferenceDischargeRegionOutput::View(1)], 0)],
+        );
+        assert!(matches!(driver.rebuild_region(&context, 0, &boundary),
+            Err(ProgramError::MalformedProgram(message)) if message == format!(
+                "reference discharge publishes input 1 of region `{region_id}` as a boundary view, but it \
+                 is not a declared view input",
+            ),
+        ));
+        let boundary = ReferenceDischargeRegionBoundary::new(
+            &ListOperation::Call,
+            0,
+            declared,
+            ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 2),
+            [ReferenceDischargeRegionBoundaryInsertion::new(vec![ReferenceDischargeRegionOutput::View(2)], 0)],
+        );
+        assert!(matches!(driver.rebuild_region(&context, 0, &boundary),
+            Err(ProgramError::MalformedProgram(message)) if message == format!(
+                "reference discharge publishes input 2 of region `{region_id}` as a boundary view, but it \
+                 is not a declared view input",
+            ),
+        ));
+
+        // A view is published at most once, even when duplicate requests appear in different insertion groups.
+        let boundary = ReferenceDischargeRegionBoundary::new(
+            &ListOperation::Call,
+            0,
+            declared,
+            ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 2),
+            [
+                ReferenceDischargeRegionBoundaryInsertion::new(vec![ReferenceDischargeRegionOutput::View(0)], 0),
+                ReferenceDischargeRegionBoundaryInsertion::new(vec![ReferenceDischargeRegionOutput::View(0)], 1),
+            ],
+        );
+        assert!(matches!(driver.rebuild_region(&context, 0, &boundary),
+            Err(ProgramError::MalformedProgram(message)) if message == format!(
+                "reference discharge publishes boundary view input 0 of region `{region_id}` more than once",
+            ),
+        ));
+
+        // Groups are already an ordered output specification; reject descending positions instead of reordering it.
+        let boundary = ReferenceDischargeRegionBoundary::new(
+            &ListOperation::Call,
+            0,
+            declared,
+            ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 2),
+            [
+                ReferenceDischargeRegionBoundaryInsertion::new(vec![ReferenceDischargeRegionOutput::View(0)], 1),
+                ReferenceDischargeRegionBoundaryInsertion::new(
+                    vec![ReferenceDischargeRegionOutput::Allocation(whole)],
+                    0,
+                ),
+            ],
+        );
+        assert!(matches!(driver.rebuild_region(&context, 0, &boundary),
+            Err(ProgramError::MalformedProgram(message)) if message == format!(
+                "reference discharge output insertion positions for region `{region_id}` are not in \
+                 nondecreasing order",
+            ),
+        ));
+    }
+
+    #[test]
+    fn test_recursive_reference_discharge_driver_rebuild_region_binds_boundary_views() {
+        // A boundary view is region-local state typed by the region input rather than by the caller allocation. The
+        // rebuilt region receives the view's initial state as a value, its accesses discharge against that state, and
+        // a published view appends its final state after every declared output, while the caller's environment stays
+        // untouched.
+        let view_type = ReferenceType::new(ListType { length: 1 });
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let view = builder.add_input(ListIrType::Reference(view_type.clone()));
+        let update = builder.add_constant(ListIrValue::List(vec![5]));
+        builder.add_instruction(ListOperation::AddUpdate, Vec::new(), vec![view, update], None).unwrap();
+        let snapshot = builder.add_instruction(ListOperation::Read, Vec::new(), vec![view], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let context = ListDischargeContext::new(ListDestination::new());
+        let allocated = ReferenceDischargeValue::from(
+            context
+                .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
+                .unwrap(),
+        );
+        let allocation = allocated.try_as_reference("the viewed allocation").unwrap().allocation_id();
+        let regions = [program];
+        let region = regions[0].entry_region_ref().id();
+        let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
+        let boundary = ReferenceDischargeRegionBoundary::new(
+            &ListOperation::Call,
+            0,
+            vec![ReferenceDischargeRegionInput::View(allocation)],
+            ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 1),
+            [
+                ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 1),
+                ReferenceDischargeRegionBoundaryInsertion::new(vec![ReferenceDischargeRegionOutput::View(0)], 1),
+            ],
+        );
+        let result = driver.rebuild_region(&context, 0, &boundary).unwrap();
+        assert_eq!(
+            result.program().to_string(),
+            indoc! {"
+                lambda %0:list<1> .
+                let %1:list<1> = const [5]
+                    %2:list<1> = list.select %0
+                    %3:list<1> = list.add %2 %1
+                    %4:list<1> = list.splice %0 %3
+                    %5:list<1> = list.select %4
+                in (%5, %4)"},
+        );
+        assert_eq!(result.output_allocations(), &[None]);
+        assert!(result.mutated_allocations().is_empty());
+        assert_eq!(context.discharged_state(allocation), Ok(ListIrValue::List(vec![1, 2])));
+        assert_eq!(context.is_mutated(allocation), Ok(false));
+
+        // Rebuilding rejects a mutated view whose final state the boundary does not publish.
+        let boundary = ReferenceDischargeRegionBoundary::new(
+            &ListOperation::Call,
+            0,
+            vec![ReferenceDischargeRegionInput::View(allocation)],
+            ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 1),
+            [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 1)],
+        );
+        assert_eq!(
+            driver.rebuild_region(&context, 0, &boundary).unwrap_err(),
+            ProgramError::MalformedProgram(format!(
+                "reference discharge mutated the boundary view at input 0 of region `{region}` without publishing \
+                 its final state",
+            )),
+        );
+
+        // A view of a preserved allocation is a preserved reference-typed input whose accesses replay as the operations
+        // the source performed, so it has no final state to publish.
+        let preserved_type = ReferenceType::new(ListType { length: 2 });
+        let preserved = ReferenceDischargeValue::from(
+            context.bind_preserved(preserved_type.clone(), ListIrValue::Reference(preserved_type)).unwrap(),
+        );
+        let preserved = preserved.try_as_reference("the preserved allocation").unwrap().allocation_id();
+        let boundary = ReferenceDischargeRegionBoundary::new(
+            &ListOperation::Call,
+            0,
+            vec![ReferenceDischargeRegionInput::View(preserved)],
+            ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 1),
+            [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 1)],
+        );
+        let result = driver.rebuild_region(&context, 0, &boundary).unwrap();
+        assert_eq!(
+            result.program().to_string(),
+            indoc! {"
+                lambda %0:ref<list<1>> .
+                let %1:list<1> = const [5]
+                    list.add_update %0 %1
+                    %2:list<1> = list.read %0
+                in (%2)"},
+        );
+        let boundary = ReferenceDischargeRegionBoundary::new(
+            &ListOperation::Call,
+            0,
+            vec![ReferenceDischargeRegionInput::View(preserved)],
+            ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 1),
+            [
+                ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 1),
+                ReferenceDischargeRegionBoundaryInsertion::new(vec![ReferenceDischargeRegionOutput::View(0)], 1),
+            ],
+        );
+        assert_eq!(
+            driver.rebuild_region(&context, 0, &boundary).unwrap_err(),
+            ProgramError::MalformedProgram(format!(
+                "reference discharge publishes the boundary view of preserved {preserved} at input 0 of region \
+                 `{region}`",
+            )),
+        );
+
+        // A view enters only at a reference-typed position.
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        builder.add_input(ListIrType::List(ListType { length: 1 }));
+        let program = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(Vec::new(), vec![Placeholder], Vec::new())
+            .unwrap();
+        let regions = [program];
+        let region = regions[0].entry_region_ref().id();
+        let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
+        let boundary = ReferenceDischargeRegionBoundary::new(
+            &ListOperation::Call,
+            0,
+            vec![ReferenceDischargeRegionInput::View(allocation)],
+            ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 1),
+            [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 0)],
+        );
+        assert_eq!(
+            driver.rebuild_region(&context, 0, &boundary).unwrap_err(),
+            ProgramError::MalformedProgram(format!(
+                "reference discharge assigns a boundary view of {allocation} to value input 0 of region `{region}`",
+            )),
+        );
+
+        // A view never enters beside a complete handle of its allocation, whose threaded state it would diverge from.
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
+        builder.add_input(ListIrType::Reference(view_type));
+        let program = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(Vec::new(), vec![Placeholder; 2], Vec::new())
+            .unwrap();
+        let regions = [program];
+        let region = regions[0].entry_region_ref().id();
+        let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
+        let boundary = ReferenceDischargeRegionBoundary::new(
+            &ListOperation::Call,
+            0,
+            vec![
+                ReferenceDischargeRegionInput::Allocation(allocation),
+                ReferenceDischargeRegionInput::View(allocation),
+            ],
+            ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 2),
+            [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 0)],
+        );
+        assert_eq!(
+            driver.rebuild_region(&context, 0, &boundary).unwrap_err(),
+            ProgramError::MalformedProgram(format!(
+                "reference discharge passes {allocation} into region `{region}` both as a complete handle and as a \
+                 boundary view",
+            )),
+        );
     }
 
     #[test]
@@ -6516,8 +7106,8 @@ mod tests {
             &ListOperation::Call,
             0,
             vec![Some(allocation)],
-            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 1),
-            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 1),
+            ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 1),
+            [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 1)],
         );
 
         assert_eq!(
@@ -6547,9 +7137,9 @@ mod tests {
         let boundary = ReferenceDischargeRegionBoundary::new(
             &ListOperation::Call,
             0,
-            Vec::new(),
-            ReferenceDischargeRegionStateInsertion::new(vec![allocation, allocation], 0),
-            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 0),
+            Vec::<ReferenceDischargeRegionInput>::new(),
+            ReferenceDischargeRegionBoundaryInsertion::new(vec![allocation, allocation], 0),
+            [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 0)],
         );
 
         assert_eq!(
@@ -6585,8 +7175,8 @@ mod tests {
             &ListOperation::Call,
             0,
             vec![Some(allocation)],
-            ReferenceDischargeRegionStateInsertion::new(vec![allocation], 1),
-            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 0),
+            ReferenceDischargeRegionBoundaryInsertion::new(vec![allocation], 1),
+            [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 0)],
         );
 
         assert_eq!(
@@ -6624,8 +7214,8 @@ mod tests {
             &ListOperation::Call,
             0,
             vec![Some(allocation)],
-            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 1),
-            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 1),
+            ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 1),
+            [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 1)],
         );
 
         assert!(matches!(
@@ -6676,8 +7266,8 @@ mod tests {
             &ListOperation::Call,
             0,
             vec![None, Some(accessed)],
-            ReferenceDischargeRegionStateInsertion::new(vec![carried], 1),
-            ReferenceDischargeRegionStateInsertion::new(vec![carried], 0),
+            ReferenceDischargeRegionBoundaryInsertion::new(vec![carried], 1),
+            [ReferenceDischargeRegionBoundaryInsertion::new(vec![carried], 0).into()],
         );
         let result = driver.rebuild_region(&context, 0, &boundary).unwrap();
         assert_eq!(
@@ -6719,22 +7309,33 @@ mod tests {
             .bind_discharged(ReferenceType::new(ListType { length: 3 }), ListIrValue::List(vec![1, 2, 3]))
             .unwrap()
             .allocation_id();
-        let rebuild = |declared: Vec<Option<ReferenceDischargeAllocationId>>, inputs, outputs| {
-            let boundary = ReferenceDischargeRegionBoundary::new(&ListOperation::Call, 0, declared, inputs, outputs);
+        let rebuild = |declared: Vec<Option<ReferenceDischargeAllocationId>>,
+                       inputs,
+                       outputs: ReferenceDischargeRegionBoundaryInsertion| {
+            let boundary =
+                ReferenceDischargeRegionBoundary::new(&ListOperation::Call, 0, declared, inputs, [outputs.into()]);
             driver.rebuild_region(&context, 0, &boundary).unwrap_err()
         };
-        let none = || ReferenceDischargeRegionStateInsertion::new(Vec::new(), 0);
+        let none = || ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 0);
         let _ = reference;
 
         // Added positions must lie within the declared boundaries.
         assert_eq!(
-            rebuild(vec![Some(allocation), None], ReferenceDischargeRegionStateInsertion::new(Vec::new(), 3), none()),
+            rebuild(
+                vec![Some(allocation), None],
+                ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 3),
+                none(),
+            ),
             ProgramError::MalformedProgram(format!(
                 "reference discharge inserts region state inputs at 3 but region `{region_id}` declares 2 inputs",
             )),
         );
         assert_eq!(
-            rebuild(vec![Some(allocation), None], none(), ReferenceDischargeRegionStateInsertion::new(Vec::new(), 2)),
+            rebuild(
+                vec![Some(allocation), None],
+                none(),
+                ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 2),
+            ),
             ProgramError::MalformedProgram(format!(
                 "reference discharge inserts region state outputs at 2 but region `{region_id}` declares 1 outputs",
             )),
@@ -6763,7 +7364,11 @@ mod tests {
 
         // An added output must denote an allocation the boundary threads in.
         assert_eq!(
-            rebuild(vec![Some(allocation), None], none(), ReferenceDischargeRegionStateInsertion::new(vec![wider], 1)),
+            rebuild(
+                vec![Some(allocation), None],
+                none(),
+                ReferenceDischargeRegionBoundaryInsertion::new(vec![wider], 1),
+            ),
             ProgramError::MalformedProgram(format!(
                 "reference discharge publishes {wider} from region `{region_id}` without threading it in",
             )),
@@ -6788,8 +7393,8 @@ mod tests {
             &ListOperation::Call,
             0,
             vec![None],
-            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 0),
-            ReferenceDischargeRegionStateInsertion::new(Vec::new(), 0),
+            ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 0),
+            [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 0)],
         );
         let prefix = "reference discharge cannot publish reference allocation ";
         let suffix = format!(" from region `{region_id}`, whose caller did not thread that allocation");
