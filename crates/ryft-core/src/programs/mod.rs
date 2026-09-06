@@ -166,7 +166,8 @@ pub use references::{
     ReferenceTypeRefinements, ReferenceView, ReferenceViewAnalysis, ReferenceViewAnalysisError, ReferenceViewOperation,
     ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError, TakenReferenceGuard,
     ValidatedPendingReplacementTransaction, ViewOverlap, ViewSymbol, ViewSymbolBinding, batch_reference_view_operation,
-    discharge_positional_region_operation, discharge_reference_free_operation, validate_reference_boundary,
+    discharge_local_reference_operation, discharge_positional_region_operation, discharge_reference_free_operation,
+    validate_reference_boundary,
 };
 pub use regions::{
     BindingRegionDriver, CalleeRegionDriver, DestinationRegionMapping, EmptyRegionDriver, InputRegionProvenance,

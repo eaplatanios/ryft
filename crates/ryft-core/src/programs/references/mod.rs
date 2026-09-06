@@ -272,8 +272,8 @@ pub use discharge::{
     ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeRegionInput,
     ReferenceDischargeRegionOutput, ReferenceDischargeRegionResult, ReferenceDischargeRegionSummary,
     ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceDischargeableType, ReferenceSource, discharge_positional_region_operation,
-    discharge_reference_free_operation,
+    ReferenceDischargeableType, ReferenceSource, discharge_local_reference_operation,
+    discharge_positional_region_operation, discharge_reference_free_operation,
 };
 pub use types::{ReferenceType, ReferenceTypeRefinements};
 
