@@ -1259,7 +1259,9 @@ macro_rules! impl_differentiable_operation {
             @impl_jvp
             impl<$context, $generic $(, $remaining_generic)*> $operation
             where { $($bounds)* }
-            |$self, $jvp_context, $jvp_driver, $inputs| $jvp_body
+            |$self, $jvp_context, $jvp_driver, $inputs| {
+                $jvp_body
+            }
         }
 
         $crate::impl_non_transposable_operation!(
@@ -1279,7 +1281,9 @@ macro_rules! impl_differentiable_operation {
             @impl_jvp
             impl<$context> $operation
             where { $($bounds)* }
-            |$self, $jvp_context, $jvp_driver, $inputs| $jvp_body
+            |$self, $jvp_context, $jvp_driver, $inputs| {
+                $jvp_body
+            }
         }
 
         $crate::impl_non_transposable_operation!($operation);
@@ -1314,7 +1318,9 @@ macro_rules! impl_differentiable_operation {
             @impl_jvp
             impl<$context $(, $generic)*> $operation
             where { $($jvp_bounds)* }
-            |$self, $jvp_context, $jvp_driver, $inputs| $jvp_body
+            |$self, $jvp_context, $jvp_driver, $inputs| {
+                $jvp_body
+            }
         }
 
         $crate::impl_differentiable_operation! {
@@ -1338,7 +1344,9 @@ macro_rules! impl_differentiable_operation {
             @impl_jvp
             impl<$context $(, $generic)*> $operation
             where { $($jvp_bounds)* }
-            |$self, $jvp_context, $jvp_driver, $inputs| $jvp_body
+            |$self, $jvp_context, $jvp_driver, $inputs| {
+                $jvp_body
+            }
         }
 
         $crate::impl_differentiable_operation! {
@@ -1377,9 +1385,9 @@ macro_rules! impl_differentiable_operation {
             $operation: $crate::Operation<Type = <$context as $crate::Domain>::Type>,
             $($bounds)*
         {
-            fn jvp<__D: $crate::DifferentiationDriver<$context>>(
+            fn jvp<__D: $crate::DifferentiationDriver<$context>, __P: $crate::DifferentiationPolicy<$context>>(
                 &self,
-                $jvp_context: &$context,
+                $jvp_context: &$crate::DifferentiationContext<$context, __P>,
                 $jvp_driver: &__D,
                 $inputs: &[$crate::DifferentiationDual<<$context as $crate::Domain>::Value>],
             ) -> Result<
@@ -1606,15 +1614,15 @@ macro_rules! impl_differentiable_elementwise_operation {
         where
             __C::Operation: ::std::convert::From<$operation>,
         {
-            fn jvp<__D: $crate::DifferentiationDriver<__C>>(
+            fn jvp<__D: $crate::DifferentiationDriver<__C>, __P: $crate::DifferentiationPolicy<__C>>(
                 &self,
-                context: &__C,
+                context: &$crate::DifferentiationContext<__C, __P>,
                 _driver: &__D,
                 inputs: &[$crate::DifferentiationDual<__C::Value>],
             ) -> Result<Vec<$crate::DifferentiationDual<__C::Value>>, $crate::DifferentiationError> {
                 $crate::check_count!("input", inputs, 1, ProgramError);
                 let mut primals = $crate::Context::bind(
-                    context,
+                    context.primal(),
                     self.clone(),
                     Vec::new(),
                     ::std::slice::from_ref(inputs[0].primal()),
@@ -1895,9 +1903,10 @@ macro_rules! impl_differentiable_elementwise_operation {
             }
             |operation, context, _driver, inputs| {
                 $crate::unary_elementwise_jvp(
+                    context,
                     operation,
                     inputs,
-                    |input| {
+                    |context, input| {
                         let mut outputs = $crate::Context::bind(
                             context,
                             operation.clone(),
@@ -2020,7 +2029,7 @@ macro_rules! impl_differentiable_elementwise_operation {
             |operation, context, _driver, inputs| {
                 $crate::check_count!("input", inputs, 1, ProgramError);
                 let mut primals = $crate::Context::bind(
-                    context,
+                    context.primal(),
                     operation.clone(),
                     Vec::new(),
                     ::std::slice::from_ref(inputs[0].primal()),
@@ -2085,7 +2094,7 @@ macro_rules! impl_differentiable_elementwise_operation {
             |operation, context, _driver, inputs| {
                 $crate::check_count!("input", inputs, 2, ProgramError);
                 let mut primals = $crate::Context::bind(
-                    context,
+                    context.primal(),
                     operation.clone(),
                     Vec::new(),
                     &[inputs[0].primal().clone(), inputs[1].primal().clone()],
@@ -2111,24 +2120,30 @@ macro_rules! impl_differentiable_elementwise_operation {
                 // which always sums its per-side contributions and would therefore stage `add(left, neg(right))` here.
                 // Staged tangent program shapes are part of an operation's differentiation contract, so this difference
                 // is load-bearing and not a consolidation candidate.
+                if left.is_none() && right.is_none() {
+                    return Ok(vec![$crate::DifferentiationDual::new(primal, $crate::MaybeZero::Zero(target))?]);
+                }
+                let tangent_primal = context.primal_to_tangent(primal.clone())?;
                 let tangent = match (left, right) {
                     (Some(left), Some(right)) => {
-                        let left = $crate::ElementwiseDerivativeAlignment::align_tangent(left, &target, &primal)?;
-                        let right = $crate::ElementwiseDerivativeAlignment::align_tangent(right, &target, &primal)?;
+                        let left =
+                            $crate::ElementwiseDerivativeAlignment::align_tangent(left, &target, &tangent_primal)?;
+                        let right =
+                            $crate::ElementwiseDerivativeAlignment::align_tangent(right, &target, &tangent_primal)?;
                         $crate::MaybeZero::Value($crate::impl_differentiable_elementwise_operation!(
                                     @combine_linear_tangents [$left_sign, $right_sign], left, right
                         ))
                     }
                     (Some(tangent), None) => {
                         let tangent =
-                            $crate::ElementwiseDerivativeAlignment::align_tangent(tangent, &target, &primal)?;
+                            $crate::ElementwiseDerivativeAlignment::align_tangent(tangent, &target, &tangent_primal)?;
                         $crate::MaybeZero::Value($crate::impl_differentiable_elementwise_operation!(
                             @apply_tangent_sign $left_sign, tangent
                         ))
                     }
                     (None, Some(tangent)) => {
                         let tangent =
-                            $crate::ElementwiseDerivativeAlignment::align_tangent(tangent, &target, &primal)?;
+                            $crate::ElementwiseDerivativeAlignment::align_tangent(tangent, &target, &tangent_primal)?;
                         $crate::MaybeZero::Value($crate::impl_differentiable_elementwise_operation!(
                             @apply_tangent_sign $right_sign, tangent
                         ))
@@ -2513,9 +2528,10 @@ macro_rules! impl_differentiable_elementwise_operation {
             }
             |operation, context, _driver, inputs| {
                 $crate::binary_elementwise_jvp(
+                    context,
                     operation,
                     inputs,
-                    |left, right| {
+                    |context, left, right| {
                         let mut outputs = $crate::Context::bind(
                             context,
                             operation.clone(),
@@ -2631,12 +2647,13 @@ macro_rules! impl_non_differentiable_operation {
             $($bounds)*
         {
             #[inline]
-            fn jvp<__D: $crate::DifferentiationDriver<__C>>(
+            fn jvp<__D: $crate::DifferentiationDriver<__C>, __P: $crate::DifferentiationPolicy<__C>>(
                 &self,
-                context: &__C,
+                context: &$crate::DifferentiationContext<__C, __P>,
                 _driver: &__D,
                 inputs: &[$crate::DifferentiationDual<__C::Value>],
             ) -> Result<Vec<$crate::DifferentiationDual<__C::Value>>, $crate::DifferentiationError> {
+                let context = context.primal();
                 // The outputs carry no tangent. We replay the primal operation on the input primals and pair each
                 // output with a structural zero tangent, which stays symbolic and stages nothing.
                 $crate::Context::bind(
@@ -3022,10 +3039,11 @@ macro_rules! define_tracer_operator {
             }
         }
 
-        impl<__C: $crate::Context> $trait for $crate::DifferentiationTracer<__C>
+        impl<__C: $crate::Context, __P: $crate::DifferentiationPolicy<__C>> $trait
+            for $crate::DifferentiationTracer<__C, __P>
         where
-            $crate::DifferentiationContext<__C>: $crate::Context<
-                    Value = $crate::DifferentiationTracer<__C>,
+            $crate::DifferentiationContext<__C, __P>: $crate::Context<
+                    Value = $crate::DifferentiationTracer<__C, __P>,
                     Operation: ::std::convert::From<$operation<__C::Type>>,
                 >,
         {
@@ -3103,7 +3121,8 @@ macro_rules! define_tracer_operator {
             }
         }
 
-        impl<__C: $crate::Context> $trait for $crate::DifferentiationTracer<__C>
+        impl<__C: $crate::Context, __P: $crate::DifferentiationPolicy<__C>> $trait
+            for $crate::DifferentiationTracer<__C, __P>
         where
             Self: $capability,
         {
@@ -3968,12 +3987,13 @@ macro_rules! check_operation_batching {
 
 /// Checks how a concrete [`Operation`](crate::Operation) behaves under forward-mode differentiation. Each
 /// case builds a single [`Instruction`](crate::Instruction) [`Program`](crate::Program), transforms it with
-/// [`Program::jvp`](crate::Program::jvp), interprets the fused primal-and-tangent program, and checks the declared
-/// primal and tangent outputs. The macro independently checks the tangent outputs against the central directional
-/// finite difference `(f(x + h·ẋ) - f(x - h·ẋ)) / (2h)`, so the numerical oracle never uses the differentiation rule
-/// being tested. An optional `jvp` string checks the transformed program's symbolic form. The default form uses the
-/// eager [`Array`](crate::Array) reference backend, while `backend = (Value, Operation)` supports downstream value and
-/// operation families whose values implement the arithmetic and approximate-equality operations used by the check.
+/// [`Program::jvp`](crate::Program::jvp) and [`Program::linearize`](crate::Program::linearize), and checks the declared
+/// primal and tangent outputs under both fused and separate execution. The macro independently checks the tangent
+/// outputs against the central directional finite difference `(f(x + h·ẋ) - f(x - h·ẋ)) / (2h)`, so the numerical
+/// oracle never uses the differentiation rule being tested. An optional `jvp` string checks the transformed program's
+/// symbolic form. The default form uses the eager [`Array`](crate::Array) reference backend, while `backend = (Value,
+/// Operation)` supports downstream value and operation families whose values implement the arithmetic and
+/// approximate-equality operations used by the check.
 ///
 /// # Example
 ///
@@ -4050,6 +4070,8 @@ macro_rules! check_operation_differentiation {
         assert!(epsilon >= 0.0, "comparison epsilon must be nonnegative");
         $(
         {
+            // Convert each fixture into the selected backend's value family. Every primal input and output must
+            // have a corresponding tangent so both differentiation paths can use the same expected results.
             let primals: Vec<$value> = vec![$(::core::convert::Into::into($primal)),+];
             let tangents: Vec<$value> = vec![$(::core::convert::Into::into($tangent)),+];
             assert_eq!(primals.len(), tangents.len(), "primal and tangent input counts differ");
@@ -4061,6 +4083,8 @@ macro_rules! check_operation_differentiation {
                 "primal and tangent output counts differ",
             );
 
+            // Build a single-operation program with input types inferred from the fixture. All operation outputs
+            // become program outputs; the placeholders describe the flat input and output vector structures.
             let mut builder = $crate::programs::builders::ProgramBuilder::<$value, $operation_family>::new();
             let input_ids = primals
                 .iter()
@@ -4077,9 +4101,13 @@ macro_rules! check_operation_differentiation {
                     vec![$crate::parameters::Placeholder; output_count],
                 )
                 .unwrap();
+
+            // Construct the fused derivative and, when supplied, check its expected symbolic program as well.
             let jvp = program.jvp().unwrap();
             $(assert_eq!(jvp.to_string(), $jvp.trim_end());)?
 
+            // The fused JVP takes all primals followed by all tangents and returns outputs in that same grouping.
+            // Check both halves against the fixture before using its tangents in the numerical check below.
             let jvp_inputs = primals.iter().cloned().chain(tangents.iter().cloned()).collect::<Vec<_>>();
             let actual = jvp.interpret(jvp_inputs).unwrap();
             assert_eq!(actual.len(), 2 * output_count);
@@ -4091,6 +4119,32 @@ macro_rules! check_operation_differentiation {
                 ::approx::assert_abs_diff_eq!(actual, expected, epsilon = epsilon);
             }
 
+            // Linearization exercises separate primal and tangent construction destinations. A rule that omits a
+            // required primal-to-tangent transfer can pass fused execution but fail on this path.
+            let linearization = program.linearize().unwrap();
+
+            // The primal program returns public primal outputs followed by residuals saved for the tangent program.
+            let separated_primals = linearization.primal().interpret(primals.clone()).unwrap();
+            assert_eq!(separated_primals.len(), output_count + linearization.residual_count());
+            for (actual, expected) in separated_primals[..output_count].iter().zip(expected_primals.iter()) {
+                ::approx::assert_abs_diff_eq!(actual, expected, epsilon = epsilon);
+            }
+
+            // Supply input tangents followed by the saved residuals. The tangent program returns only output
+            // tangents, which must agree with the same fixture used for fused execution.
+            let separated_inputs = tangents
+                .iter()
+                .cloned()
+                .chain(separated_primals[output_count..].iter().cloned())
+                .collect();
+            let separated_tangents = linearization.tangent().interpret(separated_inputs).unwrap();
+            assert_eq!(separated_tangents.len(), expected_tangents.len());
+            for (actual, expected) in separated_tangents.iter().zip(expected_tangents.iter()) {
+                ::approx::assert_abs_diff_eq!(actual, expected, epsilon = epsilon);
+            }
+
+            // Perturb every primal along its input tangent in both directions. Evaluating the original program
+            // at these points gives a numerical directional derivative independent of the differentiation rules.
             let plus_inputs = primals
                 .iter()
                 .cloned()
@@ -4107,6 +4161,9 @@ macro_rules! check_operation_differentiation {
             let minus_outputs = program.interpret(minus_inputs).unwrap();
             assert_eq!(plus_outputs.len(), output_count);
             assert_eq!(minus_outputs.len(), output_count);
+
+            // Compare the fused JVP with the central difference (f(x + h*v) - f(x - h*v)) / (2*h).
+            // The separated path has already been checked against the same expected tangent values above.
             for ((actual, plus), minus) in actual_tangents
                 .iter()
                 .zip(plus_outputs.into_iter())
@@ -6072,7 +6129,11 @@ mod tests {
             DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(5.0f32)).unwrap(),
         ];
         let outputs = TestDifferentiableOperation::<ArrayType>::new()
-            .jvp(&EagerContext::<Array, TestDifferentiableOperation<ArrayType>>::new(), &EmptyRegionDriver, &inputs)
+            .jvp(
+                &DifferentiationContext::new(EagerContext::<Array, TestDifferentiableOperation<ArrayType>>::new()),
+                &EmptyRegionDriver,
+                &inputs,
+            )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].primal(), &Array::scalar(2.0f32));
@@ -6107,7 +6168,11 @@ mod tests {
             DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(5.0f32)).unwrap(),
         ];
         let outputs = AddOperation::new()
-            .jvp(&EagerContext::<Array, ArrayOperation<Array>>::new(), &EmptyRegionDriver, &inputs)
+            .jvp(
+                &DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new()),
+                &EmptyRegionDriver,
+                &inputs,
+            )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].primal(), &Array::scalar(5.0f32));
@@ -6148,20 +6213,26 @@ mod tests {
             DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(4.0f32)).unwrap(),
             DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(5.0f32)).unwrap(),
         ];
-        let outputs = TestReversedSubOperation::<ArrayType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
+        let outputs = TestReversedSubOperation::<ArrayType>::new()
+            .jvp(&DifferentiationContext::new(context.clone()), &EmptyRegionDriver, &inputs)
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(1.0f32)));
         let inputs = [
             DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(4.0f32)).unwrap(),
             DifferentiationDual::new_with_zero_tangent(Array::scalar(3.0f32)).unwrap(),
         ];
-        let outputs = TestReversedSubOperation::<ArrayType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
+        let outputs = TestReversedSubOperation::<ArrayType>::new()
+            .jvp(&DifferentiationContext::new(context.clone()), &EmptyRegionDriver, &inputs)
+            .unwrap();
         assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(-4.0f32)));
         let inputs = [
             DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0f32)).unwrap(),
             DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(5.0f32)).unwrap(),
         ];
-        let outputs = TestReversedSubOperation::<ArrayType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
+        let outputs = TestReversedSubOperation::<ArrayType>::new()
+            .jvp(&DifferentiationContext::new(context.clone()), &EmptyRegionDriver, &inputs)
+            .unwrap();
         assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(5.0f32)));
 
         // A `[@negative, @negative]` rule combines both live tangents as `-(left + right)`.
@@ -6170,14 +6241,18 @@ mod tests {
             DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(4.0f32)).unwrap(),
             DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(5.0f32)).unwrap(),
         ];
-        let outputs = TestNegatedAddOperation::<ArrayType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
+        let outputs = TestNegatedAddOperation::<ArrayType>::new()
+            .jvp(&DifferentiationContext::new(context.clone()), &EmptyRegionDriver, &inputs)
+            .unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(-9.0f32)));
         let inputs = [
             DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0f32)).unwrap(),
             DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(5.0f32)).unwrap(),
         ];
-        let outputs = TestNegatedAddOperation::<ArrayType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
+        let outputs = TestNegatedAddOperation::<ArrayType>::new()
+            .jvp(&DifferentiationContext::new(context.clone()), &EmptyRegionDriver, &inputs)
+            .unwrap();
         assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(-5.0f32)));
     }
 
@@ -6248,7 +6323,7 @@ mod tests {
     fn test_impl_differentiable_elementwise_operation_unary_jvp_contributions() {
         let outputs = SinOperation::new()
             .jvp(
-                &EagerContext::<Array, ArrayOperation<Array>>::new(),
+                &DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new()),
                 &EmptyRegionDriver,
                 &[DifferentiationDual::new(Array::scalar(0.0f32), Array::scalar(4.0f32)).unwrap()],
             )
@@ -6259,7 +6334,7 @@ mod tests {
 
         let outputs = ExpOperation::new()
             .jvp(
-                &EagerContext::<Array, ArrayOperation<Array>>::new(),
+                &DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new()),
                 &EmptyRegionDriver,
                 &[DifferentiationDual::new(Array::scalar(0.0f32), Array::scalar(3.0f32)).unwrap()],
             )
@@ -6273,7 +6348,7 @@ mod tests {
     fn test_impl_differentiable_elementwise_operation_binary_jvp_contributions() {
         let outputs = MulOperation::new()
             .jvp(
-                &EagerContext::<Array, ArrayOperation<Array>>::new(),
+                &DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new()),
                 &EmptyRegionDriver,
                 &[
                     DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(4.0f32)).unwrap(),
@@ -6377,7 +6452,11 @@ mod tests {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let input = context.input(ArrayType::scalar(DataType::F32));
         let outputs = SinOperation::new()
-            .jvp(&context, &EmptyRegionDriver, &[DifferentiationDual::new_with_zero_tangent(input).unwrap()])
+            .jvp(
+                &DifferentiationContext::new(context.clone()),
+                &EmptyRegionDriver,
+                &[DifferentiationDual::new_with_zero_tangent(input).unwrap()],
+            )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(matches!(
@@ -6394,7 +6473,11 @@ mod tests {
         // The basic form replays the primal operation and replaces its live tangent with a structural zero.
         let inputs = [DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(1.0f32)).unwrap()];
         let outputs = TestUnaryOperation::<ArrayType>::new()
-            .jvp(&EagerContext::<Array, TestUnaryOperation<ArrayType>>::new(), &EmptyRegionDriver, &inputs)
+            .jvp(
+                &DifferentiationContext::new(EagerContext::<Array, TestUnaryOperation<ArrayType>>::new()),
+                &EmptyRegionDriver,
+                &inputs,
+            )
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].primal(), &Array::scalar(-2.0f32));
@@ -6406,7 +6489,9 @@ mod tests {
         let primal = context.input(ArrayType::scalar(DataType::F32));
         let tangent = context.input(ArrayType::scalar(DataType::F32));
         let inputs = [DifferentiationDual::new(primal, tangent).unwrap()];
-        let outputs = TestUnaryOperation::<ArrayType>::new().jvp(&context, &EmptyRegionDriver, &inputs).unwrap();
+        let outputs = TestUnaryOperation::<ArrayType>::new()
+            .jvp(&DifferentiationContext::new(context.clone()), &EmptyRegionDriver, &inputs)
+            .unwrap();
         assert_eq!(context.builder().borrow().instructions().len(), 1);
         assert!(matches!(
             outputs[0].tangent(),
@@ -6416,7 +6501,11 @@ mod tests {
         // The generic form produces the same implementation shape without constraining its marker parameter.
         let operation = TestGenericNullaryOperation::<ArrayType>(PhantomData);
         let outputs = operation
-            .jvp(&EagerContext::<Array, TestGenericNullaryOperation<ArrayType>>::new(), &EmptyRegionDriver, &[])
+            .jvp(
+                &DifferentiationContext::new(EagerContext::<Array, TestGenericNullaryOperation<ArrayType>>::new()),
+                &EmptyRegionDriver,
+                &[],
+            )
             .unwrap();
         assert!(outputs.is_empty());
 

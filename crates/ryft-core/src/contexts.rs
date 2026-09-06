@@ -804,8 +804,9 @@ pub(crate) mod tests {
         Array, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
     };
     use crate::differentiation::{
-        DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-        DifferentiationTracer, TransposableOperation, TranspositionContext, TranspositionDriver,
+        DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+        DifferentiationDual, DifferentiationError, DifferentiationPolicy, DifferentiationTracer, TransposableOperation,
+        TranspositionContext, TranspositionDriver,
     };
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::check_count;
@@ -1101,13 +1102,14 @@ pub(crate) mod tests {
     impl<const MEMBER: u8, C: Context<Type = ProjectedMemberType<MEMBER>, Operation: From<Self>>>
         DifferentiableOperation<C> for ProjectedMemberOperation<MEMBER>
     {
-        fn jvp<D: DifferentiationDriver<C>>(
+        fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
             &self,
-            context: &C,
+            context: &DifferentiationContext<C, P>,
             _driver: &D,
             inputs: &[DifferentiationDual<C::Value>],
         ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
             check_count!("input", inputs, 1, ProgramError);
+            let context = context.primal();
             let primal = context.bind(self.clone(), Vec::new(), std::slice::from_ref(inputs[0].primal()))?.remove(0);
             Ok(vec![DifferentiationDual::new(primal, inputs[0].tangent().clone())?])
         }
