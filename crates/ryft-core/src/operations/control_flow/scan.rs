@@ -44,11 +44,11 @@ use crate::partial::{
 use crate::programs::{
     AtomId, CalleeRegionDriver, InputRegionProvenance, MaybeZero, Operation, OperationFormatter, OperationProjection,
     OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionInput,
-    ReferenceDischargeRegionStateInsertion, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceNewOperation, ReferenceType, ReferenceView, ReferenceViewOperation, ReferenceViewPath, RegionInterface,
-    RegionRef, RegionSlot, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value, ValueProjection,
-    ViewOverlap, ViewSymbol, ViewSymbolBinding,
+    ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion,
+    ReferenceDischargeRegionInput, ReferenceDischargeRegionOutput, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, ReferenceNewOperation, ReferenceType, ReferenceView, ReferenceViewOperation,
+    ReferenceViewPath, RegionInterface, RegionRef, RegionSlot, Type, TypeError, TypeIdentityPosition,
+    TypeIdentityRenaming, Typed, Value, ValueProjection, ViewOverlap, ViewSymbol, ViewSymbolBinding,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -1426,11 +1426,15 @@ where
         carry_known = refined;
     };
 
-    // The split runs every known iteration before any unknown one. A body whose two sides may access one reference
-    // root (a reference-typed known feeder, or a closure over a reference-typed constant such as a captured reference)
-    // would then have its accesses to that root reordered across iterations, so such a body residualizes whole instead
-    // (accesses on distinct roots may be reordered freely).
-    if partition.shares_reference_root() {
+    // The split runs every known iteration before any residual one. Ordinary partial evaluation must keep ordered
+    // work on both sides interleaved by iteration, even when those effects involve different reference roots or no
+    // references at all. Linearization deliberately separates primal execution from later tangent execution, but
+    // neither mode may split a reference root shared across the two programs. One-sided ordered effects may split
+    // because their relative execution order is unchanged.
+    let splits_ordered_effects = !context.is_linearizing()
+        && partition.known_program().effects().classes().is_ordered()
+        && partition.residual_program().effects().classes().is_ordered();
+    if splits_ordered_effects || partition.shares_reference_root() {
         return context.fold_or_residualize(O::from(scan.clone()), vec![body.to_program()], inputs);
     }
     let (known_program, residual_program, known_input_indices, residual_inputs, partition_outputs) =
@@ -1863,9 +1867,11 @@ where
 
         // A per-iteration view is region-local state inside the rebuilt body, so it must be the only handle of its
         // allocation there: another view of the same allocation must select provably different coordinates on every
-        // iteration, while a carry or a reaching capture is a complete handle that always overlaps. The paths compared
-        // are the ones the reference view analysis derives for the body's inputs, namely the empty path for a carry and
-        // the boundary view closed over the body region for a stacked operand.
+        // iteration, while a carry is a complete handle that always overlaps. The paths compared are the ones the
+        // reference view analysis derives for the body's inputs, namely the empty path for a carry and the boundary
+        // view closed over the body region for a stacked operand. Rebuilding resolves captures in the isolated region
+        // environment: inherited whole-allocation captures cannot resolve through a view-only boundary, while nested
+        // capture prefixes may bind the existing view.
         let operation = C::Operation::from(self.clone());
         let stacked_path = |position: usize| {
             let view = operation.region_input_view(0, position).ok_or_else(|| {
@@ -1909,13 +1915,6 @@ where
                     )));
                 }
             }
-            if summary.captured_allocations().any(|captured| captured == allocation) {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "operation `{name}` passes the allocation of stacked reference operand {position} into a body \
-                     that also reaches it through a capture; a per-iteration view must be the only handle of its \
-                     allocation inside the body",
-                )));
-            }
         }
 
         // An allocation the body returns is threaded even if the body never accesses it, so that a boundary the loop's fixed
@@ -1933,22 +1932,33 @@ where
             .map(|(position, allocation)| match *allocation {
                 None => ReferenceDischargeRegionInput::Value,
                 Some(allocation) if position < carry_count => ReferenceDischargeRegionInput::Allocation(allocation),
-                Some(allocation) => ReferenceDischargeRegionInput::View {
-                    allocation,
-                    publish: widening.published().contains(&allocation),
-                },
+                Some(allocation) => ReferenceDischargeRegionInput::View(allocation),
             })
             .collect::<Vec<_>>();
 
-        let boundary = ReferenceDischargeRegionBoundary::symmetric(
+        let view_outputs = body_allocations
+            .iter()
+            .enumerate()
+            .skip(carry_count)
+            .filter_map(|(position, allocation)| {
+                allocation
+                    .filter(|allocation| widening.published().contains(allocation))
+                    .map(|_| ReferenceDischargeRegionOutput::View(position))
+            })
+            .collect();
+        let state = ReferenceDischargeRegionBoundaryInsertion::new(entering.clone(), carry_count);
+        let boundary = ReferenceDischargeRegionBoundary::new(
             self,
             0,
             declared_inputs,
-            ReferenceDischargeRegionStateInsertion::new(entering.clone(), carry_count),
+            state.clone(),
+            [
+                state.into(),
+                ReferenceDischargeRegionBoundaryInsertion::new(view_outputs, driver.region(0)?.output_ids().len()),
+            ],
         );
         let result = driver.rebuild_region(context, 0, &boundary)?;
         result.validate_predicted_mutations(widening.published(), name)?;
-        result.validate_predicted_view_mutations(name)?;
         result.validate_predicted_output_allocations(summary.output_allocations(), name)?;
 
         // A carry must leave the body as the reference it entered with, or a zero-length scan would not return its
@@ -1981,7 +1991,15 @@ where
         for input in stacked_operands {
             operands.push(context.operand_value(input)?);
         }
-        let published_views = result.published_view_inputs().to_vec();
+        let published_views = boundary
+            .added_outputs()
+            .iter()
+            .flat_map(|group| group.sources())
+            .filter_map(|output| match output {
+                ReferenceDischargeRegionOutput::View(position) => Some(*position),
+                ReferenceDischargeRegionOutput::Allocation(_) => None,
+            })
+            .collect::<Vec<_>>();
         let outputs = context.parent().bind(
             self.with_added_carries(entering.len())?,
             vec![result.into_program()],
@@ -4451,6 +4469,75 @@ mod tests {
         assert_eq!(residual_scans, 1);
     }
 
+    /// Ordered effects on both sides of a partition retain their original per-iteration execution order.
+    #[test]
+    fn test_scan_partial_evaluation_preserves_order_between_known_and_unknown_effects() {
+        use crate::operations::debugging::PrintOperation;
+        use crate::partial::{PartialEvaluationOutput, PartialValue};
+        use crate::tracing::TracingContext;
+
+        let scalar = ArrayType::scalar(DataType::F64);
+        let stacked = ArrayType::new_static(DataType::F64, [2]);
+        let mut body_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let carry = body_builder.add_input(scalar.clone());
+        let item = body_builder.add_input(scalar.clone());
+        body_builder.add_instruction(PrintOperation::new("known"), Vec::new(), vec![carry], None).unwrap();
+        let printed_item =
+            body_builder.add_instruction(PrintOperation::new("unknown"), Vec::new(), vec![item], None).unwrap()[0];
+        let body = body_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![carry, printed_item], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let body_region = builder.import_region(body.entry_region_ref());
+        let initial_carry = builder.add_input(scalar.clone());
+        let items = builder.add_input(stacked.clone());
+        let outputs = builder
+            .add_instruction(TestScanOperation::new(1, 2), vec![body_region], vec![initial_carry, items], None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        // Both prints must remain in one body: splitting would print `known` twice before either `unknown`, instead
+        // of alternating them. A staging parent must receive no known-side scan or other speculative effects.
+        let outer = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let knowledge = [PartialValue::Known(outer.input(scalar)), PartialValue::Unknown(stacked.clone())];
+        let evaluation = program.partially_evaluate_in_context(&outer, &knowledge).unwrap();
+        assert!(outer.builder().borrow().instructions().is_empty());
+        assert!(matches!(
+            evaluation.outputs.as_slice(),
+            [PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Unknown(1)],
+        ));
+        assert_eq!(evaluation.program.instructions().len(), 1);
+        let scan = &evaluation.program.instructions()[0];
+        assert!(matches!(scan.operation(), ArrayOperation::Scan(_)));
+        assert_eq!(
+            evaluation.program.region_ref(scan.regions()[0]).unwrap().to_program().to_string(),
+            body.to_string()
+        );
+
+        // The same placement holds under an eager parent, so specialization cannot execute the known prints before
+        // the residual scan runs. Applying the residual program retains the original numeric outputs as well.
+        let evaluation = program
+            .partially_evaluate(&[PartialValue::Known(Array::scalar(3.0)), PartialValue::Unknown(stacked.clone())])
+            .unwrap();
+        assert!(matches!(
+            evaluation.outputs.as_slice(),
+            [PartialEvaluationOutput::Unknown(0), PartialEvaluationOutput::Unknown(1)],
+        ));
+        assert_eq!(evaluation.program.instructions().len(), 1);
+        let scan = &evaluation.program.instructions()[0];
+        assert!(matches!(scan.operation(), ArrayOperation::Scan(_)));
+        assert_eq!(
+            evaluation.program.region_ref(scan.regions()[0]).unwrap().to_program().to_string(),
+            body.to_string()
+        );
+        let items = Array::from_f64s(stacked, vec![5.0, 7.0]);
+        assert_eq!(evaluation.interpret(&EagerContext::new(), &[items.clone()]), Ok(vec![Array::scalar(3.0), items]),);
+    }
+
     /// A split scan retains an effectful unknown body as a zero-output residual scan even when every boundary result
     /// belongs to the known side.
     #[test]
@@ -4819,7 +4906,7 @@ mod tests {
             evaluation.inputs(),
             &[PartialEvaluationInput::Unknown(0), PartialEvaluationInput::Known(TestIrValue::Reference(stack.clone()))],
         );
-        assert_eq!(evaluation.residual_reference_inputs().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(evaluation.known_reference_inputs().collect::<Vec<_>>(), vec![1]);
         assert_eq!(evaluation.outputs(), &[PartialEvaluationOutput::Unknown(0)]);
         assert_eq!(
             evaluation
@@ -6793,9 +6880,8 @@ mod tests {
         assert!(matches!(
             closed.discharge_references(),
             Err(ProgramError::MalformedProgram(message))
-                if message == "operation `scan` passes the allocation of stacked reference operand 1 into a body that \
-                               also reaches it through a capture; a per-iteration view must be the only handle of its \
-                               allocation inside the body",
+                if message == "reference discharge cannot lift a constant of reference type `ref<f32[3]>`; a \
+                               reference enters a program through an input, a capture binding, or an allocation",
         ));
     }
 

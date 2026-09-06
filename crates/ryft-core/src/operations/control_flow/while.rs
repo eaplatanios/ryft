@@ -55,7 +55,7 @@ use crate::programs::{
     AtomId, CalleeRegionDriver, Concretizable, InputRegionProvenance, MaybeZero, Operation, OperationFormatter,
     OperationProjection, OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceAccessMode,
     ReferenceDischargeAllocationId, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeRegionBoundary, ReferenceDischargeRegionStateInsertion, ReferenceDischargeValue,
+    ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeValue,
     ReferenceDischargeableOperation, RegionInterface, RegionRef, RegionSlot, Type, TypeError, Typed, Value,
     ValueProjection,
 };
@@ -1032,8 +1032,12 @@ where
                 self,
                 0,
                 carries.clone(),
-                ReferenceDischargeRegionStateInsertion::new(entering.clone(), inputs.len()),
-                ReferenceDischargeRegionStateInsertion::new(condition_published.clone(), condition.output_ids().len()),
+                ReferenceDischargeRegionBoundaryInsertion::new(entering.clone(), inputs.len()),
+                [ReferenceDischargeRegionBoundaryInsertion::new(
+                    condition_published.clone(),
+                    condition.output_ids().len(),
+                )
+                .into()],
             ),
         )?;
         condition_result.validate_predicted_mutations(condition_published.as_slice(), name)?;
@@ -1044,7 +1048,7 @@ where
                 self,
                 1,
                 carries.clone(),
-                ReferenceDischargeRegionStateInsertion::new(entering.clone(), inputs.len()),
+                ReferenceDischargeRegionBoundaryInsertion::new(entering.clone(), inputs.len()),
             ),
         )?;
         body_result.validate_predicted_mutations(widening.published(), name)?;
@@ -3850,10 +3854,6 @@ mod tests {
             crate::EagerContext::<Array, Self::Operation>::new().bind(operation, driver, inputs)
         }
 
-        fn resolve(&self, value: &Array) -> crate::ValueResolution<Array> {
-            crate::ValueResolution::Constant(value.clone())
-        }
-
         fn is_eager(&self) -> bool {
             false
         }
@@ -3861,6 +3861,10 @@ mod tests {
         // This test domain executes values directly and records no instructions, so provenance is a no-op.
         fn provenance(&self) -> Provenance {
             Provenance::unknown()
+        }
+
+        fn resolve(&self, value: &Array) -> crate::ValueResolution<Array> {
+            crate::ValueResolution::Constant(value.clone())
         }
 
         fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, _origin: Provenance, function: F) -> R {
@@ -3949,10 +3953,6 @@ mod tests {
             EagerContext::<Array, Self::Operation>::new().bind(operation, driver, inputs)
         }
 
-        fn resolve(&self, value: &Array) -> crate::ValueResolution<Array> {
-            crate::ValueResolution::Constant(value.clone())
-        }
-
         fn is_eager(&self) -> bool {
             true
         }
@@ -3960,6 +3960,10 @@ mod tests {
         // This test context executes eagerly and records no instructions, so provenance is a no-op.
         fn provenance(&self) -> Provenance {
             Provenance::unknown()
+        }
+
+        fn resolve(&self, value: &Array) -> crate::ValueResolution<Array> {
+            crate::ValueResolution::Constant(value.clone())
         }
 
         fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, _origin: Provenance, function: F) -> R {

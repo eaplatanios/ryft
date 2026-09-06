@@ -12,8 +12,8 @@ use crate::arrays::types::ir::ArrayIrType;
 use crate::contexts::EagerContext;
 use crate::parameters::Parameter;
 use crate::programs::{
-    Concretizable, Operation, ProgramError, ReferenceId, ReferenceSource, ReferenceType, RegionRef, Type, TypeError,
-    TypeIdentityRenaming, Typed, Value, ValueProjection,
+    Concretizable, ProgramError, ReferenceId, ReferenceType, Type, TypeError, TypeIdentityRenaming, Typed, Value,
+    ValueProjection,
 };
 
 /// [`Value`]-level counterpart to [`ArrayIrType`] that is used by [`Program`](crate::Program)s that may contain
@@ -23,9 +23,9 @@ use crate::programs::{
 /// or dispatch to device backends.
 ///
 /// This type lets arrays, checked host-side dimensions, and array references share one storage universe, while
-/// [`ValueProjection`] lets homogeneous [`Operation`] machinery borrow or consume only the member it understands.
-/// Reference operations remain composite-native because their signatures cross member kinds. Ordinary numeric
-/// operations still project only the array member.
+/// [`ValueProjection`] lets homogeneous [`Operation`](crate::Operation) machinery borrow or consume only the member
+/// it understands. Reference operations remain composite-native because their signatures cross member kinds. Ordinary
+/// numeric operations still project only the array member.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum ArrayIrValue<A: Value<Type = ArrayType>> {
     /// Ordinary backend [`ArrayType`]-typed [`Value`].
@@ -73,8 +73,6 @@ impl<A: Value<Type = ArrayType>> Typed for ArrayIrValue<A> {
 }
 
 impl<A: Value<Type = ArrayType>> Value for ArrayIrValue<A> {
-    const VALIDATES_EAGER_INTERPRETATION: bool = true;
-
     type DispatchDomain = EagerContext<Self>;
     type ExecutionDomain = EagerContext<Self, ArrayIrOperation<A>>;
 
@@ -113,26 +111,6 @@ impl<A: Value<Type = ArrayType>> Value for ArrayIrValue<A> {
                 ))
             }
         }
-    }
-
-    fn validate_eager_interpretation<V: Value<Type = Self::Type>, O: Operation<Type = Self::Type>>(
-        region: RegionRef<'_, V, O>,
-    ) -> Result<(), ProgramError> {
-        // Generic program interpretation has no external-holder binding table. Stateful compilation domains provide
-        // that boundary. This eager path deliberately keeps the capture count at zero and reports the flat input.
-        // Region-internal reference behavior needs no static boundary check here as the eager runtime holders enforce
-        // lifetime rules at every access, and staged consumers validate through discharge instead.
-        for (input_index, input) in region.input_ids().iter().copied().enumerate() {
-            if region.atoms()[input.index()].r#type().is_reference() {
-                return Err(ProgramError::UnsupportedOperation {
-                    message: format!(
-                        "program replay cannot bind external reference `{}`; use a stateful compilation domain",
-                        ReferenceSource::from_flat_input_index(input_index, 0),
-                    ),
-                });
-            }
-        }
-        Ok(())
     }
 
     #[inline]
@@ -409,18 +387,22 @@ mod tests {
             )
         };
         assert_eq!(RegionArena::from_regions(vec![reference_region()]).map(|_| ()), expected_error);
-        type TestValue = ArrayIrValue<Array>;
-        type TestProgram = Program<TestValue, ArrayIrOperation<Array>, Vec<TestValue>, Vec<TestValue>>;
         assert_eq!(
-            TestProgram::new(Vec::new(), Vec::new(), vec![reference_region()], RegionId::new(0)).map(|_| ()),
+            Program::<
+                ArrayIrValue<Array>,
+                ArrayIrOperation<Array>,
+                Vec<ArrayIrValue<Array>>,
+                Vec<ArrayIrValue<Array>>,
+            >::new(Vec::new(), Vec::new(), vec![reference_region()], RegionId::new(0))
+            .map(|_| ()),
             expected_error,
         );
 
         // Sealing is the backstop that covers every construction path, but a trace reports the same rejection at the
         // lift that attempted the storage, while the call that caused it is still on the stack.
         assert_eq!(
-            TracingContext::<TestValue, ArrayIrOperation<Array>>::trace(
-                |input: Tracer<TracingContext<TestValue, ArrayIrOperation<Array>>>| {
+            TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+                |input: Tracer<TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>| {
                     let context = input.context().clone();
                     context.lift(ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32))))
                 },

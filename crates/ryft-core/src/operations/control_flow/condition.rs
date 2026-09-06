@@ -429,10 +429,9 @@ where
     let true_partition = driver.partition_program(true_branch, input_known.as_slice())?;
     let false_partition = driver.partition_program(false_branch, input_known.as_slice())?;
 
-    // The split runs the known condition before the residual one. A branch whose two sides may access one reference
-    // root (a reference-typed known feeder, or a closure over a reference-typed constant) would have the residual side
-    // observe that root after the known side's later accesses instead of in program order, and a reference-typed
-    // feeder also has no typed zero for the other branch's edge slot, so the condition residualizes whole instead.
+    // In addition to the ordered-effect guard, reject reference-typed known feeders and executable reference
+    // constants. A reference feeder has no typed zero for the other branch's edge slot, and splitting branches must
+    // not expose a reference through either an edge or a captured constant without accounting for its identity.
     if true_partition.shares_reference_root() || false_partition.shares_reference_root() {
         return context.fold_or_residualize(
             O::from(condition.clone()),
@@ -2007,7 +2006,7 @@ mod tests {
             .unwrap();
         assert!(outer.builder().borrow().instructions().is_empty());
         assert!(matches!(evaluation.outputs(), [PartialEvaluationOutput::Unknown(0)]));
-        assert_eq!(evaluation.residual_reference_inputs().collect::<Vec<_>>(), vec![2]);
+        assert_eq!(evaluation.known_reference_inputs().collect::<Vec<_>>(), vec![2]);
         assert_eq!(
             evaluation
                 .program()

@@ -77,7 +77,7 @@ use crate::programs::{
     Atom, AtomId, EffectClass, EffectClasses, InputRegionProvenance, InstructionId, Operation, OperationFormatter,
     OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceAccessMode, ReferenceAnalysis,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary,
-    ReferenceDischargeRegionStateInsertion, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceRoot,
+    ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceRoot,
     Region, RegionId, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueId,
 };
 use crate::tracing::{DomainTracer, Trace, TracingContext};
@@ -495,8 +495,8 @@ where
                 self,
                 index,
                 declared_input_allocations,
-                ReferenceDischargeRegionStateInsertion::new(Vec::new(), region.input_ids().len()),
-                ReferenceDischargeRegionStateInsertion::new(Vec::new(), region.output_ids().len()),
+                ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), region.input_ids().len()),
+                [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), region.output_ids().len())],
             );
             let result = driver.rebuild_region(context, index, &boundary)?;
             result.validate_predicted_mutations(&[], name)?;
