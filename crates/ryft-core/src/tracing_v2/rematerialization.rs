@@ -88,7 +88,7 @@ pub const REMATERIALIZE_OPERATION_NAME: &str = "rematerialize";
 /// Higher-order operation used by checkpointing/rematerialization.
 ///
 /// [`RematerializeOperation`] has the same primal/forward/backward structure as
-/// [`CustomVjpOperation`](crate::differentiation::CustomVjpOperation), but it also carries
+/// [`CustomVjpOperation`](crate::operations::CustomVjpOperation), but it also carries
 /// a derived tangent program. That extra program is not user-authored custom-VJP state: it is produced by
 /// [`Rematerialize`] so forward-mode differentiation can replay the rematerialized pushforward while reverse mode
 /// replays the rematerialized pullback.
@@ -554,7 +554,7 @@ where
         // Replay the forward region on the dual primals, recovering the primal outputs followed by the forward tail
         // (region inputs plus policy-saved residuals) that the tangent region consumes.
         let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let mut forward_outputs = forward_region.interpret_in_context(context, primal_operands, None)?;
+        let mut forward_outputs = forward_region.interpret_in_context(context, primal_operands)?;
         if forward_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "{} forward region produced {} outputs which is fewer than its {} primal output(s)",
@@ -601,7 +601,7 @@ where
             )?);
         }
 
-        let tangent_outputs = tangent_region.interpret_in_context(context, tangent_operands, None)?;
+        let tangent_outputs = tangent_region.interpret_in_context(context, tangent_operands)?;
         check_count!("output", tangent_outputs, output_count, ProgramError);
 
         Ok(primal_outputs
@@ -2713,12 +2713,13 @@ mod tests {
         CotangentDestination, CotangentSeed, Differentiate, ForwardModeDifferentiate, ReverseModeDifferentiate,
         differentiate_at,
     };
-    use crate::operations::{Cos, Dot, DotDimensionNumbers, MulOperation, ScanOperation, Sin, Tag};
-    use crate::partial::{PartialEvaluationOutput, PartialValue};
-    use crate::programs::{
-        Effects, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
-        ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceType, RegionRole,
+    use crate::operations::{
+        Cos, Dot, DotDimensionNumbers, MulOperation, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze,
+        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
+        ScanOperation, Sin, Tag,
     };
+    use crate::partial::{PartialEvaluationOutput, PartialValue};
+    use crate::programs::{Effects, ReferenceType, RegionRole};
     use crate::tests::TestOrderedStateOperation;
 
     use super::*;
@@ -3344,7 +3345,7 @@ mod tests {
 
     #[test]
     fn test_rematerialization_preserves_custom_vjp_semantics_and_keeps_the_boundary_opaque() {
-        use crate::differentiation::custom_vjp;
+        use crate::operations::custom_vjp;
 
         // The custom backward rule triples the true gradient (expressed through addition to avoid constant lifting),
         // so a matching gradient proves the user-authored rule — not the true derivative — governs reverse mode
@@ -5288,7 +5289,7 @@ mod tests {
 
     #[test]
     fn test_custom_vjp_residual_candidates_expose_the_replayed_forward_producer() {
-        use crate::differentiation::custom_vjp;
+        use crate::operations::custom_vjp;
 
         // Phase 0 boundary pin: the custom-VJP *forward* program is replayed through the linearization, so the
         // declared residual's producing instruction is the replayed internal `cos` — not the opaque call — while the
