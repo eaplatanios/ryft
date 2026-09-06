@@ -29,12 +29,12 @@ pub enum EffectClass {
 
     /// Observable access to mutable state whose execution order relative to other [`OrderedState`](Self::OrderedState)
     /// effects on the same state is observable and must be preserved. This effect _orders_ and does not gate
-    /// transforms. Partial evaluation, linearization, and differentiation place stateful operations by the ordered
-    /// effect frontier documented in [`partial`](crate::partial) instead of rejecting them, while dead-code elimination
-    /// keeps them alive unless the only state behavior of the instruction is a reference allocation that nothing
-    /// accesses (refer to [`ReferenceEffect::Allocate`]). Stateful operations must still be either discharged before
-    /// stateless lowering or handled by a state-aware backend. Structured reference effects derive this class through
-    /// [`Effects::classes`]; an operation lists it explicitly only for opaque state with no structured
+    /// transforms. Partial evaluation, linearization, and differentiation place stateful operations according to the
+    /// effect ordering rules documented in [`partial`](crate::partial) instead of rejecting them, while dead-code
+    /// elimination keeps them alive unless the only state behavior of the instruction is a reference allocation that
+    /// nothing accesses (refer to [`ReferenceEffect::Allocate`]). Stateful operations must still be either discharged
+    /// before stateless lowering or handled by a state-aware backend. Structured reference effects derive this class
+    /// through [`Effects::classes`]; an operation lists it explicitly only for opaque state with no structured
     /// reference description, and generic consumers must not infer a particular state representation from the class.
     /// Keeping state distinct from I/O also prevents generic transforms from treating mutation like an external I/O
     /// effect.

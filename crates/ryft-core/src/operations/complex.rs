@@ -93,8 +93,8 @@ impl_differentiable_operation! {
                 (real_tangent, imaginary_tangent) => MaybeZero::Value(
                     real_tangent
                         .clone()
-                        .materialize(context)?
-                        .complex(&imaginary_tangent.clone().materialize(context)?)?,
+                        .materialize(context.tangent())?
+                        .complex(&imaginary_tangent.clone().materialize(context.tangent())?)?,
                 ),
             };
             Ok(vec![DifferentiationDual::new(primal, tangent)?])

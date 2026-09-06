@@ -200,8 +200,8 @@ pub use programs::{
     RegionWithMetadata, ReplayRegionDriver, TakenReferenceGuard, Transform, TransformArtifact, TransformCache, Type,
     TypeError, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature, TypeRefinements, Typed,
     ValidatedPendingReplacementTransaction, Value, ValueId, ValueProjection, ViewOverlap, ViewSymbol,
-    ViewSymbolBinding, batch_reference_view_operation, discharge_positional_region_operation,
-    discharge_reference_free_operation, infer_projected_operation_output_types,
+    ViewSymbolBinding, batch_reference_view_operation, discharge_local_reference_operation,
+    discharge_positional_region_operation, discharge_reference_free_operation, infer_projected_operation_output_types,
     infer_projected_operation_region_input_types, validate_reference_boundary,
 };
 pub use specialization::{

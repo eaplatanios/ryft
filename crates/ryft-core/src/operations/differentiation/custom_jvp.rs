@@ -9,19 +9,19 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    ResidualZeroProvider,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, ResidualZeroProvider, interpret_partitioned_jvp,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{
-    check_count, check_types, impl_non_transposable_operation, impl_reference_free_dischargeable_operation,
-};
+use crate::macros::{check_count, check_types, impl_non_transposable_operation};
 use crate::operations::constants::zero::Zero;
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     InputRegionProvenance, Operation, OperationFormatter, OutputRegionProvenance, Program, ProgramError,
-    RegionInterface, RegionSlot, TypeError, Value,
+    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, RegionInterface, RegionSlot, TypeError, Value,
+    discharge_local_reference_operation,
 };
 use crate::tracing::{DomainTracer, Trace};
 
@@ -272,11 +272,22 @@ where
     // differentiation.
 }
 
-// A custom JVP replays verbatim. Its regions may thread a plumbing reference operand as state, but discharging that
-// state would have to rewrite the dormant `jvp` rule region's boundary in a way the user-supplied rule does not
-// define, so the shared reference-free rule copies both regions across unchanged and rejects the application by name
-// if a reference reaches either closure. Plumbing references are therefore an eager-execution feature for now.
-impl_reference_free_dischargeable_operation!(<T> CustomJvpOperation<T> where T: DifferentiableType);
+// Local reference lifecycles discharge inside each region while all user-declared numeric boundaries stay intact.
+// External reference operands still require explicit state threading that these derivative interfaces do not supply.
+impl<C: Context<Type: DifferentiableType>, P: ReferenceDischargePolicy<C>> ReferenceDischargeableOperation<C, P>
+    for CustomJvpOperation<C::Type>
+where
+    C::Operation: From<CustomJvpOperation<C::Type>>,
+{
+    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
+        &self,
+        context: &ReferenceDischargeContext<C, P>,
+        driver: &D,
+        inputs: &[ReferenceDischargeValue<C, P>],
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        discharge_local_reference_operation(self, context, driver, inputs)
+    }
+}
 
 impl<T: DifferentiableType, C: Context<Type = T>, P: BatchingPolicy<C>> BatchableOperation<C, P>
     for CustomJvpOperation<T>
@@ -384,9 +395,9 @@ impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperat
 where
     C::Operation: ResidualZeroProvider<C::Type>,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -409,7 +420,7 @@ where
         validate_custom_derivative_replay(
             CUSTOM_JVP_OPERATION_NAME,
             self.non_differentiated_count,
-            context,
+            context.primal(),
             inputs,
             &output_types[..output_count],
         )?;
@@ -423,21 +434,29 @@ where
         // structural zeros against their own primal, which names every runtime quantity a reference-bearing tangent
         // type omits; static inputs keep the nullary zero.
         for input in differentiated_inputs {
+            let source = context.primal_to_tangent(input.primal().clone())?;
             jvp_inputs.push(C::Operation::materialize_zero_from_residual_sources(
-                context,
+                context.tangent(),
                 input.tangent().clone(),
-                std::iter::once(input.primal()),
+                std::iter::once(&source),
             )?);
         }
 
-        let mut outputs = jvp_region.interpret_in_context(context, jvp_inputs)?;
+        let mut outputs = if std::ptr::eq(context.primal(), context.tangent()) {
+            jvp_region.interpret_in_context(context.primal(), jvp_inputs)?
+        } else {
+            let mut known = vec![true; inputs.len()];
+            known.resize(jvp_inputs.len(), false);
+            let partition = driver.partition_jvp_program(jvp_region, &known, &(0..output_count).collect::<Vec<_>>())?;
+            interpret_partitioned_jvp(context, &partition, &jvp_inputs, output_count)?
+        };
         check_count!("output", outputs, 2 * output_count, ProgramError);
         let tangents = outputs.split_off(output_count);
-        Ok(outputs
+        outputs
             .into_iter()
             .zip(tangents)
             .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
-            .collect::<Result<Vec<_>, _>>()?)
+            .collect::<Result<Vec<_>, _>>()
     }
 }
 
@@ -670,7 +689,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayBatch, ArrayBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference,
-        ArrayType, DataType, Dimension, Shape, ShardingDimension,
+        ArrayReferenceDischarge, ArrayType, DataType, Dimension, Shape, ShardingDimension,
     };
     use crate::axes::AxisIndexOperation;
     use crate::batching::{
@@ -678,15 +697,22 @@ mod tests {
     };
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::{Differentiate, ForwardModeDifferentiate, LinearizationTracer};
+    use crate::operations::compare::{CompareOperation, ComparisonDirection};
+    use crate::operations::control_flow::condition::ConditionOperation;
+    use crate::operations::control_flow::scan::ScanOperation;
     use crate::operations::differentiation::tests::{
         ReferenceRuleDifferentiationDriver, array_ir_identity_program, nested_custom_derivative_state_program,
     };
     use crate::operations::dot::{Dot, DotDimensionNumbers};
+    use crate::operations::math::add::AddOperation;
     use crate::operations::math::cos::{Cos, CosOperation};
     use crate::operations::math::mul::MulOperation;
-    use crate::operations::math::reduce::{Reduce, ReductionKind};
+    use crate::operations::math::reduce::{Reduce, ReduceOperation, ReductionKind};
     use crate::operations::math::sin::{Sin, SinOperation};
-    use crate::operations::references::{ReferenceAddUpdate, ReferenceAddUpdateOperation};
+    use crate::operations::references::{
+        ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
+        ReferenceReadOperation,
+    };
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::{
@@ -697,6 +723,40 @@ mod tests {
 
     /// Eager composite context whose values may be arrays or references.
     type ArrayIrContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+    /// Builds square and its fused rule, with a tangent accumulator allocated before the required primal output.
+    /// The coefficient is pure known work even though the accumulator must be fresh for every pushforward call.
+    fn stateful_square_regions(consume: bool) -> Vec<FlatProgram<ArrayIrContext>> {
+        let scalar: ArrayIrType = ArrayType::scalar(DataType::F32).into();
+        let mut primal = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = primal.add_input(scalar.clone());
+        let output = primal
+            .add_instruction(ArrayOperation::Mul(MulOperation::new()), Vec::new(), vec![input, input], None)
+            .unwrap()[0];
+        let primal = primal.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let mut rule = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = rule.add_input(scalar.clone());
+        let tangent = rule.add_input(scalar);
+        let coefficient = rule.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
+        let zero = rule.add_constant(ArrayIrValue::Array(Array::scalar(0.0_f32)));
+        let accumulator = rule.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![zero], None).unwrap()[0];
+        let update = rule
+            .add_instruction(ArrayOperation::Mul(MulOperation::new()), Vec::new(), vec![coefficient, tangent], None)
+            .unwrap()[0];
+        rule.add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![accumulator, update], None)
+            .unwrap();
+        let read = if consume {
+            ArrayIrOperation::from(ReferenceFreezeOperation::new())
+        } else {
+            ArrayIrOperation::from(ReferenceReadOperation::new())
+        };
+        let derivative = rule.add_instruction(read, Vec::new(), vec![accumulator], None).unwrap()[0];
+        let output = rule
+            .add_instruction(ArrayOperation::Mul(MulOperation::new()), Vec::new(), vec![input, input], None)
+            .unwrap()[0];
+        let rule = rule.build(vec![output, derivative], vec![Placeholder; 2], vec![Placeholder; 2]).unwrap();
+        vec![primal, rule]
+    }
 
     /// Builds the plumbing-reference primal `f(counters..., x) = { counters += x; x }` and the JVP rule
     /// `jvp(counters..., x, ẋ) = { counters += x; (x, ẋ) }` over `counter_count` leading `ref<f32[]>` counters and
@@ -1131,6 +1191,155 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_jvp_linearization_keeps_tangent_state_fresh_and_hoists_coefficients() {
+        for (consume, endpoint) in [(false, "reference_read"), (true, "reference_freeze")] {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
+            let regions =
+                stateful_square_regions(consume).into_iter().map(|region| builder.import_program(region)).collect();
+            let output = builder.add_instruction(CustomJvpOperation::new(), regions, vec![input], None).unwrap()[0];
+            let program = builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![output],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            // Dormant rule state is normalized before lowering while the declared JVP remains attached and active.
+            let discharged = program
+                .clone()
+                .discharge_references::<ArrayReferenceDischarge>(0)
+                .unwrap()
+                .into_program_without_external_references()
+                .unwrap();
+            assert_eq!(discharged.instructions()[0].regions().len(), 2);
+            assert!(!discharged.entry_region_ref().contains_references_in_closure());
+            assert_eq!(
+                discharged.interpret(vec![ArrayIrValue::Array(Array::scalar(3.0_f32))]),
+                Ok(vec![ArrayIrValue::Array(Array::scalar(9.0_f32))])
+            );
+            assert_eq!(
+                discharged.jvp().unwrap().interpret(vec![
+                    ArrayIrValue::Array(Array::scalar(3.0_f32)),
+                    ArrayIrValue::Array(Array::scalar(1.0_f32)),
+                ]),
+                Ok(vec![ArrayIrValue::Array(Array::scalar(9.0_f32)), ArrayIrValue::Array(Array::scalar(6.0_f32))])
+            );
+            let linearization = program.linearize().unwrap();
+            assert_eq!(linearization.residual_count(), 1);
+            assert_eq!(
+                linearization
+                    .primal()
+                    .instructions()
+                    .iter()
+                    .map(|instruction| instruction.operation().name())
+                    .collect::<Vec<_>>(),
+                vec!["mul", "add"]
+            );
+            assert_eq!(
+                linearization
+                    .tangent()
+                    .instructions()
+                    .iter()
+                    .map(|instruction| instruction.operation().name())
+                    .collect::<Vec<_>>(),
+                vec!["reference_new", "mul", "reference_add_update", endpoint]
+            );
+            let primals = linearization.primal().interpret(vec![ArrayIrValue::Array(Array::scalar(3.0_f32))]).unwrap();
+            assert_eq!(
+                primals,
+                vec![ArrayIrValue::Array(Array::scalar(9.0_f32)), ArrayIrValue::Array(Array::scalar(6.0_f32))]
+            );
+            for (tangent, expected) in [(2.0_f32, 12.0_f32), (5.0, 30.0), (2.0, 12.0)] {
+                assert_eq!(
+                    linearization
+                        .tangent()
+                        .interpret(vec![ArrayIrValue::Array(Array::scalar(tangent)), primals[1].clone()]),
+                    Ok(vec![ArrayIrValue::Array(Array::scalar(expected))])
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_custom_jvp_linearization_partitions_a_fused_stateful_scan() {
+        let vector: ArrayIrType = ArrayType::new_static(DataType::F32, [3]).into();
+        let regions = stateful_square_regions(false)
+            .into_iter()
+            .map(|body| {
+                let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+                let inputs = (0..body.input_ids().len()).map(|_| builder.add_input(vector.clone())).collect::<Vec<_>>();
+                let body = builder.import_program(body);
+                let outputs = builder
+                    .add_instruction(ScanOperation::new(0, 3), vec![body], inputs.clone(), None)
+                    .unwrap()
+                    .to_vec();
+                let output_count = outputs.len();
+                builder
+                    .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                        outputs,
+                        vec![Placeholder; inputs.len()],
+                        vec![Placeholder; output_count],
+                    )
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(vector);
+        let regions = regions.into_iter().map(|region| builder.import_program(region)).collect();
+        let output = builder.add_instruction(CustomJvpOperation::new(), regions, vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 1);
+        let primal_operations = linearization
+            .primal()
+            .entry_region_ref()
+            .computation_regions()
+            .flat_map(|region| region.instructions().iter().map(|instruction| instruction.operation().name()))
+            .collect::<Vec<_>>();
+        let tangent_operations = linearization
+            .tangent()
+            .entry_region_ref()
+            .computation_regions()
+            .flat_map(|region| region.instructions().iter().map(|instruction| instruction.operation().name()))
+            .collect::<Vec<_>>();
+        let primals = linearization
+            .primal()
+            .interpret(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]))])
+            .unwrap();
+        assert_eq!(
+            primals,
+            vec![
+                ArrayIrValue::Array(Array::vector(vec![1.0_f32, 4.0, 9.0])),
+                ArrayIrValue::Array(Array::vector(vec![2.0_f32, 4.0, 6.0]))
+            ]
+        );
+        for (tangent, expected) in [(2.0_f32, [4.0_f32, 8.0, 12.0]), (5.0, [10.0, 20.0, 30.0]), (2.0, [4.0, 8.0, 12.0])]
+        {
+            assert_eq!(
+                linearization
+                    .tangent()
+                    .interpret(vec![ArrayIrValue::Array(Array::vector(vec![tangent; 3])), primals[1].clone()]),
+                Ok(vec![ArrayIrValue::Array(Array::vector(expected.to_vec()))])
+            );
+        }
+        assert_eq!(
+            primal_operations,
+            vec!["scan", "mul", "add"],
+            "primal: {}\ntangent: {}",
+            linearization.primal(),
+            linearization.tangent()
+        );
+        assert_eq!(tangent_operations, vec!["scan", "reference_new", "mul", "reference_add_update", "reference_read"]);
+    }
+
+    #[test]
     fn test_custom_jvp_rejects_known_tangent_outputs() {
         let r#type = test_type(&[]);
         let operation = ArrayOperation::CustomJvp(CustomJvpOperation::new());
@@ -1167,6 +1376,156 @@ mod tests {
             result,
             Err(DifferentiationError::Program(ProgramError::MalformedProgram(message))) if message == expected,
         ));
+    }
+
+    #[test]
+    fn test_custom_jvp_linearization_preserves_nested_aliased_reference_carries() {
+        for scanned_view in [false, true] {
+            let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+            let referent_type =
+                if scanned_view { ArrayType::new_static(DataType::F32, [2]) } else { ArrayType::scalar(DataType::F32) };
+            let reference_type = ArrayIrType::Reference(ReferenceType::new(referent_type));
+            let initial = if scanned_view { Array::vector(vec![0.0_f32; 2]) } else { Array::scalar(0.0_f32) };
+            let expected_state = if scanned_view { Array::vector(vec![3.0_f32; 2]) } else { Array::scalar(6.0_f32) };
+            let mut branch = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let reference = branch.add_input(reference_type.clone());
+            let branch = branch
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![reference],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+
+            // The body receives the same allocation through a known carry and an unknown formal. The latter is
+            // either another carry or a per-iteration scalar view of the stacked reference. Each iteration writes
+            // through the unknown formal, then reads through the known formal.
+            let mut body = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let known_reference = body.add_input(reference_type.clone());
+            let increment = body.add_input(scalar_type.clone());
+            let unknown_reference =
+                body.add_input(ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+            body.add_instruction(
+                ReferenceAddUpdateOperation::new(),
+                Vec::new(),
+                vec![unknown_reference, increment],
+                None,
+            )
+            .unwrap();
+            let read = body
+                .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![known_reference], None)
+                .unwrap()[0];
+            let read = if scanned_view {
+                body.add_instruction(
+                    ArrayOperation::Reduce(ReduceOperation::new(vec![0], ReductionKind::Sum)),
+                    Vec::new(),
+                    vec![read],
+                    None,
+                )
+                .unwrap()[0]
+            } else {
+                read
+            };
+            let body_outputs =
+                if scanned_view { vec![known_reference, read] } else { vec![known_reference, read, unknown_reference] };
+            let carry_count = body_outputs.len();
+            let body = body
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    body_outputs,
+                    vec![Placeholder; 3],
+                    vec![Placeholder; carry_count],
+                )
+                .unwrap();
+
+            let mut rule = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let reference = rule.add_input(reference_type.clone());
+            let primal = rule.add_input(scalar_type.clone());
+            let tangent = rule.add_input(scalar_type.clone());
+            let zero = rule.add_constant(ArrayIrValue::Array(Array::scalar(0.0_f32)));
+            let predicate = rule
+                .add_instruction(
+                    ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::GreaterThan)),
+                    Vec::new(),
+                    vec![tangent, zero],
+                    None,
+                )
+                .unwrap()[0];
+            let branch = rule.import_program(branch);
+            let alias = rule
+                .add_instruction(ConditionOperation::new(), vec![branch, branch], vec![predicate, reference], None)
+                .unwrap()[0];
+            let body = rule.import_program(body);
+            let outputs = rule
+                .add_instruction(ScanOperation::new(carry_count, 2), vec![body], vec![reference, tangent, alias], None)
+                .unwrap()
+                .to_vec();
+            let rule = rule
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![primal, outputs[1]],
+                    vec![Placeholder; 3],
+                    vec![Placeholder; 2],
+                )
+                .unwrap();
+            let reference = ArrayReference::new(initial.clone());
+            assert_eq!(
+                rule.interpret(vec![
+                    ArrayIrValue::Reference(reference.clone()),
+                    ArrayIrValue::Array(Array::scalar(1.0_f32)),
+                    ArrayIrValue::Array(Array::scalar(3.0_f32)),
+                ]),
+                Ok(vec![ArrayIrValue::Array(Array::scalar(1.0_f32)), ArrayIrValue::Array(Array::scalar(6.0_f32))])
+            );
+            assert_eq!(reference.read(), Ok(expected_state.clone()));
+
+            // The condition's predicate is tangent-dependent, making its forwarded reference unknown even though
+            // canonical provenance still ties it to the known reference. Nested partitioning must retain that alias.
+            let mut primal = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            primal.add_input(reference_type.clone());
+            let input = primal.add_input(scalar_type.clone());
+            let primal = primal
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![input],
+                    vec![Placeholder; 2],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let reference_input = builder.add_input(reference_type);
+            let input = builder.add_input(scalar_type);
+            let regions = vec![builder.import_program(primal), builder.import_program(rule)];
+            let output = builder
+                .add_instruction(
+                    CustomJvpOperation::new().with_non_differentiated_count(1),
+                    regions,
+                    vec![reference_input, input],
+                    None,
+                )
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![output],
+                    vec![Placeholder; 2],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            let linearization = program.entry_region_ref().linearize_with_activity(&[false, true]).unwrap();
+            let reference = ArrayReference::new(initial.clone());
+            let mut primals = linearization
+                .primal()
+                .interpret(vec![
+                    ArrayIrValue::Reference(reference.clone()),
+                    ArrayIrValue::Array(Array::scalar(1.0_f32)),
+                ])
+                .unwrap();
+            assert_eq!(primals.remove(0), ArrayIrValue::Array(Array::scalar(1.0_f32)));
+            let mut tangents = vec![ArrayIrValue::Array(Array::scalar(3.0_f32))];
+            tangents.extend(primals);
+            assert_eq!(
+                linearization.tangent().interpret(tangents),
+                Ok(vec![ArrayIrValue::Array(Array::scalar(6.0_f32))])
+            );
+            assert_eq!(reference.read(), Ok(expected_state.clone()));
+        }
     }
 
     #[test]
@@ -1245,7 +1604,7 @@ mod tests {
         assert!(jvp.entry_region_ref().contains_effect_in_closure(EffectClass::OrderedState));
         let driver = ReferenceRuleDifferentiationDriver { programs: vec![primal, jvp] };
         let outputs = CustomJvpOperation::<ArrayIrType>::new()
-            .jvp(&context, &driver, std::slice::from_ref(&input))
+            .jvp(&DifferentiationContext::new(context.clone()), &driver, std::slice::from_ref(&input))
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].primal(), &ArrayIrValue::Array(Array::scalar(1.0_f32)));
@@ -1275,7 +1634,7 @@ mod tests {
             )
             .unwrap(),
         ];
-        let outputs = operation.jvp(&context, &driver, &inputs).unwrap();
+        let outputs = operation.jvp(&DifferentiationContext::new(context.clone()), &driver, &inputs).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].primal(), &ArrayIrValue::Array(Array::scalar(3.0_f32)));
         assert!(matches!(outputs[0].tangent(), MaybeZero::Value(ArrayIrValue::Array(tangent))
@@ -1294,7 +1653,7 @@ mod tests {
         assert!(matches!(
             CustomJvpOperation::<ArrayIrType>::new()
                 .with_non_differentiated_count(2)
-                .jvp(&context, &aliasing_driver, &aliased),
+                .jvp(&DifferentiationContext::new(context.clone()), &aliasing_driver, &aliased),
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
                 if message == "input 1 and input 0 bind the same reference allocation",
         ));
@@ -1302,7 +1661,7 @@ mod tests {
 
         // The same operand in the differentiated segment is rejected by the replayed rule as well.
         assert!(matches!(
-            CustomJvpOperation::<ArrayIrType>::new().jvp(&context, &driver, &inputs),
+            CustomJvpOperation::<ArrayIrType>::new().jvp(&DifferentiationContext::new(context.clone()), &driver, &inputs),
             Err(DifferentiationError::Program(ProgramError::Type(error)))
                 if error == TypeError::invalid(
                     "custom_jvp accepts reference inputs only in its leading non-differentiated segment; move input \

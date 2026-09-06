@@ -8,7 +8,7 @@ use crate::batching::{
     InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationError};
+use crate::differentiation::{DifferentiableType, DifferentiationDual};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::impl_differentiable_operation;
 use crate::operations::constants::iota::IotaOperation;
@@ -270,24 +270,35 @@ impl_differentiable_operation! {
         C::Operation: From<SortOperation>,
     {
         |operation, context, _driver, inputs| {
-            // Forward-mode rule for [`SortOperation`]: sorting co-permutes every non-key operand by the keys'
-            // lexicographic order, so the live tangents ride one staged sort as extra passenger operands after the
-            // primals — the first half of the outputs are the primal outputs and the rest are the co-permuted tangents
-            // (the same trick JAX's sort JVP uses). The staged sort carries the original `key_count`, and because the
-            // tangents append after every primal operand they always land in the passenger positions. Structural-zero
-            // tangents stay symbolic because any permutation of zeros is zero.
-            let mut operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            // Sort the primals in primal execution. Tangent execution sorts the transferred keys together with
+            // the live tangents as passengers, preserving the same permutation. Structural-zero tangents remain
+            // symbolic because every permutation of zeros is zero.
+            let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            let shared = std::ptr::eq(context.primal(), context.tangent());
+            let mut outputs = if shared { Vec::new() } else {
+                context.primal().bind(*operation, Vec::new(), primal_inputs.as_slice())?
+            };
             let live_indices = inputs
                 .iter()
                 .enumerate()
                 .filter_map(|(index, input)| input.tangent().as_value().map(|tangent| (index, tangent.clone())))
                 .collect::<Vec<_>>();
-            operands.extend(live_indices.iter().map(|(_, tangent)| tangent.clone()));
-            let mut outputs = context.bind(*operation, Vec::new(), operands.as_slice())?;
-            let output_tangents = outputs.split_off(inputs.len());
             let mut tangent_by_output = vec![None; inputs.len()];
-            for ((index, _), tangent) in live_indices.iter().zip(output_tangents) {
-                tangent_by_output[*index] = Some(tangent);
+            if !live_indices.is_empty() {
+                let mut operands = primal_inputs.into_iter()
+                    .map(|value| context.primal_to_tangent(value)).collect::<Result<Vec<_>, _>>()?;
+                operands.extend(live_indices.iter().map(|(_, tangent)| tangent.clone()));
+                let mut tangent_outputs = context.tangent().bind(*operation, Vec::new(), operands.as_slice())?;
+                let output_tangents = tangent_outputs.split_off(inputs.len());
+                if shared {
+                    outputs = tangent_outputs;
+                }
+                for ((index, _), tangent) in live_indices.iter().zip(output_tangents) {
+                    tangent_by_output[*index] = Some(tangent);
+                }
+            }
+            if shared && live_indices.is_empty() {
+                outputs = context.primal().bind(*operation, Vec::new(), &inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>())?;
             }
             outputs
                 .into_iter()
@@ -297,7 +308,7 @@ impl_differentiable_operation! {
                         Some(tangent) => MaybeZero::Value(tangent),
                         None => MaybeZero::Zero(primal.r#type().tangent()?),
                     };
-                    DifferentiationDual::new(primal, tangent).map_err(DifferentiationError::from)
+                    DifferentiationDual::new(primal, tangent)
                 })
                 .collect()
         }

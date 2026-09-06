@@ -7,8 +7,9 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, ResidualZeroProvider, TransposableOperation, TranspositionContext,
+    TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -155,28 +156,32 @@ where
     // the previous tangent contents. A plumbing reference returns its previous value with a symbolic zero tangent. The
     // tangent pairing is resolved before either swap so that a rejected plumbing store leaves both references
     // untouched.
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
         let stored = stored_tangents(REFERENCE_SWAP_OPERATION_NAME, &inputs[0], &inputs[1])?;
         let previous = context
+            .primal()
             .bind(*self, Vec::new(), &[inputs[0].primal().clone(), inputs[1].primal().clone()])?
             .remove(0);
         Ok(vec![match stored {
             Some((tangent_reference, tangent)) => {
                 // A zero replacement tangent is instantiated because the tangent reference must observe the store.
+                let source = context.primal_to_tangent(inputs[1].primal().clone())?;
                 let tangent = C::Operation::materialize_zero_from_residual_sources(
-                    context,
+                    context.tangent(),
                     tangent,
-                    std::iter::once(inputs[1].primal()),
+                    std::iter::once(&source),
                 )?;
                 DifferentiationDual::new(
                     previous,
-                    MaybeZero::Value(context.bind(*self, Vec::new(), &[tangent_reference.clone(), tangent])?.remove(0)),
+                    MaybeZero::Value(
+                        context.tangent().bind(*self, Vec::new(), &[tangent_reference.clone(), tangent])?.remove(0),
+                    ),
                 )?
             }
             None => DifferentiationDual::new_with_zero_tangent(previous)?,

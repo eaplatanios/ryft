@@ -11,9 +11,9 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    MemberDifferentiableOperation, TransposableOperation, TranspositionContext, TranspositionDriver,
-    jvp_projected_operation,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, TransposableOperation,
+    TranspositionContext, TranspositionDriver, jvp_projected_operation, primal_to_tangent_duals,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -394,9 +394,9 @@ where
     C::Operation: From<GatherOperation>,
     C::Value: Gather,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        _context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -405,7 +405,9 @@ where
         let primal = inputs[0].primal().gather(indices, self)?;
         let tangent = match inputs[0].tangent() {
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
-            MaybeZero::Value(tangent) => MaybeZero::Value(tangent.gather(indices, self)?),
+            MaybeZero::Value(tangent) => {
+                MaybeZero::Value(tangent.gather(&context.primal_to_tangent(indices.clone())?, self)?)
+            }
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
@@ -503,25 +505,34 @@ where
         + From<ScatterOperation>
         + From<ZeroOperation<ArrayType>>,
 {
-    fn jvp_in_parent<D: DifferentiationDriver<C>>(
+    fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        let destinations = context;
+        let context = destinations.primal();
         let [operand, indices] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
         };
         let operand_type = <&ArrayType>::try_from(operand.primal().r#type().as_ref())?.clone();
         if operand_type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_))) {
             let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
-            return jvp_projected_operation(context, &operation, inputs);
+            return jvp_projected_operation(destinations, &operation, inputs);
         }
 
         let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
         let primal = context
             .bind(operation, Vec::new(), &[operand.primal().clone(), indices.primal().clone()])?
             .remove(0);
+        let output_primal = primal;
+        let primal = destinations.primal_to_tangent(output_primal.clone())?;
+        let tangent_inputs = primal_to_tangent_duals(destinations, inputs)?;
+        let inputs = tangent_inputs.as_slice();
+        let operand = &inputs[0];
+        let indices = &inputs[1];
+        let context = destinations.tangent();
         let tangent = match operand.tangent() {
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
             MaybeZero::Value(operand_tangent) => {
@@ -579,7 +590,7 @@ where
                 MaybeZero::Value(tangent)
             }
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
     }
 }
 

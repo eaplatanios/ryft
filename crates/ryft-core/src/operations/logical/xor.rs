@@ -68,7 +68,8 @@ mod tests {
     use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
     use crate::contexts::EagerContext;
     use crate::differentiation::{
-        DifferentiableOperation, DifferentiationDual, DifferentiationError, TransposableOperation, TranspositionContext,
+        DifferentiableOperation, DifferentiationContext, DifferentiationDual, DifferentiationError,
+        TransposableOperation, TranspositionContext,
     };
     use crate::macros::{check_operation_batching, check_operation_partial_evaluation, check_operation_type_inference};
     use crate::partial::PartialValue;
@@ -135,7 +136,7 @@ mod tests {
     fn test_xor_differentiation() {
         let outputs = XorOperation::<ArrayType>::new()
             .jvp(
-                &EagerContext::<Array, ArrayOperation<Array>>::new(),
+                &DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new()),
                 &EmptyRegionDriver,
                 &[
                     DifferentiationDual::new_with_zero_tangent(Array::scalar(true)).unwrap(),

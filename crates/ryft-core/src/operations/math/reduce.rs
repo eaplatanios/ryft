@@ -11,9 +11,9 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    ElementwiseDerivativeAlignment, MemberDifferentiableOperation, TransposableOperation, TranspositionContext,
-    TranspositionDriver, jvp_projected_operation,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment, MemberDifferentiableOperation,
+    TransposableOperation, TranspositionContext, TranspositionDriver, jvp_projected_operation, primal_to_tangent_duals,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -297,9 +297,9 @@ where
         + ElementwiseDerivativeAlignment<ArrayType>
         + Mul<Output = C::Value>,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        _context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -332,7 +332,9 @@ where
                 let tangent = match inputs[0].tangent() {
                     MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
                     MaybeZero::Value(input_tangent) => {
-                        let numeric_mask = mask.align_tangent(input_tangent.r#type().as_ref(), input_tangent)?;
+                        let numeric_mask = context
+                            .primal_to_tangent(mask.clone())?
+                            .align_tangent(input_tangent.r#type().as_ref(), input_tangent)?;
                         let tie_count = numeric_mask.clone().reduce(self.axes(), ReductionKind::Sum);
                         let masked_tangent = numeric_mask * input_tangent.clone();
                         MaybeZero::Value(masked_tangent.reduce(self.axes(), ReductionKind::Sum) / tie_count)
@@ -457,12 +459,14 @@ where
         + From<MulOperation<ArrayType>>
         + From<ReduceOperation>,
 {
-    fn jvp_in_parent<D: DifferentiationDriver<C>>(
+    fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        let destinations = context;
+        let context = destinations.primal();
         let [operand] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
         };
@@ -471,11 +475,16 @@ where
             || matches!(self.kind(), ReductionKind::Any | ReductionKind::All)
         {
             let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
-            return jvp_projected_operation(context, &operation, inputs);
+            return jvp_projected_operation(destinations, &operation, inputs);
         }
 
         let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
         let primal = context.bind(operation, Vec::new(), std::slice::from_ref(operand.primal()))?.remove(0);
+        let output_primal = primal;
+        let primal = destinations.primal_to_tangent(output_primal.clone())?;
+        let tangent_inputs = primal_to_tangent_duals(destinations, inputs)?;
+        let operand = &tangent_inputs[0];
+        let context = destinations.tangent();
         let tangent = match operand.tangent() {
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
             MaybeZero::Value(operand_tangent) => {
@@ -681,7 +690,7 @@ where
                 }
             }
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
     }
 }
 
@@ -731,7 +740,7 @@ where
             return self.clone();
         }
         self.dispatch_domain()
-            .bind(ReduceOperation::new(axes.to_vec(), kind), Vec::new(), &[self.clone()])
+            .bind(ReduceOperation::new(axes.to_vec(), kind), Vec::new(), std::slice::from_ref(self))
             .expect("`reduce` operation failed")
             .remove(0)
     }
@@ -742,7 +751,7 @@ where
             .bind(
                 ReduceOperation::new(axes.to_vec(), kind).with_output_sharding(output_sharding.clone()),
                 Vec::new(),
-                &[self.clone()],
+                std::slice::from_ref(self),
             )
             .expect("`reduce` operation failed")
             .remove(0)

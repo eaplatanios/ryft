@@ -9,9 +9,9 @@ use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    BroadcastDerivativeAlignment, DifferentiableOperation, DifferentiableType, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, TransposableOperation, TranspositionContext, TranspositionDriver,
-    transpose_projected_operation,
+    BroadcastDerivativeAlignment, DifferentiableOperation, DifferentiableType, DifferentiationContext,
+    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, TransposableOperation,
+    TranspositionContext, TranspositionDriver, primal_to_tangent_duals, transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_free_dischargeable_operation};
@@ -316,17 +316,25 @@ where
         + From<ConstantOperation<DimensionValue>>
         + OperationProjection<ArrayType, Projected: From<ReduceOperation> + From<TransposeOperation>>,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        let Some((array, output_extents)) = inputs.split_first() else {
+        let destinations = context;
+        let context = destinations.primal();
+        let Some(_) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
+        let output_primal = primal;
+        let primal = destinations.primal_to_tangent(output_primal.clone())?;
+        let tangent_inputs = primal_to_tangent_duals(destinations, inputs)?;
+        let inputs = tangent_inputs.as_slice();
+        let (array, output_extents) = inputs.split_first().unwrap();
+        let context = destinations.tangent();
         let tangent = match array.tangent() {
             MaybeZero::Zero(_) => {
                 let tangent_type = primal.r#type().tangent()?;
@@ -462,7 +470,7 @@ where
                 }
             }
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
     }
 }
 

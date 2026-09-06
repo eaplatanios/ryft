@@ -39,7 +39,7 @@ impl_differentiable_operation! {
             + StandardDiv<Output = C::Value>
             + ElementwiseDerivativeAlignment<C::Type>,
     {
-        |_operation, _context, _driver, inputs| {
+        |_operation, context, _driver, inputs| {
             // d(atan2(y, x)) = x / (x² + y²) · dy - y / (x² + y²) · dx. The shared denominator is computed once for
             // both terms, and each divided coefficient is formed independently, matching the primitive's numerical
             // rule: combining the terms into one numerator can produce `inf - inf` before division for large finite
@@ -61,8 +61,10 @@ impl_differentiable_operation! {
                 }
                 .into());
             }
-            let x_primal = x.primal().align_tangent(&target, &primal)?;
-            let y_primal = y.primal().align_tangent(&target, &primal)?;
+            let output_primal = primal;
+            let primal = context.primal_to_tangent(output_primal.clone())?;
+            let x_primal = context.primal_to_tangent(x.primal().clone())?.align_tangent(&target, &primal)?;
+            let y_primal = context.primal_to_tangent(y.primal().clone())?.align_tangent(&target, &primal)?;
             let denominator = x_primal.clone() * x_primal.clone() + y_primal.clone() * y_primal.clone();
             let y_term = y
                 .tangent()
@@ -87,7 +89,7 @@ impl_differentiable_operation! {
                 .chain(x_term)
                 .reduce(|y_term, x_term| y_term + x_term)
                 .map_or_else(|| MaybeZero::Zero(target), MaybeZero::Value);
-            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+            Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
         }
     },
     transpose = @nonlinear,

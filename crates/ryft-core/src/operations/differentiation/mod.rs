@@ -136,16 +136,20 @@ pub(crate) fn validate_custom_derivative_replay<C: Context<Type: DifferentiableT
 pub(crate) mod tests {
     use std::sync::Arc;
 
-    use crate::arrays::{Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType};
-    use crate::contexts::EagerContext;
-    use crate::differentiation::{DifferentiationDriver, DifferentiationDual, DifferentiationError, Linearization};
-    use crate::operations::references::{ReferenceNewOperation, ReferenceReadOperation};
-    use crate::parameters::Placeholder;
-    use crate::programs::{FlatProgram, Program, ProgramBuilder, ReferenceType, RegionDriver, RegionRef};
-    use crate::tracing::Trace;
     use pretty_assertions::assert_eq;
 
     use super::*;
+    use crate::arrays::{Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType};
+    use crate::contexts::EagerContext;
+    use crate::differentiation::{
+        DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+        DifferentiationPolicy, Linearization,
+    };
+    use crate::operations::references::{ReferenceNewOperation, ReferenceReadOperation};
+    use crate::parameters::Placeholder;
+    use crate::partial::PartitionedProgram;
+    use crate::programs::{FlatProgram, Program, ProgramBuilder, ReferenceType, RegionDriver, RegionRef};
+    use crate::tracing::Trace;
 
     /// Builds a reference-free program representing the identity function over `r#type`.
     pub(crate) fn array_ir_identity_program(
@@ -249,11 +253,20 @@ pub(crate) mod tests {
             unreachable!("custom derivative rules replay their rule regions instead of linearizing them")
         }
 
-        fn jvp_operation(
+        fn partition_jvp_program(
+            &self,
+            region: RegionRef<'_, ArrayIrValue<Array>, ArrayIrOperation<Array>>,
+            input_known: &[bool],
+            required_known_outputs: &[usize],
+        ) -> Result<PartitionedProgram<ArrayIrValue<Array>, ArrayIrOperation<Array>>, DifferentiationError> {
+            Ok(region.partition_with_configuration(input_known, true, true, Some(required_known_outputs))?.0)
+        }
+
+        fn jvp_operation<P: DifferentiationPolicy<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>(
             &self,
             _operation: &ArrayIrOperation<Array>,
             _programs: Vec<FlatProgram<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>,
-            _context: &EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
+            _context: &DifferentiationContext<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>, P>,
             _inputs: &[DifferentiationDual<ArrayIrValue<Array>>],
         ) -> Result<Vec<DifferentiationDual<ArrayIrValue<Array>>>, DifferentiationError> {
             unreachable!("custom derivative rules replay their rule regions instead of differentiating them")

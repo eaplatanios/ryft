@@ -8,8 +8,8 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    ElementwiseDerivativeAlignment,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_transposable_operation};
@@ -184,9 +184,9 @@ where
         + StandardMul<Output = C::Value>
         + ElementwiseDerivativeAlignment<ArrayType>,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        _context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -196,9 +196,11 @@ where
         let tangent = match inputs[0].tangent() {
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
             MaybeZero::Value(input_tangent) => {
+                let primal_input = context.primal_to_tangent(primal_input.clone())?;
+                let tangent_primal = context.primal_to_tangent(primal.clone())?;
                 let input_type = primal_input.r#type().into_owned();
                 let output_axes = output_to_input_axis_map(input_type.rank(), self.axes.as_slice());
-                let broadcast_primal = primal.broadcast(input_type, output_axes.as_slice())?;
+                let broadcast_primal = tangent_primal.broadcast(input_type, output_axes.as_slice())?;
                 let weights = (primal_input.clone() - broadcast_primal).exp()?;
                 let weights = weights.align_tangent(input_tangent.r#type().as_ref(), input_tangent)?;
                 let weighted = weights * input_tangent.clone();

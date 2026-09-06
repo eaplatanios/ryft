@@ -14,9 +14,10 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    ElementwiseDerivativeAlignment, ResidualZeroProvider, TransposableOperation, TranspositionContext,
-    TranspositionDriver, transpose_projected_operation,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment, ResidualZeroProvider,
+    TransposableOperation, TranspositionContext, TranspositionDriver, primal_to_tangent_duals,
+    transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_reference_free_dischargeable_operation};
@@ -615,9 +616,9 @@ where
     C::Operation: From<PadOperation<ArrayType>>,
     C::Value: Pad,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -630,8 +631,8 @@ where
         )?;
         // The pad needs both the operand and padding-value tangents as real values, so materialize the structurally
         // zero side (the shared all-zero fast path already handled the case where both are zero).
-        let operand_tangent = inputs[0].tangent().clone().materialize(context)?;
-        let padding_tangent = inputs[1].tangent().clone().materialize(context)?;
+        let operand_tangent = inputs[0].tangent().clone().materialize(context.tangent())?;
+        let padding_tangent = inputs[1].tangent().clone().materialize(context.tangent())?;
         let tangent = operand_tangent.pad(
             &padding_tangent,
             self.edge_padding_low(),
@@ -666,18 +667,25 @@ where
                            + From<ZeroOperation<ArrayType>>,
         > + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        let destinations = context;
+        let context = destinations.primal();
         if inputs.len() < 2 {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
         }
-        let (array_inputs, output_extents) = inputs.split_at(2);
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
+        let output_primal = primal;
+        let primal = destinations.primal_to_tangent(output_primal.clone())?;
+        let tangent_inputs = primal_to_tangent_duals(destinations, inputs)?;
+        let inputs = tangent_inputs.as_slice();
+        let (array_inputs, output_extents) = inputs.split_at(2);
+        let context = destinations.tangent();
         let tangent = if array_inputs.iter().all(|input| input.tangent().is_zero()) {
             MaybeZero::Zero(primal.r#type().tangent()?)
         } else {
@@ -937,7 +945,7 @@ where
                 MaybeZero::Value(tangent)
             }
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
     }
 }
 

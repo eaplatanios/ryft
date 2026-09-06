@@ -15,9 +15,10 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    ElementwiseDerivativeAlignment, ResidualZeroProvider, TransposableOperation, TranspositionContext,
-    TranspositionDriver, transpose_projected_operation,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment, ResidualZeroProvider,
+    TransposableOperation, TranspositionContext, TranspositionDriver, primal_to_tangent_duals,
+    transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_free_dischargeable_operation};
@@ -430,12 +431,14 @@ where
         + OperationProjection<ArrayType, Projected: From<ZeroLikeOperation<ArrayType>> + From<ZeroOperation<ArrayType>>>
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        let destinations = context;
+        let context = destinations.primal();
         let Some((result_extent, array_inputs)) = inputs.split_last() else {
             return Err(TypeError::invalid(format!(
                 "`{CONCATENATE_OPERATION_NAME}` differentiation expects at least one array followed by its result \
@@ -463,6 +466,12 @@ where
 
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
+        let output_primal = primal;
+        let primal = destinations.primal_to_tangent(output_primal.clone())?;
+        let tangent_inputs = primal_to_tangent_duals(destinations, inputs)?;
+        let inputs = tangent_inputs.as_slice();
+        let (result_extent, array_inputs) = inputs.split_last().unwrap();
+        let context = destinations.tangent();
         let tangent = if array_inputs.iter().all(|input| input.tangent().is_zero()) {
             MaybeZero::Zero(primal.r#type().tangent()?)
         } else {
@@ -559,7 +568,7 @@ where
                 MaybeZero::Value(tangent)
             }
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
     }
 }
 
@@ -576,7 +585,7 @@ impl_differentiable_operation! {
             // needs one concrete tangent per input; the shared all-zero fast path has already handled that case.
             let tangents = inputs
                 .iter()
-                .map(|dual| dual.tangent().clone().materialize(context))
+                .map(|dual| dual.tangent().clone().materialize(context.tangent()))
                 .collect::<Result<Vec<_>, _>>()?;
             let primal = Concatenate::concatenate(inputs.iter().map(DifferentiationDual::primal), operation.axis())?;
             let tangent = Concatenate::concatenate(&tangents, operation.axis())?;
@@ -2012,7 +2021,7 @@ mod tests {
             DifferentiationDual::new_with_zero_tangent(result_extent).unwrap(),
         ];
         let outputs = ConcatenateOperation::<ArrayIrType>::from(ConcatenateOperation::new(0, 1).unwrap())
-            .jvp(&context, &EmptyRegionDriver, inputs.as_slice())
+            .jvp(&DifferentiationContext::new(context.clone()), &EmptyRegionDriver, inputs.as_slice())
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].tangent().r#type().as_ref(), &ArrayIrType::Array(widened_type));

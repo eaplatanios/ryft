@@ -7,8 +7,8 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionContext, TranspositionDriver,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, TransposableOperation, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -172,17 +172,19 @@ where
     // update is accumulated into the primal reference. Accumulating a symbolic zero tangent is a no-op and stages
     // nothing. The tangent pairing is resolved before either accumulation so that a rejected plumbing store leaves both
     // references untouched.
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
         let stored = stored_tangents(REFERENCE_ADD_UPDATE_OPERATION_NAME, &inputs[0], &inputs[1])?;
-        context.bind(*self, Vec::new(), &[inputs[0].primal().clone(), inputs[1].primal().clone()])?;
+        context
+            .primal()
+            .bind(*self, Vec::new(), &[inputs[0].primal().clone(), inputs[1].primal().clone()])?;
         if let Some((tangent_reference, MaybeZero::Value(tangent))) = stored {
-            context.bind(*self, Vec::new(), &[tangent_reference.clone(), tangent])?;
+            context.tangent().bind(*self, Vec::new(), &[tangent_reference.clone(), tangent])?;
         }
         Ok(Vec::new())
     }

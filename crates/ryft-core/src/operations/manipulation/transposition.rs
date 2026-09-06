@@ -500,7 +500,9 @@ mod tests {
         MeshAxis, MeshAxisType, RaggedAxis, Sharding, ShardingDimension, StridedLayout, f8e8m0fnu,
     };
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::{DifferentiableOperation, TransposableOperation, TranspositionContext};
+    use crate::differentiation::{
+        DifferentiableOperation, DifferentiationContext, TransposableOperation, TranspositionContext,
+    };
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
@@ -1231,7 +1233,11 @@ mod tests {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let primal = context.input(cycle_input_type.clone());
         let duals = TransposeOperation::new([2, 0, 1])
-            .jvp(&context, &EmptyRegionDriver, &[DifferentiationDual::new_with_zero_tangent(primal).unwrap()])
+            .jvp(
+                &DifferentiationContext::new(context.clone()),
+                &EmptyRegionDriver,
+                &[DifferentiationDual::new_with_zero_tangent(primal).unwrap()],
+            )
             .unwrap();
         assert!(duals[0].tangent().is_zero());
         assert_eq!(duals[0].tangent().r#type().as_ref(), &cycle_output_type.tangent().unwrap());

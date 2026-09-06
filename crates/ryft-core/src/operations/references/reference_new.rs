@@ -8,8 +8,9 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, ResidualZeroProvider, TransposableOperation, TranspositionContext,
+    TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -168,22 +169,24 @@ where
     // A symbolic zero tangent is instantiated first, because the tangent reference must exist as a concrete allocation
     // for later stores to land in: a reference type is never zero-space, so the allocation's dual always carries a live
     // tangent reference.
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
-        let primal = context.bind(*self, Vec::new(), std::slice::from_ref(inputs[0].primal()))?.remove(0);
+        let primal = context.primal().bind(*self, Vec::new(), std::slice::from_ref(inputs[0].primal()))?.remove(0);
+        let source = context.primal_to_tangent(inputs[0].primal().clone())?;
         let tangent = context
+            .tangent()
             .bind(
                 *self,
                 Vec::new(),
                 &[C::Operation::materialize_zero_from_residual_sources(
-                    context,
+                    context.tangent(),
                     inputs[0].tangent().clone(),
-                    std::iter::once(inputs[0].primal()),
+                    std::iter::once(&source),
                 )?],
             )?
             .remove(0);

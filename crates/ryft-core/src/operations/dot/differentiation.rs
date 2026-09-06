@@ -1,19 +1,23 @@
+use crate::differentiation::{DifferentiationContext, DifferentiationPolicy};
+
 use super::*;
 
 /// Applies the product rule shared by dense and grouped bilinear dot operations.
 ///
 /// When one factor of a tangent term uses the widened tangent representation, both factors are converted to the
 /// output tangent element type before applying the operation.
-fn bilinear_array_jvp<V, Apply>(
+fn bilinear_array_jvp<C, V, Apply, P: DifferentiationPolicy<C>>(
+    context: &DifferentiationContext<C, P>,
+    primal: V,
     lhs: &DifferentiationDual<V>,
     rhs: &DifferentiationDual<V>,
     apply: Apply,
 ) -> Result<DifferentiationDual<V>, DifferentiationError>
 where
+    C: Context<Type = ArrayType, Value = V>,
     V: Value<Type = ArrayType> + ConvertElementType + std::ops::Add<Output = V>,
     Apply: Fn(&V, &V) -> Result<V, DifferentiationError>,
 {
-    let primal = apply(lhs.primal(), rhs.primal())?;
     let tangent_type = primal.r#type().tangent()?;
     let convert_to_tangent_type = |value: &V| {
         if value.r#type().data_type() == tangent_type.data_type() {
@@ -29,8 +33,16 @@ where
             apply(&convert_to_tangent_type(lhs)?, &convert_to_tangent_type(rhs)?)
         }
     };
-    let lhs_term = lhs.tangent().as_value().map(|tangent| apply_tangent(tangent, rhs.primal())).transpose()?;
-    let rhs_term = rhs.tangent().as_value().map(|tangent| apply_tangent(lhs.primal(), tangent)).transpose()?;
+    let lhs_term = lhs
+        .tangent()
+        .as_value()
+        .map(|tangent| apply_tangent(tangent, &context.primal_to_tangent(rhs.primal().clone())?))
+        .transpose()?;
+    let rhs_term = rhs
+        .tangent()
+        .as_value()
+        .map(|tangent| apply_tangent(&context.primal_to_tangent(lhs.primal().clone())?, tangent))
+        .transpose()?;
     let tangent = lhs_term
         .into_iter()
         .chain(rhs_term)
@@ -47,9 +59,9 @@ where
     C::Operation: From<DotOperation>,
     C::Value: ConvertElementType + Dot + std::ops::Add<Output = C::Value>,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        _context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -63,7 +75,8 @@ where
             (None, Some(output_sharding)) => left.dot_with_output_sharding(right, self.dimensions(), output_sharding),
             (None, None) => left.dot(right, self.dimensions()),
         };
-        Ok(vec![bilinear_array_jvp(left, right, |left, right| Ok(stage_dot(left, right)))?])
+        let primal = stage_dot(left.primal(), right.primal());
+        Ok(vec![bilinear_array_jvp(context, primal, left, right, |left, right| Ok(stage_dot(left, right)))?])
     }
 }
 
@@ -159,9 +172,9 @@ where
     C::Operation: From<ConvertElementTypeOperation<ArrayType>> + From<RaggedDotOperation>,
     C::Value: ConvertElementType + RaggedDot + std::ops::Add<Output = C::Value>,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        _context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -169,10 +182,15 @@ where
         let lhs = &inputs[0];
         let rhs = &inputs[1];
         let group_sizes = inputs[2].primal();
+        let primal = lhs.primal().ragged_dot_general(rhs.primal(), group_sizes, self.dimensions())?;
+        if lhs.tangent().is_zero() && rhs.tangent().is_zero() {
+            return Ok(vec![DifferentiationDual::new_with_zero_tangent(primal)?]);
+        }
+        let group_sizes = context.primal_to_tangent(group_sizes.clone())?;
         let apply = |lhs: &C::Value, rhs: &C::Value| {
-            lhs.ragged_dot_general(rhs, group_sizes, self.dimensions()).map_err(DifferentiationError::from)
+            lhs.ragged_dot_general(rhs, &group_sizes, self.dimensions()).map_err(DifferentiationError::from)
         };
-        Ok(vec![bilinear_array_jvp(lhs, rhs, apply)?])
+        Ok(vec![bilinear_array_jvp(context, primal, lhs, rhs, apply)?])
     }
 }
 

@@ -12,9 +12,9 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    ElementwiseDerivativeAlignment, MemberDifferentiableOperation, TransposableOperation, TranspositionContext,
-    TranspositionDriver, jvp_projected_operation,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment, MemberDifferentiableOperation,
+    TransposableOperation, TranspositionContext, TranspositionDriver, jvp_projected_operation, primal_to_tangent_duals,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_reference_free_dischargeable_operation};
@@ -244,9 +244,9 @@ where
     C::Operation: From<SliceOperation>,
     C::Value: Slice,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        _context: &C,
+        _context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -379,23 +379,31 @@ where
         + From<UpdateSliceOperation>
         + From<ZeroOperation<ArrayType>>,
 {
-    fn jvp_in_parent<D: DifferentiationDriver<C>>(
+    fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        let destinations = context;
+        let context = destinations.primal();
         let [operand] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
         };
         let operand_type = <&ArrayType>::try_from(operand.primal().r#type().as_ref())?.clone();
         if operand_type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_))) {
             let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
-            return jvp_projected_operation(context, &operation, inputs);
+            return jvp_projected_operation(destinations, &operation, inputs);
         }
 
         let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
         let primal = context.bind(operation, Vec::new(), std::slice::from_ref(operand.primal()))?.remove(0);
+        let output_primal = primal;
+        let primal = destinations.primal_to_tangent(output_primal.clone())?;
+        let tangent_inputs = primal_to_tangent_duals(destinations, inputs)?;
+        let inputs = tangent_inputs.as_slice();
+        let operand = &inputs[0];
+        let context = destinations.tangent();
         let tangent = match operand.tangent() {
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
             MaybeZero::Value(operand_tangent) => {
@@ -467,7 +475,7 @@ where
                 MaybeZero::Value(tangent)
             }
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
     }
 }
 
@@ -755,9 +763,9 @@ where
     C: Context<Type = ArrayIrType> + Zero<C::Value>,
     C::Operation: From<DynamicShapeSliceOperation>,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -768,13 +776,18 @@ where
         let mut primal_inputs = Vec::with_capacity(inputs.len());
         primal_inputs.push(input.primal().clone());
         primal_inputs.extend(primal_bounds.iter().cloned());
-        let mut primals = context.bind(self.clone(), Vec::new(), primal_inputs.as_slice())?;
+        let mut primals = context.primal().bind(self.clone(), Vec::new(), primal_inputs.as_slice())?;
         check_count!("output", primals, 1, ProgramError);
 
         let mut tangent_inputs = Vec::with_capacity(inputs.len());
-        tangent_inputs.push(input.tangent().clone().materialize(context)?);
-        tangent_inputs.extend(primal_bounds);
-        let mut tangents = context.bind(self.clone(), Vec::new(), tangent_inputs.as_slice())?;
+        tangent_inputs.push(input.tangent().clone().materialize(context.tangent())?);
+        tangent_inputs.extend(
+            primal_bounds
+                .into_iter()
+                .map(|value| context.primal_to_tangent(value))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        let mut tangents = context.tangent().bind(self.clone(), Vec::new(), tangent_inputs.as_slice())?;
         check_count!("output", tangents, 1, ProgramError);
         Ok(vec![DifferentiationDual::new(primals.remove(0), MaybeZero::Value(tangents.remove(0)))?])
     }
@@ -1148,9 +1161,9 @@ where
     C::Operation: From<UpdateSliceOperation>,
     C::Value: UpdateSlice,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -1161,8 +1174,8 @@ where
         let tangent = if operand.tangent().is_zero() && update.tangent().is_zero() {
             MaybeZero::Zero(primal.r#type().tangent()?)
         } else {
-            let operand_tangent = operand.tangent().clone().materialize(context)?;
-            let update_tangent = update.tangent().clone().materialize(context)?;
+            let operand_tangent = operand.tangent().clone().materialize(context.tangent())?;
+            let update_tangent = update.tangent().clone().materialize(context.tangent())?;
             MaybeZero::Value(operand_tangent.update_slice(&update_tangent, self.start_indices())?)
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)?])
@@ -1517,9 +1530,9 @@ where
     C::Operation: From<DynamicSliceOperation>,
     C::Value: DynamicSlice,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        _context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -1529,7 +1542,13 @@ where
         let primal = operand.primal().dynamic_slice(&primal_starts, self.sizes())?;
         let tangent = match operand.tangent() {
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
-            MaybeZero::Value(tangent) => MaybeZero::Value(tangent.dynamic_slice(&primal_starts, self.sizes())?),
+            MaybeZero::Value(tangent) => {
+                let tangent_starts = primal_starts
+                    .into_iter()
+                    .map(|value| context.primal_to_tangent(value))
+                    .collect::<Result<Vec<_>, _>>()?;
+                MaybeZero::Value(tangent.dynamic_slice(&tangent_starts, self.sizes())?)
+            }
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
@@ -1607,23 +1626,30 @@ where
         + From<DynamicUpdateSliceOperation>
         + From<ZeroOperation<ArrayType>>,
 {
-    fn jvp_in_parent<D: DifferentiationDriver<C>>(
+    fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        let (operand, start_indices) =
-            inputs.split_first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
+        let destinations = context;
+        let context = destinations.primal();
+        let (operand, _) = inputs.split_first().ok_or(ProgramError::InvalidInputCount { expected: 1, actual: 0 })?;
         let operand_type = <&ArrayType>::try_from(operand.primal().r#type().as_ref())?.clone();
         if operand_type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_))) {
             let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
-            return jvp_projected_operation(context, &operation, inputs);
+            return jvp_projected_operation(destinations, &operation, inputs);
         }
 
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
         let primal = context.bind(operation, Vec::new(), primal_inputs.as_slice())?.remove(0);
+        let output_primal = primal;
+        let primal = destinations.primal_to_tangent(output_primal.clone())?;
+        let tangent_inputs = primal_to_tangent_duals(destinations, inputs)?;
+        let inputs = tangent_inputs.as_slice();
+        let (operand, start_indices) = inputs.split_first().unwrap();
+        let context = destinations.tangent();
         let tangent = match operand.tangent() {
             MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
             MaybeZero::Value(operand_tangent) => {
@@ -1679,7 +1705,7 @@ where
                 MaybeZero::Value(tangent)
             }
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
     }
 }
 
@@ -1952,9 +1978,9 @@ where
     C::Operation: From<DynamicUpdateSliceOperation>,
     C::Value: DynamicUpdateSlice,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -1968,9 +1994,17 @@ where
         let tangent = if operand.tangent().is_zero() && update.tangent().is_zero() {
             MaybeZero::Zero(primal.r#type().tangent()?)
         } else {
-            let operand_tangent = operand.tangent().clone().materialize(context)?;
-            let update_tangent = update.tangent().clone().materialize(context)?;
-            MaybeZero::Value(operand_tangent.dynamic_update_slice(&update_tangent, &primal_starts)?)
+            let operand_tangent = operand.tangent().clone().materialize(context.tangent())?;
+            let update_tangent = update.tangent().clone().materialize(context.tangent())?;
+            MaybeZero::Value(
+                operand_tangent.dynamic_update_slice(
+                    &update_tangent,
+                    &primal_starts
+                        .into_iter()
+                        .map(|value| context.primal_to_tangent(value))
+                        .collect::<Result<Vec<_>, _>>()?,
+                )?,
+            )
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
@@ -2061,29 +2095,40 @@ where
         + From<DynamicUpdateSliceOperation>
         + From<ZeroOperation<ArrayType>>,
 {
-    fn jvp_in_parent<D: DifferentiationDriver<C>>(
+    fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        let destinations = context;
+        let context = destinations.primal();
         if inputs.len() < 2 {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
         }
         let operand = &inputs[0];
-        let update = &inputs[1];
-        let start_indices = &inputs[2..];
         let operand_type = <&ArrayType>::try_from(operand.primal().r#type().as_ref())?.clone();
         if operand_type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_))) {
             let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(*self);
-            return jvp_projected_operation(context, &operation, inputs);
+            return jvp_projected_operation(destinations, &operation, inputs);
         }
 
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(*self);
         let primal = context.bind(operation, Vec::new(), primal_inputs.as_slice())?.remove(0);
+        let output_primal = primal;
+        let primal = destinations.primal_to_tangent(output_primal.clone())?;
+        let tangent_inputs = primal_to_tangent_duals(destinations, inputs)?;
+        let inputs = tangent_inputs.as_slice();
+        let operand = &inputs[0];
+        let update = &inputs[1];
+        let start_indices = &inputs[2..];
+        let context = destinations.tangent();
         if operand.tangent().is_zero() && update.tangent().is_zero() {
-            return Ok(vec![DifferentiationDual::new(primal.clone(), MaybeZero::Zero(primal.r#type().tangent()?))?]);
+            return Ok(vec![DifferentiationDual::new(
+                output_primal.clone(),
+                MaybeZero::Zero(primal.r#type().tangent()?),
+            )?]);
         }
 
         // The integer starts are the ordinary primal residuals shared by the forward update and its two transpose
@@ -2227,7 +2272,7 @@ where
             },
         )?
         .remove(0);
-        Ok(vec![DifferentiationDual::new(primal, MaybeZero::Value(tangent))?])
+        Ok(vec![DifferentiationDual::new(output_primal, MaybeZero::Value(tangent))?])
     }
 }
 

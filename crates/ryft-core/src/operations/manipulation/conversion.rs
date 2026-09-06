@@ -125,7 +125,7 @@ impl_differentiable_operation! {
         C: Context<Type = T>,
         C::Value: ConvertElementType + ElementwiseDerivativeAlignment<T>,
     {
-        |operation, _context, _driver, inputs| {
+        |operation, context, _driver, inputs| {
             // Convert the primal to the requested element data type and align a live tangent to the resulting
             // differential data type. Converting into a type with no tangent space produces a structural zero tangent.
             check_count!("input", inputs, 1, ProgramError);
@@ -134,7 +134,7 @@ impl_differentiable_operation! {
             let tangent = match inputs[0].tangent() {
                 _ if output_tangent_type.is_zero_space() => MaybeZero::Zero(output_tangent_type),
                 MaybeZero::Zero(_) => MaybeZero::Zero(output_tangent_type),
-                MaybeZero::Value(tangent) => MaybeZero::Value(tangent.align_tangent(&output_tangent_type, &primal)?),
+                MaybeZero::Value(tangent) => MaybeZero::Value(tangent.align_tangent(&output_tangent_type, &context.primal_to_tangent(primal.clone())?)?),
             };
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }

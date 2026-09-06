@@ -7,8 +7,9 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, ResidualZeroProvider, TransposableOperation, TranspositionContext,
+    TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -179,16 +180,16 @@ where
     // contents. A plumbing reference carries no tangent reference, so its final value has a symbolic zero tangent. The
     // operands are cloned before consumption for the same reason the interpretation rule clones them: the rule replays
     // an already-built application over borrowed duals, and a clone names the same allocation.
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
-        let primal = context.bind(*self, Vec::new(), std::slice::from_ref(inputs[0].primal()))?.remove(0);
+        let primal = context.primal().bind(*self, Vec::new(), std::slice::from_ref(inputs[0].primal()))?.remove(0);
         Ok(vec![forwarded_tangent(&inputs[0], primal, |reference| {
-            Ok(context.bind(*self, Vec::new(), std::slice::from_ref(reference))?.remove(0))
+            Ok(context.tangent().bind(*self, Vec::new(), std::slice::from_ref(reference))?.remove(0))
         })?])
     }
 }

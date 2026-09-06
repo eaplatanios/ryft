@@ -9,20 +9,20 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, ResidualZeroProvider,
+    CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationContext,
+    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, ResidualZeroProvider,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{
-    check_count, check_types, impl_non_transposable_operation, impl_reference_free_dischargeable_operation,
-};
+use crate::macros::{check_count, check_types, impl_non_transposable_operation};
 use crate::operations::constants::zero::Zero;
 use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    InputRegionProvenance, Operation, OperationFormatter, OutputRegionProvenance, ProgramError, RegionInterface,
-    RegionSlot, Type, TypeError, Typed, Value,
+    InputRegionProvenance, Operation, OperationFormatter, OutputRegionProvenance, ProgramError,
+    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, RegionInterface, RegionSlot, Type, TypeError, Typed, Value,
+    discharge_local_reference_operation,
 };
 use crate::tracing::{DomainTracer, Trace};
 
@@ -359,12 +359,22 @@ where
     // later reverse-mode transformation.
 }
 
-// A custom VJP replays verbatim, for the reason its JVP sibling does: discharging the state a plumbing reference
-// operand threads through its regions would have to rewrite the dormant `forward` and `backward` rule boundaries in a
-// way the user-supplied rules do not describe. The shared reference-free rule copies all three regions across
-// unchanged and rejects the application by name if a reference reaches any of their closures, so plumbing references
-// are an eager-execution feature for now.
-impl_reference_free_dischargeable_operation!(<T> CustomVjpOperation<T> where T: DifferentiableType);
+// Local reference lifecycles discharge inside each region while all user-declared numeric boundaries stay intact.
+// External reference operands still require explicit state threading that these derivative interfaces do not supply.
+impl<C: Context<Type: DifferentiableType>, P: ReferenceDischargePolicy<C>> ReferenceDischargeableOperation<C, P>
+    for CustomVjpOperation<C::Type>
+where
+    C::Operation: From<CustomVjpOperation<C::Type>>,
+{
+    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
+        &self,
+        context: &ReferenceDischargeContext<C, P>,
+        driver: &D,
+        inputs: &[ReferenceDischargeValue<C, P>],
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        discharge_local_reference_operation(self, context, driver, inputs)
+    }
+}
 
 impl<T: DifferentiableType, C: Context<Type = T>, P: CotangentBatchingPolicy<C>> BatchableOperation<C, P>
     for CustomVjpOperation<T>
@@ -503,9 +513,9 @@ where
     C::Type: DifferentiableType,
     C::Operation: ResidualZeroProvider<C::Type> + From<LinearCallOperation<C::Type>>,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -538,7 +548,7 @@ where
         validate_custom_derivative_replay(
             CUSTOM_VJP_OPERATION_NAME,
             self.non_differentiated_count,
-            context,
+            context.primal(),
             inputs,
             primal_output_types.as_slice(),
         )?;
@@ -546,7 +556,7 @@ where
 
         // Replay the forward region on the dual primals, recovering the primal outputs followed by the residuals.
         let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let mut forward_outputs = forward_region.interpret_in_context(context, primal_operands)?;
+        let mut forward_outputs = forward_region.interpret_in_context(context.primal(), primal_operands)?;
         if forward_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "{} forward region produced {} outputs which is fewer than its {} primal output(s)",
@@ -575,15 +585,20 @@ where
         let mut carrier_operands =
             non_differentiated_inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         carrier_operands.extend(residuals);
+        let mut carrier_operands = carrier_operands
+            .into_iter()
+            .map(|value| context.primal_to_tangent(value))
+            .collect::<Result<Vec<_>, _>>()?;
         // The carrier's leading non-tangent group is the non-differentiated operands followed by the residuals, and
         // both are passed through the residual-count slot: to the linear call they are alike operands that its
         // transpose forwards to the backward region rather than transposing.
         let leading_operand_count = carrier_operands.len();
         for input in differentiated_inputs {
+            let source = context.primal_to_tangent(input.primal().clone())?;
             carrier_operands.push(C::Operation::materialize_zero_from_residual_sources(
-                context,
+                context.tangent(),
                 input.tangent().clone(),
-                std::iter::once(input.primal()),
+                std::iter::once(&source),
             )?);
         }
         let carrier =
@@ -592,8 +607,10 @@ where
         // already staged carrier) rejects it as unsupported. Restate that rejection in `custom_vjp` vocabulary instead
         // of leaking the carrier's internals, matching the clear error JAX raises when forward-mode autodiff is
         // applied to a `custom_vjp` function.
-        let output_tangents = context.bind(carrier, vec![backward_region.to_program()], &carrier_operands).map_err(
-            |error| match error {
+        let output_tangents = context
+            .tangent()
+            .bind(carrier, vec![backward_region.to_program()], &carrier_operands)
+            .map_err(|error| match error {
                 ProgramError::UnsupportedOperation { .. } => ProgramError::UnsupportedOperation {
                     message: format!(
                         "cannot apply forward-mode differentiation to a {CUSTOM_VJP_OPERATION_NAME} call; it supports \
@@ -601,15 +618,14 @@ where
                     ),
                 },
                 error => error,
-            },
-        )?;
+            })?;
         check_count!("output", output_tangents, output_count, ProgramError);
 
-        Ok(primal_outputs
+        primal_outputs
             .into_iter()
             .zip(output_tangents)
             .map(|(primal, tangent)| DifferentiationDual::new(primal, tangent))
-            .collect::<Result<Vec<_>, _>>()?)
+            .collect::<Result<Vec<_>, _>>()
     }
 }
 
@@ -951,6 +967,66 @@ mod tests {
     }
 
     #[test]
+    fn test_custom_vjp_discharges_local_reference_rules() {
+        use crate::arrays::ArrayReferenceDischarge;
+        use crate::operations::references::{ReferenceFreezeOperation, ReferenceNewOperation};
+
+        // The primal is the identity, but the backward rule deliberately returns three times its cotangent. A local
+        // lifecycle inside that dormant rule must disappear during discharge without replacing the custom derivative.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let identity = array_ir_identity_program(&scalar_type);
+        let mut backward = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let cotangent = backward.add_input(scalar_type.clone());
+        let three = backward.add_constant(ArrayIrValue::Array(Array::scalar(3.0_f32)));
+        let scaled = backward
+            .add_instruction(ArrayOperation::from(MulOperation::new()), Vec::new(), vec![three, cotangent], None)
+            .unwrap()[0];
+        let reference =
+            backward.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![scaled], None).unwrap()[0];
+        let output = backward
+            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        let backward = backward
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(scalar_type);
+        let regions = vec![
+            builder.import_region(identity.entry_region_ref()),
+            builder.import_region(identity.entry_region_ref()),
+            builder.import_region(backward.entry_region_ref()),
+        ];
+        let output = builder.add_instruction(CustomVjpOperation::new(), regions, vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap()
+            .discharge_references::<ArrayReferenceDischarge>(0)
+            .unwrap()
+            .into_program_without_external_references()
+            .unwrap();
+        assert_eq!(program.instructions()[0].regions().len(), 3);
+        assert!(!program.entry_region_ref().contains_references_in_closure());
+        let input = ArrayIrValue::Array(Array::scalar(5.0_f32));
+        assert_eq!(program.interpret(vec![input.clone()]), Ok(vec![input.clone()]));
+        let linearization = program.linearize().unwrap();
+        let mut primal_outputs = linearization.primal().interpret(vec![input]).unwrap();
+        let mut cotangents = vec![ArrayIrValue::Array(Array::scalar(1.0_f32))];
+        cotangents.extend(primal_outputs.split_off(1));
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(cotangents),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(3.0_f32))])
+        );
+    }
+
+    #[test]
     fn test_custom_vjp() {
         let scalar = test_type(&[]);
         let operation = CustomVjpOperation::<ArrayType>::new();
@@ -1289,7 +1365,7 @@ mod tests {
         assert!(forward.entry_region_ref().contains_effect_in_closure(EffectClass::OrderedState));
         let driver = ReferenceRuleDifferentiationDriver { programs: vec![primal, forward, backward] };
         assert!(matches!(
-            CustomVjpOperation::<ArrayIrType>::new().jvp(&context, &driver, std::slice::from_ref(&input)),
+            CustomVjpOperation::<ArrayIrType>::new().jvp(&DifferentiationContext::new(context.clone()), &driver, std::slice::from_ref(&input)),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "cannot apply forward-mode differentiation to a custom_vjp call; it supports only \
                                reverse-mode differentiation (e.g., `vjp`, `value_and_gradient`, or \

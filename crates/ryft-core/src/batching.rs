@@ -2609,114 +2609,114 @@ mod tests {
         Ok(())
     }
 
-    /// Batching policy pinning the [`BatchedOutputs`] evidence lifecycle. Its carrier, extent, and batched-program
-    /// boundary are the ordinary array ones, but its validator accepts an operation only when that operation's own
-    /// rule attested to a claim naming it. Comparing the claim's subject with the operation being validated is what
-    /// makes both a missing claim and a claim leaking from a previous operation observable; it is not a per-operation
-    /// branch in the conservation law itself.
-    #[derive(Copy, Clone, Debug)]
-    struct EvidenceBatching;
+    #[test]
+    fn test_batching_context_bind_validates_operation_evidence() {
+        /// Batching policy pinning the [`BatchedOutputs`] evidence lifecycle. Its carrier, extent, and batched-program
+        /// boundary are the ordinary array ones, but its validator accepts an operation only when that operation's own
+        /// rule attested to a claim naming it. Comparing the claim's subject with the operation being validated is what
+        /// makes both a missing claim and a claim leaking from a previous operation observable; it is not a
+        /// per-operation branch in the conservation law itself.
+        #[derive(Copy, Clone, Debug)]
+        struct EvidenceBatching;
 
-    impl<C: Context<Type = ArrayType>> BatchingPolicy<C> for EvidenceBatching {
-        type Batch = ArrayBatch<C::Value>;
-        type Extent = usize;
-        type Evidence = Vec<&'static str>;
-        type BatchedProgram = BoundaryPreservingBatchedProgram<C::Constant, C::Operation>;
+        impl<C: Context<Type = ArrayType>> BatchingPolicy<C> for EvidenceBatching {
+            type Batch = ArrayBatch<C::Value>;
+            type Extent = usize;
+            type Evidence = Vec<&'static str>;
+            type BatchedProgram = BoundaryPreservingBatchedProgram<C::Constant, C::Operation>;
 
-        fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
-            <StaticArrayBatchingPolicy as BatchingPolicy<C>>::batch(value, batch_axis)
-        }
+            fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
+                <StaticArrayBatchingPolicy as BatchingPolicy<C>>::batch(value, batch_axis)
+            }
 
-        fn replicated(value: C::Value) -> Self::Batch {
-            <StaticArrayBatchingPolicy as BatchingPolicy<C>>::replicated(value)
-        }
+            fn replicated(value: C::Value) -> Self::Batch {
+                <StaticArrayBatchingPolicy as BatchingPolicy<C>>::replicated(value)
+            }
 
-        fn value(batch: &Self::Batch) -> &C::Value {
-            batch.value()
-        }
+            fn value(batch: &Self::Batch) -> &C::Value {
+                batch.value()
+            }
 
-        fn batch_axis(batch: &Self::Batch) -> BatchAxis {
-            batch.batch_axis()
-        }
+            fn batch_axis(batch: &Self::Batch) -> BatchAxis {
+                batch.batch_axis()
+            }
 
-        fn unbatched_type(batch: &Self::Batch) -> Cow<'_, C::Type> {
-            Cow::Owned(batch.unbatched_type())
-        }
+            fn unbatched_type(batch: &Self::Batch) -> Cow<'_, C::Type> {
+                Cow::Owned(batch.unbatched_type())
+            }
 
-        fn validate_operation_outputs(
-            operation_name: &'static str,
-            _inputs: &[Self::Batch],
-            _outputs: &[Self::Batch],
-            evidence: &Self::Evidence,
-        ) -> Result<(), BatchingError> {
-            if evidence.contains(&operation_name) {
-                Ok(())
-            } else {
-                Err(BatchingError::UnsupportedOperation {
-                    message: format!("operation `{operation_name}` supplied no batching evidence"),
-                })
+            fn validate_operation_outputs(
+                operation_name: &'static str,
+                _inputs: &[Self::Batch],
+                _outputs: &[Self::Batch],
+                evidence: &Self::Evidence,
+            ) -> Result<(), BatchingError> {
+                if evidence.contains(&operation_name) {
+                    Ok(())
+                } else {
+                    Err(BatchingError::UnsupportedOperation {
+                        message: format!("operation `{operation_name}` supplied no batching evidence"),
+                    })
+                }
+            }
+
+            fn adapt_batched_program<
+                CollapseFn: Fn(
+                    &TracingContext<C::Constant, C::Operation>,
+                    Tracer<TracingContext<C::Constant, C::Operation>>,
+                    Axis,
+                ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError>,
+            >(
+                program: Self::BatchedProgram,
+                required_output_axes: Option<&[BatchAxis]>,
+                collapse_fn: CollapseFn,
+            ) -> Result<BoundaryPreservingBatchedProgram<C::Constant, C::Operation>, BatchingError> {
+                <StaticArrayBatchingPolicy as BatchingPolicy<C>>::adapt_batched_program(
+                    program,
+                    required_output_axes,
+                    collapse_fn,
+                )
             }
         }
 
-        fn adapt_batched_program<
-            CollapseFn: Fn(
-                &TracingContext<C::Constant, C::Operation>,
-                Tracer<TracingContext<C::Constant, C::Operation>>,
-                Axis,
-            ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError>,
-        >(
-            program: Self::BatchedProgram,
-            required_output_axes: Option<&[BatchAxis]>,
-            collapse_fn: CollapseFn,
-        ) -> Result<BoundaryPreservingBatchedProgram<C::Constant, C::Operation>, BatchingError> {
-            <StaticArrayBatchingPolicy as BatchingPolicy<C>>::adapt_batched_program(
-                program,
-                required_output_axes,
-                collapse_fn,
-            )
-        }
-    }
+        impl<C: Context<Type = ArrayType>> RecursiveBatchingPolicy<C> for EvidenceBatching {
+            fn batch_region(
+                _context: &BatchingContext<C, Self>,
+                _region: RegionRef<'_, C::Constant, C::Operation>,
+                _inputs: Vec<Self::Batch>,
+            ) -> Result<Vec<Self::Batch>, BatchingError> {
+                Err(BatchingError::UnsupportedOperation { message: "the evidence fixture has no regions".to_string() })
+            }
 
-    impl<C: Context<Type = ArrayType>> RecursiveBatchingPolicy<C> for EvidenceBatching {
-        fn batch_region(
-            _context: &BatchingContext<C, Self>,
-            _region: RegionRef<'_, C::Constant, C::Operation>,
-            _inputs: Vec<Self::Batch>,
-        ) -> Result<Vec<Self::Batch>, BatchingError> {
-            Err(BatchingError::UnsupportedOperation { message: "the evidence fixture has no regions".to_string() })
+            fn batch_program(
+                _context: &BatchingContext<C, Self>,
+                _region: RegionRef<'_, C::Constant, C::Operation>,
+                _input_axes: &[BatchAxis],
+                _output_axes_policy: ProgramBatchingOutputAxesPolicy,
+            ) -> Result<Self::BatchedProgram, BatchingError> {
+                Err(BatchingError::UnsupportedOperation { message: "the evidence fixture has no regions".to_string() })
+            }
         }
 
-        fn batch_program(
-            _context: &BatchingContext<C, Self>,
-            _region: RegionRef<'_, C::Constant, C::Operation>,
-            _input_axes: &[BatchAxis],
-            _output_axes_policy: ProgramBatchingOutputAxesPolicy,
-        ) -> Result<Self::BatchedProgram, BatchingError> {
-            Err(BatchingError::UnsupportedOperation { message: "the evidence fixture has no regions".to_string() })
+        // Identity rule attesting to `add` alone, so one context exercises both the attested and the silent transition.
+        impl<C: Context<Type = ArrayType>> BatchableOperation<C, EvidenceBatching> for ArrayOperation<C::Value> {
+            fn batch<D: BatchingDriver<C, EvidenceBatching>>(
+                &self,
+                _context: &BatchingContext<C, EvidenceBatching>,
+                _driver: &D,
+                inputs: &[ArrayBatch<C::Value>],
+            ) -> Result<BatchedOutputs<C, EvidenceBatching>, BatchingError>
+            where
+                Self: Operation<Type = C::Type>,
+            {
+                let evidence = match self.name() {
+                    name @ "add" => vec![name],
+                    _ => Vec::new(),
+                };
+                Ok(BatchedOutputs::new(inputs.to_vec(), evidence))
+            }
         }
-    }
 
-    // Identity rule attesting to `add` alone, so one context exercises both the attested and the silent transition.
-    impl<C: Context<Type = ArrayType>> BatchableOperation<C, EvidenceBatching> for ArrayOperation<C::Value> {
-        fn batch<D: BatchingDriver<C, EvidenceBatching>>(
-            &self,
-            _context: &BatchingContext<C, EvidenceBatching>,
-            _driver: &D,
-            inputs: &[ArrayBatch<C::Value>],
-        ) -> Result<BatchedOutputs<C, EvidenceBatching>, BatchingError>
-        where
-            Self: Operation<Type = C::Type>,
-        {
-            let evidence = match self.name() {
-                name @ "add" => vec![name],
-                _ => Vec::new(),
-            };
-            Ok(BatchedOutputs::new(inputs.to_vec(), evidence))
-        }
-    }
-
-    #[test]
-    fn test_operation_evidence_reaches_validation_and_does_not_outlive_its_rule() {
         type Parent = EagerContext<Array, ArrayOperation<Array>>;
         let context = BatchingContext::<Parent, EvidenceBatching>::with_policy(Parent::new(), 2);
         let input = BatchingTracer::new(context.clone(), ArrayBatch::replicated(Array::scalar(1.0_f32)));

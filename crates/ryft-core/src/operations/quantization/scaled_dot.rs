@@ -1,3 +1,5 @@
+use crate::differentiation::{DifferentiationContext, DifferentiationPolicy};
+
 use super::*;
 
 /// Canonical operation name for [`ScaledDotOperation`].
@@ -285,9 +287,9 @@ impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for ScaledDotOpera
 where
     C::Operation: From<ScaledDotOperation>,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        _context: &C,
+        _context: &DifferentiationContext<C, P>,
         _driver: &D,
         _inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {

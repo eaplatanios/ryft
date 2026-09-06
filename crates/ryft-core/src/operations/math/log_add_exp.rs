@@ -138,7 +138,7 @@ impl_differentiable_operation! {
             + ElementwiseDerivativeAlignment<C::Type>,
         <C::Value as Value>::DispatchDomain: Fill<f64, C::Value>,
     {
-        |_operation, _context, _driver, inputs| {
+        |_operation, context, _driver, inputs| {
             // The partial derivative with respect to each operand is the softmax weight `exp(x - log_add_exp(a, b))`,
             // so the tangent is `w_a · da + w_b · db`. Both weights are formed against the shared primal output, which
             // is therefore computed once. Following JAX's `_logaddexp_jvp`, every operand and the primal output pass
@@ -165,6 +165,8 @@ impl_differentiable_operation! {
                 }
                 .into());
             }
+            let output_primal = primal;
+            let primal = context.primal_to_tangent(output_primal.clone())?;
             let aligned_primal = primal.align_tangent(&target, &primal)?;
             let infinity = aligned_primal.dispatch_domain().fill(&target, f64::INFINITY)?;
             let replace_infinity = |value: C::Value| -> Result<C::Value, DifferentiationError> {
@@ -176,7 +178,7 @@ impl_differentiable_operation! {
                 .tangent()
                 .as_value()
                 .map(|tangent| {
-                    let operand = replace_infinity(left.primal().align_tangent(&target, &primal)?)?;
+                    let operand = replace_infinity(context.primal_to_tangent(left.primal().clone())?.align_tangent(&target, &primal)?)?;
                     let weight = (operand - output_exponent.clone()).exp()?;
                     Ok::<_, DifferentiationError>(weight * tangent.align_tangent(&target, &primal)?)
                 })
@@ -185,7 +187,7 @@ impl_differentiable_operation! {
                 .tangent()
                 .as_value()
                 .map(|tangent| {
-                    let operand = replace_infinity(right.primal().align_tangent(&target, &primal)?)?;
+                    let operand = replace_infinity(context.primal_to_tangent(right.primal().clone())?.align_tangent(&target, &primal)?)?;
                     let weight = (operand - output_exponent.clone()).exp()?;
                     Ok::<_, DifferentiationError>(weight * tangent.align_tangent(&target, &primal)?)
                 })
@@ -195,7 +197,7 @@ impl_differentiable_operation! {
                 .chain(right_term)
                 .reduce(|left_term, right_term| left_term + right_term)
                 .map_or_else(|| MaybeZero::Zero(target), MaybeZero::Value);
-            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+            Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
         }
     },
     transpose = @nonlinear,

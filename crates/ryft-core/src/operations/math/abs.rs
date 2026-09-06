@@ -65,7 +65,7 @@ impl_differentiable_operation! {
             + std::ops::Div<Output = C::Value>
             + ElementwiseDerivativeAlignment<C::Type>,
     {
-        |_operation, _context, _driver, inputs| {
+        |_operation, context, _driver, inputs| {
             // Away from zero, the real derivative is `d|x| = sign(x) · dx`, while the complex magnitude is a ℂ → ℝ map
             // with `d|z| = Re(z̄ · dz) / |z|`. At the real origin, choose the right derivative and return `dx`. At the
             // complex origin, replace the zero denominator with one so the zero numerator yields zero. These
@@ -84,6 +84,8 @@ impl_differentiable_operation! {
                     .into());
                 }
                 MaybeZero::Value(tangent) => {
+                    let primal = context.primal_to_tangent(primal.clone())?;
+                    let input_primal = context.primal_to_tangent(input.primal().clone())?;
                     if input.primal().r#type().is_complex() {
                         let denominator = primal.align_tangent(&primal_tangent_type, &primal)?;
                         let zero = denominator.zero_like()?;
@@ -93,15 +95,15 @@ impl_differentiable_operation! {
                         // Normalize `conj(z) / |z|` before multiplying by `dz`. Computing `conj(z) * dz` first is
                         // algebraically equivalent but can overflow even when the final directional derivative is
                         // finite.
-                        let conjugate = input.primal().conjugate()?;
+                        let conjugate = input_primal.conjugate()?;
                         let real = conjugate.real()? / denominator.clone();
                         let imaginary = conjugate.imaginary()? / denominator.clone();
                         let coefficient = real.complex(&imaginary)?;
                         let input_tangent_type = input.primal().r#type().tangent()?;
-                        let tangent = tangent.align_tangent(&input_tangent_type, input.primal())?;
+                        let tangent = tangent.align_tangent(&input_tangent_type, &input_primal)?;
                         MaybeZero::Value((tangent * coefficient).real()?.align_tangent(&primal_tangent_type, &primal)?)
                     } else {
-                        let input = input.primal().align_tangent(&primal_tangent_type, &primal)?;
+                        let input = input_primal.align_tangent(&primal_tangent_type, &primal)?;
                         let tangent = tangent.align_tangent(&primal_tangent_type, &primal)?;
                         let zero = input.zero_like()?;
                         let non_negative = input.compare(&zero, ComparisonDirection::GreaterThanOrEqual)?;

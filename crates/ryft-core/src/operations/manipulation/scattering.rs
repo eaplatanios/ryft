@@ -11,9 +11,10 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    ElementwiseDerivativeAlignment, MemberDifferentiableOperation, ResidualZeroProvider, TransposableOperation,
-    TranspositionContext, TranspositionDriver, jvp_projected_operation,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment, MemberDifferentiableOperation,
+    ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver, jvp_projected_operation,
+    primal_to_tangent_duals,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -414,9 +415,9 @@ where
     C::Operation: From<ScatterOperation>,
     C::Value: Scatter,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -439,9 +440,13 @@ where
         } else {
             // One of the two linear tangents may still be a structural zero; scatter-add needs both as real values,
             // so materialize the zero side before staging the tangent scatter.
-            let operand_tangent = operand.tangent().clone().materialize(context)?;
-            let updates_tangent = updates.tangent().clone().materialize(context)?;
-            MaybeZero::Value(operand_tangent.scatter(indices, &updates_tangent, self)?)
+            let operand_tangent = operand.tangent().clone().materialize(context.tangent())?;
+            let updates_tangent = updates.tangent().clone().materialize(context.tangent())?;
+            MaybeZero::Value(operand_tangent.scatter(
+                &context.primal_to_tangent(indices.clone())?,
+                &updates_tangent,
+                self,
+            )?)
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
@@ -573,13 +578,15 @@ where
         + From<ZeroLikeOperation<ArrayType>>
         + From<ZeroOperation<ArrayType>>,
 {
-    fn jvp_in_parent<D: DifferentiationDriver<C>>(
+    fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        let [operand, indices, updates] = inputs else {
+        let destinations = context;
+        let context = destinations.primal();
+        let [operand, _, updates] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 3, actual: inputs.len() }.into());
         };
         let operand_type = <&ArrayType>::try_from(operand.primal().r#type().as_ref())?.clone();
@@ -589,11 +596,19 @@ where
         };
         let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
         if is_static(&operand_type) && is_static(&updates_type) {
-            return jvp_projected_operation(context, &operation, inputs);
+            return jvp_projected_operation(destinations, &operation, inputs);
         }
 
         let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         let primal = context.bind(operation.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
+        let output_primal = primal;
+        let primal = destinations.primal_to_tangent(output_primal.clone())?;
+        let tangent_inputs = primal_to_tangent_duals(destinations, inputs)?;
+        let inputs = tangent_inputs.as_slice();
+        let operand = &inputs[0];
+        let indices = &inputs[1];
+        let updates = &inputs[2];
+        let context = destinations.tangent();
         let tangent = if operand.tangent().is_zero() && updates.tangent().is_zero() {
             MaybeZero::Zero(primal.r#type().tangent()?)
         } else if self.kind() != ScatterReductionKind::Add {
@@ -620,7 +635,7 @@ where
             ];
             MaybeZero::Value(context.bind(operation, Vec::new(), tangent_inputs.as_slice())?.remove(0))
         };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        Ok(vec![DifferentiationDual::new(output_primal, tangent)?])
     }
 }
 

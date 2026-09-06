@@ -120,7 +120,9 @@ mod tests {
         ShardingDimension,
     };
     use crate::contexts::EagerContext;
-    use crate::differentiation::{DifferentiableOperation, DifferentiationDual, differentiate_at};
+    use crate::differentiation::{
+        DifferentiableOperation, DifferentiationContext, DifferentiationDual, differentiate_at,
+    };
     use crate::interpretation::InterpretableOperation;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -298,7 +300,7 @@ mod tests {
         let smallest_positive = f64::from_bits(1);
         let outputs = DivOperation::<ArrayType>::new()
             .jvp(
-                &context,
+                &DifferentiationContext::new(context.clone()),
                 &EmptyRegionDriver,
                 &[
                     DifferentiationDual::new(Array::scalar(0.0), Array::scalar(smallest_positive)).unwrap(),
