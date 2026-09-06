@@ -1424,29 +1424,26 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeRegionResult<V, O
     }
 }
 
-// TODO(eaplatanios): Review this.
-/// Transitive reference-access summary of one region closure, expressed in the caller allocations its boundary names.
+/// Transitive reference-access summary of a [`Region`](crate::Region) closure, expressed in the caller allocations
+/// its boundary names. This is the analysis a structured rule needs before it can size its state boundary, and it is
+/// computed entirely from generic hooks (i.e., operation-local [`Operation::effects`], the input- and output-region
+/// provenance hooks, reference-output identity, and recursive summaries of nested regions). Allocations allocated
+/// inside the closure are deliberately absent as they belong to no caller and cross no boundary.
 ///
-/// This is the analysis a structured rule needs before it can size its state boundary, and it is computed entirely
-/// from generic hooks: operation-local [`Operation::effects`], the input- and output-region provenance
-/// hooks, reference-output identity, and recursive summaries of nested regions. Allocations allocated inside the
-/// closure are deliberately absent: they belong to no caller and cross no boundary.
-///
-/// The summary separates reachability from semantic access. The reached set holds every caller allocation the
-/// closure's replay must be able to resolve, including a capture constant that is only rematerialized and passed
-/// along, and is what sizes the state boundary through
-/// [`boundary_widening`](ReferenceDischargeContext::boundary_widening).
+/// The summary separates reachability from semantic access. The reached set holds every caller allocation the closure's
+/// replay must be able to resolve, including a capture constant that is only rematerialized and passed along, and is
+/// what sizes the state boundary through [`boundary_widening`](ReferenceDischargeContext::boundary_widening).
 /// [`accessed_allocations`](Self::accessed_allocations) and [`access_modes`](Self::access_modes) hold only the
 /// allocations the closure semantically accesses, which is what region access policies validate. Sizing a boundary
 /// from the accessed allocations would under-thread merely-forwarded captures.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReferenceDischargeRegionSummary {
     /// Refer to the documentation of [`Self::reached_allocations`].
-    reached: BTreeSet<ReferenceDischargeAllocationId>,
+    reached_allocations: BTreeSet<ReferenceDischargeAllocationId>,
 
     /// Every caller allocation the closure accesses, mapped to its exact non-consuming access modes. Refer to the
-    /// documentation of [`Self::accessed_allocations`] and [`Self::access_modes`].
-    accesses: BTreeMap<ReferenceDischargeAllocationId, BTreeSet<ReferenceAccessMode>>,
+    /// documentation of [`Self::accessed_allocations`] and [`Self::access_modes`] for more information.
+    accessed_allocations: BTreeMap<ReferenceDischargeAllocationId, BTreeSet<ReferenceAccessMode>>,
 
     /// Refer to the documentation of [`Self::output_allocations`].
     output_allocations: Vec<Option<ReferenceDischargeAllocationId>>,
@@ -1536,7 +1533,7 @@ impl ReferenceDischargeRegionSummary {
             {
                 allocations.insert(atom_id, Some(allocation));
                 if materialized_atoms.contains(&atom_id) {
-                    summary.reached.insert(allocation);
+                    summary.reached_allocations.insert(allocation);
                 }
             }
         }
@@ -1718,11 +1715,11 @@ impl ReferenceDischargeRegionSummary {
                 None => None,
             });
         }
-        summary.reached.extend(summary.output_allocations.iter().copied().flatten());
+        summary.reached_allocations.extend(summary.output_allocations.iter().copied().flatten());
 
         // Every exact access mode the closure performs is held to the region access policy that the owning operation
         // declares for this region.
-        for (allocation, modes) in &summary.accesses {
+        for (allocation, modes) in &summary.accessed_allocations {
             for mode in modes {
                 if !operation.allows_reference_access_through_region_input(region_index, *mode) {
                     return Err(ProgramError::MalformedProgram(format!(
@@ -1739,13 +1736,13 @@ impl ReferenceDischargeRegionSummary {
     /// semantically accessed, in canonical allocation order.
     #[inline]
     pub fn reached_allocations(&self) -> impl Iterator<Item = ReferenceDischargeAllocationId> + '_ {
-        self.reached.iter().copied()
+        self.reached_allocations.iter().copied()
     }
 
     /// Returns every caller allocation the closure accesses, in canonical allocation order.
     #[inline]
     pub fn accessed_allocations(&self) -> impl Iterator<Item = ReferenceDischargeAllocationId> + '_ {
-        self.accesses.keys().copied()
+        self.accessed_allocations.keys().copied()
     }
 
     /// Returns the exact access modes recorded for `allocation`, in [`ReferenceAccessMode`] declaration order.
@@ -1754,7 +1751,7 @@ impl ReferenceDischargeRegionSummary {
         &self,
         allocation: ReferenceDischargeAllocationId,
     ) -> impl Iterator<Item = ReferenceAccessMode> + '_ {
-        self.accesses.get(&allocation).into_iter().flatten().copied()
+        self.accessed_allocations.get(&allocation).into_iter().flatten().copied()
     }
 
     /// Returns the caller allocation each declared region output denotes, or [`None`] where the output is a value. A
@@ -1789,9 +1786,9 @@ impl ReferenceDischargeRegionSummary {
     /// An operation whose regions must agree on them, such as a condition, has that agreement checked against the
     /// rebuilt regions themselves.
     pub fn merge(&mut self, other: &Self) {
-        self.reached.extend(other.reached.iter().copied());
-        for (allocation, modes) in &other.accesses {
-            self.accesses.entry(*allocation).or_default().extend(modes.iter().copied());
+        self.reached_allocations.extend(other.reached_allocations.iter().copied());
+        for (allocation, modes) in &other.accessed_allocations {
+            self.accessed_allocations.entry(*allocation).or_default().extend(modes.iter().copied());
         }
     }
 
@@ -1816,8 +1813,8 @@ impl ReferenceDischargeRegionSummary {
                 "reference discharge cannot pass {allocation} into a region that consumes it through `{operation}`",
             )));
         }
-        self.reached.insert(allocation);
-        self.accesses.entry(allocation).or_default().insert(mode);
+        self.reached_allocations.insert(allocation);
+        self.accessed_allocations.entry(allocation).or_default().insert(mode);
         Ok(())
     }
 }
