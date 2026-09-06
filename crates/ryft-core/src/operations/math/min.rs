@@ -121,29 +121,7 @@ mod tests {
 
     #[test]
     fn test_min() {
-        assert_eq!(Array::scalar(2i32).min(&Array::scalar(5i32)).unwrap(), Array::scalar(2i32));
-        assert_eq!(Array::scalar(-2i64).min(&Array::scalar(-5i64)).unwrap(), Array::scalar(-5i64));
-        assert_eq!(Array::scalar(3u32).min(&Array::scalar(7u32)).unwrap(), Array::scalar(3u32));
-        assert_eq!(Array::scalar(2.5f32).min(&Array::scalar(1.5f32)).unwrap(), Array::scalar(1.5f32));
-        // Mixed-precision operands promote before comparing.
-        assert_eq!(Array::scalar(2.5f32).min(&Array::scalar(3.5f64)).unwrap(), Array::scalar(2.5f64));
-        assert_eq!(
-            Array::scalar(bf16::from_f32(2.0)).min(&Array::scalar(bf16::from_f32(3.0))).unwrap(),
-            Array::scalar(bf16::from_f32(2.0)),
-        );
-        assert_eq!(
-            Array::scalar(f16::from_f32(2.0)).min(&Array::scalar(f16::from_f32(3.0))).unwrap(),
-            Array::scalar(f16::from_f32(2.0)),
-        );
-        // NaNs propagate and `-0.0` orders below `+0.0`.
-        assert!(Array::scalar(f64::NAN).min(&Array::scalar(1.0f64)).unwrap().to_f64s()[0].is_nan());
-        assert!(Array::scalar(1.0f64).min(&Array::scalar(f64::NAN)).unwrap().to_f64s()[0].is_nan());
-        let zero = Array::scalar(-0.0f64).min(&Array::scalar(0.0f64)).unwrap().to_f64s()[0];
-        assert!(zero == 0.0 && zero.is_sign_negative());
-        assert_eq!(
-            Array::vector(vec![0.7, -1.0]).min(&Array::vector(vec![0.3, 2.0])).unwrap(),
-            Array::vector(vec![0.3, -1.0]),
-        );
+        assert_eq!(MinOperation::<ArrayType>::new().to_string(), "min");
     }
 
     #[test]
@@ -170,6 +148,42 @@ mod tests {
             @reject @unreduced,
             operation = MinOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_min_interpretation() {
+        assert_eq!(Array::scalar(2i32).min(&Array::scalar(5i32)).unwrap(), Array::scalar(2i32));
+        assert_eq!(Array::scalar(-2i64).min(&Array::scalar(-5i64)).unwrap(), Array::scalar(-5i64));
+        assert_eq!(Array::scalar(3u32).min(&Array::scalar(7u32)).unwrap(), Array::scalar(3u32));
+        assert_eq!(Array::scalar(2.5f32).min(&Array::scalar(1.5f32)).unwrap(), Array::scalar(1.5f32));
+        // Mixed-precision operands promote before comparing.
+        assert_eq!(Array::scalar(2.5f32).min(&Array::scalar(3.5f64)).unwrap(), Array::scalar(2.5f64));
+        assert_eq!(
+            Array::scalar(bf16::from_f32(2.0)).min(&Array::scalar(bf16::from_f32(3.0))).unwrap(),
+            Array::scalar(bf16::from_f32(2.0)),
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(2.0)).min(&Array::scalar(f16::from_f32(3.0))).unwrap(),
+            Array::scalar(f16::from_f32(2.0)),
+        );
+        // NaNs propagate and `-0.0` orders below `+0.0`.
+        assert!(Array::scalar(f64::NAN).min(&Array::scalar(1.0f64)).unwrap().to_f64s()[0].is_nan());
+        assert!(Array::scalar(1.0f64).min(&Array::scalar(f64::NAN)).unwrap().to_f64s()[0].is_nan());
+        let zero = Array::scalar(-0.0f64).min(&Array::scalar(0.0f64)).unwrap().to_f64s()[0];
+        assert!(zero == 0.0 && zero.is_sign_negative());
+        assert_eq!(
+            Array::vector(vec![0.7, -1.0]).min(&Array::vector(vec![0.3, 2.0])).unwrap(),
+            Array::vector(vec![0.3, -1.0]),
+        );
+    }
+
+    #[test]
+    fn test_min_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = MinOperation::new(),
+            inputs = [Array::scalar(0.7), Array::scalar(0.3)],
+            expected = Array::scalar(0.3),
         );
     }
 
@@ -237,15 +251,6 @@ mod tests {
             .interpret(vec![Array::scalar(2.0), Array::scalar(2.0), Array::scalar(3.0), Array::scalar(5.0)])
             .unwrap();
         assert_eq!(outputs, vec![Array::scalar(2.0), Array::scalar(3.0)]);
-    }
-
-    #[test]
-    fn test_min_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = MinOperation::new(),
-            inputs = [Array::scalar(0.7), Array::scalar(0.3)],
-            expected = Array::scalar(0.3),
-        );
     }
 
     #[test]

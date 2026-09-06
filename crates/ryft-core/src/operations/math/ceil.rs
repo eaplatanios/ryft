@@ -54,21 +54,14 @@ mod tests {
     use crate::arrays::{Array, ArrayType, DataType};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
-        check_operation_type_inference,
+        check_operation_transposition, check_operation_type_inference,
     };
 
     use super::*;
 
     #[test]
     fn test_ceil() {
-        assert_eq!(Array::scalar(2.3f32).ceil().unwrap(), Array::scalar(3.0f32));
-        assert_eq!(Array::scalar(-2.7f64).ceil().unwrap(), Array::scalar(-2.0f64));
-        assert_eq!(Array::scalar(bf16::from_f32(2.3)).ceil().unwrap(), Array::scalar(bf16::from_f32(2.3f32.ceil())),);
-        assert_eq!(Array::scalar(f16::from_f32(2.3)).ceil().unwrap(), Array::scalar(f16::from_f32(2.3f32.ceil())),);
-        // NaNs pass through unchanged.
-        assert!(Array::scalar(f64::NAN).ceil().unwrap().to_f64s()[0].is_nan());
-
-        assert_eq!(Array::vector(vec![0.7, 1.0, -1.5]).ceil().unwrap(), Array::vector(vec![1.0, 1.0, -1.0]),);
+        assert_eq!(CeilOperation::<ArrayType>::new().to_string(), "ceil");
     }
 
     #[test]
@@ -95,6 +88,27 @@ mod tests {
             @reject @unreduced,
             operation = CeilOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_ceil_interpretation() {
+        assert_eq!(Array::scalar(2.3f32).ceil().unwrap(), Array::scalar(3.0f32));
+        assert_eq!(Array::scalar(-2.7f64).ceil().unwrap(), Array::scalar(-2.0f64));
+        assert_eq!(Array::scalar(bf16::from_f32(2.3)).ceil().unwrap(), Array::scalar(bf16::from_f32(2.3f32.ceil())),);
+        assert_eq!(Array::scalar(f16::from_f32(2.3)).ceil().unwrap(), Array::scalar(f16::from_f32(2.3f32.ceil())),);
+        // NaNs pass through unchanged.
+        assert!(Array::scalar(f64::NAN).ceil().unwrap().to_f64s()[0].is_nan());
+
+        assert_eq!(Array::vector(vec![0.7, 1.0, -1.5]).ceil().unwrap(), Array::vector(vec![1.0, 1.0, -1.0]),);
+    }
+
+    #[test]
+    fn test_ceil_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = CeilOperation::new(),
+            inputs = [Array::scalar(2.3)],
+            expected = Array::scalar(3.0),
         );
     }
 
@@ -126,11 +140,15 @@ mod tests {
     }
 
     #[test]
-    fn test_ceil_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = CeilOperation::new(),
-            inputs = [Array::scalar(2.3)],
-            expected = Array::scalar(3.0),
+    fn test_ceil_transposition() {
+        check_operation_transposition!(
+            @exact,
+            operation = CeilOperation::<ArrayType>::new(),
+            cases = [{
+                inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
+                output_cotangents = [Array::scalar(3.0)],
+                input_cotangents = [Array::scalar(0.0)],
+            }],
         );
     }
 

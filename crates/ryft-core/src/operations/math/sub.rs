@@ -102,35 +102,7 @@ mod tests {
 
     #[test]
     fn test_sub() {
-        let operation = SubOperation::<ArrayType>::new();
-
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Array::scalar(2.0f32), Array::scalar(3.5f64)],
-            ),
-            Ok(vec![Array::scalar(-1.5f64)])
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &SubOperation::<ArrayType>::new(),
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Array::scalar(2.0), Array::scalar(3.5)],
-            ),
-            Ok(vec![Array::scalar(-1.5)]),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Array::scalar(Complex::new(1.0f64, 2.0)), Array::scalar(Complex::new(0.5f64, -1.0))],
-            ),
-            Ok(vec![Array::scalar(Complex::new(0.5f64, 3.0))]),
-        );
+        assert_eq!(SubOperation::<ArrayType>::new().to_string(), "sub");
     }
 
     #[test]
@@ -187,6 +159,48 @@ mod tests {
     }
 
     #[test]
+    fn test_sub_interpretation() {
+        let operation = SubOperation::<ArrayType>::new();
+
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(2.0f32), Array::scalar(3.5f64)],
+            ),
+            Ok(vec![Array::scalar(-1.5f64)])
+        );
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &SubOperation::<ArrayType>::new(),
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(2.0), Array::scalar(3.5)],
+            ),
+            Ok(vec![Array::scalar(-1.5)]),
+        );
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(Complex::new(1.0f64, 2.0)), Array::scalar(Complex::new(0.5f64, -1.0))],
+            ),
+            Ok(vec![Array::scalar(Complex::new(0.5f64, 3.0))]),
+        );
+    }
+
+    #[test]
+    fn test_sub_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = SubOperation::new(),
+            inputs = [Array::scalar(2.0), Array::scalar(3.5)],
+            expected = Array::scalar(-1.5),
+        );
+    }
+
+    #[test]
     fn test_sub_batching() {
         check_operation_batching!(
             @approx(epsilon = 1e-9),
@@ -219,15 +233,6 @@ mod tests {
                     in (%4, %5)
                 "},
             }],
-        );
-    }
-
-    #[test]
-    fn test_sub_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = SubOperation::new(),
-            inputs = [Array::scalar(2.0), Array::scalar(3.5)],
-            expected = Array::scalar(-1.5),
         );
     }
 

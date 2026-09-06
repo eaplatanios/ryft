@@ -67,16 +67,25 @@ impl_capability_for_primitive!(usize);
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, DataType};
+    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
+    use crate::contexts::EagerContext;
+    use crate::differentiation::{
+        DifferentiableOperation, DifferentiationDual, DifferentiationError, TransposableOperation, TranspositionContext,
+    };
     use crate::macros::{check_operation_batching, check_operation_partial_evaluation, check_operation_type_inference};
+    use crate::partial::PartialValue;
+    use crate::programs::{EmptyRegionDriver, MaybeZero, ProgramError};
+    use crate::tracing::TracingContext;
 
     use super::*;
 
     #[test]
     fn test_not() {
-        // Check the operation-specific eager value semantics.
-        assert_eq!((!Array::vector(vec![true, false, true])).elements::<bool>(), Ok(vec![false, true, false]));
+        assert_eq!(NotOperation::<ArrayType>::new().to_string(), "not");
+    }
 
+    #[test]
+    fn test_not_type_inference() {
         // Check the shared elementwise type-inference contract in both type universes.
         check_operation_type_inference!(
             @elementwise @unary,
@@ -86,7 +95,26 @@ mod tests {
                 output_data_types = [DataType::Boolean],
             }],
         );
+    }
 
+    #[test]
+    fn test_not_interpretation() {
+        // Check the operation-specific eager value semantics.
+        assert_eq!((!Array::vector(vec![true, false, true])).elements::<bool>(), Ok(vec![false, true, false]));
+    }
+
+    #[test]
+    fn test_not_partial_evaluation() {
+        // Check that known inputs fold and unknown inputs residualize.
+        check_operation_partial_evaluation!(
+            operation = NotOperation::new(),
+            inputs = [Array::scalar(true)],
+            expected = Array::scalar(false),
+        );
+    }
+
+    #[test]
+    fn test_not_batching() {
         // Check mapped and replicated batching behavior.
         check_operation_batching!(
             @exact,
@@ -103,13 +131,40 @@ mod tests {
                 },
             ],
         );
+    }
 
-        // Check that known inputs fold and unknown inputs residualize.
-        check_operation_partial_evaluation!(
-            operation = NotOperation::new(),
-            inputs = [Array::scalar(true)],
-            expected = Array::scalar(false),
+    #[test]
+    fn test_not_differentiation() {
+        let outputs = NotOperation::<ArrayType>::new()
+            .jvp(
+                &EagerContext::<Array, ArrayOperation<Array>>::new(),
+                &EmptyRegionDriver,
+                &[DifferentiationDual::new_with_zero_tangent(Array::scalar(true)).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].primal(), &Array::scalar(false));
+        assert!(
+            matches!(outputs[0].tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::Zero))
         );
+    }
+
+    #[test]
+    fn test_not_transposition() {
+        // Program transposition elides zero-space Boolean cotangents, so check the primitive's rejection directly.
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        assert!(matches!(
+            NotOperation::<ArrayType>::new().transpose(
+                &mut TranspositionContext::new(context),
+                &EmptyRegionDriver,
+                &[
+                    PartialValue::Unknown(ArrayType::scalar(DataType::Boolean)),
+                ],
+                &[MaybeZero::Zero(ArrayType::scalar(DataType::Zero))],
+            ),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "operation `not` is not transposable",
+        ));
     }
 
     #[test]

@@ -31,69 +31,6 @@ use crate::programs::{
 /// Canonical operation name for [`DimensionSizeOperation`].
 pub const DIMENSION_SIZE_OPERATION_NAME: &str = "dimension_size";
 
-/// Reads the runtime extent of one array axis.
-///
-/// This is the equivalent of using an array shape component such as `x.shape[axis]`. The concrete representation is
-/// selected by `Output`: a materialized array backend can return its host extent, while a composite program value
-/// returns a dimension SSA value that can be passed explicitly to shape-carrying operations and combined with other
-/// dimension operations. A program result is not an integer array; convert it to ordinary scalar data explicitly when
-/// a numerical computation needs the extent as data.
-///
-/// In a composite trace, the capability works both on the outer array member and on a
-/// [`ProjectedValue<ArrayType, V>`]. The projected form stages into and returns the parent composite carrier, allowing
-/// an array operation result to feed shape computation without exposing an adapter conversion in user code.
-///
-/// Negative axes index from the final array axis. A dynamic selected axis preserves its existing
-/// [`DimensionVariable`], while a static selected axis produces a fresh dimension with exact bounds.
-///
-/// # Example
-///
-/// ```rust
-/// # use ryft_core::{ArrayIrValue, DimensionSize, ProgramError};
-/// # use ryft_core::arrays::Array;
-/// # fn main() -> Result<(), ProgramError> {
-/// let array = ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0; 6]));
-/// let columns = array.dimension_size(-1)?;
-/// let ArrayIrValue::Dimension(columns) = columns else {
-///     unreachable!("dimension_size always returns a dimension member");
-/// };
-/// assert_eq!(columns.extent(), 3);
-/// # Ok(())
-/// # }
-/// ```
-pub trait DimensionSize<Output = Self>: Typed + Sized {
-    /// Returns the runtime extent of `axis` in the representation selected by `Output`.
-    fn dimension_size<AxisValue: Into<Axis>>(&self, axis: AxisValue) -> Result<Output, ProgramError>;
-}
-
-impl<V: Value<Type = ArrayIrType>> DimensionSize<V> for V
-where
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<DimensionSizeOperation>,
-{
-    fn dimension_size<AxisValue: Into<Axis>>(&self, axis: AxisValue) -> Result<V, ProgramError> {
-        let r#type = self.r#type();
-        let input_type = <&ArrayType>::try_from(r#type.as_ref())?;
-        let operation = DimensionSizeOperation::new(input_type, axis)?;
-        Ok(self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?.remove(0))
-    }
-}
-
-impl<V: Value<Type = ArrayIrType>> DimensionSize<V> for ProjectedValue<ArrayType, V>
-where
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<DimensionSizeOperation>,
-{
-    fn dimension_size<AxisValue: Into<Axis>>(&self, axis: AxisValue) -> Result<V, ProgramError> {
-        let operation = DimensionSizeOperation::new(self.r#type().as_ref(), axis)?;
-        Ok(self
-            .value()
-            .dispatch_domain()
-            .bind(operation, Vec::new(), std::slice::from_ref(self.value()))?
-            .remove(0))
-    }
-}
-
 /// Mixed array-to-dimension operation used by [`DimensionSize`].
 ///
 /// Refer to [`DimensionSize`] for semantic details and an example.
@@ -254,8 +191,6 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>> Pa
 {
 }
 
-impl_reference_free_dischargeable_operation!(DimensionSizeOperation);
-
 // Batching reads the same logical array axis after accounting for an inserted packed batch axis. An ordinary static
 // or dynamic axis produces shared shape metadata and remains replicated. A bounded ragged axis instead returns its
 // per-item extent array as the mapped dimension carrier, preserving the logical dimension identity rather than
@@ -314,6 +249,71 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>> Ba
 
 impl_non_differentiable_operation!(DimensionSizeOperation);
 impl_non_transposable_operation!(DimensionSizeOperation);
+
+impl_reference_free_dischargeable_operation!(DimensionSizeOperation);
+
+/// Reads the runtime extent of one array axis.
+///
+/// This is the equivalent of using an array shape component such as `x.shape[axis]`. The concrete representation is
+/// selected by `Output`: a materialized array backend can return its host extent, while a composite program value
+/// returns a dimension SSA value that can be passed explicitly to shape-carrying operations and combined with other
+/// dimension operations. A program result is not an integer array; convert it to ordinary scalar data explicitly when
+/// a numerical computation needs the extent as data.
+///
+/// In a composite trace, the capability works both on the outer array member and on a
+/// [`ProjectedValue<ArrayType, V>`]. The projected form stages into and returns the parent composite carrier, allowing
+/// an array operation result to feed shape computation without exposing an adapter conversion in user code.
+///
+/// Negative axes index from the final array axis. A dynamic selected axis preserves its existing
+/// [`DimensionVariable`], while a static selected axis produces a fresh dimension with exact bounds.
+///
+/// # Example
+///
+/// ```rust
+/// # use ryft_core::{ArrayIrValue, DimensionSize, ProgramError};
+/// # use ryft_core::arrays::Array;
+/// # fn main() -> Result<(), ProgramError> {
+/// let array = ArrayIrValue::Array(Array::matrix(2, 3, vec![0.0; 6]));
+/// let columns = array.dimension_size(-1)?;
+/// let ArrayIrValue::Dimension(columns) = columns else {
+///     unreachable!("dimension_size always returns a dimension member");
+/// };
+/// assert_eq!(columns.extent(), 3);
+/// # Ok(())
+/// # }
+/// ```
+pub trait DimensionSize<Output = Self>: Typed + Sized {
+    /// Returns the runtime extent of `axis` in the representation selected by `Output`.
+    fn dimension_size<AxisValue: Into<Axis>>(&self, axis: AxisValue) -> Result<Output, ProgramError>;
+}
+
+impl<V: Value<Type = ArrayIrType>> DimensionSize<V> for V
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<DimensionSizeOperation>,
+{
+    fn dimension_size<AxisValue: Into<Axis>>(&self, axis: AxisValue) -> Result<V, ProgramError> {
+        let r#type = self.r#type();
+        let input_type = <&ArrayType>::try_from(r#type.as_ref())?;
+        let operation = DimensionSizeOperation::new(input_type, axis)?;
+        Ok(self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?.remove(0))
+    }
+}
+
+impl<V: Value<Type = ArrayIrType>> DimensionSize<V> for ProjectedValue<ArrayType, V>
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<DimensionSizeOperation>,
+{
+    fn dimension_size<AxisValue: Into<Axis>>(&self, axis: AxisValue) -> Result<V, ProgramError> {
+        let operation = DimensionSizeOperation::new(self.r#type().as_ref(), axis)?;
+        Ok(self
+            .value()
+            .dispatch_domain()
+            .bind(operation, Vec::new(), std::slice::from_ref(self.value()))?
+            .remove(0))
+    }
+}
 
 #[cfg(test)]
 mod tests {

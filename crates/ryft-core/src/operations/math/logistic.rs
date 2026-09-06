@@ -78,21 +78,7 @@ mod tests {
 
     #[test]
     fn test_logistic() {
-        assert_eq!(Array::scalar(0.5f32).logistic().unwrap(), Array::scalar(1.0 / (1.0 + (-0.5f32).exp())),);
-        assert_eq!(Array::scalar(0.5f64).logistic().unwrap(), Array::scalar(1.0 / (1.0 + (-0.5f64).exp())),);
-        assert_eq!(
-            Array::scalar(bf16::from_f32(0.5)).logistic().unwrap(),
-            Array::scalar(bf16::from_f32(1.0 / (1.0 + (-0.5f32).exp()))),
-        );
-        assert_eq!(
-            Array::scalar(f16::from_f32(0.5)).logistic().unwrap(),
-            Array::scalar(f16::from_f32(1.0 / (1.0 + (-0.5f32).exp()))),
-        );
-        let input = ComplexNumber::new(0.7f64, -0.3f64);
-        let expected = ComplexNumber::new(1.0, 0.0) / (ComplexNumber::new(1.0, 0.0) + (-input).exp());
-        assert_abs_diff_eq!(Array::scalar(input).logistic().unwrap(), Array::scalar(expected), epsilon = 1e-12);
-
-        assert_eq!(Array::scalar(0.7).logistic().unwrap(), Array::scalar(1.0 / (1.0 + (-0.7f64).exp())),);
+        assert_eq!(LogisticOperation::<ArrayType>::new().to_string(), "logistic");
     }
 
     #[test]
@@ -115,6 +101,34 @@ mod tests {
             @reject @unreduced,
             operation = LogisticOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_logistic_interpretation() {
+        assert_eq!(Array::scalar(0.5f32).logistic().unwrap(), Array::scalar(1.0 / (1.0 + (-0.5f32).exp())),);
+        assert_eq!(Array::scalar(0.5f64).logistic().unwrap(), Array::scalar(1.0 / (1.0 + (-0.5f64).exp())),);
+        assert_eq!(
+            Array::scalar(bf16::from_f32(0.5)).logistic().unwrap(),
+            Array::scalar(bf16::from_f32(1.0 / (1.0 + (-0.5f32).exp()))),
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(0.5)).logistic().unwrap(),
+            Array::scalar(f16::from_f32(1.0 / (1.0 + (-0.5f32).exp()))),
+        );
+        let input = ComplexNumber::new(0.7f64, -0.3f64);
+        let expected = ComplexNumber::new(1.0, 0.0) / (ComplexNumber::new(1.0, 0.0) + (-input).exp());
+        assert_abs_diff_eq!(Array::scalar(input).logistic().unwrap(), Array::scalar(expected), epsilon = 1e-12);
+
+        assert_eq!(Array::scalar(0.7).logistic().unwrap(), Array::scalar(1.0 / (1.0 + (-0.7f64).exp())),);
+    }
+
+    #[test]
+    fn test_logistic_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = LogisticOperation::new(),
+            inputs = [Array::scalar(0.7)],
+            expected = Array::scalar(1.0 / (1.0 + (-0.7f64).exp())),
         );
     }
 
@@ -164,15 +178,6 @@ mod tests {
                 .gradient(|input| { input.logistic().unwrap() })
                 .unwrap(),
             epsilon = 1e-12,
-        );
-    }
-
-    #[test]
-    fn test_logistic_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = LogisticOperation::new(),
-            inputs = [Array::scalar(0.7)],
-            expected = Array::scalar(1.0 / (1.0 + (-0.7f64).exp())),
         );
     }
 

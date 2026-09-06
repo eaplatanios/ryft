@@ -76,19 +76,7 @@ mod tests {
 
     #[test]
     fn test_sin() {
-        assert_eq!(Array::scalar(0.5f32).sin().unwrap(), Array::scalar(0.5f32.sin()));
-        assert_eq!(Array::scalar(0.5f64).sin().unwrap(), Array::scalar(0.5f64.sin()));
-        assert_eq!(Array::scalar(bf16::from_f32(0.5)).sin().unwrap(), Array::scalar(bf16::from_f32(0.5f32.sin())),);
-        assert_eq!(Array::scalar(f16::from_f32(0.5)).sin().unwrap(), Array::scalar(f16::from_f32(0.5f32.sin())),);
-        let extreme = Array::scalar(ComplexNumber::new(0.0f64, 1000.0))
-            .sin()
-            .unwrap()
-            .elements::<ComplexNumber<f64>>()
-            .unwrap()[0];
-        assert_eq!(extreme.re, 0.0);
-        assert!(extreme.im.is_infinite() && extreme.im.is_sign_positive());
-
-        assert_eq!(Array::scalar(0.5).sin().unwrap(), Array::scalar(0.5f64.sin()),);
+        assert_eq!(SinOperation::<ArrayType>::new().to_string(), "sin");
     }
 
     #[test]
@@ -111,6 +99,32 @@ mod tests {
             @reject @unreduced,
             operation = SinOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_sin_interpretation() {
+        assert_eq!(Array::scalar(0.5f32).sin().unwrap(), Array::scalar(0.5f32.sin()));
+        assert_eq!(Array::scalar(0.5f64).sin().unwrap(), Array::scalar(0.5f64.sin()));
+        assert_eq!(Array::scalar(bf16::from_f32(0.5)).sin().unwrap(), Array::scalar(bf16::from_f32(0.5f32.sin())),);
+        assert_eq!(Array::scalar(f16::from_f32(0.5)).sin().unwrap(), Array::scalar(f16::from_f32(0.5f32.sin())),);
+        let extreme = Array::scalar(ComplexNumber::new(0.0f64, 1000.0))
+            .sin()
+            .unwrap()
+            .elements::<ComplexNumber<f64>>()
+            .unwrap()[0];
+        assert_eq!(extreme.re, 0.0);
+        assert!(extreme.im.is_infinite() && extreme.im.is_sign_positive());
+
+        assert_eq!(Array::scalar(0.5).sin().unwrap(), Array::scalar(0.5f64.sin()),);
+    }
+
+    #[test]
+    fn test_sin_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = SinOperation::new(),
+            inputs = [Array::scalar(0.5)],
+            expected = Array::scalar(0.5f64.sin()),
         );
     }
 
@@ -186,15 +200,6 @@ mod tests {
                 in (%2, %5)
             "}
             .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_sin_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = SinOperation::new(),
-            inputs = [Array::scalar(0.5)],
-            expected = Array::scalar(0.5f64.sin()),
         );
     }
 

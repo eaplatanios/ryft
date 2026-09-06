@@ -33,158 +33,16 @@ fn sharded_array(mesh: &LogicalMesh, sizes: &[usize], dimensions: Vec<ShardingDi
 }
 
 #[test]
-fn test_dot_accumulation_type() {
-    // Type inference widens the output to the accumulation type for promotable operand types and rejects
-    // non-promotable ones, combining with a requested output sharding, and differentiation.
-    let operation = DotOperation::matmul().with_accumulation_type(DataType::F32);
-    assert_eq!(operation.accumulation_type(), Some(DataType::F32));
-    let lhs = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
-    let rhs = lhs.clone();
-    let bf16_operand = ArrayType::new(DataType::BF16, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
-    let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
-    check_operation_type_inference!(
-        operation = operation,
-        cases = [
-            {
-                input_types = [lhs.clone(), rhs.clone()],
-                output_types = [output_type.clone()],
-            },
-            {
-                input_types = [bf16_operand.clone(), bf16_operand],
-                output_types = [output_type],
-            },
-        ],
-    );
-    let narrowing = DotOperation::matmul().with_accumulation_type(DataType::F16);
-    let f32_operand = plain_array(&[2, 2]);
-    check_operation_type_inference!(
-        operation = narrowing,
-        cases = [{
-            input_types = [f32_operand.clone(), f32_operand],
-            error = "`dot` operand data type f32 cannot accumulate at data type f16",
-        }],
-    );
+fn test_dot() {
     let mesh = test_mesh();
-    let sharded = DotOperation::matmul().with_accumulation_type(DataType::F32).with_output_sharding(
-        Sharding::new(mesh, vec![ShardingDimension::Replicated, ShardingDimension::Replicated]).unwrap(),
-    );
-    check_operation_type_inference!(
-        operation = sharded,
-        cases = [{
-            input_types = [lhs.clone(), rhs.clone()],
-            error = "`dot` does not support combining an accumulation type with a requested output sharding yet",
-        }],
-    );
-
-    // The eager reference backend upcasts the operands and accumulates at the accumulation type: every value
-    // below is exactly representable in `f8e4m3fn`, so the `f32` results are exact.
-    let lhs_values = Array::from_f64s(lhs.clone(), vec![0.5, 1.0, 1.5, 2.0]);
-    let rhs_values = Array::from_f64s(rhs.clone(), vec![1.0, 0.5, 0.5, 1.0]);
-    let product = lhs_values.dot_with_accumulation_type(&rhs_values, &DotDimensionNumbers::matmul(), DataType::F32);
-    assert_eq!(
-        product.r#type().as_ref(),
-        &ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))
-    );
-    assert_eq!(product.to_f64s(), vec![1.0, 1.25, 2.5, 2.75]);
-
-    // Forward-mode differentiation stages accumulation-typed tangent dots over the operand-typed tangents, so
-    // the output tangent lives at the accumulation type exactly like the primal output. Every value below is
-    // exactly representable in `f8e4m3fn` and every product sum is exact in `f32`.
-    let mut builder = crate::programs::builders::ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-    let lhs_input = builder.add_input(lhs.clone());
-    let rhs_input = builder.add_input(rhs.clone());
-    let output = builder
-        .add_instruction(
-            DotOperation::matmul().with_accumulation_type(DataType::F32),
-            Vec::new(),
-            vec![lhs_input, rhs_input],
-            None,
-        )
-        .unwrap()[0];
-    let program = builder
-        .build::<Vec<Array>, Vec<Array>>(
-            vec![output],
-            vec![crate::parameters::Placeholder; 2],
-            vec![crate::parameters::Placeholder],
-        )
-        .unwrap();
-    let jvp = program.jvp().unwrap();
-    assert_eq!(
-        jvp.to_string(),
-        indoc! {"
-                lambda %0:f8e4m3fn[2, 2], %1:f8e4m3fn[2, 2], %2:f8e4m3fn[2, 2], %3:f8e4m3fn[2, 2] .
-                let %4:f32[2, 2] = dot [
-                    dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-                    accumulation_type=f32,
-                ] %0 %1
-                    %5:f32[2, 2] = dot [
-                        dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-                        accumulation_type=f32,
-                    ] %2 %1
-                    %6:f32[2, 2] = dot [
-                        dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
-                        accumulation_type=f32,
-                    ] %0 %3
-                    %7:f32[2, 2] = add %5 %6
-                in (%4, %7)
-            "}
-        .trim_end(),
-    );
-    let jvp_outputs = jvp
-        .interpret(vec![
-            lhs_values.clone(),
-            rhs_values.clone(),
-            Array::from_f64s(lhs.clone(), vec![1.0, 1.0, 1.0, 1.0]),
-            Array::from_f64s(rhs.clone(), vec![0.5, 0.5, 0.5, 0.5]),
-        ])
-        .unwrap();
-    assert_eq!(jvp_outputs[0].to_f64s(), vec![1.0, 1.25, 2.5, 2.75]);
-    assert_eq!(jvp_outputs[1].r#type().data_type(), DataType::F32);
-    // Tangent = d_lhs · rhs + lhs · d_rhs = [[1.5, 1.5], [1.5, 1.5]] + [[0.75, 0.75], [1.75, 1.75]].
-    assert_eq!(jvp_outputs[1].to_f64s(), vec![2.25, 2.25, 3.25, 3.25]);
-
-    // The transpose rule contracts the adjoint at the accumulation type and converts the result back to the
-    // linear operand's `f8e4m3fn` cotangent representation. With an identity output cotangent, the adjoint of
-    // the linear RHS is exactly `lhsᵀ`.
-    check_operation_transposition!(
-        @exact,
-        operation = DotOperation::matmul().with_accumulation_type(DataType::F32),
-        cases = [{
-            inputs = [
-                (@known, lhs_values),
-                (@linear(type = rhs.clone())),
-            ],
-            output_cotangents = [Array::from_f64s(
-                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
-                vec![1.0, 0.0, 0.0, 1.0],
-            )],
-            input_cotangents = [Array::from_f64s(rhs, vec![0.5, 1.5, 1.0, 2.0])],
-        }],
-    );
-
-    // Batching lifts the dimension numbers while carrying the accumulation type, so per-item products still
-    // accumulate at the widened type.
-    let lifted = program
-        .batched(
-            2,
-            ShardingDimension::Replicated,
-            &[BatchAxis::new(0), BatchAxis::new(0)],
-            crate::batching::ProgramBatchingOutputAxesPolicy::Natural,
-        )
-        .unwrap()
-        .into_parts()
-        .0;
-    let batched_lhs_type = ArrayType::new(
-        DataType::F8E4M3FN,
-        Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(2)]),
-    );
-    let batched_lhs = Array::from_f64s(batched_lhs_type.clone(), vec![0.5, 1.0, 1.5, 2.0, 0.5, 1.0, 1.5, 2.0]);
-    let batched_rhs = Array::from_f64s(batched_lhs_type, vec![1.0, 0.5, 0.5, 1.0, 1.0, 0.5, 0.5, 1.0]);
-    let outputs = lifted.interpret(vec![batched_lhs, batched_rhs]).unwrap();
-    assert_eq!(outputs.len(), 1);
-    assert_eq!(outputs[0].r#type().data_type(), DataType::F32);
-    // Both batch items repeat the unbatched case, whose exact product is [[1, 1.25], [2.5, 2.75]].
-    assert_eq!(outputs[0].to_f64s(), vec![1.0, 1.25, 2.5, 2.75, 1.0, 1.25, 2.5, 2.75]);
+    let sharding =
+        Sharding::new(mesh, vec![ShardingDimension::sharded(["m"]), ShardingDimension::replicated()]).unwrap();
+    let operation = DotOperation::matmul().with_output_sharding(sharding.clone());
+    assert_eq!(operation.output_sharding(), Some(&sharding));
+    assert_eq!(DotOperation::matmul().output_sharding(), None);
+    // The output sharding is rendered only when present.
+    assert!(!DotOperation::matmul().to_string().contains("output_sharding="));
+    assert!(operation.to_string().contains(&format!("output_sharding={sharding}")));
 }
 
 #[test]
@@ -575,16 +433,158 @@ fn test_dot_inference_unreduced_output_sharding() {
 }
 
 #[test]
-fn test_dot_operation_output_sharding_builder_and_render() {
+fn test_dot_accumulation_type() {
+    // Type inference widens the output to the accumulation type for promotable operand types and rejects
+    // non-promotable ones, combining with a requested output sharding, and differentiation.
+    let operation = DotOperation::matmul().with_accumulation_type(DataType::F32);
+    assert_eq!(operation.accumulation_type(), Some(DataType::F32));
+    let lhs = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
+    let rhs = lhs.clone();
+    let bf16_operand = ArrayType::new(DataType::BF16, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
+    let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]));
+    check_operation_type_inference!(
+        operation = operation,
+        cases = [
+            {
+                input_types = [lhs.clone(), rhs.clone()],
+                output_types = [output_type.clone()],
+            },
+            {
+                input_types = [bf16_operand.clone(), bf16_operand],
+                output_types = [output_type],
+            },
+        ],
+    );
+    let narrowing = DotOperation::matmul().with_accumulation_type(DataType::F16);
+    let f32_operand = plain_array(&[2, 2]);
+    check_operation_type_inference!(
+        operation = narrowing,
+        cases = [{
+            input_types = [f32_operand.clone(), f32_operand],
+            error = "`dot` operand data type f32 cannot accumulate at data type f16",
+        }],
+    );
     let mesh = test_mesh();
-    let sharding =
-        Sharding::new(mesh, vec![ShardingDimension::sharded(["m"]), ShardingDimension::replicated()]).unwrap();
-    let operation = DotOperation::matmul().with_output_sharding(sharding.clone());
-    assert_eq!(operation.output_sharding(), Some(&sharding));
-    assert_eq!(DotOperation::matmul().output_sharding(), None);
-    // The output sharding is rendered only when present.
-    assert!(!DotOperation::matmul().to_string().contains("output_sharding="));
-    assert!(operation.to_string().contains(&format!("output_sharding={sharding}")));
+    let sharded = DotOperation::matmul().with_accumulation_type(DataType::F32).with_output_sharding(
+        Sharding::new(mesh, vec![ShardingDimension::Replicated, ShardingDimension::Replicated]).unwrap(),
+    );
+    check_operation_type_inference!(
+        operation = sharded,
+        cases = [{
+            input_types = [lhs.clone(), rhs.clone()],
+            error = "`dot` does not support combining an accumulation type with a requested output sharding yet",
+        }],
+    );
+
+    // The eager reference backend upcasts the operands and accumulates at the accumulation type: every value
+    // below is exactly representable in `f8e4m3fn`, so the `f32` results are exact.
+    let lhs_values = Array::from_f64s(lhs.clone(), vec![0.5, 1.0, 1.5, 2.0]);
+    let rhs_values = Array::from_f64s(rhs.clone(), vec![1.0, 0.5, 0.5, 1.0]);
+    let product = lhs_values.dot_with_accumulation_type(&rhs_values, &DotDimensionNumbers::matmul(), DataType::F32);
+    assert_eq!(
+        product.r#type().as_ref(),
+        &ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)]))
+    );
+    assert_eq!(product.to_f64s(), vec![1.0, 1.25, 2.5, 2.75]);
+
+    // Forward-mode differentiation stages accumulation-typed tangent dots over the operand-typed tangents, so
+    // the output tangent lives at the accumulation type exactly like the primal output. Every value below is
+    // exactly representable in `f8e4m3fn` and every product sum is exact in `f32`.
+    let mut builder = crate::programs::builders::ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+    let lhs_input = builder.add_input(lhs.clone());
+    let rhs_input = builder.add_input(rhs.clone());
+    let output = builder
+        .add_instruction(
+            DotOperation::matmul().with_accumulation_type(DataType::F32),
+            Vec::new(),
+            vec![lhs_input, rhs_input],
+            None,
+        )
+        .unwrap()[0];
+    let program = builder
+        .build::<Vec<Array>, Vec<Array>>(
+            vec![output],
+            vec![crate::parameters::Placeholder; 2],
+            vec![crate::parameters::Placeholder],
+        )
+        .unwrap();
+    let jvp = program.jvp().unwrap();
+    assert_eq!(
+        jvp.to_string(),
+        indoc! {"
+                lambda %0:f8e4m3fn[2, 2], %1:f8e4m3fn[2, 2], %2:f8e4m3fn[2, 2], %3:f8e4m3fn[2, 2] .
+                let %4:f32[2, 2] = dot [
+                    dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                    accumulation_type=f32,
+                ] %0 %1
+                    %5:f32[2, 2] = dot [
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                        accumulation_type=f32,
+                    ] %2 %1
+                    %6:f32[2, 2] = dot [
+                        dimensions=(lhs_contracting=[1], rhs_contracting=[0], lhs_batching=[], rhs_batching=[]),
+                        accumulation_type=f32,
+                    ] %0 %3
+                    %7:f32[2, 2] = add %5 %6
+                in (%4, %7)
+            "}
+        .trim_end(),
+    );
+    let jvp_outputs = jvp
+        .interpret(vec![
+            lhs_values.clone(),
+            rhs_values.clone(),
+            Array::from_f64s(lhs.clone(), vec![1.0, 1.0, 1.0, 1.0]),
+            Array::from_f64s(rhs.clone(), vec![0.5, 0.5, 0.5, 0.5]),
+        ])
+        .unwrap();
+    assert_eq!(jvp_outputs[0].to_f64s(), vec![1.0, 1.25, 2.5, 2.75]);
+    assert_eq!(jvp_outputs[1].r#type().data_type(), DataType::F32);
+    // Tangent = d_lhs · rhs + lhs · d_rhs = [[1.5, 1.5], [1.5, 1.5]] + [[0.75, 0.75], [1.75, 1.75]].
+    assert_eq!(jvp_outputs[1].to_f64s(), vec![2.25, 2.25, 3.25, 3.25]);
+
+    // The transpose rule contracts the adjoint at the accumulation type and converts the result back to the
+    // linear operand's `f8e4m3fn` cotangent representation. With an identity output cotangent, the adjoint of
+    // the linear RHS is exactly `lhsᵀ`.
+    check_operation_transposition!(
+        @exact,
+        operation = DotOperation::matmul().with_accumulation_type(DataType::F32),
+        cases = [{
+            inputs = [
+                (@known, lhs_values),
+                (@linear(type = rhs.clone())),
+            ],
+            output_cotangents = [Array::from_f64s(
+                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
+                vec![1.0, 0.0, 0.0, 1.0],
+            )],
+            input_cotangents = [Array::from_f64s(rhs, vec![0.5, 1.5, 1.0, 2.0])],
+        }],
+    );
+
+    // Batching lifts the dimension numbers while carrying the accumulation type, so per-item products still
+    // accumulate at the widened type.
+    let lifted = program
+        .batched(
+            2,
+            ShardingDimension::Replicated,
+            &[BatchAxis::new(0), BatchAxis::new(0)],
+            crate::batching::ProgramBatchingOutputAxesPolicy::Natural,
+        )
+        .unwrap()
+        .into_parts()
+        .0;
+    let batched_lhs_type = ArrayType::new(
+        DataType::F8E4M3FN,
+        Shape::new(vec![Dimension::Static(2), Dimension::Static(2), Dimension::Static(2)]),
+    );
+    let batched_lhs = Array::from_f64s(batched_lhs_type.clone(), vec![0.5, 1.0, 1.5, 2.0, 0.5, 1.0, 1.5, 2.0]);
+    let batched_rhs = Array::from_f64s(batched_lhs_type, vec![1.0, 0.5, 0.5, 1.0, 1.0, 0.5, 0.5, 1.0]);
+    let outputs = lifted.interpret(vec![batched_lhs, batched_rhs]).unwrap();
+    assert_eq!(outputs.len(), 1);
+    assert_eq!(outputs[0].r#type().data_type(), DataType::F32);
+    // Both batch items repeat the unbatched case, whose exact product is [[1, 1.25], [2.5, 2.75]].
+    assert_eq!(outputs[0].to_f64s(), vec![1.0, 1.25, 2.5, 2.75, 1.0, 1.25, 2.5, 2.75]);
 }
 
 #[test]
@@ -903,7 +903,7 @@ fn test_dot_batching_rejects_unsupported_ragged_configurations() {
 }
 
 #[test]
-fn test_dot_dense_jacobians() {
+fn test_dot_differentiation() {
     let inputs = (Array::vector(vec![2.0, 3.0, 5.0]), Array::vector(vec![7.0, 11.0, 13.0]));
 
     // Reverse mode batches the pullback's adjoint dots over output-coordinate cotangents.
@@ -926,7 +926,7 @@ fn test_dot_dense_jacobians() {
 }
 
 #[test]
-fn test_dot_partitioned_transpose_computes_operand_adjoints() {
+fn test_dot_transposition() {
     let matmul = DotDimensionNumbers::matmul();
     let left = Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     let right = Array::matrix(3, 2, vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0]);
@@ -1344,6 +1344,42 @@ fn test_ragged_dot_batching_leading_axis_and_ragged_axis_rejection() {
 }
 
 #[test]
+fn test_ragged_dot_batch_widened_differential_staging() {
+    let lhs_type = ArrayType::new_static(DataType::F8E8M0FNU, [3, 2]);
+    let rhs_type = ArrayType::new_static(DataType::F8E8M0FNU, [3, 2, 1]);
+    let dimensions = RaggedDotDimensionNumbers::new(
+        DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]),
+        vec![0],
+        Vec::new(),
+    );
+    let mut builder = crate::ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+    let lhs = builder.add_input(lhs_type.clone());
+    let rhs = builder.add_input(rhs_type.clone());
+    let group_sizes = builder.add_constant(Array::vector(vec![1_i32, 2]));
+    let output = builder
+        .add_instruction(RaggedDotOperation::new(dimensions), Vec::new(), vec![lhs, rhs, group_sizes], None)
+        .unwrap()[0];
+    let program = builder
+        .build::<Vec<Array>, Vec<Array>>(vec![output], vec![crate::Placeholder; 2], vec![crate::Placeholder])
+        .unwrap();
+
+    let jvp = program.clone().jvp().unwrap();
+    assert_eq!(
+        jvp.input_types(),
+        vec![
+            lhs_type.clone(),
+            rhs_type.clone(),
+            ArrayType::new_static(DataType::F32, [3, 2]),
+            ArrayType::new_static(DataType::F32, [3, 2, 1]),
+        ],
+    );
+    assert_eq!(
+        jvp.output_types(),
+        vec![ArrayType::new_static(DataType::F8E8M0FNU, [3, 1]), ArrayType::new_static(DataType::F32, [3, 1]),],
+    );
+}
+
+#[test]
 fn test_ragged_dot_jvp_and_noncontracting_transpose() {
     let lhs = Array::matrix(3, 2, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
     let rhs = Array::from_f64s(plain_array(&[2, 2, 1]), vec![10.0, 1.0, 2.0, 3.0]);
@@ -1470,42 +1506,6 @@ fn test_ragged_dot_noncontracting_transpose_inverts_permuted_output_axes() {
                 vec![1.0, 10.0, 3.0, 20.0, 37.0, 152.0, 47.0, 188.0],
             )],
         }],
-    );
-}
-
-#[test]
-fn test_ragged_dot_batch_widened_differential_staging() {
-    let lhs_type = ArrayType::new_static(DataType::F8E8M0FNU, [3, 2]);
-    let rhs_type = ArrayType::new_static(DataType::F8E8M0FNU, [3, 2, 1]);
-    let dimensions = RaggedDotDimensionNumbers::new(
-        DotDimensionNumbers::new(vec![1], vec![1], vec![0], vec![0]),
-        vec![0],
-        Vec::new(),
-    );
-    let mut builder = crate::ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-    let lhs = builder.add_input(lhs_type.clone());
-    let rhs = builder.add_input(rhs_type.clone());
-    let group_sizes = builder.add_constant(Array::vector(vec![1_i32, 2]));
-    let output = builder
-        .add_instruction(RaggedDotOperation::new(dimensions), Vec::new(), vec![lhs, rhs, group_sizes], None)
-        .unwrap()[0];
-    let program = builder
-        .build::<Vec<Array>, Vec<Array>>(vec![output], vec![crate::Placeholder; 2], vec![crate::Placeholder])
-        .unwrap();
-
-    let jvp = program.clone().jvp().unwrap();
-    assert_eq!(
-        jvp.input_types(),
-        vec![
-            lhs_type.clone(),
-            rhs_type.clone(),
-            ArrayType::new_static(DataType::F32, [3, 2]),
-            ArrayType::new_static(DataType::F32, [3, 2, 1]),
-        ],
-    );
-    assert_eq!(
-        jvp.output_types(),
-        vec![ArrayType::new_static(DataType::F8E8M0FNU, [3, 1]), ArrayType::new_static(DataType::F32, [3, 1]),],
     );
 }
 

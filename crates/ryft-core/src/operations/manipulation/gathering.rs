@@ -12,12 +12,13 @@ use crate::batching::{
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    LinearCallOperation, MemberDifferentiableOperation, TransposableOperation, TranspositionContext,
-    TranspositionDriver, jvp_projected_operation,
+    MemberDifferentiableOperation, TransposableOperation, TranspositionContext, TranspositionDriver,
+    jvp_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
+use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::broadcasting::Broadcast;
 use crate::operations::manipulation::reshaping::Reshape;
@@ -35,9 +36,6 @@ use crate::tracing::{Tracer, TracingContext};
 
 use super::scattering::{ScatterDimensionNumbers, ScatterOperation, ScatterReductionKind};
 use super::slicing::batch_by_item_expansion;
-
-/// Canonical operation name for [`GatherOperation`].
-pub const GATHER_OPERATION_NAME: &str = "gather";
 
 /// Out-of-bounds index handling for [`gather`](Gather) and [`scatter`](super::scattering::Scatter). The mode does not
 /// affect the output [`Type`](crate::programs::types::Type)—only how a start index that would read or write outside
@@ -183,6 +181,9 @@ impl Display for GatherDimensionNumbers {
         )
     }
 }
+
+/// Canonical operation name for [`GatherOperation`].
+pub const GATHER_OPERATION_NAME: &str = "gather";
 
 /// [`Operation`] that reads slices ("windows") out of an operand at positions named by an integer index operand,
 /// assembling them into a new array. Refer to the documentation of [`Gather`] for the full semantics.
@@ -359,6 +360,32 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for GatherOp
 {
 }
 
+/// Batching rule for [`GatherOperation`]. A gather mixes window reads, collapsed axes, and index-driven offsets whose
+/// axis bookkeeping does not compose cleanly with an extra mapped axis, so any batched operand, indices, or both is
+/// handled by per-item expansion (`batch_by_item_expansion`): each batch item gathers independently and the results
+/// restack along a fresh leading batch axis. This stages `O(axis_size)` gathers but is correct for every
+/// dimension-number configuration; dimension-number lifting (one lifted gather, no expansion) is a performance
+/// optimization left as a follow-up. When no input is mapped the gather applies once, unbatched.
+impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for GatherOperation
+where
+    C: Context<Type = ArrayType> + Zero<C::Value>,
+    C::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
+    GatherOperation: InterpretableOperation<C>,
+{
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+        &self,
+        context: &BatchingContext<C, ArrayBatching<P>>,
+        _driver: &D,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+        check_count!("input", inputs, 2, ProgramError);
+        let Some(axis_size) = ArrayBatch::common_batch_size(inputs)? else {
+            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
+        };
+        Ok(batch_by_item_expansion(context, GATHER_OPERATION_NAME, self, inputs, axis_size)?.into())
+    }
+}
+
 /// Forward-mode rule for [`GatherOperation`]: `gather` is linear in the data operand, and the index operand is a
 /// non-differentiated primal operand edge, so the tangent gathers the operand tangent at the same primal indices. A
 /// zero operand tangent yields a typed zero output tangent.
@@ -381,6 +408,84 @@ where
             MaybeZero::Value(tangent) => MaybeZero::Value(tangent.gather(indices, self)?),
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)?])
+    }
+}
+
+/// Partition-aware transpose rule for the primal [`GatherOperation`]. The integer index operand (operand 1) has no
+/// tangent space, so in a valid pushforward it is the known operand and the gathered operand (operand 0) is the
+/// linear one. The forward map `t ↦ gather(t, indices)` has, as its adjoint, the dual scatter-add that writes the
+/// output cotangent back into a zero operand at the gathered windows: the scatter geometry mirrors the gather
+/// axis-for-axis. The transpose reads the known indices from the pullback boundary and stages an ordinary additive
+/// [`ScatterOperation`], so linearization retains the indices as regular SSA residuals. The indices receive a
+/// structural zero, and a zero output cotangent stays a structural zero.
+///
+/// **Contract:** this homogeneous rule requires a statically shaped operand. The scatter target is a zero of the
+/// operand's cotangent type, and the homogeneous [`ArrayType`] operation family owns no first-class dimension
+/// operations, so it has no constructor that can supply a runtime extent for that zero. A dynamically shaped operand
+/// is therefore rejected here with an exact diagnostic. Mixed [`ArrayIrType`](crate::ArrayIrType) programs are
+/// unaffected: the [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation) rule above routes a
+/// dynamically shaped gather into a residual-carrying [`LinearCallOperation`](crate::LinearCallOperation) whose
+/// transpose region rebuilds the same zero from the retained exact extents.
+impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for GatherOperation
+where
+    O: Operation<Type = ArrayType> + From<ZeroOperation<ArrayType>> + From<ScatterOperation>,
+{
+    fn transpose<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TranspositionContext<'_, V, O>,
+        _driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        // The rule stages into the tracing context only, so the transposition context is narrowed once up front.
+        let context: &mut TracingContext<V, O> = context;
+        check_count!("input", inputs, 2, ProgramError);
+        check_count!("output", outputs, 1, ProgramError);
+        match &outputs[0] {
+            MaybeZero::Zero(_) => Ok(vec![
+                MaybeZero::Zero(inputs[0].r#type().cotangent()?),
+                MaybeZero::Zero(inputs[1].r#type().cotangent()?),
+            ]),
+            MaybeZero::Value(cotangent) => {
+                // The indices are the known operand; the dispatch guarantees a `Known` operand carries its pullback
+                // value, so read the tracer directly.
+                let indices = inputs[1]
+                    .as_known()
+                    .expect("dispatch guarantees a known operand carries its pullback value")
+                    .clone();
+                // Only the nullary zero is available in the homogeneous family, so enforce this rule's static-shape
+                // contract explicitly instead of letting a dynamic operand surface the constructor's own diagnostic.
+                let operand_cotangent_type = inputs[0].r#type().cotangent()?;
+                if operand_cotangent_type.static_shape().is_none() {
+                    return Err(TypeError::invalid(format!(
+                        "`{GATHER_OPERATION_NAME}` transpose requires a statically shaped operand but got \
+                         {operand_cotangent_type}",
+                    ))
+                    .into());
+                }
+                let zeros = MaybeZero::Zero(operand_cotangent_type).materialize(context)?;
+                let scatter_dimensions = ScatterDimensionNumbers::new(
+                    self.dimensions().offset_dimensions().to_vec(),
+                    self.dimensions().collapsed_slice_dimensions().to_vec(),
+                    self.dimensions().start_index_map().to_vec(),
+                )
+                .with_batching_dimensions(
+                    self.dimensions().operand_batching_dimensions().to_vec(),
+                    self.dimensions().start_indices_batching_dimensions().to_vec(),
+                );
+                let scatter_operation = ScatterOperation::new(scatter_dimensions, ScatterReductionKind::Add)
+                    .with_mode(self.mode())
+                    .with_indices_are_sorted(self.indices_are_sorted())
+                    .with_unique_indices(self.unique_indices());
+                let outputs =
+                    context.stage_operation(scatter_operation, Vec::new(), &[zeros, indices, cotangent.clone()])?;
+                check_count!("output", outputs, 1, ProgramError);
+                Ok(vec![
+                    MaybeZero::Value(outputs.into_iter().next().unwrap()),
+                    MaybeZero::Zero(inputs[1].r#type().cotangent()?),
+                ])
+            }
+        }
     }
 }
 
@@ -478,32 +583,6 @@ where
     }
 }
 
-/// Batching rule for [`GatherOperation`]. A gather mixes window reads, collapsed axes, and index-driven offsets whose
-/// axis bookkeeping does not compose cleanly with an extra mapped axis, so any batched operand, indices, or both is
-/// handled by per-item expansion (`batch_by_item_expansion`): each batch item gathers independently and the results
-/// restack along a fresh leading batch axis. This stages `O(axis_size)` gathers but is correct for every
-/// dimension-number configuration; dimension-number lifting (one lifted gather, no expansion) is a performance
-/// optimization left as a follow-up. When no input is mapped the gather applies once, unbatched.
-impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for GatherOperation
-where
-    C: Context<Type = ArrayType> + Zero<C::Value>,
-    C::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
-    GatherOperation: InterpretableOperation<C>,
-{
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
-        &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
-        _driver: &D,
-        inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
-        check_count!("input", inputs, 2, ProgramError);
-        let Some(axis_size) = ArrayBatch::common_batch_size(inputs)? else {
-            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
-        };
-        Ok(batch_by_item_expansion(context, GATHER_OPERATION_NAME, self, inputs, axis_size)?.into())
-    }
-}
-
 /// Returns whether `dimension` is sharded over at least one explicit mesh axis of `mesh` (the explicit-axis gate used
 /// by the dot/reduce/slice sharding rules). Shared with [`super::scattering`].
 pub(crate) fn dimension_has_explicit_axis(mesh: &LogicalMesh, dimension: &ShardingDimension) -> bool {
@@ -575,84 +654,6 @@ pub(crate) fn validate_unique_in_range(
         }
     }
     Ok(())
-}
-
-/// Partition-aware transpose rule for the primal [`GatherOperation`]. The integer index operand (operand 1) has no
-/// tangent space, so in a valid pushforward it is the known operand and the gathered operand (operand 0) is the
-/// linear one. The forward map `t ↦ gather(t, indices)` has, as its adjoint, the dual scatter-add that writes the
-/// output cotangent back into a zero operand at the gathered windows: the scatter geometry mirrors the gather
-/// axis-for-axis. The transpose reads the known indices from the pullback boundary and stages an ordinary additive
-/// [`ScatterOperation`], so linearization retains the indices as regular SSA residuals. The indices receive a
-/// structural zero, and a zero output cotangent stays a structural zero.
-///
-/// **Contract:** this homogeneous rule requires a statically shaped operand. The scatter target is a zero of the
-/// operand's cotangent type, and the homogeneous [`ArrayType`] operation family owns no first-class dimension
-/// operations, so it has no constructor that can supply a runtime extent for that zero. A dynamically shaped operand
-/// is therefore rejected here with an exact diagnostic. Mixed [`ArrayIrType`](crate::ArrayIrType) programs are
-/// unaffected: the [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation) rule above routes a
-/// dynamically shaped gather into a residual-carrying [`LinearCallOperation`](crate::LinearCallOperation) whose
-/// transpose region rebuilds the same zero from the retained exact extents.
-impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for GatherOperation
-where
-    O: Operation<Type = ArrayType> + From<ZeroOperation<ArrayType>> + From<ScatterOperation>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<'_, V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        // The rule stages into the tracing context only, so the transposition context is narrowed once up front.
-        let context: &mut TracingContext<V, O> = context;
-        check_count!("input", inputs, 2, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(vec![
-                MaybeZero::Zero(inputs[0].r#type().cotangent()?),
-                MaybeZero::Zero(inputs[1].r#type().cotangent()?),
-            ]),
-            MaybeZero::Value(cotangent) => {
-                // The indices are the known operand; the dispatch guarantees a `Known` operand carries its pullback
-                // value, so read the tracer directly.
-                let indices = inputs[1]
-                    .as_known()
-                    .expect("dispatch guarantees a known operand carries its pullback value")
-                    .clone();
-                // Only the nullary zero is available in the homogeneous family, so enforce this rule's static-shape
-                // contract explicitly instead of letting a dynamic operand surface the constructor's own diagnostic.
-                let operand_cotangent_type = inputs[0].r#type().cotangent()?;
-                if operand_cotangent_type.static_shape().is_none() {
-                    return Err(TypeError::invalid(format!(
-                        "`{GATHER_OPERATION_NAME}` transpose requires a statically shaped operand but got \
-                         {operand_cotangent_type}",
-                    ))
-                    .into());
-                }
-                let zeros = MaybeZero::Zero(operand_cotangent_type).materialize(context)?;
-                let scatter_dimensions = ScatterDimensionNumbers::new(
-                    self.dimensions().offset_dimensions().to_vec(),
-                    self.dimensions().collapsed_slice_dimensions().to_vec(),
-                    self.dimensions().start_index_map().to_vec(),
-                )
-                .with_batching_dimensions(
-                    self.dimensions().operand_batching_dimensions().to_vec(),
-                    self.dimensions().start_indices_batching_dimensions().to_vec(),
-                );
-                let scatter_operation = ScatterOperation::new(scatter_dimensions, ScatterReductionKind::Add)
-                    .with_mode(self.mode())
-                    .with_indices_are_sorted(self.indices_are_sorted())
-                    .with_unique_indices(self.unique_indices());
-                let outputs =
-                    context.stage_operation(scatter_operation, Vec::new(), &[zeros, indices, cotangent.clone()])?;
-                check_count!("output", outputs, 1, ProgramError);
-                Ok(vec![
-                    MaybeZero::Value(outputs.into_iter().next().unwrap()),
-                    MaybeZero::Zero(inputs[1].r#type().cotangent()?),
-                ])
-            }
-        }
-    }
 }
 
 /// Value-level gather capability: the receiver-style entry point for staging or executing [`GatherOperation`].

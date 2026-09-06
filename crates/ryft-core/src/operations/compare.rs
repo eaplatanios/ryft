@@ -18,9 +18,6 @@ use crate::programs::{
 
 // TODO(eaplatanios): Review this module.
 
-/// Canonical operation name for [`CompareOperation`].
-pub const COMPARE_OPERATION_NAME: &str = "compare";
-
 /// Direction of the pairwise comparison performed by a [`CompareOperation`]. Each direction corresponds to one
 /// comparison predicate.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -45,6 +42,9 @@ impl Display for ComparisonDirection {
         })
     }
 }
+
+/// Canonical operation name for [`CompareOperation`].
+pub const COMPARE_OPERATION_NAME: &str = "compare";
 
 /// [`Operation`] that performs pairwise comparisons in the `T` type universe. [`DataType`] and [`ArrayType`]
 /// instantiations provide homogeneous elementwise comparison, while [`ArrayIrType`] provides the mixed
@@ -191,10 +191,6 @@ where
 {
 }
 
-impl_reference_free_dischargeable_operation!(<T> CompareOperation<T> where T: Type);
-impl_non_differentiable_operation!(<T> CompareOperation<T> where T: Type);
-impl_non_transposable_operation!(<T> CompareOperation<T> where T: Type);
-
 // Batching rule for first-class dimension comparison. Dimension operands describe one shared array shape and must
 // therefore remain replicated; their Boolean array result is replicated ordinary data.
 impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatching> for CompareOperation<ArrayIrType>
@@ -221,6 +217,11 @@ where
             .into())
     }
 }
+
+impl_non_differentiable_operation!(<T> CompareOperation<T> where T: Type);
+impl_non_transposable_operation!(<T> CompareOperation<T> where T: Type);
+
+impl_reference_free_dischargeable_operation!(<T> CompareOperation<T> where T: Type);
 
 /// Represents the ability to perform a pairwise comparison between two values. For array values,
 /// `left.compare(right, direction)` produces a Boolean-valued result whose `i`-th element is the result of comparing
@@ -437,94 +438,14 @@ mod tests {
     }
 
     #[test]
-    fn test_compare_batching() {
-        check_operation_batching!(
-            @exact,
-            operation = CompareOperation::new(ComparisonDirection::GreaterThan),
-            axis_size = 2,
-            cases = [
-                {
-                    inputs = [
-                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
-                        (@replicated, Array::scalar(0.0)),
-                    ],
-                    outputs = [(@mapped(axis = 0), Array::vector(vec![true, false]))],
-                },
-                {
-                    inputs = [
-                        (@replicated, Array::scalar(0.0)),
-                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
-                    ],
-                    outputs = [(@mapped(axis = 0), Array::vector(vec![false, true]))],
-                },
-            ],
-        );
-    }
-
-    #[test]
-    fn test_compare_differentiation() {
-        // `f(x) = select(x > 0, 2x, 3x)`: the comparison output is Boolean, so its tangent is symbolically zero and
-        // the derivative comes entirely from the selected branch (2 for x > 0 and 3 for x <= 0).
-        let (primal, tangent) = differentiate_at(Array::scalar(2.0)).jvp(Array::scalar(1.0), piecewise_select).unwrap();
-        assert_eq!(primal.to_f64s(), vec![4.0]);
-        assert_eq!(tangent.to_f64s(), vec![2.0]);
-
-        let (primal, tangent) =
-            differentiate_at(Array::scalar(-2.0)).jvp(Array::scalar(1.0), piecewise_select).unwrap();
-        assert_eq!(primal.to_f64s(), vec![-6.0]);
-        assert_eq!(tangent.to_f64s(), vec![3.0]);
-    }
-
-    #[test]
-    fn test_compare_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = CompareOperation::new(ComparisonDirection::GreaterThan),
-            inputs = [Array::scalar(1.0), Array::scalar(0.0)],
-            expected = Array::scalar(true),
-        );
-
-        let bounds = DimensionBounds::new(0, Some(9)).unwrap();
-        let left_type = DimensionType::new(DimensionVariable::new("left", bounds));
-        let right_type = DimensionType::new(DimensionVariable::new("right", bounds));
-        check_operation_partial_evaluation!(
-            backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
-            operation = CompareOperation::new(ComparisonDirection::LessThan),
-            cases = [
-                {
-                    inputs = [
-                        (@known, ArrayIrValue::Dimension(
-                            DimensionValue::new(left_type.clone(), 3).unwrap()
-                        )),
-                        (@known, ArrayIrValue::Dimension(
-                            DimensionValue::new(right_type.clone(), 5).unwrap()
-                        )),
-                    ],
-                    outputs = [
-                        (@known, ArrayIrValue::Array(Array::scalar(true))),
-                    ],
-                    residual_instructions = 0,
-                },
-                {
-                    inputs = [
-                        (@unknown(
-                            type = ArrayIrType::Dimension(left_type.clone()),
-                            replay = ArrayIrValue::Dimension(
-                                DimensionValue::new(left_type.clone(), 3).unwrap()
-                            )
-                        )),
-                        (@unknown(
-                            type = ArrayIrType::Dimension(right_type.clone()),
-                            replay = ArrayIrValue::Dimension(
-                                DimensionValue::new(right_type.clone(), 5).unwrap()
-                            )
-                        )),
-                    ],
-                    outputs = [
-                        (@residual, ArrayIrValue::Array(Array::scalar(true))),
-                    ],
-                    residual_instructions = 1,
-                },
-            ],
+    fn test_compare_interpretation() {
+        assert_eq!(
+            CompareOperation::new(ComparisonDirection::GreaterThan).interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[Array::vector(vec![1.0, -2.0]), Array::scalar(0.0)],
+            ),
+            Ok(vec![Array::vector(vec![true, false])]),
         );
     }
 
@@ -605,5 +526,97 @@ mod tests {
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "operation `compare` is not transposable",
         ));
+    }
+
+    #[test]
+    fn test_compare_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = CompareOperation::new(ComparisonDirection::GreaterThan),
+            inputs = [Array::scalar(1.0), Array::scalar(0.0)],
+            expected = Array::scalar(true),
+        );
+
+        let bounds = DimensionBounds::new(0, Some(9)).unwrap();
+        let left_type = DimensionType::new(DimensionVariable::new("left", bounds));
+        let right_type = DimensionType::new(DimensionVariable::new("right", bounds));
+        check_operation_partial_evaluation!(
+            backend = (ArrayIrValue<Array>, ArrayIrOperation<Array>),
+            operation = CompareOperation::new(ComparisonDirection::LessThan),
+            cases = [
+                {
+                    inputs = [
+                        (@known, ArrayIrValue::Dimension(
+                            DimensionValue::new(left_type.clone(), 3).unwrap()
+                        )),
+                        (@known, ArrayIrValue::Dimension(
+                            DimensionValue::new(right_type.clone(), 5).unwrap()
+                        )),
+                    ],
+                    outputs = [
+                        (@known, ArrayIrValue::Array(Array::scalar(true))),
+                    ],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [
+                        (@unknown(
+                            type = ArrayIrType::Dimension(left_type.clone()),
+                            replay = ArrayIrValue::Dimension(
+                                DimensionValue::new(left_type.clone(), 3).unwrap()
+                            )
+                        )),
+                        (@unknown(
+                            type = ArrayIrType::Dimension(right_type.clone()),
+                            replay = ArrayIrValue::Dimension(
+                                DimensionValue::new(right_type.clone(), 5).unwrap()
+                            )
+                        )),
+                    ],
+                    outputs = [
+                        (@residual, ArrayIrValue::Array(Array::scalar(true))),
+                    ],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_compare_batching() {
+        check_operation_batching!(
+            @exact,
+            operation = CompareOperation::new(ComparisonDirection::GreaterThan),
+            axis_size = 2,
+            cases = [
+                {
+                    inputs = [
+                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
+                        (@replicated, Array::scalar(0.0)),
+                    ],
+                    outputs = [(@mapped(axis = 0), Array::vector(vec![true, false]))],
+                },
+                {
+                    inputs = [
+                        (@replicated, Array::scalar(0.0)),
+                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
+                    ],
+                    outputs = [(@mapped(axis = 0), Array::vector(vec![false, true]))],
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_compare_differentiation() {
+        // `f(x) = select(x > 0, 2x, 3x)`: the comparison output is Boolean, so its tangent is symbolically zero and
+        // the derivative comes entirely from the selected branch (2 for x > 0 and 3 for x <= 0).
+        let (primal, tangent) = differentiate_at(Array::scalar(2.0)).jvp(Array::scalar(1.0), piecewise_select).unwrap();
+        assert_eq!(primal.to_f64s(), vec![4.0]);
+        assert_eq!(tangent.to_f64s(), vec![2.0]);
+
+        let (primal, tangent) =
+            differentiate_at(Array::scalar(-2.0)).jvp(Array::scalar(1.0), piecewise_select).unwrap();
+        assert_eq!(primal.to_f64s(), vec![-6.0]);
+        assert_eq!(tangent.to_f64s(), vec![3.0]);
     }
 }

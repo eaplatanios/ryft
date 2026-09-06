@@ -109,37 +109,6 @@ impl Operation for LogSumExpOperation {
     }
 }
 
-/// Returns the output [`ArrayType`] produced by a [`LogSumExpOperation`] over `axes`.
-///
-/// The axis geometry — validation, the removal of the reduced axes from the output shape, and the
-/// [`Sharding`](crate::arrays::Sharding) rule — is the reduction family's, and is delegated to
-/// [`reduce_shape_abstract`]. What this primitive adds is its element data-type domain: real floating-point formats
-/// only (the exponential and the logarithm have no meaning for the integer, Boolean, token, or structural-zero
-/// element types, and complex support is an explicit non-goal), and, among those, only the formats whose lowest value
-/// is an identity of the inner sum of exponentials across every copy of itself that a padded slice folds, which the
-/// ragged batching rule writes over the padding of a reduced bounded axis. [`DataType::F8E8M0FNU`],
-/// [`DataType::F6E2M3FN`], [`DataType::F4E2M1FN`], [`DataType::F8E4M3B11FNUZ`], and [`DataType::F6E3M2FN`] fail that
-/// second requirement and are therefore rejected rather than accepted into a program that would only read high once
-/// it evaluates.
-///
-/// The eager kernel and the operation's type inference share this rule, so a directly invoked [`LogSumExp`]
-/// capability rejects exactly what a staged program rejects.
-pub(crate) fn log_sum_exp_abstract(input: &ArrayType, axes: &[usize]) -> Result<ArrayType, TypeError> {
-    reduce_shape_abstract(input, axes, LOG_SUM_EXP_OPERATION_NAME, validate_log_sum_exp_data_type)
-}
-
-/// Validates the element data-type domain documented on [`log_sum_exp_abstract`], which the operation's type
-/// inference and its eager entry points share.
-pub(crate) fn validate_log_sum_exp_data_type(data_type: DataType) -> Result<(), TypeError> {
-    // The domain is exactly the one `cumulative_log_sum_exp` accepts, and for the same reason: both operations can be
-    // asked to write the format's lowest value over ragged padding, so both need that sentinel to fold as an
-    // identity. The predicate and its diagnostic are therefore shared rather than restated here.
-    match is_log_add_exp_identity_data_type(data_type) {
-        true => Ok(()),
-        false => Err(TypeError::invalid(log_add_exp_identity_data_type_error(LOG_SUM_EXP_OPERATION_NAME, data_type))),
-    }
-}
-
 impl<C: Domain<Type = ArrayType, Value: LogSumExp>> InterpretableOperation<C> for LogSumExpOperation {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -279,6 +248,37 @@ where
     }
 }
 
+/// Returns the output [`ArrayType`] produced by a [`LogSumExpOperation`] over `axes`.
+///
+/// The axis geometry — validation, the removal of the reduced axes from the output shape, and the
+/// [`Sharding`](crate::arrays::Sharding) rule — is the reduction family's, and is delegated to
+/// [`reduce_shape_abstract`]. What this primitive adds is its element data-type domain: real floating-point formats
+/// only (the exponential and the logarithm have no meaning for the integer, Boolean, token, or structural-zero
+/// element types, and complex support is an explicit non-goal), and, among those, only the formats whose lowest value
+/// is an identity of the inner sum of exponentials across every copy of itself that a padded slice folds, which the
+/// ragged batching rule writes over the padding of a reduced bounded axis. [`DataType::F8E8M0FNU`],
+/// [`DataType::F6E2M3FN`], [`DataType::F4E2M1FN`], [`DataType::F8E4M3B11FNUZ`], and [`DataType::F6E3M2FN`] fail that
+/// second requirement and are therefore rejected rather than accepted into a program that would only read high once
+/// it evaluates.
+///
+/// The eager kernel and the operation's type inference share this rule, so a directly invoked [`LogSumExp`]
+/// capability rejects exactly what a staged program rejects.
+pub(crate) fn log_sum_exp_abstract(input: &ArrayType, axes: &[usize]) -> Result<ArrayType, TypeError> {
+    reduce_shape_abstract(input, axes, LOG_SUM_EXP_OPERATION_NAME, validate_log_sum_exp_data_type)
+}
+
+/// Validates the element data-type domain documented on [`log_sum_exp_abstract`], which the operation's type
+/// inference and its eager entry points share.
+pub(crate) fn validate_log_sum_exp_data_type(data_type: DataType) -> Result<(), TypeError> {
+    // The domain is exactly the one `cumulative_log_sum_exp` accepts, and for the same reason: both operations can be
+    // asked to write the format's lowest value over ragged padding, so both need that sentinel to fold as an
+    // identity. The predicate and its diagnostic are therefore shared rather than restated here.
+    match is_log_add_exp_identity_data_type(data_type) {
+        true => Ok(()),
+        false => Err(TypeError::invalid(log_add_exp_identity_data_type_error(LOG_SUM_EXP_OPERATION_NAME, data_type))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;
@@ -302,77 +302,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_log_sum_exp_abstract() {
-        // The reduced axes are dropped and the remaining axes keep their order.
-        let input = ArrayType::new_static(DataType::F64, [2, 3, 4]);
-        assert_eq!(log_sum_exp_abstract(&input, &[1]), Ok(ArrayType::new_static(DataType::F64, [2, 4])));
-        assert_eq!(log_sum_exp_abstract(&input, &[0, 2]), Ok(ArrayType::new_static(DataType::F64, [3])));
-        assert_eq!(log_sum_exp_abstract(&input, &[]), Ok(input.clone()));
-
-        // Axis validation mirrors the reduction family's.
-        assert_eq!(
-            log_sum_exp_abstract(&input, &[3]),
-            Err(TypeError::invalid("`log_sum_exp` axis 3 is out of bounds for rank 3".to_string())),
-        );
-        assert_eq!(
-            log_sum_exp_abstract(&input, &[1, 1]),
-            Err(TypeError::invalid("`log_sum_exp` contains duplicate axis 1".to_string())),
-        );
-
-        // Only real floating-point payloads have the exponential and logarithm this primitive is built from.
-        for data_type in [DataType::I32, DataType::Boolean, DataType::C64, DataType::Token, DataType::Zero] {
-            assert_eq!(
-                log_sum_exp_abstract(&ArrayType::new_static(data_type, [2, 3]), &[1]),
-                Err(TypeError::invalid(format!(
-                    "`log_sum_exp` requires real floating-point inputs but got {data_type}"
-                ))),
-            );
-        }
-
-        // `f8e8m0fnu` is floating-point but encodes bare positive exponents, so it has neither the zero the inner sum
-        // needs nor the negative infinity an empty reduction returns. It is rejected here rather than in the kernel.
-        assert_eq!(
-            log_sum_exp_abstract(&ArrayType::new_static(DataType::F8E8M0FNU, [2, 3]), &[1]),
-            Err(TypeError::invalid(
-                "`log_sum_exp` requires a floating-point format that represents zero and negative infinity but got \
-                 f8e8m0fnu"
-                    .to_string(),
-            )),
-        );
-
-        // Four more formats do have a sentinel whose exponential underflows to zero, but one that holds across too
-        // few copies of itself: the ragged batching rule below masks padding with the format's lowest value, and a
-        // padded slice folds as many copies as the axis is padded by, which lifts `-7.5` at two copies, `-6` and
-        // `-30` at three, and `-28` at eight.
-        for data_type in [DataType::F6E2M3FN, DataType::F4E2M1FN, DataType::F8E4M3B11FNUZ, DataType::F6E3M2FN] {
-            assert_eq!(
-                log_sum_exp_abstract(&ArrayType::new_static(data_type, [2, 3]), &[1]),
-                Err(TypeError::invalid(format!(
-                    "`log_sum_exp` requires a floating-point format whose lowest value is a `log_add_exp` identity \
-                     but got {data_type}"
-                ))),
-            );
-        }
-
-        // Reducing over a sharded dimension deletes its entry without error (the partitioner owns the collective),
-        // and the surviving dimension keeps its sharding.
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let sharded = ArrayType::new_static(DataType::F64, [2, 3])
-            .with_sharding(
-                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
-                    .unwrap(),
-            )
-            .unwrap();
-        assert_eq!(
-            log_sum_exp_abstract(&sharded, &[0]),
-            Ok(ArrayType::new_static(DataType::F64, [3])
-                .with_sharding(Sharding::new(mesh, vec![ShardingDimension::replicated()]).unwrap())
-                .unwrap()),
-        );
+    fn test_log_sum_exp() {
+        assert_eq!(LogSumExpOperation::new(vec![0, 2]).to_string(), "log_sum_exp [axes=[0, 2]]");
+        assert_eq!(LogSumExpOperation::new(vec![1]).axes(), &[1]);
     }
 
     #[test]
-    fn test_log_sum_exp_operation_type_inference() {
+    fn test_log_sum_exp_type_inference() {
         check_operation_type_inference!(
             operation = LogSumExpOperation::new(vec![1]),
             cases = [
@@ -389,13 +325,7 @@ mod tests {
     }
 
     #[test]
-    fn test_log_sum_exp_operation_rendering() {
-        assert_eq!(LogSumExpOperation::new(vec![0, 2]).to_string(), "log_sum_exp [axes=[0, 2]]");
-        assert_eq!(LogSumExpOperation::new(vec![1]).axes(), &[1]);
-    }
-
-    #[test]
-    fn test_log_sum_exp_over_eager_arrays() {
+    fn test_log_sum_exp_interpretation() {
         // The expected values below spell out the guarded construction the primitive documents (shift by the safe
         // maximum, sum the exponentials, take the logarithm, add the shift back) so that they pin that construction
         // rather than an equivalent-in-exact-arithmetic alternative.
@@ -464,20 +394,16 @@ mod tests {
     }
 
     #[test]
-    fn test_log_sum_exp_operation_batches_replicated_input_as_pass_through() {
-        check_operation_batching!(
-            @exact,
+    fn test_log_sum_exp_partial_evaluation() {
+        check_operation_partial_evaluation!(
             operation = LogSumExpOperation::new(vec![0]),
-            axis_size = 2,
-            cases = [{
-                inputs = [(@replicated, Array::vector(vec![0.0, 0.0]))],
-                outputs = [(@replicated, Array::scalar(std::f64::consts::LN_2))],
-            }],
+            inputs = [Array::vector(vec![0.0, 0.0])],
+            expected = Array::scalar(std::f64::consts::LN_2),
         );
     }
 
     #[test]
-    fn test_log_sum_exp_operation_batches_along_the_shifted_axis() {
+    fn test_log_sum_exp_batching() {
         // Physical input is [2 batch items, 2 columns] mapped at axis 0, so the per-item axis 0 reduces physical
         // axis 1 and each batch item is reduced independently.
         check_operation_batching!(
@@ -494,7 +420,20 @@ mod tests {
     }
 
     #[test]
-    fn test_log_sum_exp_operation_consumes_a_reduced_ragged_axis() {
+    fn test_log_sum_exp_batches_replicated_input_as_pass_through() {
+        check_operation_batching!(
+            @exact,
+            operation = LogSumExpOperation::new(vec![0]),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@replicated, Array::vector(vec![0.0, 0.0]))],
+                outputs = [(@replicated, Array::scalar(std::f64::consts::LN_2))],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_log_sum_exp_consumes_a_reduced_ragged_axis() {
         // Static array batching cannot neutralize ragged padding, and says so rather than summing the padding's
         // exponentials into the live result.
         let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
@@ -576,7 +515,7 @@ mod tests {
     }
 
     #[test]
-    fn test_log_sum_exp_operation_differentiation() {
+    fn test_log_sum_exp_differentiation() {
         // The tangent is the softmax-weighted sum of the operand tangents over the reduced axes.
         let primals = [1.0f64, 2.0, 3.0];
         let tangents = [0.5f64, -1.5, 2.0];
@@ -609,20 +548,81 @@ mod tests {
     }
 
     #[test]
-    fn test_log_sum_exp_operation_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = LogSumExpOperation::new(vec![0]),
-            inputs = [Array::vector(vec![0.0, 0.0])],
-            expected = Array::scalar(std::f64::consts::LN_2),
-        );
-    }
-
-    #[test]
-    fn test_log_sum_exp_operation_transposition() {
+    fn test_log_sum_exp_transposition() {
         check_operation_transposition!(
             @rejected,
             operation = LogSumExpOperation::new(vec![0]),
             input_types = [ArrayType::new_static(DataType::F64, [3])],
+        );
+    }
+
+    #[test]
+    fn test_log_sum_exp_abstract() {
+        // The reduced axes are dropped and the remaining axes keep their order.
+        let input = ArrayType::new_static(DataType::F64, [2, 3, 4]);
+        assert_eq!(log_sum_exp_abstract(&input, &[1]), Ok(ArrayType::new_static(DataType::F64, [2, 4])));
+        assert_eq!(log_sum_exp_abstract(&input, &[0, 2]), Ok(ArrayType::new_static(DataType::F64, [3])));
+        assert_eq!(log_sum_exp_abstract(&input, &[]), Ok(input.clone()));
+
+        // Axis validation mirrors the reduction family's.
+        assert_eq!(
+            log_sum_exp_abstract(&input, &[3]),
+            Err(TypeError::invalid("`log_sum_exp` axis 3 is out of bounds for rank 3".to_string())),
+        );
+        assert_eq!(
+            log_sum_exp_abstract(&input, &[1, 1]),
+            Err(TypeError::invalid("`log_sum_exp` contains duplicate axis 1".to_string())),
+        );
+
+        // Only real floating-point payloads have the exponential and logarithm this primitive is built from.
+        for data_type in [DataType::I32, DataType::Boolean, DataType::C64, DataType::Token, DataType::Zero] {
+            assert_eq!(
+                log_sum_exp_abstract(&ArrayType::new_static(data_type, [2, 3]), &[1]),
+                Err(TypeError::invalid(format!(
+                    "`log_sum_exp` requires real floating-point inputs but got {data_type}"
+                ))),
+            );
+        }
+
+        // `f8e8m0fnu` is floating-point but encodes bare positive exponents, so it has neither the zero the inner sum
+        // needs nor the negative infinity an empty reduction returns. It is rejected here rather than in the kernel.
+        assert_eq!(
+            log_sum_exp_abstract(&ArrayType::new_static(DataType::F8E8M0FNU, [2, 3]), &[1]),
+            Err(TypeError::invalid(
+                "`log_sum_exp` requires a floating-point format that represents zero and negative infinity but got \
+                 f8e8m0fnu"
+                    .to_string(),
+            )),
+        );
+
+        // Four more formats do have a sentinel whose exponential underflows to zero, but one that holds across too
+        // few copies of itself: the ragged batching rule below masks padding with the format's lowest value, and a
+        // padded slice folds as many copies as the axis is padded by, which lifts `-7.5` at two copies, `-6` and
+        // `-30` at three, and `-28` at eight.
+        for data_type in [DataType::F6E2M3FN, DataType::F4E2M1FN, DataType::F8E4M3B11FNUZ, DataType::F6E3M2FN] {
+            assert_eq!(
+                log_sum_exp_abstract(&ArrayType::new_static(data_type, [2, 3]), &[1]),
+                Err(TypeError::invalid(format!(
+                    "`log_sum_exp` requires a floating-point format whose lowest value is a `log_add_exp` identity \
+                     but got {data_type}"
+                ))),
+            );
+        }
+
+        // Reducing over a sharded dimension deletes its entry without error (the partitioner owns the collective),
+        // and the surviving dimension keeps its sharding.
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let sharded = ArrayType::new_static(DataType::F64, [2, 3])
+            .with_sharding(
+                Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap(),
+            )
+            .unwrap();
+        assert_eq!(
+            log_sum_exp_abstract(&sharded, &[0]),
+            Ok(ArrayType::new_static(DataType::F64, [3])
+                .with_sharding(Sharding::new(mesh, vec![ShardingDimension::replicated()]).unwrap())
+                .unwrap()),
         );
     }
 }

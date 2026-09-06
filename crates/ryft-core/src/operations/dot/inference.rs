@@ -33,12 +33,6 @@ fn merge_batch_sharding_dimensions(lhs: &ShardingDimension, rhs: &ShardingDimens
     }
 }
 
-/// Canonical operation name for [`DotOperation`].
-pub const DOT_OPERATION_NAME: &str = "dot";
-
-/// Canonical operation name for [`RaggedDotOperation`].
-pub const RAGGED_DOT_OPERATION_NAME: &str = "ragged_dot_general";
-
 /// Computes the abstract result type of one grouped generalized dot product.
 pub(crate) fn ragged_dot_abstract(
     lhs: &ArrayType,

@@ -95,6 +95,12 @@ impl<C: Domain> InterpretableOperation<C> for TagOperation<C::Type> {
 
 impl<C: Context<Operation: From<TagOperation<C::Type>>>> PartiallyEvaluatableOperation<C> for TagOperation<C::Type> {}
 
+impl_differentiable_elementwise_operation! {
+    @linear<T>
+    TagOperation<T>,
+    rule = [@positive]
+}
+
 /// Represents the ability to tag values in programs with keys. [`Tag`] stages a [`TagOperation`], which is effectively
 /// an identity function carrying a string-valued key. The tag gets attached to traced values and survives forward-mode
 /// differentiation (the [`DifferentiableOperation`] rule re-tags the primal value and passes the tangent value
@@ -115,12 +121,100 @@ impl<V: Value<DispatchDomain: Context<Operation: From<TagOperation<V::Type>>>>> 
     }
 }
 
-impl_differentiable_elementwise_operation! {
-    @linear<T>
-    TagOperation<T>,
-    rule = [@positive]
-}
-
 // TODO(eaplatanios): Add unit tests mirroring the structure and style of the tests in
 //  `ryft_core::operations::math::add`, including checks for the `DifferentiableOperation` and the
 //  `TransposableOperation` implementations.
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use crate::arrays::{Array, ArrayType, DataType};
+    use crate::contexts::EagerContext;
+    use crate::macros::{
+        check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
+        check_operation_transposition, check_operation_type_inference,
+    };
+    use crate::programs::EmptyRegionDriver;
+
+    use super::*;
+
+    #[test]
+    fn test_tag() {
+        let operation = TagOperation::<ArrayType>::new("residual");
+        assert_eq!(operation.key(), "residual");
+        assert_eq!(operation.to_string(), "tag [key=residual]");
+    }
+
+    #[test]
+    fn test_tag_type_inference() {
+        check_operation_type_inference!(
+            operation = TagOperation::new("residual"),
+            cases = [{
+                input_types = [ArrayType::scalar(DataType::F64)],
+                output_types = [ArrayType::scalar(DataType::F64)],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_tag_interpretation() {
+        assert_eq!(
+            TagOperation::new("residual").interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(3.0)],
+            ),
+            Ok(vec![Array::scalar(3.0)]),
+        );
+    }
+
+    #[test]
+    fn test_tag_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = TagOperation::new("residual"),
+            inputs = [Array::scalar(3.0)],
+            expected = Array::scalar(3.0),
+        );
+    }
+
+    #[test]
+    fn test_tag_batching() {
+        check_operation_batching!(
+            @exact,
+            operation = TagOperation::new("residual"),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::vector(vec![3.0, -2.0]))],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![3.0, -2.0]))],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_tag_differentiation() {
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            operation = TagOperation::new("residual"),
+            cases = [{
+                primals = [Array::scalar(3.0)],
+                tangents = [Array::scalar(2.0)],
+                primal_outputs = [Array::scalar(3.0)],
+                tangent_outputs = [Array::scalar(2.0)],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_tag_transposition() {
+        check_operation_transposition!(
+            @exact,
+            operation = TagOperation::new("residual"),
+            cases = [{
+                inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
+                output_cotangents = [Array::scalar(2.0)],
+                input_cotangents = [Array::scalar(2.0)],
+            }],
+        );
+    }
+}

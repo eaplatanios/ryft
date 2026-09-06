@@ -114,7 +114,18 @@ mod tests {
     }
 
     #[test]
-    fn test_cumulative_log_sum_exp_operation_type_inference() {
+    fn test_cumulative_log_sum_exp() {
+        // The scan direction renders only when it is set, keeping the common forward scan compact.
+        assert_eq!(CumulativeLogSumExpOperation::new(1).to_string(), "cumulative_log_sum_exp [axis=1]");
+        assert_eq!(
+            CumulativeLogSumExpOperation::new(0).with_reverse(true).to_string(),
+            "cumulative_log_sum_exp [axis=0, reverse=true]",
+        );
+        assert_eq!(CumulativeLogSumExpOperation::new(0).with_reverse(false), CumulativeLogSumExpOperation::new(0),);
+    }
+
+    #[test]
+    fn test_cumulative_log_sum_exp_type_inference() {
         // The output type follows the staged input type exactly.
         let operation = CumulativeLogSumExpOperation::new(1);
         let input = ArrayType::new_static(DataType::F64, [3, 2]);
@@ -191,18 +202,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cumulative_log_sum_exp_operation_rendering() {
-        // The scan direction renders only when it is set, keeping the common forward scan compact.
-        assert_eq!(CumulativeLogSumExpOperation::new(1).to_string(), "cumulative_log_sum_exp [axis=1]");
-        assert_eq!(
-            CumulativeLogSumExpOperation::new(0).with_reverse(true).to_string(),
-            "cumulative_log_sum_exp [axis=0, reverse=true]",
-        );
-        assert_eq!(CumulativeLogSumExpOperation::new(0).with_reverse(false), CumulativeLogSumExpOperation::new(0),);
-    }
-
-    #[test]
-    fn test_cumulative_log_sum_exp_operation_interpretation() {
+    fn test_cumulative_log_sum_exp_interpretation() {
         let context = EagerContext::<Array>::new();
         let interpret = |operation: &CumulativeLogSumExpOperation, input: &Array| {
             operation.interpret(&context, &EmptyRegionDriver, std::slice::from_ref(input)).unwrap().remove(0)
@@ -253,22 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cumulative_log_sum_exp_capability_over_eager_arrays() {
-        // The capability is the receiver-style entry point of the same kernel, in both scan directions, and it
-        // reports the operation's own validation errors instead of panicking.
-        let input = Array::vector(vec![0.0, 0.0]);
-        assert_eq!(input.cumulative_log_sum_exp(0), Ok(Array::vector(vec![0.0, std::f64::consts::LN_2])));
-        assert_eq!(input.reverse_cumulative_log_sum_exp(0), Ok(Array::vector(vec![std::f64::consts::LN_2, 0.0])));
-        assert_eq!(
-            Array::vector(vec![1_i32, 2]).cumulative_log_sum_exp(0),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`cumulative_log_sum_exp` requires real floating-point inputs but got i32".to_string(),
-            ))),
-        );
-    }
-
-    #[test]
-    fn test_cumulative_log_sum_exp_operation_batches_along_the_shifted_axis() {
+    fn test_cumulative_log_sum_exp_batching() {
         // A replicated operand carries no inserted batch dimension, so the scanned axis needs no shift.
         check_operation_batching!(
             @approx(epsilon = 1e-12),
@@ -313,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cumulative_log_sum_exp_operation_masks_ragged_padding_with_negative_infinity() {
+    fn test_cumulative_log_sum_exp_masks_ragged_padding_with_negative_infinity() {
         // Scanning a ragged axis would fold its padding into every later live prefix, so the rule asks the policy to
         // neutralize that padding with the combining operator's identity first. Static array batching cannot, and
         // says so rather than silently scanning padding.
@@ -401,7 +386,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cumulative_log_sum_exp_operation_differentiation() {
+    fn test_cumulative_log_sum_exp_differentiation() {
         // The partial derivative with respect to each accumulated element is that element's softmax weight within
         // the prefix, so each output tangent is the softmax-weighted average of the operand tangents over it.
         let e = std::f64::consts::E;
@@ -432,6 +417,21 @@ mod tests {
                     3.0,
                 ])],
             }],
+        );
+    }
+
+    #[test]
+    fn test_cumulative_log_sum_exp_capability_over_eager_arrays() {
+        // The capability is the receiver-style entry point of the same kernel, in both scan directions, and it
+        // reports the operation's own validation errors instead of panicking.
+        let input = Array::vector(vec![0.0, 0.0]);
+        assert_eq!(input.cumulative_log_sum_exp(0), Ok(Array::vector(vec![0.0, std::f64::consts::LN_2])));
+        assert_eq!(input.reverse_cumulative_log_sum_exp(0), Ok(Array::vector(vec![std::f64::consts::LN_2, 0.0])));
+        assert_eq!(
+            Array::vector(vec![1_i32, 2]).cumulative_log_sum_exp(0),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`cumulative_log_sum_exp` requires real floating-point inputs but got i32".to_string(),
+            ))),
         );
     }
 }

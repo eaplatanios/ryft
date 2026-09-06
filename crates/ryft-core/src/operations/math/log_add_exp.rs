@@ -255,6 +255,43 @@ mod tests {
 
     #[test]
     fn test_log_add_exp() {
+        assert_eq!(LogAddExpOperation::<ArrayType>::new().to_string(), "log_add_exp");
+    }
+
+    #[test]
+    fn test_log_add_exp_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @binary,
+            operation = LogAddExpOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::F32, DataType::F64],
+                    output_data_types = [DataType::F64],
+                },
+                {
+                    input_data_types = [DataType::C64, DataType::C64],
+                    error = "`log_add_exp` does not support input data type c64",
+                },
+                {
+                    input_data_types = [DataType::I32, DataType::F32],
+                    error = "`log_add_exp` does not support input data type i32",
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            @reject @unreduced,
+            operation = LogAddExpOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        );
+        check_operation_type_inference!(
+            @reject @mismatched_reduced,
+            operation = LogAddExpOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_log_add_exp_interpretation() {
         // Ordinary values in every supported floating-point width, each evaluated in its own precision.
         assert_eq!(
             Array::scalar(1.0f64).log_add_exp(&Array::scalar(2.0f64)).unwrap(),
@@ -316,34 +353,11 @@ mod tests {
     }
 
     #[test]
-    fn test_log_add_exp_type_inference() {
-        check_operation_type_inference!(
-            @elementwise @binary,
-            operation = LogAddExpOperation,
-            cases = [
-                {
-                    input_data_types = [DataType::F32, DataType::F64],
-                    output_data_types = [DataType::F64],
-                },
-                {
-                    input_data_types = [DataType::C64, DataType::C64],
-                    error = "`log_add_exp` does not support input data type c64",
-                },
-                {
-                    input_data_types = [DataType::I32, DataType::F32],
-                    error = "`log_add_exp` does not support input data type i32",
-                },
-            ],
-        );
-        check_operation_type_inference!(
-            @reject @unreduced,
-            operation = LogAddExpOperation::<ArrayType>::new(),
-            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
-        );
-        check_operation_type_inference!(
-            @reject @mismatched_reduced,
-            operation = LogAddExpOperation::<ArrayType>::new(),
-            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+    fn test_log_add_exp_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = LogAddExpOperation::new(),
+            inputs = [Array::scalar(0.5), Array::scalar(-0.25)],
+            expected = Array::scalar(expected(0.5, -0.25)),
         );
     }
 
@@ -428,15 +442,6 @@ mod tests {
         // A NaN operand propagates through both the primal and the weights.
         assert!(jvp((f64::NAN, 1.0), (2.0, 3.0)).is_nan());
         assert!(jvp((1.0, f64::NAN), (2.0, 3.0)).is_nan());
-    }
-
-    #[test]
-    fn test_log_add_exp_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = LogAddExpOperation::new(),
-            inputs = [Array::scalar(0.5), Array::scalar(-0.25)],
-            expected = Array::scalar(expected(0.5, -0.25)),
-        );
     }
 
     #[test]

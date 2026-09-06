@@ -84,37 +84,14 @@ mod tests {
     use crate::arrays::{Array, ArrayType, DataType};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
-        check_operation_type_inference,
+        check_operation_transposition, check_operation_type_inference,
     };
 
     use super::*;
 
     #[test]
     fn test_sign() {
-        assert_eq!(Array::scalar(-3i32).sign().unwrap(), Array::scalar(-1i32));
-        assert_eq!(Array::scalar(0i32).sign().unwrap(), Array::scalar(0i32));
-        assert_eq!(Array::scalar(5i64).sign().unwrap(), Array::scalar(1i64));
-        assert_eq!(Array::scalar(-2.5f32).sign().unwrap(), Array::scalar(-1.0f32));
-        assert_eq!(Array::scalar(2.5f64).sign().unwrap(), Array::scalar(1.0f64));
-        assert_eq!(Array::scalar(bf16::from_f32(-4.0)).sign().unwrap(), Array::scalar(bf16::from_f32(-1.0)));
-        assert_eq!(Array::scalar(f16::from_f32(4.0)).sign().unwrap(), Array::scalar(f16::from_f32(1.0)));
-        // Signed zeros and NaNs pass through unchanged.
-        assert_eq!(Array::scalar(0.0f64).sign().unwrap(), Array::scalar(0.0f64));
-        assert!(Array::scalar(-0.0f64).sign().unwrap().to_f64s()[0].is_sign_negative());
-        assert!(Array::scalar(f64::NAN).sign().unwrap().to_f64s()[0].is_nan());
-        // Complex signs normalize to `z / |z|` and map the origin to itself.
-        let input = ComplexNumber::new(3.0f64, -4.0f64);
-        assert_abs_diff_eq!(
-            Array::scalar(input).sign().unwrap(),
-            Array::scalar(ComplexNumber::new(0.6, -0.8)),
-            epsilon = 1e-12,
-        );
-        assert_eq!(
-            Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)).sign().unwrap(),
-            Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)),
-        );
-
-        assert_eq!(Array::vector(vec![-0.7, 0.0, 2.0]).sign().unwrap(), Array::vector(vec![-1.0, 0.0, 1.0]),);
+        assert_eq!(SignOperation::<ArrayType>::new().to_string(), "sign");
     }
 
     #[test]
@@ -149,6 +126,43 @@ mod tests {
     }
 
     #[test]
+    fn test_sign_interpretation() {
+        assert_eq!(Array::scalar(-3i32).sign().unwrap(), Array::scalar(-1i32));
+        assert_eq!(Array::scalar(0i32).sign().unwrap(), Array::scalar(0i32));
+        assert_eq!(Array::scalar(5i64).sign().unwrap(), Array::scalar(1i64));
+        assert_eq!(Array::scalar(-2.5f32).sign().unwrap(), Array::scalar(-1.0f32));
+        assert_eq!(Array::scalar(2.5f64).sign().unwrap(), Array::scalar(1.0f64));
+        assert_eq!(Array::scalar(bf16::from_f32(-4.0)).sign().unwrap(), Array::scalar(bf16::from_f32(-1.0)));
+        assert_eq!(Array::scalar(f16::from_f32(4.0)).sign().unwrap(), Array::scalar(f16::from_f32(1.0)));
+        // Signed zeros and NaNs pass through unchanged.
+        assert_eq!(Array::scalar(0.0f64).sign().unwrap(), Array::scalar(0.0f64));
+        assert!(Array::scalar(-0.0f64).sign().unwrap().to_f64s()[0].is_sign_negative());
+        assert!(Array::scalar(f64::NAN).sign().unwrap().to_f64s()[0].is_nan());
+        // Complex signs normalize to `z / |z|` and map the origin to itself.
+        let input = ComplexNumber::new(3.0f64, -4.0f64);
+        assert_abs_diff_eq!(
+            Array::scalar(input).sign().unwrap(),
+            Array::scalar(ComplexNumber::new(0.6, -0.8)),
+            epsilon = 1e-12,
+        );
+        assert_eq!(
+            Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)).sign().unwrap(),
+            Array::scalar(ComplexNumber::new(0.0f64, 0.0f64)),
+        );
+
+        assert_eq!(Array::vector(vec![-0.7, 0.0, 2.0]).sign().unwrap(), Array::vector(vec![-1.0, 0.0, 1.0]),);
+    }
+
+    #[test]
+    fn test_sign_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = SignOperation::new(),
+            inputs = [Array::scalar(-0.7)],
+            expected = Array::scalar(-1.0),
+        );
+    }
+
+    #[test]
     fn test_sign_batching() {
         check_operation_batching!(
             @exact,
@@ -176,11 +190,15 @@ mod tests {
     }
 
     #[test]
-    fn test_sign_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = SignOperation::new(),
-            inputs = [Array::scalar(-0.7)],
-            expected = Array::scalar(-1.0),
+    fn test_sign_transposition() {
+        check_operation_transposition!(
+            @exact,
+            operation = SignOperation::<ArrayType>::new(),
+            cases = [{
+                inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
+                output_cotangents = [Array::scalar(3.0)],
+                input_cotangents = [Array::scalar(0.0)],
+            }],
         );
     }
 

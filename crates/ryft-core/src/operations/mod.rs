@@ -13,6 +13,7 @@ pub mod control_flow;
 pub mod cumulative;
 pub mod custom_call;
 pub mod debugging;
+pub mod differentiation;
 pub mod dimensions;
 pub mod dot;
 pub mod logical;
@@ -20,6 +21,7 @@ pub mod manipulation;
 pub mod math;
 pub mod quantization;
 pub mod random;
+pub mod references;
 pub mod sharding;
 pub mod sort;
 pub mod tag;
@@ -31,6 +33,11 @@ pub use constants::*;
 pub use control_flow::*;
 pub use cumulative::*;
 pub use debugging::{PRINT_OPERATION_NAME, Print, PrintOperation};
+pub use differentiation::{
+    CUSTOM_JVP_OPERATION_NAME, CUSTOM_VJP_OPERATION_NAME, CustomJvp, CustomJvpOperation, CustomVjp, CustomVjpOperation,
+    LinearCallOperation, STOP_GRADIENT_OPERATION_NAME, StopGradient, StopGradientOperation, StopGradients, custom_jvp,
+    custom_vjp,
+};
 pub use dimensions::{
     ArithmeticDimensionOperation, DIMENSION_ADD_OPERATION_NAME, DIMENSION_DIV_FLOOR_OPERATION_NAME,
     DIMENSION_FROM_SCALAR_OPERATION_NAME, DIMENSION_MAX_OPERATION_NAME, DIMENSION_MIN_OPERATION_NAME,
@@ -53,6 +60,13 @@ pub use logical::*;
 pub use manipulation::*;
 pub use math::*;
 pub use quantization::{BlockQuantize, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation};
+pub use references::{
+    REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME,
+    REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME, ReferenceAddUpdate,
+    ReferenceAddUpdateOperation, ReferenceAddUpdateOperationProvider, ReferenceFreeze, ReferenceFreezeOperation,
+    ReferenceNew, ReferenceNewOperation, ReferenceNewOperationProvider, ReferenceRead, ReferenceReadOperation,
+    ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation,
+};
 pub use sharding::*;
 pub use tag::{TAG_OPERATION_NAME, Tag, TagOperation};
 

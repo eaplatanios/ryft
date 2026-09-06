@@ -46,12 +46,6 @@ use crate::programs::{
     MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
 };
 
-/// Canonical operation name for [`ReshardOperation`].
-pub const RESHARD_OPERATION_NAME: &str = "reshard";
-
-/// Canonical operation name for [`ShardingConstraintOperation`].
-pub const SHARDING_CONSTRAINT_OPERATION_NAME: &str = "sharding_constraint";
-
 /// Returns the mesh-axis names referenced by `sharding` — those that shard a ranked dimension plus those in its
 /// unreduced and reduced sets. Used by both operations to validate the requested sharding against the mesh-axis
 /// types they govern.
@@ -68,6 +62,9 @@ fn referenced_axes(sharding: &Sharding) -> impl Iterator<Item = &str> {
         .chain(sharding.reduced_axes())
         .map(String::as_str)
 }
+
+/// Canonical operation name for [`ReshardOperation`].
+pub const RESHARD_OPERATION_NAME: &str = "reshard";
 
 /// Unary [`Operation`] that performs a type-level sharding transition, the analogue of JAX's
 /// [`jax.sharding.reshard`](https://docs.jax.dev/en/latest/jax.sharding.html). It leaves the array value, shape, and
@@ -160,36 +157,6 @@ impl Operation for ReshardOperation {
     }
 }
 
-/// Value-level resharding capability, the receiver-style entry point for staging or executing [`ReshardOperation`].
-///
-/// The provided default returns the value unchanged, which is correct for concrete (single-device) values, for which
-/// a sharding only describes distribution metadata. Staging values override it to stage the operation, which keeps
-/// transforms that apply operations through interpretation (e.g. program batching and re-tracing) from silently
-/// dropping the resharding.
-pub trait Reshard: Clone {
-    /// Reshards `self` to `sharding`.
-    fn reshard(&self, sharding: &Sharding) -> Self {
-        let _ = sharding;
-        self.clone()
-    }
-}
-
-// Any context-carrying value reshards by binding a [`ReshardOperation`] through its own context. The
-// `From<ReshardOperation>` bound makes this disjoint from the eager value types (whose context operation is
-// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
-impl<V: Value<Type = ArrayType>> Reshard for V
-where
-    V::DispatchDomain: Context<Type = ArrayType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReshardOperation>,
-{
-    fn reshard(&self, sharding: &Sharding) -> Self {
-        self.dispatch_domain()
-            .bind(ReshardOperation::new(sharding.clone()), Vec::new(), std::slice::from_ref(self))
-            .expect("`reshard` operation failed")
-            .remove(0)
-    }
-}
-
 impl<C: Domain<Type = ArrayType, Value: Reshard>> InterpretableOperation<C> for ReshardOperation {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -205,6 +172,40 @@ impl<C: Domain<Type = ArrayType, Value: Reshard>> InterpretableOperation<C> for 
 }
 
 impl<C: Context> PartiallyEvaluatableOperation<C> for ReshardOperation where C::Operation: From<ReshardOperation> {}
+
+// Batching rule for [`ReshardOperation`]. The lifted reshard's target sharding gains the mapped axis's sharding
+// (derived from the batched inputs via [`ArrayBatch::sharding_for_inputs`]) at the new batch dimension.
+impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
+    for ReshardOperation
+where
+    ReshardOperation: InterpretableOperation<C>,
+{
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+        &self,
+        context: &BatchingContext<C, ArrayBatching<P>>,
+        _driver: &D,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+        check_count!("input", inputs, 1, ProgramError);
+        // Validates that a mapped batch axis has a static size before lifting.
+        ArrayBatch::common_batch_size(inputs)?;
+        let (lifted_sharding, output_axis) = match inputs[0].batch_axis_position() {
+            Some(batch_axis) => {
+                let axis_sharding = ArrayBatch::sharding_for_inputs(inputs)?;
+                let lifted = self
+                    .sharding()
+                    .with_inserted_dimension(batch_axis, axis_sharding)
+                    .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
+                (lifted, Some(batch_axis))
+            }
+            None => (self.sharding().clone(), None),
+        };
+        let lifted_op = ReshardOperation::new(lifted_sharding);
+        Ok(lifted_op
+            .interpret_with_batch_axes(context, inputs, &[BatchAxis::from_optional_position(output_axis)])?
+            .into())
+    }
+}
 
 impl_differentiable_operation! {
     ReshardOperation,
@@ -257,39 +258,38 @@ impl_differentiable_operation! {
     },
 }
 
-// Batching rule for [`ReshardOperation`]. The lifted reshard's target sharding gains the mapped axis's sharding
-// (derived from the batched inputs via [`ArrayBatch::sharding_for_inputs`]) at the new batch dimension.
-impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
-    for ReshardOperation
-where
-    ReshardOperation: InterpretableOperation<C>,
-{
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
-        &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
-        _driver: &D,
-        inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
-        check_count!("input", inputs, 1, ProgramError);
-        // Validates that a mapped batch axis has a static size before lifting.
-        ArrayBatch::common_batch_size(inputs)?;
-        let (lifted_sharding, output_axis) = match inputs[0].batch_axis_position() {
-            Some(batch_axis) => {
-                let axis_sharding = ArrayBatch::sharding_for_inputs(inputs)?;
-                let lifted = self
-                    .sharding()
-                    .with_inserted_dimension(batch_axis, axis_sharding)
-                    .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
-                (lifted, Some(batch_axis))
-            }
-            None => (self.sharding().clone(), None),
-        };
-        let lifted_op = ReshardOperation::new(lifted_sharding);
-        Ok(lifted_op
-            .interpret_with_batch_axes(context, inputs, &[BatchAxis::from_optional_position(output_axis)])?
-            .into())
+/// Value-level resharding capability, the receiver-style entry point for staging or executing [`ReshardOperation`].
+///
+/// The provided default returns the value unchanged, which is correct for concrete (single-device) values, for which
+/// a sharding only describes distribution metadata. Staging values override it to stage the operation, which keeps
+/// transforms that apply operations through interpretation (e.g. program batching and re-tracing) from silently
+/// dropping the resharding.
+pub trait Reshard: Clone {
+    /// Reshards `self` to `sharding`.
+    fn reshard(&self, sharding: &Sharding) -> Self {
+        let _ = sharding;
+        self.clone()
     }
 }
+
+// Any context-carrying value reshards by binding a [`ReshardOperation`] through its own context. The
+// `From<ReshardOperation>` bound makes this disjoint from the eager value types (whose context operation is
+// `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete implementations.
+impl<V: Value<Type = ArrayType>> Reshard for V
+where
+    V::DispatchDomain: Context<Type = ArrayType>,
+    <V::DispatchDomain as Domain>::Operation: From<ReshardOperation>,
+{
+    fn reshard(&self, sharding: &Sharding) -> Self {
+        self.dispatch_domain()
+            .bind(ReshardOperation::new(sharding.clone()), Vec::new(), std::slice::from_ref(self))
+            .expect("`reshard` operation failed")
+            .remove(0)
+    }
+}
+
+/// Canonical operation name for [`ShardingConstraintOperation`].
+pub const SHARDING_CONSTRAINT_OPERATION_NAME: &str = "sharding_constraint";
 
 /// Unary [`Operation`] that records a sharding-propagation hint, the analogue of JAX's
 /// [`jax.lax.with_sharding_constraint`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.with_sharding_constraint.html).
@@ -375,35 +375,6 @@ impl Operation for ShardingConstraintOperation {
     }
 }
 
-/// Value-level sharding-constraint capability, the receiver-style entry point for staging or executing
-/// [`ShardingConstraintOperation`]. The provided default returns the value unchanged (the hint is type-level
-/// metadata, meaningful only at lowering); staging values override it to stage the operation so interpretation-driven
-/// transforms do not drop the hint.
-pub trait ConstrainSharding: Clone {
-    /// Records `sharding` as a propagation hint on `self`.
-    fn constrain_sharding(&self, sharding: &Sharding) -> Self {
-        let _ = sharding;
-        self.clone()
-    }
-}
-
-// Any context-carrying value constrains its sharding by binding a [`ShardingConstraintOperation`] through its own
-// context. The `From<ShardingConstraintOperation>` bound makes this disjoint from the eager value types (whose
-// context operation is `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete
-// implementations.
-impl<V: Value<Type = ArrayType>> ConstrainSharding for V
-where
-    V::DispatchDomain: Context<Type = ArrayType>,
-    <V::DispatchDomain as Domain>::Operation: From<ShardingConstraintOperation>,
-{
-    fn constrain_sharding(&self, sharding: &Sharding) -> Self {
-        self.dispatch_domain()
-            .bind(ShardingConstraintOperation::new(sharding.clone()), Vec::new(), std::slice::from_ref(self))
-            .expect("`constrain_sharding` operation failed")
-            .remove(0)
-    }
-}
-
 impl<C: Domain<Type = ArrayType, Value: ConstrainSharding>> InterpretableOperation<C> for ShardingConstraintOperation {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -421,6 +392,41 @@ impl<C: Domain<Type = ArrayType, Value: ConstrainSharding>> InterpretableOperati
 impl<C: Context> PartiallyEvaluatableOperation<C> for ShardingConstraintOperation where
     C::Operation: From<ShardingConstraintOperation>
 {
+}
+
+// Batching rule for [`ShardingConstraintOperation`]. The lifted hint gains a [`ShardingDimension::Unconstrained`]
+// entry at the new batch dimension: the hint governs only the compiler-propagated auto axes, so the new dimension
+// is left open for the backend to fill rather than pinned to a derived or replicated entry (matching JAX's
+// `with_sharding_constraint` batcher, which inserts `PartitionSpec.UNCONSTRAINED`).
+impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
+    for ShardingConstraintOperation
+where
+    ShardingConstraintOperation: InterpretableOperation<C>,
+{
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+        &self,
+        context: &BatchingContext<C, ArrayBatching<P>>,
+        _driver: &D,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+        check_count!("input", inputs, 1, ProgramError);
+        // Validates that a mapped batch axis has a static size before lifting.
+        ArrayBatch::common_batch_size(inputs)?;
+        let (lifted_sharding, output_axis) = match inputs[0].batch_axis_position() {
+            Some(batch_axis) => {
+                let lifted = self
+                    .sharding()
+                    .with_inserted_dimension(batch_axis, ShardingDimension::Unconstrained)
+                    .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
+                (lifted, Some(batch_axis))
+            }
+            None => (self.sharding().clone(), None),
+        };
+        let lifted_op = ShardingConstraintOperation::new(lifted_sharding);
+        Ok(lifted_op
+            .interpret_with_batch_axes(context, inputs, &[BatchAxis::from_optional_position(output_axis)])?
+            .into())
+    }
 }
 
 impl_differentiable_operation! {
@@ -466,38 +472,32 @@ impl_differentiable_operation! {
     },
 }
 
-// Batching rule for [`ShardingConstraintOperation`]. The lifted hint gains a [`ShardingDimension::Unconstrained`]
-// entry at the new batch dimension: the hint governs only the compiler-propagated auto axes, so the new dimension
-// is left open for the backend to fill rather than pinned to a derived or replicated entry (matching JAX's
-// `with_sharding_constraint` batcher, which inserts `PartitionSpec.UNCONSTRAINED`).
-impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
-    for ShardingConstraintOperation
+/// Value-level sharding-constraint capability, the receiver-style entry point for staging or executing
+/// [`ShardingConstraintOperation`]. The provided default returns the value unchanged (the hint is type-level
+/// metadata, meaningful only at lowering); staging values override it to stage the operation so interpretation-driven
+/// transforms do not drop the hint.
+pub trait ConstrainSharding: Clone {
+    /// Records `sharding` as a propagation hint on `self`.
+    fn constrain_sharding(&self, sharding: &Sharding) -> Self {
+        let _ = sharding;
+        self.clone()
+    }
+}
+
+// Any context-carrying value constrains its sharding by binding a [`ShardingConstraintOperation`] through its own
+// context. The `From<ShardingConstraintOperation>` bound makes this disjoint from the eager value types (whose
+// context operation is `ConstantOperation`), so it covers the transform tracers without conflicting with the concrete
+// implementations.
+impl<V: Value<Type = ArrayType>> ConstrainSharding for V
 where
-    ShardingConstraintOperation: InterpretableOperation<C>,
+    V::DispatchDomain: Context<Type = ArrayType>,
+    <V::DispatchDomain as Domain>::Operation: From<ShardingConstraintOperation>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
-        &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
-        _driver: &D,
-        inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
-        check_count!("input", inputs, 1, ProgramError);
-        // Validates that a mapped batch axis has a static size before lifting.
-        ArrayBatch::common_batch_size(inputs)?;
-        let (lifted_sharding, output_axis) = match inputs[0].batch_axis_position() {
-            Some(batch_axis) => {
-                let lifted = self
-                    .sharding()
-                    .with_inserted_dimension(batch_axis, ShardingDimension::Unconstrained)
-                    .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
-                (lifted, Some(batch_axis))
-            }
-            None => (self.sharding().clone(), None),
-        };
-        let lifted_op = ShardingConstraintOperation::new(lifted_sharding);
-        Ok(lifted_op
-            .interpret_with_batch_axes(context, inputs, &[BatchAxis::from_optional_position(output_axis)])?
-            .into())
+    fn constrain_sharding(&self, sharding: &Sharding) -> Self {
+        self.dispatch_domain()
+            .bind(ShardingConstraintOperation::new(sharding.clone()), Vec::new(), std::slice::from_ref(self))
+            .expect("`constrain_sharding` operation failed")
+            .remove(0)
     }
 }
 
@@ -583,49 +583,24 @@ mod tests {
     }
 
     #[test]
-    fn test_sharding_constraint_is_type_level_identity() {
-        let mesh = explicit_manual_mesh();
-        let hint = Sharding::new(mesh, vec![ShardingDimension::sharded(["a"])]).unwrap();
-        let operation = ShardingConstraintOperation::new(hint.clone());
-
-        assert_eq!(operation.name(), SHARDING_CONSTRAINT_OPERATION_NAME);
-        assert_eq!(operation.to_string(), format!("sharding_constraint [sharding={hint}]"));
-
-        // Inference is the identity: the input type passes through untouched, hint included, even though the input
-        // carries no sharding of its own.
-        let input = vector_type(8);
-        assert_eq!(operation.infer_output_types(std::slice::from_ref(&input), &[]), Ok(vec![input]));
-    }
-
-    #[test]
-    fn test_sharding_constraint_rejects_non_auto_axes() {
-        let mesh = explicit_manual_mesh();
-        let explicit_hint = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
-        assert_eq!(
-            ShardingConstraintOperation::new(explicit_hint).infer_output_types(&[vector_type(8)], &[]),
-            Err(TypeError::invalid(
-                "sharding_constraint can only hint placement over auto mesh axes, but `x` is not auto; use \
-                          reshard for explicit or manual axes"
-                    .to_string()
-            )),
-        );
-    }
-
-    fn mesh() -> LogicalMesh {
-        LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
-        ])
-        .unwrap()
-    }
-
-    fn vector_f64_type(size: usize) -> ArrayType {
-        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(size)]))
-    }
-
-    fn matrix_type(rows: usize, columns: usize) -> ArrayType {
-        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(rows), Dimension::Static(columns)]))
+    fn test_reshard_batching_lifts_the_target_sharding() {
+        let mesh = mesh();
+        // The batch item reshards to a rank-1 sharding; batching over an unsharded input inserts a replicated entry at
+        // the new batch axis, so the lifted reshard targets a rank-2 sharding.
+        let target = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let expected_lifted = target.with_inserted_dimension(0, ShardingDimension::Replicated).unwrap();
+        let (_output_type, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |x| {
+                let target = target.clone();
+                Ok(batch(move |item| Ok(item.reshard(&target)), x, BatchAxis::new(0), BatchAxis::new(0), None).unwrap())
+            },
+            matrix_type(2, 3),
+        )
+        .unwrap();
+        let ArrayOperation::Reshard(operation) = program.instructions()[0].operation() else {
+            panic!("expected the batched program to stage a reshard operation");
+        };
+        assert_eq!(operation.sharding(), &expected_lifted);
     }
 
     #[test]
@@ -657,6 +632,23 @@ mod tests {
             })
             .expect("the pullback should stage a reshard transposition");
         assert_eq!(staged, input_sharding.cotangent());
+    }
+
+    fn mesh() -> LogicalMesh {
+        LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("m", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("a", 2, MeshAxisType::Auto).unwrap(),
+        ])
+        .unwrap()
+    }
+
+    fn vector_f64_type(size: usize) -> ArrayType {
+        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(size)]))
+    }
+
+    fn matrix_type(rows: usize, columns: usize) -> ArrayType {
+        ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(rows), Dimension::Static(columns)]))
     }
 
     #[test]
@@ -693,22 +685,52 @@ mod tests {
     }
 
     #[test]
-    fn test_reshard_batching_lifts_the_target_sharding() {
+    fn test_sharding_constraint_is_type_level_identity() {
+        let mesh = explicit_manual_mesh();
+        let hint = Sharding::new(mesh, vec![ShardingDimension::sharded(["a"])]).unwrap();
+        let operation = ShardingConstraintOperation::new(hint.clone());
+
+        assert_eq!(operation.name(), SHARDING_CONSTRAINT_OPERATION_NAME);
+        assert_eq!(operation.to_string(), format!("sharding_constraint [sharding={hint}]"));
+
+        // Inference is the identity: the input type passes through untouched, hint included, even though the input
+        // carries no sharding of its own.
+        let input = vector_type(8);
+        assert_eq!(operation.infer_output_types(std::slice::from_ref(&input), &[]), Ok(vec![input]));
+    }
+
+    #[test]
+    fn test_sharding_constraint_rejects_non_auto_axes() {
+        let mesh = explicit_manual_mesh();
+        let explicit_hint = Sharding::new(mesh, vec![ShardingDimension::sharded(["x"])]).unwrap();
+        assert_eq!(
+            ShardingConstraintOperation::new(explicit_hint).infer_output_types(&[vector_type(8)], &[]),
+            Err(TypeError::invalid(
+                "sharding_constraint can only hint placement over auto mesh axes, but `x` is not auto; use \
+                          reshard for explicit or manual axes"
+                    .to_string()
+            )),
+        );
+    }
+
+    #[test]
+    fn test_sharding_constraint_batching_inserts_an_unconstrained_dimension() {
         let mesh = mesh();
-        // The batch item reshards to a rank-1 sharding; batching over an unsharded input inserts a replicated entry at
-        // the new batch axis, so the lifted reshard targets a rank-2 sharding.
-        let target = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let expected_lifted = target.with_inserted_dimension(0, ShardingDimension::Replicated).unwrap();
+        // The hint governs only the compiler-propagated auto axes, so batching leaves the new batch axis unconstrained
+        // for the backend to fill rather than pinning it to a derived or replicated entry.
+        let hint = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["a"])]).unwrap();
+        let expected_lifted = hint.with_inserted_dimension(0, ShardingDimension::Unconstrained).unwrap();
         let (_output_type, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
             |x| {
-                let target = target.clone();
-                Ok(batch(move |item| Ok(item.reshard(&target)), x, BatchAxis::new(0), BatchAxis::new(0), None).unwrap())
+                let hint = hint.clone();
+                Ok(batch(move |item| Ok(item.constrain_sharding(&hint)), x, BatchAxis::new(0), BatchAxis::new(0), None)
+                    .unwrap())
             },
             matrix_type(2, 3),
         )
         .unwrap();
-        let ArrayOperation::Reshard(operation) = program.instructions()[0].operation() else {
-            panic!("expected the batched program to stage a reshard operation");
+        let ArrayOperation::ShardingConstraint(operation) = program.instructions()[0].operation() else {
+            panic!("expected the batched program to stage a sharding_constraint operation");
         };
         assert_eq!(operation.sharding(), &expected_lifted);
     }
@@ -735,27 +757,5 @@ mod tests {
             })
             .expect("the pullback should stage a self-adjoint sharding-constraint transposition");
         assert_eq!(staged, hint);
-    }
-
-    #[test]
-    fn test_sharding_constraint_batching_inserts_an_unconstrained_dimension() {
-        let mesh = mesh();
-        // The hint governs only the compiler-propagated auto axes, so batching leaves the new batch axis unconstrained
-        // for the backend to fill rather than pinning it to a derived or replicated entry.
-        let hint = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["a"])]).unwrap();
-        let expected_lifted = hint.with_inserted_dimension(0, ShardingDimension::Unconstrained).unwrap();
-        let (_output_type, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |x| {
-                let hint = hint.clone();
-                Ok(batch(move |item| Ok(item.constrain_sharding(&hint)), x, BatchAxis::new(0), BatchAxis::new(0), None)
-                    .unwrap())
-            },
-            matrix_type(2, 3),
-        )
-        .unwrap();
-        let ArrayOperation::ShardingConstraint(operation) = program.instructions()[0].operation() else {
-            panic!("expected the batched program to stage a sharding_constraint operation");
-        };
-        assert_eq!(operation.sharding(), &expected_lifted);
     }
 }

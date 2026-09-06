@@ -28,14 +28,14 @@ pub const SELECT_OPERATION_NAME: &str = "select";
 #[derive(Clone, Debug)]
 pub struct SelectOperation<T: Type>(PhantomData<fn() -> T>);
 
-impl<T: Type> Copy for SelectOperation<T> {}
-
 impl<T: Type> SelectOperation<T> {
     /// Constructs a select operation for the `T` type universe.
     pub const fn new() -> Self {
         Self(PhantomData)
     }
 }
+
+impl<T: Type> Copy for SelectOperation<T> {}
 
 impl<T: Type> Display for SelectOperation<T> {
     #[inline]
@@ -352,13 +352,14 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{Array, Dimension, Shape};
+    use crate::contexts::EagerContext;
     use crate::differentiation::differentiate_at;
     use crate::macros::{
         check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
         check_operation_type_inference,
     };
     use crate::operations::compare::{Compare, ComparisonDirection};
-    use crate::programs::{ProgramError, Typed};
+    use crate::programs::{EmptyRegionDriver, ProgramError, Typed};
 
     use super::*;
 
@@ -369,6 +370,11 @@ mod tests {
         // Check operation identity in the array type universe.
         assert_eq!(array_operation.name(), SELECT_OPERATION_NAME);
         assert_eq!(format!("{array_operation}"), SELECT_OPERATION_NAME);
+    }
+
+    #[test]
+    fn test_select_type_inference() {
+        let array_operation = SelectOperation::<ArrayType>::new();
 
         // Check ternary shape broadcasting and branch promotion in the array type universe.
         let condition_type = ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Static(3)]));
@@ -417,23 +423,41 @@ mod tests {
                 },
             ],
         );
+    }
 
+    #[test]
+    fn test_select_interpretation() {
+        let branch_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         // Check eager selection, scalar broadcasting, and mixed branch data-type promotion together.
-        let output = Select::select(
-            &Array::vector(vec![true, false, true]),
-            &Array::scalar(7.0_f32),
-            &Array::vector(vec![4.0_f64, 5.0, 6.0]),
-        )
-        .unwrap();
+        let output = SelectOperation::<ArrayType>::new()
+            .interpret(
+                &EagerContext::<Array>::new(),
+                &EmptyRegionDriver,
+                &[
+                    Array::vector(vec![true, false, true]),
+                    Array::scalar(7.0_f32),
+                    Array::vector(vec![4.0_f64, 5.0, 6.0]),
+                ],
+            )
+            .unwrap()
+            .remove(0);
         assert_eq!(output.r#type().into_owned(), branch_type);
         assert_eq!(output.to_f64s(), vec![7.0, 5.0, 7.0]);
+    }
 
+    #[test]
+    fn test_select_partial_evaluation() {
         // Check that known inputs fold and unknown inputs residualize.
         check_operation_partial_evaluation!(
             operation = SelectOperation::<ArrayType>::new(),
             inputs = [Array::scalar(true), Array::scalar(2.0_f32), Array::scalar(3.0_f64)],
             expected = Array::scalar(2.0_f64),
         );
+    }
+
+    #[test]
+    fn test_select_batching() {
+        let array_operation = SelectOperation::<ArrayType>::new();
 
         // Check elementwise batching with mapped conditions and a replicated branch.
         check_operation_batching!(
@@ -449,7 +473,10 @@ mod tests {
                 outputs = [(@mapped(axis = 0), Array::vector(vec![2.0, 4.0]))],
             }],
         );
+    }
 
+    #[test]
+    fn test_select_differentiation() {
         // Check that differentiation routes tangents and cotangents through the selected branch. This stays explicit
         // because the operation-check helper's finite-difference oracle cannot perturb a Boolean condition input.
         fn piecewise<V: Clone + Compare<V> + Select + std::ops::Add<Output = V>>(
@@ -483,7 +510,10 @@ mod tests {
         assert_eq!(value, Array::scalar(6.0));
         assert_eq!(gradient.0, Array::scalar(0.0));
         assert_eq!(gradient.1, Array::scalar(3.0));
+    }
 
+    #[test]
+    fn test_select_transposition() {
         // Check that primitive transposition partitions the cotangent between the two linear branches.
         let condition = Array::vector(vec![true, false]);
         let on_true = Array::vector(vec![10.0, 20.0]);

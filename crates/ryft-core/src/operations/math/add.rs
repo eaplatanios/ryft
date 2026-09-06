@@ -104,33 +104,7 @@ mod tests {
 
     #[test]
     fn test_add() {
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &AddOperation::<ArrayType>::new(),
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Array::scalar(2.0f32), Array::scalar(3.5f64)],
-            ),
-            Ok(vec![Array::scalar(5.5f64)])
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &AddOperation::<ArrayType>::new(),
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Array::scalar(2.0), Array::vector(vec![3.5, -1.0])],
-            ),
-            Ok(vec![Array::vector(vec![5.5, 1.0])]),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &AddOperation::<ArrayType>::new(),
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Array::scalar(Complex::new(1.0f64, 2.0)), Array::scalar(Complex::new(0.5f64, -1.0))],
-            ),
-            Ok(vec![Array::scalar(Complex::new(1.5f64, 1.0))]),
-        );
+        assert_eq!(AddOperation::<ArrayType>::new().to_string(), "add");
     }
 
     #[test]
@@ -188,6 +162,46 @@ mod tests {
     }
 
     #[test]
+    fn test_add_interpretation() {
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &AddOperation::<ArrayType>::new(),
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(2.0f32), Array::scalar(3.5f64)],
+            ),
+            Ok(vec![Array::scalar(5.5f64)])
+        );
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &AddOperation::<ArrayType>::new(),
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(2.0), Array::vector(vec![3.5, -1.0])],
+            ),
+            Ok(vec![Array::vector(vec![5.5, 1.0])]),
+        );
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &AddOperation::<ArrayType>::new(),
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(Complex::new(1.0f64, 2.0)), Array::scalar(Complex::new(0.5f64, -1.0))],
+            ),
+            Ok(vec![Array::scalar(Complex::new(1.5f64, 1.0))]),
+        );
+    }
+
+    #[test]
+    fn test_add_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = AddOperation::new(),
+            inputs = [Array::scalar(2.0), Array::scalar(3.5)],
+            expected = Array::scalar(5.5),
+        );
+    }
+
+    #[test]
     fn test_add_batching() {
         check_operation_batching!(
             @approx(epsilon = 1e-9),
@@ -220,15 +234,6 @@ mod tests {
                     in (%4, %5)
                 "},
             }],
-        );
-    }
-
-    #[test]
-    fn test_add_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = AddOperation::new(),
-            inputs = [Array::scalar(2.0), Array::scalar(3.5)],
-            expected = Array::scalar(5.5),
         );
     }
 

@@ -83,7 +83,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cumulative_product_operation_type_inference() {
+    fn test_cumulative_product() {
+        // The scan direction renders only when it is set, keeping the common forward scan compact.
+        assert_eq!(CumulativeProductOperation::new(1).to_string(), "cumulative_product [axis=1]");
+        assert_eq!(
+            CumulativeProductOperation::new(0).with_reverse(true).to_string(),
+            "cumulative_product [axis=0, reverse=true]",
+        );
+        assert_eq!(CumulativeProductOperation::new(0).with_reverse(false), CumulativeProductOperation::new(0));
+    }
+
+    #[test]
+    fn test_cumulative_product_type_inference() {
         // The output type follows the staged input type exactly, and complex payloads are accepted alongside the
         // real numeric ones.
         let operation = CumulativeProductOperation::new(1);
@@ -131,18 +142,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cumulative_product_operation_rendering() {
-        // The scan direction renders only when it is set, keeping the common forward scan compact.
-        assert_eq!(CumulativeProductOperation::new(1).to_string(), "cumulative_product [axis=1]");
-        assert_eq!(
-            CumulativeProductOperation::new(0).with_reverse(true).to_string(),
-            "cumulative_product [axis=0, reverse=true]",
-        );
-        assert_eq!(CumulativeProductOperation::new(0).with_reverse(false), CumulativeProductOperation::new(0));
-    }
-
-    #[test]
-    fn test_cumulative_product_operation_interpretation() {
+    fn test_cumulative_product_interpretation() {
         let context = EagerContext::<Array>::new();
         let interpret = |operation: &CumulativeProductOperation, input: &Array| {
             operation.interpret(&context, &EmptyRegionDriver, std::slice::from_ref(input)).unwrap().remove(0)
@@ -185,22 +185,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cumulative_product_capability_over_eager_arrays() {
-        // The capability is the receiver-style entry point of the same kernel, in both scan directions, and it
-        // reports the operation's own validation errors instead of panicking.
-        let input = Array::vector(vec![1.0, 2.0, 3.0]);
-        assert_eq!(input.cumulative_product(0), Ok(Array::vector(vec![1.0, 2.0, 6.0])));
-        assert_eq!(input.reverse_cumulative_product(0), Ok(Array::vector(vec![6.0, 6.0, 3.0])));
-        assert_eq!(
-            input.cumulative_product(1),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`cumulative_product` axis 1 is out of bounds for rank 1".to_string(),
-            ))),
-        );
-    }
-
-    #[test]
-    fn test_cumulative_product_operation_batches_along_the_shifted_axis() {
+    fn test_cumulative_product_batching() {
         // A replicated operand carries no inserted batch dimension, so the scanned axis needs no shift.
         check_operation_batching!(
             @exact,
@@ -237,7 +222,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cumulative_product_operation_masks_ragged_padding_with_one() {
+    fn test_cumulative_product_masks_ragged_padding_with_one() {
         // Scanning a ragged axis would multiply its padding into every later live prefix, so the rule asks the
         // policy to neutralize that padding with the multiplicative identity first. Static array batching cannot,
         // and says so rather than silently scanning padding.
@@ -325,7 +310,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cumulative_product_operation_differentiation() {
+    fn test_cumulative_product_differentiation() {
         // The primitive is nonlinear, so the rule differentiates through the associative-scan decomposition. The
         // expected tangents below are the exact product rule applied to each prefix (and each suffix).
         check_operation_differentiation!(
@@ -347,6 +332,21 @@ mod tests {
                 primal_outputs = [Array::vector(vec![24.0, 24.0, 12.0, 4.0])],
                 tangent_outputs = [Array::vector(vec![50.0, 26.0, 7.0, 1.0])],
             }],
+        );
+    }
+
+    #[test]
+    fn test_cumulative_product_capability_over_eager_arrays() {
+        // The capability is the receiver-style entry point of the same kernel, in both scan directions, and it
+        // reports the operation's own validation errors instead of panicking.
+        let input = Array::vector(vec![1.0, 2.0, 3.0]);
+        assert_eq!(input.cumulative_product(0), Ok(Array::vector(vec![1.0, 2.0, 6.0])));
+        assert_eq!(input.reverse_cumulative_product(0), Ok(Array::vector(vec![6.0, 6.0, 3.0])));
+        assert_eq!(
+            input.cumulative_product(1),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`cumulative_product` axis 1 is out of bounds for rank 1".to_string(),
+            ))),
         );
     }
 }

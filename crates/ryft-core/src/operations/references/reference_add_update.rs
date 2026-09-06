@@ -2,9 +2,6 @@
 
 // TODO(eaplatanios): Review this module.
 
-use std::borrow::Cow;
-use std::sync::LazyLock;
-
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
 };
@@ -15,23 +12,17 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
-use crate::operations::AddOperation;
+use crate::operations::math::add::AddOperation;
+use crate::operations::references::reference_read::ReferenceReadOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::ProgramError;
-use crate::programs::atoms::MaybeZero;
-use crate::programs::effects::{EffectClasses, Effects, ReferenceAccessMode, ReferenceEffect};
-use crate::programs::operations::Operation;
-use crate::programs::references::discharge::{
-    ReferenceAccumulationPolicy, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargeValue,
-    ReferenceDischargeableOperation,
+use crate::programs::{
+    EffectClasses, Effects, MaybeZero, Operation, ProgramError, ReferenceAccessMode, ReferenceAccumulationPolicy,
+    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    ReferenceEffect, ReferenceType, ReferenceViewOperation, RegionInterface, Type, TypeError, Typed, Value,
 };
-use crate::programs::references::operations::ReferenceReadOperation;
-use crate::programs::references::types::ReferenceType;
-use crate::programs::references::views::ReferenceViewOperation;
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::Value;
 use crate::tracing::{Tracer, TracingContext};
+use std::borrow::Cow;
+use std::sync::LazyLock;
 
 use super::{align_stored_batch, stored_tangents, validate_operand_types};
 
@@ -256,9 +247,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use indoc::indoc;
-    use pretty_assertions::assert_eq;
-
     use crate::arrays::{
         Array, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrValue, ArrayType, DataType, DimensionBounds,
         DimensionType, DimensionValue, DimensionVariable,
@@ -266,12 +254,13 @@ mod tests {
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::EagerContext;
     use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
+    use crate::operations::references::reference_new::ReferenceNew;
+    use crate::operations::references::reference_read::ReferenceRead;
+    use crate::operations::references::tests::*;
     use crate::parameters::Placeholder;
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::effects::EffectClass;
-    use crate::programs::references::operations::tests::*;
-    use crate::programs::references::operations::{ReferenceNew, ReferenceRead};
-    use crate::programs::regions::EmptyRegionDriver;
+    use crate::programs::{EffectClass, EmptyRegionDriver, ProgramBuilder};
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
 
     use super::*;
 

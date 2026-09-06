@@ -3,9 +3,6 @@ use super::*;
 /// Canonical operation name for [`DotProductAttentionOperation`].
 pub const DOT_PRODUCT_ATTENTION_OPERATION_NAME: &str = "dot_product_attention";
 
-/// Canonical operation name for [`DotProductAttentionBackwardOperation`].
-pub const DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME: &str = "dot_product_attention_backward";
-
 /// Scaled dot-product attention boundary. For each batch item and query head, this operation computes
 ///
 /// ```text
@@ -157,6 +154,31 @@ impl Operation for DotProductAttentionOperation {
         })
     }
 }
+
+impl<C: Domain<Type = ArrayType, Value: DotProductAttention>> InterpretableOperation<C>
+    for DotProductAttentionOperation
+{
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        let (output, residual) =
+            C::Value::dot_product_attention(AttentionInputs::from_values(self.signature, inputs)?, self.configuration)?;
+        Ok(std::iter::once(output).chain(residual).collect())
+    }
+}
+
+/// Partial evaluation defers to the default fold-or-residualize behavior of
+/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
+impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DotProductAttentionOperation where
+    C::Operation: From<DotProductAttentionOperation>
+{
+}
+
+/// Canonical operation name for [`DotProductAttentionBackwardOperation`].
+pub const DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME: &str = "dot_product_attention_backward";
 
 /// Fused-kernel boundary for the analytical backward pass of [`DotProductAttentionOperation`].
 ///
@@ -332,21 +354,6 @@ impl Operation for DotProductAttentionBackwardOperation {
     }
 }
 
-impl<C: Domain<Type = ArrayType, Value: DotProductAttention>> InterpretableOperation<C>
-    for DotProductAttentionOperation
-{
-    fn interpret<D: InterpretationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        let (output, residual) =
-            C::Value::dot_product_attention(AttentionInputs::from_values(self.signature, inputs)?, self.configuration)?;
-        Ok(std::iter::once(output).chain(residual).collect())
-    }
-}
-
 impl<C: Domain<Type = ArrayType, Value: DotProductAttentionBackward>> InterpretableOperation<C>
     for DotProductAttentionBackwardOperation
 {
@@ -374,13 +381,6 @@ impl<C: Domain<Type = ArrayType, Value: DotProductAttentionBackward>> Interpreta
             self.configuration,
         )
     }
-}
-
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
-impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DotProductAttentionOperation where
-    C::Operation: From<DotProductAttentionOperation>
-{
 }
 
 /// Partial evaluation defers to the default fold-or-residualize behavior of

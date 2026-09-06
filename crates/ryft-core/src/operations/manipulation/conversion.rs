@@ -30,8 +30,6 @@ pub struct ConvertElementTypeOperation<T: ElementType> {
     marker: PhantomData<fn() -> T>,
 }
 
-impl<T: ElementType> Copy for ConvertElementTypeOperation<T> {}
-
 impl<T: ElementType> ConvertElementTypeOperation<T> {
     /// Creates a new [`ConvertElementTypeOperation`].
     #[inline]
@@ -45,6 +43,8 @@ impl<T: ElementType> ConvertElementTypeOperation<T> {
         self.data_type
     }
 }
+
+impl<T: ElementType> Copy for ConvertElementTypeOperation<T> {}
 
 impl<T: ElementType> Display for ConvertElementTypeOperation<T> {
     #[inline]
@@ -245,22 +245,28 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{Array, ArrayType, DataType, Dimension, Layout, Memory, Shape, StridedLayout};
+    use crate::contexts::EagerContext;
     use crate::differentiation::differentiate_at;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
-    use crate::programs::Typed;
+    use crate::programs::{EmptyRegionDriver, Typed};
 
     use super::*;
 
     #[test]
     fn test_convert_element_type() {
-        // Check operation metadata and exact inference, including structural array metadata and token rejection.
+        // Check operation identity and the requested output element type.
         let array_operation = ConvertElementTypeOperation::<ArrayType>::new(DataType::F32);
         assert_eq!(array_operation.name(), CONVERT_ELEMENT_TYPE_OPERATION_NAME);
         assert_eq!(array_operation.data_type(), DataType::F32);
         assert_eq!(array_operation.to_string(), "convert_element_type [data_type=f32]");
+    }
+
+    #[test]
+    fn test_convert_element_type_type_inference() {
+        let array_operation = ConvertElementTypeOperation::<ArrayType>::new(DataType::F32);
 
         check_operation_type_inference!(
             operation = array_operation,
@@ -294,6 +300,19 @@ mod tests {
                 error = "cannot convert values to or from the token data type",
             }],
         );
+    }
+
+    #[test]
+    fn test_convert_element_type_interpretation() {
+        let output = ConvertElementTypeOperation::<ArrayType>::new(DataType::F32)
+            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, &[Array::scalar(2.0_f64)])
+            .unwrap();
+        assert_eq!(output, vec![Array::scalar(2.0_f32)]);
+    }
+
+    #[test]
+    fn test_convert_element_type_partial_evaluation() {
+        let array_operation = ConvertElementTypeOperation::<ArrayType>::new(DataType::F32);
 
         // Check the default fold-or-residualize rule and preservation of mapped batch placement.
         check_operation_partial_evaluation!(
@@ -301,6 +320,11 @@ mod tests {
             inputs = [Array::scalar(2.0_f64)],
             expected = Array::scalar(2.0_f32),
         );
+    }
+
+    #[test]
+    fn test_convert_element_type_batching() {
+        let array_operation = ConvertElementTypeOperation::<ArrayType>::new(DataType::F32);
 
         check_operation_batching!(
             @exact,
@@ -317,7 +341,10 @@ mod tests {
                 )],
             }],
         );
+    }
 
+    #[test]
+    fn test_convert_element_type_differentiation() {
         // Check the continuous conversion JVP against finite differences and its reverse conversion of cotangents.
         check_operation_differentiation!(
             @approx(step = 0.125, epsilon = 1e-6),
@@ -329,24 +356,10 @@ mod tests {
                 tangent_outputs = [Array::from_f64s(ArrayType::scalar(DataType::F64), vec![2.0])],
             }],
         );
+    }
 
-        check_operation_transposition!(
-            @exact,
-            operation = ConvertElementTypeOperation::new(DataType::F32),
-            cases = [
-                {
-                    inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
-                    output_cotangents = [Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0])],
-                    input_cotangents = [Array::from_f64s(ArrayType::scalar(DataType::F64), vec![3.0])],
-                },
-                {
-                    inputs = [(@linear(type = ArrayType::scalar(DataType::I32)))],
-                    output_cotangents = [Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0])],
-                    input_cotangents = [Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap()],
-                },
-            ],
-        );
-
+    #[test]
+    fn test_convert_element_type_differentiation_low_precision() {
         // Low-precision primals use their wider differential representations in both conversion directions.
         let primal = Array::from_f64s(ArrayType::scalar(DataType::F8E8M0FNU), vec![2.0]);
         let tangent = Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0]);
@@ -427,5 +440,25 @@ mod tests {
             .unwrap();
         assert_eq!(output.r#type().into_owned(), ArrayType::scalar(DataType::F64));
         assert_eq!(output_tangent, Array::from_f64s(ArrayType::scalar(DataType::F64), vec![0.0]));
+    }
+
+    #[test]
+    fn test_convert_element_type_transposition() {
+        check_operation_transposition!(
+            @exact,
+            operation = ConvertElementTypeOperation::new(DataType::F32),
+            cases = [
+                {
+                    inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
+                    output_cotangents = [Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0])],
+                    input_cotangents = [Array::from_f64s(ArrayType::scalar(DataType::F64), vec![3.0])],
+                },
+                {
+                    inputs = [(@linear(type = ArrayType::scalar(DataType::I32)))],
+                    output_cotangents = [Array::from_f64s(ArrayType::scalar(DataType::F32), vec![3.0])],
+                    input_cotangents = [Array::new(ArrayType::scalar(DataType::Zero), Vec::new()).unwrap()],
+                },
+            ],
+        );
     }
 }

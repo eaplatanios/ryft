@@ -39,9 +39,6 @@ use super::gathering::{
 };
 use super::slicing::batch_by_item_expansion;
 
-/// Canonical operation name for [`ScatterOperation`].
-pub const SCATTER_OPERATION_NAME: &str = "scatter";
-
 /// Combiner applied when a [`scatter`](Scatter) writes an update into the operand. Each kind selects the binary
 /// reduction used where an update meets the existing operand value and lowers to the corresponding
 /// `stablehlo.scatter` combiner region. Only [`Add`](Self::Add) is a linear map and participates in the
@@ -201,6 +198,9 @@ impl Display for ScatterDimensionNumbers {
         )
     }
 }
+
+/// Canonical operation name for [`ScatterOperation`].
+pub const SCATTER_OPERATION_NAME: &str = "scatter";
 
 /// [`Operation`] that writes update windows into a copy of an operand at positions named by an integer index operand,
 /// combining overlaps with a [`ScatterReductionKind`]. Refer to the documentation of [`Scatter`] for the semantics.
@@ -377,6 +377,32 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for ScatterO
 {
 }
 
+/// Batching rule for [`ScatterOperation`]. As with gather, a scatter's window/inserted/index axis bookkeeping does not
+/// compose cleanly with an extra mapped axis, so any batched operand, indices, or updates is handled by per-item
+/// expansion (`batch_by_item_expansion`): each batch item scatters independently and the results restack along a fresh
+/// leading batch axis. This stages `O(axis_size)` scatters but is correct for every combiner and dimension-number
+/// configuration; dimension-number lifting is a performance optimization left as a follow-up. When no input is mapped
+/// the scatter applies once, unbatched.
+impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for ScatterOperation
+where
+    C: Context<Type = ArrayType> + Zero<C::Value>,
+    C::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
+    ScatterOperation: InterpretableOperation<C>,
+{
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+        &self,
+        context: &BatchingContext<C, ArrayBatching<P>>,
+        _driver: &D,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+        check_count!("input", inputs, 3, ProgramError);
+        let Some(axis_size) = ArrayBatch::common_batch_size(inputs)? else {
+            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
+        };
+        Ok(batch_by_item_expansion(context, SCATTER_OPERATION_NAME, self, inputs, axis_size)?.into())
+    }
+}
+
 /// Forward-mode rule for [`ScatterOperation`]. For the [`Add`](ScatterReductionKind::Add) combiner the operation
 /// is jointly linear in its operand and updates, while the integer index operand is a non-differentiated primal operand
 /// edge, so the tangent scatter-adds the operand and update tangents at the same primal indices. A zero operand and
@@ -416,76 +442,6 @@ where
             let operand_tangent = operand.tangent().clone().materialize(context)?;
             let updates_tangent = updates.tangent().clone().materialize(context)?;
             MaybeZero::Value(operand_tangent.scatter(indices, &updates_tangent, self)?)
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
-}
-
-/// Projected array IR JVP rule for [`ScatterOperation`]. Scatter-add is jointly linear in its operand and updates and
-/// needs both tangents as real values, but a structural zero whose type names an extent by identity carries no runtime
-/// extent, so the type alone cannot construct that zero. This rule therefore materializes each missing tangent from its
-/// own primal through [`materialize_array_tangent`], which names those extents, before staging the tangent scatter. The transpose needs no
-/// operand geometry of its own — scatter-add's operand Jacobian is the identity and the update cotangent gathers the
-/// output cotangent at the same known indices — so this rule stages a plain tangent scatter rather than a residual-
-/// parameterized [`LinearCallOperation`](crate::LinearCallOperation), and transposition continues through the
-/// homogeneous rule. Fully static operand and update geometry delegates to the homogeneous projected rule unchanged.
-impl<C> MemberDifferentiableOperation<C> for ScatterOperation
-where
-    C: Context<Type = ArrayIrType> + Zero<C::Value>,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Operation: ResidualZeroProvider<ArrayIrType> + OperationProjection<ArrayType>,
-    <C::Operation as OperationProjection<ArrayType>>::Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
-        + From<ScatterOperation>
-        + From<ZeroLikeOperation<ArrayType>>
-        + From<ZeroOperation<ArrayType>>,
-{
-    fn jvp_in_parent<D: DifferentiationDriver<C>>(
-        &self,
-        context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        let [operand, indices, updates] = inputs else {
-            return Err(ProgramError::InvalidInputCount { expected: 3, actual: inputs.len() }.into());
-        };
-        let operand_type = <&ArrayType>::try_from(operand.primal().r#type().as_ref())?.clone();
-        let updates_type = <&ArrayType>::try_from(updates.primal().r#type().as_ref())?.clone();
-        let is_static = |r#type: &ArrayType| {
-            r#type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_)))
-        };
-        let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
-        if is_static(&operand_type) && is_static(&updates_type) {
-            return jvp_projected_operation(context, &operation, inputs);
-        }
-
-        let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let primal = context.bind(operation.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
-        let tangent = if operand.tangent().is_zero() && updates.tangent().is_zero() {
-            MaybeZero::Zero(primal.r#type().tangent()?)
-        } else if self.kind() != ScatterReductionKind::Add {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "differentiation of {} with the {} combiner is not yet implemented (only scatter-add is linear)",
-                    SCATTER_OPERATION_NAME,
-                    self.kind(),
-                ),
-            }
-            .into());
-        } else {
-            let projected_context = ProjectedContext::<C, ArrayType>::new(context.clone());
-            let tangent_inputs = [
-                <C::Value as ValueProjection<ArrayType>>::from_projected(materialize_array_tangent(
-                    &projected_context,
-                    operand,
-                )?),
-                indices.primal().clone(),
-                <C::Value as ValueProjection<ArrayType>>::from_projected(materialize_array_tangent(
-                    &projected_context,
-                    updates,
-                )?),
-            ];
-            MaybeZero::Value(context.bind(operation, Vec::new(), tangent_inputs.as_slice())?.remove(0))
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
@@ -598,29 +554,73 @@ where
     }
 }
 
-/// Batching rule for [`ScatterOperation`]. As with gather, a scatter's window/inserted/index axis bookkeeping does not
-/// compose cleanly with an extra mapped axis, so any batched operand, indices, or updates is handled by per-item
-/// expansion (`batch_by_item_expansion`): each batch item scatters independently and the results restack along a fresh
-/// leading batch axis. This stages `O(axis_size)` scatters but is correct for every combiner and dimension-number
-/// configuration; dimension-number lifting is a performance optimization left as a follow-up. When no input is mapped
-/// the scatter applies once, unbatched.
-impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for ScatterOperation
+/// Projected array IR JVP rule for [`ScatterOperation`]. Scatter-add is jointly linear in its operand and updates and
+/// needs both tangents as real values, but a structural zero whose type names an extent by identity carries no runtime
+/// extent, so the type alone cannot construct that zero. This rule therefore materializes each missing tangent from its
+/// own primal through [`materialize_array_tangent`], which names those extents, before staging the tangent scatter. The transpose needs no
+/// operand geometry of its own — scatter-add's operand Jacobian is the identity and the update cotangent gathers the
+/// output cotangent at the same known indices — so this rule stages a plain tangent scatter rather than a residual-
+/// parameterized [`LinearCallOperation`](crate::LinearCallOperation), and transposition continues through the
+/// homogeneous rule. Fully static operand and update geometry delegates to the homogeneous projected rule unchanged.
+impl<C> MemberDifferentiableOperation<C> for ScatterOperation
 where
-    C: Context<Type = ArrayType> + Zero<C::Value>,
-    C::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
-    ScatterOperation: InterpretableOperation<C>,
+    C: Context<Type = ArrayIrType> + Zero<C::Value>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Operation: ResidualZeroProvider<ArrayIrType> + OperationProjection<ArrayType>,
+    <C::Operation as OperationProjection<ArrayType>>::Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
+        + From<ScatterOperation>
+        + From<ZeroLikeOperation<ArrayType>>
+        + From<ZeroOperation<ArrayType>>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn jvp_in_parent<D: DifferentiationDriver<C>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &C,
         _driver: &D,
-        inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
-        check_count!("input", inputs, 3, ProgramError);
-        let Some(axis_size) = ArrayBatch::common_batch_size(inputs)? else {
-            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        let [operand, indices, updates] = inputs else {
+            return Err(ProgramError::InvalidInputCount { expected: 3, actual: inputs.len() }.into());
         };
-        Ok(batch_by_item_expansion(context, SCATTER_OPERATION_NAME, self, inputs, axis_size)?.into())
+        let operand_type = <&ArrayType>::try_from(operand.primal().r#type().as_ref())?.clone();
+        let updates_type = <&ArrayType>::try_from(updates.primal().r#type().as_ref())?.clone();
+        let is_static = |r#type: &ArrayType| {
+            r#type.shape().dimensions().iter().all(|dimension| matches!(dimension, Dimension::Static(_)))
+        };
+        let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
+        if is_static(&operand_type) && is_static(&updates_type) {
+            return jvp_projected_operation(context, &operation, inputs);
+        }
+
+        let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+        let primal = context.bind(operation.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
+        let tangent = if operand.tangent().is_zero() && updates.tangent().is_zero() {
+            MaybeZero::Zero(primal.r#type().tangent()?)
+        } else if self.kind() != ScatterReductionKind::Add {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "differentiation of {} with the {} combiner is not yet implemented (only scatter-add is linear)",
+                    SCATTER_OPERATION_NAME,
+                    self.kind(),
+                ),
+            }
+            .into());
+        } else {
+            let projected_context = ProjectedContext::<C, ArrayType>::new(context.clone());
+            let tangent_inputs = [
+                <C::Value as ValueProjection<ArrayType>>::from_projected(materialize_array_tangent(
+                    &projected_context,
+                    operand,
+                )?),
+                indices.primal().clone(),
+                <C::Value as ValueProjection<ArrayType>>::from_projected(materialize_array_tangent(
+                    &projected_context,
+                    updates,
+                )?),
+            ];
+            MaybeZero::Value(context.bind(operation, Vec::new(), tangent_inputs.as_slice())?.remove(0))
+        };
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
 }
 

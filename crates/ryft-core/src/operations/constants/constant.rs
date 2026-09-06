@@ -116,9 +116,6 @@ impl<V: Value, C: Context<Type = V::Type, Operation: From<ConstantOperation<V>>>
 {
 }
 
-impl_non_differentiable_operation!(<V> ConstantOperation<V> where V: Value);
-impl_nullary_transposable_operation!(<V> ConstantOperation<V> where V: Value);
-
 impl<
     Stored: Value<Type = ArrayType>,
     C: Context<Type = ArrayType, Operation: From<ConstantOperation<Stored>>>,
@@ -142,6 +139,9 @@ impl<
             .into())
     }
 }
+
+impl_non_differentiable_operation!(<V> ConstantOperation<V> where V: Value);
+impl_nullary_transposable_operation!(<V> ConstantOperation<V> where V: Value);
 
 /// Represents the ability to materialize a stored [`ConstantOperation`] payload and is typically implemented by
 /// [`Context`]s. [`Constant`] is the literal value counterpart to [`Zero`](crate::Zero), [`One`](crate::One), and
@@ -212,10 +212,12 @@ mod tests {
 
     use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
     use crate::contexts::EagerContext;
+    use crate::differentiation::{TransposableOperation, TranspositionContext};
     use crate::interpretation::InterpretableOperation;
+    use crate::macros::{check_operation_batching, check_operation_partial_evaluation};
     use crate::parameters::Placeholder;
-    use crate::programs::{Atom, AtomId, EmptyRegionDriver, Operation, ProgramBuilder};
-    use crate::tracing::DomainTracingContext;
+    use crate::programs::{Atom, AtomId, EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder};
+    use crate::tracing::{DomainTracingContext, TracingContext};
 
     use super::*;
 
@@ -226,8 +228,31 @@ mod tests {
         assert_eq!(operation.name(), CONSTANT_OPERATION_NAME);
         assert_eq!(format!("{operation}"), "constant [value=3.5]");
         assert_eq!(operation.value(), &Array::scalar(3.5));
-        assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![ArrayType::scalar(DataType::F64)]));
 
+        // Verify the operation's textual form when it appears in a program.
+        let mut program_builder = ProgramBuilder::<Array, ConstantOperation<Array>>::new();
+        let output = program_builder.add_instruction(operation, Vec::new(), vec![], None).unwrap()[0];
+        let program = program_builder.build::<(), Array>(vec![output], (), Placeholder).unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:f64[] = constant [value=3.5]
+                in (%0)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_constant_type_inference() {
+        let operation = ConstantOperation::<Array>::new(Array::scalar(3.5));
+        assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![ArrayType::scalar(DataType::F64)]));
+    }
+
+    #[test]
+    fn test_constant_interpretation() {
+        let operation = ConstantOperation::<Array>::new(Array::scalar(3.5));
         // Eager interpretation returns the literal value unchanged.
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
@@ -254,19 +279,53 @@ mod tests {
         let staged_builder = context.builder().borrow();
         assert!(staged_builder.instructions().is_empty());
         assert!(matches!(&staged_builder.atoms()[0], Atom::Constant(value) if *value == Array::scalar(3.5)));
+    }
 
-        // Verify the operation's textual form when it appears in a program.
-        let mut program_builder = ProgramBuilder::<Array, ConstantOperation<Array>>::new();
-        let output = program_builder.add_instruction(operation, Vec::new(), vec![], None).unwrap()[0];
-        let program = program_builder.build::<(), Array>(vec![output], (), Placeholder).unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda  .
-                let %0:f64[] = constant [value=3.5]
-                in (%0)
-            "}
-            .trim_end(),
+    #[test]
+    fn test_constant_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = ConstantOperation::new(Array::scalar(3.5)),
+            cases = [{
+                inputs = [],
+                outputs = [(@known, Array::scalar(3.5))],
+                residual_instructions = 0,
+            }],
         );
+    }
+
+    #[test]
+    fn test_constant_batching() {
+        check_operation_batching!(
+            @exact,
+            operation = ConstantOperation::new(Array::scalar(3.5)),
+            axis_size = 2,
+            cases = [{
+                inputs = [],
+                outputs = [(@replicated, Array::scalar(3.5))],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_constant_differentiation() {
+        let context = DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let output = context.constant(Array::scalar(3.5)).unwrap();
+        assert_eq!(output.primal(), &Array::scalar(3.5));
+        assert!(matches!(output.tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::F64)));
+    }
+
+    #[test]
+    fn test_constant_transposition() {
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let output_cotangent = context.input(ArrayType::scalar(DataType::F64));
+        let input_cotangents = ConstantOperation::new(Array::scalar(3.5))
+            .transpose(
+                &mut TranspositionContext::new(context),
+                &EmptyRegionDriver,
+                &[],
+                &[MaybeZero::Value(output_cotangent)],
+            )
+            .unwrap();
+        assert!(input_cotangents.is_empty());
     }
 }

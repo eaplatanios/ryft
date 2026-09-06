@@ -2,9 +2,6 @@
 
 // TODO(eaplatanios): Review this module.
 
-use std::borrow::Cow;
-use std::sync::LazyLock;
-
 use crate::axes::Axis;
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
@@ -16,22 +13,17 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
-use crate::operations::Zero;
+use crate::operations::constants::zero::Zero;
+use crate::operations::references::reference_freeze::ReferenceFreezeOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::ProgramError;
-use crate::programs::atoms::MaybeZero;
-use crate::programs::effects::{EffectClasses, Effects, ReferenceEffect};
-use crate::programs::operations::Operation;
-use crate::programs::references::discharge::{
-    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
-    ReferenceDischargeableOperation,
+use crate::programs::{
+    EffectClasses, Effects, MaybeZero, Operation, ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceEffect, ReferenceType,
+    RegionInterface, Type, TypeError, Typed, Value,
 };
-use crate::programs::references::operations::ReferenceFreezeOperation;
-use crate::programs::references::types::ReferenceType;
-use crate::programs::regions::RegionInterface;
-use crate::programs::types::{Type, TypeError, Typed};
-use crate::programs::values::Value;
 use crate::tracing::{Tracer, TracingContext};
+use std::borrow::Cow;
+use std::sync::LazyLock;
 
 /// Canonical operation name for [`ReferenceNewOperation`].
 pub const REFERENCE_NEW_OPERATION_NAME: &str = "reference_new";
@@ -257,9 +249,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use indoc::indoc;
-    use pretty_assertions::assert_eq;
-
     use crate::arrays::{
         Array, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType,
         DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
@@ -267,14 +256,15 @@ mod tests {
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::EagerContext;
     use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
+    use crate::operations::references::reference_read::ReferenceRead;
+    use crate::operations::references::reference_write::ReferenceWrite;
+    use crate::operations::references::tests::*;
     use crate::parameters::Placeholder;
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::effects::EffectClass;
-    use crate::programs::identities::TypeIdentityPosition;
-    use crate::programs::references::discharge::ReferenceDischargeResult;
-    use crate::programs::references::operations::tests::*;
-    use crate::programs::references::operations::{ReferenceRead, ReferenceWrite};
-    use crate::programs::regions::EmptyRegionDriver;
+    use crate::programs::{
+        EffectClass, EmptyRegionDriver, ProgramBuilder, ReferenceDischargeResult, TypeIdentityPosition,
+    };
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
 
     use super::*;
 

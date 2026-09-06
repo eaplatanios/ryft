@@ -54,24 +54,14 @@ mod tests {
     use crate::arrays::{Array, ArrayType, DataType};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
-        check_operation_type_inference,
+        check_operation_transposition, check_operation_type_inference,
     };
 
     use super::*;
 
     #[test]
     fn test_round() {
-        // Ties resolve toward the nearest even integer.
-        assert_eq!(Array::scalar(2.5f64).round().unwrap(), Array::scalar(2.0f64));
-        assert_eq!(Array::scalar(3.5f64).round().unwrap(), Array::scalar(4.0f64));
-        assert_eq!(Array::scalar(-2.5f32).round().unwrap(), Array::scalar(-2.0f32));
-        assert_eq!(Array::scalar(2.3f64).round().unwrap(), Array::scalar(2.0f64));
-        assert_eq!(Array::scalar(bf16::from_f32(2.5)).round().unwrap(), Array::scalar(bf16::from_f32(2.0)));
-        assert_eq!(Array::scalar(f16::from_f32(3.5)).round().unwrap(), Array::scalar(f16::from_f32(4.0)));
-        // NaNs pass through unchanged.
-        assert!(Array::scalar(f64::NAN).round().unwrap().to_f64s()[0].is_nan());
-
-        assert_eq!(Array::vector(vec![0.5, 1.5, -2.5]).round().unwrap(), Array::vector(vec![0.0, 2.0, -2.0]),);
+        assert_eq!(RoundOperation::<ArrayType>::new().to_string(), "round");
     }
 
     #[test]
@@ -98,6 +88,30 @@ mod tests {
             @reject @unreduced,
             operation = RoundOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_round_interpretation() {
+        // Ties resolve toward the nearest even integer.
+        assert_eq!(Array::scalar(2.5f64).round().unwrap(), Array::scalar(2.0f64));
+        assert_eq!(Array::scalar(3.5f64).round().unwrap(), Array::scalar(4.0f64));
+        assert_eq!(Array::scalar(-2.5f32).round().unwrap(), Array::scalar(-2.0f32));
+        assert_eq!(Array::scalar(2.3f64).round().unwrap(), Array::scalar(2.0f64));
+        assert_eq!(Array::scalar(bf16::from_f32(2.5)).round().unwrap(), Array::scalar(bf16::from_f32(2.0)));
+        assert_eq!(Array::scalar(f16::from_f32(3.5)).round().unwrap(), Array::scalar(f16::from_f32(4.0)));
+        // NaNs pass through unchanged.
+        assert!(Array::scalar(f64::NAN).round().unwrap().to_f64s()[0].is_nan());
+
+        assert_eq!(Array::vector(vec![0.5, 1.5, -2.5]).round().unwrap(), Array::vector(vec![0.0, 2.0, -2.0]),);
+    }
+
+    #[test]
+    fn test_round_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = RoundOperation::new(),
+            inputs = [Array::scalar(2.5)],
+            expected = Array::scalar(2.0),
         );
     }
 
@@ -129,11 +143,15 @@ mod tests {
     }
 
     #[test]
-    fn test_round_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = RoundOperation::new(),
-            inputs = [Array::scalar(2.5)],
-            expected = Array::scalar(2.0),
+    fn test_round_transposition() {
+        check_operation_transposition!(
+            @exact,
+            operation = RoundOperation::<ArrayType>::new(),
+            cases = [{
+                inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
+                output_cotangents = [Array::scalar(3.0)],
+                input_cotangents = [Array::scalar(0.0)],
+            }],
         );
     }
 

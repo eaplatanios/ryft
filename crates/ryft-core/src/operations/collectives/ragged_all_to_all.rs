@@ -61,9 +61,6 @@ use super::{
     resolve_named_axis_size,
 };
 
-/// Canonical name of the [`RaggedAllToAllOperation`].
-pub const RAGGED_ALL_TO_ALL_OPERATION_NAME: &str = "ragged_all_to_all";
-
 /// Operand representation carried by [`RaggedAllToAllOperation`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 enum RaggedAllToAllRepresentation {
@@ -101,6 +98,9 @@ pub(crate) trait RaggedAllToAllEvaluation: Sized {
         receive_sizes: &Self,
     ) -> Result<Self, ProgramError>;
 }
+
+/// Canonical name of the [`RaggedAllToAllOperation`].
+pub const RAGGED_ALL_TO_ALL_OPERATION_NAME: &str = "ragged_all_to_all";
 
 /// Primitive that exchanges variable-length leading-axis segments between participants of a named axis.
 ///
@@ -451,431 +451,11 @@ impl<C: Domain<Type = ArrayType, Value: RaggedAllToAllEvaluation>> Interpretable
     }
 }
 
-// This direct composite carrier has an array-only boundary, but it cannot be a second projected `ArrayType` member in
-// `ArrayIrOperation`. Keep the projection explicit so its contract remains identical to the homogeneous operation.
-impl MemberOperation<ArrayIrType> for RaggedAllToAllOperation {
-    fn infer_parent_region_input_types(
-        &self,
-        input_types: &[ArrayIrType],
-        region_interfaces: &[RegionInterface<ArrayIrType>],
-    ) -> Result<Vec<Option<Vec<ArrayIrType>>>, TypeError> {
-        infer_projected_operation_region_input_types(self, input_types, region_interfaces)
-    }
-
-    fn infer_parent_output_types(
-        &self,
-        input_types: &[ArrayIrType],
-        region_interfaces: &[RegionInterface<ArrayIrType>],
-    ) -> Result<Vec<ArrayIrType>, TypeError> {
-        infer_projected_operation_output_types(self, input_types, region_interfaces)
-    }
-
-    fn rename_parent_type_identities(
-        &self,
-        _renaming: &TypeIdentityRenaming<DimensionVariable>,
-    ) -> Result<Self, TypeError> {
-        Ok(self.clone())
-    }
-}
-
-impl<C> MemberInterpretableOperation<C> for RaggedAllToAllOperation
-where
-    C: Domain<
-            Type = ArrayIrType,
-            Value: ValueProjection<ArrayType, Projected: RaggedAllToAllEvaluation + Value<Type = ArrayType>>,
-        >,
-{
-    fn interpret_in_parent<D: InterpretationDriver<C>>(
-        &self,
-        context: &C,
-        driver: &D,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        interpret_projected_operation(context, self, driver, inputs)
-    }
-}
-
 // Partial evaluation uses the default fold-or-residualize behavior. Known metadata remain ordinary runtime values;
 // the rule never assumes that a known primal operand is a compile-time literal.
 impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for RaggedAllToAllOperation where
     C::Operation: From<RaggedAllToAllOperation>
 {
-}
-
-// The two data operands are jointly linear. Metadata remain primal values and therefore become ordinary residuals
-// whenever the tangent exchange survives partial evaluation.
-impl<C: Context<Type = ArrayType, Value: ZeroLike>> DifferentiableOperation<C> for RaggedAllToAllOperation
-where
-    C::Operation: From<RaggedAllToAllOperation>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        check_count!("input", inputs, 6, ProgramError);
-        let [operand, output, input_offsets, send_sizes, output_offsets, receive_sizes] = inputs else {
-            unreachable!();
-        };
-        let primal_inputs = [
-            operand.primal().clone(),
-            output.primal().clone(),
-            input_offsets.primal().clone(),
-            send_sizes.primal().clone(),
-            output_offsets.primal().clone(),
-            receive_sizes.primal().clone(),
-        ];
-        let mut primal_outputs = context.bind(self.clone(), Vec::new(), &primal_inputs)?;
-        check_count!("output", primal_outputs, 1, ProgramError);
-        let primal = primal_outputs.remove(0);
-        let tangent = if operand.tangent().is_zero() && output.tangent().is_zero() {
-            MaybeZero::Zero(primal.r#type().tangent()?)
-        } else {
-            let operand_tangent = match operand.tangent() {
-                MaybeZero::Zero(_) => operand.primal().zero_like()?,
-                MaybeZero::Value(tangent) => tangent.clone(),
-            };
-            let output_tangent = match output.tangent() {
-                MaybeZero::Zero(_) => output.primal().zero_like()?,
-                MaybeZero::Value(tangent) => tangent.clone(),
-            };
-            let tangent_inputs = [
-                operand_tangent,
-                output_tangent,
-                input_offsets.primal().clone(),
-                send_sizes.primal().clone(),
-                output_offsets.primal().clone(),
-                receive_sizes.primal().clone(),
-            ];
-            let mut tangent_outputs = context.bind(self.clone(), Vec::new(), &tangent_inputs)?;
-            check_count!("output", tangent_outputs, 1, ProgramError);
-            MaybeZero::Value(tangent_outputs.remove(0))
-        };
-        Ok(vec![DifferentiationDual::new(primal, tangent)?])
-    }
-}
-
-impl<C> MemberDifferentiableOperation<C> for RaggedAllToAllOperation
-where
-    C: Context<
-            Type = ArrayIrType,
-            Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-            Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-            Operation: OperationProjection<ArrayType>,
-        >,
-    <C::Operation as OperationProjection<ArrayType>>::Projected:
-        DifferentiableOperation<ProjectedContext<C, ArrayType>> + From<RaggedAllToAllOperation>,
-{
-    fn jvp_in_parent<D: DifferentiationDriver<C>>(
-        &self,
-        context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
-        jvp_projected_operation(context, &operation, inputs)
-    }
-}
-
-/// Returns `input` as the known primal residual required by the transpose rule.
-fn known_transpose_input<V: Value<Type = ArrayType>, O: Operation<Type = ArrayType>>(
-    input: &PartialValue<Tracer<TracingContext<V, O>>>,
-    name: &str,
-) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError> {
-    input.as_known().cloned().ok_or_else(|| {
-        ProgramError::UnsupportedOperation {
-            message: format!(
-                "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` transpose requires `{name}` to be a known primal residual",
-            ),
-        }
-        .into()
-    })
-}
-
-/// Stages the logical named-axis exchange that transposes sender-owned offset metadata.
-fn transpose_logical_offsets<V, O>(
-    operation: &RaggedAllToAllOperation,
-    context: &mut TracingContext<V, O>,
-    offsets: &Tracer<TracingContext<V, O>>,
-) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError>
-where
-    V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType> + From<AllToAllOperation>,
-{
-    let options = operation.axis_index_groups().map_or_else(CollectiveOptions::tiled, |groups| {
-        CollectiveOptions::tiled().with_axis_index_groups(groups.to_vec())
-    });
-    let exchange = AllToAllOperation::new(operation.axis_name().to_string(), operation.axis_size(), 0, 0, options);
-    let mut outputs = context.bind(exchange, Vec::new(), std::slice::from_ref(offsets))?;
-    check_count!("output", outputs, 1, ProgramError);
-    Ok(outputs.remove(0))
-}
-
-/// Transposes physical sender/receiver offset blocks within each participant group using only static slices and
-/// concatenations. Physical batching has already materialized every participant, so no named-axis binder remains in
-/// which a dense collective could run.
-fn transpose_physical_offsets<V, O>(
-    operation: &RaggedAllToAllOperation,
-    offsets: &Tracer<TracingContext<V, O>>,
-) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError>
-where
-    V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType> + From<ConcatenateOperation<ArrayType>> + From<SliceOperation>,
-{
-    let offset_type = offsets.r#type();
-    let metadata_length = offset_type.shape().dimensions()[1].value().unwrap();
-    let group_size = operation.effective_axis_size()?;
-    let slices_per_peer = metadata_length / group_size;
-    let groups = operation
-        .axis_index_groups()
-        .map_or_else(|| vec![(0..operation.axis_size()).collect()], |groups| groups.to_vec());
-    let mut rows = Vec::with_capacity(operation.axis_size());
-    for participant in 0..operation.axis_size() {
-        let (group, participant_position) = groups
-            .iter()
-            .find_map(|group| {
-                group.iter().position(|candidate| *candidate == participant).map(|position| (group, position))
-            })
-            .unwrap();
-        let start = participant_position * slices_per_peer;
-        let mut blocks = Vec::with_capacity(group_size);
-        for &sender in group {
-            blocks.push(offsets.slice(&[sender, start], &[sender + 1, start + slices_per_peer], &[1, 1])?);
-        }
-        rows.push(Tracer::concatenate(blocks.iter(), 1)?);
-    }
-    Ok(Tracer::concatenate(rows.iter(), 0)?)
-}
-
-/// Transposes sender-owned offset metadata in the operation's current logical or physical representation.
-fn transpose_offsets<V, O>(
-    operation: &RaggedAllToAllOperation,
-    context: &mut TracingContext<V, O>,
-    offsets: &Tracer<TracingContext<V, O>>,
-) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError>
-where
-    V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType>
-        + From<AllToAllOperation>
-        + From<ConcatenateOperation<ArrayType>>
-        + From<SliceOperation>,
-{
-    if operation.is_physical() {
-        transpose_physical_offsets(operation, offsets)
-    } else {
-        transpose_logical_offsets(operation, context, offsets)
-    }
-}
-
-/// Stages the interval mask that preserves the output seed's cotangent outside received regions.
-fn mask_output_cotangent<V, O>(
-    context: &mut TracingContext<V, O>,
-    cotangent: &Tracer<TracingContext<V, O>>,
-    output_offsets: &Tracer<TracingContext<V, O>>,
-    receive_sizes: &Tracer<TracingContext<V, O>>,
-    physical: bool,
-) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError>
-where
-    V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType>
-        + From<AddOperation<ArrayType>>
-        + From<BroadcastOperation>
-        + From<ConvertElementTypeOperation<ArrayType>>
-        + From<CompareOperation<ArrayType>>
-        + From<CumulativeSumOperation>
-        + From<NegOperation<ArrayType>>
-        + From<OneOperation<ArrayType>>
-        + From<ReshapeOperation>
-        + From<ScatterOperation>
-        + From<SelectOperation<ArrayType>>
-        + From<SliceOperation>
-        + From<TransferToMemoryOperation>
-        + From<ZeroOperation<ArrayType>>,
-{
-    let output_type = cotangent.r#type().into_owned();
-    let leading_axis = usize::from(physical);
-    let output_extent =
-        output_type.shape().dimensions()[leading_axis]
-            .value()
-            .ok_or_else(|| ProgramError::UnsupportedOperation {
-                message: format!(
-                    "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` transpose requires a static output leading dimension",
-                ),
-            })?;
-    let marker_extent = output_extent.checked_add(1).ok_or_else(|| ProgramError::InvalidArgument {
-        message: format!("`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` transpose marker extent does not fit in `usize`"),
-    })?;
-    let mut marker_dimensions = output_type.shape().dimensions()[..=leading_axis].to_vec();
-    marker_dimensions[leading_axis] = Dimension::Static(marker_extent);
-    let marker_type = ArrayType::new(DataType::I64, Shape::new(marker_dimensions)).with_memory(output_type.memory());
-
-    // Metadata may use any integer width and memory placement. Widen index arithmetic to `u64` before adding and
-    // move it beside the cotangent so scatter's three operands share one memory space.
-    let normalize_metadata = |value: &Tracer<TracingContext<V, O>>| -> Result<_, ProgramError> {
-        let value = if value.r#type().memory() == output_type.memory() {
-            value.clone()
-        } else {
-            value.transfer_to_memory(output_type.memory())
-        };
-        if value.r#type().data_type() == DataType::U64 {
-            Ok(value)
-        } else {
-            Ok(value.convert_element_type(DataType::U64)?)
-        }
-    };
-    let output_offsets = normalize_metadata(output_offsets)?;
-    let receive_sizes = normalize_metadata(receive_sizes)?;
-    let update_type = output_offsets.r#type().into_owned().with_data_type(DataType::I64);
-    let marker = context.zero(&marker_type)?;
-    let ones = context.one(&update_type)?;
-    let negative_ones = ones.neg()?;
-    let end_offsets = output_offsets.add(&receive_sizes)?;
-    let mut index_dimensions = output_offsets.r#type().shape().dimensions().to_vec();
-    index_dimensions.push(Dimension::Static(1));
-    let start_indices = output_offsets.reshape(Shape::new(index_dimensions.clone()))?;
-    let end_indices = end_offsets.reshape(Shape::new(index_dimensions))?;
-    let scatter_dimensions = if physical {
-        ScatterDimensionNumbers::new(Vec::new(), vec![1], vec![1]).with_batching_dimensions(vec![0], vec![0])
-    } else {
-        ScatterDimensionNumbers::new(Vec::new(), vec![0], vec![0])
-    };
-    // Both boundaries are additive. A zero-length region contributes `+1` and `-1` at the same position, while
-    // adjacent regions combine deterministically at their shared boundary.
-    let scatter = ScatterOperation::new(scatter_dimensions, ScatterReductionKind::Add);
-    let markers = marker.scatter(&start_indices, &ones, &scatter)?.scatter(&end_indices, &negative_ones, &scatter)?;
-    let markers = markers.cumulative_sum(leading_axis)?;
-    let start_indices = vec![0; markers.r#type().rank()];
-    let mut limit_indices = markers
-        .r#type()
-        .shape()
-        .dimensions()
-        .iter()
-        .map(|dimension| dimension.value().unwrap())
-        .collect::<Vec<_>>();
-    limit_indices[leading_axis] = output_extent;
-    let strides = vec![1; markers.r#type().rank()];
-    let markers = markers.slice(start_indices.as_slice(), limit_indices.as_slice(), strides.as_slice())?;
-    let marker_zero = context.zero(markers.r#type().as_ref())?;
-    let received = markers.not_equal(&marker_zero)?;
-    let condition_type =
-        ArrayType::new(DataType::Boolean, output_type.shape().clone()).with_memory(output_type.memory());
-    let received = received.broadcast(condition_type, &(0..=leading_axis).collect::<Vec<_>>())?;
-    let zero = context.zero(&output_type)?;
-    Ok(Tracer::select(&received, &zero, cotangent)?)
-}
-
-impl<V: Value<Type = ArrayType>, O: Operation<Type = ArrayType>> TransposableOperation<V, O> for RaggedAllToAllOperation
-where
-    O: From<AddOperation<ArrayType>>
-        + From<AllToAllOperation>
-        + From<BroadcastOperation>
-        + From<ConcatenateOperation<ArrayType>>
-        + From<CompareOperation<ArrayType>>
-        + From<ConvertElementTypeOperation<ArrayType>>
-        + From<CumulativeSumOperation>
-        + From<NegOperation<ArrayType>>
-        + From<OneOperation<ArrayType>>
-        + From<RaggedAllToAllOperation>
-        + From<ReshapeOperation>
-        + From<ScatterOperation>
-        + From<SelectOperation<ArrayType>>
-        + From<SliceOperation>
-        + From<TransferToMemoryOperation>
-        + From<ZeroOperation<ArrayType>>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<'_, V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        let provenance_context = context.clone();
-        provenance_context.invoke_with_provenance_scope(ProvenanceScope::new("ryft"), || {
-            provenance_context.invoke_with_provenance_scope(ProvenanceScope::new("differentiation"), || {
-                provenance_context.invoke_with_provenance_scope(
-                    ProvenanceScope::new("ragged_all_to_all_transpose"),
-                    || {
-                        check_count!("input", inputs, 6, ProgramError);
-                        check_count!("output", outputs, 1, ProgramError);
-                        let [operand, output, input_offsets, send_sizes, output_offsets, receive_sizes] = inputs else {
-                            unreachable!()
-                        };
-                        let zero_inputs = || {
-                            inputs
-                                .iter()
-                                .map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?)))
-                                .collect::<Result<Vec<_>, DifferentiationError>>()
-                        };
-                        let MaybeZero::Value(cotangent) = &outputs[0] else {
-                            return zero_inputs();
-                        };
-                        if operand.is_known() && output.is_known() {
-                            return zero_inputs();
-                        }
-
-                        let input_offsets = known_transpose_input(input_offsets, "input_offsets")?;
-                        let send_sizes = known_transpose_input(send_sizes, "send_sizes")?;
-                        let output_offsets = known_transpose_input(output_offsets, "output_offsets")?;
-                        let receive_sizes = known_transpose_input(receive_sizes, "receive_sizes")?;
-                        let (operand_cotangent, permuted_output_offsets) = if operand.is_known() {
-                            (MaybeZero::Zero(operand.r#type().cotangent()?), None)
-                        } else {
-                            let permuted_output_offsets = transpose_offsets(self, context, &output_offsets)?;
-                            let permuted_input_offsets = transpose_offsets(self, context, &input_offsets)?;
-                            let zero = context.zero(&operand.r#type().cotangent()?)?;
-                            let adjoint_inputs = [
-                                cotangent.clone(),
-                                zero,
-                                permuted_output_offsets.clone(),
-                                receive_sizes.clone(),
-                                permuted_input_offsets,
-                                send_sizes.clone(),
-                            ];
-                            let mut contributions =
-                                context.bind(self.with_additive_updates(), Vec::new(), &adjoint_inputs)?;
-                            check_count!("output", contributions, 1, ProgramError);
-                            (MaybeZero::Value(contributions.remove(0)), Some(permuted_output_offsets))
-                        };
-                        let output_cotangent = if output.is_known() {
-                            MaybeZero::Zero(output.r#type().cotangent()?)
-                        } else if self.update_kind == RaggedAllToAllUpdateKind::Add {
-                            MaybeZero::Value(cotangent.clone())
-                        } else {
-                            let permuted_output_offsets = match permuted_output_offsets {
-                                Some(permuted_output_offsets) => permuted_output_offsets,
-                                None => transpose_offsets(self, context, &output_offsets)?,
-                            };
-                            MaybeZero::Value(mask_output_cotangent(
-                                context,
-                                cotangent,
-                                &permuted_output_offsets,
-                                &receive_sizes,
-                                self.is_physical(),
-                            )?)
-                        };
-                        Ok(vec![
-                            operand_cotangent,
-                            output_cotangent,
-                            MaybeZero::Zero(input_offsets.r#type().cotangent()?),
-                            MaybeZero::Zero(send_sizes.r#type().cotangent()?),
-                            MaybeZero::Zero(output_offsets.r#type().cotangent()?),
-                            MaybeZero::Zero(receive_sizes.r#type().cotangent()?),
-                        ])
-                    },
-                )
-            })
-        })
-    }
-}
-
-/// Constructs a `u64` scalar array containing `extent` in the memory space of `metadata_type`.
-fn metadata_extent_scalar(metadata_type: &ArrayType, extent: usize) -> Result<Array, ProgramError> {
-    let extent = u64::try_from(extent).map_err(|_| ProgramError::InvalidArgument {
-        message: format!("`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` extent {extent} does not fit in `u64`"),
-    })?;
-    Array::from_elements(ArrayType::scalar(DataType::U64).with_memory(metadata_type.memory()), &[extent])
 }
 
 // A matching named batch axis is the eager reference implementation's participant axis. All operands are aligned to
@@ -1094,6 +674,209 @@ where
     }
 }
 
+// The two data operands are jointly linear. Metadata remain primal values and therefore become ordinary residuals
+// whenever the tangent exchange survives partial evaluation.
+impl<C: Context<Type = ArrayType, Value: ZeroLike>> DifferentiableOperation<C> for RaggedAllToAllOperation
+where
+    C::Operation: From<RaggedAllToAllOperation>,
+{
+    fn jvp<D: DifferentiationDriver<C>>(
+        &self,
+        context: &C,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        check_count!("input", inputs, 6, ProgramError);
+        let [operand, output, input_offsets, send_sizes, output_offsets, receive_sizes] = inputs else {
+            unreachable!();
+        };
+        let primal_inputs = [
+            operand.primal().clone(),
+            output.primal().clone(),
+            input_offsets.primal().clone(),
+            send_sizes.primal().clone(),
+            output_offsets.primal().clone(),
+            receive_sizes.primal().clone(),
+        ];
+        let mut primal_outputs = context.bind(self.clone(), Vec::new(), &primal_inputs)?;
+        check_count!("output", primal_outputs, 1, ProgramError);
+        let primal = primal_outputs.remove(0);
+        let tangent = if operand.tangent().is_zero() && output.tangent().is_zero() {
+            MaybeZero::Zero(primal.r#type().tangent()?)
+        } else {
+            let operand_tangent = match operand.tangent() {
+                MaybeZero::Zero(_) => operand.primal().zero_like()?,
+                MaybeZero::Value(tangent) => tangent.clone(),
+            };
+            let output_tangent = match output.tangent() {
+                MaybeZero::Zero(_) => output.primal().zero_like()?,
+                MaybeZero::Value(tangent) => tangent.clone(),
+            };
+            let tangent_inputs = [
+                operand_tangent,
+                output_tangent,
+                input_offsets.primal().clone(),
+                send_sizes.primal().clone(),
+                output_offsets.primal().clone(),
+                receive_sizes.primal().clone(),
+            ];
+            let mut tangent_outputs = context.bind(self.clone(), Vec::new(), &tangent_inputs)?;
+            check_count!("output", tangent_outputs, 1, ProgramError);
+            MaybeZero::Value(tangent_outputs.remove(0))
+        };
+        Ok(vec![DifferentiationDual::new(primal, tangent)?])
+    }
+}
+
+impl<V: Value<Type = ArrayType>, O: Operation<Type = ArrayType>> TransposableOperation<V, O> for RaggedAllToAllOperation
+where
+    O: From<AddOperation<ArrayType>>
+        + From<AllToAllOperation>
+        + From<BroadcastOperation>
+        + From<ConcatenateOperation<ArrayType>>
+        + From<CompareOperation<ArrayType>>
+        + From<ConvertElementTypeOperation<ArrayType>>
+        + From<CumulativeSumOperation>
+        + From<NegOperation<ArrayType>>
+        + From<OneOperation<ArrayType>>
+        + From<RaggedAllToAllOperation>
+        + From<ReshapeOperation>
+        + From<ScatterOperation>
+        + From<SelectOperation<ArrayType>>
+        + From<SliceOperation>
+        + From<TransferToMemoryOperation>
+        + From<ZeroOperation<ArrayType>>,
+{
+    fn transpose<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TranspositionContext<'_, V, O>,
+        _driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        let provenance_context = context.clone();
+        provenance_context.invoke_with_provenance_scope(ProvenanceScope::new("ryft"), || {
+            provenance_context.invoke_with_provenance_scope(ProvenanceScope::new("differentiation"), || {
+                provenance_context.invoke_with_provenance_scope(
+                    ProvenanceScope::new("ragged_all_to_all_transpose"),
+                    || {
+                        check_count!("input", inputs, 6, ProgramError);
+                        check_count!("output", outputs, 1, ProgramError);
+                        let [operand, output, input_offsets, send_sizes, output_offsets, receive_sizes] = inputs else {
+                            unreachable!()
+                        };
+                        let zero_inputs = || {
+                            inputs
+                                .iter()
+                                .map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?)))
+                                .collect::<Result<Vec<_>, DifferentiationError>>()
+                        };
+                        let MaybeZero::Value(cotangent) = &outputs[0] else {
+                            return zero_inputs();
+                        };
+                        if operand.is_known() && output.is_known() {
+                            return zero_inputs();
+                        }
+
+                        let input_offsets = known_transpose_input(input_offsets, "input_offsets")?;
+                        let send_sizes = known_transpose_input(send_sizes, "send_sizes")?;
+                        let output_offsets = known_transpose_input(output_offsets, "output_offsets")?;
+                        let receive_sizes = known_transpose_input(receive_sizes, "receive_sizes")?;
+                        let (operand_cotangent, permuted_output_offsets) = if operand.is_known() {
+                            (MaybeZero::Zero(operand.r#type().cotangent()?), None)
+                        } else {
+                            let permuted_output_offsets = transpose_offsets(self, context, &output_offsets)?;
+                            let permuted_input_offsets = transpose_offsets(self, context, &input_offsets)?;
+                            let zero = context.zero(&operand.r#type().cotangent()?)?;
+                            let adjoint_inputs = [
+                                cotangent.clone(),
+                                zero,
+                                permuted_output_offsets.clone(),
+                                receive_sizes.clone(),
+                                permuted_input_offsets,
+                                send_sizes.clone(),
+                            ];
+                            let mut contributions =
+                                context.bind(self.with_additive_updates(), Vec::new(), &adjoint_inputs)?;
+                            check_count!("output", contributions, 1, ProgramError);
+                            (MaybeZero::Value(contributions.remove(0)), Some(permuted_output_offsets))
+                        };
+                        let output_cotangent = if output.is_known() {
+                            MaybeZero::Zero(output.r#type().cotangent()?)
+                        } else if self.update_kind == RaggedAllToAllUpdateKind::Add {
+                            MaybeZero::Value(cotangent.clone())
+                        } else {
+                            let permuted_output_offsets = match permuted_output_offsets {
+                                Some(permuted_output_offsets) => permuted_output_offsets,
+                                None => transpose_offsets(self, context, &output_offsets)?,
+                            };
+                            MaybeZero::Value(mask_output_cotangent(
+                                context,
+                                cotangent,
+                                &permuted_output_offsets,
+                                &receive_sizes,
+                                self.is_physical(),
+                            )?)
+                        };
+                        Ok(vec![
+                            operand_cotangent,
+                            output_cotangent,
+                            MaybeZero::Zero(input_offsets.r#type().cotangent()?),
+                            MaybeZero::Zero(send_sizes.r#type().cotangent()?),
+                            MaybeZero::Zero(output_offsets.r#type().cotangent()?),
+                            MaybeZero::Zero(receive_sizes.r#type().cotangent()?),
+                        ])
+                    },
+                )
+            })
+        })
+    }
+}
+
+// This direct composite carrier has an array-only boundary, but it cannot be a second projected `ArrayType` member in
+// `ArrayIrOperation`. Keep the projection explicit so its contract remains identical to the homogeneous operation.
+impl MemberOperation<ArrayIrType> for RaggedAllToAllOperation {
+    fn infer_parent_region_input_types(
+        &self,
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<Option<Vec<ArrayIrType>>>, TypeError> {
+        infer_projected_operation_region_input_types(self, input_types, region_interfaces)
+    }
+
+    fn infer_parent_output_types(
+        &self,
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<ArrayIrType>, TypeError> {
+        infer_projected_operation_output_types(self, input_types, region_interfaces)
+    }
+
+    fn rename_parent_type_identities(
+        &self,
+        _renaming: &TypeIdentityRenaming<DimensionVariable>,
+    ) -> Result<Self, TypeError> {
+        Ok(self.clone())
+    }
+}
+
+impl<C> MemberInterpretableOperation<C> for RaggedAllToAllOperation
+where
+    C: Domain<
+            Type = ArrayIrType,
+            Value: ValueProjection<ArrayType, Projected: RaggedAllToAllEvaluation + Value<Type = ArrayType>>,
+        >,
+{
+    fn interpret_in_parent<D: InterpretationDriver<C>>(
+        &self,
+        context: &C,
+        driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        interpret_projected_operation(context, self, driver, inputs)
+    }
+}
+
 impl<C> MemberBatchableOperation<C, ArrayIrBatching> for RaggedAllToAllOperation
 where
     C: Context<
@@ -1119,6 +902,223 @@ where
     ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
         batch_projected_operation(context, self, inputs)
     }
+}
+
+impl<C> MemberDifferentiableOperation<C> for RaggedAllToAllOperation
+where
+    C: Context<
+            Type = ArrayIrType,
+            Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+            Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+            Operation: OperationProjection<ArrayType>,
+        >,
+    <C::Operation as OperationProjection<ArrayType>>::Projected:
+        DifferentiableOperation<ProjectedContext<C, ArrayType>> + From<RaggedAllToAllOperation>,
+{
+    fn jvp_in_parent<D: DifferentiationDriver<C>>(
+        &self,
+        context: &C,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        let operation = <C::Operation as OperationProjection<ArrayType>>::Projected::from(self.clone());
+        jvp_projected_operation(context, &operation, inputs)
+    }
+}
+
+/// Returns `input` as the known primal residual required by the transpose rule.
+fn known_transpose_input<V: Value<Type = ArrayType>, O: Operation<Type = ArrayType>>(
+    input: &PartialValue<Tracer<TracingContext<V, O>>>,
+    name: &str,
+) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError> {
+    input.as_known().cloned().ok_or_else(|| {
+        ProgramError::UnsupportedOperation {
+            message: format!(
+                "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` transpose requires `{name}` to be a known primal residual",
+            ),
+        }
+        .into()
+    })
+}
+
+/// Stages the logical named-axis exchange that transposes sender-owned offset metadata.
+fn transpose_logical_offsets<V, O>(
+    operation: &RaggedAllToAllOperation,
+    context: &mut TracingContext<V, O>,
+    offsets: &Tracer<TracingContext<V, O>>,
+) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError>
+where
+    V: Value<Type = ArrayType>,
+    O: Operation<Type = ArrayType> + From<AllToAllOperation>,
+{
+    let options = operation.axis_index_groups().map_or_else(CollectiveOptions::tiled, |groups| {
+        CollectiveOptions::tiled().with_axis_index_groups(groups.to_vec())
+    });
+    let exchange = AllToAllOperation::new(operation.axis_name().to_string(), operation.axis_size(), 0, 0, options);
+    let mut outputs = context.bind(exchange, Vec::new(), std::slice::from_ref(offsets))?;
+    check_count!("output", outputs, 1, ProgramError);
+    Ok(outputs.remove(0))
+}
+
+/// Transposes physical sender/receiver offset blocks within each participant group using only static slices and
+/// concatenations. Physical batching has already materialized every participant, so no named-axis binder remains in
+/// which a dense collective could run.
+fn transpose_physical_offsets<V, O>(
+    operation: &RaggedAllToAllOperation,
+    offsets: &Tracer<TracingContext<V, O>>,
+) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError>
+where
+    V: Value<Type = ArrayType>,
+    O: Operation<Type = ArrayType> + From<ConcatenateOperation<ArrayType>> + From<SliceOperation>,
+{
+    let offset_type = offsets.r#type();
+    let metadata_length = offset_type.shape().dimensions()[1].value().unwrap();
+    let group_size = operation.effective_axis_size()?;
+    let slices_per_peer = metadata_length / group_size;
+    let groups = operation
+        .axis_index_groups()
+        .map_or_else(|| vec![(0..operation.axis_size()).collect()], |groups| groups.to_vec());
+    let mut rows = Vec::with_capacity(operation.axis_size());
+    for participant in 0..operation.axis_size() {
+        let (group, participant_position) = groups
+            .iter()
+            .find_map(|group| {
+                group.iter().position(|candidate| *candidate == participant).map(|position| (group, position))
+            })
+            .unwrap();
+        let start = participant_position * slices_per_peer;
+        let mut blocks = Vec::with_capacity(group_size);
+        for &sender in group {
+            blocks.push(offsets.slice(&[sender, start], &[sender + 1, start + slices_per_peer], &[1, 1])?);
+        }
+        rows.push(Tracer::concatenate(blocks.iter(), 1)?);
+    }
+    Ok(Tracer::concatenate(rows.iter(), 0)?)
+}
+
+/// Transposes sender-owned offset metadata in the operation's current logical or physical representation.
+fn transpose_offsets<V, O>(
+    operation: &RaggedAllToAllOperation,
+    context: &mut TracingContext<V, O>,
+    offsets: &Tracer<TracingContext<V, O>>,
+) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError>
+where
+    V: Value<Type = ArrayType>,
+    O: Operation<Type = ArrayType>
+        + From<AllToAllOperation>
+        + From<ConcatenateOperation<ArrayType>>
+        + From<SliceOperation>,
+{
+    if operation.is_physical() {
+        transpose_physical_offsets(operation, offsets)
+    } else {
+        transpose_logical_offsets(operation, context, offsets)
+    }
+}
+
+/// Stages the interval mask that preserves the output seed's cotangent outside received regions.
+fn mask_output_cotangent<V, O>(
+    context: &mut TracingContext<V, O>,
+    cotangent: &Tracer<TracingContext<V, O>>,
+    output_offsets: &Tracer<TracingContext<V, O>>,
+    receive_sizes: &Tracer<TracingContext<V, O>>,
+    physical: bool,
+) -> Result<Tracer<TracingContext<V, O>>, DifferentiationError>
+where
+    V: Value<Type = ArrayType>,
+    O: Operation<Type = ArrayType>
+        + From<AddOperation<ArrayType>>
+        + From<BroadcastOperation>
+        + From<ConvertElementTypeOperation<ArrayType>>
+        + From<CompareOperation<ArrayType>>
+        + From<CumulativeSumOperation>
+        + From<NegOperation<ArrayType>>
+        + From<OneOperation<ArrayType>>
+        + From<ReshapeOperation>
+        + From<ScatterOperation>
+        + From<SelectOperation<ArrayType>>
+        + From<SliceOperation>
+        + From<TransferToMemoryOperation>
+        + From<ZeroOperation<ArrayType>>,
+{
+    let output_type = cotangent.r#type().into_owned();
+    let leading_axis = usize::from(physical);
+    let output_extent =
+        output_type.shape().dimensions()[leading_axis]
+            .value()
+            .ok_or_else(|| ProgramError::UnsupportedOperation {
+                message: format!(
+                    "`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` transpose requires a static output leading dimension",
+                ),
+            })?;
+    let marker_extent = output_extent.checked_add(1).ok_or_else(|| ProgramError::InvalidArgument {
+        message: format!("`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` transpose marker extent does not fit in `usize`"),
+    })?;
+    let mut marker_dimensions = output_type.shape().dimensions()[..=leading_axis].to_vec();
+    marker_dimensions[leading_axis] = Dimension::Static(marker_extent);
+    let marker_type = ArrayType::new(DataType::I64, Shape::new(marker_dimensions)).with_memory(output_type.memory());
+
+    // Metadata may use any integer width and memory placement. Widen index arithmetic to `u64` before adding and
+    // move it beside the cotangent so scatter's three operands share one memory space.
+    let normalize_metadata = |value: &Tracer<TracingContext<V, O>>| -> Result<_, ProgramError> {
+        let value = if value.r#type().memory() == output_type.memory() {
+            value.clone()
+        } else {
+            value.transfer_to_memory(output_type.memory())
+        };
+        if value.r#type().data_type() == DataType::U64 {
+            Ok(value)
+        } else {
+            Ok(value.convert_element_type(DataType::U64)?)
+        }
+    };
+    let output_offsets = normalize_metadata(output_offsets)?;
+    let receive_sizes = normalize_metadata(receive_sizes)?;
+    let update_type = output_offsets.r#type().into_owned().with_data_type(DataType::I64);
+    let marker = context.zero(&marker_type)?;
+    let ones = context.one(&update_type)?;
+    let negative_ones = ones.neg()?;
+    let end_offsets = output_offsets.add(&receive_sizes)?;
+    let mut index_dimensions = output_offsets.r#type().shape().dimensions().to_vec();
+    index_dimensions.push(Dimension::Static(1));
+    let start_indices = output_offsets.reshape(Shape::new(index_dimensions.clone()))?;
+    let end_indices = end_offsets.reshape(Shape::new(index_dimensions))?;
+    let scatter_dimensions = if physical {
+        ScatterDimensionNumbers::new(Vec::new(), vec![1], vec![1]).with_batching_dimensions(vec![0], vec![0])
+    } else {
+        ScatterDimensionNumbers::new(Vec::new(), vec![0], vec![0])
+    };
+    // Both boundaries are additive. A zero-length region contributes `+1` and `-1` at the same position, while
+    // adjacent regions combine deterministically at their shared boundary.
+    let scatter = ScatterOperation::new(scatter_dimensions, ScatterReductionKind::Add);
+    let markers = marker.scatter(&start_indices, &ones, &scatter)?.scatter(&end_indices, &negative_ones, &scatter)?;
+    let markers = markers.cumulative_sum(leading_axis)?;
+    let start_indices = vec![0; markers.r#type().rank()];
+    let mut limit_indices = markers
+        .r#type()
+        .shape()
+        .dimensions()
+        .iter()
+        .map(|dimension| dimension.value().unwrap())
+        .collect::<Vec<_>>();
+    limit_indices[leading_axis] = output_extent;
+    let strides = vec![1; markers.r#type().rank()];
+    let markers = markers.slice(start_indices.as_slice(), limit_indices.as_slice(), strides.as_slice())?;
+    let marker_zero = context.zero(markers.r#type().as_ref())?;
+    let received = markers.not_equal(&marker_zero)?;
+    let condition_type =
+        ArrayType::new(DataType::Boolean, output_type.shape().clone()).with_memory(output_type.memory());
+    let received = received.broadcast(condition_type, &(0..=leading_axis).collect::<Vec<_>>())?;
+    let zero = context.zero(&output_type)?;
+    Ok(Tracer::select(&received, &zero, cotangent)?)
+}
+
+/// Constructs a `u64` scalar array containing `extent` in the memory space of `metadata_type`.
+fn metadata_extent_scalar(metadata_type: &ArrayType, extent: usize) -> Result<Array, ProgramError> {
+    let extent = u64::try_from(extent).map_err(|_| ProgramError::InvalidArgument {
+        message: format!("`{RAGGED_ALL_TO_ALL_OPERATION_NAME}` extent {extent} does not fit in `u64`"),
+    })?;
+    Array::from_elements(ArrayType::scalar(DataType::U64).with_memory(metadata_type.memory()), &[extent])
 }
 
 /// Stages an explicitly packed ragged all-to-all in any named-axis array operation domain that carries
@@ -1236,173 +1236,6 @@ mod tests {
     // Returns a static array type with the provided element type and dimensions.
     fn array_type(data_type: DataType, dimensions: impl IntoIterator<Item = usize>) -> ArrayType {
         ArrayType::new(data_type, Shape::new(dimensions.into_iter().map(Dimension::Static).collect()))
-    }
-
-    #[test]
-    fn test_ragged_all_to_all_type_inference() {
-        let data = || array_type(DataType::F32, [3, 2]);
-        let output = || array_type(DataType::F32, [4, 2]);
-        let metadata = || array_type(DataType::I32, [2]);
-        let metadata_length = DimensionVariable::new("metadata_length", DimensionBounds::positive(Some(4)).unwrap());
-        let dynamic_metadata = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(metadata_length)]));
-        check_operation_type_inference!(
-            operation = RaggedAllToAllOperation::new("x".to_string(), 2),
-            cases = [
-                {
-                    input_types = [data(), output(), metadata(), metadata(), metadata(), metadata()],
-                    output_types = [output()],
-                },
-                {
-                    input_types = [
-                        ArrayType::scalar(DataType::F32),
-                        output(),
-                        metadata(),
-                        metadata(),
-                        metadata(),
-                        metadata(),
-                    ],
-                    error = "`ragged_all_to_all` data operands must have rank at least 1 but got `f32[]` and \
-                             `f32[4, 2]`",
-                },
-                {
-                    input_types = [
-                        data(),
-                        array_type(DataType::F64, [4, 2]),
-                        metadata(),
-                        metadata(),
-                        metadata(),
-                        metadata(),
-                    ],
-                    error = "`ragged_all_to_all` operand and output data types must match but got `f32` and `f64`",
-                },
-                {
-                    input_types = [
-                        data(),
-                        array_type(DataType::F32, [4, 3]),
-                        metadata(),
-                        metadata(),
-                        metadata(),
-                        metadata(),
-                    ],
-                    error = "`ragged_all_to_all` operand and output trailing dimensions must match but got `[3, 2]` \
-                             and `[4, 3]`",
-                },
-                {
-                    input_types = [
-                        data(),
-                        output(),
-                        array_type(DataType::I32, [2, 1]),
-                        metadata(),
-                        metadata(),
-                        metadata(),
-                    ],
-                    error = "`ragged_all_to_all` `input_offsets` must be rank 1 but got `i32[2, 1]`",
-                },
-                {
-                    input_types = [
-                        array_type(DataType::F32, [2, 3]),
-                        array_type(DataType::F32, [4, 3]),
-                        array_type(DataType::I32, [2, 2]),
-                        array_type(DataType::I32, [2, 2]),
-                        array_type(DataType::I32, [2, 2]),
-                        array_type(DataType::I32, [2, 2]),
-                    ],
-                    error = "`ragged_all_to_all` `input_offsets` must be rank 1 but got `i32[2, 2]`",
-                },
-                {
-                    input_types = [
-                        data(),
-                        output(),
-                        array_type(DataType::F32, [2]),
-                        metadata(),
-                        metadata(),
-                        metadata(),
-                    ],
-                    error = "`ragged_all_to_all` `input_offsets` must have an integer data type but got `f32`",
-                },
-                {
-                    input_types = [
-                        data(),
-                        output(),
-                        metadata(),
-                        array_type(DataType::I64, [2]),
-                        metadata(),
-                        metadata(),
-                    ],
-                    error = "`ragged_all_to_all` metadata operands must share one integer data type but \
-                             `input_offsets` has `i32` and `send_sizes` has `i64`",
-                },
-                {
-                    input_types = [
-                        data(),
-                        output(),
-                        metadata(),
-                        array_type(DataType::I32, [4]),
-                        metadata(),
-                        metadata(),
-                    ],
-                    error = "`ragged_all_to_all` metadata operands must have equal lengths but `input_offsets` has \
-                             length 2 and `send_sizes` has length 4",
-                },
-                {
-                    input_types = [
-                        data(),
-                        output(),
-                        dynamic_metadata.clone(),
-                        dynamic_metadata.clone(),
-                        dynamic_metadata.clone(),
-                        dynamic_metadata.clone(),
-                    ],
-                    error = format!(
-                        "`ragged_all_to_all` `input_offsets` must have a static length but got `{dynamic_metadata}`",
-                    ),
-                },
-                {
-                    input_types = [
-                        data(),
-                        output(),
-                        array_type(DataType::I32, [0]),
-                        array_type(DataType::I32, [0]),
-                        array_type(DataType::I32, [0]),
-                        array_type(DataType::I32, [0]),
-                    ],
-                    error = "`ragged_all_to_all` metadata length must be greater than zero",
-                },
-                {
-                    input_types = [
-                        data(),
-                        output(),
-                        array_type(DataType::I32, [3]),
-                        array_type(DataType::I32, [3]),
-                        array_type(DataType::I32, [3]),
-                        array_type(DataType::I32, [3]),
-                    ],
-                    error = "`ragged_all_to_all` metadata length 3 is not divisible by group size 2",
-                },
-            ],
-        );
-        assert_eq!(
-            RaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 1], vec![2, 2]])
-                .unwrap_err()
-                .to_string(),
-            "`ragged_all_to_all` axis index groups contain participant 2 more than once",
-        );
-        assert_eq!(
-            RaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 1], vec![2]])
-                .unwrap_err()
-                .to_string(),
-            "`ragged_all_to_all` axis index group 1 has size 1 but every group must have size 2",
-        );
-        assert_eq!(
-            RaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 1], vec![2, 4]])
-                .unwrap_err()
-                .to_string(),
-            "`ragged_all_to_all` axis index 4 is out of bounds for axis size 4",
-        );
-        assert_eq!(
-            RaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 1]]).unwrap_err().to_string(),
-            "`ragged_all_to_all` axis index groups do not contain participant 2",
-        );
     }
 
     #[test]
@@ -1534,251 +1367,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ragged_all_to_all_batching_rejects_ragged_operands() {
-        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let ragged_operand = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]), variable, vec![0])])
-            .unwrap();
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
-            .with_axis_name("x".to_string());
-        let metadata = || ArrayBatch::new(Array::matrix(2, 2, vec![0_i32; 4]), BatchAxis::new(0)).unwrap();
-        assert_eq!(
-            RaggedAllToAllOperation::new("x".to_string(), 2).batch(
-                &context,
-                &EmptyRegionDriver,
-                &[
-                    ragged_operand,
-                    ArrayBatch::new(Array::matrix(2, 4, vec![0.0_f32; 8]), BatchAxis::new(0)).unwrap(),
-                    metadata(),
-                    metadata(),
-                    metadata(),
-                    metadata(),
-                ],
-            ),
-            Err(BatchingError::UnsupportedOperation {
-                message: "`ragged_all_to_all` does not support bounded ragged dimension `length` on operand 0"
-                    .to_string(),
-            }),
-        );
-    }
-
-    #[test]
-    fn test_ragged_all_to_all_jvp_handles_joint_and_structural_zero_tangents() {
-        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
-        let operation = RaggedAllToAllOperation::new("x".to_string(), 1);
-        let operand = Array::vector(vec![10.0_f64, 11.0, 12.0]);
-        let output = Array::vector(vec![100.0_f64, 101.0, 102.0, 103.0]);
-        let metadata = [
-            Array::vector(vec![1_i32]),
-            Array::vector(vec![2_i32]),
-            Array::vector(vec![0_i32]),
-            Array::vector(vec![2_i32]),
-        ];
-        let operand_tangent = Array::vector(vec![1.0_f64, 2.0, 3.0]);
-        let output_tangent = Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0]);
-        let structural_zero = |primal: &Array| MaybeZero::Zero(primal.r#type().tangent().unwrap());
-        let duals = |operand_tangent: MaybeZero<Array>, output_tangent: MaybeZero<Array>| {
-            let mut inputs = vec![
-                DifferentiationDual::new(operand.clone(), operand_tangent).unwrap(),
-                DifferentiationDual::new(output.clone(), output_tangent).unwrap(),
-            ];
-            inputs.extend(metadata.iter().cloned().map(|primal| {
-                let tangent = structural_zero(&primal);
-                DifferentiationDual::new(primal, tangent).unwrap()
-            }));
-            inputs
-        };
-
-        let evaluate = |inputs: Vec<DifferentiationDual<Array>>| {
-            operation.jvp(&context, &EmptyRegionDriver, inputs.as_slice()).unwrap().remove(0)
-        };
-        let zero = evaluate(duals(structural_zero(&operand), structural_zero(&output)));
-        assert_eq!(zero.primal().to_f64s(), vec![11.0, 12.0, 102.0, 103.0]);
-        assert!(zero.tangent().is_zero());
-
-        let operand_only = evaluate(duals(MaybeZero::Value(operand_tangent.clone()), structural_zero(&output)));
-        assert_eq!(operand_only.tangent().as_value().unwrap().to_f64s(), vec![2.0, 3.0, 0.0, 0.0]);
-
-        let output_only = evaluate(duals(structural_zero(&operand), MaybeZero::Value(output_tangent.clone())));
-        assert_eq!(output_only.tangent().as_value().unwrap().to_f64s(), vec![0.0, 0.0, 30.0, 40.0]);
-
-        let joint = evaluate(duals(MaybeZero::Value(operand_tangent), MaybeZero::Value(output_tangent)));
-        assert_eq!(joint.tangent().as_value().unwrap().to_f64s(), vec![2.0, 3.0, 30.0, 40.0]);
-    }
-
-    #[test]
-    fn test_ragged_all_to_all_value_and_gradient_through_named_batch_axis() {
-        let operand = Array::matrix(2, 3, vec![10.0_f64, 11.0, 12.0, 20.0, 21.0, 22.0]);
-        let output = Array::matrix(2, 4, vec![100.0_f64, 101.0, 102.0, 103.0, 200.0, 201.0, 202.0, 203.0]);
-        let input_offsets = Array::matrix(2, 2, vec![0_i32, 0, 0, 2]);
-        let send_sizes = Array::matrix(2, 2, vec![0_i32, 1, 1, 0]);
-        let output_offsets = Array::matrix(2, 2, vec![1_i32, 1, 2, 3]);
-        let receive_sizes = Array::matrix(2, 2, vec![0_i32, 1, 1, 0]);
-
-        let (value, gradient) = differentiate_at((operand, output))
-            .value_and_gradient(move |(operand, output)| {
-                let context = operand.context().clone();
-                let input_offsets = context.lift(input_offsets.clone())?;
-                let send_sizes = context.lift(send_sizes.clone())?;
-                let output_offsets = context.lift(output_offsets.clone())?;
-                let receive_sizes = context.lift(receive_sizes.clone())?;
-                let exchanged = batch(
-                    |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
-                        operand.ragged_all_to_all(
-                            "x",
-                            &output,
-                            &input_offsets,
-                            &send_sizes,
-                            &output_offsets,
-                            &receive_sizes,
-                        )
-                    },
-                    (operand, output, input_offsets, send_sizes, output_offsets, receive_sizes),
-                    (
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                    ),
-                    BatchAxis::new(0),
-                    BatchAxisSpecification::named("x"),
-                )?;
-                Ok(exchanged.reduce(&[0, 1], ReductionKind::Sum))
-            })
-            .unwrap();
-
-        assert_eq!(value.to_f64s(), vec![939.0]);
-        assert_eq!(gradient.0.to_f64s(), vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
-        assert_eq!(gradient.1.to_f64s(), vec![1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0]);
-
-        check_gradient!(
-            |operand, output| {
-                let context = operand.dispatch_domain();
-                let input_offsets = context.lift(Array::matrix(2, 2, vec![0_i32, 0, 0, 2]))?;
-                let send_sizes = context.lift(Array::matrix(2, 2, vec![0_i32, 1, 1, 0]))?;
-                let output_offsets = context.lift(Array::matrix(2, 2, vec![1_i32, 1, 2, 3]))?;
-                let receive_sizes = context.lift(Array::matrix(2, 2, vec![0_i32, 1, 1, 0]))?;
-                let exchanged = batch(
-                    |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
-                        operand.ragged_all_to_all(
-                            "x",
-                            &output,
-                            &input_offsets,
-                            &send_sizes,
-                            &output_offsets,
-                            &receive_sizes,
-                        )
-                    },
-                    (operand, output, input_offsets, send_sizes, output_offsets, receive_sizes),
-                    (
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                    ),
-                    BatchAxis::new(0),
-                    BatchAxisSpecification::named("x"),
-                )?;
-                Ok(exchanged.reduce(&[0, 1], ReductionKind::Sum))
-            },
-            at = Array::matrix(2, 3, vec![10.0_f64, 11.0, 12.0, 20.0, 21.0, 22.0]),
-            with = Array::matrix(2, 4, vec![100.0_f64, 101.0, 102.0, 103.0, 200.0, 201.0, 202.0, 203.0]),
-            step = 1e-6,
-            tolerance = 1e-6,
-        );
-        check_gradient!(
-            |output, operand| {
-                let context = output.dispatch_domain();
-                let input_offsets = context.lift(Array::matrix(2, 2, vec![0_i32, 0, 0, 2]))?;
-                let send_sizes = context.lift(Array::matrix(2, 2, vec![0_i32, 1, 1, 0]))?;
-                let output_offsets = context.lift(Array::matrix(2, 2, vec![1_i32, 1, 2, 3]))?;
-                let receive_sizes = context.lift(Array::matrix(2, 2, vec![0_i32, 1, 1, 0]))?;
-                let exchanged = batch(
-                    |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
-                        operand.ragged_all_to_all(
-                            "x",
-                            &output,
-                            &input_offsets,
-                            &send_sizes,
-                            &output_offsets,
-                            &receive_sizes,
-                        )
-                    },
-                    (operand, output, input_offsets, send_sizes, output_offsets, receive_sizes),
-                    (
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                        BatchAxis::new(0),
-                    ),
-                    BatchAxis::new(0),
-                    BatchAxisSpecification::named("x"),
-                )?;
-                Ok(exchanged.reduce(&[0, 1], ReductionKind::Sum))
-            },
-            at = Array::matrix(2, 4, vec![100.0_f64, 101.0, 102.0, 103.0, 200.0, 201.0, 202.0, 203.0],),
-            with = Array::matrix(2, 3, vec![10.0_f64, 11.0, 12.0, 20.0, 21.0, 22.0]),
-            step = 1e-6,
-            tolerance = 1e-6,
-        );
-    }
-
-    #[test]
-    fn test_named_batch_axis_composes_outside_ragged_all_to_all_differentiation() {
-        let (values, gradients) = batch(
-            |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
-                differentiate_at((operand, output))
-                    .with_captures((input_offsets, send_sizes, output_offsets, receive_sizes))
-                    .value_and_gradient(
-                        |(operand, output), (input_offsets, send_sizes, output_offsets, receive_sizes)| {
-                            Ok(operand
-                                .ragged_all_to_all(
-                                    "x",
-                                    &output,
-                                    &input_offsets,
-                                    &send_sizes,
-                                    &output_offsets,
-                                    &receive_sizes,
-                                )?
-                                .reduce(&[0], ReductionKind::Sum))
-                        },
-                    )
-                    .map_err(ProgramError::from)
-            },
-            (
-                Array::matrix(2, 3, vec![10.0_f64, 11.0, 12.0, 20.0, 21.0, 22.0]),
-                Array::matrix(2, 4, vec![100.0_f64, 101.0, 102.0, 103.0, 200.0, 201.0, 202.0, 203.0]),
-                Array::matrix(2, 2, vec![0_i32, 0, 0, 2]),
-                Array::matrix(2, 2, vec![0_i32, 1, 1, 0]),
-                Array::matrix(2, 2, vec![1_i32, 1, 2, 3]),
-                Array::matrix(2, 2, vec![0_i32, 1, 1, 0]),
-            ),
-            (
-                BatchAxis::new(0),
-                BatchAxis::new(0),
-                BatchAxis::new(0),
-                BatchAxis::new(0),
-                BatchAxis::new(0),
-                BatchAxis::new(0),
-            ),
-            (BatchAxis::new(0), (BatchAxis::new(0), BatchAxis::new(0))),
-            BatchAxisSpecification::named("x"),
-        )
-        .unwrap();
-
-        assert_eq!(values.to_f64s(), vec![324.0, 615.0]);
-        assert_eq!(gradients.0.to_f64s(), vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
-        assert_eq!(gradients.1.to_f64s(), vec![1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0]);
-    }
-
-    #[test]
     fn test_grouped_physical_ragged_all_to_all_transpose_routes_cotangents() {
         let operation = RaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 2], vec![3, 1]])
             .unwrap()
@@ -1885,102 +1473,6 @@ mod tests {
     }
 
     #[test]
-    fn test_ragged_all_to_all_composes_named_batch_axes_in_both_orders() {
-        let metadata_type = ArrayType::new_static(DataType::I8, [2, 2, 2]);
-        let inputs = (
-            Array::from_f64s(
-                ArrayType::new_static(DataType::F64, [2, 2, 3]),
-                vec![10.0, 11.0, 12.0, 20.0, 21.0, 22.0, 30.0, 31.0, 32.0, 40.0, 41.0, 42.0],
-            ),
-            Array::from_f64s(
-                ArrayType::new_static(DataType::F64, [2, 2, 4]),
-                vec![
-                    100.0, 101.0, 102.0, 103.0, 110.0, 111.0, 112.0, 113.0, 200.0, 201.0, 202.0, 203.0, 210.0, 211.0,
-                    212.0, 213.0,
-                ],
-            ),
-            Array::from_elements(metadata_type.clone(), &[0_i8, 1, 2, 0, 0, 2, 1, 2]).unwrap(),
-            Array::from_elements(metadata_type.clone(), &[1_i8; 8]).unwrap(),
-            Array::from_elements(metadata_type.clone(), &[0_i8, 1, 1, 0, 2, 3, 3, 2]).unwrap(),
-            Array::from_elements(metadata_type, &[1_i8; 8]).unwrap(),
-        );
-        let transpose = |input: &Array| input.transpose([1, 0, 2]).unwrap();
-        let transposed_inputs = (
-            transpose(&inputs.0),
-            transpose(&inputs.1),
-            transpose(&inputs.2),
-            transpose(&inputs.3),
-            transpose(&inputs.4),
-            transpose(&inputs.5),
-        );
-        let x_then_y: Array = batch(
-            |inputs| {
-                Ok(batch(
-                    |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
-                        operand.ragged_all_to_all(
-                            "x",
-                            &output,
-                            &input_offsets,
-                            &send_sizes,
-                            &output_offsets,
-                            &receive_sizes,
-                        )
-                    },
-                    inputs,
-                    BatchAxis::new(0),
-                    BatchAxis::new(0),
-                    BatchAxisSpecification::named("y"),
-                )?)
-            },
-            inputs,
-            BatchAxis::new(0),
-            BatchAxis::new(0),
-            BatchAxisSpecification::named("x"),
-        )
-        .unwrap();
-        assert_eq!(x_then_y.r#type().as_ref(), &ArrayType::new_static(DataType::F64, [2, 2, 4]));
-        assert_eq!(
-            x_then_y.to_f64s(),
-            vec![
-                10.0, 101.0, 30.0, 103.0, 110.0, 22.0, 112.0, 41.0, 200.0, 11.0, 202.0, 32.0, 20.0, 211.0, 42.0, 213.0,
-            ],
-        );
-
-        let y_then_x: Array = batch(
-            |inputs| {
-                Ok(batch(
-                    |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
-                        operand.ragged_all_to_all(
-                            "x",
-                            &output,
-                            &input_offsets,
-                            &send_sizes,
-                            &output_offsets,
-                            &receive_sizes,
-                        )
-                    },
-                    inputs,
-                    BatchAxis::new(0),
-                    BatchAxis::new(0),
-                    BatchAxisSpecification::named("x"),
-                )?)
-            },
-            transposed_inputs,
-            BatchAxis::new(0),
-            BatchAxis::new(0),
-            BatchAxisSpecification::named("y"),
-        )
-        .unwrap();
-        assert_eq!(y_then_x.r#type().as_ref(), &ArrayType::new_static(DataType::F64, [2, 2, 4]));
-        assert_eq!(
-            y_then_x.to_f64s(),
-            vec![
-                10.0, 101.0, 30.0, 103.0, 200.0, 11.0, 202.0, 32.0, 110.0, 22.0, 112.0, 41.0, 20.0, 211.0, 42.0, 213.0,
-            ],
-        );
-    }
-
-    #[test]
     fn test_logical_ragged_all_to_all_stages_an_unrelated_axis_merge() {
         type TestContext = TracingContext<Array, ArrayOperation<Array>>;
 
@@ -2044,189 +1536,6 @@ mod tests {
         assert!(
             program.instructions().iter().all(|instruction| instruction.provenance() == &expected_provenance),
             "every merged batching instruction is attributed",
-        );
-    }
-
-    #[test]
-    fn test_unrelated_ragged_all_to_all_batching_rejects_a_dynamic_packed_extent() {
-        type TestContext = TracingContext<Array, ArrayOperation<Array>>;
-
-        let input_extent = DimensionVariable::new("input_extent", DimensionBounds::new(0, Some(8)).unwrap());
-        let error = TestContext::trace(
-            |inputs: Vec<_>| {
-                let context = BatchingContext::new(inputs[0].context().clone(), 2).with_axis_name("y".to_string());
-                let inputs = inputs
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, input)| ArrayBatch::new(input, BatchAxis::new(usize::from(index >= 2))))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let mut outputs = RaggedAllToAllOperation::new("x".to_string(), 2)
-                    .batch(&context, &EmptyRegionDriver, inputs.as_slice())?
-                    .into_parts()
-                    .0;
-                Ok(outputs.remove(0).into_value())
-            },
-            vec![
-                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(input_extent)])),
-                ArrayType::new_static(DataType::F32, [2, 4]),
-                ArrayType::new_static(DataType::I32, [2, 2]),
-                ArrayType::new_static(DataType::I32, [2, 2]),
-                ArrayType::new_static(DataType::I32, [2, 2]),
-                ArrayType::new_static(DataType::I32, [2, 2]),
-            ],
-        )
-        .unwrap_err();
-        let error = error.downcast_custom::<BatchingError>().unwrap();
-        assert_eq!(
-            error,
-            &BatchingError::UnsupportedOperation {
-                message: "`ragged_all_to_all` merged batching requires `operand` axis 0 to have a static extent"
-                    .to_string(),
-            },
-        );
-
-        let trailing_extent = DimensionVariable::new("trailing_extent", DimensionBounds::new(0, Some(8)).unwrap());
-        let error = TestContext::trace(
-            |inputs: Vec<_>| {
-                let context = BatchingContext::new(inputs[0].context().clone(), 2).with_axis_name("y".to_string());
-                let inputs = inputs
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, input)| ArrayBatch::new(input, BatchAxis::new(usize::from(index >= 2))))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let mut outputs = RaggedAllToAllOperation::new("x".to_string(), 2)
-                    .batch(&context, &EmptyRegionDriver, inputs.as_slice())?
-                    .into_parts()
-                    .0;
-                Ok(outputs.remove(0).into_value())
-            },
-            vec![
-                ArrayType::new(
-                    DataType::F32,
-                    Shape::new(vec![
-                        Dimension::Static(2),
-                        Dimension::Static(3),
-                        Dimension::Dynamic(trailing_extent.clone()),
-                    ]),
-                ),
-                ArrayType::new(
-                    DataType::F32,
-                    Shape::new(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Dynamic(trailing_extent)]),
-                ),
-                ArrayType::new_static(DataType::I32, [2, 2]),
-                ArrayType::new_static(DataType::I32, [2, 2]),
-                ArrayType::new_static(DataType::I32, [2, 2]),
-                ArrayType::new_static(DataType::I32, [2, 2]),
-            ],
-        )
-        .unwrap_err();
-        let error = error.downcast_custom::<BatchingError>().unwrap();
-        assert_eq!(
-            error,
-            &BatchingError::UnsupportedOperation {
-                message: "`ragged_all_to_all` merged batching requires `operand` axis 1 to have a static extent"
-                    .to_string(),
-            },
-        );
-    }
-
-    #[test]
-    fn test_unrelated_ragged_all_to_all_batching_rejects_a_dynamic_mapped_extent() {
-        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-
-        let context = TestContext::new();
-        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
-        let batch_extent = context.input(DimensionType::new(batch.clone()).into());
-        let batching_context =
-            BatchingContext::<_, ArrayIrBatching>::new(context.clone(), batch_extent).with_axis_name("y".to_string());
-        let packed_type = |data_type, dimensions: &[usize]| {
-            ArrayType::new(
-                data_type,
-                Shape::new(
-                    std::iter::once(Dimension::Dynamic(batch.clone()))
-                        .chain(dimensions.iter().copied().map(Dimension::Static))
-                        .collect(),
-                ),
-            )
-        };
-        let metadata_type = packed_type(DataType::I32, &[2, 2]);
-        let input_types = [
-            packed_type(DataType::F32, &[2, 3]),
-            packed_type(DataType::F32, &[2, 4]),
-            metadata_type.clone(),
-            metadata_type.clone(),
-            metadata_type.clone(),
-            metadata_type,
-        ];
-        let inputs = input_types.map(|r#type| {
-            BatchingTracer::new(
-                batching_context.clone(),
-                ArrayIrBatch::new(context.input(r#type.into()), BatchAxis::new(0)).unwrap(),
-            )
-        });
-        let error = batching_context
-            .bind(
-                ArrayIrOperation::RaggedAllToAll(
-                    RaggedAllToAllOperation::new("x".to_string(), 2).with_physical_representation(),
-                ),
-                Vec::new(),
-                &inputs,
-            )
-            .unwrap_err();
-        let error = error.downcast_custom::<BatchingError>().unwrap();
-        assert_eq!(
-            error,
-            &BatchingError::UnsupportedOperation {
-                message: "`ragged_all_to_all` merged batching requires a statically known mapped-axis extent"
-                    .to_string(),
-            },
-        );
-    }
-
-    #[test]
-    fn test_unrelated_ragged_all_to_all_batching_handles_empty_batches_and_rejects_groups() {
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 0)
-            .with_axis_name("y".to_string());
-        let empty = |r#type: ArrayType| Array::from_elements::<f32>(r#type, &[]).unwrap();
-        let empty_metadata = || Array::from_elements::<i32>(ArrayType::new_static(DataType::I32, [2, 0]), &[]).unwrap();
-        let inputs = vec![
-            ArrayBatch::new(empty(ArrayType::new_static(DataType::F32, [0, 3])), BatchAxis::new(0)).unwrap(),
-            ArrayBatch::new(empty(ArrayType::new_static(DataType::F32, [0, 4])), BatchAxis::new(0)).unwrap(),
-            ArrayBatch::new(empty_metadata(), BatchAxis::new(1)).unwrap(),
-            ArrayBatch::new(empty_metadata(), BatchAxis::new(1)).unwrap(),
-            ArrayBatch::new(empty_metadata(), BatchAxis::new(1)).unwrap(),
-            ArrayBatch::new(empty_metadata(), BatchAxis::new(1)).unwrap(),
-        ];
-        let outputs = RaggedAllToAllOperation::new("x".to_string(), 2)
-            .batch(&context, &EmptyRegionDriver, inputs.as_slice())
-            .unwrap()
-            .into_parts()
-            .0;
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].value().r#type().as_ref(), &ArrayType::new_static(DataType::F32, [0, 4]));
-
-        let grouped = RaggedAllToAllOperation::grouped("x".to_string(), 2, vec![vec![0, 1]]).unwrap();
-        assert_eq!(
-            grouped.batch(&context, &EmptyRegionDriver, inputs.as_slice()),
-            Err(BatchingError::UnsupportedOperation {
-                message:
-                    "`ragged_all_to_all` axis index groups are not supported when merging an unrelated mapped axis"
-                        .to_string(),
-            }),
-        );
-
-        let mut invalid_inputs = inputs;
-        invalid_inputs[1] = ArrayBatch::new(
-            Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [0, 4]), &[]).unwrap(),
-            BatchAxis::new(0),
-        )
-        .unwrap();
-        assert_eq!(
-            RaggedAllToAllOperation::new("x".to_string(), 2)
-                .batch(&context, &EmptyRegionDriver, invalid_inputs.as_slice())
-                .unwrap_err()
-                .to_string(),
-            "`ragged_all_to_all` operand and output data types must match but got `f32` and `f64`",
         );
     }
 
@@ -2513,5 +1822,696 @@ mod tests {
             assert_eq!(pullback.input_types(), &[output_type]);
             assert_eq!(pullback.output_types(), &[operand_type, program.input_types()[1].clone()]);
         }
+    }
+
+    #[test]
+    fn test_ragged_all_to_all_type_inference() {
+        let data = || array_type(DataType::F32, [3, 2]);
+        let output = || array_type(DataType::F32, [4, 2]);
+        let metadata = || array_type(DataType::I32, [2]);
+        let metadata_length = DimensionVariable::new("metadata_length", DimensionBounds::positive(Some(4)).unwrap());
+        let dynamic_metadata = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(metadata_length)]));
+        check_operation_type_inference!(
+            operation = RaggedAllToAllOperation::new("x".to_string(), 2),
+            cases = [
+                {
+                    input_types = [data(), output(), metadata(), metadata(), metadata(), metadata()],
+                    output_types = [output()],
+                },
+                {
+                    input_types = [
+                        ArrayType::scalar(DataType::F32),
+                        output(),
+                        metadata(),
+                        metadata(),
+                        metadata(),
+                        metadata(),
+                    ],
+                    error = "`ragged_all_to_all` data operands must have rank at least 1 but got `f32[]` and \
+                             `f32[4, 2]`",
+                },
+                {
+                    input_types = [
+                        data(),
+                        array_type(DataType::F64, [4, 2]),
+                        metadata(),
+                        metadata(),
+                        metadata(),
+                        metadata(),
+                    ],
+                    error = "`ragged_all_to_all` operand and output data types must match but got `f32` and `f64`",
+                },
+                {
+                    input_types = [
+                        data(),
+                        array_type(DataType::F32, [4, 3]),
+                        metadata(),
+                        metadata(),
+                        metadata(),
+                        metadata(),
+                    ],
+                    error = "`ragged_all_to_all` operand and output trailing dimensions must match but got `[3, 2]` \
+                             and `[4, 3]`",
+                },
+                {
+                    input_types = [
+                        data(),
+                        output(),
+                        array_type(DataType::I32, [2, 1]),
+                        metadata(),
+                        metadata(),
+                        metadata(),
+                    ],
+                    error = "`ragged_all_to_all` `input_offsets` must be rank 1 but got `i32[2, 1]`",
+                },
+                {
+                    input_types = [
+                        array_type(DataType::F32, [2, 3]),
+                        array_type(DataType::F32, [4, 3]),
+                        array_type(DataType::I32, [2, 2]),
+                        array_type(DataType::I32, [2, 2]),
+                        array_type(DataType::I32, [2, 2]),
+                        array_type(DataType::I32, [2, 2]),
+                    ],
+                    error = "`ragged_all_to_all` `input_offsets` must be rank 1 but got `i32[2, 2]`",
+                },
+                {
+                    input_types = [
+                        data(),
+                        output(),
+                        array_type(DataType::F32, [2]),
+                        metadata(),
+                        metadata(),
+                        metadata(),
+                    ],
+                    error = "`ragged_all_to_all` `input_offsets` must have an integer data type but got `f32`",
+                },
+                {
+                    input_types = [
+                        data(),
+                        output(),
+                        metadata(),
+                        array_type(DataType::I64, [2]),
+                        metadata(),
+                        metadata(),
+                    ],
+                    error = "`ragged_all_to_all` metadata operands must share one integer data type but \
+                             `input_offsets` has `i32` and `send_sizes` has `i64`",
+                },
+                {
+                    input_types = [
+                        data(),
+                        output(),
+                        metadata(),
+                        array_type(DataType::I32, [4]),
+                        metadata(),
+                        metadata(),
+                    ],
+                    error = "`ragged_all_to_all` metadata operands must have equal lengths but `input_offsets` has \
+                             length 2 and `send_sizes` has length 4",
+                },
+                {
+                    input_types = [
+                        data(),
+                        output(),
+                        dynamic_metadata.clone(),
+                        dynamic_metadata.clone(),
+                        dynamic_metadata.clone(),
+                        dynamic_metadata.clone(),
+                    ],
+                    error = format!(
+                        "`ragged_all_to_all` `input_offsets` must have a static length but got `{dynamic_metadata}`",
+                    ),
+                },
+                {
+                    input_types = [
+                        data(),
+                        output(),
+                        array_type(DataType::I32, [0]),
+                        array_type(DataType::I32, [0]),
+                        array_type(DataType::I32, [0]),
+                        array_type(DataType::I32, [0]),
+                    ],
+                    error = "`ragged_all_to_all` metadata length must be greater than zero",
+                },
+                {
+                    input_types = [
+                        data(),
+                        output(),
+                        array_type(DataType::I32, [3]),
+                        array_type(DataType::I32, [3]),
+                        array_type(DataType::I32, [3]),
+                        array_type(DataType::I32, [3]),
+                    ],
+                    error = "`ragged_all_to_all` metadata length 3 is not divisible by group size 2",
+                },
+            ],
+        );
+        assert_eq!(
+            RaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 1], vec![2, 2]])
+                .unwrap_err()
+                .to_string(),
+            "`ragged_all_to_all` axis index groups contain participant 2 more than once",
+        );
+        assert_eq!(
+            RaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 1], vec![2]])
+                .unwrap_err()
+                .to_string(),
+            "`ragged_all_to_all` axis index group 1 has size 1 but every group must have size 2",
+        );
+        assert_eq!(
+            RaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 1], vec![2, 4]])
+                .unwrap_err()
+                .to_string(),
+            "`ragged_all_to_all` axis index 4 is out of bounds for axis size 4",
+        );
+        assert_eq!(
+            RaggedAllToAllOperation::grouped("x".to_string(), 4, vec![vec![0, 1]]).unwrap_err().to_string(),
+            "`ragged_all_to_all` axis index groups do not contain participant 2",
+        );
+    }
+
+    #[test]
+    fn test_ragged_all_to_all_batching_rejects_ragged_operands() {
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let ragged_operand = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]), BatchAxis::new(0))
+            .unwrap()
+            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]), variable, vec![0])])
+            .unwrap();
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
+            .with_axis_name("x".to_string());
+        let metadata = || ArrayBatch::new(Array::matrix(2, 2, vec![0_i32; 4]), BatchAxis::new(0)).unwrap();
+        assert_eq!(
+            RaggedAllToAllOperation::new("x".to_string(), 2).batch(
+                &context,
+                &EmptyRegionDriver,
+                &[
+                    ragged_operand,
+                    ArrayBatch::new(Array::matrix(2, 4, vec![0.0_f32; 8]), BatchAxis::new(0)).unwrap(),
+                    metadata(),
+                    metadata(),
+                    metadata(),
+                    metadata(),
+                ],
+            ),
+            Err(BatchingError::UnsupportedOperation {
+                message: "`ragged_all_to_all` does not support bounded ragged dimension `length` on operand 0"
+                    .to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_ragged_all_to_all_value_and_gradient_through_named_batch_axis() {
+        let operand = Array::matrix(2, 3, vec![10.0_f64, 11.0, 12.0, 20.0, 21.0, 22.0]);
+        let output = Array::matrix(2, 4, vec![100.0_f64, 101.0, 102.0, 103.0, 200.0, 201.0, 202.0, 203.0]);
+        let input_offsets = Array::matrix(2, 2, vec![0_i32, 0, 0, 2]);
+        let send_sizes = Array::matrix(2, 2, vec![0_i32, 1, 1, 0]);
+        let output_offsets = Array::matrix(2, 2, vec![1_i32, 1, 2, 3]);
+        let receive_sizes = Array::matrix(2, 2, vec![0_i32, 1, 1, 0]);
+
+        let (value, gradient) = differentiate_at((operand, output))
+            .value_and_gradient(move |(operand, output)| {
+                let context = operand.context().clone();
+                let input_offsets = context.lift(input_offsets.clone())?;
+                let send_sizes = context.lift(send_sizes.clone())?;
+                let output_offsets = context.lift(output_offsets.clone())?;
+                let receive_sizes = context.lift(receive_sizes.clone())?;
+                let exchanged = batch(
+                    |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
+                        operand.ragged_all_to_all(
+                            "x",
+                            &output,
+                            &input_offsets,
+                            &send_sizes,
+                            &output_offsets,
+                            &receive_sizes,
+                        )
+                    },
+                    (operand, output, input_offsets, send_sizes, output_offsets, receive_sizes),
+                    (
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                    ),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::named("x"),
+                )?;
+                Ok(exchanged.reduce(&[0, 1], ReductionKind::Sum))
+            })
+            .unwrap();
+
+        assert_eq!(value.to_f64s(), vec![939.0]);
+        assert_eq!(gradient.0.to_f64s(), vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(gradient.1.to_f64s(), vec![1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0]);
+
+        check_gradient!(
+            |operand, output| {
+                let context = operand.dispatch_domain();
+                let input_offsets = context.lift(Array::matrix(2, 2, vec![0_i32, 0, 0, 2]))?;
+                let send_sizes = context.lift(Array::matrix(2, 2, vec![0_i32, 1, 1, 0]))?;
+                let output_offsets = context.lift(Array::matrix(2, 2, vec![1_i32, 1, 2, 3]))?;
+                let receive_sizes = context.lift(Array::matrix(2, 2, vec![0_i32, 1, 1, 0]))?;
+                let exchanged = batch(
+                    |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
+                        operand.ragged_all_to_all(
+                            "x",
+                            &output,
+                            &input_offsets,
+                            &send_sizes,
+                            &output_offsets,
+                            &receive_sizes,
+                        )
+                    },
+                    (operand, output, input_offsets, send_sizes, output_offsets, receive_sizes),
+                    (
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                    ),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::named("x"),
+                )?;
+                Ok(exchanged.reduce(&[0, 1], ReductionKind::Sum))
+            },
+            at = Array::matrix(2, 3, vec![10.0_f64, 11.0, 12.0, 20.0, 21.0, 22.0]),
+            with = Array::matrix(2, 4, vec![100.0_f64, 101.0, 102.0, 103.0, 200.0, 201.0, 202.0, 203.0]),
+            step = 1e-6,
+            tolerance = 1e-6,
+        );
+        check_gradient!(
+            |output, operand| {
+                let context = output.dispatch_domain();
+                let input_offsets = context.lift(Array::matrix(2, 2, vec![0_i32, 0, 0, 2]))?;
+                let send_sizes = context.lift(Array::matrix(2, 2, vec![0_i32, 1, 1, 0]))?;
+                let output_offsets = context.lift(Array::matrix(2, 2, vec![1_i32, 1, 2, 3]))?;
+                let receive_sizes = context.lift(Array::matrix(2, 2, vec![0_i32, 1, 1, 0]))?;
+                let exchanged = batch(
+                    |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
+                        operand.ragged_all_to_all(
+                            "x",
+                            &output,
+                            &input_offsets,
+                            &send_sizes,
+                            &output_offsets,
+                            &receive_sizes,
+                        )
+                    },
+                    (operand, output, input_offsets, send_sizes, output_offsets, receive_sizes),
+                    (
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                        BatchAxis::new(0),
+                    ),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::named("x"),
+                )?;
+                Ok(exchanged.reduce(&[0, 1], ReductionKind::Sum))
+            },
+            at = Array::matrix(2, 4, vec![100.0_f64, 101.0, 102.0, 103.0, 200.0, 201.0, 202.0, 203.0],),
+            with = Array::matrix(2, 3, vec![10.0_f64, 11.0, 12.0, 20.0, 21.0, 22.0]),
+            step = 1e-6,
+            tolerance = 1e-6,
+        );
+    }
+
+    #[test]
+    fn test_named_batch_axis_composes_outside_ragged_all_to_all_differentiation() {
+        let (values, gradients) = batch(
+            |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
+                differentiate_at((operand, output))
+                    .with_captures((input_offsets, send_sizes, output_offsets, receive_sizes))
+                    .value_and_gradient(
+                        |(operand, output), (input_offsets, send_sizes, output_offsets, receive_sizes)| {
+                            Ok(operand
+                                .ragged_all_to_all(
+                                    "x",
+                                    &output,
+                                    &input_offsets,
+                                    &send_sizes,
+                                    &output_offsets,
+                                    &receive_sizes,
+                                )?
+                                .reduce(&[0], ReductionKind::Sum))
+                        },
+                    )
+                    .map_err(ProgramError::from)
+            },
+            (
+                Array::matrix(2, 3, vec![10.0_f64, 11.0, 12.0, 20.0, 21.0, 22.0]),
+                Array::matrix(2, 4, vec![100.0_f64, 101.0, 102.0, 103.0, 200.0, 201.0, 202.0, 203.0]),
+                Array::matrix(2, 2, vec![0_i32, 0, 0, 2]),
+                Array::matrix(2, 2, vec![0_i32, 1, 1, 0]),
+                Array::matrix(2, 2, vec![1_i32, 1, 2, 3]),
+                Array::matrix(2, 2, vec![0_i32, 1, 1, 0]),
+            ),
+            (
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+            ),
+            (BatchAxis::new(0), (BatchAxis::new(0), BatchAxis::new(0))),
+            BatchAxisSpecification::named("x"),
+        )
+        .unwrap();
+
+        assert_eq!(values.to_f64s(), vec![324.0, 615.0]);
+        assert_eq!(gradients.0.to_f64s(), vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(gradients.1.to_f64s(), vec![1.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_ragged_all_to_all_composes_named_batch_axes_in_both_orders() {
+        let metadata_type = ArrayType::new_static(DataType::I8, [2, 2, 2]);
+        let inputs = (
+            Array::from_f64s(
+                ArrayType::new_static(DataType::F64, [2, 2, 3]),
+                vec![10.0, 11.0, 12.0, 20.0, 21.0, 22.0, 30.0, 31.0, 32.0, 40.0, 41.0, 42.0],
+            ),
+            Array::from_f64s(
+                ArrayType::new_static(DataType::F64, [2, 2, 4]),
+                vec![
+                    100.0, 101.0, 102.0, 103.0, 110.0, 111.0, 112.0, 113.0, 200.0, 201.0, 202.0, 203.0, 210.0, 211.0,
+                    212.0, 213.0,
+                ],
+            ),
+            Array::from_elements(metadata_type.clone(), &[0_i8, 1, 2, 0, 0, 2, 1, 2]).unwrap(),
+            Array::from_elements(metadata_type.clone(), &[1_i8; 8]).unwrap(),
+            Array::from_elements(metadata_type.clone(), &[0_i8, 1, 1, 0, 2, 3, 3, 2]).unwrap(),
+            Array::from_elements(metadata_type, &[1_i8; 8]).unwrap(),
+        );
+        let transpose = |input: &Array| input.transpose([1, 0, 2]).unwrap();
+        let transposed_inputs = (
+            transpose(&inputs.0),
+            transpose(&inputs.1),
+            transpose(&inputs.2),
+            transpose(&inputs.3),
+            transpose(&inputs.4),
+            transpose(&inputs.5),
+        );
+        let x_then_y: Array = batch(
+            |inputs| {
+                Ok(batch(
+                    |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
+                        operand.ragged_all_to_all(
+                            "x",
+                            &output,
+                            &input_offsets,
+                            &send_sizes,
+                            &output_offsets,
+                            &receive_sizes,
+                        )
+                    },
+                    inputs,
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::named("y"),
+                )?)
+            },
+            inputs,
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            BatchAxisSpecification::named("x"),
+        )
+        .unwrap();
+        assert_eq!(x_then_y.r#type().as_ref(), &ArrayType::new_static(DataType::F64, [2, 2, 4]));
+        assert_eq!(
+            x_then_y.to_f64s(),
+            vec![
+                10.0, 101.0, 30.0, 103.0, 110.0, 22.0, 112.0, 41.0, 200.0, 11.0, 202.0, 32.0, 20.0, 211.0, 42.0, 213.0,
+            ],
+        );
+
+        let y_then_x: Array = batch(
+            |inputs| {
+                Ok(batch(
+                    |(operand, output, input_offsets, send_sizes, output_offsets, receive_sizes)| {
+                        operand.ragged_all_to_all(
+                            "x",
+                            &output,
+                            &input_offsets,
+                            &send_sizes,
+                            &output_offsets,
+                            &receive_sizes,
+                        )
+                    },
+                    inputs,
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    BatchAxisSpecification::named("x"),
+                )?)
+            },
+            transposed_inputs,
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            BatchAxisSpecification::named("y"),
+        )
+        .unwrap();
+        assert_eq!(y_then_x.r#type().as_ref(), &ArrayType::new_static(DataType::F64, [2, 2, 4]));
+        assert_eq!(
+            y_then_x.to_f64s(),
+            vec![
+                10.0, 101.0, 30.0, 103.0, 200.0, 11.0, 202.0, 32.0, 110.0, 22.0, 112.0, 41.0, 20.0, 211.0, 42.0, 213.0,
+            ],
+        );
+    }
+
+    #[test]
+    fn test_unrelated_ragged_all_to_all_batching_rejects_a_dynamic_packed_extent() {
+        type TestContext = TracingContext<Array, ArrayOperation<Array>>;
+
+        let input_extent = DimensionVariable::new("input_extent", DimensionBounds::new(0, Some(8)).unwrap());
+        let error = TestContext::trace(
+            |inputs: Vec<_>| {
+                let context = BatchingContext::new(inputs[0].context().clone(), 2).with_axis_name("y".to_string());
+                let inputs = inputs
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, input)| ArrayBatch::new(input, BatchAxis::new(usize::from(index >= 2))))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut outputs = RaggedAllToAllOperation::new("x".to_string(), 2)
+                    .batch(&context, &EmptyRegionDriver, inputs.as_slice())?
+                    .into_parts()
+                    .0;
+                Ok(outputs.remove(0).into_value())
+            },
+            vec![
+                ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2), Dimension::Dynamic(input_extent)])),
+                ArrayType::new_static(DataType::F32, [2, 4]),
+                ArrayType::new_static(DataType::I32, [2, 2]),
+                ArrayType::new_static(DataType::I32, [2, 2]),
+                ArrayType::new_static(DataType::I32, [2, 2]),
+                ArrayType::new_static(DataType::I32, [2, 2]),
+            ],
+        )
+        .unwrap_err();
+        let error = error.downcast_custom::<BatchingError>().unwrap();
+        assert_eq!(
+            error,
+            &BatchingError::UnsupportedOperation {
+                message: "`ragged_all_to_all` merged batching requires `operand` axis 0 to have a static extent"
+                    .to_string(),
+            },
+        );
+
+        let trailing_extent = DimensionVariable::new("trailing_extent", DimensionBounds::new(0, Some(8)).unwrap());
+        let error = TestContext::trace(
+            |inputs: Vec<_>| {
+                let context = BatchingContext::new(inputs[0].context().clone(), 2).with_axis_name("y".to_string());
+                let inputs = inputs
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, input)| ArrayBatch::new(input, BatchAxis::new(usize::from(index >= 2))))
+                    .collect::<Result<Vec<_>, _>>()?;
+                let mut outputs = RaggedAllToAllOperation::new("x".to_string(), 2)
+                    .batch(&context, &EmptyRegionDriver, inputs.as_slice())?
+                    .into_parts()
+                    .0;
+                Ok(outputs.remove(0).into_value())
+            },
+            vec![
+                ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![
+                        Dimension::Static(2),
+                        Dimension::Static(3),
+                        Dimension::Dynamic(trailing_extent.clone()),
+                    ]),
+                ),
+                ArrayType::new(
+                    DataType::F32,
+                    Shape::new(vec![Dimension::Static(2), Dimension::Static(4), Dimension::Dynamic(trailing_extent)]),
+                ),
+                ArrayType::new_static(DataType::I32, [2, 2]),
+                ArrayType::new_static(DataType::I32, [2, 2]),
+                ArrayType::new_static(DataType::I32, [2, 2]),
+                ArrayType::new_static(DataType::I32, [2, 2]),
+            ],
+        )
+        .unwrap_err();
+        let error = error.downcast_custom::<BatchingError>().unwrap();
+        assert_eq!(
+            error,
+            &BatchingError::UnsupportedOperation {
+                message: "`ragged_all_to_all` merged batching requires `operand` axis 1 to have a static extent"
+                    .to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_unrelated_ragged_all_to_all_batching_rejects_a_dynamic_mapped_extent() {
+        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        let context = TestContext::new();
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
+        let batch_extent = context.input(DimensionType::new(batch.clone()).into());
+        let batching_context =
+            BatchingContext::<_, ArrayIrBatching>::new(context.clone(), batch_extent).with_axis_name("y".to_string());
+        let packed_type = |data_type, dimensions: &[usize]| {
+            ArrayType::new(
+                data_type,
+                Shape::new(
+                    std::iter::once(Dimension::Dynamic(batch.clone()))
+                        .chain(dimensions.iter().copied().map(Dimension::Static))
+                        .collect(),
+                ),
+            )
+        };
+        let metadata_type = packed_type(DataType::I32, &[2, 2]);
+        let input_types = [
+            packed_type(DataType::F32, &[2, 3]),
+            packed_type(DataType::F32, &[2, 4]),
+            metadata_type.clone(),
+            metadata_type.clone(),
+            metadata_type.clone(),
+            metadata_type,
+        ];
+        let inputs = input_types.map(|r#type| {
+            BatchingTracer::new(
+                batching_context.clone(),
+                ArrayIrBatch::new(context.input(r#type.into()), BatchAxis::new(0)).unwrap(),
+            )
+        });
+        let error = batching_context
+            .bind(
+                ArrayIrOperation::RaggedAllToAll(
+                    RaggedAllToAllOperation::new("x".to_string(), 2).with_physical_representation(),
+                ),
+                Vec::new(),
+                &inputs,
+            )
+            .unwrap_err();
+        let error = error.downcast_custom::<BatchingError>().unwrap();
+        assert_eq!(
+            error,
+            &BatchingError::UnsupportedOperation {
+                message: "`ragged_all_to_all` merged batching requires a statically known mapped-axis extent"
+                    .to_string(),
+            },
+        );
+    }
+
+    #[test]
+    fn test_unrelated_ragged_all_to_all_batching_handles_empty_batches_and_rejects_groups() {
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 0)
+            .with_axis_name("y".to_string());
+        let empty = |r#type: ArrayType| Array::from_elements::<f32>(r#type, &[]).unwrap();
+        let empty_metadata = || Array::from_elements::<i32>(ArrayType::new_static(DataType::I32, [2, 0]), &[]).unwrap();
+        let inputs = vec![
+            ArrayBatch::new(empty(ArrayType::new_static(DataType::F32, [0, 3])), BatchAxis::new(0)).unwrap(),
+            ArrayBatch::new(empty(ArrayType::new_static(DataType::F32, [0, 4])), BatchAxis::new(0)).unwrap(),
+            ArrayBatch::new(empty_metadata(), BatchAxis::new(1)).unwrap(),
+            ArrayBatch::new(empty_metadata(), BatchAxis::new(1)).unwrap(),
+            ArrayBatch::new(empty_metadata(), BatchAxis::new(1)).unwrap(),
+            ArrayBatch::new(empty_metadata(), BatchAxis::new(1)).unwrap(),
+        ];
+        let outputs = RaggedAllToAllOperation::new("x".to_string(), 2)
+            .batch(&context, &EmptyRegionDriver, inputs.as_slice())
+            .unwrap()
+            .into_parts()
+            .0;
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].value().r#type().as_ref(), &ArrayType::new_static(DataType::F32, [0, 4]));
+
+        let grouped = RaggedAllToAllOperation::grouped("x".to_string(), 2, vec![vec![0, 1]]).unwrap();
+        assert_eq!(
+            grouped.batch(&context, &EmptyRegionDriver, inputs.as_slice()),
+            Err(BatchingError::UnsupportedOperation {
+                message:
+                    "`ragged_all_to_all` axis index groups are not supported when merging an unrelated mapped axis"
+                        .to_string(),
+            }),
+        );
+
+        let mut invalid_inputs = inputs;
+        invalid_inputs[1] = ArrayBatch::new(
+            Array::from_elements::<f64>(ArrayType::new_static(DataType::F64, [0, 4]), &[]).unwrap(),
+            BatchAxis::new(0),
+        )
+        .unwrap();
+        assert_eq!(
+            RaggedAllToAllOperation::new("x".to_string(), 2)
+                .batch(&context, &EmptyRegionDriver, invalid_inputs.as_slice())
+                .unwrap_err()
+                .to_string(),
+            "`ragged_all_to_all` operand and output data types must match but got `f32` and `f64`",
+        );
+    }
+
+    #[test]
+    fn test_ragged_all_to_all_jvp_handles_joint_and_structural_zero_tangents() {
+        let context = EagerContext::<Array, ArrayOperation<Array>>::new();
+        let operation = RaggedAllToAllOperation::new("x".to_string(), 1);
+        let operand = Array::vector(vec![10.0_f64, 11.0, 12.0]);
+        let output = Array::vector(vec![100.0_f64, 101.0, 102.0, 103.0]);
+        let metadata = [
+            Array::vector(vec![1_i32]),
+            Array::vector(vec![2_i32]),
+            Array::vector(vec![0_i32]),
+            Array::vector(vec![2_i32]),
+        ];
+        let operand_tangent = Array::vector(vec![1.0_f64, 2.0, 3.0]);
+        let output_tangent = Array::vector(vec![10.0_f64, 20.0, 30.0, 40.0]);
+        let structural_zero = |primal: &Array| MaybeZero::Zero(primal.r#type().tangent().unwrap());
+        let duals = |operand_tangent: MaybeZero<Array>, output_tangent: MaybeZero<Array>| {
+            let mut inputs = vec![
+                DifferentiationDual::new(operand.clone(), operand_tangent).unwrap(),
+                DifferentiationDual::new(output.clone(), output_tangent).unwrap(),
+            ];
+            inputs.extend(metadata.iter().cloned().map(|primal| {
+                let tangent = structural_zero(&primal);
+                DifferentiationDual::new(primal, tangent).unwrap()
+            }));
+            inputs
+        };
+
+        let evaluate = |inputs: Vec<DifferentiationDual<Array>>| {
+            operation.jvp(&context, &EmptyRegionDriver, inputs.as_slice()).unwrap().remove(0)
+        };
+        let zero = evaluate(duals(structural_zero(&operand), structural_zero(&output)));
+        assert_eq!(zero.primal().to_f64s(), vec![11.0, 12.0, 102.0, 103.0]);
+        assert!(zero.tangent().is_zero());
+
+        let operand_only = evaluate(duals(MaybeZero::Value(operand_tangent.clone()), structural_zero(&output)));
+        assert_eq!(operand_only.tangent().as_value().unwrap().to_f64s(), vec![2.0, 3.0, 0.0, 0.0]);
+
+        let output_only = evaluate(duals(structural_zero(&operand), MaybeZero::Value(output_tangent.clone())));
+        assert_eq!(output_only.tangent().as_value().unwrap().to_f64s(), vec![0.0, 0.0, 30.0, 40.0]);
+
+        let joint = evaluate(duals(MaybeZero::Value(operand_tangent), MaybeZero::Value(output_tangent)));
+        assert_eq!(joint.tangent().as_value().unwrap().to_f64s(), vec![2.0, 3.0, 30.0, 40.0]);
     }
 }

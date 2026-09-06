@@ -45,9 +45,6 @@ shape_changing_collective! {
     /// extents together with their zero-filled values.
     operation = ParallelPermuteOperation,
     name = PARALLEL_PERMUTE_OPERATION_NAME = "parallel_permute",
-    /// Value-level entry point for staging a [`ParallelPermuteOperation`]. Refer to its documentation for the semantics
-    /// and transform rules.
-    capability = ParallelPermute::parallel_permute,
     fields = {
         /// Pairs of `(source, target)` positions along the named axis: the value of participant `source` is sent to
         /// participant `target`.
@@ -79,67 +76,6 @@ impl ParallelPermuteOperation {
     #[inline]
     pub fn source_target_pairs(&self) -> &[(usize, usize)] {
         self.source_target_pairs.as_slice()
-    }
-}
-
-/// Convenience permutation encoded as the source participant selected for each output participant.
-pub trait ParallelShuffle: Sized {
-    /// Permutes a named axis using `permutation[output] = input` encoding.
-    fn parallel_shuffle(&self, axis_name: &str, permutation: &[usize]) -> Result<Self, ProgramError>;
-}
-
-impl<V> ParallelShuffle for V
-where
-    V: Value<Type = ArrayIrType>,
-    V::DispatchDomain: Context<Type = ArrayIrType> + NamedAxes,
-    <V::DispatchDomain as Domain>::Operation: From<ParallelPermuteOperation>,
-{
-    fn parallel_shuffle(&self, axis_name: &str, permutation: &[usize]) -> Result<Self, ProgramError> {
-        let context = self.dispatch_domain();
-        let axis_size = resolve_named_axis_size(&context, axis_name)?;
-        if permutation.len() != axis_size {
-            return Err(TypeError::invalid(format!(
-                "`parallel_shuffle` permutation length {} must equal axis size {axis_size}",
-                permutation.len(),
-            ))
-            .into());
-        }
-        let mut seen = vec![false; axis_size];
-        for &source in permutation {
-            let Some(source_seen) = seen.get_mut(source) else {
-                return Err(TypeError::invalid(format!(
-                    "`parallel_shuffle` source index {source} is out of bounds for axis size {axis_size}",
-                ))
-                .into());
-            };
-            if *source_seen {
-                return Err(TypeError::invalid(format!(
-                    "`parallel_shuffle` permutation contains source index {source} more than once",
-                ))
-                .into());
-            }
-            *source_seen = true;
-        }
-        Ok(context
-            .bind(
-                ParallelPermuteOperation::new(
-                    axis_name.to_string(),
-                    axis_size,
-                    permutation.iter().copied().zip(0..axis_size).collect(),
-                ),
-                Vec::new(),
-                std::slice::from_ref(self),
-            )?
-            .remove(0))
-    }
-}
-
-impl<V> ParallelShuffle for ProjectedValue<ArrayType, V>
-where
-    V: ParallelShuffle + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
-{
-    fn parallel_shuffle(&self, axis_name: &str, permutation: &[usize]) -> Result<Self, ProgramError> {
-        self.value().parallel_shuffle(axis_name, permutation)?.into_projected().map_err(Into::into)
     }
 }
 
@@ -229,6 +165,105 @@ where
     }
 }
 
+shape_changing_collective!(@differentiation ParallelPermuteOperation);
+
+// Transpose rule for [`ParallelPermuteOperation`]: sending along `(source, target)` pulls cotangents back along
+// `(target, source)`, so the operand cotangent is the permutation with every pair inverted.
+impl<V, O> TransposableOperation<V, O> for ParallelPermuteOperation
+where
+    V: Value<Type = ArrayType>,
+    O: Operation<Type = ArrayType> + From<ParallelPermuteOperation>,
+{
+    fn transpose<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TranspositionContext<'_, V, O>,
+        _driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        let inverted_pairs =
+            self.source_target_pairs.iter().map(|(source, target)| (*target, *source)).collect::<Vec<_>>();
+        transpose_shape_changing_collective(
+            context,
+            inputs,
+            outputs,
+            ParallelPermuteOperation::new(self.axis_name.clone(), self.axis_size, inverted_pairs),
+        )
+    }
+}
+
+shape_changing_collective! {
+    @capability
+    operation = ParallelPermuteOperation,
+    /// Value-level entry point for staging a [`ParallelPermuteOperation`]. Refer to its documentation for the semantics
+    /// and transform rules.
+    capability = ParallelPermute::parallel_permute,
+    fields = {
+        source_target_pairs: Vec<(usize, usize)>,
+    },
+}
+
+/// Convenience permutation encoded as the source participant selected for each output participant.
+pub trait ParallelShuffle: Sized {
+    /// Permutes a named axis using `permutation[output] = input` encoding.
+    fn parallel_shuffle(&self, axis_name: &str, permutation: &[usize]) -> Result<Self, ProgramError>;
+}
+
+impl<V> ParallelShuffle for V
+where
+    V: Value<Type = ArrayIrType>,
+    V::DispatchDomain: Context<Type = ArrayIrType> + NamedAxes,
+    <V::DispatchDomain as Domain>::Operation: From<ParallelPermuteOperation>,
+{
+    fn parallel_shuffle(&self, axis_name: &str, permutation: &[usize]) -> Result<Self, ProgramError> {
+        let context = self.dispatch_domain();
+        let axis_size = resolve_named_axis_size(&context, axis_name)?;
+        if permutation.len() != axis_size {
+            return Err(TypeError::invalid(format!(
+                "`parallel_shuffle` permutation length {} must equal axis size {axis_size}",
+                permutation.len(),
+            ))
+            .into());
+        }
+        let mut seen = vec![false; axis_size];
+        for &source in permutation {
+            let Some(source_seen) = seen.get_mut(source) else {
+                return Err(TypeError::invalid(format!(
+                    "`parallel_shuffle` source index {source} is out of bounds for axis size {axis_size}",
+                ))
+                .into());
+            };
+            if *source_seen {
+                return Err(TypeError::invalid(format!(
+                    "`parallel_shuffle` permutation contains source index {source} more than once",
+                ))
+                .into());
+            }
+            *source_seen = true;
+        }
+        Ok(context
+            .bind(
+                ParallelPermuteOperation::new(
+                    axis_name.to_string(),
+                    axis_size,
+                    permutation.iter().copied().zip(0..axis_size).collect(),
+                ),
+                Vec::new(),
+                std::slice::from_ref(self),
+            )?
+            .remove(0))
+    }
+}
+
+impl<V> ParallelShuffle for ProjectedValue<ArrayType, V>
+where
+    V: ParallelShuffle + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
+{
+    fn parallel_shuffle(&self, axis_name: &str, permutation: &[usize]) -> Result<Self, ProgramError> {
+        self.value().parallel_shuffle(axis_name, permutation)?.into_projected().map_err(Into::into)
+    }
+}
+
 /// Applies one participant permutation to `axis` of a packed value, filling untargeted destinations with zeros.
 fn permute_participant_axis<V>(value: &V, axis: usize, sources: &[Option<usize>]) -> Result<V, BatchingError>
 where
@@ -267,31 +302,6 @@ where
     if axis == 0 { Ok(permuted) } else { Ok(permuted.move_axis(0, axis)?) }
 }
 
-// Transpose rule for [`ParallelPermuteOperation`]: sending along `(source, target)` pulls cotangents back along
-// `(target, source)`, so the operand cotangent is the permutation with every pair inverted.
-impl<V, O> TransposableOperation<V, O> for ParallelPermuteOperation
-where
-    V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType> + From<ParallelPermuteOperation>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<'_, V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        let inverted_pairs =
-            self.source_target_pairs.iter().map(|(source, target)| (*target, *source)).collect::<Vec<_>>();
-        transpose_shape_changing_collective(
-            context,
-            inputs,
-            outputs,
-            ParallelPermuteOperation::new(self.axis_name.clone(), self.axis_size, inverted_pairs),
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -327,56 +337,6 @@ mod tests {
             panic!("parallel_shuffle must preserve the array member kind");
         };
         assert_eq!(output.to_f64s(), vec![5.0, 6.0, 1.0, 2.0, 3.0, 4.0]);
-    }
-
-    #[test]
-    fn test_parallel_permute_type_inference() {
-        use crate::macros::check_operation_type_inference;
-
-        check_operation_type_inference!(
-            operation = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1), (1, 0)]),
-            cases = [{
-                input_types = [f32_vector(3)],
-                output_types = [f32_vector(3)],
-            }],
-        );
-        check_operation_type_inference!(
-            operation = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 2)]),
-            cases = [{
-                input_types = [f32_vector(3)],
-                error = "`parallel_permute` pair (0, 2) is out of bounds for axis size 2",
-            }],
-        );
-        check_operation_type_inference!(
-            operation = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1), (0, 0)]),
-            cases = [{
-                input_types = [f32_vector(3)],
-                error = "`parallel_permute` pairs must have unique sources and targets but (0, 0) repeats one",
-            }],
-        );
-    }
-
-    #[test]
-    fn test_parallel_permute_over_batched_axis_permutes_the_items() {
-        use crate::batching::BatchingTracer;
-
-        // The rotation `[(0, 1), (1, 0)]` swaps the two batch items: item 0 receives item 1's `[3, 4]` and item 1
-        // receives item 0's `[1, 2]`.
-        let output: Array = batch(
-            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching>| {
-                item.parallel_permute("x", vec![(0, 1), (1, 0)])
-            },
-            Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
-            BatchAxis::new(0),
-            BatchAxis::new(0),
-            BatchAxisSpecification::named("x"),
-        )
-        .unwrap();
-        assert_eq!(
-            output.r#type().into_owned(),
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
-        );
-        assert_eq!(output.to_f64s(), vec![3.0, 4.0, 1.0, 2.0]);
     }
 
     #[test]
@@ -492,25 +452,6 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_permute_over_batched_axis_zeros_untargeted_items() {
-        use crate::batching::BatchingTracer;
-
-        // With the single pair `(0, 1)`, item 1 receives item 0's `[1, 2]` while no pair targets item 0, so it
-        // receives zeros, matching JAX's `ppermute` semantics for untargeted participants.
-        let output: Array = batch(
-            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching>| {
-                item.parallel_permute("x", vec![(0, 1)])
-            },
-            Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
-            BatchAxis::new(0),
-            BatchAxis::new(0),
-            BatchAxisSpecification::named("x"),
-        )
-        .unwrap();
-        assert_eq!(output.to_f64s(), vec![0.0, 0.0, 1.0, 2.0]);
-    }
-
-    #[test]
     fn test_parallel_permute_transposes_to_inverted_pairs() {
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
@@ -538,5 +479,74 @@ mod tests {
             "#}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_parallel_permute_type_inference() {
+        use crate::macros::check_operation_type_inference;
+
+        check_operation_type_inference!(
+            operation = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1), (1, 0)]),
+            cases = [{
+                input_types = [f32_vector(3)],
+                output_types = [f32_vector(3)],
+            }],
+        );
+        check_operation_type_inference!(
+            operation = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 2)]),
+            cases = [{
+                input_types = [f32_vector(3)],
+                error = "`parallel_permute` pair (0, 2) is out of bounds for axis size 2",
+            }],
+        );
+        check_operation_type_inference!(
+            operation = ParallelPermuteOperation::new("x".to_string(), 2, vec![(0, 1), (0, 0)]),
+            cases = [{
+                input_types = [f32_vector(3)],
+                error = "`parallel_permute` pairs must have unique sources and targets but (0, 0) repeats one",
+            }],
+        );
+    }
+
+    #[test]
+    fn test_parallel_permute_over_batched_axis_permutes_the_items() {
+        use crate::batching::BatchingTracer;
+
+        // The rotation `[(0, 1), (1, 0)]` swaps the two batch items: item 0 receives item 1's `[3, 4]` and item 1
+        // receives item 0's `[1, 2]`.
+        let output: Array = batch(
+            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching>| {
+                item.parallel_permute("x", vec![(0, 1), (1, 0)])
+            },
+            Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            BatchAxisSpecification::named("x"),
+        )
+        .unwrap();
+        assert_eq!(
+            output.r#type().into_owned(),
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(2)])),
+        );
+        assert_eq!(output.to_f64s(), vec![3.0, 4.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_parallel_permute_over_batched_axis_zeros_untargeted_items() {
+        use crate::batching::BatchingTracer;
+
+        // With the single pair `(0, 1)`, item 1 receives item 0's `[1, 2]` while no pair targets item 0, so it
+        // receives zeros, matching JAX's `ppermute` semantics for untargeted participants.
+        let output: Array = batch(
+            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching>| {
+                item.parallel_permute("x", vec![(0, 1)])
+            },
+            Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            BatchAxisSpecification::named("x"),
+        )
+        .unwrap();
+        assert_eq!(output.to_f64s(), vec![0.0, 0.0, 1.0, 2.0]);
     }
 }

@@ -29,60 +29,6 @@ pub const RUNTIME_DIMENSION_DATA_TYPE: DataType = DataType::I64;
 /// Canonical operation name for [`DimensionToScalarOperation`].
 pub const DIMENSION_TO_SCALAR_OPERATION_NAME: &str = "dimension_to_scalar";
 
-/// Converts a first-class dimension into ordinary rank-zero signed 64-bit array data.
-///
-/// This is the explicit boundary from a first-class dimension to numerical data. Composite program values produce an
-/// array member in their parent carrier, while concrete dimension backends can select a concrete array representation
-/// through `Output`. The returned scalar cannot define an array extent; converting it back into a first-class
-/// dimension requires a separate checked gateway.
-///
-/// # Example
-///
-/// ```rust
-/// # use ryft_core::{ArrayIrValue, DimensionToScalar, DimensionValue, ProgramError};
-/// # use ryft_core::arrays::Array;
-/// # fn main() -> Result<(), ProgramError> {
-/// let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(3)?);
-/// let scalar = dimension.to_scalar()?;
-/// let ArrayIrValue::Array(scalar) = scalar else {
-///     unreachable!("dimension_to_scalar always returns an array member");
-/// };
-/// assert_eq!(scalar, Array::scalar(3_i64));
-/// # Ok(())
-/// # }
-/// ```
-pub trait DimensionToScalar<Output = Self>: Typed + Sized {
-    /// Returns this dimension as ordinary rank-zero signed 64-bit array data represented by `Output`.
-    fn to_scalar(&self) -> Result<Output, ProgramError>;
-}
-
-impl<V: Value<Type = ArrayIrType>> DimensionToScalar<V> for V
-where
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<DimensionToScalarOperation>,
-{
-    fn to_scalar(&self) -> Result<V, ProgramError> {
-        Ok(self
-            .dispatch_domain()
-            .bind(DimensionToScalarOperation, Vec::new(), std::slice::from_ref(self))?
-            .remove(0))
-    }
-}
-
-impl<V: Value<Type = ArrayIrType>> DimensionToScalar<V> for ProjectedValue<DimensionType, V>
-where
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<DimensionToScalarOperation>,
-{
-    fn to_scalar(&self) -> Result<V, ProgramError> {
-        Ok(self
-            .value()
-            .dispatch_domain()
-            .bind(DimensionToScalarOperation, Vec::new(), std::slice::from_ref(self.value()))?
-            .remove(0))
-    }
-}
-
 /// Mixed dimension-to-array operation used by [`DimensionToScalar`].
 ///
 /// Refer to [`DimensionToScalar`] for semantic details and an example.
@@ -141,8 +87,6 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>
 {
 }
 
-impl_reference_free_dischargeable_operation!(DimensionToScalarOperation);
-
 // Batching converts a replicated first-class dimension into one replicated scalar array. A mapped dimension already
 // stores its per-item extents as packed integer array data on the batch carrier, so conversion exposes that same value
 // as a mapped scalar array without staging another operation.
@@ -174,6 +118,62 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>
 
 impl_non_differentiable_operation!(DimensionToScalarOperation);
 impl_non_transposable_operation!(DimensionToScalarOperation);
+
+impl_reference_free_dischargeable_operation!(DimensionToScalarOperation);
+
+/// Converts a first-class dimension into ordinary rank-zero signed 64-bit array data.
+///
+/// This is the explicit boundary from a first-class dimension to numerical data. Composite program values produce an
+/// array member in their parent carrier, while concrete dimension backends can select a concrete array representation
+/// through `Output`. The returned scalar cannot define an array extent; converting it back into a first-class
+/// dimension requires a separate checked gateway.
+///
+/// # Example
+///
+/// ```rust
+/// # use ryft_core::{ArrayIrValue, DimensionToScalar, DimensionValue, ProgramError};
+/// # use ryft_core::arrays::Array;
+/// # fn main() -> Result<(), ProgramError> {
+/// let dimension = ArrayIrValue::<Array>::Dimension(DimensionValue::constant(3)?);
+/// let scalar = dimension.to_scalar()?;
+/// let ArrayIrValue::Array(scalar) = scalar else {
+///     unreachable!("dimension_to_scalar always returns an array member");
+/// };
+/// assert_eq!(scalar, Array::scalar(3_i64));
+/// # Ok(())
+/// # }
+/// ```
+pub trait DimensionToScalar<Output = Self>: Typed + Sized {
+    /// Returns this dimension as ordinary rank-zero signed 64-bit array data represented by `Output`.
+    fn to_scalar(&self) -> Result<Output, ProgramError>;
+}
+
+impl<V: Value<Type = ArrayIrType>> DimensionToScalar<V> for V
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<DimensionToScalarOperation>,
+{
+    fn to_scalar(&self) -> Result<V, ProgramError> {
+        Ok(self
+            .dispatch_domain()
+            .bind(DimensionToScalarOperation, Vec::new(), std::slice::from_ref(self))?
+            .remove(0))
+    }
+}
+
+impl<V: Value<Type = ArrayIrType>> DimensionToScalar<V> for ProjectedValue<DimensionType, V>
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<DimensionToScalarOperation>,
+{
+    fn to_scalar(&self) -> Result<V, ProgramError> {
+        Ok(self
+            .value()
+            .dispatch_domain()
+            .bind(DimensionToScalarOperation, Vec::new(), std::slice::from_ref(self.value()))?
+            .remove(0))
+    }
+}
 
 #[cfg(test)]
 mod tests {

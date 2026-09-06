@@ -102,10 +102,10 @@ impl<T: Type, C: Context<Type = T, Operation: From<OneOperation<T>>>> PartiallyE
 {
 }
 
-impl_non_differentiable_operation!(<T> OneOperation<T> where T: Type);
-impl_nullary_transposable_operation!(<T> OneOperation<T> where T: Type);
 impl_nullary_batchable_operation!(@replicated OneOperation<ArrayType>);
 impl_nullary_batchable_operation!(@member<ArrayIrType, ArrayIrBatching> OneOperation<ArrayType>);
+impl_non_differentiable_operation!(<T> OneOperation<T> where T: Type);
+impl_nullary_transposable_operation!(<T> OneOperation<T> where T: Type);
 
 impl_member_operation_for_array_ir_constant_operation!(OneOperation<ArrayType>);
 impl_member_interpretable_operation_for_array_ir_constant_operation!(
@@ -260,61 +260,22 @@ mod tests {
     };
     use crate::batching::{BatchAxis, BatchableOperation, BatchingContext};
     use crate::contexts::EagerContext;
+    use crate::differentiation::{TransposableOperation, TranspositionContext};
     use crate::interpretation::InterpretableOperation;
     use crate::operations::constants::constant::ConstantOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder, ReferenceType};
+    use crate::tracing::TracingContext;
 
     use super::*;
 
     #[test]
     fn test_one() {
-        // Verify the operation's stored type, identity, rendering, and eager interpretation.
+        // Verify the operation's stored type, identity, and rendering.
         let operation = OneOperation::new(ArrayType::scalar(DataType::F64));
         assert_eq!(operation.name(), ONE_OPERATION_NAME);
         assert_eq!(format!("{operation}"), "one [type=f64[]]");
         assert_eq!(operation.r#type(), &ArrayType::scalar(DataType::F64));
-        assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![ArrayType::scalar(DataType::F64)]));
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[],
-            ),
-            Ok(vec![Array::scalar(1.0)]),
-        );
-
-        // A nullary one does not acquire a physical batch axis because the same value serves every batch item.
-        let scalar_type = ArrayType::scalar(DataType::F64);
-        let outputs: Vec<ArrayBatch<Array>> = OneOperation::new(scalar_type.clone())
-            .batch(
-                &BatchingContext::new(EagerContext::<Array, ConstantOperation<Array>>::new(), 2),
-                &EmptyRegionDriver,
-                &[],
-            )
-            .unwrap()
-            .into_parts()
-            .0;
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
-        assert_eq!(outputs[0].r#type().into_owned(), scalar_type);
-        assert_eq!(outputs[0].value().to_f64s(), vec![1.0]);
-
-        // Nullary construction rejects output types with ungrounded identity references, while a definition-position
-        // identity remains valid because the constructed value establishes it itself.
-        let rows = crate::arrays::DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap());
-        let dynamic_type =
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(3)]));
-        assert_eq!(
-            OneOperation::new(dynamic_type).infer_output_types(&[], &[]),
-            Err(TypeError::invalid(
-                "`one` cannot construct type f32[rows, 3] without operands because it references identity rows",
-            )),
-        );
-        let dimension_type = DimensionType::new(rows);
-        assert_eq!(OneOperation::new(dimension_type.clone()).infer_output_types(&[], &[]), Ok(vec![dimension_type]),);
-
         // Verify the operation's textual form when it appears in a program.
         let mut builder = ProgramBuilder::<Array, OneOperation<ArrayType>>::new();
         let output = builder.add_instruction(operation, Vec::new(), vec![], None).unwrap()[0];
@@ -331,54 +292,38 @@ mod tests {
     }
 
     #[test]
-    fn test_one_operation_provider() {
-        // Homogeneous operation families receive the infallible provider implementation through their ordinary
-        // `From<OneOperation<T>>` conversion.
-        let static_type = ArrayType::new_static(DataType::F32, [2]);
-        let ArrayOperation::<Array>::One(operation) = ArrayOperation::one_operation(static_type.clone()).unwrap()
-        else {
-            panic!("expected a homogeneous one operation");
-        };
-        assert_eq!(operation.r#type(), &static_type);
+    fn test_one_type_inference() {
+        let operation = OneOperation::new(ArrayType::scalar(DataType::F64));
+        assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![ArrayType::scalar(DataType::F64)]));
 
-        // The composite provider projects a valid operand-free array one into the homogeneous member family.
-        let ArrayIrOperation::<Array>::Array(ArrayOperation::One(operation)) =
-            ArrayIrOperation::one_operation(ArrayIrType::Array(static_type.clone())).unwrap()
-        else {
-            panic!("expected a composite homogeneous one operation");
-        };
-        assert_eq!(operation.r#type(), &static_type);
-
-        // Operand-free construction cannot resolve a dynamic identity. Dynamic mixed ones must instead receive their
-        // concrete extents as dimension operands.
-        let size = DimensionVariable::new("size", DimensionBounds::unbounded());
-        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size.clone())]));
+        // Nullary construction rejects output types with ungrounded identity references, while a definition-position
+        // identity remains valid because the constructed value establishes it itself.
+        let rows = crate::arrays::DimensionVariable::new("rows", DimensionBounds::non_negative(Some(8)).unwrap());
+        let dynamic_type =
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone()), Dimension::Static(3)]));
         assert_eq!(
-            ArrayIrOperation::<Array>::one_operation(ArrayIrType::Array(dynamic_type)).unwrap_err(),
-            ProgramError::Type(TypeError::invalid(
-                "`one` cannot construct type f32[size] without operands because it references identity size",
+            OneOperation::new(dynamic_type).infer_output_types(&[], &[]),
+            Err(TypeError::invalid(
+                "`one` cannot construct type f32[rows, 3] without operands because it references identity rows",
             )),
         );
-
-        // First-class dimensions and references are not algebraic values. In particular, a reference cannot be replaced
-        // by a one of its referent type. The differentiation rules allocate tangent and cotangent references instead of
-        // ever materializing a one reference.
-        assert_eq!(
-            ArrayIrOperation::<Array>::one_operation(ArrayIrType::Dimension(DimensionType::new(size))).unwrap_err(),
-            ProgramError::Type(TypeError::invalid("cannot materialize a one for a first-class dimension type")),
-        );
-        let reference_type = ReferenceType::new(static_type);
-        assert_eq!(
-            ArrayIrOperation::<Array>::one_operation(ArrayIrType::Reference(reference_type.clone())).unwrap_err(),
-            ProgramError::Type(TypeError::invalid(format!(
-                "cannot materialize a one for reference type `{reference_type}`; a reference denotes an allocation \
-                 and has no one value, so tangent and cotangent references are allocated by the differentiation rules",
-            ))),
-        );
+        let dimension_type = DimensionType::new(rows);
+        assert_eq!(OneOperation::new(dimension_type.clone()).infer_output_types(&[], &[]), Ok(vec![dimension_type]),);
     }
 
     #[test]
-    fn test_eager_context_one() {
+    fn test_one_interpretation() {
+        let operation = OneOperation::new(ArrayType::scalar(DataType::F64));
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[],
+            ),
+            Ok(vec![Array::scalar(1.0)]),
+        );
+
         let context = EagerContext::<Array>::new();
 
         // Verify canonical rank-zero one values across every supported data-type family.
@@ -435,6 +380,111 @@ mod tests {
     }
 
     #[test]
+    fn test_one_partial_evaluation() {
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let output_type = ArrayType::new_static(DataType::F32, [2]);
+        let output = context.one(&output_type).unwrap();
+        let expected = Array::from_elements(output_type, &[1.0f32; 2]).unwrap();
+        assert_eq!(output.value().unwrap().as_known(), Some(&expected));
+    }
+
+    #[test]
+    fn test_one_batching() {
+        // A nullary one does not acquire a physical batch axis because the same value serves every batch item.
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let outputs: Vec<ArrayBatch<Array>> = OneOperation::new(scalar_type.clone())
+            .batch(
+                &BatchingContext::new(EagerContext::<Array, ConstantOperation<Array>>::new(), 2),
+                &EmptyRegionDriver,
+                &[],
+            )
+            .unwrap()
+            .into_parts()
+            .0;
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
+        assert_eq!(outputs[0].r#type().into_owned(), scalar_type);
+        assert_eq!(outputs[0].value().to_f64s(), vec![1.0]);
+
+        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
+        let output_type = ArrayType::new_static(DataType::F32, [2]);
+        let output = context.one(&output_type).unwrap();
+        assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
+        assert_eq!(output.batch().value(), &Array::from_elements(output_type, &[1.0f32; 2]).unwrap());
+    }
+
+    #[test]
+    fn test_one_differentiation() {
+        let context = DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let output_type = ArrayType::new_static(DataType::F32, [2]);
+        let output = context.one(&output_type).unwrap();
+        assert_eq!(output.primal(), &Array::from_elements(output_type.clone(), &[1.0f32; 2]).unwrap());
+        assert!(matches!(output.tangent(), MaybeZero::Zero(r#type) if r#type == &output_type));
+    }
+
+    #[test]
+    fn test_one_transposition() {
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let output_cotangent = context.input(ArrayType::scalar(DataType::F64));
+        let input_cotangents = OneOperation::new(ArrayType::scalar(DataType::F64))
+            .transpose(
+                &mut TranspositionContext::new(context),
+                &EmptyRegionDriver,
+                &[],
+                &[MaybeZero::Value(output_cotangent)],
+            )
+            .unwrap();
+        assert!(input_cotangents.is_empty());
+    }
+
+    #[test]
+    fn test_one_operation_provider() {
+        // Homogeneous operation families receive the infallible provider implementation through their ordinary
+        // `From<OneOperation<T>>` conversion.
+        let static_type = ArrayType::new_static(DataType::F32, [2]);
+        let ArrayOperation::<Array>::One(operation) = ArrayOperation::one_operation(static_type.clone()).unwrap()
+        else {
+            panic!("expected a homogeneous one operation");
+        };
+        assert_eq!(operation.r#type(), &static_type);
+
+        // The composite provider projects a valid operand-free array one into the homogeneous member family.
+        let ArrayIrOperation::<Array>::Array(ArrayOperation::One(operation)) =
+            ArrayIrOperation::one_operation(ArrayIrType::Array(static_type.clone())).unwrap()
+        else {
+            panic!("expected a composite homogeneous one operation");
+        };
+        assert_eq!(operation.r#type(), &static_type);
+
+        // Operand-free construction cannot resolve a dynamic identity. Dynamic mixed ones must instead receive their
+        // concrete extents as dimension operands.
+        let size = DimensionVariable::new("size", DimensionBounds::unbounded());
+        let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size.clone())]));
+        assert_eq!(
+            ArrayIrOperation::<Array>::one_operation(ArrayIrType::Array(dynamic_type)).unwrap_err(),
+            ProgramError::Type(TypeError::invalid(
+                "`one` cannot construct type f32[size] without operands because it references identity size",
+            )),
+        );
+
+        // First-class dimensions and references are not algebraic values. In particular, a reference cannot be replaced
+        // by a one of its referent type. The differentiation rules allocate tangent and cotangent references instead of
+        // ever materializing a one reference.
+        assert_eq!(
+            ArrayIrOperation::<Array>::one_operation(ArrayIrType::Dimension(DimensionType::new(size))).unwrap_err(),
+            ProgramError::Type(TypeError::invalid("cannot materialize a one for a first-class dimension type")),
+        );
+        let reference_type = ReferenceType::new(static_type);
+        assert_eq!(
+            ArrayIrOperation::<Array>::one_operation(ArrayIrType::Reference(reference_type.clone())).unwrap_err(),
+            ProgramError::Type(TypeError::invalid(format!(
+                "cannot materialize a one for reference type `{reference_type}`; a reference denotes an allocation \
+                 and has no one value, so tangent and cotangent references are allocated by the differentiation rules",
+            ))),
+        );
+    }
+
+    #[test]
     fn test_projected_context_one() {
         let parent = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let context = ProjectedContext::<_, ArrayType>::new(parent.clone());
@@ -483,32 +533,5 @@ mod tests {
             "}
             .trim_end(),
         );
-    }
-
-    #[test]
-    fn test_partial_evaluation_context_one() {
-        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
-        let output_type = ArrayType::new_static(DataType::F32, [2]);
-        let output = context.one(&output_type).unwrap();
-        let expected = Array::from_elements(output_type, &[1.0f32; 2]).unwrap();
-        assert_eq!(output.value().unwrap().as_known(), Some(&expected));
-    }
-
-    #[test]
-    fn test_batching_context_one() {
-        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
-        let output_type = ArrayType::new_static(DataType::F32, [2]);
-        let output = context.one(&output_type).unwrap();
-        assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
-        assert_eq!(output.batch().value(), &Array::from_elements(output_type, &[1.0f32; 2]).unwrap());
-    }
-
-    #[test]
-    fn test_differentiation_context_one() {
-        let context = DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
-        let output_type = ArrayType::new_static(DataType::F32, [2]);
-        let output = context.one(&output_type).unwrap();
-        assert_eq!(output.primal(), &Array::from_elements(output_type.clone(), &[1.0f32; 2]).unwrap());
-        assert!(matches!(output.tangent(), MaybeZero::Zero(r#type) if r#type == &output_type));
     }
 }

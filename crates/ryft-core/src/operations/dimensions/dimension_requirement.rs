@@ -46,71 +46,6 @@ pub enum DimensionRequirementPredicate {
     Bounds(DimensionBounds),
 }
 
-/// Asserts relationships required of first-class runtime dimensions.
-///
-/// Requirements proven from exact values, shared identities, or interval bounds are pure and may be erased.
-/// Statically impossible requirements fail during type inference. Inconclusive requirements remain ordered runtime
-/// assertions so that they cannot be eliminated and the first observed failure remains deterministic.
-///
-/// # Example
-///
-/// ```rust
-/// # use ryft_core::{DimensionRequirement, DimensionValue, ProgramError};
-/// # fn main() -> Result<(), ProgramError> {
-/// let twelve = DimensionValue::constant(12)?;
-/// twelve.require_divisible_by(&DimensionValue::constant(4)?)?;
-/// assert!(twelve.require_equal(&DimensionValue::constant(7)?).is_err());
-/// # Ok(())
-/// # }
-/// ```
-pub trait DimensionRequirement: Typed<Type = DimensionType> + Sized {
-    /// Requires `self == right`.
-    fn require_equal(&self, right: &Self) -> Result<(), ProgramError>;
-
-    /// Requires `self <= right`.
-    fn require_less_than_or_equal(&self, right: &Self) -> Result<(), ProgramError>;
-
-    /// Requires `right` to be positive and to divide `self` exactly.
-    fn require_divisible_by(&self, right: &Self) -> Result<(), ProgramError>;
-
-    /// Requires `self` to lie within `bounds`.
-    fn require_bounds(&self, bounds: DimensionBounds) -> Result<(), ProgramError>;
-}
-
-impl<V: Value<Type = DimensionType>> DimensionRequirement for V
-where
-    V::DispatchDomain: Context<Type = DimensionType>,
-    <V::DispatchDomain as Domain>::Operation: From<DimensionRequirementOperation>,
-{
-    #[inline]
-    fn require_equal(&self, right: &Self) -> Result<(), ProgramError> {
-        let operation = DimensionRequirementOperation::equal(&self.r#type().as_ref(), &right.r#type());
-        self.dispatch_domain().bind(operation, Vec::new(), &[self.clone(), right.clone()])?;
-        Ok(())
-    }
-
-    #[inline]
-    fn require_less_than_or_equal(&self, right: &Self) -> Result<(), ProgramError> {
-        let operation = DimensionRequirementOperation::less_than_or_equal(&self.r#type().as_ref(), &right.r#type());
-        self.dispatch_domain().bind(operation, Vec::new(), &[self.clone(), right.clone()])?;
-        Ok(())
-    }
-
-    #[inline]
-    fn require_divisible_by(&self, right: &Self) -> Result<(), ProgramError> {
-        let operation = DimensionRequirementOperation::divisible_by(&self.r#type().as_ref(), &right.r#type());
-        self.dispatch_domain().bind(operation, Vec::new(), &[self.clone(), right.clone()])?;
-        Ok(())
-    }
-
-    #[inline]
-    fn require_bounds(&self, bounds: DimensionBounds) -> Result<(), ProgramError> {
-        let operation = DimensionRequirementOperation::bounds(&self.r#type(), bounds);
-        self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
-        Ok(())
-    }
-}
-
 /// Zero-result runtime-dimension assertion used by [`DimensionRequirement`].
 ///
 /// Refer to [`DimensionRequirement`] for semantic details and an example.
@@ -576,6 +511,71 @@ struct AbstractDimensionValue {
 
     /// Concrete extent when known from a literal or singleton interval.
     exact: Option<usize>,
+}
+
+/// Asserts relationships required of first-class runtime dimensions.
+///
+/// Requirements proven from exact values, shared identities, or interval bounds are pure and may be erased.
+/// Statically impossible requirements fail during type inference. Inconclusive requirements remain ordered runtime
+/// assertions so that they cannot be eliminated and the first observed failure remains deterministic.
+///
+/// # Example
+///
+/// ```rust
+/// # use ryft_core::{DimensionRequirement, DimensionValue, ProgramError};
+/// # fn main() -> Result<(), ProgramError> {
+/// let twelve = DimensionValue::constant(12)?;
+/// twelve.require_divisible_by(&DimensionValue::constant(4)?)?;
+/// assert!(twelve.require_equal(&DimensionValue::constant(7)?).is_err());
+/// # Ok(())
+/// # }
+/// ```
+pub trait DimensionRequirement: Typed<Type = DimensionType> + Sized {
+    /// Requires `self == right`.
+    fn require_equal(&self, right: &Self) -> Result<(), ProgramError>;
+
+    /// Requires `self <= right`.
+    fn require_less_than_or_equal(&self, right: &Self) -> Result<(), ProgramError>;
+
+    /// Requires `right` to be positive and to divide `self` exactly.
+    fn require_divisible_by(&self, right: &Self) -> Result<(), ProgramError>;
+
+    /// Requires `self` to lie within `bounds`.
+    fn require_bounds(&self, bounds: DimensionBounds) -> Result<(), ProgramError>;
+}
+
+impl<V: Value<Type = DimensionType>> DimensionRequirement for V
+where
+    V::DispatchDomain: Context<Type = DimensionType>,
+    <V::DispatchDomain as Domain>::Operation: From<DimensionRequirementOperation>,
+{
+    #[inline]
+    fn require_equal(&self, right: &Self) -> Result<(), ProgramError> {
+        let operation = DimensionRequirementOperation::equal(&self.r#type().as_ref(), &right.r#type());
+        self.dispatch_domain().bind(operation, Vec::new(), &[self.clone(), right.clone()])?;
+        Ok(())
+    }
+
+    #[inline]
+    fn require_less_than_or_equal(&self, right: &Self) -> Result<(), ProgramError> {
+        let operation = DimensionRequirementOperation::less_than_or_equal(&self.r#type().as_ref(), &right.r#type());
+        self.dispatch_domain().bind(operation, Vec::new(), &[self.clone(), right.clone()])?;
+        Ok(())
+    }
+
+    #[inline]
+    fn require_divisible_by(&self, right: &Self) -> Result<(), ProgramError> {
+        let operation = DimensionRequirementOperation::divisible_by(&self.r#type().as_ref(), &right.r#type());
+        self.dispatch_domain().bind(operation, Vec::new(), &[self.clone(), right.clone()])?;
+        Ok(())
+    }
+
+    #[inline]
+    fn require_bounds(&self, bounds: DimensionBounds) -> Result<(), ProgramError> {
+        let operation = DimensionRequirementOperation::bounds(&self.r#type(), bounds);
+        self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?;
+        Ok(())
+    }
 }
 
 impl AbstractDimensionValue {

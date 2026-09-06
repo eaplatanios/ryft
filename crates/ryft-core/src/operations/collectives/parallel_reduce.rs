@@ -280,6 +280,70 @@ where
     }
 }
 
+impl_differentiable_operation! {
+    ParallelReduceOperation,
+    jvp<C>
+    where
+        C: Context<Type = ArrayType>,
+        C::Operation: From<ParallelReduceOperation>,
+    {
+        |operation, context, _driver, inputs| {
+            // Forward-mode (JVP) rule for [`ParallelReduceOperation`]. `Sum`/`Mean` are linear and self-adjoint, so the
+            // tangent is the same collective applied to the operand tangent: `tangent_out =
+            // collective(input.tangent())`. A structural-zero operand tangent is preserved as-is rather than staging a
+            // collective on a zero, keeping `collective(zero)` out of the tangent program. `Max` is non-linear and
+            // reports an [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
+            check_count!("input", inputs, 1, ProgramError);
+            if matches!(operation.kind, ParallelReductionKind::Max) {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: "`parallel_max` differentiation is not yet supported".to_string(),
+                }
+                .into());
+            }
+            let primal = stage_collective(context, operation, inputs[0].primal())?;
+            // A collective of a structural zero stays a structural zero, keeping `collective(zero)` out of the
+            // tangent program.
+            let tangent = match inputs[0].tangent() {
+                MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.clone()),
+                MaybeZero::Value(tangent) => MaybeZero::Value(stage_collective(context, operation, tangent)?),
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        }
+    },
+    transpose<V, O>
+    where
+        V: Value<Type = ArrayType>,
+        O: Operation<Type = ArrayType> + From<ParallelReduceOperation>,
+    {
+        |operation, context, _driver, inputs, outputs| {
+            // Transpose rule for [`ParallelReduceOperation`]. `parallel_sum`/`parallel_mean` are self-adjoint, so the
+            // operand cotangent is the same collective applied to the output cotangent. The single operand is linear
+            // (its [`PartialValue`] is [`Unknown`](PartialValue::Unknown)); a known operand contributes no cotangent
+            // and so receives a structural zero. `Max` reports an
+            // [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
+            check_count!("input", inputs, 1, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            if matches!(operation.kind, ParallelReductionKind::Max) {
+                return Err(ProgramError::UnsupportedOperation {
+                    message: "`parallel_max` transpose is not yet supported".to_string(),
+                }
+                .into());
+            }
+            // A known (non-linear) operand contributes no cotangent.
+            if inputs[0].is_known() {
+                return Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)]);
+            }
+            match &outputs[0] {
+                MaybeZero::Value(cotangent) => {
+                    let contribution = stage_collective(context, operation, cotangent)?;
+                    Ok(vec![MaybeZero::Value(contribution)])
+                }
+                MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)]),
+            }
+        }
+    },
+}
+
 /// Shared reduce-and-optionally-mean skeleton for [`ParallelReduceOperation`] batching. It collapses the mapped batch
 /// axis with the kind's [`ReductionKind`] and, for `Mean`, scales the replicated result by `1 / N` using a
 /// `make_parallel_mean_factor`-produced rank-0 factor (relying on implicit rank-0 broadcasting in the multiplication).
@@ -361,70 +425,6 @@ fn parallel_mean_batch_size<V: Value<Type = ArrayType>>(input: &ArrayBatch<V>) -
 /// Builds the rank-0 [`ArrayType`] of `data_type` used to hold a `Mean`'s `1 / N` factor.
 fn parallel_mean_factor_type(data_type: DataType) -> ArrayType {
     ArrayType::new(data_type, Shape::scalar())
-}
-
-impl_differentiable_operation! {
-    ParallelReduceOperation,
-    jvp<C>
-    where
-        C: Context<Type = ArrayType>,
-        C::Operation: From<ParallelReduceOperation>,
-    {
-        |operation, context, _driver, inputs| {
-            // Forward-mode (JVP) rule for [`ParallelReduceOperation`]. `Sum`/`Mean` are linear and self-adjoint, so the
-            // tangent is the same collective applied to the operand tangent: `tangent_out =
-            // collective(input.tangent())`. A structural-zero operand tangent is preserved as-is rather than staging a
-            // collective on a zero, keeping `collective(zero)` out of the tangent program. `Max` is non-linear and
-            // reports an [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
-            check_count!("input", inputs, 1, ProgramError);
-            if matches!(operation.kind, ParallelReductionKind::Max) {
-                return Err(ProgramError::UnsupportedOperation {
-                    message: "`parallel_max` differentiation is not yet supported".to_string(),
-                }
-                .into());
-            }
-            let primal = stage_collective(context, operation, inputs[0].primal())?;
-            // A collective of a structural zero stays a structural zero, keeping `collective(zero)` out of the
-            // tangent program.
-            let tangent = match inputs[0].tangent() {
-                MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.clone()),
-                MaybeZero::Value(tangent) => MaybeZero::Value(stage_collective(context, operation, tangent)?),
-            };
-            Ok(vec![DifferentiationDual::new(primal, tangent)?])
-        }
-    },
-    transpose<V, O>
-    where
-        V: Value<Type = ArrayType>,
-        O: Operation<Type = ArrayType> + From<ParallelReduceOperation>,
-    {
-        |operation, context, _driver, inputs, outputs| {
-            // Transpose rule for [`ParallelReduceOperation`]. `parallel_sum`/`parallel_mean` are self-adjoint, so the
-            // operand cotangent is the same collective applied to the output cotangent. The single operand is linear
-            // (its [`PartialValue`] is [`Unknown`](PartialValue::Unknown)); a known operand contributes no cotangent
-            // and so receives a structural zero. `Max` reports an
-            // [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
-            check_count!("input", inputs, 1, ProgramError);
-            check_count!("output", outputs, 1, ProgramError);
-            if matches!(operation.kind, ParallelReductionKind::Max) {
-                return Err(ProgramError::UnsupportedOperation {
-                    message: "`parallel_max` transpose is not yet supported".to_string(),
-                }
-                .into());
-            }
-            // A known (non-linear) operand contributes no cotangent.
-            if inputs[0].is_known() {
-                return Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)]);
-            }
-            match &outputs[0] {
-                MaybeZero::Value(cotangent) => {
-                    let contribution = stage_collective(context, operation, cotangent)?;
-                    Ok(vec![MaybeZero::Value(contribution)])
-                }
-                MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)]),
-            }
-        }
-    },
 }
 
 /// Re-stages this collective of the same axis name and kind on a single tracer operand, returning its single output.
@@ -526,88 +526,6 @@ mod tests {
         axis_size: usize,
     ) -> BatchingContext<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching> {
         BatchingContext::new(EagerContext::new(), axis_size).with_axis_name("i".to_string())
-    }
-
-    #[test]
-    fn test_parallel_reduce_sum_reduces_along_the_batch_axis() {
-        // Mapped input shape [3] at axis 0: per-item scalar. A `Sum` reduction collapses the batch axis to a
-        // replicated scalar holding the total.
-        let input = {
-            let value = Array::vector(vec![1.0, 2.0, 3.0]);
-            ArrayBatch::new(value, Some(0))
-        }
-        .unwrap();
-        let outputs = ParallelReduceOperation::new("i".to_string(), ParallelReductionKind::Sum)
-            .batch(&batching_context(3), &EmptyRegionDriver, &[input])
-            .unwrap()
-            .into_parts()
-            .0;
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
-        assert_eq!(outputs[0].value().to_f64s(), vec![6.0]);
-    }
-
-    #[test]
-    fn test_parallel_reduce_max_reduces_along_the_batch_axis() {
-        let input = {
-            let value = Array::vector(vec![1.0, 4.0, 2.0]);
-            ArrayBatch::new(value, Some(0))
-        }
-        .unwrap();
-        let outputs = ParallelReduceOperation::new("i".to_string(), ParallelReductionKind::Max)
-            .batch(&batching_context(3), &EmptyRegionDriver, &[input])
-            .unwrap()
-            .into_parts()
-            .0;
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
-        assert_eq!(outputs[0].value().to_f64s(), vec![4.0]);
-    }
-
-    #[test]
-    fn test_parallel_reduce_mean_divides_by_batch_size() {
-        // Per-item scalar input of shape [3] mapped at axis 0. A `Mean` reduction returns the mean of the three batch
-        // items as a replicated scalar, exercising the `1 / N` factor that distinguishes it from `Sum`. The batching
-        // frame binds the axis name `"data"` to show the rule matches on the collective's own axis name rather than a
-        // fixture default.
-        let input = {
-            let value = Array::vector(vec![2.0, 4.0, 6.0]);
-            ArrayBatch::new(value, Some(0))
-        }
-        .unwrap();
-        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3)
-            .with_axis_name("data".to_string());
-        let outputs = ParallelReduceOperation::new("data".to_string(), ParallelReductionKind::Mean)
-            .batch(&context, &EmptyRegionDriver, &[input])
-            .unwrap()
-            .into_parts()
-            .0;
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
-        let values = outputs[0].value().to_f64s();
-        assert_eq!(values.len(), 1);
-        let delta = (values[0] - 4.0).abs();
-        assert!(delta < 1e-9, "expected parallel_mean = 4.0, got {}", values[0]);
-    }
-
-    #[test]
-    fn test_parallel_mean_batching_rejects_ragged_operands_without_a_denominator_definition() {
-        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]), variable, vec![0])])
-            .unwrap();
-
-        assert_eq!(
-            ParallelReduceOperation::new("i".to_string(), ParallelReductionKind::Mean).batch(
-                &batching_context(2),
-                &EmptyRegionDriver,
-                &[input]
-            ),
-            Err(BatchingError::UnsupportedOperation {
-                message: "`parallel_mean` does not define a denominator for bounded ragged inputs".to_string(),
-            }),
-        );
     }
 
     #[test]
@@ -738,29 +656,117 @@ mod tests {
     }
 
     #[test]
-    fn test_parallel_reduce_sum_value_and_grad_through_vmap_re_sums_the_cotangent() {
-        use crate::arrays::Array;
-        use crate::batching::BatchAxisSpecification;
+    fn test_grouped_reduction_collective_validates_and_renders_partition() {
+        let operation = ParallelReduceOperation::grouped(
+            "x".to_string(),
+            ParallelReductionKind::Mean,
+            4,
+            vec![vec![0, 2], vec![3, 1]],
+        )
+        .unwrap();
+        assert_eq!(operation.axis_size(), Some(4));
+        assert_eq!(operation.group_size(), Some(2));
+        assert_eq!(operation.axis_index_groups(), Some([vec![0, 2], vec![3, 1]].as_slice()));
+        assert_eq!(
+            operation.infer_output_types(&[ArrayType::scalar(DataType::F32)], &[]).unwrap(),
+            vec![ArrayType::scalar(DataType::F32)],
+        );
+        assert_eq!(
+            operation.to_string(),
+            "parallel_mean [axis_name=\"x\", axis_size=4, axis_index_groups=[[0, 2], [3, 1]]]",
+        );
 
-        // `g(x) = parallel_sum_i(x)`: the vmapped `parallel_sum` over the mapped axis `"i"` consumes that axis,
-        // producing the replicated total `S = Σ_j x_j`. Reverse mode pulls the scalar ones cotangent back through
-        // the self-adjoint `parallel_sum`, which re-broadcasts the cotangent across the batch items, giving
-        // `∂g/∂x_i = 1` for every input. With `x = [1, 2, 3]` the value is `6` and the gradient is `[1, 1, 1]`.
-        let (value, gradient) = differentiate_at(Array::vector(vec![1.0, 2.0, 3.0]))
-            .value_and_gradient(|x| {
-                let total = batch(
-                    |item| item.parallel_reduce("i", ParallelReductionKind::Sum),
-                    x,
-                    BatchAxis::new(0),
-                    BatchAxis::replicated(),
-                    BatchAxisSpecification::named("i"),
-                )
-                .unwrap();
-                total
-            })
+        assert!(matches!(
+            ParallelReduceOperation::grouped(
+                "x".to_string(),
+                ParallelReductionKind::Sum,
+                4,
+                vec![vec![0, 1], vec![1, 2]]
+            ),
+            Err(TypeError::Invalid { .. }),
+        ));
+    }
+
+    #[test]
+    fn test_parallel_reduce_sum_reduces_along_the_batch_axis() {
+        // Mapped input shape [3] at axis 0: per-item scalar. A `Sum` reduction collapses the batch axis to a
+        // replicated scalar holding the total.
+        let input = {
+            let value = Array::vector(vec![1.0, 2.0, 3.0]);
+            ArrayBatch::new(value, Some(0))
+        }
+        .unwrap();
+        let outputs = ParallelReduceOperation::new("i".to_string(), ParallelReductionKind::Sum)
+            .batch(&batching_context(3), &EmptyRegionDriver, &[input])
+            .unwrap()
+            .into_parts()
+            .0;
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
+        assert_eq!(outputs[0].value().to_f64s(), vec![6.0]);
+    }
+
+    #[test]
+    fn test_parallel_reduce_max_reduces_along_the_batch_axis() {
+        let input = {
+            let value = Array::vector(vec![1.0, 4.0, 2.0]);
+            ArrayBatch::new(value, Some(0))
+        }
+        .unwrap();
+        let outputs = ParallelReduceOperation::new("i".to_string(), ParallelReductionKind::Max)
+            .batch(&batching_context(3), &EmptyRegionDriver, &[input])
+            .unwrap()
+            .into_parts()
+            .0;
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
+        assert_eq!(outputs[0].value().to_f64s(), vec![4.0]);
+    }
+
+    #[test]
+    fn test_parallel_reduce_mean_divides_by_batch_size() {
+        // Per-item scalar input of shape [3] mapped at axis 0. A `Mean` reduction returns the mean of the three batch
+        // items as a replicated scalar, exercising the `1 / N` factor that distinguishes it from `Sum`. The batching
+        // frame binds the axis name `"data"` to show the rule matches on the collective's own axis name rather than a
+        // fixture default.
+        let input = {
+            let value = Array::vector(vec![2.0, 4.0, 6.0]);
+            ArrayBatch::new(value, Some(0))
+        }
+        .unwrap();
+        let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3)
+            .with_axis_name("data".to_string());
+        let outputs = ParallelReduceOperation::new("data".to_string(), ParallelReductionKind::Mean)
+            .batch(&context, &EmptyRegionDriver, &[input])
+            .unwrap()
+            .into_parts()
+            .0;
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
+        let values = outputs[0].value().to_f64s();
+        assert_eq!(values.len(), 1);
+        let delta = (values[0] - 4.0).abs();
+        assert!(delta < 1e-9, "expected parallel_mean = 4.0, got {}", values[0]);
+    }
+
+    #[test]
+    fn test_parallel_mean_batching_rejects_ragged_operands_without_a_denominator_definition() {
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]), BatchAxis::new(0))
+            .unwrap()
+            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]), variable, vec![0])])
             .unwrap();
-        assert_eq!(value.to_f64s(), vec![6.0]);
-        assert_eq!(gradient.to_f64s(), vec![1.0, 1.0, 1.0]);
+
+        assert_eq!(
+            ParallelReduceOperation::new("i".to_string(), ParallelReductionKind::Mean).batch(
+                &batching_context(2),
+                &EmptyRegionDriver,
+                &[input]
+            ),
+            Err(BatchingError::UnsupportedOperation {
+                message: "`parallel_mean` does not define a denominator for bounded ragged inputs".to_string(),
+            }),
+        );
     }
 
     #[test]
@@ -820,34 +826,28 @@ mod tests {
     }
 
     #[test]
-    fn test_grouped_reduction_collective_validates_and_renders_partition() {
-        let operation = ParallelReduceOperation::grouped(
-            "x".to_string(),
-            ParallelReductionKind::Mean,
-            4,
-            vec![vec![0, 2], vec![3, 1]],
-        )
-        .unwrap();
-        assert_eq!(operation.axis_size(), Some(4));
-        assert_eq!(operation.group_size(), Some(2));
-        assert_eq!(operation.axis_index_groups(), Some([vec![0, 2], vec![3, 1]].as_slice()));
-        assert_eq!(
-            operation.infer_output_types(&[ArrayType::scalar(DataType::F32)], &[]).unwrap(),
-            vec![ArrayType::scalar(DataType::F32)],
-        );
-        assert_eq!(
-            operation.to_string(),
-            "parallel_mean [axis_name=\"x\", axis_size=4, axis_index_groups=[[0, 2], [3, 1]]]",
-        );
+    fn test_parallel_reduce_sum_value_and_grad_through_vmap_re_sums_the_cotangent() {
+        use crate::arrays::Array;
+        use crate::batching::BatchAxisSpecification;
 
-        assert!(matches!(
-            ParallelReduceOperation::grouped(
-                "x".to_string(),
-                ParallelReductionKind::Sum,
-                4,
-                vec![vec![0, 1], vec![1, 2]]
-            ),
-            Err(TypeError::Invalid { .. }),
-        ));
+        // `g(x) = parallel_sum_i(x)`: the vmapped `parallel_sum` over the mapped axis `"i"` consumes that axis,
+        // producing the replicated total `S = Σ_j x_j`. Reverse mode pulls the scalar ones cotangent back through
+        // the self-adjoint `parallel_sum`, which re-broadcasts the cotangent across the batch items, giving
+        // `∂g/∂x_i = 1` for every input. With `x = [1, 2, 3]` the value is `6` and the gradient is `[1, 1, 1]`.
+        let (value, gradient) = differentiate_at(Array::vector(vec![1.0, 2.0, 3.0]))
+            .value_and_gradient(|x| {
+                let total = batch(
+                    |item| item.parallel_reduce("i", ParallelReductionKind::Sum),
+                    x,
+                    BatchAxis::new(0),
+                    BatchAxis::replicated(),
+                    BatchAxisSpecification::named("i"),
+                )
+                .unwrap();
+                total
+            })
+            .unwrap();
+        assert_eq!(value.to_f64s(), vec![6.0]);
+        assert_eq!(gradient.to_f64s(), vec![1.0, 1.0, 1.0]);
     }
 }

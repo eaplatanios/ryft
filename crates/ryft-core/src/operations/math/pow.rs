@@ -105,25 +105,7 @@ mod tests {
 
     #[test]
     fn test_pow() {
-        assert_eq!(Array::scalar(2.0f32).pow(&Array::scalar(3.0f32)).unwrap(), Array::scalar(2.0f32.powf(3.0)),);
-        assert_eq!(Array::scalar(2.0f64).pow(&Array::scalar(3.0f64)).unwrap(), Array::scalar(2.0f64.powf(3.0)),);
-        assert_eq!(
-            Array::scalar(bf16::from_f32(2.0)).pow(&Array::scalar(bf16::from_f32(3.0))).unwrap(),
-            Array::scalar(bf16::from_f32(2.0f32.powf(3.0))),
-        );
-        assert_eq!(
-            Array::scalar(f16::from_f32(2.0)).pow(&Array::scalar(f16::from_f32(3.0))).unwrap(),
-            Array::scalar(f16::from_f32(2.0f32.powf(3.0))),
-        );
-        // The complex power is the principal value `exp(y · log(x))`.
-        let input = ComplexNumber::new(0.7f64, -0.3f64);
-        let exponent = ComplexNumber::new(2.0f64, 0.0f64);
-        assert_abs_diff_eq!(
-            Array::scalar(input).pow(&Array::scalar(exponent)).unwrap(),
-            Array::scalar(input.powc(exponent)),
-            epsilon = 1e-12,
-        );
-        assert_eq!(Array::scalar(2.0).pow(&Array::scalar(3.0)).unwrap(), Array::scalar(8.0),);
+        assert_eq!(PowOperation::<ArrayType>::new().to_string(), "pow");
     }
 
     #[test]
@@ -146,6 +128,38 @@ mod tests {
             @reject @unreduced,
             operation = PowOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_pow_interpretation() {
+        assert_eq!(Array::scalar(2.0f32).pow(&Array::scalar(3.0f32)).unwrap(), Array::scalar(2.0f32.powf(3.0)),);
+        assert_eq!(Array::scalar(2.0f64).pow(&Array::scalar(3.0f64)).unwrap(), Array::scalar(2.0f64.powf(3.0)),);
+        assert_eq!(
+            Array::scalar(bf16::from_f32(2.0)).pow(&Array::scalar(bf16::from_f32(3.0))).unwrap(),
+            Array::scalar(bf16::from_f32(2.0f32.powf(3.0))),
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(2.0)).pow(&Array::scalar(f16::from_f32(3.0))).unwrap(),
+            Array::scalar(f16::from_f32(2.0f32.powf(3.0))),
+        );
+        // The complex power is the principal value `exp(y · log(x))`.
+        let input = ComplexNumber::new(0.7f64, -0.3f64);
+        let exponent = ComplexNumber::new(2.0f64, 0.0f64);
+        assert_abs_diff_eq!(
+            Array::scalar(input).pow(&Array::scalar(exponent)).unwrap(),
+            Array::scalar(input.powc(exponent)),
+            epsilon = 1e-12,
+        );
+        assert_eq!(Array::scalar(2.0).pow(&Array::scalar(3.0)).unwrap(), Array::scalar(8.0),);
+    }
+
+    #[test]
+    fn test_pow_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = PowOperation::new(),
+            inputs = [Array::scalar(2.0), Array::scalar(3.0)],
+            expected = Array::scalar(8.0),
         );
     }
 
@@ -217,15 +231,6 @@ mod tests {
                 .unwrap(),
             Array::scalar(input * 2.0),
             epsilon = 1e-12,
-        );
-    }
-
-    #[test]
-    fn test_pow_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = PowOperation::new(),
-            inputs = [Array::scalar(2.0), Array::scalar(3.0)],
-            expected = Array::scalar(8.0),
         );
     }
 

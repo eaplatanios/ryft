@@ -122,7 +122,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_eager_context_fill() {
+    fn test_fill_interpretation() {
         let context = EagerContext::<Array>::new();
 
         // Rank-zero and rank-positive fills both apply the requested element conversion exactly once.
@@ -165,6 +165,33 @@ mod tests {
                 if message == "cannot materialize a value of dynamically sized type f32[size]; stage a rank-zero \
                                fill and expand it with a dynamic `broadcast` operation instead",
         ));
+    }
+
+    #[test]
+    fn test_fill_partial_evaluation() {
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let output_type = ArrayType::new_static(DataType::F32, [2]);
+        let output = context.fill(&output_type, 3.5f32).unwrap();
+        let expected = Array::from_elements(output_type, &[3.5f32; 2]).unwrap();
+        assert_eq!(output.value().unwrap().as_known(), Some(&expected));
+    }
+
+    #[test]
+    fn test_fill_batching() {
+        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
+        let output_type = ArrayType::new_static(DataType::F32, [2]);
+        let output = context.fill(&output_type, 4.5f32).unwrap();
+        assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
+        assert_eq!(output.batch().value(), &Array::from_elements(output_type, &[4.5f32; 2]).unwrap(),);
+    }
+
+    #[test]
+    fn test_fill_differentiation() {
+        let context = DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let output_type = ArrayType::new_static(DataType::F32, [2]);
+        let output = context.fill(&output_type, 5.5f32).unwrap();
+        assert_eq!(output.primal(), &Array::from_elements(output_type.clone(), &[5.5f32; 2]).unwrap());
+        assert!(matches!(output.tangent(), MaybeZero::Zero(r#type) if r#type == &output_type));
     }
 
     #[test]
@@ -239,32 +266,5 @@ mod tests {
             "}
             .trim_end(),
         );
-    }
-
-    #[test]
-    fn test_partial_evaluation_context_fill() {
-        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
-        let output_type = ArrayType::new_static(DataType::F32, [2]);
-        let output = context.fill(&output_type, 3.5f32).unwrap();
-        let expected = Array::from_elements(output_type, &[3.5f32; 2]).unwrap();
-        assert_eq!(output.value().unwrap().as_known(), Some(&expected));
-    }
-
-    #[test]
-    fn test_batching_context_fill() {
-        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
-        let output_type = ArrayType::new_static(DataType::F32, [2]);
-        let output = context.fill(&output_type, 4.5f32).unwrap();
-        assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
-        assert_eq!(output.batch().value(), &Array::from_elements(output_type, &[4.5f32; 2]).unwrap(),);
-    }
-
-    #[test]
-    fn test_differentiation_context_fill() {
-        let context = DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
-        let output_type = ArrayType::new_static(DataType::F32, [2]);
-        let output = context.fill(&output_type, 5.5f32).unwrap();
-        assert_eq!(output.primal(), &Array::from_elements(output_type.clone(), &[5.5f32; 2]).unwrap());
-        assert!(matches!(output.tangent(), MaybeZero::Zero(r#type) if r#type == &output_type));
     }
 }

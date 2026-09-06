@@ -75,20 +75,7 @@ mod tests {
 
     #[test]
     fn test_log() {
-        assert_eq!(Array::scalar(0.5f32).log().unwrap(), Array::scalar(0.5f32.ln()));
-        assert_eq!(Array::scalar(0.5f64).log().unwrap(), Array::scalar(0.5f64.ln()));
-        assert_eq!(Array::scalar(bf16::from_f32(0.5)).log().unwrap(), Array::scalar(bf16::from_f32(0.5f32.ln())),);
-        assert_eq!(Array::scalar(f16::from_f32(0.5)).log().unwrap(), Array::scalar(f16::from_f32(0.5f32.ln())),);
-        let input = ComplexNumber::new(0.7f64, -0.3f64);
-        assert_abs_diff_eq!(Array::scalar(input).log().unwrap(), Array::scalar(input.ln()), epsilon = 1e-12);
-        // The principal branch maps the negative real axis to `ln|x| + iπ`.
-        assert_abs_diff_eq!(
-            Array::scalar(ComplexNumber::new(-1.0f64, 0.0)).log().unwrap(),
-            Array::scalar(ComplexNumber::new(0.0f64, std::f64::consts::PI)),
-            epsilon = 1e-12,
-        );
-
-        assert_eq!(Array::scalar(0.7).log().unwrap(), Array::scalar(0.7f64.ln()),);
+        assert_eq!(LogOperation::<ArrayType>::new().to_string(), "log");
     }
 
     #[test]
@@ -111,6 +98,33 @@ mod tests {
             @reject @unreduced,
             operation = LogOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_log_interpretation() {
+        assert_eq!(Array::scalar(0.5f32).log().unwrap(), Array::scalar(0.5f32.ln()));
+        assert_eq!(Array::scalar(0.5f64).log().unwrap(), Array::scalar(0.5f64.ln()));
+        assert_eq!(Array::scalar(bf16::from_f32(0.5)).log().unwrap(), Array::scalar(bf16::from_f32(0.5f32.ln())),);
+        assert_eq!(Array::scalar(f16::from_f32(0.5)).log().unwrap(), Array::scalar(f16::from_f32(0.5f32.ln())),);
+        let input = ComplexNumber::new(0.7f64, -0.3f64);
+        assert_abs_diff_eq!(Array::scalar(input).log().unwrap(), Array::scalar(input.ln()), epsilon = 1e-12);
+        // The principal branch maps the negative real axis to `ln|x| + iπ`.
+        assert_abs_diff_eq!(
+            Array::scalar(ComplexNumber::new(-1.0f64, 0.0)).log().unwrap(),
+            Array::scalar(ComplexNumber::new(0.0f64, std::f64::consts::PI)),
+            epsilon = 1e-12,
+        );
+
+        assert_eq!(Array::scalar(0.7).log().unwrap(), Array::scalar(0.7f64.ln()),);
+    }
+
+    #[test]
+    fn test_log_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = LogOperation::new(),
+            inputs = [Array::scalar(0.7)],
+            expected = Array::scalar(0.7f64.ln()),
         );
     }
 
@@ -184,15 +198,6 @@ mod tests {
                 in (%2, %4)
             "}
             .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_log_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = LogOperation::new(),
-            inputs = [Array::scalar(0.7)],
-            expected = Array::scalar(0.7f64.ln()),
         );
     }
 

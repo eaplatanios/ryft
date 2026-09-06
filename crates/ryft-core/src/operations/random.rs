@@ -41,9 +41,6 @@ use crate::tracing::{Tracer, TracingContext};
 
 // TODO(eaplatanios): Review this module.
 
-/// Canonical operation name for [`RngBitGeneratorOperation`].
-pub const RNG_BIT_GENERATOR_OPERATION_NAME: &str = "rng_bit_generator";
-
 /// Deterministic counter-based pseudorandom bit-generation algorithm used by an [`RngBitGeneratorOperation`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum RandomAlgorithm {
@@ -77,6 +74,9 @@ impl Display for RandomAlgorithm {
         }
     }
 }
+
+/// Canonical operation name for [`RngBitGeneratorOperation`].
+pub const RNG_BIT_GENERATOR_OPERATION_NAME: &str = "rng_bit_generator";
 
 /// [`Operation`] that deterministically generates uniformly distributed random bits from a counter-based generator
 /// state in the `T` type universe — the analogue of
@@ -291,31 +291,6 @@ where
 {
 }
 
-impl_reference_free_dischargeable_operation!(<T> RngBitGeneratorOperation<T> where T: Type);
-
-impl_non_differentiable_operation!(<T> RngBitGeneratorOperation<T> where T: Type);
-
-// Random bits are discrete and therefore never form a linear map that can be transposed.
-impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>> TransposableOperation<V, O> for RngBitGeneratorOperation<T>
-where
-    RngBitGeneratorOperation<T>: Operation<Type = T>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        _context: &mut TranspositionContext<'_, V, O>,
-        _driver: &D,
-        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: format!(
-                "`{RNG_BIT_GENERATOR_OPERATION_NAME}` cannot be transposed because random bits are discrete"
-            ),
-        }
-        .into())
-    }
-}
-
 // Batching rule for [`RngBitGeneratorOperation`]. A state mapped at some batch axis is realigned to batch axis 0
 // (a `[b, state_width]` stack of per-item states for both [`ThreeFry`](RandomAlgorithm::ThreeFry) and
 // [`Philox`](RandomAlgorithm::Philox)) and one carry-free [`ScanOperation`] is staged over it, whose body binds this
@@ -445,6 +420,31 @@ where
             .into())
     }
 }
+
+impl_non_differentiable_operation!(<T> RngBitGeneratorOperation<T> where T: Type);
+
+// Random bits are discrete and therefore never form a linear map that can be transposed.
+impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>> TransposableOperation<V, O> for RngBitGeneratorOperation<T>
+where
+    RngBitGeneratorOperation<T>: Operation<Type = T>,
+{
+    fn transpose<D: TranspositionDriver<V, O>>(
+        &self,
+        _context: &mut TranspositionContext<'_, V, O>,
+        _driver: &D,
+        _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "`{RNG_BIT_GENERATOR_OPERATION_NAME}` cannot be transposed because random bits are discrete"
+            ),
+        }
+        .into())
+    }
+}
+
+impl_reference_free_dischargeable_operation!(<T> RngBitGeneratorOperation<T> where T: Type);
 
 /// Represents the ability to generate deterministic random bits from a counter-based generator state.
 /// [`RngBitGenerator`] stages or executes an [`RngBitGeneratorOperation`]; refer to its documentation for the
@@ -789,106 +789,8 @@ mod tests {
     }
 
     #[test]
-    fn test_threefry2x32_known_answers() {
-        // The Random123 known-answer vectors for ThreeFry-2x32 with 20 rounds.
-        assert_eq!(threefry2x32([0, 0], [0, 0]), [0x6b200159, 0x99ba4efe]);
-        assert_eq!(threefry2x32([0xffffffff, 0xffffffff], [0xffffffff, 0xffffffff]), [0x1cb996fc, 0xbb002be7]);
-        assert_eq!(threefry2x32([0x13198a2e, 0x03707344], [0x243f6a88, 0x85a308d3]), [0xc4923a9c, 0x483df7a0]);
-    }
-
-    #[test]
-    fn test_threefry_words() {
-        // A key with a nonzero high half exercises the `u64 -> [u32; 2]` key split, low half first.
-        let key = (1u64 << 32) | 42;
-        let key_pair = [42u32, 1u32];
-
-        // 32-bit words: each counter's two cipher words land in adjacent positions, odd counts truncate the final
-        // pair, and the counter advances by the `ceil(count / 2)` cipher invocations that actually ran.
-        let (words, counter) = threefry_u32_words(key, 7, 5);
-        assert_eq!(words.len(), 5);
-        assert_eq!(counter, 10);
-        assert_eq!(words[0..2], threefry2x32(key_pair, [7, 0]));
-        assert_eq!(words[2..4], threefry2x32(key_pair, [8, 0]));
-        assert_eq!(words[4], threefry2x32(key_pair, [9, 0])[0]);
-        let (even_words, even_counter) = threefry_u32_words(key, 7, 4);
-        assert_eq!(even_words, words[0..4]);
-        assert_eq!(even_counter, 9);
-
-        // 64-bit words: one counter per word, with the two cipher outputs combined as `first | (second << 32)`, and
-        // the counter advances by `count`.
-        let (words, counter) = threefry_u64_words(key, 7, 3);
-        assert_eq!(counter, 10);
-        let word = |pair_counter: u32| {
-            let output = threefry2x32(key_pair, [pair_counter, 0]);
-            u64::from(output[0]) | (u64::from(output[1]) << 32)
-        };
-        assert_eq!(words, vec![word(7), word(8), word(9)]);
-    }
-
-    #[test]
-    fn test_philox4x32_known_answers() {
-        // The Random123 known-answer vectors for Philox-4x32 with 10 rounds.
-        assert_eq!(philox4x32([0, 0], [0, 0, 0, 0]), [0x6627e8d5, 0xe169c58d, 0xbc57ac4c, 0x9b00dbd8]);
-        assert_eq!(
-            philox4x32([0xffffffff, 0xffffffff], [0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff]),
-            [0x408f276d, 0x41c83b0e, 0xa20bc7c6, 0x6d5451fd],
-        );
-        assert_eq!(
-            philox4x32([0xa4093822, 0x299f31d0], [0x243f6a88, 0x85a308d3, 0x13198a2e, 0x03707344]),
-            [0xd16cfe09, 0x94fdcceb, 0x5001e420, 0x24126ea1],
-        );
-    }
-
-    #[test]
-    fn test_philox_words() {
-        // A key with a nonzero high half exercises the `u64 -> [u32; 2]` key split, low half first, and a counter
-        // just below the 64-bit boundary exercises the carry into the high `u64` half of the 128-bit counter.
-        let key = (1u64 << 32) | 42;
-        let key_pair = [42u32, 1u32];
-        let counter = u128::from(u64::MAX - 1);
-        let quad = |quad_counter: u128| {
-            philox4x32(
-                key_pair,
-                [
-                    quad_counter as u32,
-                    (quad_counter >> 32) as u32,
-                    (quad_counter >> 64) as u32,
-                    (quad_counter >> 96) as u32,
-                ],
-            )
-        };
-
-        // 32-bit words: each counter's four cipher words land in adjacent positions, non-multiple-of-four counts
-        // truncate the final quad, and the counter advances by the `ceil(count / 4)` cipher invocations that
-        // actually ran (carrying into the high half here).
-        let (words, advanced) = philox_u32_words(key, counter, 9);
-        assert_eq!(words.len(), 9);
-        assert_eq!(advanced, counter + 3);
-        assert_eq!(advanced >> 64, 1);
-        assert_eq!(words[0..4], quad(counter));
-        assert_eq!(words[4..8], quad(counter + 1));
-        assert_eq!(words[8], quad(counter + 2)[0]);
-
-        // 64-bit words: each cipher invocation yields the two adjacent words `first | (second << 32)` and
-        // `third | (fourth << 32)`, odd counts truncate the final pair, and the counter advances by the
-        // `ceil(count / 2)` cipher invocations.
-        let (words, advanced) = philox_u64_words(key, counter, 3);
-        assert_eq!(advanced, counter + 2);
-        let first_quad = quad(counter);
-        let second_quad = quad(counter + 1);
-        assert_eq!(
-            words,
-            vec![
-                u64::from(first_quad[0]) | (u64::from(first_quad[1]) << 32),
-                u64::from(first_quad[2]) | (u64::from(first_quad[3]) << 32),
-                u64::from(second_quad[0]) | (u64::from(second_quad[1]) << 32),
-            ],
-        );
-    }
-
-    #[test]
     fn test_rng_bit_generator() {
-        let operation = RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, bits_type(5));
+        let operation = RngBitGeneratorOperation::<ArrayType>::new(RandomAlgorithm::ThreeFry, bits_type(5));
         assert_eq!(operation.name(), RNG_BIT_GENERATOR_OPERATION_NAME);
         assert_eq!(operation.algorithm(), RandomAlgorithm::ThreeFry);
         assert_eq!(operation.output_type(), &bits_type(5));
@@ -897,7 +799,50 @@ mod tests {
             operation.infer_output_types(&[RandomAlgorithm::ThreeFry.state_type()], &[]),
             Ok(vec![RandomAlgorithm::ThreeFry.state_type(), bits_type(5)]),
         );
+    }
 
+    #[test]
+    fn test_rng_bit_generator_type_inference() {
+        // Wrong state shape and wrong state data type are rejected against the algorithm's state contract.
+        let operation = RngBitGeneratorOperation::<ArrayType>::new(RandomAlgorithm::ThreeFry, bits_type(4));
+        check_operation_type_inference!(
+            operation = operation,
+            cases = [
+                {
+                    input_types = [ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(3)]))],
+                    error = "`rng_bit_generator` with the three_fry algorithm needs a u64[2] state but got u64[3]",
+                },
+                {
+                    input_types = [ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]))],
+                    error = "`rng_bit_generator` with the three_fry algorithm needs a u64[2] state but got f32[2]",
+                },
+            ],
+        );
+
+        // Floating-point bits outputs are rejected; every unsigned-integer width is accepted.
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
+        check_operation_type_inference!(
+            operation = RngBitGeneratorOperation::<ArrayType>::new(RandomAlgorithm::ThreeFry, output_type),
+            cases = [{
+                input_types = [RandomAlgorithm::ThreeFry.state_type()],
+                error = "`rng_bit_generator` does not support output data type f32",
+            }],
+        );
+        for data_type in [DataType::U8, DataType::U16, DataType::U64] {
+            let output_type = ArrayType::new(data_type, Shape::new(vec![Dimension::Static(4)]));
+            check_operation_type_inference!(
+                operation = RngBitGeneratorOperation::<ArrayType>::new(RandomAlgorithm::ThreeFry, output_type.clone()),
+                cases = [{
+                    input_types = [RandomAlgorithm::ThreeFry.state_type()],
+                    output_types = [RandomAlgorithm::ThreeFry.state_type(), output_type],
+                }],
+            );
+        }
+    }
+
+    #[test]
+    fn test_rng_bit_generator_interpretation() {
+        let operation = RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, bits_type(5));
         // Eager interpretation through the reference backend matches the reference word expansion, advances the
         // counter by the number of cipher invocations, and is deterministic in the state.
         let state = state(42, 7);
@@ -965,42 +910,26 @@ mod tests {
     }
 
     #[test]
-    fn test_rng_bit_generator_type_inference() {
-        // Wrong state shape and wrong state data type are rejected against the algorithm's state contract.
-        let operation = RngBitGeneratorOperation::<ArrayType>::new(RandomAlgorithm::ThreeFry, bits_type(4));
-        check_operation_type_inference!(
-            operation = operation,
-            cases = [
-                {
-                    input_types = [ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(3)]))],
-                    error = "`rng_bit_generator` with the three_fry algorithm needs a u64[2] state but got u64[3]",
-                },
-                {
-                    input_types = [ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]))],
-                    error = "`rng_bit_generator` with the three_fry algorithm needs a u64[2] state but got f32[2]",
-                },
-            ],
-        );
+    fn test_philox_rng_bit_generator() {
+        // The reference backend maps the `ui64[3]` state to `[key, counter]` with the 128-bit counter split into
+        // its low and high `u64` halves.
+        let state = Array::from_elements(RandomAlgorithm::Philox.state_type(), &[42u64, 7, 9]).unwrap();
+        let counter = 7u128 | (9u128 << 64);
 
-        // Floating-point bits outputs are rejected; every unsigned-integer width is accepted.
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
-        check_operation_type_inference!(
-            operation = RngBitGeneratorOperation::<ArrayType>::new(RandomAlgorithm::ThreeFry, output_type),
-            cases = [{
-                input_types = [RandomAlgorithm::ThreeFry.state_type()],
-                error = "`rng_bit_generator` does not support output data type f32",
-            }],
-        );
-        for data_type in [DataType::U8, DataType::U16, DataType::U64] {
-            let output_type = ArrayType::new(data_type, Shape::new(vec![Dimension::Static(4)]));
-            check_operation_type_inference!(
-                operation = RngBitGeneratorOperation::<ArrayType>::new(RandomAlgorithm::ThreeFry, output_type.clone()),
-                cases = [{
-                    input_types = [RandomAlgorithm::ThreeFry.state_type()],
-                    output_types = [RandomAlgorithm::ThreeFry.state_type(), output_type],
-                }],
-            );
-        }
+        // Five `u32` words run two cipher invocations, and the counter advances by that invocation count.
+        let (advanced, bits) = state.rng_bit_generator(RandomAlgorithm::Philox, &bits_type(5)).unwrap();
+        let (expected_words, expected_counter) = philox_u32_words(42, counter, 5);
+        assert_eq!(expected_counter, counter + 2);
+        assert_eq!(advanced.elements::<u64>(), Ok(vec![42, expected_counter as u64, (expected_counter >> 64) as u64]),);
+        assert_eq!(bits.elements::<u32>(), Ok(expected_words));
+
+        // Three `u64` words also run two cipher invocations (two words per invocation, truncated).
+        let u64_bits_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(3)]));
+        let (advanced, bits) = state.rng_bit_generator(RandomAlgorithm::Philox, &u64_bits_type).unwrap();
+        let (expected_words, expected_counter) = philox_u64_words(42, counter, 3);
+        assert_eq!(expected_counter, counter + 2);
+        assert_eq!(advanced.elements::<u64>(), Ok(vec![42, expected_counter as u64, (expected_counter >> 64) as u64]),);
+        assert_eq!(bits.elements::<u64>(), Ok(expected_words));
     }
 
     #[test]
@@ -1037,13 +966,6 @@ mod tests {
             "}
             .trim_end(),
         );
-    }
-
-    /// Returns an active batching frame over an eager reference-backend parent for direct batching-rule tests.
-    fn batching_context(
-        axis_size: usize,
-    ) -> BatchingContext<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching> {
-        BatchingContext::new(EagerContext::new(), axis_size)
     }
 
     #[test]
@@ -1263,27 +1185,109 @@ mod tests {
         Ok(())
     }
 
+    /// Returns an active batching frame over an eager reference-backend parent for direct batching-rule tests.
+    fn batching_context(
+        axis_size: usize,
+    ) -> BatchingContext<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching> {
+        BatchingContext::new(EagerContext::new(), axis_size)
+    }
+
     #[test]
-    fn test_philox_rng_bit_generator() {
-        // The reference backend maps the `ui64[3]` state to `[key, counter]` with the 128-bit counter split into
-        // its low and high `u64` halves.
-        let state = Array::from_elements(RandomAlgorithm::Philox.state_type(), &[42u64, 7, 9]).unwrap();
-        let counter = 7u128 | (9u128 << 64);
+    fn test_threefry2x32_known_answers() {
+        // The Random123 known-answer vectors for ThreeFry-2x32 with 20 rounds.
+        assert_eq!(threefry2x32([0, 0], [0, 0]), [0x6b200159, 0x99ba4efe]);
+        assert_eq!(threefry2x32([0xffffffff, 0xffffffff], [0xffffffff, 0xffffffff]), [0x1cb996fc, 0xbb002be7]);
+        assert_eq!(threefry2x32([0x13198a2e, 0x03707344], [0x243f6a88, 0x85a308d3]), [0xc4923a9c, 0x483df7a0]);
+    }
 
-        // Five `u32` words run two cipher invocations, and the counter advances by that invocation count.
-        let (advanced, bits) = state.rng_bit_generator(RandomAlgorithm::Philox, &bits_type(5)).unwrap();
-        let (expected_words, expected_counter) = philox_u32_words(42, counter, 5);
-        assert_eq!(expected_counter, counter + 2);
-        assert_eq!(advanced.elements::<u64>(), Ok(vec![42, expected_counter as u64, (expected_counter >> 64) as u64]),);
-        assert_eq!(bits.elements::<u32>(), Ok(expected_words));
+    #[test]
+    fn test_threefry_words() {
+        // A key with a nonzero high half exercises the `u64 -> [u32; 2]` key split, low half first.
+        let key = (1u64 << 32) | 42;
+        let key_pair = [42u32, 1u32];
 
-        // Three `u64` words also run two cipher invocations (two words per invocation, truncated).
-        let u64_bits_type = ArrayType::new(DataType::U64, Shape::new(vec![Dimension::Static(3)]));
-        let (advanced, bits) = state.rng_bit_generator(RandomAlgorithm::Philox, &u64_bits_type).unwrap();
-        let (expected_words, expected_counter) = philox_u64_words(42, counter, 3);
-        assert_eq!(expected_counter, counter + 2);
-        assert_eq!(advanced.elements::<u64>(), Ok(vec![42, expected_counter as u64, (expected_counter >> 64) as u64]),);
-        assert_eq!(bits.elements::<u64>(), Ok(expected_words));
+        // 32-bit words: each counter's two cipher words land in adjacent positions, odd counts truncate the final
+        // pair, and the counter advances by the `ceil(count / 2)` cipher invocations that actually ran.
+        let (words, counter) = threefry_u32_words(key, 7, 5);
+        assert_eq!(words.len(), 5);
+        assert_eq!(counter, 10);
+        assert_eq!(words[0..2], threefry2x32(key_pair, [7, 0]));
+        assert_eq!(words[2..4], threefry2x32(key_pair, [8, 0]));
+        assert_eq!(words[4], threefry2x32(key_pair, [9, 0])[0]);
+        let (even_words, even_counter) = threefry_u32_words(key, 7, 4);
+        assert_eq!(even_words, words[0..4]);
+        assert_eq!(even_counter, 9);
+
+        // 64-bit words: one counter per word, with the two cipher outputs combined as `first | (second << 32)`, and
+        // the counter advances by `count`.
+        let (words, counter) = threefry_u64_words(key, 7, 3);
+        assert_eq!(counter, 10);
+        let word = |pair_counter: u32| {
+            let output = threefry2x32(key_pair, [pair_counter, 0]);
+            u64::from(output[0]) | (u64::from(output[1]) << 32)
+        };
+        assert_eq!(words, vec![word(7), word(8), word(9)]);
+    }
+
+    #[test]
+    fn test_philox4x32_known_answers() {
+        // The Random123 known-answer vectors for Philox-4x32 with 10 rounds.
+        assert_eq!(philox4x32([0, 0], [0, 0, 0, 0]), [0x6627e8d5, 0xe169c58d, 0xbc57ac4c, 0x9b00dbd8]);
+        assert_eq!(
+            philox4x32([0xffffffff, 0xffffffff], [0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff]),
+            [0x408f276d, 0x41c83b0e, 0xa20bc7c6, 0x6d5451fd],
+        );
+        assert_eq!(
+            philox4x32([0xa4093822, 0x299f31d0], [0x243f6a88, 0x85a308d3, 0x13198a2e, 0x03707344]),
+            [0xd16cfe09, 0x94fdcceb, 0x5001e420, 0x24126ea1],
+        );
+    }
+
+    #[test]
+    fn test_philox_words() {
+        // A key with a nonzero high half exercises the `u64 -> [u32; 2]` key split, low half first, and a counter
+        // just below the 64-bit boundary exercises the carry into the high `u64` half of the 128-bit counter.
+        let key = (1u64 << 32) | 42;
+        let key_pair = [42u32, 1u32];
+        let counter = u128::from(u64::MAX - 1);
+        let quad = |quad_counter: u128| {
+            philox4x32(
+                key_pair,
+                [
+                    quad_counter as u32,
+                    (quad_counter >> 32) as u32,
+                    (quad_counter >> 64) as u32,
+                    (quad_counter >> 96) as u32,
+                ],
+            )
+        };
+
+        // 32-bit words: each counter's four cipher words land in adjacent positions, non-multiple-of-four counts
+        // truncate the final quad, and the counter advances by the `ceil(count / 4)` cipher invocations that
+        // actually ran (carrying into the high half here).
+        let (words, advanced) = philox_u32_words(key, counter, 9);
+        assert_eq!(words.len(), 9);
+        assert_eq!(advanced, counter + 3);
+        assert_eq!(advanced >> 64, 1);
+        assert_eq!(words[0..4], quad(counter));
+        assert_eq!(words[4..8], quad(counter + 1));
+        assert_eq!(words[8], quad(counter + 2)[0]);
+
+        // 64-bit words: each cipher invocation yields the two adjacent words `first | (second << 32)` and
+        // `third | (fourth << 32)`, odd counts truncate the final pair, and the counter advances by the
+        // `ceil(count / 2)` cipher invocations.
+        let (words, advanced) = philox_u64_words(key, counter, 3);
+        assert_eq!(advanced, counter + 2);
+        let first_quad = quad(counter);
+        let second_quad = quad(counter + 1);
+        assert_eq!(
+            words,
+            vec![
+                u64::from(first_quad[0]) | (u64::from(first_quad[1]) << 32),
+                u64::from(first_quad[2]) | (u64::from(first_quad[3]) << 32),
+                u64::from(second_quad[0]) | (u64::from(second_quad[1]) << 32),
+            ],
+        );
     }
 
     #[test]

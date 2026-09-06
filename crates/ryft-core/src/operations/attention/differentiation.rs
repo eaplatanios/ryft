@@ -4,7 +4,7 @@ use ryft_macros::Parameterized;
 
 use crate::arrays::ArrayType;
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{CustomVjp, DifferentiableType, custom_vjp};
+use crate::differentiation::DifferentiableType;
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::attention::{
     AttentionConfiguration, AttentionInputs, DOT_PRODUCT_ATTENTION_BACKWARD_OPERATION_NAME,
@@ -12,6 +12,7 @@ use crate::operations::attention::{
     DotProductAttentionOperation,
 };
 use crate::operations::constants::zero::{Zero, ZeroOperationProvider};
+use crate::operations::differentiation::custom_vjp::{CustomVjp, custom_vjp};
 use crate::parameters::Parameter;
 use crate::programs::{ProgramError, Typed, Value};
 use crate::tracing::DomainTracer;

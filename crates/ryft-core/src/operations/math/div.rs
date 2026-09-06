@@ -133,46 +133,7 @@ mod tests {
 
     #[test]
     fn test_div() {
-        let operation = DivOperation::<ArrayType>::new();
-
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Array::scalar(7.0f32), Array::scalar(2.0f64)],
-            ),
-            Ok(vec![Array::scalar(3.5f64)]),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &DivOperation::<ArrayType>::new(),
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Array::scalar(7.0), Array::scalar(2.0)],
-            ),
-            Ok(vec![Array::scalar(3.5)]),
-        );
-        assert_eq!(Div::div(&7_usize, &2), Ok(3));
-        assert_eq!(
-            Div::div(&7_usize, &0),
-            Err(ProgramError::InvalidArgument {
-                message: "`div` divisor is zero or the result does not fit in usize".to_string(),
-            }),
-        );
-        assert_abs_diff_eq!(
-            match InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Array::scalar(Complex::new(1.0f64, 2.0)), Array::scalar(Complex::new(0.5f64, -1.0))],
-            ) {
-                Ok(outputs) => outputs[0].clone(),
-                Err(error) => panic!("expected a complex quotient but got {error}"),
-            },
-            Array::scalar(Complex::new(1.0f64, 2.0) / Complex::new(0.5f64, -1.0)),
-            epsilon = 1e-12,
-        );
+        assert_eq!(DivOperation::<ArrayType>::new().to_string(), "div");
     }
 
     #[test]
@@ -234,6 +195,59 @@ mod tests {
             @reject @mismatched_reduced,
             operation = DivOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_div_interpretation() {
+        let operation = DivOperation::<ArrayType>::new();
+
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(7.0f32), Array::scalar(2.0f64)],
+            ),
+            Ok(vec![Array::scalar(3.5f64)]),
+        );
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &DivOperation::<ArrayType>::new(),
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(7.0), Array::scalar(2.0)],
+            ),
+            Ok(vec![Array::scalar(3.5)]),
+        );
+        assert_eq!(Div::div(&7_usize, &2), Ok(3));
+        assert_eq!(
+            Div::div(&7_usize, &0),
+            Err(ProgramError::InvalidArgument {
+                message: "`div` divisor is zero or the result does not fit in usize".to_string(),
+            }),
+        );
+        assert_abs_diff_eq!(
+            match InterpretableOperation::<EagerContext<Array>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(Complex::new(1.0f64, 2.0)), Array::scalar(Complex::new(0.5f64, -1.0))],
+            ) {
+                Ok(outputs) => outputs[0].clone(),
+                Err(error) => panic!("expected a complex quotient but got {error}"),
+            },
+            Array::scalar(Complex::new(1.0f64, 2.0) / Complex::new(0.5f64, -1.0)),
+            epsilon = 1e-12,
+        );
+    }
+
+    #[test]
+    fn test_div_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = DivOperation::new(),
+            inputs = [Array::scalar(7.0), Array::scalar(2.0)],
+            expected = Array::scalar(3.5),
         );
     }
 
@@ -307,15 +321,6 @@ mod tests {
             .unwrap();
         assert_eq!(primal, Array::scalar(2.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap());
         assert_eq!(tangent, Array::scalar(-0.5f32));
-    }
-
-    #[test]
-    fn test_div_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = DivOperation::new(),
-            inputs = [Array::scalar(7.0), Array::scalar(2.0)],
-            expected = Array::scalar(3.5),
-        );
     }
 
     #[test]

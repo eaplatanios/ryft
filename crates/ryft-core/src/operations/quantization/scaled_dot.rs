@@ -224,39 +224,16 @@ impl<C: Domain<Type = ArrayType, Value: ScaledDot>> InterpretableOperation<C> fo
     }
 }
 
-/// Partial evaluation defers to the default fold-or-residualize behavior of
-/// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
+// Partial evaluation defers to the default fold-or-residualize behavior of
+// [`Program::partially_evaluate`](crate::Program::partially_evaluate).
 impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for ScaledDotOperation where
     C::Operation: From<ScaledDotOperation>
 {
 }
 
-/// Scaled dot intentionally has no differentiation rule. Its scales encode quantization metadata rather than
-/// differentiable parameters, and silently treating them as constants would define a straight-through estimator that
-/// is not part of the operation's semantics. Callers that need a differentiable approximation can spell out the
-/// dequantization composition explicitly and choose their own gradient policy.
-impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for ScaledDotOperation
-where
-    C::Operation: From<ScaledDotOperation>,
-{
-    fn jvp<D: DifferentiationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        _inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: format!("`{SCALED_DOT_OPERATION_NAME}` does not support differentiation"),
-        }
-        .into())
-    }
-}
-
-crate::impl_non_transposable_operation!(ScaledDotOperation);
-
-/// Batching rule for [`ScaledDotOperation`]. Every input is aligned to one leading mapped axis. The rule then shifts
-/// every existing dimension number past that new axis and records axis zero as an additional batching dimension on
-/// both element operands. Repeating the transform applies the same lift again, so batching has no rank ceiling.
+// Batching rule for [`ScaledDotOperation`]. Every input is aligned to one leading mapped axis. The rule then shifts
+// every existing dimension number past that new axis and records axis zero as an additional batching dimension on
+// both element operands. Repeating the transform applies the same lift again, so batching has no rank ceiling.
 impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
     for ScaledDotOperation
 where
@@ -299,6 +276,29 @@ where
             .into())
     }
 }
+
+// Scaled dot intentionally has no differentiation rule. Its scales encode quantization metadata rather than
+// differentiable parameters, and silently treating them as constants would define a straight-through estimator that
+// is not part of the operation's semantics. Callers that need a differentiable approximation can spell out the
+// dequantization composition explicitly and choose their own gradient policy.
+impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for ScaledDotOperation
+where
+    C::Operation: From<ScaledDotOperation>,
+{
+    fn jvp<D: DifferentiationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        _inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: format!("`{SCALED_DOT_OPERATION_NAME}` does not support differentiation"),
+        }
+        .into())
+    }
+}
+
+crate::impl_non_transposable_operation!(ScaledDotOperation);
 
 /// Value-level generalized block-scaled dot capability.
 pub trait ScaledDot: Typed<Type = ArrayType> + Sized {
@@ -344,10 +344,10 @@ pub trait ScaledDot: Typed<Type = ArrayType> + Sized {
     }
 }
 
-/// Any context-carrying value computes a block-scaled dot by binding a [`ScaledDotOperation`] through its own
-/// context. The `From<ScaledDotOperation>` bound makes this disjoint from the eager reference value types (whose
-/// context operation is [`ConstantOperation`](crate::operations::constants::ConstantOperation)), so it covers the
-/// transform tracers and backend-owned values without conflicting with concrete implementations.
+// Any context-carrying value computes a block-scaled dot by binding a [`ScaledDotOperation`] through its own
+// context. The `From<ScaledDotOperation>` bound makes this disjoint from the eager reference value types (whose
+// context operation is [`ConstantOperation`](crate::operations::constants::ConstantOperation)), so it covers the
+// transform tracers and backend-owned values without conflicting with concrete implementations.
 impl<V: Value<Type = ArrayType>> ScaledDot for V
 where
     V::DispatchDomain: Context<Operation: From<ScaledDotOperation>>,
@@ -519,7 +519,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_scaled_dot_jax_contract() {
+    fn test_scaled_dot() {
         // This fixture uses JAX's rank-2 default convention: the left trailing axis contracts with the right leading
         // axis. The two sides infer independent block ratios of two from different scale-axis positions.
         let lhs = Array::from_f64s(
@@ -577,7 +577,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scaled_dot_inference() {
+    fn test_scaled_dot_type_inference() {
         let dimensions = DotDimensionNumbers::new(vec![2, 3], vec![1, 2], vec![0], vec![0]);
         let operation = ScaledDotOperation::new(dimensions, DataType::BF16, true, true);
         let lhs = ArrayType::new(DataType::F8E4M3FN, Shape::new(vec![2.into(), 3.into(), 4.into(), 6.into()]));

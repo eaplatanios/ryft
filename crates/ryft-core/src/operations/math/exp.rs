@@ -75,20 +75,7 @@ mod tests {
 
     #[test]
     fn test_exp() {
-        assert_eq!(Array::scalar(0.5f32).exp().unwrap(), Array::scalar(0.5f32.exp()));
-        assert_eq!(Array::scalar(0.5f64).exp().unwrap(), Array::scalar(0.5f64.exp()));
-        assert_eq!(Array::scalar(bf16::from_f32(0.5)).exp().unwrap(), Array::scalar(bf16::from_f32(0.5f32.exp())),);
-        assert_eq!(Array::scalar(f16::from_f32(0.5)).exp().unwrap(), Array::scalar(f16::from_f32(0.5f32.exp())),);
-        let input = ComplexNumber::new(0.7f64, -0.3f64);
-        assert_abs_diff_eq!(Array::scalar(input).exp().unwrap(), Array::scalar(input.exp()), epsilon = 1e-12);
-        // Euler's identity: e^{iπ} = -1.
-        assert_abs_diff_eq!(
-            Array::scalar(ComplexNumber::new(0.0f64, std::f64::consts::PI)).exp().unwrap(),
-            Array::scalar(ComplexNumber::new(-1.0f64, 0.0)),
-            epsilon = 1e-12,
-        );
-
-        assert_eq!(Array::scalar(0.7).exp().unwrap(), Array::scalar(0.7f64.exp()),);
+        assert_eq!(ExpOperation::<ArrayType>::new().to_string(), "exp");
     }
 
     #[test]
@@ -111,6 +98,33 @@ mod tests {
             @reject @unreduced,
             operation = ExpOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_exp_interpretation() {
+        assert_eq!(Array::scalar(0.5f32).exp().unwrap(), Array::scalar(0.5f32.exp()));
+        assert_eq!(Array::scalar(0.5f64).exp().unwrap(), Array::scalar(0.5f64.exp()));
+        assert_eq!(Array::scalar(bf16::from_f32(0.5)).exp().unwrap(), Array::scalar(bf16::from_f32(0.5f32.exp())),);
+        assert_eq!(Array::scalar(f16::from_f32(0.5)).exp().unwrap(), Array::scalar(f16::from_f32(0.5f32.exp())),);
+        let input = ComplexNumber::new(0.7f64, -0.3f64);
+        assert_abs_diff_eq!(Array::scalar(input).exp().unwrap(), Array::scalar(input.exp()), epsilon = 1e-12);
+        // Euler's identity: e^{iπ} = -1.
+        assert_abs_diff_eq!(
+            Array::scalar(ComplexNumber::new(0.0f64, std::f64::consts::PI)).exp().unwrap(),
+            Array::scalar(ComplexNumber::new(-1.0f64, 0.0)),
+            epsilon = 1e-12,
+        );
+
+        assert_eq!(Array::scalar(0.7).exp().unwrap(), Array::scalar(0.7f64.exp()),);
+    }
+
+    #[test]
+    fn test_exp_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = ExpOperation::new(),
+            inputs = [Array::scalar(0.7)],
+            expected = Array::scalar(0.7f64.exp()),
         );
     }
 
@@ -190,15 +204,6 @@ mod tests {
                 in (%2, %5)
             "}
             .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_exp_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = ExpOperation::new(),
-            inputs = [Array::scalar(0.7)],
-            expected = Array::scalar(0.7f64.exp()),
         );
     }
 

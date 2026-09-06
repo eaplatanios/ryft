@@ -8,16 +8,16 @@ use crate::batching::{
     ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain};
-use crate::differentiation::DifferentiationError;
-use crate::differentiation::batching::CotangentBatchingPolicy;
-use crate::differentiation::forward::{DifferentiableOperation, DifferentiationDriver, DifferentiationDual};
-use crate::differentiation::types::DifferentiableType;
-use crate::differentiation::zeros::ResidualZeroProvider;
+use crate::differentiation::{
+    CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, ResidualZeroProvider,
+};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
     check_count, check_types, impl_non_transposable_operation, impl_reference_free_dischargeable_operation,
 };
-use crate::operations::Zero;
+use crate::operations::constants::zero::Zero;
+use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
@@ -27,8 +27,7 @@ use crate::programs::{
 use crate::tracing::{DomainTracer, Trace};
 
 use super::{
-    LinearCallOperation, validate_custom_derivative_reference_boundary, validate_custom_derivative_replay,
-    validate_non_differentiated_count,
+    validate_custom_derivative_reference_boundary, validate_custom_derivative_replay, validate_non_differentiated_count,
 };
 
 /// Canonical operation name for [`CustomVjpOperation`].
@@ -547,7 +546,7 @@ where
 
         // Replay the forward region on the dual primals, recovering the primal outputs followed by the residuals.
         let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let mut forward_outputs = forward_region.interpret_in_context(context, primal_operands, None)?;
+        let mut forward_outputs = forward_region.interpret_in_context(context, primal_operands)?;
         if forward_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "{} forward region produced {} outputs which is fewer than its {} primal output(s)",
@@ -793,7 +792,7 @@ where
 /// A custom VJP is reverse-mode only: forward-mode differentiation of a staged call is rejected, and the current
 /// transpose implementation also rejects transposing its generated pullback, so higher-order derivatives through a
 /// custom VJP are not yet supported. When the function is forward-differentiable or must participate in higher-order
-/// differentiation, use [`custom_jvp`](fn@crate::differentiation::custom_jvp) instead.
+/// differentiation, use [`custom_jvp`](fn@crate::operations::differentiation::custom_jvp::custom_jvp) instead.
 ///
 /// # Calling convention
 ///
@@ -858,19 +857,22 @@ mod tests {
     };
     use crate::batching::{Batch, BatchAxis, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::{Context, EagerContext};
-    use crate::differentiation::operations::tests::{
-        ReferenceRuleDifferentiationDriver, array_ir_identity_program, nested_custom_derivative_state_program,
-    };
     use crate::differentiation::{
         CotangentDestination, CotangentSeed, Differentiate, ForwardModeDifferentiate, LinearizationTracer,
         ReverseModeDifferentiate, differentiate_at,
     };
-    use crate::operations::{Cos, CosOperation, MulOperation, Reduce, ReductionKind, Sin, SinOperation};
+    use crate::operations::differentiation::tests::{
+        ReferenceRuleDifferentiationDriver, array_ir_identity_program, nested_custom_derivative_state_program,
+    };
+    use crate::operations::math::cos::{Cos, CosOperation};
+    use crate::operations::math::mul::MulOperation;
+    use crate::operations::math::reduce::{Reduce, ReductionKind};
+    use crate::operations::math::sin::{Sin, SinOperation};
+    use crate::operations::references::{ReferenceNew, ReferenceRead, ReferenceWrite};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::{
-        EffectClass, EffectClasses, Program, ProgramBuilder, ReferenceNew, ReferenceRead, ReferenceType,
-        ReferenceWrite, RegionRole, ValueProjection,
+        EffectClass, EffectClasses, Program, ProgramBuilder, ReferenceType, RegionRole, ValueProjection,
     };
 
     use super::*;

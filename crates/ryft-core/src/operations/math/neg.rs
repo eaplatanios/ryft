@@ -102,44 +102,7 @@ mod tests {
 
     #[test]
     fn test_neg() {
-        let operation = NegOperation::<ArrayType>::new();
-
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Array::scalar(2.0)],
-            ),
-            Ok(vec![Array::scalar(-2.0)]),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Array::scalar(1u8)],
-            ),
-            Ok(vec![Array::scalar(u8::MAX)]),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &NegOperation::<ArrayType>::new(),
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Array::scalar(2.0)],
-            ),
-            Ok(vec![Array::scalar(-2.0)]),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Array::scalar(Complex::new(1.0f64, -2.0))],
-            ),
-            Ok(vec![Array::scalar(Complex::new(-1.0f64, 2.0))]),
-        );
+        assert_eq!(NegOperation::<ArrayType>::new().to_string(), "neg");
     }
 
     #[test]
@@ -199,6 +162,57 @@ mod tests {
     }
 
     #[test]
+    fn test_neg_interpretation() {
+        let operation = NegOperation::<ArrayType>::new();
+
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(2.0)],
+            ),
+            Ok(vec![Array::scalar(-2.0)]),
+        );
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(1u8)],
+            ),
+            Ok(vec![Array::scalar(u8::MAX)]),
+        );
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &NegOperation::<ArrayType>::new(),
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(2.0)],
+            ),
+            Ok(vec![Array::scalar(-2.0)]),
+        );
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(Complex::new(1.0f64, -2.0))],
+            ),
+            Ok(vec![Array::scalar(Complex::new(-1.0f64, 2.0))]),
+        );
+    }
+
+    #[test]
+    fn test_neg_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = NegOperation::new(),
+            inputs = [Array::scalar(2.0)],
+            expected = Array::scalar(-2.0),
+        );
+    }
+
+    #[test]
     fn test_neg_batching() {
         check_operation_batching!(
             @approx(epsilon = 1e-9),
@@ -228,15 +242,6 @@ mod tests {
                     in (%2, %3)
                 "},
             }],
-        );
-    }
-
-    #[test]
-    fn test_neg_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = NegOperation::new(),
-            inputs = [Array::scalar(2.0)],
-            expected = Array::scalar(-2.0),
         );
     }
 

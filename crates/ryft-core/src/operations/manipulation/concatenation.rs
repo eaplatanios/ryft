@@ -16,14 +16,15 @@ use crate::batching::{
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    ElementwiseDerivativeAlignment, LinearCallOperation, ResidualZeroProvider, TransposableOperation,
-    TranspositionContext, TranspositionDriver, transpose_projected_operation,
+    ElementwiseDerivativeAlignment, ResidualZeroProvider, TransposableOperation, TranspositionContext,
+    TranspositionDriver, transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_free_dischargeable_operation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::constants::zero_like::ZeroLikeOperation;
+use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_add::DimensionAddOperation;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcastOperation};
@@ -293,95 +294,123 @@ where
 {
 }
 
-impl_reference_free_dischargeable_operation!(<T> ConcatenateOperation<T> where T: Type);
+impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>, P: ArrayBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatching<P>> for ConcatenateOperation<ArrayType>
+where
+    ConcatenateOperation<ArrayType>: InterpretableOperation<C>,
+{
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+        &self,
+        context: &BatchingContext<C, ArrayBatching<P>>,
+        _driver: &D,
+        inputs: &[ArrayBatch<C::Value>],
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+        // Align all operands on one physical batch axis (replicated operands are broadcast to gain it via
+        // `ArrayBatch::match_axis`, so each batch item concatenates its own operands), and shift the concatenated
+        // axis past the inserted batch axis when the batch axis sits at or before it. When no operand is batched,
+        // the operation passes through unchanged.
+        if inputs.is_empty() {
+            return Err(TypeError::invalid(format!(
+                "`{CONCATENATE_OPERATION_NAME}` expects at least one operand but got none",
+            ))
+            .into());
+        }
+        let Some(batch_axis) = inputs.iter().find_map(ArrayBatch::batch_axis_position) else {
+            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
+        };
+        let materialized = inputs
+            .iter()
+            .map(|input| P::match_axis(context, input, Axis::from(batch_axis)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let lifted_axis = if batch_axis <= self.axis() { self.axis() + 1 } else { self.axis() };
+        Ok(ConcatenateOperation::new(lifted_axis, materialized[0].r#type().rank())?
+            .interpret_with_batch_axes(context, materialized.as_slice(), &[BatchAxis::from_position(batch_axis)])?
+            .into())
+    }
+}
 
-impl_differentiable_operation! {
-    ConcatenateOperation<ArrayType>,
-    jvp<C>
-    where
-        C: Context<Type = ArrayType, Value: Concatenate, Operation: From<ConcatenateOperation<ArrayType>>>
-            + Zero<C::Value>,
-    {
-        |operation, context, _driver, inputs| {
-            // Forward-mode rule for `ConcatenateOperation`. Concatenation is linear in every input, so its tangent
-            // concatenates the input tangents along the same axis. Materialize structural zeros because concatenation
-            // needs one concrete tangent per input; the shared all-zero fast path has already handled that case.
-            let tangents = inputs
-                .iter()
-                .map(|dual| dual.tangent().clone().materialize(context))
-                .collect::<Result<Vec<_>, _>>()?;
-            let primal = Concatenate::concatenate(inputs.iter().map(DifferentiationDual::primal), operation.axis())?;
-            let tangent = Concatenate::concatenate(&tangents, operation.axis())?;
-            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+// Batching rule for mixed [`ConcatenateOperation<ArrayIrType>`] instructions. The trailing result extent stays
+// replicated, while array operands are aligned on one physical mapped axis before concatenation.
+impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatching> for ConcatenateOperation<ArrayIrType>
+where
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Value: ValueProjection<ArrayType, Projected: Broadcast + Transpose + Value<Type = ArrayType>>,
+    C::Operation: From<ConcatenateOperation<ArrayIrType>>
+        + From<DynamicBroadcastOperation>
+        + From<ConstantOperation<DimensionValue>>
+        + From<DimensionSizeOperation>
+        + OperationProjection<ArrayType>,
+{
+    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
+        &self,
+        context: &BatchingContext<C, ArrayIrBatching>,
+        _driver: &D,
+        inputs: &[ArrayIrBatch<C::Value>],
+    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
+        let Some((result_extent, inputs)) = inputs.split_last() else {
+            return Err(TypeError::invalid(format!(
+                "`{CONCATENATE_OPERATION_NAME}` expects at least one array followed by its result extent",
+            ))
+            .into());
+        };
+        if inputs.is_empty() {
+            return match result_extent.unbatched_type() {
+                ArrayIrType::Array(_) => Err(TypeError::invalid(format!(
+                    "`{CONCATENATE_OPERATION_NAME}` expects a trailing result-extent dimension",
+                ))
+                .into()),
+                ArrayIrType::Dimension(_) => Err(TypeError::invalid(format!(
+                    "`{CONCATENATE_OPERATION_NAME}` expects at least one array before its result extent",
+                ))
+                .into()),
+                ArrayIrType::Reference(_) => Err(TypeError::invalid(format!(
+                    "`{CONCATENATE_OPERATION_NAME}` expects a trailing result-extent dimension",
+                ))
+                .into()),
+            };
         }
-    },
-    transpose<V, O>
-    where
-        V: Value<Type = ArrayType>,
-        O: Operation<Type = ArrayType> + From<SliceOperation>,
-        Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
-    {
-        |operation, context, _driver, inputs, outputs| {
-            // Transposition rule for `ConcatenateOperation`. The forward map lays its inputs end to end, so its
-            // pullback slices the output cotangent at cumulative input offsets. The concatenated input dimensions must
-            // be static so those offsets are known. Symbolic-zero cotangents remain symbolic for every input.
-            check_count!("output", outputs, 1, ProgramError);
-            if inputs.is_empty() {
-                return Err(TypeError::invalid(format!(
-                    "`{}` transpose expects at least one operand but got none",
-                    CONCATENATE_OPERATION_NAME,
-                )).into());
-            }
-            let axis = operation.axis();
-            match &outputs[0] {
-                MaybeZero::Zero(_) => inputs
-                    .iter()
-                    .map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?)))
-                    .collect(),
-                MaybeZero::Value(cotangent) => {
-                    let rank = inputs[0].r#type().rank();
-                    let mut offset = 0usize;
-                    let mut input_cotangents = Vec::with_capacity(inputs.len());
-                    for (index, input) in inputs.iter().enumerate() {
-                        let input_type = input.r#type();
-                        let dimension = input_type.dimension(axis);
-                        let Dimension::Static(input_axis_size) = dimension else {
-                            return Err(TypeError::invalid(format!(
-                                    "`{CONCATENATE_OPERATION_NAME}` transpose requires a static size along the \
-                                    concatenated axis {axis} but operand {index} has size {dimension}",
-                                ))
-                            .into());
-                        };
-                        let mut start_indices = vec![0usize; rank];
-                        let mut limit_indices = input_type
-                            .shape()
-                            .dimensions()
-                            .iter()
-                            .enumerate()
-                            .map(|(other_axis, dimension)| {
-                                dimension.value().ok_or_else(|| {
-                                    TypeError::invalid(format!(
-                                        "`{CONCATENATE_OPERATION_NAME}` transpose requires a static size on axis \
-                                         {other_axis} but operand {index} has size {dimension}",
-                                    ))
-                                })
-                            })
-                            .collect::<Result<Vec<_>, _>>()?;
-                        start_indices[axis] = offset;
-                        limit_indices[axis] = offset + input_axis_size;
-                        let slice = SliceOperation::new(start_indices, limit_indices);
-                        let outputs = context.stage_operation(slice, Vec::new(), std::slice::from_ref(cotangent))?;
-                        check_count!("output", outputs, 1, ProgramError);
-                        let input_cotangent =
-                            outputs.into_iter().next().unwrap().unalign_cotangent(&input_type.cotangent()?)?;
-                        input_cotangents.push(MaybeZero::Value(input_cotangent));
-                        offset += input_axis_size;
-                    }
-                    Ok(input_cotangents)
-                }
-            }
-        }
-    },
+        // A mapped extent would authorize a different output shape for each batch item, which requires a ragged
+        // representation. Concatenate therefore accepts only one replicated result extent.
+        result_extent.validate_replicated_dimension()?;
+
+        let Some(batch_axis) = inputs.iter().find_map(ArrayIrBatch::batch_axis_position) else {
+            return Ok(context
+                .parent()
+                .bind(
+                    self.clone(),
+                    Vec::new(),
+                    &inputs
+                        .iter()
+                        .chain(std::iter::once(result_extent))
+                        .map(|input| input.value().clone())
+                        .collect::<Vec<_>>(),
+                )?
+                .into_iter()
+                .map(ArrayIrBatch::replicated)
+                .collect::<Vec<_>>()
+                .into());
+        };
+
+        // Align every packed array on one mapped axis. Replicated operands gain that axis using the transform's
+        // declared sharding, so each batch item concatenates the corresponding per-item arrays.
+        let aligned_inputs = inputs
+            .iter()
+            .cloned()
+            .map(|input| align_array_batch(context, input, Axis::from(batch_axis)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let lifted_axis = if batch_axis <= self.axis() { self.axis() + 1 } else { self.axis() };
+        let mut lifted_inputs = aligned_inputs.into_iter().map(ArrayIrBatch::into_value).collect::<Vec<_>>();
+        lifted_inputs.push(result_extent.value().clone());
+        let input_types = lifted_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
+        let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(lifted_axis, &input_types)?;
+        Ok(context
+            .parent()
+            .bind(operation, Vec::new(), lifted_inputs.as_slice())?
+            .into_iter()
+            .map(|output| ArrayIrBatch::new(output, BatchAxis::from_position(batch_axis)))
+            .collect::<Result<Vec<_>, _>>()?
+            .into())
+    }
 }
 
 // Forward-mode rule for mixed array IR concatenation. The trailing result-extent operand is an ordinary
@@ -532,6 +561,95 @@ where
         };
         Ok(vec![DifferentiationDual::new(primal, tangent)?])
     }
+}
+
+impl_differentiable_operation! {
+    ConcatenateOperation<ArrayType>,
+    jvp<C>
+    where
+        C: Context<Type = ArrayType, Value: Concatenate, Operation: From<ConcatenateOperation<ArrayType>>>
+            + Zero<C::Value>,
+    {
+        |operation, context, _driver, inputs| {
+            // Forward-mode rule for `ConcatenateOperation`. Concatenation is linear in every input, so its tangent
+            // concatenates the input tangents along the same axis. Materialize structural zeros because concatenation
+            // needs one concrete tangent per input; the shared all-zero fast path has already handled that case.
+            let tangents = inputs
+                .iter()
+                .map(|dual| dual.tangent().clone().materialize(context))
+                .collect::<Result<Vec<_>, _>>()?;
+            let primal = Concatenate::concatenate(inputs.iter().map(DifferentiationDual::primal), operation.axis())?;
+            let tangent = Concatenate::concatenate(&tangents, operation.axis())?;
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
+        }
+    },
+    transpose<V, O>
+    where
+        V: Value<Type = ArrayType>,
+        O: Operation<Type = ArrayType> + From<SliceOperation>,
+        Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
+    {
+        |operation, context, _driver, inputs, outputs| {
+            // Transposition rule for `ConcatenateOperation`. The forward map lays its inputs end to end, so its
+            // pullback slices the output cotangent at cumulative input offsets. The concatenated input dimensions must
+            // be static so those offsets are known. Symbolic-zero cotangents remain symbolic for every input.
+            check_count!("output", outputs, 1, ProgramError);
+            if inputs.is_empty() {
+                return Err(TypeError::invalid(format!(
+                    "`{}` transpose expects at least one operand but got none",
+                    CONCATENATE_OPERATION_NAME,
+                )).into());
+            }
+            let axis = operation.axis();
+            match &outputs[0] {
+                MaybeZero::Zero(_) => inputs
+                    .iter()
+                    .map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?)))
+                    .collect(),
+                MaybeZero::Value(cotangent) => {
+                    let rank = inputs[0].r#type().rank();
+                    let mut offset = 0usize;
+                    let mut input_cotangents = Vec::with_capacity(inputs.len());
+                    for (index, input) in inputs.iter().enumerate() {
+                        let input_type = input.r#type();
+                        let dimension = input_type.dimension(axis);
+                        let Dimension::Static(input_axis_size) = dimension else {
+                            return Err(TypeError::invalid(format!(
+                                    "`{CONCATENATE_OPERATION_NAME}` transpose requires a static size along the \
+                                    concatenated axis {axis} but operand {index} has size {dimension}",
+                                ))
+                            .into());
+                        };
+                        let mut start_indices = vec![0usize; rank];
+                        let mut limit_indices = input_type
+                            .shape()
+                            .dimensions()
+                            .iter()
+                            .enumerate()
+                            .map(|(other_axis, dimension)| {
+                                dimension.value().ok_or_else(|| {
+                                    TypeError::invalid(format!(
+                                        "`{CONCATENATE_OPERATION_NAME}` transpose requires a static size on axis \
+                                         {other_axis} but operand {index} has size {dimension}",
+                                    ))
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        start_indices[axis] = offset;
+                        limit_indices[axis] = offset + input_axis_size;
+                        let slice = SliceOperation::new(start_indices, limit_indices);
+                        let outputs = context.stage_operation(slice, Vec::new(), std::slice::from_ref(cotangent))?;
+                        check_count!("output", outputs, 1, ProgramError);
+                        let input_cotangent =
+                            outputs.into_iter().next().unwrap().unalign_cotangent(&input_type.cotangent()?)?;
+                        input_cotangents.push(MaybeZero::Value(input_cotangent));
+                        offset += input_axis_size;
+                    }
+                    Ok(input_cotangents)
+                }
+            }
+        }
+    },
 }
 
 // Direct transposition rule for mixed array IR concatenation. The explicit result extent receives a structural-zero
@@ -710,124 +828,7 @@ where
     }
 }
 
-impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>, P: ArrayBatchingPolicy<C>>
-    BatchableOperation<C, ArrayBatching<P>> for ConcatenateOperation<ArrayType>
-where
-    ConcatenateOperation<ArrayType>: InterpretableOperation<C>,
-{
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
-        &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
-        _driver: &D,
-        inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
-        // Align all operands on one physical batch axis (replicated operands are broadcast to gain it via
-        // `ArrayBatch::match_axis`, so each batch item concatenates its own operands), and shift the concatenated
-        // axis past the inserted batch axis when the batch axis sits at or before it. When no operand is batched,
-        // the operation passes through unchanged.
-        if inputs.is_empty() {
-            return Err(TypeError::invalid(format!(
-                "`{CONCATENATE_OPERATION_NAME}` expects at least one operand but got none",
-            ))
-            .into());
-        }
-        let Some(batch_axis) = inputs.iter().find_map(ArrayBatch::batch_axis_position) else {
-            return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
-        };
-        let materialized = inputs
-            .iter()
-            .map(|input| P::match_axis(context, input, Axis::from(batch_axis)))
-            .collect::<Result<Vec<_>, _>>()?;
-        let lifted_axis = if batch_axis <= self.axis() { self.axis() + 1 } else { self.axis() };
-        Ok(ConcatenateOperation::new(lifted_axis, materialized[0].r#type().rank())?
-            .interpret_with_batch_axes(context, materialized.as_slice(), &[BatchAxis::from_position(batch_axis)])?
-            .into())
-    }
-}
-
-// Batching rule for mixed [`ConcatenateOperation<ArrayIrType>`] instructions. The trailing result extent stays
-// replicated, while array operands are aligned on one physical mapped axis before concatenation.
-impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatching> for ConcatenateOperation<ArrayIrType>
-where
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value: ValueProjection<ArrayType, Projected: Broadcast + Transpose + Value<Type = ArrayType>>,
-    C::Operation: From<ConcatenateOperation<ArrayIrType>>
-        + From<DynamicBroadcastOperation>
-        + From<ConstantOperation<DimensionValue>>
-        + From<DimensionSizeOperation>
-        + OperationProjection<ArrayType>,
-{
-    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
-        &self,
-        context: &BatchingContext<C, ArrayIrBatching>,
-        _driver: &D,
-        inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
-        let Some((result_extent, inputs)) = inputs.split_last() else {
-            return Err(TypeError::invalid(format!(
-                "`{CONCATENATE_OPERATION_NAME}` expects at least one array followed by its result extent",
-            ))
-            .into());
-        };
-        if inputs.is_empty() {
-            return match result_extent.unbatched_type() {
-                ArrayIrType::Array(_) => Err(TypeError::invalid(format!(
-                    "`{CONCATENATE_OPERATION_NAME}` expects a trailing result-extent dimension",
-                ))
-                .into()),
-                ArrayIrType::Dimension(_) => Err(TypeError::invalid(format!(
-                    "`{CONCATENATE_OPERATION_NAME}` expects at least one array before its result extent",
-                ))
-                .into()),
-                ArrayIrType::Reference(_) => Err(TypeError::invalid(format!(
-                    "`{CONCATENATE_OPERATION_NAME}` expects a trailing result-extent dimension",
-                ))
-                .into()),
-            };
-        }
-        // A mapped extent would authorize a different output shape for each batch item, which requires a ragged
-        // representation. Concatenate therefore accepts only one replicated result extent.
-        result_extent.validate_replicated_dimension()?;
-
-        let Some(batch_axis) = inputs.iter().find_map(ArrayIrBatch::batch_axis_position) else {
-            return Ok(context
-                .parent()
-                .bind(
-                    self.clone(),
-                    Vec::new(),
-                    &inputs
-                        .iter()
-                        .chain(std::iter::once(result_extent))
-                        .map(|input| input.value().clone())
-                        .collect::<Vec<_>>(),
-                )?
-                .into_iter()
-                .map(ArrayIrBatch::replicated)
-                .collect::<Vec<_>>()
-                .into());
-        };
-
-        // Align every packed array on one mapped axis. Replicated operands gain that axis using the transform's
-        // declared sharding, so each batch item concatenates the corresponding per-item arrays.
-        let aligned_inputs = inputs
-            .iter()
-            .cloned()
-            .map(|input| align_array_batch(context, input, Axis::from(batch_axis)))
-            .collect::<Result<Vec<_>, _>>()?;
-        let lifted_axis = if batch_axis <= self.axis() { self.axis() + 1 } else { self.axis() };
-        let mut lifted_inputs = aligned_inputs.into_iter().map(ArrayIrBatch::into_value).collect::<Vec<_>>();
-        lifted_inputs.push(result_extent.value().clone());
-        let input_types = lifted_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
-        let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(lifted_axis, &input_types)?;
-        Ok(context
-            .parent()
-            .bind(operation, Vec::new(), lifted_inputs.as_slice())?
-            .into_iter()
-            .map(|output| ArrayIrBatch::new(output, BatchAxis::from_position(batch_axis)))
-            .collect::<Result<Vec<_>, _>>()?
-            .into())
-    }
-}
+impl_reference_free_dischargeable_operation!(<T> ConcatenateOperation<T> where T: Type);
 
 /// Represents the ability to join one or more arrays end to end along one axis. This is the direct analogue of JAX's
 /// [`lax.concatenate`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.concatenate.html) and has the semantics of

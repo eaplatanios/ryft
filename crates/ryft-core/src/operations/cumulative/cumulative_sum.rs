@@ -118,20 +118,6 @@ impl Operation for CumulativeSumOperation {
     }
 }
 
-/// Returns the output [`ArrayType`] of a cumulative sum of `input` along `axis`, layering the summation element
-/// data-type domain (real or complex numeric, plus the payload-free structural zero) onto the geometry validated by
-/// [`cumulative_abstract`]. The eager kernel and the operation's type inference share this rule, so a directly
-/// invoked [`CumulativeSum`] capability rejects exactly what a staged program rejects.
-pub(crate) fn cumulative_sum_abstract(input: &ArrayType, axis: usize) -> Result<ArrayType, TypeError> {
-    let data_type = input.data_type();
-    if !data_type.is_numeric() && data_type != DataType::Zero {
-        return Err(TypeError::invalid(format!(
-            "`{CUMULATIVE_SUM_OPERATION_NAME}` requires numeric inputs but got {data_type}"
-        )));
-    }
-    cumulative_abstract(input, axis, CUMULATIVE_SUM_OPERATION_NAME)
-}
-
 impl<C: Domain<Type = ArrayType, Value: CumulativeSum>> InterpretableOperation<C> for CumulativeSumOperation {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -291,6 +277,20 @@ where
     }
 }
 
+/// Returns the output [`ArrayType`] of a cumulative sum of `input` along `axis`, layering the summation element
+/// data-type domain (real or complex numeric, plus the payload-free structural zero) onto the geometry validated by
+/// [`cumulative_abstract`]. The eager kernel and the operation's type inference share this rule, so a directly
+/// invoked [`CumulativeSum`] capability rejects exactly what a staged program rejects.
+pub(crate) fn cumulative_sum_abstract(input: &ArrayType, axis: usize) -> Result<ArrayType, TypeError> {
+    let data_type = input.data_type();
+    if !data_type.is_numeric() && data_type != DataType::Zero {
+        return Err(TypeError::invalid(format!(
+            "`{CUMULATIVE_SUM_OPERATION_NAME}` requires numeric inputs but got {data_type}"
+        )));
+    }
+    cumulative_abstract(input, axis, CUMULATIVE_SUM_OPERATION_NAME)
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
@@ -310,7 +310,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_cumulative_sum_operation_type_inference() {
+    fn test_cumulative_sum() {
+        // The scan direction renders only when it is set, keeping the common forward scan compact.
+        assert_eq!(CumulativeSumOperation::new(1).to_string(), "cumulative_sum [axis=1]");
+        assert_eq!(
+            CumulativeSumOperation::new(0).with_reverse(true).to_string(),
+            "cumulative_sum [axis=0, reverse=true]",
+        );
+        assert_eq!(CumulativeSumOperation::new(0).with_reverse(false), CumulativeSumOperation::new(0));
+    }
+
+    #[test]
+    fn test_cumulative_sum_type_inference() {
         // The output type follows the staged input type exactly, and complex payloads are accepted alongside the
         // real numeric ones.
         let operation = CumulativeSumOperation::new(1);
@@ -358,18 +369,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cumulative_sum_operation_rendering() {
-        // The scan direction renders only when it is set, keeping the common forward scan compact.
-        assert_eq!(CumulativeSumOperation::new(1).to_string(), "cumulative_sum [axis=1]");
-        assert_eq!(
-            CumulativeSumOperation::new(0).with_reverse(true).to_string(),
-            "cumulative_sum [axis=0, reverse=true]",
-        );
-        assert_eq!(CumulativeSumOperation::new(0).with_reverse(false), CumulativeSumOperation::new(0));
-    }
-
-    #[test]
-    fn test_cumulative_sum_operation_interpretation() {
+    fn test_cumulative_sum_interpretation() {
         let context = EagerContext::<Array>::new();
         let interpret = |operation: &CumulativeSumOperation, input: &Array| {
             operation.interpret(&context, &EmptyRegionDriver, std::slice::from_ref(input)).unwrap().remove(0)
@@ -419,35 +419,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cumulative_sum_capability_over_eager_arrays() {
-        // The capability is the receiver-style entry point of the same kernel, in both scan directions, and it
-        // reports the operation's own validation errors instead of panicking.
-        let input = Array::vector(vec![1.0, 2.0, 3.0]);
-        assert_eq!(input.cumulative_sum(0), Ok(Array::vector(vec![1.0, 3.0, 6.0])));
-        assert_eq!(input.reverse_cumulative_sum(0), Ok(Array::vector(vec![6.0, 5.0, 3.0])));
-        assert_eq!(
-            input.cumulative_sum(1),
-            Err(ProgramError::Type(TypeError::invalid(
-                "`cumulative_sum` axis 1 is out of bounds for rank 1".to_string(),
-            ))),
-        );
-    }
-
-    #[test]
-    fn test_cumulative_sum_operation_batches_replicated_input_as_pass_through() {
-        check_operation_batching!(
-            @exact,
-            operation = CumulativeSumOperation::new(0),
-            axis_size = 2,
-            cases = [{
-                inputs = [(@replicated, Array::vector(vec![1.0, 2.0, 3.0]))],
-                outputs = [(@replicated, Array::vector(vec![1.0, 3.0, 6.0]))],
-            }],
-        );
-    }
-
-    #[test]
-    fn test_cumulative_sum_operation_batches_along_the_shifted_axis() {
+    fn test_cumulative_sum_batching() {
         // Physical input is [2 batch items, 3 columns] mapped at axis 0, so the per-item axis 0 scans physical axis
         // 1 and each batch item accumulates independently.
         check_operation_batching!(
@@ -473,7 +445,20 @@ mod tests {
     }
 
     #[test]
-    fn test_cumulative_sum_operation_passes_ragged_axes_through_unmasked() {
+    fn test_cumulative_sum_batches_replicated_input_as_pass_through() {
+        check_operation_batching!(
+            @exact,
+            operation = CumulativeSumOperation::new(0),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@replicated, Array::vector(vec![1.0, 2.0, 3.0]))],
+                outputs = [(@replicated, Array::vector(vec![1.0, 3.0, 6.0]))],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_cumulative_sum_passes_ragged_axes_through_unmasked() {
         // Per item, a ragged `[length]` row is scanned along its dense trailing axis, so the ragged axis is not the
         // scanned one: nothing needs masking, the axis rides through onto the result unchanged, and — because the
         // scan consumes no axis — the rule claims no consumption evidence.
@@ -500,7 +485,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cumulative_sum_operation_masks_ragged_padding_on_the_scanned_axis() {
+    fn test_cumulative_sum_masks_ragged_padding_on_the_scanned_axis() {
         // Scanning a ragged axis would accumulate its padding into every later live prefix, so the rule asks the
         // policy to neutralize that padding first. Static array batching cannot, and says so rather than silently
         // scanning padding.
@@ -585,7 +570,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cumulative_sum_operation_differentiation() {
+    fn test_cumulative_sum_differentiation() {
         // The primitive is linear, so the tangent is the same scan of the operand tangent in both directions.
         check_operation_differentiation!(
             @approx(step = 0.125, epsilon = 1e-6),
@@ -610,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn test_cumulative_sum_operation_transposition_flips_the_scan_direction() {
+    fn test_cumulative_sum_transposition_flips_the_scan_direction() {
         // The adjoint of a forward prefix sum is a reverse prefix sum of the output cotangent, staged as the same
         // primitive with its `reverse` flag flipped, and vice versa.
         check_operation_transposition!(
@@ -640,6 +625,21 @@ mod tests {
                     in (%1)
                 "},
             }],
+        );
+    }
+
+    #[test]
+    fn test_cumulative_sum_capability_over_eager_arrays() {
+        // The capability is the receiver-style entry point of the same kernel, in both scan directions, and it
+        // reports the operation's own validation errors instead of panicking.
+        let input = Array::vector(vec![1.0, 2.0, 3.0]);
+        assert_eq!(input.cumulative_sum(0), Ok(Array::vector(vec![1.0, 3.0, 6.0])));
+        assert_eq!(input.reverse_cumulative_sum(0), Ok(Array::vector(vec![6.0, 5.0, 3.0])));
+        assert_eq!(
+            input.cumulative_sum(1),
+            Err(ProgramError::Type(TypeError::invalid(
+                "`cumulative_sum` axis 1 is out of bounds for rank 1".to_string(),
+            ))),
         );
     }
 }

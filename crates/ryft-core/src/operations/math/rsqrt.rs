@@ -80,21 +80,7 @@ mod tests {
 
     #[test]
     fn test_rsqrt() {
-        assert_eq!(Array::scalar(0.5f32).rsqrt().unwrap(), Array::scalar(1.0 / 0.5f32.sqrt()));
-        assert_eq!(Array::scalar(0.5f64).rsqrt().unwrap(), Array::scalar(1.0 / 0.5f64.sqrt()));
-        assert_eq!(
-            Array::scalar(bf16::from_f32(0.5)).rsqrt().unwrap(),
-            Array::scalar(bf16::from_f32(1.0 / 0.5f32.sqrt())),
-        );
-        assert_eq!(
-            Array::scalar(f16::from_f32(0.5)).rsqrt().unwrap(),
-            Array::scalar(f16::from_f32(1.0 / 0.5f32.sqrt())),
-        );
-        let input = ComplexNumber::new(0.7f64, -0.3f64);
-        let expected = ComplexNumber::new(1.0, 0.0) / input.sqrt();
-        assert_abs_diff_eq!(Array::scalar(input).rsqrt().unwrap(), Array::scalar(expected), epsilon = 1e-12);
-
-        assert_eq!(Array::scalar(4.0).rsqrt().unwrap(), Array::scalar(0.5),);
+        assert_eq!(RsqrtOperation::<ArrayType>::new().to_string(), "rsqrt");
     }
 
     #[test]
@@ -117,6 +103,34 @@ mod tests {
             @reject @unreduced,
             operation = RsqrtOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_rsqrt_interpretation() {
+        assert_eq!(Array::scalar(0.5f32).rsqrt().unwrap(), Array::scalar(1.0 / 0.5f32.sqrt()));
+        assert_eq!(Array::scalar(0.5f64).rsqrt().unwrap(), Array::scalar(1.0 / 0.5f64.sqrt()));
+        assert_eq!(
+            Array::scalar(bf16::from_f32(0.5)).rsqrt().unwrap(),
+            Array::scalar(bf16::from_f32(1.0 / 0.5f32.sqrt())),
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(0.5)).rsqrt().unwrap(),
+            Array::scalar(f16::from_f32(1.0 / 0.5f32.sqrt())),
+        );
+        let input = ComplexNumber::new(0.7f64, -0.3f64);
+        let expected = ComplexNumber::new(1.0, 0.0) / input.sqrt();
+        assert_abs_diff_eq!(Array::scalar(input).rsqrt().unwrap(), Array::scalar(expected), epsilon = 1e-12);
+
+        assert_eq!(Array::scalar(4.0).rsqrt().unwrap(), Array::scalar(0.5),);
+    }
+
+    #[test]
+    fn test_rsqrt_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = RsqrtOperation::new(),
+            inputs = [Array::scalar(4.0)],
+            expected = Array::scalar(0.5),
         );
     }
 
@@ -160,15 +174,6 @@ mod tests {
                 .gradient(|input| { input.rsqrt().unwrap() })
                 .unwrap(),
             epsilon = 1e-12,
-        );
-    }
-
-    #[test]
-    fn test_rsqrt_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = RsqrtOperation::new(),
-            inputs = [Array::scalar(4.0)],
-            expected = Array::scalar(0.5),
         );
     }
 

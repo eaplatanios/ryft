@@ -245,8 +245,9 @@ mod tests {
     use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, batch};
     use crate::contexts::EagerContext;
     use crate::differentiation::differentiate_at;
+    use crate::macros::check_operation_partial_evaluation;
     use crate::operations::dot::{Dot, DotDimensionNumbers};
-    use crate::programs::Typed;
+    use crate::programs::{EmptyRegionDriver, Typed};
     use crate::tracing::Trace;
 
     use super::*;
@@ -262,19 +263,29 @@ mod tests {
     }
 
     #[test]
-    fn test_transfer_to_memory_operation() {
+    fn test_transfer_to_memory() {
         let operation = TransferToMemoryOperation::new(PINNED_HOST);
         assert_eq!(operation.name(), TRANSFER_TO_MEMORY_OPERATION_NAME);
         assert_eq!(operation.destination(), PINNED_HOST);
         assert_eq!(operation.to_string(), "transfer_to_memory [destination=Host[Pinned]]");
+    }
+
+    #[test]
+    fn test_transfer_to_memory_type_inference() {
+        let operation = TransferToMemoryOperation::new(PINNED_HOST);
         let inferred = operation.infer_output_types(&[vector_type(2)], &[]).unwrap();
         assert_eq!(inferred, vec![vector_type(2).with_memory(PINNED_HOST)]);
         assert!(operation.infer_output_types(&[], &[]).is_err());
+    }
+
+    #[test]
+    fn test_transfer_to_memory_interpretation() {
+        let operation = TransferToMemoryOperation::new(PINNED_HOST);
         // Eager domains have no memory hierarchy, so interpretation keeps the payload unchanged while re-placing
         // the value's carried type in the destination so that it matches the declared output type.
         let input = Array::vector(vec![1.0, 2.0]);
         let outputs = operation
-            .interpret(&crate::EagerContext::<Array>::new(), &crate::EmptyRegionDriver, std::slice::from_ref(&input))
+            .interpret(&EagerContext::<Array>::new(), &EmptyRegionDriver, std::slice::from_ref(&input))
             .unwrap();
         assert_eq!(outputs, vec![input.transfer_to_memory(PINNED_HOST)]);
         assert_eq!(*outputs[0].r#type(), vector_type(2).with_memory(PINNED_HOST));
@@ -299,7 +310,17 @@ mod tests {
     }
 
     #[test]
-    fn test_transfer_to_memory_batching_preserves_the_operation_and_the_memory() {
+    fn test_transfer_to_memory_partial_evaluation() {
+        let input = Array::vector(vec![1.0, 2.0]);
+        check_operation_partial_evaluation!(
+            operation = TransferToMemoryOperation::new(PINNED_HOST),
+            inputs = [input.clone()],
+            expected = input.transfer_to_memory(PINNED_HOST),
+        );
+    }
+
+    #[test]
+    fn test_transfer_to_memory_batching() {
         // Batching over concrete values keeps the payload unchanged while re-placing the carried type in the
         // destination — exactly like interpretation — and preserves the batch axis.
         let input = {
@@ -309,11 +330,8 @@ mod tests {
         .unwrap();
         let operation = ArrayOperation::<Array>::TransferToMemory(TransferToMemoryOperation::new(PINNED_HOST));
         let context = BatchingContext::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
-        let outputs = operation
-            .batch(&context, &crate::EmptyRegionDriver, std::slice::from_ref(&input))
-            .unwrap()
-            .into_parts()
-            .0;
+        let outputs =
+            operation.batch(&context, &EmptyRegionDriver, std::slice::from_ref(&input)).unwrap().into_parts().0;
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value(), &input.value().transfer_to_memory(PINNED_HOST));
@@ -327,7 +345,7 @@ mod tests {
             .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1.0, 3.0]), variable, vec![0])])
             .unwrap();
         let ragged_outputs = operation
-            .batch(&context, &crate::EmptyRegionDriver, std::slice::from_ref(&ragged_input))
+            .batch(&context, &EmptyRegionDriver, std::slice::from_ref(&ragged_input))
             .unwrap()
             .into_parts()
             .0;
@@ -362,7 +380,7 @@ mod tests {
     }
 
     #[test]
-    fn test_transfer_to_memory_jvp_moves_the_primal_and_the_tangent() {
+    fn test_transfer_to_memory_differentiation() {
         // Eagerly the transfer is the identity on both the primal and the tangent.
         let (primal, tangent) = differentiate_at(Array::vector(vec![2.0, 3.0]))
             .jvp(Array::vector(vec![1.0, 0.5]), |x| Ok(x.transfer_to_memory(PINNED_HOST)))
@@ -372,7 +390,21 @@ mod tests {
     }
 
     #[test]
-    fn test_transfer_to_memory_transposition_moves_the_cotangent_back_to_the_source_memory() {
+    fn test_transfer_to_memory_round_trip_differentiates_like_the_identity() {
+        let (value, gradient) = differentiate_at(Array::vector(vec![0.5, 1.5]))
+            .value_and_gradient(|x| {
+                let on_host = x.transfer_to_memory(Memory::Host { pinned: false });
+                let back = on_host.transfer_to_memory(Memory::Device);
+                back.dot(&back, &DotDimensionNumbers::inner_product())
+            })
+            .unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], 2.5, epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[0], 1.0, epsilon = 1e-9);
+        assert_abs_diff_eq!(gradient.to_f64s()[1], 3.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_transfer_to_memory_transposition() {
         let (output, pullback) = differentiate_at(Array::vector(vec![2.0, 3.0]))
             .vjp(|x| Ok(x.transfer_to_memory(PINNED_HOST)))
             .unwrap();
@@ -394,19 +426,5 @@ mod tests {
         assert_eq!(destination, Memory::Device);
         let output_types: Vec<_> = pullback.outputs().map(|atom| atom.r#type().into_owned()).collect();
         assert_eq!(output_types, vec![vector_type(2)]);
-    }
-
-    #[test]
-    fn test_transfer_to_memory_round_trip_differentiates_like_the_identity() {
-        let (value, gradient) = differentiate_at(Array::vector(vec![0.5, 1.5]))
-            .value_and_gradient(|x| {
-                let on_host = x.transfer_to_memory(Memory::Host { pinned: false });
-                let back = on_host.transfer_to_memory(Memory::Device);
-                back.dot(&back, &DotDimensionNumbers::inner_product())
-            })
-            .unwrap();
-        assert_abs_diff_eq!(value.to_f64s()[0], 2.5, epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient.to_f64s()[0], 1.0, epsilon = 1e-9);
-        assert_abs_diff_eq!(gradient.to_f64s()[1], 3.0, epsilon = 1e-9);
     }
 }

@@ -8,15 +8,15 @@ use crate::batching::{
     ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain};
-use crate::differentiation::DifferentiationError;
-use crate::differentiation::forward::{DifferentiableOperation, DifferentiationDriver, DifferentiationDual};
-use crate::differentiation::types::DifferentiableType;
-use crate::differentiation::zeros::ResidualZeroProvider;
+use crate::differentiation::{
+    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
+    ResidualZeroProvider,
+};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
     check_count, check_types, impl_non_transposable_operation, impl_reference_free_dischargeable_operation,
 };
-use crate::operations::Zero;
+use crate::operations::constants::zero::Zero;
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
@@ -430,7 +430,7 @@ where
             )?);
         }
 
-        let mut outputs = jvp_region.interpret_in_context(context, jvp_inputs, None)?;
+        let mut outputs = jvp_region.interpret_in_context(context, jvp_inputs)?;
         check_count!("output", outputs, 2 * output_count, ProgramError);
         let tangents = outputs.split_off(output_count);
         Ok(outputs
@@ -616,7 +616,7 @@ fn without_non_differentiated_tangent_inputs<V: Value, O: Clone + Operation<Type
 /// `log`-`sum`-`exp`, a softmax, or a normalization, where a hand-written tangent avoids the cancellation or redundant
 /// work the generic rule incurs. A single custom JVP serves **both** differentiation modes: reverse mode obtains its
 /// gradient by transposing the supplied tangent map, so the one rule composes with forward mode, reverse mode, and
-/// their higher-order combinations. Prefer it over [`custom_vjp`](fn@crate::differentiation::custom_vjp) whenever the
+/// their higher-order combinations. Prefer it over [`custom_vjp`](fn@crate::operations::differentiation::custom_vjp::custom_vjp) whenever the
 /// function is naturally forward-differentiable, and use a custom VJP only when just the reverse rule is natural (for
 /// example implicit differentiation or adjoint solvers).
 ///
@@ -677,18 +677,20 @@ mod tests {
         Batch, BatchAxis, BatchingContext, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver,
     };
     use crate::contexts::{Context, EagerContext};
-    use crate::differentiation::operations::tests::{
+    use crate::differentiation::{Differentiate, ForwardModeDifferentiate, LinearizationTracer};
+    use crate::operations::differentiation::tests::{
         ReferenceRuleDifferentiationDriver, array_ir_identity_program, nested_custom_derivative_state_program,
     };
-    use crate::differentiation::{Differentiate, ForwardModeDifferentiate, LinearizationTracer};
-    use crate::operations::{
-        Cos, CosOperation, Dot, DotDimensionNumbers, MulOperation, Reduce, ReductionKind, Sin, SinOperation,
-    };
+    use crate::operations::dot::{Dot, DotDimensionNumbers};
+    use crate::operations::math::cos::{Cos, CosOperation};
+    use crate::operations::math::mul::MulOperation;
+    use crate::operations::math::reduce::{Reduce, ReductionKind};
+    use crate::operations::math::sin::{Sin, SinOperation};
+    use crate::operations::references::{ReferenceAddUpdate, ReferenceAddUpdateOperation};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::{
-        EffectClass, EffectClasses, FlatProgram, MaybeZero, ProgramBuilder, ReferenceAddUpdate,
-        ReferenceAddUpdateOperation, ReferenceType, RegionRole,
+        EffectClass, EffectClasses, FlatProgram, MaybeZero, ProgramBuilder, ReferenceType, RegionRole,
     };
 
     use super::*;

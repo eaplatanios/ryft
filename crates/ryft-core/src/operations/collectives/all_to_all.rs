@@ -19,12 +19,12 @@ use crate::batching::{
 use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    LinearCallOperation, MemberDifferentiableOperation, TransposableOperation, TranspositionContext,
-    TranspositionDriver,
+    MemberDifferentiableOperation, TransposableOperation, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
 use crate::operations::constants::constant::ConstantOperation;
+use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::DynamicBroadcastOperation;
@@ -287,7 +287,237 @@ impl AllToAllOperation {
     }
 }
 
+// Batching rule for [`AllToAllOperation`]. A matching `batch` level consumes the mapped batch axis with a
+// reshape/transpose block exchange: the per-item `split_axis` is split into `(b, d_p / b)` chunks, the chunk axis
+// is swapped with the leading batch axis (so the batch axis indexes the *receiving* item), and the sender axis is
+// then merged item-major into the per-item `concat_axis` — batch item `i` receives every item's chunk `i`,
+// concatenated along `concat_axis`. A non-matching level forwards the collective untouched to the parent context
+// via [`forward_collective_to_parent`].
+impl<C, P: CollectiveBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for AllToAllOperation
+where
+    C: Context<Type = ArrayType>,
+    C::Operation: From<AllToAllOperation>,
+    <C as Domain>::Value: Transpose,
+{
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+        &self,
+        context: &BatchingContext<C, ArrayBatching<P>>,
+        _driver: &D,
+        inputs: &[ArrayBatch<<C as Domain>::Value>],
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+        if let Some(ragged_axis) = inputs.iter().find_map(|input| input.ragged_axes().first()) {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "`all_to_all` cannot route bounded ragged dimension `{}` without explicit per-destination \
+                     offsets and sizes; use `ragged_all_to_all`",
+                    ragged_axis.dimension(),
+                ),
+            });
+        }
+        if context.axis_name() != Some(self.axis_name.as_str()) {
+            let [input] = inputs else {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
+            };
+            let Some(batch_axis) = input.batch_axis_position() else {
+                return Ok(forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs)?.into());
+            };
+            let (split_axis, concat_axis, output_batch_axis) =
+                forwarded_all_to_all_axes(self.options.mode, self.split_axis, self.concat_axis, batch_axis);
+            let operation =
+                Self::new(self.axis_name.clone(), self.axis_size, split_axis, concat_axis, self.options.clone());
+            return Ok(forward_shape_changing_collective(
+                context,
+                C::Operation::from(operation),
+                input,
+                Some(output_batch_axis),
+            )?
+            .into());
+        }
+        let [input] = inputs else {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
+        };
+        let input_type = input.unbatched_type();
+        let mut output_types = self.infer_output_types(std::slice::from_ref(&input_type), &[])?;
+        let output_type = output_types.remove(0);
+        let output_extents = output_type
+            .shape()
+            .dimensions()
+            .iter()
+            .map(|dimension| P::collective_extent_from_dimension(context, dimension))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(vec![batch_all_to_all_matching_axis::<C, P>(
+            self,
+            context,
+            input,
+            input_type.rank(),
+            output_extents,
+            output_type.sharding().cloned(),
+        )?]
+        .into())
+    }
+}
+
+shape_changing_collective!(@differentiation AllToAllOperation);
+
+// Transpose rule for [`AllToAllOperation`]: the chunk exchange is its own adjoint with the split and concatenation
+// axes swapped.
+impl<V, O> TransposableOperation<V, O> for AllToAllOperation
+where
+    V: Value<Type = ArrayType>,
+    O: Operation<Type = ArrayType> + From<AllToAllOperation>,
+{
+    fn transpose<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TranspositionContext<'_, V, O>,
+        _driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        transpose_shape_changing_collective(
+            context,
+            inputs,
+            outputs,
+            AllToAllOperation::new(
+                self.axis_name.clone(),
+                self.axis_size,
+                self.concat_axis,
+                self.split_axis,
+                self.options.clone(),
+            ),
+        )
+    }
+}
+
 impl_shape_changing_collective_member_operation!(AllToAllOperation, infer_explicit_all_to_all_output_types);
+
+// Batching rule for explicit-extent [`AllToAllOperation`]. Dimension SSA supplies its temporary split and merge
+// shapes directly, while matching-axis array mechanics reuse the homogeneous collective kernel.
+impl<C> MemberBatchableOperation<C, ArrayIrBatching> for AllToAllOperation
+where
+    C: Context<
+            Type = ArrayIrType,
+            Operation: From<AllToAllOperation>
+                           + From<DynamicBroadcastOperation>
+                           + From<ConstantOperation<DimensionValue>>
+                           + From<DimensionSizeOperation>
+                           + From<DynamicReshapeOperation>
+                           + OperationProjection<ArrayType>,
+        >,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Value:
+        ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>> + ValueProjection<DimensionType>,
+    <C::Value as ValueProjection<DimensionType>>::Projected:
+        DimensionRequirement + Div + Mul + Value<Type = DimensionType>,
+{
+    fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatching>>(
+        &self,
+        context: &BatchingContext<C, ArrayIrBatching>,
+        _driver: &D,
+        inputs: &[ArrayIrBatch<C::Value>],
+    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
+        let (array, output_extents) = explicit_collective_inputs(inputs)?;
+        if let Some(ragged_axis) = array.ragged_axes().first() {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "`all_to_all` cannot route bounded ragged dimension `{}` without explicit per-destination \
+                     offsets and sizes; use `ragged_all_to_all`",
+                    ragged_axis.dimension(),
+                ),
+            });
+        }
+        validate_explicit_collective_output_extents(output_extents)?;
+        let logical_input_types = inputs.iter().map(|input| input.unbatched_type().clone()).collect::<Vec<_>>();
+        let mut logical_output_types = infer_explicit_all_to_all_output_types(self, logical_input_types.as_slice())?;
+        let logical_output_type = <&ArrayType>::try_from(&logical_output_types.remove(0))?.clone();
+
+        if context.axis_name() != Some(self.axis_name()) {
+            if array.batch_axis().is_replicated() {
+                return Ok(forward_explicit_collective(self.clone(), context, array, output_extents, None)?.into());
+            }
+            let input_batch_axis = array.batch_axis_position().unwrap();
+            let (physical_split_axis, physical_concat_axis, output_batch_axis) = forwarded_all_to_all_axes(
+                self.options().mode(),
+                self.split_axis(),
+                self.concat_axis(),
+                input_batch_axis,
+            );
+            let operation = Self::new(
+                self.axis_name().to_string(),
+                self.axis_size(),
+                physical_split_axis,
+                physical_concat_axis,
+                self.options().clone(),
+            );
+            return Ok(forward_explicit_collective(
+                operation,
+                context,
+                array,
+                output_extents,
+                Some(output_batch_axis),
+            )?
+            .into());
+        }
+
+        let array = ArrayBatch::new(
+            <C::Value as ValueProjection<ArrayType>>::into_projected(array.value().clone())?,
+            array.batch_axis(),
+        )?;
+        let output_extents = output_extents
+            .iter()
+            .map(|extent| <C::Value as ValueProjection<DimensionType>>::into_projected(extent.value().clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let projected_context = BatchingContext::<_, ArrayBatching<DynamicArrayBatchingPolicy>>::with_policy(
+            ProjectedContext::new(context.parent().clone()),
+            context.axis_extent().clone(),
+        )
+        .with_axis_name(context.axis_name().map(str::to_string))
+        .with_axis_sharding(context.axis_sharding().clone());
+        let output = batch_all_to_all_matching_axis::<_, DynamicArrayBatchingPolicy>(
+            self,
+            &projected_context,
+            &array,
+            array.unbatched_type().rank(),
+            output_extents,
+            logical_output_type.sharding().cloned(),
+        )?;
+        let batch_axis = output.batch_axis();
+        Ok(ArrayIrBatch::new(<C::Value as ValueProjection<ArrayType>>::from_projected(output.into_value()), batch_axis)
+            .map(|output| vec![output])?
+            .into())
+    }
+}
+
+// Mixed array IR JVP for all-to-all. Explicit output extents are retained as ordinary residual values, and the
+// transposed linear region swaps the split and concatenation axes.
+impl<C> MemberDifferentiableOperation<C> for AllToAllOperation
+where
+    C: Context<Type = ArrayIrType>,
+    C::Operation: From<AllToAllOperation>
+        + From<DimensionSizeOperation>
+        + From<LinearCallOperation<ArrayIrType>>
+        + From<ConstantOperation<DimensionValue>>
+        + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+{
+    fn jvp_in_parent<D: DifferentiationDriver<C>>(
+        &self,
+        context: &C,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        jvp_shape_changing_collective_with_adjoint(
+            self,
+            AllToAllOperation::new(
+                self.axis_name().to_string(),
+                self.axis_size(),
+                self.concat_axis(),
+                self.split_axis(),
+                self.options().clone(),
+            ),
+            context,
+            inputs,
+        )
+    }
+}
 
 /// Stages an all-to-all with first-class dynamic tiled extents and rank-changing untiled semantics.
 pub trait AllToAll: Sized {
@@ -409,38 +639,6 @@ pub trait ParallelSwapAxes: AllToAll {
 
 impl<V: AllToAll> ParallelSwapAxes for V {}
 
-// Mixed array IR JVP for all-to-all. Explicit output extents are retained as ordinary residual values, and the
-// transposed linear region swaps the split and concatenation axes.
-impl<C> MemberDifferentiableOperation<C> for AllToAllOperation
-where
-    C: Context<Type = ArrayIrType>,
-    C::Operation: From<AllToAllOperation>
-        + From<DimensionSizeOperation>
-        + From<LinearCallOperation<ArrayIrType>>
-        + From<ConstantOperation<DimensionValue>>
-        + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
-{
-    fn jvp_in_parent<D: DifferentiationDriver<C>>(
-        &self,
-        context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        jvp_shape_changing_collective_with_adjoint(
-            self,
-            AllToAllOperation::new(
-                self.axis_name().to_string(),
-                self.axis_size(),
-                self.concat_axis(),
-                self.split_axis(),
-                self.options().clone(),
-            ),
-            context,
-            inputs,
-        )
-    }
-}
-
 /// Returns the physical split/concat axes and mapped result axis for a forwarded all-to-all.
 fn forwarded_all_to_all_axes(
     mode: CollectiveMode,
@@ -544,202 +742,6 @@ where
     ArrayBatch::new(output, BatchAxis::from_position(0))
 }
 
-// Batching rule for [`AllToAllOperation`]. A matching `batch` level consumes the mapped batch axis with a
-// reshape/transpose block exchange: the per-item `split_axis` is split into `(b, d_p / b)` chunks, the chunk axis
-// is swapped with the leading batch axis (so the batch axis indexes the *receiving* item), and the sender axis is
-// then merged item-major into the per-item `concat_axis` — batch item `i` receives every item's chunk `i`,
-// concatenated along `concat_axis`. A non-matching level forwards the collective untouched to the parent context
-// via [`forward_collective_to_parent`].
-impl<C, P: CollectiveBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for AllToAllOperation
-where
-    C: Context<Type = ArrayType>,
-    C::Operation: From<AllToAllOperation>,
-    <C as Domain>::Value: Transpose,
-{
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
-        &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
-        _driver: &D,
-        inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
-        if let Some(ragged_axis) = inputs.iter().find_map(|input| input.ragged_axes().first()) {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!(
-                    "`all_to_all` cannot route bounded ragged dimension `{}` without explicit per-destination \
-                     offsets and sizes; use `ragged_all_to_all`",
-                    ragged_axis.dimension(),
-                ),
-            });
-        }
-        if context.axis_name() != Some(self.axis_name.as_str()) {
-            let [input] = inputs else {
-                return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
-            };
-            let Some(batch_axis) = input.batch_axis_position() else {
-                return Ok(forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs)?.into());
-            };
-            let (split_axis, concat_axis, output_batch_axis) =
-                forwarded_all_to_all_axes(self.options.mode, self.split_axis, self.concat_axis, batch_axis);
-            let operation =
-                Self::new(self.axis_name.clone(), self.axis_size, split_axis, concat_axis, self.options.clone());
-            return Ok(forward_shape_changing_collective(
-                context,
-                C::Operation::from(operation),
-                input,
-                Some(output_batch_axis),
-            )?
-            .into());
-        }
-        let [input] = inputs else {
-            return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
-        };
-        let input_type = input.unbatched_type();
-        let mut output_types = self.infer_output_types(std::slice::from_ref(&input_type), &[])?;
-        let output_type = output_types.remove(0);
-        let output_extents = output_type
-            .shape()
-            .dimensions()
-            .iter()
-            .map(|dimension| P::collective_extent_from_dimension(context, dimension))
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(vec![batch_all_to_all_matching_axis::<C, P>(
-            self,
-            context,
-            input,
-            input_type.rank(),
-            output_extents,
-            output_type.sharding().cloned(),
-        )?]
-        .into())
-    }
-}
-
-// Batching rule for explicit-extent [`AllToAllOperation`]. Dimension SSA supplies its temporary split and merge
-// shapes directly, while matching-axis array mechanics reuse the homogeneous collective kernel.
-impl<C> MemberBatchableOperation<C, ArrayIrBatching> for AllToAllOperation
-where
-    C: Context<
-            Type = ArrayIrType,
-            Operation: From<AllToAllOperation>
-                           + From<DynamicBroadcastOperation>
-                           + From<ConstantOperation<DimensionValue>>
-                           + From<DimensionSizeOperation>
-                           + From<DynamicReshapeOperation>
-                           + OperationProjection<ArrayType>,
-        >,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value:
-        ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>> + ValueProjection<DimensionType>,
-    <C::Value as ValueProjection<DimensionType>>::Projected:
-        DimensionRequirement + Div + Mul + Value<Type = DimensionType>,
-{
-    fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatching>>(
-        &self,
-        context: &BatchingContext<C, ArrayIrBatching>,
-        _driver: &D,
-        inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
-        let (array, output_extents) = explicit_collective_inputs(inputs)?;
-        if let Some(ragged_axis) = array.ragged_axes().first() {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!(
-                    "`all_to_all` cannot route bounded ragged dimension `{}` without explicit per-destination \
-                     offsets and sizes; use `ragged_all_to_all`",
-                    ragged_axis.dimension(),
-                ),
-            });
-        }
-        validate_explicit_collective_output_extents(output_extents)?;
-        let logical_input_types = inputs.iter().map(|input| input.unbatched_type().clone()).collect::<Vec<_>>();
-        let mut logical_output_types = infer_explicit_all_to_all_output_types(self, logical_input_types.as_slice())?;
-        let logical_output_type = <&ArrayType>::try_from(&logical_output_types.remove(0))?.clone();
-
-        if context.axis_name() != Some(self.axis_name()) {
-            if array.batch_axis().is_replicated() {
-                return Ok(forward_explicit_collective(self.clone(), context, array, output_extents, None)?.into());
-            }
-            let input_batch_axis = array.batch_axis_position().unwrap();
-            let (physical_split_axis, physical_concat_axis, output_batch_axis) = forwarded_all_to_all_axes(
-                self.options().mode(),
-                self.split_axis(),
-                self.concat_axis(),
-                input_batch_axis,
-            );
-            let operation = Self::new(
-                self.axis_name().to_string(),
-                self.axis_size(),
-                physical_split_axis,
-                physical_concat_axis,
-                self.options().clone(),
-            );
-            return Ok(forward_explicit_collective(
-                operation,
-                context,
-                array,
-                output_extents,
-                Some(output_batch_axis),
-            )?
-            .into());
-        }
-
-        let array = ArrayBatch::new(
-            <C::Value as ValueProjection<ArrayType>>::into_projected(array.value().clone())?,
-            array.batch_axis(),
-        )?;
-        let output_extents = output_extents
-            .iter()
-            .map(|extent| <C::Value as ValueProjection<DimensionType>>::into_projected(extent.value().clone()))
-            .collect::<Result<Vec<_>, _>>()?;
-        let projected_context = BatchingContext::<_, ArrayBatching<DynamicArrayBatchingPolicy>>::with_policy(
-            ProjectedContext::new(context.parent().clone()),
-            context.axis_extent().clone(),
-        )
-        .with_axis_name(context.axis_name().map(str::to_string))
-        .with_axis_sharding(context.axis_sharding().clone());
-        let output = batch_all_to_all_matching_axis::<_, DynamicArrayBatchingPolicy>(
-            self,
-            &projected_context,
-            &array,
-            array.unbatched_type().rank(),
-            output_extents,
-            logical_output_type.sharding().cloned(),
-        )?;
-        let batch_axis = output.batch_axis();
-        Ok(ArrayIrBatch::new(<C::Value as ValueProjection<ArrayType>>::from_projected(output.into_value()), batch_axis)
-            .map(|output| vec![output])?
-            .into())
-    }
-}
-
-// Transpose rule for [`AllToAllOperation`]: the chunk exchange is its own adjoint with the split and concatenation
-// axes swapped.
-impl<V, O> TransposableOperation<V, O> for AllToAllOperation
-where
-    V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType> + From<AllToAllOperation>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<'_, V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        transpose_shape_changing_collective(
-            context,
-            inputs,
-            outputs,
-            AllToAllOperation::new(
-                self.axis_name.clone(),
-                self.axis_size,
-                self.concat_axis,
-                self.split_axis,
-                self.options.clone(),
-            ),
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -777,65 +779,11 @@ mod tests {
     }
 
     #[test]
-    fn test_all_to_all_type_inference() {
-        use crate::macros::check_operation_type_inference;
-
-        let matrix = |rows: usize, columns: usize| {
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(rows), Dimension::Static(columns)]))
-        };
-        check_operation_type_inference!(
-            operation = AllToAllOperation::new("x".to_string(), 4, 0, 1, CollectiveOptions::tiled()),
-            cases = [
-                {
-                    input_types = [matrix(8, 3)],
-                    output_types = [matrix(2, 12)],
-                },
-                {
-                    input_types = [matrix(6, 3)],
-                    error = "`all_to_all` split axis 0 size 6 is not divisible by group size 4",
-                },
-            ],
-        );
-    }
-
-    #[test]
     fn test_all_to_all_forwarded_axes_account_for_the_mapped_axis() {
         assert_eq!(forwarded_all_to_all_axes(CollectiveMode::Tiled, 0, 1, 1), (0, 2, 1));
         assert_eq!(forwarded_all_to_all_axes(CollectiveMode::Tiled, 1, 0, 0), (2, 1, 0));
         assert_eq!(forwarded_all_to_all_axes(CollectiveMode::Untiled, 0, 0, 2), (0, 0, 2));
         assert_eq!(forwarded_all_to_all_axes(CollectiveMode::Untiled, 1, 1, 0), (2, 2, 0));
-    }
-
-    #[test]
-    fn test_all_to_all_over_batched_axis_exchanges_chunks() {
-        use crate::batching::BatchingTracer;
-
-        // Block exchange with `split_axis == concat_axis == 0`: each item splits its vector into two chunks and
-        // receives its own chunk index from every item, concatenated item-major. With items `[1, 2, 3, 4]` and
-        // `[5, 6, 7, 8]`, item 0 receives `[1, 2, 5, 6]` and item 1 receives `[3, 4, 7, 8]`, matching the verified
-        // cross-device `shard_map` execution semantics of StableHLO's `all_to_all`.
-        let x = Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
-        let output: ArrayIrValue<Array> = batch(
-            |item: BatchingTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>, ArrayIrBatching>| {
-                item.all_to_all_tiled("x", 0, 0)
-            },
-            ArrayIrValue::Array(x),
-            BatchAxis::new(0),
-            BatchAxis::new(0),
-            BatchAxisSpecification::named("x"),
-        )
-        .unwrap();
-        assert_eq!(
-            output.r#type().into_owned(),
-            ArrayIrType::Array(ArrayType::new(
-                DataType::F64,
-                Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]),
-            )),
-        );
-        let ArrayIrValue::Array(output) = output else {
-            panic!("`all_to_all` must preserve the array member kind");
-        };
-        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]);
     }
 
     #[test]
@@ -885,6 +833,60 @@ mod tests {
                     .to_string(),
             }),
         );
+    }
+
+    #[test]
+    fn test_all_to_all_type_inference() {
+        use crate::macros::check_operation_type_inference;
+
+        let matrix = |rows: usize, columns: usize| {
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(rows), Dimension::Static(columns)]))
+        };
+        check_operation_type_inference!(
+            operation = AllToAllOperation::new("x".to_string(), 4, 0, 1, CollectiveOptions::tiled()),
+            cases = [
+                {
+                    input_types = [matrix(8, 3)],
+                    output_types = [matrix(2, 12)],
+                },
+                {
+                    input_types = [matrix(6, 3)],
+                    error = "`all_to_all` split axis 0 size 6 is not divisible by group size 4",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_all_to_all_over_batched_axis_exchanges_chunks() {
+        use crate::batching::BatchingTracer;
+
+        // Block exchange with `split_axis == concat_axis == 0`: each item splits its vector into two chunks and
+        // receives its own chunk index from every item, concatenated item-major. With items `[1, 2, 3, 4]` and
+        // `[5, 6, 7, 8]`, item 0 receives `[1, 2, 5, 6]` and item 1 receives `[3, 4, 7, 8]`, matching the verified
+        // cross-device `shard_map` execution semantics of StableHLO's `all_to_all`.
+        let x = Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
+        let output: ArrayIrValue<Array> = batch(
+            |item: BatchingTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>, ArrayIrBatching>| {
+                item.all_to_all_tiled("x", 0, 0)
+            },
+            ArrayIrValue::Array(x),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            BatchAxisSpecification::named("x"),
+        )
+        .unwrap();
+        assert_eq!(
+            output.r#type().into_owned(),
+            ArrayIrType::Array(ArrayType::new(
+                DataType::F64,
+                Shape::new(vec![Dimension::Static(2), Dimension::Static(4)]),
+            )),
+        );
+        let ArrayIrValue::Array(output) = output else {
+            panic!("`all_to_all` must preserve the array member kind");
+        };
+        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]);
     }
 
     #[test]

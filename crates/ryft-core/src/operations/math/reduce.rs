@@ -12,14 +12,15 @@ use crate::batching::{
 use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    ElementwiseDerivativeAlignment, LinearCallOperation, MemberDifferentiableOperation, TransposableOperation,
-    TranspositionContext, TranspositionDriver, jvp_projected_operation,
+    ElementwiseDerivativeAlignment, MemberDifferentiableOperation, TransposableOperation, TranspositionContext,
+    TranspositionDriver, jvp_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::compare::{Compare, CompareOperation, ComparisonDirection};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::fill::Fill;
+use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::dimensions::dimension_to_scalar::DimensionToScalarOperation;
@@ -93,121 +94,6 @@ impl Display for ReductionKind {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "{}", self.name())
     }
-}
-
-/// Returns the output [`ArrayType`] produced by reducing `input` along `axes` with `kind`.
-///
-/// Validates that:
-///   - `axes` are unique and within `0..rank(input)`;
-///   - `kind` matches the input data type (Boolean for Any/All, Boolean or numeric for Max/Min, and numeric for
-///     Sum/Mean; structural-zero supports every kind).
-///
-/// The reduced axes are removed from the output shape; non-reduced axes keep their order. The output [`Sharding`]
-/// follows JAX's reduction sharding rule (`_reduce_op_sharding_rule` in `jax/_src/lax/lax.py`): the reduced axes'
-/// per-dimension [`ShardingDimension`](crate::arrays::ShardingDimension) entries are deleted while the remaining
-/// entries keep their order, and the reduction-state and manual-axis sets pass through unchanged. A reduced axis that
-/// is sharded is *not* an error here — the backend partitioner owns the cross-shard reduction; use
-/// [`ReduceOperation::with_output_sharding`] to request an unreduced output that defers it. The
-/// [`Layout`](crate::arrays::Layout) is dropped (it is rank-specific) and the [`Memory`](crate::arrays::Memory)
-/// placement is preserved.
-pub fn reduce_abstract(
-    input: &ArrayType,
-    axes: &[usize],
-    kind: ReductionKind,
-    operation_name: &'static str,
-) -> Result<ArrayType, TypeError> {
-    reduce_shape_abstract(input, axes, operation_name, |data_type| {
-        let (requirement, supports_kind) = if kind.requires_boolean() {
-            ("Boolean", data_type.is_boolean())
-        } else if matches!(kind, ReductionKind::Max | ReductionKind::Min) {
-            ("Boolean or numeric", data_type.is_boolean() || data_type.is_numeric() || data_type == DataType::Zero)
-        } else {
-            ("numeric", data_type.is_numeric() || data_type == DataType::Zero)
-        };
-        match supports_kind {
-            true => Ok(()),
-            false => Err(TypeError::invalid(format!(
-                "`{operation_name}` kind {kind} requires {requirement} inputs but got {data_type}"
-            ))),
-        }
-    })
-}
-
-/// Returns the output [`ArrayType`] produced by reducing `input` along `axes`, which is the axis geometry every
-/// reducing primitive shares: the reduced axes are validated, removed from the output shape while the remaining axes
-/// keep their order, and the [`Sharding`] follows the rule that [`reduce_abstract`] documents. The element data type
-/// passes through unchanged.
-///
-/// Reducing primitives differ only in which element data types they accept, so that check is supplied by the caller
-/// rather than encoded here. It is invoked between the axis validation and the output construction, which is what
-/// makes an out-of-bounds or duplicate axis outrank an unsupported element type in the reported diagnostic.
-///
-/// # Parameters
-///
-///   - `input`: Type of the reduced operand.
-///   - `axes`: Reduced axes, in the operand's own coordinate system.
-///   - `operation_name`: Operation name used in diagnostics.
-///   - `validate_element_type`: Caller's element data-type domain check.
-pub(crate) fn reduce_shape_abstract(
-    input: &ArrayType,
-    axes: &[usize],
-    operation_name: &'static str,
-    validate_element_type: impl FnOnce(DataType) -> Result<(), TypeError>,
-) -> Result<ArrayType, TypeError> {
-    let rank = input.rank();
-    let mut reduce_mask = vec![false; rank];
-    for axis in axes {
-        if *axis >= rank {
-            return Err(TypeError::invalid(format!("`{operation_name}` axis {axis} is out of bounds for rank {rank}")));
-        }
-        if reduce_mask[*axis] {
-            return Err(TypeError::invalid(format!("`{operation_name}` contains duplicate axis {axis}")));
-        }
-        reduce_mask[*axis] = true;
-    }
-
-    let data_type = input.data_type();
-    validate_element_type(data_type)?;
-
-    let dimensions = input
-        .shape()
-        .dimensions()
-        .iter()
-        .enumerate()
-        .filter_map(|(axis, size)| (!reduce_mask[axis]).then_some(size.clone()))
-        .collect::<Vec<_>>();
-    let sharding = reduce_sharding(input.sharding(), &reduce_mask, operation_name)?;
-    ArrayType::new(data_type, Shape::new(dimensions))
-        .with_memory(input.memory())
-        .with_sharding(sharding)
-        .map_err(|error| TypeError::invalid(error.to_string()))
-}
-
-/// Computes the output [`Sharding`] for a reduction whose reduced axes are marked in `reduce_mask`. The reduced
-/// axes' per-dimension entries are deleted; the remaining entries keep their order and the reduction-state and
-/// manual-axis sets pass through unchanged. Refer to the documentation of [`reduce_abstract`] for the full rule.
-pub(crate) fn reduce_sharding(
-    sharding: Option<&Sharding>,
-    reduce_mask: &[bool],
-    operation_name: &'static str,
-) -> Result<Option<Sharding>, TypeError> {
-    sharding
-        .map(|sharding| {
-            let dimensions = sharding
-                .dimensions()
-                .iter()
-                .enumerate()
-                .filter_map(|(axis, dimension)| (!reduce_mask[axis]).then(|| dimension.clone()))
-                .collect::<Vec<_>>();
-            Sharding::new(sharding.mesh().clone(), dimensions)
-                .and_then(|output| output.with_unreduced_axes(sharding.unreduced_axes().clone()))
-                .and_then(|output| output.with_reduced_axes(sharding.reduced_axes().clone()))
-                .and_then(|output| output.with_varying_manual_axes(sharding.varying_manual_axes().clone()))
-                .map_err(|error| {
-                    TypeError::invalid(format!("`{operation_name}` output sharding construction failed: {error}"))
-                })
-        })
-        .transpose()
 }
 
 /// Primitive representing one N-dimensional axis-collapsing reduction.
@@ -318,80 +204,6 @@ impl Operation for ReduceOperation {
     }
 }
 
-/// Validates a requested `output_sharding` for a reduction, mirroring JAX's `_reduce_sum_unreduced_rule`. Only
-/// [`ReductionKind::Sum`] may carry a requested output sharding. The sharding must match the reduced output's rank
-/// and (when the operand carries a sharding) its mesh, and may not reference [`MeshAxisType::Auto`] axes. When the
-/// request is unreduced, every requested unreduced axis must be an [`MeshAxisType::Explicit`] axis that either
-/// sharded one of the summed-over dimensions or was already unreduced on the operand — the axes whose cross-device
-/// reduction the request is deferring.
-fn validate_reduce_output_sharding(
-    input: &ArrayType,
-    axes: &[usize],
-    kind: ReductionKind,
-    output_sharding: &Sharding,
-    reduced_output: &ArrayType,
-) -> Result<(), TypeError> {
-    use crate::arrays::{MeshAxisType, ShardingDimension};
-
-    if kind != ReductionKind::Sum {
-        return Err(TypeError::invalid(format!(
-            "{} does not support a requested output sharding (only reduce_sum does)",
-            kind.name()
-        )));
-    }
-    if output_sharding.rank() != reduced_output.rank() {
-        return Err(TypeError::invalid(format!(
-            "reduce_sum output sharding rank ({}) does not match the output rank ({})",
-            output_sharding.rank(),
-            reduced_output.rank(),
-        )));
-    }
-    if let Some(input_sharding) = input.sharding()
-        && output_sharding.mesh() != input_sharding.mesh()
-    {
-        return Err(TypeError::invalid("reduce_sum output sharding must use the same mesh as the operand"));
-    }
-    let mut referenced_axes: Vec<&String> = output_sharding.unreduced_axes().iter().collect();
-    referenced_axes.extend(output_sharding.reduced_axes());
-    for dimension in output_sharding.dimensions() {
-        if let ShardingDimension::Sharded(axis_names) = dimension {
-            referenced_axes.extend(axis_names);
-        }
-    }
-    if referenced_axes
-        .iter()
-        .any(|name| output_sharding.mesh().axis_type(name) == Some(MeshAxisType::Auto))
-    {
-        return Err(TypeError::invalid("reduce_sum output sharding cannot reference auto mesh axes"));
-    }
-
-    if !output_sharding.unreduced_axes().is_empty() {
-        // The axes whose reduction the request defers: the Explicit axes that sharded the summed-over dimensions,
-        // together with the axes the operand was already unreduced over.
-        let mut reducible_axes: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-        if let Some(input_sharding) = input.sharding() {
-            for axis in axes {
-                if let ShardingDimension::Sharded(axis_names) = &input_sharding.dimensions()[*axis] {
-                    reducible_axes.extend(
-                        axis_names
-                            .iter()
-                            .filter(|name| input_sharding.mesh().axis_type(name) == Some(MeshAxisType::Explicit))
-                            .map(String::as_str),
-                    );
-                }
-            }
-            reducible_axes.extend(input_sharding.unreduced_axes().iter().map(String::as_str));
-        }
-        if !output_sharding.unreduced_axes().iter().all(|name| reducible_axes.contains(name.as_str())) {
-            return Err(TypeError::invalid(
-                "reduce_sum output sharding unreduced axes must be among the explicit axes sharding the \
-                          reduced dimensions or the operand's unreduced axes",
-            ));
-        }
-    }
-    Ok(())
-}
-
 impl<C: Domain<Type = ArrayType, Value: Reduce>> InterpretableOperation<C> for ReduceOperation {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -459,90 +271,6 @@ where
             P::mask_reduction_input(context, input, lifted_op.axes(), self.kind)
         })
     }
-}
-
-/// Applies the batching skeleton shared by the primitives that collapse a set of array axes, given an operation whose
-/// axes have already been lifted past the inserted batch dimension.
-///
-/// Collapsing an axis is what makes it legitimate to *consume* an operand's per-item extents along a reduced bounded
-/// ragged axis: the padding is first neutralized by `mask`, so the result no longer depends on those extents, and each
-/// consumed [`DimensionVariable`] is then reported as the rule's [`BatchedOutputs`] evidence, which is how the
-/// carrier-invariant validation boundary tells a deliberate consumption apart from a silently dropped extent. The
-/// evidence is collected from the *unmasked* operand, because masking rewrites the payload while leaving the ragged
-/// metadata that the boundary is told about in place. Ragged axes outside `reduced_axes` survive onto the result.
-///
-/// This skeleton is specific to axis-collapsing primitives. A prefix scan, for instance, masks the very same way but
-/// keeps the axis it touches, and so consumes nothing and reports no evidence.
-///
-/// # Parameters
-///
-///   - `context`: Active [`BatchingContext`] for the transform level being applied.
-///   - `operation`: Lifted operation, interpreted over the physical batched value.
-///   - `input`: Operand batch, as the rule received it.
-///   - `reduced_axes`: Collapsed axes of `operation`, in the physical batched coordinate system.
-///   - `output_axis`: Position of the batch axis in the result.
-///   - `mask`: Neutralizes the operand's ragged padding along `reduced_axes` with the operation's own identity.
-pub(crate) fn batch_reducing_operation<C, P, O, Mask>(
-    context: &BatchingContext<C, ArrayBatching<P>>,
-    operation: &O,
-    input: &ArrayBatch<C::Value>,
-    reduced_axes: &[usize],
-    output_axis: usize,
-    mask: Mask,
-) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError>
-where
-    C: Context<Type = ArrayType>,
-    P: RaggedArrayBatchingPolicy<C>,
-    O: InterpretableOperation<C>,
-    Mask: FnOnce(&ArrayBatch<C::Value>) -> Result<ArrayBatch<C::Value>, BatchingError>,
-{
-    let consumed_ragged_dimensions = input
-        .ragged_axes()
-        .iter()
-        .filter(|ragged_axis| reduced_axes.contains(&ragged_axis.axis()))
-        .map(|ragged_axis| ragged_axis.dimension().clone())
-        .collect::<Vec<_>>();
-    let masked = mask(input)?;
-    let remaining_ragged_axes = masked
-        .ragged_axes()
-        .iter()
-        .cloned()
-        .filter_map(|ragged_axis| ragged_axis.reduced(reduced_axes))
-        .collect::<Vec<_>>();
-    let output_batch_axis = BatchAxis::from_position(output_axis);
-    let mut outputs = operation.interpret_with_batch_axes(
-        context,
-        std::slice::from_ref(&masked),
-        std::slice::from_ref(&output_batch_axis),
-    )?;
-    check_count!("output", outputs, 1, ProgramError);
-    let output =
-        ArrayBatch::new(outputs.remove(0).into_value(), output_batch_axis)?.with_ragged_axes(remaining_ragged_axes)?;
-    Ok(BatchedOutputs::new(vec![output], consumed_ragged_dimensions))
-}
-
-/// Lifts a reduce's `axes` through one batching level inserted at `batch_axis`.
-///
-/// Returns the rewritten axes and the output batch axis position. Each user axis `i` shifts to
-/// `i + 1` when `i >= batch_axis`. The output batch axis is `batch_axis` minus the number of
-/// reduced axes that lie strictly below it (because those axes get dropped in the output).
-///
-/// The axes are expressed in the per-item coordinate system and therefore cannot name the inserted
-/// batch dimension. In particular, a user axis equal to `batch_axis` shifts past the physical batch
-/// dimension rather than reducing it.
-pub fn lift_reduce_axes(axes: &[usize], batch_axis: usize) -> (Vec<usize>, usize) {
-    let mut lifted = Vec::with_capacity(axes.len());
-    let mut axes_below_batch = 0usize;
-    for axis in axes {
-        if *axis < batch_axis {
-            lifted.push(*axis);
-            axes_below_batch += 1;
-        } else {
-            lifted.push(*axis + 1);
-        }
-    }
-    let output_batch_axis = batch_axis - axes_below_batch;
-    (lifted, output_batch_axis)
 }
 
 // Forward-mode rule for [`ReduceOperation`]. The additive reductions ([`Sum`](ReductionKind::Sum) /
@@ -619,6 +347,89 @@ where
                 ),
             }
             .into()),
+        }
+    }
+}
+
+impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ReduceOperation
+where
+    O: Operation<Type = ArrayType>
+        + From<BroadcastOperation>
+        + From<ConstantOperation<crate::arrays::Array>>
+        + From<MulOperation<ArrayType>>,
+{
+    fn transpose<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TranspositionContext<'_, V, O>,
+        _driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        check_count!("input", inputs, 1, ProgramError);
+        check_count!("output", outputs, 1, ProgramError);
+        let input_type = inputs[0].r#type();
+        let input_shape = input_type.shape();
+        match &outputs[0] {
+            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(input_type.cotangent()?)]),
+            MaybeZero::Value(cotangent) => match self.kind {
+                ReductionKind::Sum | ReductionKind::Mean => {
+                    // Replicating the cotangent back over a reduced axis requires that axis's extent, which a
+                    // directly transposed program cannot observe as it holds no primal value that carries it.
+                    if let Some(axis) =
+                        self.axes.iter().find(|axis| matches!(input_shape.dimension(**axis), Dimension::Dynamic(_)))
+                    {
+                        return Err(ProgramError::UnsupportedOperation {
+                            message: format!(
+                                "direct `{}` transposition over reduced axis {axis} of {input_shape} requires \
+                                 linearization so that the runtime extent can be retained as a residual",
+                                self.name(),
+                            ),
+                        }
+                        .into());
+                    }
+
+                    let output_type = input_type.cotangent()?;
+                    let output_axes = output_to_input_axis_map(input_shape.rank(), &self.axes);
+                    let broadcasted = cotangent.broadcast(output_type, output_axes.as_slice())?;
+                    let cotangent_input = match self.kind {
+                        ReductionKind::Sum => broadcasted,
+                        ReductionKind::Mean => {
+                            // The check above rejected every runtime-sized reduced axis, so each reduced extent is
+                            // statically known here.
+                            let reduced_extents = self
+                                .axes
+                                .iter()
+                                .map(|axis| input_shape.dimension(*axis).value().unwrap())
+                                .collect::<Vec<_>>();
+                            let element_count = if reduced_extents.contains(&0) {
+                                0
+                            } else {
+                                reduced_extents.iter().try_fold(1usize, |count, extent| {
+                                    count.checked_mul(*extent).ok_or_else(|| {
+                                        TypeError::invalid(format!(
+                                            "mean transpose reduced element count overflows usize for input shape \
+                                             {input_shape}",
+                                        ))
+                                    })
+                                })?
+                            };
+                            let inverse_count = 1.0 / element_count as f64;
+                            // Stage a rank-zero literal holding `1 / N` and rely on implicit rank-zero broadcasting in
+                            // the subsequent multiplication to scale the broadcast-back cotangent to the input shape.
+                            let factor_type = ArrayType::new(cotangent.r#type().data_type(), Shape::scalar());
+                            let factor = context.fill(&factor_type, inverse_count)?;
+                            factor * broadcasted
+                        }
+                        _ => unreachable!("outer match handled the only two supported kinds"),
+                    };
+                    Ok(vec![MaybeZero::Value(cotangent_input)])
+                }
+                other => Err(TypeError::invalid(format!(
+                    "reduce transpose for {other} is not yet supported; only Sum and Mean are wired \
+                        (Max/Min need argmax-style gather; Any/All are not differentiable)"
+                ))
+                .into()),
+            },
         }
     }
 }
@@ -886,100 +697,6 @@ where
 // Both replications need every reduced extent, so a reduced axis whose extent is only known at run time is rejected
 // here and served by [`MemberDifferentiableOperation::jvp_in_parent`] instead: linearization retains those extents as
 // first-class dimension residuals and stages the replication as a mixed broadcast against them.
-impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ReduceOperation
-where
-    O: Operation<Type = ArrayType>
-        + From<BroadcastOperation>
-        + From<ConstantOperation<crate::arrays::Array>>
-        + From<MulOperation<ArrayType>>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<'_, V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        let input_type = inputs[0].r#type();
-        let input_shape = input_type.shape();
-        match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(input_type.cotangent()?)]),
-            MaybeZero::Value(cotangent) => match self.kind {
-                ReductionKind::Sum | ReductionKind::Mean => {
-                    // Replicating the cotangent back over a reduced axis requires that axis's extent, which a
-                    // directly transposed program cannot observe as it holds no primal value that carries it.
-                    if let Some(axis) =
-                        self.axes.iter().find(|axis| matches!(input_shape.dimension(**axis), Dimension::Dynamic(_)))
-                    {
-                        return Err(ProgramError::UnsupportedOperation {
-                            message: format!(
-                                "direct `{}` transposition over reduced axis {axis} of {input_shape} requires \
-                                 linearization so that the runtime extent can be retained as a residual",
-                                self.name(),
-                            ),
-                        }
-                        .into());
-                    }
-
-                    let output_type = input_type.cotangent()?;
-                    let output_axes = output_to_input_axis_map(input_shape.rank(), &self.axes);
-                    let broadcasted = cotangent.broadcast(output_type, output_axes.as_slice())?;
-                    let cotangent_input = match self.kind {
-                        ReductionKind::Sum => broadcasted,
-                        ReductionKind::Mean => {
-                            // The check above rejected every runtime-sized reduced axis, so each reduced extent is
-                            // statically known here.
-                            let reduced_extents = self
-                                .axes
-                                .iter()
-                                .map(|axis| input_shape.dimension(*axis).value().unwrap())
-                                .collect::<Vec<_>>();
-                            let element_count = if reduced_extents.contains(&0) {
-                                0
-                            } else {
-                                reduced_extents.iter().try_fold(1usize, |count, extent| {
-                                    count.checked_mul(*extent).ok_or_else(|| {
-                                        TypeError::invalid(format!(
-                                            "mean transpose reduced element count overflows usize for input shape \
-                                             {input_shape}",
-                                        ))
-                                    })
-                                })?
-                            };
-                            let inverse_count = 1.0 / element_count as f64;
-                            // Stage a rank-zero literal holding `1 / N` and rely on implicit rank-zero broadcasting in
-                            // the subsequent multiplication to scale the broadcast-back cotangent to the input shape.
-                            let factor_type = ArrayType::new(cotangent.r#type().data_type(), Shape::scalar());
-                            let factor = context.fill(&factor_type, inverse_count)?;
-                            factor * broadcasted
-                        }
-                        _ => unreachable!("outer match handled the only two supported kinds"),
-                    };
-                    Ok(vec![MaybeZero::Value(cotangent_input)])
-                }
-                other => Err(TypeError::invalid(format!(
-                    "reduce transpose for {other} is not yet supported; only Sum and Mean are wired \
-                        (Max/Min need argmax-style gather; Any/All are not differentiable)"
-                ))
-                .into()),
-            },
-        }
-    }
-}
-
-/// Builds the `output_axes` vector that maps a reduced output's axes back to the
-/// corresponding input axes. Output axis `j` corresponds to the `j`-th non-reduced input axis;
-/// the returned vector lists those input-axis indices in order.
-pub(crate) fn output_to_input_axis_map(input_rank: usize, reduced_axes: &[usize]) -> Vec<usize> {
-    let mut reduce_mask = vec![false; input_rank];
-    for axis in reduced_axes {
-        reduce_mask[*axis] = true;
-    }
-    (0..input_rank).filter(|axis| !reduce_mask[*axis]).collect()
-}
-
 /// Value-level reduction capability.
 ///
 /// [`Reduce`] is the receiver-style entry point for staging or executing a [`ReduceOperation`]: it reduces the
@@ -1030,6 +747,290 @@ where
             .expect("`reduce` operation failed")
             .remove(0)
     }
+}
+
+/// Returns the output [`ArrayType`] produced by reducing `input` along `axes` with `kind`.
+///
+/// Validates that:
+///   - `axes` are unique and within `0..rank(input)`;
+///   - `kind` matches the input data type (Boolean for Any/All, Boolean or numeric for Max/Min, and numeric for
+///     Sum/Mean; structural-zero supports every kind).
+///
+/// The reduced axes are removed from the output shape; non-reduced axes keep their order. The output [`Sharding`]
+/// follows JAX's reduction sharding rule (`_reduce_op_sharding_rule` in `jax/_src/lax/lax.py`): the reduced axes'
+/// per-dimension [`ShardingDimension`](crate::arrays::ShardingDimension) entries are deleted while the remaining
+/// entries keep their order, and the reduction-state and manual-axis sets pass through unchanged. A reduced axis that
+/// is sharded is *not* an error here — the backend partitioner owns the cross-shard reduction; use
+/// [`ReduceOperation::with_output_sharding`] to request an unreduced output that defers it. The
+/// [`Layout`](crate::arrays::Layout) is dropped (it is rank-specific) and the [`Memory`](crate::arrays::Memory)
+/// placement is preserved.
+pub fn reduce_abstract(
+    input: &ArrayType,
+    axes: &[usize],
+    kind: ReductionKind,
+    operation_name: &'static str,
+) -> Result<ArrayType, TypeError> {
+    reduce_shape_abstract(input, axes, operation_name, |data_type| {
+        let (requirement, supports_kind) = if kind.requires_boolean() {
+            ("Boolean", data_type.is_boolean())
+        } else if matches!(kind, ReductionKind::Max | ReductionKind::Min) {
+            ("Boolean or numeric", data_type.is_boolean() || data_type.is_numeric() || data_type == DataType::Zero)
+        } else {
+            ("numeric", data_type.is_numeric() || data_type == DataType::Zero)
+        };
+        match supports_kind {
+            true => Ok(()),
+            false => Err(TypeError::invalid(format!(
+                "`{operation_name}` kind {kind} requires {requirement} inputs but got {data_type}"
+            ))),
+        }
+    })
+}
+
+/// Returns the output [`ArrayType`] produced by reducing `input` along `axes`, which is the axis geometry every
+/// reducing primitive shares: the reduced axes are validated, removed from the output shape while the remaining axes
+/// keep their order, and the [`Sharding`] follows the rule that [`reduce_abstract`] documents. The element data type
+/// passes through unchanged.
+///
+/// Reducing primitives differ only in which element data types they accept, so that check is supplied by the caller
+/// rather than encoded here. It is invoked between the axis validation and the output construction, which is what
+/// makes an out-of-bounds or duplicate axis outrank an unsupported element type in the reported diagnostic.
+///
+/// # Parameters
+///
+///   - `input`: Type of the reduced operand.
+///   - `axes`: Reduced axes, in the operand's own coordinate system.
+///   - `operation_name`: Operation name used in diagnostics.
+///   - `validate_element_type`: Caller's element data-type domain check.
+pub(crate) fn reduce_shape_abstract(
+    input: &ArrayType,
+    axes: &[usize],
+    operation_name: &'static str,
+    validate_element_type: impl FnOnce(DataType) -> Result<(), TypeError>,
+) -> Result<ArrayType, TypeError> {
+    let rank = input.rank();
+    let mut reduce_mask = vec![false; rank];
+    for axis in axes {
+        if *axis >= rank {
+            return Err(TypeError::invalid(format!("`{operation_name}` axis {axis} is out of bounds for rank {rank}")));
+        }
+        if reduce_mask[*axis] {
+            return Err(TypeError::invalid(format!("`{operation_name}` contains duplicate axis {axis}")));
+        }
+        reduce_mask[*axis] = true;
+    }
+
+    let data_type = input.data_type();
+    validate_element_type(data_type)?;
+
+    let dimensions = input
+        .shape()
+        .dimensions()
+        .iter()
+        .enumerate()
+        .filter_map(|(axis, size)| (!reduce_mask[axis]).then_some(size.clone()))
+        .collect::<Vec<_>>();
+    let sharding = reduce_sharding(input.sharding(), &reduce_mask, operation_name)?;
+    ArrayType::new(data_type, Shape::new(dimensions))
+        .with_memory(input.memory())
+        .with_sharding(sharding)
+        .map_err(|error| TypeError::invalid(error.to_string()))
+}
+
+/// Computes the output [`Sharding`] for a reduction whose reduced axes are marked in `reduce_mask`. The reduced
+/// axes' per-dimension entries are deleted; the remaining entries keep their order and the reduction-state and
+/// manual-axis sets pass through unchanged. Refer to the documentation of [`reduce_abstract`] for the full rule.
+pub(crate) fn reduce_sharding(
+    sharding: Option<&Sharding>,
+    reduce_mask: &[bool],
+    operation_name: &'static str,
+) -> Result<Option<Sharding>, TypeError> {
+    sharding
+        .map(|sharding| {
+            let dimensions = sharding
+                .dimensions()
+                .iter()
+                .enumerate()
+                .filter_map(|(axis, dimension)| (!reduce_mask[axis]).then(|| dimension.clone()))
+                .collect::<Vec<_>>();
+            Sharding::new(sharding.mesh().clone(), dimensions)
+                .and_then(|output| output.with_unreduced_axes(sharding.unreduced_axes().clone()))
+                .and_then(|output| output.with_reduced_axes(sharding.reduced_axes().clone()))
+                .and_then(|output| output.with_varying_manual_axes(sharding.varying_manual_axes().clone()))
+                .map_err(|error| {
+                    TypeError::invalid(format!("`{operation_name}` output sharding construction failed: {error}"))
+                })
+        })
+        .transpose()
+}
+
+/// Validates a requested `output_sharding` for a reduction, mirroring JAX's `_reduce_sum_unreduced_rule`. Only
+/// [`ReductionKind::Sum`] may carry a requested output sharding. The sharding must match the reduced output's rank
+/// and (when the operand carries a sharding) its mesh, and may not reference [`MeshAxisType::Auto`] axes. When the
+/// request is unreduced, every requested unreduced axis must be an [`MeshAxisType::Explicit`] axis that either
+/// sharded one of the summed-over dimensions or was already unreduced on the operand — the axes whose cross-device
+/// reduction the request is deferring.
+fn validate_reduce_output_sharding(
+    input: &ArrayType,
+    axes: &[usize],
+    kind: ReductionKind,
+    output_sharding: &Sharding,
+    reduced_output: &ArrayType,
+) -> Result<(), TypeError> {
+    use crate::arrays::{MeshAxisType, ShardingDimension};
+
+    if kind != ReductionKind::Sum {
+        return Err(TypeError::invalid(format!(
+            "{} does not support a requested output sharding (only reduce_sum does)",
+            kind.name()
+        )));
+    }
+    if output_sharding.rank() != reduced_output.rank() {
+        return Err(TypeError::invalid(format!(
+            "reduce_sum output sharding rank ({}) does not match the output rank ({})",
+            output_sharding.rank(),
+            reduced_output.rank(),
+        )));
+    }
+    if let Some(input_sharding) = input.sharding()
+        && output_sharding.mesh() != input_sharding.mesh()
+    {
+        return Err(TypeError::invalid("reduce_sum output sharding must use the same mesh as the operand"));
+    }
+    let mut referenced_axes: Vec<&String> = output_sharding.unreduced_axes().iter().collect();
+    referenced_axes.extend(output_sharding.reduced_axes());
+    for dimension in output_sharding.dimensions() {
+        if let ShardingDimension::Sharded(axis_names) = dimension {
+            referenced_axes.extend(axis_names);
+        }
+    }
+    if referenced_axes
+        .iter()
+        .any(|name| output_sharding.mesh().axis_type(name) == Some(MeshAxisType::Auto))
+    {
+        return Err(TypeError::invalid("reduce_sum output sharding cannot reference auto mesh axes"));
+    }
+
+    if !output_sharding.unreduced_axes().is_empty() {
+        // The axes whose reduction the request defers: the Explicit axes that sharded the summed-over dimensions,
+        // together with the axes the operand was already unreduced over.
+        let mut reducible_axes: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        if let Some(input_sharding) = input.sharding() {
+            for axis in axes {
+                if let ShardingDimension::Sharded(axis_names) = &input_sharding.dimensions()[*axis] {
+                    reducible_axes.extend(
+                        axis_names
+                            .iter()
+                            .filter(|name| input_sharding.mesh().axis_type(name) == Some(MeshAxisType::Explicit))
+                            .map(String::as_str),
+                    );
+                }
+            }
+            reducible_axes.extend(input_sharding.unreduced_axes().iter().map(String::as_str));
+        }
+        if !output_sharding.unreduced_axes().iter().all(|name| reducible_axes.contains(name.as_str())) {
+            return Err(TypeError::invalid(
+                "reduce_sum output sharding unreduced axes must be among the explicit axes sharding the \
+                          reduced dimensions or the operand's unreduced axes",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Applies the batching skeleton shared by the primitives that collapse a set of array axes, given an operation whose
+/// axes have already been lifted past the inserted batch dimension.
+///
+/// Collapsing an axis is what makes it legitimate to *consume* an operand's per-item extents along a reduced bounded
+/// ragged axis: the padding is first neutralized by `mask`, so the result no longer depends on those extents, and each
+/// consumed [`DimensionVariable`] is then reported as the rule's [`BatchedOutputs`] evidence, which is how the
+/// carrier-invariant validation boundary tells a deliberate consumption apart from a silently dropped extent. The
+/// evidence is collected from the *unmasked* operand, because masking rewrites the payload while leaving the ragged
+/// metadata that the boundary is told about in place. Ragged axes outside `reduced_axes` survive onto the result.
+///
+/// This skeleton is specific to axis-collapsing primitives. A prefix scan, for instance, masks the very same way but
+/// keeps the axis it touches, and so consumes nothing and reports no evidence.
+///
+/// # Parameters
+///
+///   - `context`: Active [`BatchingContext`] for the transform level being applied.
+///   - `operation`: Lifted operation, interpreted over the physical batched value.
+///   - `input`: Operand batch, as the rule received it.
+///   - `reduced_axes`: Collapsed axes of `operation`, in the physical batched coordinate system.
+///   - `output_axis`: Position of the batch axis in the result.
+///   - `mask`: Neutralizes the operand's ragged padding along `reduced_axes` with the operation's own identity.
+pub(crate) fn batch_reducing_operation<C, P, O, Mask>(
+    context: &BatchingContext<C, ArrayBatching<P>>,
+    operation: &O,
+    input: &ArrayBatch<C::Value>,
+    reduced_axes: &[usize],
+    output_axis: usize,
+    mask: Mask,
+) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError>
+where
+    C: Context<Type = ArrayType>,
+    P: RaggedArrayBatchingPolicy<C>,
+    O: InterpretableOperation<C>,
+    Mask: FnOnce(&ArrayBatch<C::Value>) -> Result<ArrayBatch<C::Value>, BatchingError>,
+{
+    let consumed_ragged_dimensions = input
+        .ragged_axes()
+        .iter()
+        .filter(|ragged_axis| reduced_axes.contains(&ragged_axis.axis()))
+        .map(|ragged_axis| ragged_axis.dimension().clone())
+        .collect::<Vec<_>>();
+    let masked = mask(input)?;
+    let remaining_ragged_axes = masked
+        .ragged_axes()
+        .iter()
+        .cloned()
+        .filter_map(|ragged_axis| ragged_axis.reduced(reduced_axes))
+        .collect::<Vec<_>>();
+    let output_batch_axis = BatchAxis::from_position(output_axis);
+    let mut outputs = operation.interpret_with_batch_axes(
+        context,
+        std::slice::from_ref(&masked),
+        std::slice::from_ref(&output_batch_axis),
+    )?;
+    check_count!("output", outputs, 1, ProgramError);
+    let output =
+        ArrayBatch::new(outputs.remove(0).into_value(), output_batch_axis)?.with_ragged_axes(remaining_ragged_axes)?;
+    Ok(BatchedOutputs::new(vec![output], consumed_ragged_dimensions))
+}
+
+/// Lifts a reduce's `axes` through one batching level inserted at `batch_axis`.
+///
+/// Returns the rewritten axes and the output batch axis position. Each user axis `i` shifts to
+/// `i + 1` when `i >= batch_axis`. The output batch axis is `batch_axis` minus the number of
+/// reduced axes that lie strictly below it (because those axes get dropped in the output).
+///
+/// The axes are expressed in the per-item coordinate system and therefore cannot name the inserted
+/// batch dimension. In particular, a user axis equal to `batch_axis` shifts past the physical batch
+/// dimension rather than reducing it.
+pub fn lift_reduce_axes(axes: &[usize], batch_axis: usize) -> (Vec<usize>, usize) {
+    let mut lifted = Vec::with_capacity(axes.len());
+    let mut axes_below_batch = 0usize;
+    for axis in axes {
+        if *axis < batch_axis {
+            lifted.push(*axis);
+            axes_below_batch += 1;
+        } else {
+            lifted.push(*axis + 1);
+        }
+    }
+    let output_batch_axis = batch_axis - axes_below_batch;
+    (lifted, output_batch_axis)
+}
+
+/// Builds the `output_axes` vector that maps a reduced output's axes back to the
+/// corresponding input axes. Output axis `j` corresponds to the `j`-th non-reduced input axis;
+/// the returned vector lists those input-axis indices in order.
+pub(crate) fn output_to_input_axis_map(input_rank: usize, reduced_axes: &[usize]) -> Vec<usize> {
+    let mut reduce_mask = vec![false; input_rank];
+    for axis in reduced_axes {
+        reduce_mask[*axis] = true;
+    }
+    (0..input_rank).filter(|axis| !reduce_mask[*axis]).collect()
 }
 
 /// Reduction evaluation helper that operates on a flat row-major payload and shape.
@@ -1128,6 +1129,312 @@ mod tests {
     use crate::tracing::TracingContext;
 
     use super::*;
+
+    #[test]
+    fn test_reduce_type_inference() {
+        // The operation carries no input shape; the output type is derived from the actual staged
+        // input type, and out-of-range axes are rejected against it.
+        let operation = ReduceOperation::new(vec![1], ReductionKind::Sum);
+        let input = ArrayType::new_static(DataType::F64, [3, 2]);
+        assert_eq!(operation.infer_output_types(&[input], &[]), Ok(vec![ArrayType::new_static(DataType::F64, [3])]));
+        assert_eq!(
+            operation.infer_output_types(&[ArrayType::new_static(DataType::F64, [3])], &[]),
+            Err(TypeError::invalid("`reduce_sum` axis 1 is out of bounds for rank 1".to_string())),
+        );
+    }
+
+    #[test]
+    fn test_reduce_interpretation() {
+        use crate::arrays::{
+            Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension, StridedLayout,
+        };
+
+        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let output_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let input_type = ArrayType::new_static(DataType::F64, [2, 3])
+            .with_layout(Layout::Strided(StridedLayout::new(vec![24, 8])))
+            .with_memory(Memory::Host { pinned: true })
+            .with_sharding(
+                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap(),
+            )
+            .unwrap();
+        let input = Array::from_f64s(input_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let outputs = ReduceOperation::new(vec![1], ReductionKind::Sum)
+            .interpret(&crate::EagerContext::<Array>::new(), &crate::EmptyRegionDriver, std::slice::from_ref(&input))
+            .unwrap();
+        let output = outputs.into_iter().next().unwrap();
+        // The payload kernel and abstract rule must agree on the complete result type: reduction projects sharding,
+        // preserves memory placement, and clears the rank-specific layout.
+        assert_eq!(
+            output.r#type().as_ref(),
+            &ArrayType::new_static(DataType::F64, [2])
+                .with_memory(Memory::Host { pinned: true })
+                .with_sharding(output_sharding)
+                .unwrap(),
+        );
+        assert_eq!(output.to_f64s(), vec![6.0, 15.0]);
+    }
+
+    #[test]
+    fn test_reduce_batching() {
+        check_operation_batching!(
+            @exact,
+            operation = ReduceOperation::new(vec![1], ReductionKind::Sum),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@replicated, Array::matrix(2, 3, vec![1.0; 6]))],
+                outputs = [(@replicated, Array::vector(vec![3.0, 3.0]))],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_reduce_operation_batches_along_non_batch_axis() {
+        // Physical input is [3 batch items, 2 rows, 3 cols] mapped at axis 0. Per-item reduce over
+        // axis 1 (the "cols" axis from the per-item view; physically axis 2 after batching).
+        check_operation_batching!(
+            @exact,
+            operation = ReduceOperation::new(vec![1], ReductionKind::Sum),
+            axis_size = 3,
+            cases = [{
+                inputs = [(@mapped(
+                    axis = 0
+                ), Array::from_f64s(
+                    ArrayType::new_static(DataType::F64, [3, 2, 3]),
+                    (0..18).map(|index| index as f64).collect(),
+                ))],
+                outputs = [(@mapped(
+                    axis = 0
+                ), Array::matrix(3, 2, vec![3.0, 12.0, 21.0, 30.0, 39.0, 48.0]))],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_reduce_operation_batches_a_per_item_axis_at_the_physical_batch_position() {
+        check_operation_batching!(
+            @exact,
+            operation = ReduceOperation::new(vec![0], ReductionKind::Sum),
+            axis_size = 3,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::matrix(3, 2, vec![1.0; 6]))],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![2.0, 2.0, 2.0]))],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_lift_reduce_axes_shifts_axes_above_batch_and_keeps_axes_below() {
+        // Per-item reduce over axes [0, 2] of a rank-3 input. Batching at axis 1 inserts a new
+        // dimension at position 1, so per-item axis 0 stays at 0, per-item axis 2 shifts to 3.
+        // Output batch axis is at position 1 - 1 = 0 (one reduced axis was below the batch axis).
+        assert_eq!(lift_reduce_axes(&[0, 2], 1), (vec![0, 3], 0));
+        // Reducing only above the batch axis leaves the batch axis position unchanged.
+        assert_eq!(lift_reduce_axes(&[2], 0), (vec![3], 0));
+        // A per-item axis at the physical batch position shifts past the inserted batch dimension.
+        assert_eq!(lift_reduce_axes(&[0, 1], 1), (vec![0, 2], 0));
+    }
+
+    #[test]
+    fn test_reduce_differentiation() {
+        for kind in [ReductionKind::Max, ReductionKind::Min] {
+            let input = Array::vector(vec![1.0, 1.0]);
+            let (primal, tangent) = differentiate_at(input.clone())
+                .jvp(Array::vector(vec![1.0, 3.0]), |input| Ok(input.reduce(&[0], kind)))
+                .unwrap();
+            assert_eq!(primal.to_f64s(), vec![1.0]);
+            assert_eq!(tangent.to_f64s(), vec![2.0]);
+
+            let (primal, gradient) =
+                differentiate_at(input).value_and_gradient(|input| Ok(input.reduce(&[0], kind))).unwrap();
+            assert_eq!(primal.to_f64s(), vec![1.0]);
+            assert_abs_diff_eq!(gradient.to_f64s()[0], 0.5, epsilon = 1e-9);
+            assert_abs_diff_eq!(gradient.to_f64s()[1], 0.5, epsilon = 1e-9);
+        }
+    }
+
+    #[test]
+    fn test_reduce_dynamic_reduced_axis_transposition() {
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
+        let input_type =
+            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)]));
+
+        // Direct transposition observes no primal value, so the reduced axis's runtime extent is unavailable and the
+        // replication cannot be staged. Both additive kinds report that instead of failing inside broadcast inference.
+        for kind in [ReductionKind::Sum, ReductionKind::Mean] {
+            let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+            let output_cotangent = {
+                let atom = context
+                    .builder()
+                    .borrow_mut()
+                    .add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])));
+                context.tracer(atom, None)
+            };
+            assert!(matches!(
+                ReduceOperation::new(vec![0], kind).transpose(
+                    &mut TranspositionContext::new(context.clone()),
+                    &crate::programs::regions::EmptyRegionDriver,
+                    &[PartialValue::Unknown(input_type.clone())],
+                    &[MaybeZero::Value(output_cotangent)],
+                ),
+                Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                    if message == format!(
+                        "direct `reduce_{kind}` transposition over reduced axis 0 of [batch, 2] requires \
+                         linearization so that the runtime extent can be retained as a residual",
+                    ),
+            ));
+        }
+
+        // Linearization retains that extent as a first-class dimension residual, so the same reductions transpose
+        // through the composite universe and their pullbacks replay at more than one concrete extent.
+        for (axes, cotangent) in [(vec![0], Array::vector(vec![1.0, 2.0])), (vec![0, 1], Array::scalar(3.0))] {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let input = builder.add_input(input_type.clone().into());
+            let output = builder
+                .add_instruction(
+                    ArrayIrOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(
+                        axes.clone(),
+                        ReductionKind::Sum,
+                    ))),
+                    Vec::new(),
+                    vec![input],
+                    None,
+                )
+                .unwrap()[0];
+            let program = builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![output],
+                    vec![Placeholder],
+                    vec![Placeholder],
+                )
+                .unwrap();
+            let linearization = program.linearize().unwrap();
+            let pullback = linearization.pullback().unwrap();
+
+            for rows in [4usize, 2] {
+                let values = (0..rows * 2).map(|index| index as f64).collect::<Vec<_>>();
+                let mut primal_outputs = linearization
+                    .primal()
+                    .interpret(vec![ArrayIrValue::Array(Array::matrix(rows, 2, values))])
+                    .unwrap();
+                let residuals = primal_outputs.split_off(1);
+                let mut pullback_inputs = vec![ArrayIrValue::Array(cotangent.clone())];
+                pullback_inputs.extend(residuals);
+
+                // A sum broadcasts each output cotangent back over every reduced position.
+                let expected = (0..rows * 2)
+                    .map(|index| if axes.len() == 1 { cotangent.to_f64s()[index % 2] } else { cotangent.to_f64s()[0] })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    pullback.interpret(pullback_inputs),
+                    Ok(vec![ArrayIrValue::Array(Array::matrix(rows, 2, expected))]),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_reduce_mean_transpose_divides_by_axis_size() {
+        // Mean over a length-4 axis: transpose maps a unit cotangent to a broadcast-back
+        // cotangent of `1 / 4` at every input position.
+        use std::rc::Rc;
+
+        use crate::parameters::Placeholder;
+        use crate::tracing::TracingContext;
+
+        let input_shape = Shape::new(vec![Dimension::Static(4)]);
+        let input_type = ArrayType::new(DataType::F64, input_shape.clone());
+        let cotangent_type = ArrayType::scalar(DataType::F64);
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let transpose_builder = context.builder().clone();
+        let output_cotangent_atom = transpose_builder.borrow_mut().add_input(cotangent_type);
+        let output_cotangent = context.tracer(output_cotangent_atom, None);
+        let contribution = ReduceOperation::new(vec![0], ReductionKind::Mean)
+            .transpose(
+                &mut TranspositionContext::new(context.clone()),
+                &crate::programs::regions::EmptyRegionDriver,
+                &[PartialValue::Unknown(input_type)],
+                &[MaybeZero::Value(output_cotangent)],
+            )
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("transpose should return one contribution");
+        let MaybeZero::Value(contribution) = contribution else {
+            panic!("transpose should produce one cotangent contribution");
+        };
+        let contribution_atom = contribution.atom_id().unwrap();
+        drop(contribution);
+        drop(context);
+        let transpose_builder = Rc::try_unwrap(transpose_builder)
+            .expect("transpose builder should not have outstanding linear terms")
+            .into_inner();
+        let transpose_program =
+            transpose_builder.build::<Array, Array>(vec![contribution_atom], Placeholder, Placeholder).unwrap();
+        let result = transpose_program.interpret(Array::scalar(1.0)).unwrap();
+        assert_eq!(result.r#type().shape(), &input_shape);
+        for value in result.to_f64s() {
+            let delta = (value - 0.25).abs();
+            assert!(delta < 1e-9, "expected ≈ 0.25, got {value}");
+        }
+    }
+
+    #[test]
+    fn test_reduce_mean_transpose_checks_reduced_element_count() {
+        use crate::differentiation::DifferentiationError;
+        use crate::partial::PartialValue;
+        use crate::programs::{MaybeZero, ProgramError, TypeError};
+        use crate::tracing::TracingContext;
+
+        let input_shape = Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(2)]);
+        let input_type = ArrayType::new(DataType::F64, input_shape.clone());
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let output_cotangent = {
+            let atom = context.builder().borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+            context.tracer(atom, None)
+        };
+
+        assert!(matches!(
+            ReduceOperation::new(vec![0, 1], ReductionKind::Mean).transpose(
+                &mut TranspositionContext::new(context.clone()),
+                &crate::programs::regions::EmptyRegionDriver,
+                &[PartialValue::Unknown(input_type)],
+                &[MaybeZero::Value(output_cotangent)],
+            ),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == format!(
+                    "mean transpose reduced element count overflows usize for input shape {input_shape}",
+                ),
+        ));
+    }
+
+    #[test]
+    fn test_reduce_mean_transpose_accepts_zero_reduced_element_count_without_overflow() {
+        use crate::partial::PartialValue;
+        use crate::programs::MaybeZero;
+        use crate::tracing::TracingContext;
+
+        let input_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(2), Dimension::Static(0)]),
+        );
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let output_cotangent = {
+            let atom = context.builder().borrow_mut().add_input(ArrayType::scalar(DataType::F64));
+            context.tracer(atom, None)
+        };
+
+        let contributions = ReduceOperation::new(vec![0, 1, 2], ReductionKind::Mean)
+            .transpose(
+                &mut TranspositionContext::new(context.clone()),
+                &crate::programs::regions::EmptyRegionDriver,
+                &[PartialValue::Unknown(input_type.clone())],
+                &[MaybeZero::Value(output_cotangent)],
+            )
+            .unwrap();
+        assert_eq!(contributions.len(), 1);
+        assert_eq!(contributions[0].r#type().as_ref(), &input_type);
+    }
 
     #[test]
     fn test_reduce_abstract_drops_reduced_axes_and_keeps_remaining_order() {
@@ -1252,19 +1559,6 @@ mod tests {
     }
 
     #[test]
-    fn test_reduce_operation_infer_output_types_follows_the_input_type() {
-        // The operation carries no input shape; the output type is derived from the actual staged
-        // input type, and out-of-range axes are rejected against it.
-        let operation = ReduceOperation::new(vec![1], ReductionKind::Sum);
-        let input = ArrayType::new_static(DataType::F64, [3, 2]);
-        assert_eq!(operation.infer_output_types(&[input], &[]), Ok(vec![ArrayType::new_static(DataType::F64, [3])]));
-        assert_eq!(
-            operation.infer_output_types(&[ArrayType::new_static(DataType::F64, [3])], &[]),
-            Err(TypeError::invalid("`reduce_sum` axis 1 is out of bounds for rank 1".to_string())),
-        );
-    }
-
-    #[test]
     fn test_reduce_sum_output_sharding_requests_unreduced_output() {
         use crate::arrays::{LogicalMesh, MeshAxis, MeshAxisType, Sharding, ShardingDimension};
         use crate::programs::Operation;
@@ -1324,38 +1618,6 @@ mod tests {
     }
 
     #[test]
-    fn test_reduce_operation_interprets_sum_over_axis() {
-        use crate::arrays::{
-            Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension, StridedLayout,
-        };
-
-        let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let output_sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let input_type = ArrayType::new_static(DataType::F64, [2, 3])
-            .with_layout(Layout::Strided(StridedLayout::new(vec![24, 8])))
-            .with_memory(Memory::Host { pinned: true })
-            .with_sharding(
-                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()]).unwrap(),
-            )
-            .unwrap();
-        let input = Array::from_f64s(input_type, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        let outputs = ReduceOperation::new(vec![1], ReductionKind::Sum)
-            .interpret(&crate::EagerContext::<Array>::new(), &crate::EmptyRegionDriver, std::slice::from_ref(&input))
-            .unwrap();
-        let output = outputs.into_iter().next().unwrap();
-        // The payload kernel and abstract rule must agree on the complete result type: reduction projects sharding,
-        // preserves memory placement, and clears the rank-specific layout.
-        assert_eq!(
-            output.r#type().as_ref(),
-            &ArrayType::new_static(DataType::F64, [2])
-                .with_memory(Memory::Host { pinned: true })
-                .with_sharding(output_sharding)
-                .unwrap(),
-        );
-        assert_eq!(output.to_f64s(), vec![6.0, 15.0]);
-    }
-
-    #[test]
     fn test_reduce_with_output_sharding_stages_through_the_capability() {
         use std::rc::Rc;
 
@@ -1401,267 +1663,6 @@ mod tests {
         assert_eq!(linearization.tangent().output_types()[0], expected_output_type);
         assert!(linearization.primal().to_string().contains(&format!("output_sharding={unreduced}")));
         assert!(linearization.tangent().to_string().contains(&format!("output_sharding={unreduced}")));
-    }
-
-    #[test]
-    fn test_reduce_operation_batches_replicated_input_as_pass_through() {
-        check_operation_batching!(
-            @exact,
-            operation = ReduceOperation::new(vec![1], ReductionKind::Sum),
-            axis_size = 2,
-            cases = [{
-                inputs = [(@replicated, Array::matrix(2, 3, vec![1.0; 6]))],
-                outputs = [(@replicated, Array::vector(vec![3.0, 3.0]))],
-            }],
-        );
-    }
-
-    #[test]
-    fn test_reduce_operation_batches_along_non_batch_axis() {
-        // Physical input is [3 batch items, 2 rows, 3 cols] mapped at axis 0. Per-item reduce over
-        // axis 1 (the "cols" axis from the per-item view; physically axis 2 after batching).
-        check_operation_batching!(
-            @exact,
-            operation = ReduceOperation::new(vec![1], ReductionKind::Sum),
-            axis_size = 3,
-            cases = [{
-                inputs = [(@mapped(
-                    axis = 0
-                ), Array::from_f64s(
-                    ArrayType::new_static(DataType::F64, [3, 2, 3]),
-                    (0..18).map(|index| index as f64).collect(),
-                ))],
-                outputs = [(@mapped(
-                    axis = 0
-                ), Array::matrix(3, 2, vec![3.0, 12.0, 21.0, 30.0, 39.0, 48.0]))],
-            }],
-        );
-    }
-
-    #[test]
-    fn test_reduce_operation_batches_a_per_item_axis_at_the_physical_batch_position() {
-        check_operation_batching!(
-            @exact,
-            operation = ReduceOperation::new(vec![0], ReductionKind::Sum),
-            axis_size = 3,
-            cases = [{
-                inputs = [(@mapped(axis = 0), Array::matrix(3, 2, vec![1.0; 6]))],
-                outputs = [(@mapped(axis = 0), Array::vector(vec![2.0, 2.0, 2.0]))],
-            }],
-        );
-    }
-
-    #[test]
-    fn test_lift_reduce_axes_shifts_axes_above_batch_and_keeps_axes_below() {
-        // Per-item reduce over axes [0, 2] of a rank-3 input. Batching at axis 1 inserts a new
-        // dimension at position 1, so per-item axis 0 stays at 0, per-item axis 2 shifts to 3.
-        // Output batch axis is at position 1 - 1 = 0 (one reduced axis was below the batch axis).
-        assert_eq!(lift_reduce_axes(&[0, 2], 1), (vec![0, 3], 0));
-        // Reducing only above the batch axis leaves the batch axis position unchanged.
-        assert_eq!(lift_reduce_axes(&[2], 0), (vec![3], 0));
-        // A per-item axis at the physical batch position shifts past the inserted batch dimension.
-        assert_eq!(lift_reduce_axes(&[0, 1], 1), (vec![0, 2], 0));
-    }
-
-    #[test]
-    fn test_reduce_extrema_derivatives_split_ties_evenly() {
-        for kind in [ReductionKind::Max, ReductionKind::Min] {
-            let input = Array::vector(vec![1.0, 1.0]);
-            let (primal, tangent) = differentiate_at(input.clone())
-                .jvp(Array::vector(vec![1.0, 3.0]), |input| Ok(input.reduce(&[0], kind)))
-                .unwrap();
-            assert_eq!(primal.to_f64s(), vec![1.0]);
-            assert_eq!(tangent.to_f64s(), vec![2.0]);
-
-            let (primal, gradient) =
-                differentiate_at(input).value_and_gradient(|input| Ok(input.reduce(&[0], kind))).unwrap();
-            assert_eq!(primal.to_f64s(), vec![1.0]);
-            assert_abs_diff_eq!(gradient.to_f64s()[0], 0.5, epsilon = 1e-9);
-            assert_abs_diff_eq!(gradient.to_f64s()[1], 0.5, epsilon = 1e-9);
-        }
-    }
-
-    #[test]
-    fn test_reduce_mean_transpose_divides_by_axis_size() {
-        // Mean over a length-4 axis: transpose maps a unit cotangent to a broadcast-back
-        // cotangent of `1 / 4` at every input position.
-        use std::rc::Rc;
-
-        use crate::parameters::Placeholder;
-        use crate::tracing::TracingContext;
-
-        let input_shape = Shape::new(vec![Dimension::Static(4)]);
-        let input_type = ArrayType::new(DataType::F64, input_shape.clone());
-        let cotangent_type = ArrayType::scalar(DataType::F64);
-        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let transpose_builder = context.builder().clone();
-        let output_cotangent_atom = transpose_builder.borrow_mut().add_input(cotangent_type);
-        let output_cotangent = context.tracer(output_cotangent_atom, None);
-        let contribution = ReduceOperation::new(vec![0], ReductionKind::Mean)
-            .transpose(
-                &mut TranspositionContext::new(context.clone()),
-                &crate::programs::regions::EmptyRegionDriver,
-                &[PartialValue::Unknown(input_type)],
-                &[MaybeZero::Value(output_cotangent)],
-            )
-            .unwrap()
-            .into_iter()
-            .next()
-            .expect("transpose should return one contribution");
-        let MaybeZero::Value(contribution) = contribution else {
-            panic!("transpose should produce one cotangent contribution");
-        };
-        let contribution_atom = contribution.atom_id().unwrap();
-        drop(contribution);
-        drop(context);
-        let transpose_builder = Rc::try_unwrap(transpose_builder)
-            .expect("transpose builder should not have outstanding linear terms")
-            .into_inner();
-        let transpose_program =
-            transpose_builder.build::<Array, Array>(vec![contribution_atom], Placeholder, Placeholder).unwrap();
-        let result = transpose_program.interpret(Array::scalar(1.0)).unwrap();
-        assert_eq!(result.r#type().shape(), &input_shape);
-        for value in result.to_f64s() {
-            let delta = (value - 0.25).abs();
-            assert!(delta < 1e-9, "expected ≈ 0.25, got {value}");
-        }
-    }
-
-    #[test]
-    fn test_reduce_mean_transpose_checks_reduced_element_count() {
-        use crate::differentiation::DifferentiationError;
-        use crate::partial::PartialValue;
-        use crate::programs::{MaybeZero, ProgramError, TypeError};
-        use crate::tracing::TracingContext;
-
-        let input_shape = Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(2)]);
-        let input_type = ArrayType::new(DataType::F64, input_shape.clone());
-        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let output_cotangent = {
-            let atom = context.builder().borrow_mut().add_input(ArrayType::scalar(DataType::F64));
-            context.tracer(atom, None)
-        };
-
-        assert!(matches!(
-            ReduceOperation::new(vec![0, 1], ReductionKind::Mean).transpose(
-                &mut TranspositionContext::new(context.clone()),
-                &crate::programs::regions::EmptyRegionDriver,
-                &[PartialValue::Unknown(input_type)],
-                &[MaybeZero::Value(output_cotangent)],
-            ),
-            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
-                if message == format!(
-                    "mean transpose reduced element count overflows usize for input shape {input_shape}",
-                ),
-        ));
-    }
-
-    #[test]
-    fn test_reduce_mean_transpose_accepts_zero_reduced_element_count_without_overflow() {
-        use crate::partial::PartialValue;
-        use crate::programs::MaybeZero;
-        use crate::tracing::TracingContext;
-
-        let input_type = ArrayType::new(
-            DataType::F64,
-            Shape::new(vec![Dimension::Static(usize::MAX), Dimension::Static(2), Dimension::Static(0)]),
-        );
-        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let output_cotangent = {
-            let atom = context.builder().borrow_mut().add_input(ArrayType::scalar(DataType::F64));
-            context.tracer(atom, None)
-        };
-
-        let contributions = ReduceOperation::new(vec![0, 1, 2], ReductionKind::Mean)
-            .transpose(
-                &mut TranspositionContext::new(context.clone()),
-                &crate::programs::regions::EmptyRegionDriver,
-                &[PartialValue::Unknown(input_type.clone())],
-                &[MaybeZero::Value(output_cotangent)],
-            )
-            .unwrap();
-        assert_eq!(contributions.len(), 1);
-        assert_eq!(contributions[0].r#type().as_ref(), &input_type);
-    }
-
-    #[test]
-    fn test_reduce_dynamic_reduced_axis_transposition() {
-        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
-        let input_type =
-            ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)]));
-
-        // Direct transposition observes no primal value, so the reduced axis's runtime extent is unavailable and the
-        // replication cannot be staged. Both additive kinds report that instead of failing inside broadcast inference.
-        for kind in [ReductionKind::Sum, ReductionKind::Mean] {
-            let context = TracingContext::<Array, ArrayOperation<Array>>::new();
-            let output_cotangent = {
-                let atom = context
-                    .builder()
-                    .borrow_mut()
-                    .add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])));
-                context.tracer(atom, None)
-            };
-            assert!(matches!(
-                ReduceOperation::new(vec![0], kind).transpose(
-                    &mut TranspositionContext::new(context.clone()),
-                    &crate::programs::regions::EmptyRegionDriver,
-                    &[PartialValue::Unknown(input_type.clone())],
-                    &[MaybeZero::Value(output_cotangent)],
-                ),
-                Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                    if message == format!(
-                        "direct `reduce_{kind}` transposition over reduced axis 0 of [batch, 2] requires \
-                         linearization so that the runtime extent can be retained as a residual",
-                    ),
-            ));
-        }
-
-        // Linearization retains that extent as a first-class dimension residual, so the same reductions transpose
-        // through the composite universe and their pullbacks replay at more than one concrete extent.
-        for (axes, cotangent) in [(vec![0], Array::vector(vec![1.0, 2.0])), (vec![0, 1], Array::scalar(3.0))] {
-            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-            let input = builder.add_input(input_type.clone().into());
-            let output = builder
-                .add_instruction(
-                    ArrayIrOperation::Array(ArrayOperation::Reduce(ReduceOperation::new(
-                        axes.clone(),
-                        ReductionKind::Sum,
-                    ))),
-                    Vec::new(),
-                    vec![input],
-                    None,
-                )
-                .unwrap()[0];
-            let program = builder
-                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                    vec![output],
-                    vec![Placeholder],
-                    vec![Placeholder],
-                )
-                .unwrap();
-            let linearization = program.linearize().unwrap();
-            let pullback = linearization.pullback().unwrap();
-
-            for rows in [4usize, 2] {
-                let values = (0..rows * 2).map(|index| index as f64).collect::<Vec<_>>();
-                let mut primal_outputs = linearization
-                    .primal()
-                    .interpret(vec![ArrayIrValue::Array(Array::matrix(rows, 2, values))])
-                    .unwrap();
-                let residuals = primal_outputs.split_off(1);
-                let mut pullback_inputs = vec![ArrayIrValue::Array(cotangent.clone())];
-                pullback_inputs.extend(residuals);
-
-                // A sum broadcasts each output cotangent back over every reduced position.
-                let expected = (0..rows * 2)
-                    .map(|index| if axes.len() == 1 { cotangent.to_f64s()[index % 2] } else { cotangent.to_f64s()[0] })
-                    .collect::<Vec<_>>();
-                assert_eq!(
-                    pullback.interpret(pullback_inputs),
-                    Ok(vec![ArrayIrValue::Array(Array::matrix(rows, 2, expected))]),
-                );
-            }
-        }
     }
 
     #[test]

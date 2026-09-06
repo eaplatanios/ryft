@@ -126,6 +126,7 @@ mod tests {
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::differentiate_at;
     use crate::interpretation::InterpretableOperation;
+    use crate::macros::{check_operation_transposition, check_operation_type_inference};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, PartialTracer};
     use crate::programs::{EmptyRegionDriver, Operation, ProgramBuilder};
@@ -135,11 +136,42 @@ mod tests {
 
     #[test]
     fn test_zero_like() {
-        // Verify the operation's identity, zero metadata, rendering, and eager interpretation.
+        // Verify the operation's identity, zero metadata, and rendering.
         let operation = ZeroLikeOperation::<ArrayType>::new();
         assert!(operation.is_zero(0));
         assert!(!operation.is_zero(1));
         assert_eq!(format!("{operation}"), ZERO_LIKE_OPERATION_NAME);
+
+        // Verify the operation's textual form when it appears in a program.
+        let mut builder = ProgramBuilder::<Array, ZeroLikeOperation<ArrayType>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                    lambda %0:f64[] .
+                    let %1:f64[] = zero_like %0
+                    in (%1)
+                "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_zero_like_type_inference() {
+        check_operation_type_inference!(
+            operation = ZeroLikeOperation::<ArrayType>::new(),
+            cases = [{
+                input_types = [ArrayType::new_static(DataType::F32, [2])],
+                output_types = [ArrayType::new_static(DataType::F32, [2])],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_zero_like_interpretation() {
+        let operation = ZeroLikeOperation::<ArrayType>::new();
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
                 &operation,
@@ -161,24 +193,6 @@ mod tests {
             Err(ProgramError::Type(TypeError::invalid("data type `f8e8m0fnu` cannot represent zero"))),
         );
 
-        // Verify the operation's textual form when it appears in a program.
-        let mut builder = ProgramBuilder::<Array, ZeroLikeOperation<ArrayType>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
-        let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                    lambda %0:f64[] .
-                    let %1:f64[] = zero_like %0
-                    in (%1)
-                "}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_array_zero_like() {
         // Verify value-driven zero synthesis across representative rank-zero array data-type families.
         for (input, expected) in [
             (Array::scalar(false), Array::scalar(false)),
@@ -217,6 +231,49 @@ mod tests {
     }
 
     #[test]
+    fn test_zero_like_partial_evaluation() {
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let input = PartialTracer::new(context, PartialEvaluationValue::known(Array::vector(vec![1.5f32, -2.5])));
+        let output = input.zero_like().unwrap();
+        assert_eq!(output.value().unwrap().as_known(), Some(&Array::vector(vec![0.0f32, 0.0])));
+    }
+
+    #[test]
+    fn test_zero_like_batching() {
+        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
+        let input = BatchingTracer::new(
+            context,
+            ArrayBatch::new(Array::vector(vec![1.5f32, -2.5]), BatchAxis::replicated()).unwrap(),
+        );
+        let output = input.zero_like().unwrap();
+        assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
+        assert_eq!(output.batch().value(), &Array::vector(vec![0.0f32, 0.0]));
+    }
+
+    #[test]
+    fn test_zero_like_differentiation() {
+        // Dense reverse-mode differentiation batches the constant rule while constructing the identity Jacobian.
+        let jacobian = differentiate_at(Array::scalar(2.0))
+            .jacobian_reverse(|input| Ok(input.clone() + input.zero_like()?))
+            .unwrap();
+        let block = jacobian.iter_blocks().next().unwrap();
+        assert_eq!(block.value().to_f64s(), vec![1.0]);
+    }
+
+    #[test]
+    fn test_zero_like_transposition() {
+        check_operation_transposition!(
+            @exact,
+            operation = ZeroLikeOperation::<ArrayType>::new(),
+            cases = [{
+                inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
+                output_cotangents = [Array::scalar(3.0)],
+                input_cotangents = [Array::scalar(0.0)],
+            }],
+        );
+    }
+
+    #[test]
     fn test_staging_zero_like() {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let input = context.input(ArrayType::new_static(DataType::F32, [2]));
@@ -236,35 +293,5 @@ mod tests {
             "}
             .trim_end(),
         );
-    }
-
-    #[test]
-    fn test_partial_evaluation_zero_like() {
-        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
-        let input = PartialTracer::new(context, PartialEvaluationValue::known(Array::vector(vec![1.5f32, -2.5])));
-        let output = input.zero_like().unwrap();
-        assert_eq!(output.value().unwrap().as_known(), Some(&Array::vector(vec![0.0f32, 0.0])));
-    }
-
-    #[test]
-    fn test_batching_zero_like() {
-        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
-        let input = BatchingTracer::new(
-            context,
-            ArrayBatch::new(Array::vector(vec![1.5f32, -2.5]), BatchAxis::replicated()).unwrap(),
-        );
-        let output = input.zero_like().unwrap();
-        assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
-        assert_eq!(output.batch().value(), &Array::vector(vec![0.0f32, 0.0]));
-    }
-
-    #[test]
-    fn test_differentiation_zero_like() {
-        // Dense reverse-mode differentiation batches the constant rule while constructing the identity Jacobian.
-        let jacobian = differentiate_at(Array::scalar(2.0))
-            .jacobian_reverse(|input| Ok(input.clone() + input.zero_like()?))
-            .unwrap();
-        let block = jacobian.iter_blocks().next().unwrap();
-        assert_eq!(block.value().to_f64s(), vec![1.0]);
     }
 }

@@ -123,6 +123,12 @@ impl<C: Context> PartiallyEvaluatableOperation<C> for PrintOperation<C::Type> wh
 {
 }
 
+impl_differentiable_elementwise_operation! {
+    @linear<T>
+    PrintOperation<T>,
+    rule = [@positive]
+}
+
 /// Represents the ability to print values in programs with labels. [`Print`] stages a [`PrintOperation`], which is
 /// effectively an identity function that prints its input to standard error when executed. Because the staged
 /// operation reports [`EffectClass::OrderedIo`], the print survives dead-code elimination and keeps its execution order
@@ -149,12 +155,6 @@ where
     }
 }
 
-impl_differentiable_elementwise_operation! {
-    @linear<T>
-    PrintOperation<T>,
-    rule = [@positive]
-}
-
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -175,7 +175,7 @@ mod tests {
     }
 
     #[test]
-    fn test_print_operation_contract() {
+    fn test_print() {
         let operation = PrintOperation::new("x");
         let scalar_type = ArrayType::scalar(DataType::F64);
 
@@ -186,22 +186,12 @@ mod tests {
     }
 
     #[test]
-    fn test_print_interprets_as_the_identity() {
+    fn test_print_interpretation() {
         let context = EagerContext::<Array>::new();
         let input = Array::scalar(3.0);
         let outputs =
             PrintOperation::new("x").interpret(&context.clone(), &EmptyRegionDriver, &[input.clone()]).unwrap();
         assert_eq!(outputs, vec![input]);
-    }
-
-    #[test]
-    fn test_print_is_transparent_to_differentiation() {
-        // The JVP rule re-prints the primal and passes the tangent through, so the effect survives on the primal
-        // side of the linearization without perturbing the gradient. The dead primal print (its output is unused by
-        // the gradient) exercises the effect keep-alive of the partition projections.
-        let (value, gradient) = differentiate_at(Array::scalar(3.0)).value_and_gradient(print_square).unwrap();
-        assert_eq!(value.to_f64s()[0], 9.0);
-        assert_eq!(gradient.to_f64s()[0], 6.0);
     }
 
     #[test]
@@ -218,6 +208,16 @@ mod tests {
             ArrayOperation::Print(operation) if operation.label() == "x",
         ));
         assert_eq!(program.effects().classes(), EffectClasses::single(EffectClass::OrderedIo));
+    }
+
+    #[test]
+    fn test_print_differentiation() {
+        // The JVP rule re-prints the primal and passes the tangent through, so the effect survives on the primal
+        // side of the linearization without perturbing the gradient. The dead primal print (its output is unused by
+        // the gradient) exercises the effect keep-alive of the partition projections.
+        let (value, gradient) = differentiate_at(Array::scalar(3.0)).value_and_gradient(print_square).unwrap();
+        assert_eq!(value.to_f64s()[0], 9.0);
+        assert_eq!(gradient.to_f64s()[0], 6.0);
     }
 
     #[test]

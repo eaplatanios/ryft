@@ -25,9 +25,10 @@ use crate::arrays::{
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{BatchAxis, BatchingContext, BatchingError};
 use crate::contexts::{Context, Domain, ProjectedContext};
-use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationError, LinearCallOperation};
+use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationError};
 use crate::macros::check_count;
 use crate::operations::constants::constant::ConstantOperation;
+use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcastOperation};
@@ -640,7 +641,7 @@ macro_rules! shape_changing_collective {
     };
 
     // Internal branch: generates the operation struct with its accessors, the `Display`/`Operation` implementations,
-    // degenerate interpretation, default partial evaluation, and the linear forward-mode rule.
+    // degenerate interpretation, and default partial evaluation.
     (
         @operation
         $(#[$operation_documentation:meta])*
@@ -739,7 +740,10 @@ macro_rules! shape_changing_collective {
             C::Operation: From<$operation>
         {
         }
+    };
 
+    // Generates the linear forward-mode rule after the operation's batching implementation.
+    (@differentiation $operation:ident) => {
         // Forward-mode rule: the collective is linear, so the tangent rides the same collective. Structural-zero
         // tangents stay symbolic, retyped to the output tangent type (the collective changes shapes).
         impl<C: Context<Type = ArrayType>> DifferentiableOperation<C> for $operation
@@ -1208,6 +1212,86 @@ mod tests {
     }
 
     #[test]
+    fn test_grouped_collective_shape_arithmetic_uses_group_size() {
+        let grouped = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
+        let result_extent = DimensionValue::constant(6).unwrap().r#type().into_owned();
+        assert_eq!(
+            infer_explicit_all_gather_output_types(
+                &AllGatherOperation::new("x".to_string(), 4, 0, grouped.clone(), AllGatherOutputVariance::Varying,),
+                &[f32_vector(3).into(), result_extent.into(),],
+            ),
+            Ok(vec![f32_vector(6).into()]),
+        );
+        assert_eq!(
+            infer_explicit_parallel_sum_scatter_output_types(
+                &ParallelSumScatterOperation::new("x".to_string(), 4, 0, grouped),
+                &[f32_vector(6).into(), DimensionValue::constant(3).unwrap().r#type().into_owned().into()],
+            ),
+            Ok(vec![f32_vector(3).into()]),
+        );
+    }
+
+    #[test]
+    fn test_explicit_shape_changing_collective_member_transforms() -> Result<(), ProgramError> {
+        type Context = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        // A live tangent through a dynamically shaped mixed collective stages one residual-aware linear call directly
+        // through the payload's member JVP rule.
+        let variable = DimensionVariable::new("items", DimensionBounds::new(1, Some(9))?);
+        let dimension_type = DimensionType::new(variable.clone());
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
+        let context = Context::new();
+        let primal = context.input(array_type.clone().into());
+        let tangent = context.input(array_type.into());
+        let extent = context.input(dimension_type.into());
+        let extent_tangent_type = extent.r#type().tangent()?;
+        let outputs = AllGatherOperation::new(
+            "x".to_string(),
+            1,
+            0,
+            CollectiveOptions::tiled(),
+            AllGatherOutputVariance::Varying,
+        )
+        .jvp_in_parent(
+            &context,
+            &crate::EmptyRegionDriver,
+            &[
+                DifferentiationDual::new(primal, MaybeZero::Value(tangent))?,
+                DifferentiationDual::new(extent, MaybeZero::Zero(extent_tangent_type))?,
+            ],
+        )?;
+        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(_)));
+        assert!(
+            context
+                .builder()
+                .borrow()
+                .instructions()
+                .iter()
+                .any(|instruction| matches!(instruction.operation(), ArrayIrOperation::LinearCall(_)))
+        );
+
+        // Direct mixed transposition delegates the array contribution through the homogeneous projection and gives
+        // the explicit extent operand a structural-zero cotangent.
+        let mut context = Context::new();
+        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));
+        let output_cotangent = context.input(array_type.clone().into());
+        let extent_type = DimensionValue::constant(3)?.r#type().into_owned();
+        let cotangents = transpose_mixed_operation(
+            &mut context,
+            &ParallelSumScatterOperation::new("x".to_string(), 1, 0, CollectiveOptions::tiled()),
+            &[PartialValue::Unknown(array_type.into()), PartialValue::Unknown(extent_type.into())],
+            &[MaybeZero::Value(output_cotangent)],
+        )?;
+        assert!(matches!(cotangents.as_slice(), [MaybeZero::Value(_), MaybeZero::Zero(_)]));
+        assert!(matches!(
+            context.builder().borrow().instructions()[0].operation(),
+            ArrayIrOperation::Array(ArrayOperation::AllGather(_)),
+        ));
+
+        Ok(())
+    }
+
+    #[test]
     fn test_untiled_collective_type_inference() {
         let shape = |dimensions| ArrayType::new(DataType::F32, Shape::new(dimensions));
 
@@ -1273,26 +1357,6 @@ mod tests {
                 ],
             ),
             Err(TypeError::invalid("`parallel_sum_scatter` untiled scatter axis 1 size 5 must equal group size 4",)),
-        );
-    }
-
-    #[test]
-    fn test_grouped_collective_shape_arithmetic_uses_group_size() {
-        let grouped = CollectiveOptions::tiled().with_axis_index_groups(vec![vec![0, 2], vec![3, 1]]);
-        let result_extent = DimensionValue::constant(6).unwrap().r#type().into_owned();
-        assert_eq!(
-            infer_explicit_all_gather_output_types(
-                &AllGatherOperation::new("x".to_string(), 4, 0, grouped.clone(), AllGatherOutputVariance::Varying,),
-                &[f32_vector(3).into(), result_extent.into(),],
-            ),
-            Ok(vec![f32_vector(6).into()]),
-        );
-        assert_eq!(
-            infer_explicit_parallel_sum_scatter_output_types(
-                &ParallelSumScatterOperation::new("x".to_string(), 4, 0, grouped),
-                &[f32_vector(6).into(), DimensionValue::constant(3).unwrap().r#type().into_owned().into()],
-            ),
-            Ok(vec![f32_vector(3).into()]),
         );
     }
 
@@ -1494,65 +1558,5 @@ mod tests {
         assert!(matches!(transposed_twice.instructions()[0].operation(), ArrayOperation::AllToAll(_)));
         assert_eq!(transposed_twice.input_types(), program.input_types());
         assert_eq!(transposed_twice.output_types(), program.output_types());
-    }
-
-    #[test]
-    fn test_explicit_shape_changing_collective_member_transforms() -> Result<(), ProgramError> {
-        type Context = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-
-        // A live tangent through a dynamically shaped mixed collective stages one residual-aware linear call directly
-        // through the payload's member JVP rule.
-        let variable = DimensionVariable::new("items", DimensionBounds::new(1, Some(9))?);
-        let dimension_type = DimensionType::new(variable.clone());
-        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
-        let context = Context::new();
-        let primal = context.input(array_type.clone().into());
-        let tangent = context.input(array_type.into());
-        let extent = context.input(dimension_type.into());
-        let extent_tangent_type = extent.r#type().tangent()?;
-        let outputs = AllGatherOperation::new(
-            "x".to_string(),
-            1,
-            0,
-            CollectiveOptions::tiled(),
-            AllGatherOutputVariance::Varying,
-        )
-        .jvp_in_parent(
-            &context,
-            &crate::EmptyRegionDriver,
-            &[
-                DifferentiationDual::new(primal, MaybeZero::Value(tangent))?,
-                DifferentiationDual::new(extent, MaybeZero::Zero(extent_tangent_type))?,
-            ],
-        )?;
-        assert!(matches!(outputs[0].tangent(), MaybeZero::Value(_)));
-        assert!(
-            context
-                .builder()
-                .borrow()
-                .instructions()
-                .iter()
-                .any(|instruction| matches!(instruction.operation(), ArrayIrOperation::LinearCall(_)))
-        );
-
-        // Direct mixed transposition delegates the array contribution through the homogeneous projection and gives
-        // the explicit extent operand a structural-zero cotangent.
-        let mut context = Context::new();
-        let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));
-        let output_cotangent = context.input(array_type.clone().into());
-        let extent_type = DimensionValue::constant(3)?.r#type().into_owned();
-        let cotangents = transpose_mixed_operation(
-            &mut context,
-            &ParallelSumScatterOperation::new("x".to_string(), 1, 0, CollectiveOptions::tiled()),
-            &[PartialValue::Unknown(array_type.into()), PartialValue::Unknown(extent_type.into())],
-            &[MaybeZero::Value(output_cotangent)],
-        )?;
-        assert!(matches!(cotangents.as_slice(), [MaybeZero::Value(_), MaybeZero::Zero(_)]));
-        assert!(matches!(
-            context.builder().borrow().instructions()[0].operation(),
-            ArrayIrOperation::Array(ArrayOperation::AllGather(_)),
-        ));
-
-        Ok(())
     }
 }

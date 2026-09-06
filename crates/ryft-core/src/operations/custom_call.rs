@@ -16,11 +16,12 @@ use crate::batching::{
     batch_projected_operation,
 };
 use crate::contexts::{Context, Domain};
-use crate::differentiation::operations::{CUSTOM_JVP_OPERATION_NAME, CUSTOM_VJP_OPERATION_NAME};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_free_dischargeable_operation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::control_flow::scan::ScanOperation;
+use crate::operations::differentiation::custom_jvp::CUSTOM_JVP_OPERATION_NAME;
+use crate::operations::differentiation::custom_vjp::CUSTOM_VJP_OPERATION_NAME;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::broadcasting::DynamicBroadcastOperation;
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
@@ -30,9 +31,6 @@ use crate::programs::{
     EffectClass, EffectClasses, Effects, Operation, OperationFormatter, OperationProjection, ProgramBuilder,
     ProgramError, RegionInterface, Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
-
-/// Canonical operation name for [`CustomCallOperation`].
-pub const CUSTOM_CALL_OPERATION_NAME: &str = "custom_call";
 
 /// Typed configuration attribute value carried by a [`CustomCallOperation`] and forwarded to the foreign kernel.
 /// The variants deliberately cover only the encodings every supporting backend must decode: strings, Booleans,
@@ -484,6 +482,9 @@ struct CustomCallRaggedInput<'a, V> {
     physical_type: ArrayType,
 }
 
+/// Canonical operation name for [`CustomCallOperation`].
+pub const CUSTOM_CALL_OPERATION_NAME: &str = "custom_call";
+
 /// [`Operation`] that calls a foreign kernel registered with the executing backend under a target name — the
 /// analogue of [`jax.ffi.ffi_call`](https://docs.jax.dev/en/latest/ffi.html). The operation is opaque to Ryft:
 /// its output types are declared up front instead of inferred, and typed [`CustomCallAttribute`]s are forwarded
@@ -513,8 +514,8 @@ struct CustomCallRaggedInput<'a, V> {
 /// The reference array backend cannot execute foreign kernels, so eager interpretation on it reports an error.
 ///
 /// Because the kernel is opaque, Ryft cannot derive its transform rules. Differentiating it reports an error
-/// directing users to wrap the call with [`custom_jvp`](crate::differentiation::custom_jvp()) or
-/// [`custom_vjp`](crate::differentiation::custom_vjp()), which supply the missing derivative. Those wrappers do *not*
+/// directing users to wrap the call with [`custom_jvp`](crate::operations::differentiation::custom_jvp::custom_jvp()) or
+/// [`custom_vjp`](crate::operations::differentiation::custom_vjp::custom_vjp()), which supply the missing derivative. Those wrappers do *not*
 /// supply a batching rule: each of them structurally batches its own primal region, so a mapped operand reaches this
 /// same operation and meets this same batching contract. Batching a call whose operands are all replicated binds it
 /// unchanged, because a region-free foreign kernel cannot observe the transform's named axis. A mapped operand is
@@ -1508,32 +1509,6 @@ where
 {
 }
 
-impl_reference_free_dischargeable_operation!(<T> CustomCallOperation<T> where T: Type);
-
-impl_differentiable_operation! {
-    <T> CustomCallOperation<T>,
-    jvp<C>
-    where
-        T: Type,
-    {
-        |operation, _context, _driver, _inputs| {
-            // Foreign kernels are opaque, so there is no derivative to derive: differentiation reports an error
-            // directing users to wrap the call with `custom_jvp` or `custom_vjp`, which is also how JAX handles
-            // `ffi_call` differentiation.
-            Err(ProgramError::UnsupportedOperation {
-                message: format!(
-                    "custom call `{}` has no differentiation rule; wrap it with `{}` or `{}` to provide one",
-                    operation.target_name,
-                    CUSTOM_JVP_OPERATION_NAME,
-                    CUSTOM_VJP_OPERATION_NAME,
-                ),
-            }
-            .into())
-        }
-    },
-    transpose = @nonlinear,
-}
-
 // Homogeneous-array batching rule for [`CustomCallOperation`]. A foreign kernel is opaque, so Ryft cannot derive how
 // a batch axis threads through it. A call whose operands are *all replicated* is nevertheless bound unchanged through
 // the parent context and reports replicated outputs, matching JAX, which only invokes a batching rule once some
@@ -1902,6 +1877,32 @@ where
     }
 }
 
+impl_differentiable_operation! {
+    <T> CustomCallOperation<T>,
+    jvp<C>
+    where
+        T: Type,
+    {
+        |operation, _context, _driver, _inputs| {
+            // Foreign kernels are opaque, so there is no derivative to derive: differentiation reports an error
+            // directing users to wrap the call with `custom_jvp` or `custom_vjp`, which is also how JAX handles
+            // `ffi_call` differentiation.
+            Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "custom call `{}` has no differentiation rule; wrap it with `{}` or `{}` to provide one",
+                    operation.target_name,
+                    CUSTOM_JVP_OPERATION_NAME,
+                    CUSTOM_VJP_OPERATION_NAME,
+                ),
+            }
+            .into())
+        }
+    },
+    transpose = @nonlinear,
+}
+
+impl_reference_free_dischargeable_operation!(<T> CustomCallOperation<T> where T: Type);
+
 /// Represents the ability to call foreign kernels registered with the executing backend. [`CustomCall`] stages or
 /// executes a [`CustomCallOperation`]; refer to its documentation for the calling convention and the transform
 /// rules. The capability method dispatches through the first input's context, so it needs at least one input
@@ -2069,30 +2070,7 @@ mod tests {
     }
 
     #[test]
-    fn test_dense_custom_call_rejection_does_not_project_ragged_carriers() {
-        let type_read_count = Rc::new(Cell::new(0));
-        let input = TypeReadCountingArray {
-            r#type: ArrayType::new_static(DataType::F32, [2, 3]),
-            type_read_count: Rc::clone(&type_read_count),
-        };
-        let input = ArrayBatch::new(input, BatchAxis::new(0)).unwrap();
-        type_read_count.set(0);
-
-        let operation = CustomCallOperation::new("ryft.test.dense", vec![vector_type()]);
-        let context = BatchingContext::<_, ArrayBatching>::new(TypeReadCountingContext, 2);
-        assert!(matches!(
-            operation.batch(&context, &EmptyRegionDriver, &[input]),
-            Err(BatchingError::UnsupportedOperation { message })
-                if message
-                    == "custom call `ryft.test.dense` has no batching rule for operand 0 mapped at batch axis 0; \
-                        invoke a kernel that understands the batch axis, or select an explicit batching behavior \
-                        with `CustomCallOperation::with_batching`",
-        ));
-        assert_eq!(type_read_count.get(), 0);
-    }
-
-    #[test]
-    fn test_custom_call_operation_contract() {
+    fn test_custom_call() {
         let operation = CustomCallOperation::new("ryft.test.add_one", vec![vector_type()])
             .with_attribute("scale", 2.0)
             .with_attribute("count", 4i64)
@@ -2690,7 +2668,7 @@ mod tests {
     }
 
     #[test]
-    fn test_custom_call_is_rejected_by_the_reference_backend() {
+    fn test_custom_call_interpretation() {
         let operation = CustomCallOperation::new("ryft.test.add_one", vec![vector_type()]);
         let result = InterpretableOperation::<EagerContext<Array>>::interpret(
             &operation,
@@ -2703,257 +2681,6 @@ mod tests {
             Err(ProgramError::UnsupportedOperation { message })
                 if message == "the reference array backend cannot execute the foreign kernel `ryft.test.add_one`",
         ));
-    }
-
-    #[test]
-    fn test_custom_call_rejects_differentiation_and_batching() {
-        let operation = CustomCallOperation::new("ryft.test.add_one", vec![vector_type()]);
-
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(vector_type());
-        let output = builder.add_instruction(operation.clone(), Vec::new(), vec![input], None).unwrap()[0];
-        let program =
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-
-        assert!(matches!(
-            program.jvp(),
-            Err(error)
-                if error.to_string().contains("custom call `ryft.test.add_one` has no differentiation rule"),
-        ));
-        assert!(matches!(
-            program.batched(
-                2,
-                ShardingDimension::Replicated,
-                &[BatchAxis::new(0)],
-                ProgramBatchingOutputAxesPolicy::Natural,
-            ),
-            Err(error)
-                if error.to_string()
-                    == "custom call `ryft.test.add_one` has no batching rule for operand 0 mapped at batch axis 0; \
-                        invoke a kernel that understands the batch axis, or select an explicit batching behavior \
-                        with `CustomCallOperation::with_batching`",
-        ));
-    }
-
-    /// A custom call whose operands are all replicated is bound unchanged and reports replicated outputs. This is the
-    /// JAX-parity behavior: a batching rule is consulted only once an operand is actually mapped, and this shortcut is
-    /// sound because the region-free foreign kernel cannot observe the transform's axis.
-    #[test]
-    fn test_custom_call_batches_all_replicated_operands_unchanged() {
-        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |inputs: Vec<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>>| {
-                let operation = CustomCallOperation::new("ryft.test.add_one", vec![vector_type()]);
-                Ok(vec![CustomCall::custom_call(&operation, inputs.iter())?.remove(0)])
-            },
-            vec![vector_type(), vector_type()],
-        )
-        .unwrap();
-
-        let (batched, output_axes) = program
-            .batched(
-                2,
-                ShardingDimension::Replicated,
-                &[BatchAxis::replicated(), BatchAxis::replicated()],
-                ProgramBatchingOutputAxesPolicy::Natural,
-            )
-            .unwrap()
-            .into_parts();
-        assert_eq!(output_axes, vec![BatchAxis::replicated()]);
-        let batched = batched.to_flat_program();
-        assert_eq!(
-            batched.to_string(),
-            indoc! {"
-                lambda %0:f32[2], %1:f32[2] .
-                let %2:f32[2] = custom_call [target=ryft.test.add_one] %0 %1
-                in (%2)
-            "}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_custom_call_batch_rejects_ragged_operands_before_binding() {
-        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
-        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]), BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]), variable, vec![0])])
-            .unwrap();
-        let operation = CustomCallOperation::new("ryft.test.side_effect", vec![vector_type()])
-            .with_batching(CustomCallBatching::BroadcastAll)
-            .with_side_effect();
-        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
-        assert!(matches!(
-            operation.batch(&context, &EmptyRegionDriver, &[input]),
-            Err(BatchingError::UnsupportedOperation { message })
-                if message == "custom call `ryft.test.side_effect` does not support bounded ragged dimension `length` \
-                    on operand 0",
-        ));
-    }
-
-    #[test]
-    fn test_custom_call_ragged_contract_discharges_sequential_and_broadcast_batching() -> Result<(), ProgramError> {
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
-        let packed_type = ArrayType::new_static(DataType::F32, [4]);
-        let extent_type = ArrayType::scalar(DataType::I32);
-
-        for behavior in [CustomCallBatching::Sequential { unroll: None }, CustomCallBatching::BroadcastAll] {
-            let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
-            let packed = trace.input(ArrayType::new_static(DataType::F32, [2, 4]));
-            let extents = trace.input(ArrayType::new_static(DataType::I32, [2]));
-            let context = BatchingContext::<_, ArrayBatching>::new(trace.clone(), 2);
-            let data = ArrayBatch::new(packed, BatchAxis::new(0))?.with_ragged_axes(vec![RaggedAxis::new(
-                1,
-                extents.clone(),
-                length.clone(),
-                vec![0],
-            )])?;
-            let extent_operand = ArrayBatch::new(extents.clone(), BatchAxis::new(0))?;
-            let operation = CustomCallOperation::new("ryft.test.ragged", vec![packed_type.clone()])
-                .with_batching(behavior)
-                .with_ragged_contract(preserved_ragged_contract(length.clone()));
-            assert_eq!(
-                operation.infer_output_types(&[packed_type.clone(), extent_type.clone()], &[]),
-                Ok(vec![packed_type.clone()])
-            );
-
-            let (outputs, evidence) =
-                operation.batch(&context, &EmptyRegionDriver, &[data, extent_operand])?.into_parts();
-            assert!(evidence.is_empty());
-            assert_eq!(outputs.len(), 1);
-            assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-            assert_eq!(outputs[0].ragged_axes().len(), 1);
-            assert_eq!(outputs[0].ragged_axes()[0].axis(), 1);
-            assert_eq!(outputs[0].ragged_axes()[0].extent_axes(), &[0]);
-            assert_eq!(outputs[0].ragged_axes()[0].dimension(), &length);
-            assert_eq!(outputs[0].ragged_axes()[0].extents(), &extents);
-
-            let output_id = outputs[0].value().atom_id().unwrap();
-            let program = trace.builder().borrow().clone().build::<Vec<Array>, Vec<Array>>(
-                vec![output_id],
-                vec![Placeholder, Placeholder],
-                vec![Placeholder],
-            )?;
-            let rendered = program.to_string();
-            if matches!(behavior, CustomCallBatching::Sequential { .. }) {
-                assert_eq!(
-                    rendered,
-                    indoc! {"
-                        lambda %0:f32[2, 4], %1:i32[2] .
-                        let %2:f32[2, 4] = scan [carry_count=0, length=2, reverse=false] %0 %1 [
-                            body={
-                                lambda %0:f32[4], %1:i32[] .
-                                let %2:f32[4] = custom_call [
-                                    target=ryft.test.ragged,
-                                    batching=sequential,
-                                    ragged_contract={inputs=[data:operand(0)@0<=operand(1):length], \
-                         outputs=[preserve(data)@0], ragged_discharged=true},
-                                ] %0 %1
-                                in (%2)
-                            },
-                        ]
-                        in (%2)
-                    "}
-                    .trim_end(),
-                );
-            } else {
-                assert_eq!(
-                    rendered,
-                    indoc! {"
-                        lambda %0:f32[2, 4], %1:i32[2] .
-                        let %2:f32[2, 4] = custom_call [
-                            target=ryft.test.ragged,
-                            batching=broadcast_all,
-                            ragged_contract={inputs=[data:operand(0)@1<=operand(1):length], \
-                         outputs=[preserve(data)@1], batch_prefix_count=1, \
-                         ragged_discharged=true},
-                        ] %0 %1
-                        in (%2)
-                    "}
-                    .trim_end(),
-                );
-            }
-        }
-        Ok(())
-    }
-
-    #[test]
-    fn test_custom_call_ragged_contract_rejects_extent_identity_mismatch_and_nested_batching() {
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
-        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let packed = trace.input(ArrayType::new_static(DataType::F32, [2, 4]));
-        let extents = trace.input(ArrayType::new_static(DataType::I32, [2]));
-        let other_extents = trace.input(ArrayType::new_static(DataType::I32, [2]));
-        let context = BatchingContext::<_, ArrayBatching>::new(trace, 2);
-        let data = ArrayBatch::new(packed, BatchAxis::new(0))
-            .unwrap()
-            .with_ragged_axes(vec![RaggedAxis::new(1, extents, length.clone(), vec![0])])
-            .unwrap();
-        let extent_operand = ArrayBatch::new(other_extents, BatchAxis::new(0)).unwrap();
-        let operation = CustomCallOperation::new("ryft.test.ragged", vec![ArrayType::new_static(DataType::F32, [4])])
-            .with_batching(CustomCallBatching::BroadcastAll)
-            .with_ragged_contract(preserved_ragged_contract(length));
-        assert!(matches!(
-            operation.batch(&context, &EmptyRegionDriver, &[data.clone(), extent_operand.clone()]),
-            Err(BatchingError::InvalidBatchMetadata { message })
-                if message == "custom call `ryft.test.ragged` ragged input binding `data` requires operand 1 to be \
-                               the exact extent value carried by operand 0",
-        ));
-
-        let nested = CustomCallOperation {
-            ragged_contract: operation.ragged_contract.as_ref().map(CustomCallRaggedContract::ragged_discharged),
-            ..operation
-        };
-        assert!(matches!(
-            nested.batch(&context, &EmptyRegionDriver, &[data, extent_operand]),
-            Err(BatchingError::UnsupportedOperation { message })
-                if message == "custom call `ryft.test.ragged` does not support nested ragged batching",
-        ));
-    }
-
-    #[test]
-    fn test_array_ir_sequential_custom_call_records_ragged_discharge_in_the_scan_body() -> Result<(), ProgramError> {
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
-        let batch_size = DimensionVariable::new("batch_size", DimensionBounds::new(1, Some(5)).unwrap());
-        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let packed = trace.input(ArrayType::new_static(DataType::F32, [2, 4]).into());
-        let extents = trace.input(ArrayType::new_static(DataType::I32, [2]).into());
-        let axis_extent = trace.input(DimensionType::new(batch_size).into());
-        let context = BatchingContext::<_, ArrayIrBatching>::new(trace.clone(), axis_extent);
-        let data = ArrayIrBatch::new(packed, BatchAxis::new(0))?.with_ragged_axes(vec![RaggedAxis::new(
-            1,
-            extents.clone(),
-            length.clone(),
-            vec![0],
-        )])?;
-        let extent_operand = ArrayIrBatch::new(extents, BatchAxis::new(0))?;
-        let operation = CustomCallOperation::<ArrayIrType>::from(
-            CustomCallOperation::new("ryft.test.ragged", vec![ArrayType::new_static(DataType::F32, [4])])
-                .with_batching(CustomCallBatching::Sequential { unroll: None })
-                .with_ragged_contract(preserved_ragged_contract(length)),
-        );
-        let output = operation.batch(&context, &EmptyRegionDriver, &[data, extent_operand])?.into_parts().0.remove(0);
-        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-            vec![output.value().atom_id().unwrap()],
-            vec![Placeholder; 3],
-            vec![Placeholder],
-        )?;
-        let scan = program
-            .entry_region()
-            .instructions()
-            .iter()
-            .find(|instruction| matches!(instruction.operation(), ArrayIrOperation::Scan(_)))
-            .unwrap();
-        let body = program.region(scan.regions()[0])?;
-        let contract = body
-            .instructions()
-            .iter()
-            .find_map(|instruction| match instruction.operation() {
-                ArrayIrOperation::CustomCall(operation) => operation.ragged_contract(),
-                _ => None,
-            })
-            .unwrap();
-        assert!(contract.ragged_discharged);
-        Ok(())
     }
 
     #[test]
@@ -3133,266 +2860,230 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_custom_call_ragged_contract_survives_projection() -> Result<(), ProgramError> {
-        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
-        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let packed = trace.input(ArrayType::new_static(DataType::F32, [2, 4]).into());
-        let extents = trace.input(ArrayType::new_static(DataType::I32, [2]).into());
-        let axis_extent = trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
-        let context = BatchingContext::<_, ArrayIrBatching>::new(trace, axis_extent);
-        let data = ArrayIrBatch::new(packed, BatchAxis::new(0))?.with_ragged_axes(vec![RaggedAxis::new(
-            1,
-            extents.clone(),
-            length.clone(),
-            vec![0],
-        )])?;
-        let extent_operand = ArrayIrBatch::new(extents.clone(), BatchAxis::new(0))?;
-        let operation = CustomCallOperation::<ArrayIrType>::from(
-            CustomCallOperation::new("ryft.test.ragged", vec![ArrayType::new_static(DataType::F32, [4])])
-                .with_batching(CustomCallBatching::BroadcastAll)
-                .with_ragged_contract(preserved_ragged_contract(length.clone())),
-        );
-        let (outputs, evidence) = operation.batch(&context, &EmptyRegionDriver, &[data, extent_operand])?.into_parts();
-        assert!(evidence.is_empty());
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].ragged_axes().len(), 1);
-        assert_eq!(outputs[0].ragged_axes()[0].axis(), 1);
-        assert_eq!(outputs[0].ragged_axes()[0].dimension(), &length);
-        assert_eq!(outputs[0].ragged_axes()[0].extents(), &extents);
-        Ok(())
-    }
+    fn test_custom_call_rejects_differentiation_and_batching() {
+        let operation = CustomCallOperation::new("ryft.test.add_one", vec![vector_type()]);
 
-    #[test]
-    fn test_array_ir_custom_call_attaches_fresh_ragged_output_to_replicated_call() -> Result<(), ProgramError> {
-        let output_length = DimensionVariable::new("output_length", DimensionBounds::new(0, Some(5)).unwrap());
-        let batch_size = DimensionVariable::new("batch_size", DimensionBounds::new(1, Some(5)).unwrap());
-        let operation = CustomCallOperation::<ArrayIrType>::from(
-            CustomCallOperation::new(
-                "ryft.test.fresh_ragged",
-                vec![ArrayType::new_static(DataType::F32, [4]), ArrayType::scalar(DataType::I32)],
-            )
-            .with_ragged_contract(CustomCallRaggedContract::new(
-                Vec::new(),
-                vec![
-                    CustomCallRaggedOutputBinding::Fresh {
-                        axis: 0,
-                        extent_output_index: 1,
-                        dimension: output_length.clone(),
-                    },
-                    CustomCallRaggedOutputBinding::Consumed,
-                ],
-            )),
-        );
-        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input = trace.input(ArrayType::new_static(DataType::F32, [4]).into());
-        let axis_extent = trace.input(DimensionType::new(batch_size).into());
-        let context = BatchingContext::<_, ArrayIrBatching>::new(trace, axis_extent);
-        let (outputs, evidence) =
-            operation.batch(&context, &EmptyRegionDriver, &[ArrayIrBatch::replicated(input)])?.into_parts();
-        assert!(evidence.is_empty());
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
-        assert_eq!(outputs[0].ragged_axes()[0].axis(), 0);
-        assert_eq!(outputs[0].ragged_axes()[0].dimension(), &output_length);
-        assert!(outputs[0].ragged_axes()[0].extent_axes().is_empty());
-        assert_eq!(outputs[0].ragged_axes()[0].extents(), outputs[1].value());
-        Ok(())
-    }
-
-    #[test]
-    fn test_array_ir_custom_call_fresh_output_composes_under_nested_dense_batching() -> Result<(), ProgramError> {
-        let output_length = DimensionVariable::new("output_length", DimensionBounds::new(0, Some(5)).unwrap());
-        let operation = CustomCallOperation::<ArrayIrType>::from(
-            CustomCallOperation::new(
-                "ryft.test.fresh_ragged",
-                vec![ArrayType::new_static(DataType::F32, [4]), ArrayType::scalar(DataType::I32)],
-            )
-            .with_batching(CustomCallBatching::BroadcastAll)
-            .with_ragged_contract(CustomCallRaggedContract::new(
-                Vec::new(),
-                vec![
-                    CustomCallRaggedOutputBinding::Fresh {
-                        axis: 0,
-                        extent_output_index: 1,
-                        dimension: output_length.clone(),
-                    },
-                    CustomCallRaggedOutputBinding::Consumed,
-                ],
-            )),
-        );
-        let output_types = operation
-            .output_types
-            .iter()
-            .map(|output_type| output_type.with_inserted_dimension(0, Dimension::Static(3)))
-            .collect::<Result<Vec<_>, _>>()?;
-        let operation = CustomCallOperation {
-            output_types,
-            ragged_contract: operation.ragged_contract.as_ref().map(|contract| contract.batch_prefixed(false)),
-            ..operation
-        };
-
-        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let outer = DimensionVariable::new("outer", DimensionBounds::new(1, Some(5)).unwrap());
-        let axis_extent = trace.input(DimensionType::new(outer.clone()).into());
-        let input = trace.input(
-            ArrayType::new(
-                DataType::F32,
-                Shape::new(vec![Dimension::Dynamic(outer), Dimension::Static(3), Dimension::Static(4)]),
-            )
-            .into(),
-        );
-        let context = BatchingContext::<_, ArrayIrBatching>::new(trace.clone(), axis_extent);
-        let (outputs, evidence) = operation
-            .batch(&context, &EmptyRegionDriver, &[ArrayIrBatch::new(input, BatchAxis::new(0))?])?
-            .into_parts();
-        assert!(evidence.is_empty());
-        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
-        assert_eq!(outputs[0].ragged_axes().len(), 1);
-        assert_eq!(outputs[0].ragged_axes()[0].axis(), 2);
-        assert_eq!(outputs[0].ragged_axes()[0].extent_axes(), &[0, 1]);
-        assert_eq!(outputs[0].ragged_axes()[0].dimension(), &output_length);
-        assert_eq!(outputs[0].ragged_axes()[0].extents(), outputs[1].value());
-
-        let output_ids = outputs.iter().map(|output| output.value().atom_id()).collect::<Result<Vec<_>, _>>()?;
-        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-            output_ids,
-            vec![Placeholder, Placeholder],
-            vec![Placeholder, Placeholder],
-        )?;
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:dimension<outer ∈ [1, 5)>, %1:f32[outer, 3, 4] .
-                let %2:f32[outer, 3, 4], %3:i32[outer, 3] = custom_call [
-                    target=ryft.test.fresh_ragged,
-                    batching=broadcast_all,
-                    ragged_contract={inputs=[], outputs=[fresh@2<=output(1):output_length, consume], \
-                 batch_prefix_count=2},
-                ] %1 %0 %0
-                in (%2, %3)
-            "}
-            .trim_end(),
-        );
-        Ok(())
-    }
-
-    /// The mixed universe applies the same all-replicated shortcut, including the trailing first-class output-extent
-    /// operand, which stays an ordinary replicated operand of the unchanged call.
-    #[test]
-    fn test_array_ir_custom_call_batches_all_replicated_operands_unchanged() -> Result<(), ProgramError> {
-        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
-        let operation = CustomCallOperation::<ArrayIrType>::from(CustomCallOperation::new(
-            "ryft.test.dynamic",
-            vec![output_type.clone()],
-        ));
-
-        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input = trace.input(vector_type().into());
-        let extent = trace.input(DimensionType::new(rows).into());
-        let context = BatchingContext::<_, ArrayIrBatching>::new(
-            trace.clone(),
-            trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())),
-        );
-        let inputs = [
-            BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(input)),
-            BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(extent)),
-        ];
-        let [output] = context.bind(operation, Vec::new(), &inputs)?.try_into().unwrap();
-        assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
-        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(output_type));
-
-        let output_id = output.into_batch().into_value().atom_id().unwrap();
-        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-            vec![output_id],
-            vec![Placeholder, Placeholder],
-            vec![Placeholder],
-        )?;
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:f32[2], %1:dimension<rows ∈ [1, 9)> .
-                let %2:dimension<2> = const 2
-                    %3:f32[rows] = custom_call [target=ryft.test.dynamic] %0 %1
-                in (%3)
-            "}
-            .trim_end(),
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn test_array_ir_dense_custom_call_validates_extents_before_array_projection() {
-        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows)]));
-        let operation =
-            CustomCallOperation::<ArrayIrType>::from(CustomCallOperation::new("ryft.test.dynamic", vec![output_type]));
-        let context = BatchingContext::<_, ArrayIrBatching>::new(
-            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
-        );
-        let inputs = [
-            ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())),
-            ArrayIrBatch::replicated(ArrayIrValue::Array(Array::scalar(2_i32))),
-        ];
-        assert!(matches!(
-            operation.batch(&context, &EmptyRegionDriver, &inputs),
-            Err(BatchingError::Type(TypeError::Invalid { message }))
-                if message == "expected dimension type but got array type",
-        ));
-    }
-
-    #[test]
-    fn test_array_ir_custom_call_rejects_transforms() {
-        let operation = CustomCallOperation::<ArrayIrType>::from(CustomCallOperation::new(
-            "ryft.test.add_one",
-            vec![vector_type()],
-        ));
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let input = builder.add_input(vector_type().into());
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(vector_type());
         let output = builder.add_instruction(operation.clone(), Vec::new(), vec![input], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output],
-                vec![Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+
         assert!(matches!(
             program.jvp(),
             Err(error)
-                if error.to_string()
-                    == "custom call `ryft.test.add_one` has no differentiation rule; wrap it with `custom_jvp` or \
-                        `custom_vjp` to provide one",
+                if error.to_string().contains("custom call `ryft.test.add_one` has no differentiation rule"),
         ));
-
-        let batching_context = BatchingContext::<_, ArrayIrBatching>::new(
-            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
-            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
-        );
-        let mapped = ArrayIrBatch::new(
-            ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f32, 2.0, 3.0, 4.0])),
-            BatchAxis::new(0),
-        )
-        .unwrap();
         assert!(matches!(
-            operation.batch(&batching_context, &EmptyRegionDriver, &[mapped]),
-            Err(BatchingError::UnsupportedOperation { message })
-                if message
+            program.batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::new(0)],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            ),
+            Err(error)
+                if error.to_string()
                     == "custom call `ryft.test.add_one` has no batching rule for operand 0 mapped at batch axis 0; \
                         invoke a kernel that understands the batch axis, or select an explicit batching behavior \
                         with `CustomCallOperation::with_batching`",
         ));
+    }
 
-        let transposition_context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+    /// A custom call whose operands are all replicated is bound unchanged and reports replicated outputs. This is the
+    /// JAX-parity behavior: a batching rule is consulted only once an operand is actually mapped, and this shortcut is
+    /// sound because the region-free foreign kernel cannot observe the transform's axis.
+    #[test]
+    fn test_custom_call_batches_all_replicated_operands_unchanged() {
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<DomainTracer<EagerContext<Array, ArrayOperation<Array>>>>| {
+                let operation = CustomCallOperation::new("ryft.test.add_one", vec![vector_type()]);
+                Ok(vec![CustomCall::custom_call(&operation, inputs.iter())?.remove(0)])
+            },
+            vec![vector_type(), vector_type()],
+        )
+        .unwrap();
+
+        let (batched, output_axes) = program
+            .batched(
+                2,
+                ShardingDimension::Replicated,
+                &[BatchAxis::replicated(), BatchAxis::replicated()],
+                ProgramBatchingOutputAxesPolicy::Natural,
+            )
+            .unwrap()
+            .into_parts();
+        assert_eq!(output_axes, vec![BatchAxis::replicated()]);
+        let batched = batched.to_flat_program();
+        assert_eq!(
+            batched.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:f32[2] .
+                let %2:f32[2] = custom_call [target=ryft.test.add_one] %0 %1
+                in (%2)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_custom_call_batch_rejects_ragged_operands_before_binding() {
+        let variable = DimensionVariable::new("length", DimensionBounds::new(0, Some(4)).unwrap());
+        let input = ArrayBatch::new(Array::matrix(2, 3, vec![1.0_f32; 6]), BatchAxis::new(0))
+            .unwrap()
+            .with_ragged_axes(vec![RaggedAxis::new(1, Array::vector(vec![1_i32, 3]), variable, vec![0])])
+            .unwrap();
+        let operation = CustomCallOperation::new("ryft.test.side_effect", vec![vector_type()])
+            .with_batching(CustomCallBatching::BroadcastAll)
+            .with_side_effect();
+        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
         assert!(matches!(
-            operation.transpose(
-                &mut TranspositionContext::new(transposition_context.clone()),
-                &EmptyRegionDriver,
-                &[],
-                &[],
-            ),
-            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "operation `custom_call` is not transposable",
+            operation.batch(&context, &EmptyRegionDriver, &[input]),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == "custom call `ryft.test.side_effect` does not support bounded ragged dimension `length` \
+                    on operand 0",
+        ));
+    }
+
+    #[test]
+    fn test_dense_custom_call_rejection_does_not_project_ragged_carriers() {
+        let type_read_count = Rc::new(Cell::new(0));
+        let input = TypeReadCountingArray {
+            r#type: ArrayType::new_static(DataType::F32, [2, 3]),
+            type_read_count: Rc::clone(&type_read_count),
+        };
+        let input = ArrayBatch::new(input, BatchAxis::new(0)).unwrap();
+        type_read_count.set(0);
+
+        let operation = CustomCallOperation::new("ryft.test.dense", vec![vector_type()]);
+        let context = BatchingContext::<_, ArrayBatching>::new(TypeReadCountingContext, 2);
+        assert!(matches!(
+            operation.batch(&context, &EmptyRegionDriver, &[input]),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message
+                    == "custom call `ryft.test.dense` has no batching rule for operand 0 mapped at batch axis 0; \
+                        invoke a kernel that understands the batch axis, or select an explicit batching behavior \
+                        with `CustomCallOperation::with_batching`",
+        ));
+        assert_eq!(type_read_count.get(), 0);
+    }
+
+    #[test]
+    fn test_custom_call_ragged_contract_discharges_sequential_and_broadcast_batching() -> Result<(), ProgramError> {
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
+        let packed_type = ArrayType::new_static(DataType::F32, [4]);
+        let extent_type = ArrayType::scalar(DataType::I32);
+
+        for behavior in [CustomCallBatching::Sequential { unroll: None }, CustomCallBatching::BroadcastAll] {
+            let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+            let packed = trace.input(ArrayType::new_static(DataType::F32, [2, 4]));
+            let extents = trace.input(ArrayType::new_static(DataType::I32, [2]));
+            let context = BatchingContext::<_, ArrayBatching>::new(trace.clone(), 2);
+            let data = ArrayBatch::new(packed, BatchAxis::new(0))?.with_ragged_axes(vec![RaggedAxis::new(
+                1,
+                extents.clone(),
+                length.clone(),
+                vec![0],
+            )])?;
+            let extent_operand = ArrayBatch::new(extents.clone(), BatchAxis::new(0))?;
+            let operation = CustomCallOperation::new("ryft.test.ragged", vec![packed_type.clone()])
+                .with_batching(behavior)
+                .with_ragged_contract(preserved_ragged_contract(length.clone()));
+            assert_eq!(
+                operation.infer_output_types(&[packed_type.clone(), extent_type.clone()], &[]),
+                Ok(vec![packed_type.clone()])
+            );
+
+            let (outputs, evidence) =
+                operation.batch(&context, &EmptyRegionDriver, &[data, extent_operand])?.into_parts();
+            assert!(evidence.is_empty());
+            assert_eq!(outputs.len(), 1);
+            assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+            assert_eq!(outputs[0].ragged_axes().len(), 1);
+            assert_eq!(outputs[0].ragged_axes()[0].axis(), 1);
+            assert_eq!(outputs[0].ragged_axes()[0].extent_axes(), &[0]);
+            assert_eq!(outputs[0].ragged_axes()[0].dimension(), &length);
+            assert_eq!(outputs[0].ragged_axes()[0].extents(), &extents);
+
+            let output_id = outputs[0].value().atom_id().unwrap();
+            let program = trace.builder().borrow().clone().build::<Vec<Array>, Vec<Array>>(
+                vec![output_id],
+                vec![Placeholder, Placeholder],
+                vec![Placeholder],
+            )?;
+            let rendered = program.to_string();
+            if matches!(behavior, CustomCallBatching::Sequential { .. }) {
+                assert_eq!(
+                    rendered,
+                    indoc! {"
+                        lambda %0:f32[2, 4], %1:i32[2] .
+                        let %2:f32[2, 4] = scan [carry_count=0, length=2, reverse=false] %0 %1 [
+                            body={
+                                lambda %0:f32[4], %1:i32[] .
+                                let %2:f32[4] = custom_call [
+                                    target=ryft.test.ragged,
+                                    batching=sequential,
+                                    ragged_contract={inputs=[data:operand(0)@0<=operand(1):length], \
+                         outputs=[preserve(data)@0], ragged_discharged=true},
+                                ] %0 %1
+                                in (%2)
+                            },
+                        ]
+                        in (%2)
+                    "}
+                    .trim_end(),
+                );
+            } else {
+                assert_eq!(
+                    rendered,
+                    indoc! {"
+                        lambda %0:f32[2, 4], %1:i32[2] .
+                        let %2:f32[2, 4] = custom_call [
+                            target=ryft.test.ragged,
+                            batching=broadcast_all,
+                            ragged_contract={inputs=[data:operand(0)@1<=operand(1):length], \
+                         outputs=[preserve(data)@1], batch_prefix_count=1, \
+                         ragged_discharged=true},
+                        ] %0 %1
+                        in (%2)
+                    "}
+                    .trim_end(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_custom_call_ragged_contract_rejects_extent_identity_mismatch_and_nested_batching() {
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
+        let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let packed = trace.input(ArrayType::new_static(DataType::F32, [2, 4]));
+        let extents = trace.input(ArrayType::new_static(DataType::I32, [2]));
+        let other_extents = trace.input(ArrayType::new_static(DataType::I32, [2]));
+        let context = BatchingContext::<_, ArrayBatching>::new(trace, 2);
+        let data = ArrayBatch::new(packed, BatchAxis::new(0))
+            .unwrap()
+            .with_ragged_axes(vec![RaggedAxis::new(1, extents, length.clone(), vec![0])])
+            .unwrap();
+        let extent_operand = ArrayBatch::new(other_extents, BatchAxis::new(0)).unwrap();
+        let operation = CustomCallOperation::new("ryft.test.ragged", vec![ArrayType::new_static(DataType::F32, [4])])
+            .with_batching(CustomCallBatching::BroadcastAll)
+            .with_ragged_contract(preserved_ragged_contract(length));
+        assert!(matches!(
+            operation.batch(&context, &EmptyRegionDriver, &[data.clone(), extent_operand.clone()]),
+            Err(BatchingError::InvalidBatchMetadata { message })
+                if message == "custom call `ryft.test.ragged` ragged input binding `data` requires operand 1 to be \
+                               the exact extent value carried by operand 0",
+        ));
+
+        let nested = CustomCallOperation {
+            ragged_contract: operation.ragged_contract.as_ref().map(CustomCallRaggedContract::ragged_discharged),
+            ..operation
+        };
+        assert!(matches!(
+            nested.batch(&context, &EmptyRegionDriver, &[data, extent_operand]),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message == "custom call `ryft.test.ragged` does not support nested ragged batching",
         ));
     }
 
@@ -3696,102 +3387,6 @@ mod tests {
         );
     }
 
-    /// The mixed rule threads replicated first-class output extents as leading invariant scan carries, so the body's
-    /// call declares exactly the per-item extents it was given, and it supports a dynamic mapped extent by consuming
-    /// it as the scan's trailing trip-count operand.
-    #[test]
-    fn test_array_ir_custom_call_batches_sequentially_with_extent_carries() -> Result<(), ProgramError> {
-        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
-        let operation = CustomCallOperation::<ArrayIrType>::from(
-            CustomCallOperation::new("ryft.test.dynamic", vec![output_type])
-                .with_batching(CustomCallBatching::Sequential { unroll: None }),
-        );
-
-        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
-        let batch_extent = trace.input(DimensionType::new(batch.clone()).into());
-        let mapped = trace.input(
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)])).into(),
-        );
-        let extent = trace.input(DimensionType::new(rows).into());
-        let context = BatchingContext::<_, ArrayIrBatching>::new(trace.clone(), batch_extent);
-        let inputs = [
-            BatchingTracer::new(context.clone(), ArrayIrBatch::new(mapped, BatchAxis::new(0))?),
-            BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(extent)),
-        ];
-        let [output] = context.bind(operation, Vec::new(), &inputs)?.try_into().unwrap();
-        assert_eq!(output.batch().batch_axis(), BatchAxis::new(0));
-
-        let output_id = output.into_batch().into_value().atom_id().unwrap();
-        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-            vec![output_id],
-            vec![Placeholder, Placeholder, Placeholder],
-            vec![Placeholder],
-        )?;
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[batch, 2], %2:dimension<rows ∈ [1, 9)> .
-                let %3:dimension<rows ∈ [1, 9)>, %4:f32[batch, rows] = scan [carry_count=1, length=batch, \
-                 reverse=false] %2 %1 %0 [
-                    body={
-                        lambda %0:dimension<rows ∈ [1, 9)>, %1:f32[2] .
-                        let %2:f32[rows] = custom_call [target=ryft.test.dynamic, batching=sequential] %1 %0
-                        in (%0, %2)
-                    },
-                ]
-                in (%4)
-            "}
-            .trim_end(),
-        );
-        Ok(())
-    }
-
-    /// The mixed `BroadcastAll` rule rebinds one call whose declared outputs gain the mapped batch dimension, and
-    /// regroups the trailing extents so each output's new leading dynamic axis is grounded by the transform's extent.
-    #[test]
-    fn test_array_ir_custom_call_broadcasts_all_operands_with_regrouped_extents() -> Result<(), ProgramError> {
-        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
-        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
-        let operation = CustomCallOperation::<ArrayIrType>::from(
-            CustomCallOperation::new("ryft.test.dynamic", vec![output_type])
-                .with_batching(CustomCallBatching::BroadcastAll),
-        );
-
-        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
-        let batch_extent = trace.input(DimensionType::new(batch.clone()).into());
-        let mapped = trace.input(
-            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)])).into(),
-        );
-        let extent = trace.input(DimensionType::new(rows).into());
-        let context = BatchingContext::<_, ArrayIrBatching>::new(trace.clone(), batch_extent);
-        let inputs = [
-            BatchingTracer::new(context.clone(), ArrayIrBatch::new(mapped, BatchAxis::new(0))?),
-            BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(extent)),
-        ];
-        let [output] = context.bind(operation, Vec::new(), &inputs)?.try_into().unwrap();
-        assert_eq!(output.batch().batch_axis(), BatchAxis::new(0));
-
-        let output_id = output.into_batch().into_value().atom_id().unwrap();
-        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-            vec![output_id],
-            vec![Placeholder, Placeholder, Placeholder],
-            vec![Placeholder],
-        )?;
-        assert_eq!(
-            program.to_string(),
-            indoc! {"
-                lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[batch, 2], %2:dimension<rows ∈ [1, 9)> .
-                let %3:f32[batch, rows] = custom_call [target=ryft.test.dynamic, batching=broadcast_all] %1 %0 %2
-                in (%3)
-            "}
-            .trim_end(),
-        );
-        Ok(())
-    }
-
     /// Side-effect occurrence counts differ between the two behaviors, which is exactly why the selection is
     /// explicit. Both stage a single call instruction and both keep the call's [`EffectClass::OrderedIo`], so neither is
     /// eliminated or reordered, but `Sequential` executes it once per batch item through the scan's ordered trips
@@ -3870,5 +3465,411 @@ mod tests {
                 "{behavior}: {rendered}",
             );
         }
+    }
+
+    #[test]
+    fn test_array_ir_custom_call_ragged_contract_survives_projection() -> Result<(), ProgramError> {
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let packed = trace.input(ArrayType::new_static(DataType::F32, [2, 4]).into());
+        let extents = trace.input(ArrayType::new_static(DataType::I32, [2]).into());
+        let axis_extent = trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
+        let context = BatchingContext::<_, ArrayIrBatching>::new(trace, axis_extent);
+        let data = ArrayIrBatch::new(packed, BatchAxis::new(0))?.with_ragged_axes(vec![RaggedAxis::new(
+            1,
+            extents.clone(),
+            length.clone(),
+            vec![0],
+        )])?;
+        let extent_operand = ArrayIrBatch::new(extents.clone(), BatchAxis::new(0))?;
+        let operation = CustomCallOperation::<ArrayIrType>::from(
+            CustomCallOperation::new("ryft.test.ragged", vec![ArrayType::new_static(DataType::F32, [4])])
+                .with_batching(CustomCallBatching::BroadcastAll)
+                .with_ragged_contract(preserved_ragged_contract(length.clone())),
+        );
+        let (outputs, evidence) = operation.batch(&context, &EmptyRegionDriver, &[data, extent_operand])?.into_parts();
+        assert!(evidence.is_empty());
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].ragged_axes().len(), 1);
+        assert_eq!(outputs[0].ragged_axes()[0].axis(), 1);
+        assert_eq!(outputs[0].ragged_axes()[0].dimension(), &length);
+        assert_eq!(outputs[0].ragged_axes()[0].extents(), &extents);
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_ir_custom_call_attaches_fresh_ragged_output_to_replicated_call() -> Result<(), ProgramError> {
+        let output_length = DimensionVariable::new("output_length", DimensionBounds::new(0, Some(5)).unwrap());
+        let batch_size = DimensionVariable::new("batch_size", DimensionBounds::new(1, Some(5)).unwrap());
+        let operation = CustomCallOperation::<ArrayIrType>::from(
+            CustomCallOperation::new(
+                "ryft.test.fresh_ragged",
+                vec![ArrayType::new_static(DataType::F32, [4]), ArrayType::scalar(DataType::I32)],
+            )
+            .with_ragged_contract(CustomCallRaggedContract::new(
+                Vec::new(),
+                vec![
+                    CustomCallRaggedOutputBinding::Fresh {
+                        axis: 0,
+                        extent_output_index: 1,
+                        dimension: output_length.clone(),
+                    },
+                    CustomCallRaggedOutputBinding::Consumed,
+                ],
+            )),
+        );
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = trace.input(ArrayType::new_static(DataType::F32, [4]).into());
+        let axis_extent = trace.input(DimensionType::new(batch_size).into());
+        let context = BatchingContext::<_, ArrayIrBatching>::new(trace, axis_extent);
+        let (outputs, evidence) =
+            operation.batch(&context, &EmptyRegionDriver, &[ArrayIrBatch::replicated(input)])?.into_parts();
+        assert!(evidence.is_empty());
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::replicated());
+        assert_eq!(outputs[0].ragged_axes()[0].axis(), 0);
+        assert_eq!(outputs[0].ragged_axes()[0].dimension(), &output_length);
+        assert!(outputs[0].ragged_axes()[0].extent_axes().is_empty());
+        assert_eq!(outputs[0].ragged_axes()[0].extents(), outputs[1].value());
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_ir_dense_custom_call_validates_extents_before_array_projection() {
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows)]));
+        let operation =
+            CustomCallOperation::<ArrayIrType>::from(CustomCallOperation::new("ryft.test.dynamic", vec![output_type]));
+        let context = BatchingContext::<_, ArrayIrBatching>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        let inputs = [
+            ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())),
+            ArrayIrBatch::replicated(ArrayIrValue::Array(Array::scalar(2_i32))),
+        ];
+        assert!(matches!(
+            operation.batch(&context, &EmptyRegionDriver, &inputs),
+            Err(BatchingError::Type(TypeError::Invalid { message }))
+                if message == "expected dimension type but got array type",
+        ));
+    }
+
+    /// The mixed `BroadcastAll` rule rebinds one call whose declared outputs gain the mapped batch dimension, and
+    /// regroups the trailing extents so each output's new leading dynamic axis is grounded by the transform's extent.
+    #[test]
+    fn test_array_ir_custom_call_broadcasts_all_operands_with_regrouped_extents() -> Result<(), ProgramError> {
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
+        let operation = CustomCallOperation::<ArrayIrType>::from(
+            CustomCallOperation::new("ryft.test.dynamic", vec![output_type])
+                .with_batching(CustomCallBatching::BroadcastAll),
+        );
+
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
+        let batch_extent = trace.input(DimensionType::new(batch.clone()).into());
+        let mapped = trace.input(
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)])).into(),
+        );
+        let extent = trace.input(DimensionType::new(rows).into());
+        let context = BatchingContext::<_, ArrayIrBatching>::new(trace.clone(), batch_extent);
+        let inputs = [
+            BatchingTracer::new(context.clone(), ArrayIrBatch::new(mapped, BatchAxis::new(0))?),
+            BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(extent)),
+        ];
+        let [output] = context.bind(operation, Vec::new(), &inputs)?.try_into().unwrap();
+        assert_eq!(output.batch().batch_axis(), BatchAxis::new(0));
+
+        let output_id = output.into_batch().into_value().atom_id().unwrap();
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![output_id],
+            vec![Placeholder, Placeholder, Placeholder],
+            vec![Placeholder],
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[batch, 2], %2:dimension<rows ∈ [1, 9)> .
+                let %3:f32[batch, rows] = custom_call [target=ryft.test.dynamic, batching=broadcast_all] %1 %0 %2
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_ir_custom_call_fresh_output_composes_under_nested_dense_batching() -> Result<(), ProgramError> {
+        let output_length = DimensionVariable::new("output_length", DimensionBounds::new(0, Some(5)).unwrap());
+        let operation = CustomCallOperation::<ArrayIrType>::from(
+            CustomCallOperation::new(
+                "ryft.test.fresh_ragged",
+                vec![ArrayType::new_static(DataType::F32, [4]), ArrayType::scalar(DataType::I32)],
+            )
+            .with_batching(CustomCallBatching::BroadcastAll)
+            .with_ragged_contract(CustomCallRaggedContract::new(
+                Vec::new(),
+                vec![
+                    CustomCallRaggedOutputBinding::Fresh {
+                        axis: 0,
+                        extent_output_index: 1,
+                        dimension: output_length.clone(),
+                    },
+                    CustomCallRaggedOutputBinding::Consumed,
+                ],
+            )),
+        );
+        let output_types = operation
+            .output_types
+            .iter()
+            .map(|output_type| output_type.with_inserted_dimension(0, Dimension::Static(3)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let operation = CustomCallOperation {
+            output_types,
+            ragged_contract: operation.ragged_contract.as_ref().map(|contract| contract.batch_prefixed(false)),
+            ..operation
+        };
+
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let outer = DimensionVariable::new("outer", DimensionBounds::new(1, Some(5)).unwrap());
+        let axis_extent = trace.input(DimensionType::new(outer.clone()).into());
+        let input = trace.input(
+            ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![Dimension::Dynamic(outer), Dimension::Static(3), Dimension::Static(4)]),
+            )
+            .into(),
+        );
+        let context = BatchingContext::<_, ArrayIrBatching>::new(trace.clone(), axis_extent);
+        let (outputs, evidence) = operation
+            .batch(&context, &EmptyRegionDriver, &[ArrayIrBatch::new(input, BatchAxis::new(0))?])?
+            .into_parts();
+        assert!(evidence.is_empty());
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].ragged_axes().len(), 1);
+        assert_eq!(outputs[0].ragged_axes()[0].axis(), 2);
+        assert_eq!(outputs[0].ragged_axes()[0].extent_axes(), &[0, 1]);
+        assert_eq!(outputs[0].ragged_axes()[0].dimension(), &output_length);
+        assert_eq!(outputs[0].ragged_axes()[0].extents(), outputs[1].value());
+
+        let output_ids = outputs.iter().map(|output| output.value().atom_id()).collect::<Result<Vec<_>, _>>()?;
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            output_ids,
+            vec![Placeholder, Placeholder],
+            vec![Placeholder, Placeholder],
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<outer ∈ [1, 5)>, %1:f32[outer, 3, 4] .
+                let %2:f32[outer, 3, 4], %3:i32[outer, 3] = custom_call [
+                    target=ryft.test.fresh_ragged,
+                    batching=broadcast_all,
+                    ragged_contract={inputs=[], outputs=[fresh@2<=output(1):output_length, consume], \
+                 batch_prefix_count=2},
+                ] %1 %0 %0
+                in (%2, %3)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    /// The mixed universe applies the same all-replicated shortcut, including the trailing first-class output-extent
+    /// operand, which stays an ordinary replicated operand of the unchanged call.
+    #[test]
+    fn test_array_ir_custom_call_batches_all_replicated_operands_unchanged() -> Result<(), ProgramError> {
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
+        let operation = CustomCallOperation::<ArrayIrType>::from(CustomCallOperation::new(
+            "ryft.test.dynamic",
+            vec![output_type.clone()],
+        ));
+
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = trace.input(vector_type().into());
+        let extent = trace.input(DimensionType::new(rows).into());
+        let context = BatchingContext::<_, ArrayIrBatching>::new(
+            trace.clone(),
+            trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())),
+        );
+        let inputs = [
+            BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(input)),
+            BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(extent)),
+        ];
+        let [output] = context.bind(operation, Vec::new(), &inputs)?.try_into().unwrap();
+        assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
+        assert_eq!(output.r#type().as_ref(), &ArrayIrType::Array(output_type));
+
+        let output_id = output.into_batch().into_value().atom_id().unwrap();
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![output_id],
+            vec![Placeholder, Placeholder],
+            vec![Placeholder],
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f32[2], %1:dimension<rows ∈ [1, 9)> .
+                let %2:dimension<2> = const 2
+                    %3:f32[rows] = custom_call [target=ryft.test.dynamic] %0 %1
+                in (%3)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    /// The mixed rule threads replicated first-class output extents as leading invariant scan carries, so the body's
+    /// call declares exactly the per-item extents it was given, and it supports a dynamic mapped extent by consuming
+    /// it as the scan's trailing trip-count operand.
+    #[test]
+    fn test_array_ir_custom_call_batches_sequentially_with_extent_carries() -> Result<(), ProgramError> {
+        let rows = DimensionVariable::new("rows", DimensionBounds::new(1, Some(9)).unwrap());
+        let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows.clone())]));
+        let operation = CustomCallOperation::<ArrayIrType>::from(
+            CustomCallOperation::new("ryft.test.dynamic", vec![output_type])
+                .with_batching(CustomCallBatching::Sequential { unroll: None }),
+        );
+
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9)).unwrap());
+        let batch_extent = trace.input(DimensionType::new(batch.clone()).into());
+        let mapped = trace.input(
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)])).into(),
+        );
+        let extent = trace.input(DimensionType::new(rows).into());
+        let context = BatchingContext::<_, ArrayIrBatching>::new(trace.clone(), batch_extent);
+        let inputs = [
+            BatchingTracer::new(context.clone(), ArrayIrBatch::new(mapped, BatchAxis::new(0))?),
+            BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(extent)),
+        ];
+        let [output] = context.bind(operation, Vec::new(), &inputs)?.try_into().unwrap();
+        assert_eq!(output.batch().batch_axis(), BatchAxis::new(0));
+
+        let output_id = output.into_batch().into_value().atom_id().unwrap();
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![output_id],
+            vec![Placeholder, Placeholder, Placeholder],
+            vec![Placeholder],
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[batch, 2], %2:dimension<rows ∈ [1, 9)> .
+                let %3:dimension<rows ∈ [1, 9)>, %4:f32[batch, rows] = scan [carry_count=1, length=batch, \
+                 reverse=false] %2 %1 %0 [
+                    body={
+                        lambda %0:dimension<rows ∈ [1, 9)>, %1:f32[2] .
+                        let %2:f32[rows] = custom_call [target=ryft.test.dynamic, batching=sequential] %1 %0
+                        in (%0, %2)
+                    },
+                ]
+                in (%4)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_ir_sequential_custom_call_records_ragged_discharge_in_the_scan_body() -> Result<(), ProgramError> {
+        let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
+        let batch_size = DimensionVariable::new("batch_size", DimensionBounds::new(1, Some(5)).unwrap());
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let packed = trace.input(ArrayType::new_static(DataType::F32, [2, 4]).into());
+        let extents = trace.input(ArrayType::new_static(DataType::I32, [2]).into());
+        let axis_extent = trace.input(DimensionType::new(batch_size).into());
+        let context = BatchingContext::<_, ArrayIrBatching>::new(trace.clone(), axis_extent);
+        let data = ArrayIrBatch::new(packed, BatchAxis::new(0))?.with_ragged_axes(vec![RaggedAxis::new(
+            1,
+            extents.clone(),
+            length.clone(),
+            vec![0],
+        )])?;
+        let extent_operand = ArrayIrBatch::new(extents, BatchAxis::new(0))?;
+        let operation = CustomCallOperation::<ArrayIrType>::from(
+            CustomCallOperation::new("ryft.test.ragged", vec![ArrayType::new_static(DataType::F32, [4])])
+                .with_batching(CustomCallBatching::Sequential { unroll: None })
+                .with_ragged_contract(preserved_ragged_contract(length)),
+        );
+        let output = operation.batch(&context, &EmptyRegionDriver, &[data, extent_operand])?.into_parts().0.remove(0);
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![output.value().atom_id().unwrap()],
+            vec![Placeholder; 3],
+            vec![Placeholder],
+        )?;
+        let scan = program
+            .entry_region()
+            .instructions()
+            .iter()
+            .find(|instruction| matches!(instruction.operation(), ArrayIrOperation::Scan(_)))
+            .unwrap();
+        let body = program.region(scan.regions()[0])?;
+        let contract = body
+            .instructions()
+            .iter()
+            .find_map(|instruction| match instruction.operation() {
+                ArrayIrOperation::CustomCall(operation) => operation.ragged_contract(),
+                _ => None,
+            })
+            .unwrap();
+        assert!(contract.ragged_discharged);
+        Ok(())
+    }
+
+    #[test]
+    fn test_array_ir_custom_call_rejects_transforms() {
+        let operation = CustomCallOperation::<ArrayIrType>::from(CustomCallOperation::new(
+            "ryft.test.add_one",
+            vec![vector_type()],
+        ));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(vector_type().into());
+        let output = builder.add_instruction(operation.clone(), Vec::new(), vec![input], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(matches!(
+            program.jvp(),
+            Err(error)
+                if error.to_string()
+                    == "custom call `ryft.test.add_one` has no differentiation rule; wrap it with `custom_jvp` or \
+                        `custom_vjp` to provide one",
+        ));
+
+        let batching_context = BatchingContext::<_, ArrayIrBatching>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        let mapped = ArrayIrBatch::new(
+            ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f32, 2.0, 3.0, 4.0])),
+            BatchAxis::new(0),
+        )
+        .unwrap();
+        assert!(matches!(
+            operation.batch(&batching_context, &EmptyRegionDriver, &[mapped]),
+            Err(BatchingError::UnsupportedOperation { message })
+                if message
+                    == "custom call `ryft.test.add_one` has no batching rule for operand 0 mapped at batch axis 0; \
+                        invoke a kernel that understands the batch axis, or select an explicit batching behavior \
+                        with `CustomCallOperation::with_batching`",
+        ));
+
+        let transposition_context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        assert!(matches!(
+            operation.transpose(
+                &mut TranspositionContext::new(transposition_context.clone()),
+                &EmptyRegionDriver,
+                &[],
+                &[],
+            ),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "operation `custom_call` is not transposable",
+        ));
     }
 }

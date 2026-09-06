@@ -10,18 +10,6 @@ use crate::programs::{MaybeZero, Type, TypeError, Typed};
 
 // TODO(eaplatanios): Review this module.
 
-/// Canonical operation name for [`ComplexOperation`].
-pub const COMPLEX_OPERATION_NAME: &str = "complex";
-
-/// Canonical operation name for [`ConjugateOperation`].
-pub const CONJUGATE_OPERATION_NAME: &str = "conjugate";
-
-/// Canonical operation name for [`RealOperation`].
-pub const REAL_OPERATION_NAME: &str = "real";
-
-/// Canonical operation name for [`ImaginaryOperation`].
-pub const IMAGINARY_OPERATION_NAME: &str = "imaginary";
-
 /// Maps a real part element [`DataType`] to the complex [`DataType`] it constructs (i.e., `f32 → c64` and
 /// `f64 → c128`), reporting a [`TypeError`] under `op`'s name for any other part data type.
 fn part_to_complex_data_type(part: DataType, op: &'static str) -> Result<DataType, TypeError> {
@@ -41,6 +29,9 @@ fn complex_to_part_data_type(complex: DataType, op: &'static str) -> Result<Data
         other => Err(TypeError::invalid(format!("`{op}` requires a complex operand but got {other}"))),
     }
 }
+
+/// Canonical operation name for [`ComplexOperation`].
+pub const COMPLEX_OPERATION_NAME: &str = "complex";
 
 define_elementwise_operation!(
     @binary
@@ -150,6 +141,9 @@ define_elementwise_capability!(
     ComplexOperation,
 );
 
+/// Canonical operation name for [`ConjugateOperation`].
+pub const CONJUGATE_OPERATION_NAME: &str = "conjugate";
+
 define_elementwise_operation!(
     @unary
     /// [`Operation`] that computes the elementwise complex conjugate of one complex value (i.e., `z ↦ z̄`, negating
@@ -218,6 +212,9 @@ define_elementwise_capability!(
     conjugate,
     ConjugateOperation,
 );
+
+/// Canonical operation name for [`RealOperation`].
+pub const REAL_OPERATION_NAME: &str = "real";
 
 define_elementwise_operation!(
     @unary
@@ -288,6 +285,9 @@ define_elementwise_capability!(
     real,
     RealOperation,
 );
+
+/// Canonical operation name for [`ImaginaryOperation`].
+pub const IMAGINARY_OPERATION_NAME: &str = "imaginary";
 
 define_elementwise_operation!(
     @unary
@@ -370,22 +370,17 @@ mod tests {
     use crate::contexts::{Context, EagerContext};
     use crate::differentiation::differentiate_at;
     use crate::interpretation::InterpretableOperation;
-    use crate::macros::check_operation_type_inference;
+    use crate::macros::{
+        check_operation_batching, check_operation_partial_evaluation, check_operation_transposition,
+        check_operation_type_inference,
+    };
     use crate::programs::EmptyRegionDriver;
 
     use super::*;
 
     #[test]
     fn test_complex() {
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &ComplexOperation::<ArrayType>::new(),
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Array::scalar(1.5f32), Array::scalar(-2.0f32)],
-            ),
-            Ok(vec![Array::scalar(ComplexNumber::new(1.5f32, -2.0f32))]),
-        );
+        assert_eq!(ComplexOperation::<ArrayType>::new().to_string(), "complex");
     }
 
     #[test]
@@ -415,123 +410,43 @@ mod tests {
     }
 
     #[test]
-    fn test_conjugate() {
+    fn test_complex_interpretation() {
         assert_eq!(
             InterpretableOperation::<EagerContext<Array>>::interpret(
-                &ConjugateOperation::<ArrayType>::new(),
+                &ComplexOperation::<ArrayType>::new(),
                 &EagerContext::new(),
                 &EmptyRegionDriver,
-                &[Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)])],
+                &[Array::scalar(1.5f32), Array::scalar(-2.0f32)],
             ),
-            Ok(vec![Array::vector(vec![ComplexNumber::new(1.5f64, 2.0f64), ComplexNumber::new(0.5f64, -1.0f64)])]),
+            Ok(vec![Array::scalar(ComplexNumber::new(1.5f32, -2.0f32))]),
         );
     }
 
     #[test]
-    fn test_conjugate_type_inference() {
-        check_operation_type_inference!(
-            @elementwise @unary,
-            operation = ConjugateOperation,
-            cases = [
-                {
-                    input_data_types = [DataType::C64],
-                    output_data_types = [DataType::C64],
-                },
-                {
-                    input_data_types = [DataType::F64],
-                    error = "`conjugate` requires a complex operand but got f64",
-                },
-            ],
+    fn test_complex_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = ComplexOperation::new(),
+            inputs = [Array::scalar(1.5f64), Array::scalar(-2.0f64)],
+            expected = Array::scalar(ComplexNumber::new(1.5f64, -2.0f64)),
         );
     }
 
     #[test]
-    fn test_real() {
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &RealOperation::<ArrayType>::new(),
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)])],
-            ),
-            Ok(vec![Array::vector(vec![1.5f64, 0.5f64])]),
-        );
-    }
-
-    #[test]
-    fn test_real_type_inference() {
-        check_operation_type_inference!(
-            @elementwise @unary,
-            operation = RealOperation,
-            cases = [
-                {
-                    input_data_types = [DataType::C64],
-                    output_data_types = [DataType::F32],
-                },
-                {
-                    input_data_types = [DataType::C128],
-                    output_data_types = [DataType::F64],
-                },
-                {
-                    input_data_types = [DataType::F32],
-                    error = "`real` requires a complex operand but got f32",
-                },
-            ],
-        );
-    }
-
-    #[test]
-    fn test_imaginary() {
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &ImaginaryOperation::<ArrayType>::new(),
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)])],
-            ),
-            Ok(vec![Array::vector(vec![-2.0f64, 1.0f64])]),
-        );
-    }
-
-    #[test]
-    fn test_imaginary_type_inference() {
-        check_operation_type_inference!(
-            @elementwise @unary,
-            operation = ImaginaryOperation,
-            cases = [
-                {
-                    input_data_types = [DataType::C64],
-                    output_data_types = [DataType::F32],
-                },
-                {
-                    input_data_types = [DataType::Boolean],
-                    error = "`imaginary` requires a complex operand but got bool",
-                },
-            ],
+    fn test_complex_batching() {
+        check_operation_batching!(
+            @exact,
+            operation = ComplexOperation::new(),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::vector(vec![1.5f64, 0.5f64])),
+                    (@mapped(axis = 0), Array::vector(vec![-2.0f64, 1.0f64]))],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)]))],
+            }],
         );
     }
 
     #[test]
     fn test_complex_differentiation() {
-        let z = ComplexNumber::new(0.7f64, -0.3f64);
-        let tangent_seed = ComplexNumber::new(0.5f64, 2.0f64);
-
-        // Conjugation: d(z̄) = d̄z.
-        let (primal, tangent) =
-            differentiate_at(Array::scalar(z)).jvp(Array::scalar(tangent_seed), |x| x.conjugate()).unwrap();
-        assert_eq!(primal, Array::scalar(z.conj()));
-        assert_eq!(tangent, Array::scalar(tangent_seed.conj()));
-
-        // Part extraction: d(Re(z)) = Re(dz) and d(Im(z)) = Im(dz).
-        let (primal, tangent) =
-            differentiate_at(Array::scalar(z)).jvp(Array::scalar(tangent_seed), |x| x.real()).unwrap();
-        assert_eq!(primal, Array::scalar(z.re));
-        assert_eq!(tangent, Array::scalar(tangent_seed.re));
-        let (primal, tangent) =
-            differentiate_at(Array::scalar(z)).jvp(Array::scalar(tangent_seed), |x| x.imaginary()).unwrap();
-        assert_eq!(primal, Array::scalar(z.im));
-        assert_eq!(tangent, Array::scalar(tangent_seed.im));
-
         // Construction: d(complex(re, im)) = complex(dre, dim), including the mixed case where one part tangent is a
         // structural zero that must be materialized to keep the staged `complex` arity.
         let (primal, tangent) = differentiate_at((Array::scalar(1.5f64), Array::scalar(-2.0f64)))
@@ -569,5 +484,271 @@ mod tests {
             .unwrap();
         assert_eq!(primal, Array::scalar(z.norm_sqr()));
         assert_eq!(tangent, Array::scalar((tangent_seed * z.conj() + z * tangent_seed.conj()).re));
+    }
+
+    #[test]
+    fn test_complex_transposition() {
+        check_operation_transposition!(
+            @exact,
+            operation = ComplexOperation::new(),
+            cases = [{
+                inputs = [(@linear(type = ArrayType::scalar(DataType::F64))),
+                    (@linear(type = ArrayType::scalar(DataType::F64)))],
+                output_cotangents = [Array::scalar(ComplexNumber::new(3.0f64, -4.0f64))],
+                input_cotangents = [Array::scalar(3.0f64), Array::scalar(4.0f64)],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_conjugate() {
+        assert_eq!(ConjugateOperation::<ArrayType>::new().to_string(), "conjugate");
+    }
+
+    #[test]
+    fn test_conjugate_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = ConjugateOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::C64],
+                    output_data_types = [DataType::C64],
+                },
+                {
+                    input_data_types = [DataType::F64],
+                    error = "`conjugate` requires a complex operand but got f64",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_conjugate_interpretation() {
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &ConjugateOperation::<ArrayType>::new(),
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)])],
+            ),
+            Ok(vec![Array::vector(vec![ComplexNumber::new(1.5f64, 2.0f64), ComplexNumber::new(0.5f64, -1.0f64)])]),
+        );
+    }
+
+    #[test]
+    fn test_conjugate_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = ConjugateOperation::new(),
+            inputs = [Array::scalar(ComplexNumber::new(1.5f64, -2.0f64))],
+            expected = Array::scalar(ComplexNumber::new(1.5f64, 2.0f64)),
+        );
+    }
+
+    #[test]
+    fn test_conjugate_batching() {
+        check_operation_batching!(
+            @exact,
+            operation = ConjugateOperation::new(),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)]))],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![ComplexNumber::new(1.5f64, 2.0f64), ComplexNumber::new(0.5f64, -1.0f64)]))],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_conjugate_differentiation() {
+        let z = ComplexNumber::new(0.7f64, -0.3f64);
+        let tangent_seed = ComplexNumber::new(0.5f64, 2.0f64);
+
+        // Conjugation: d(z̄) = d̄z.
+        let (primal, tangent) =
+            differentiate_at(Array::scalar(z)).jvp(Array::scalar(tangent_seed), |x| x.conjugate()).unwrap();
+        assert_eq!(primal, Array::scalar(z.conj()));
+        assert_eq!(tangent, Array::scalar(tangent_seed.conj()));
+    }
+
+    #[test]
+    fn test_conjugate_transposition() {
+        check_operation_transposition!(
+            @exact,
+            operation = ConjugateOperation::new(),
+            cases = [{
+                inputs = [(@linear(type = ArrayType::scalar(DataType::C128)))],
+                output_cotangents = [Array::scalar(ComplexNumber::new(3.0f64, -4.0f64))],
+                input_cotangents = [Array::scalar(ComplexNumber::new(3.0f64, 4.0f64))],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_real() {
+        assert_eq!(RealOperation::<ArrayType>::new().to_string(), "real");
+    }
+
+    #[test]
+    fn test_real_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = RealOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::C64],
+                    output_data_types = [DataType::F32],
+                },
+                {
+                    input_data_types = [DataType::C128],
+                    output_data_types = [DataType::F64],
+                },
+                {
+                    input_data_types = [DataType::F32],
+                    error = "`real` requires a complex operand but got f32",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_real_interpretation() {
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &RealOperation::<ArrayType>::new(),
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)])],
+            ),
+            Ok(vec![Array::vector(vec![1.5f64, 0.5f64])]),
+        );
+    }
+
+    #[test]
+    fn test_real_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = RealOperation::new(),
+            inputs = [Array::scalar(ComplexNumber::new(1.5f64, -2.0f64))],
+            expected = Array::scalar(1.5f64),
+        );
+    }
+
+    #[test]
+    fn test_real_batching() {
+        check_operation_batching!(
+            @exact,
+            operation = RealOperation::new(),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)]))],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![1.5f64, 0.5f64]))],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_real_differentiation() {
+        let z = ComplexNumber::new(0.7f64, -0.3f64);
+        let tangent_seed = ComplexNumber::new(0.5f64, 2.0f64);
+
+        // Part extraction: d(Re(z)) = Re(dz) and d(Im(z)) = Im(dz).
+        let (primal, tangent) =
+            differentiate_at(Array::scalar(z)).jvp(Array::scalar(tangent_seed), |x| x.real()).unwrap();
+        assert_eq!(primal, Array::scalar(z.re));
+        assert_eq!(tangent, Array::scalar(tangent_seed.re));
+    }
+
+    #[test]
+    fn test_real_transposition() {
+        check_operation_transposition!(
+            @exact,
+            operation = RealOperation::new(),
+            cases = [{
+                inputs = [(@linear(type = ArrayType::scalar(DataType::C128)))],
+                output_cotangents = [Array::scalar(3.0f64)],
+                input_cotangents = [Array::scalar(ComplexNumber::new(3.0f64, 0.0f64))],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_imaginary() {
+        assert_eq!(ImaginaryOperation::<ArrayType>::new().to_string(), "imaginary");
+    }
+
+    #[test]
+    fn test_imaginary_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = ImaginaryOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::C64],
+                    output_data_types = [DataType::F32],
+                },
+                {
+                    input_data_types = [DataType::Boolean],
+                    error = "`imaginary` requires a complex operand but got bool",
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_imaginary_interpretation() {
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &ImaginaryOperation::<ArrayType>::new(),
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)])],
+            ),
+            Ok(vec![Array::vector(vec![-2.0f64, 1.0f64])]),
+        );
+    }
+
+    #[test]
+    fn test_imaginary_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = ImaginaryOperation::new(),
+            inputs = [Array::scalar(ComplexNumber::new(1.5f64, -2.0f64))],
+            expected = Array::scalar(-2.0f64),
+        );
+    }
+
+    #[test]
+    fn test_imaginary_batching() {
+        check_operation_batching!(
+            @exact,
+            operation = ImaginaryOperation::new(),
+            axis_size = 2,
+            cases = [{
+                inputs = [(@mapped(axis = 0), Array::vector(vec![ComplexNumber::new(1.5f64, -2.0f64), ComplexNumber::new(0.5f64, 1.0f64)]))],
+                outputs = [(@mapped(axis = 0), Array::vector(vec![-2.0f64, 1.0f64]))],
+            }],
+        );
+    }
+
+    #[test]
+    fn test_imaginary_differentiation() {
+        let z = ComplexNumber::new(0.7f64, -0.3f64);
+        let tangent_seed = ComplexNumber::new(0.5f64, 2.0f64);
+
+        let (primal, tangent) =
+            differentiate_at(Array::scalar(z)).jvp(Array::scalar(tangent_seed), |x| x.imaginary()).unwrap();
+        assert_eq!(primal, Array::scalar(z.im));
+        assert_eq!(tangent, Array::scalar(tangent_seed.im));
+    }
+
+    #[test]
+    fn test_imaginary_transposition() {
+        check_operation_transposition!(
+            @exact,
+            operation = ImaginaryOperation::new(),
+            cases = [{
+                inputs = [(@linear(type = ArrayType::scalar(DataType::C128)))],
+                output_cotangents = [Array::scalar(3.0f64)],
+                input_cotangents = [Array::scalar(ComplexNumber::new(0.0f64, -3.0f64))],
+            }],
+        );
     }
 }

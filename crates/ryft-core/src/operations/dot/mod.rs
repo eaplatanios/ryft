@@ -39,9 +39,10 @@ pub use dimensions::{
     DotDimensionNumbers, RaggedDotDimensionNumbers, RaggedDotMode, adjoint_dimensions_for_left_dot,
     adjoint_dimensions_for_right_dot, lhs_result_axes, lift_dot_dimensions, rhs_result_axes,
 };
-pub use inference::{DOT_OPERATION_NAME, RAGGED_DOT_OPERATION_NAME};
 pub(crate) use inference::{dot_abstract, ragged_dot_abstract};
-pub use operation::{Dot, DotOperation, DotOps, RaggedDot, RaggedDotOperation};
+pub use operation::{
+    DOT_OPERATION_NAME, Dot, DotOperation, DotOps, RAGGED_DOT_OPERATION_NAME, RaggedDot, RaggedDotOperation,
+};
 
 #[cfg(test)]
 mod tests;

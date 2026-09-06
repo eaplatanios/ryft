@@ -139,6 +139,47 @@ mod tests {
 
     #[test]
     fn test_atan2() {
+        assert_eq!(Atan2Operation::<ArrayType>::new().to_string(), "atan2");
+    }
+
+    #[test]
+    fn test_atan2_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @binary,
+            operation = Atan2Operation,
+            cases = [
+                {
+                    input_data_types = [DataType::F32, DataType::F64],
+                    output_data_types = [DataType::F64],
+                },
+                {
+                    input_data_types = [DataType::C64, DataType::C64],
+                    output_data_types = [DataType::C64],
+                },
+                {
+                    input_data_types = [DataType::F32, DataType::C128],
+                    output_data_types = [DataType::C128],
+                },
+                {
+                    input_data_types = [DataType::I32, DataType::F32],
+                    error = "`atan2` does not support input data type i32",
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            @reject @unreduced,
+            operation = Atan2Operation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        );
+        check_operation_type_inference!(
+            @reject @mismatched_reduced,
+            operation = Atan2Operation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_atan2_interpretation() {
         assert_eq!(
             Array::scalar(0.5f32).atan2(&Array::scalar(-0.25f32)).unwrap(),
             Array::scalar(0.5f32.atan2(-0.25f32)),
@@ -176,38 +217,11 @@ mod tests {
     }
 
     #[test]
-    fn test_atan2_type_inference() {
-        check_operation_type_inference!(
-            @elementwise @binary,
-            operation = Atan2Operation,
-            cases = [
-                {
-                    input_data_types = [DataType::F32, DataType::F64],
-                    output_data_types = [DataType::F64],
-                },
-                {
-                    input_data_types = [DataType::C64, DataType::C64],
-                    output_data_types = [DataType::C64],
-                },
-                {
-                    input_data_types = [DataType::F32, DataType::C128],
-                    output_data_types = [DataType::C128],
-                },
-                {
-                    input_data_types = [DataType::I32, DataType::F32],
-                    error = "`atan2` does not support input data type i32",
-                },
-            ],
-        );
-        check_operation_type_inference!(
-            @reject @unreduced,
-            operation = Atan2Operation::<ArrayType>::new(),
-            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
-        );
-        check_operation_type_inference!(
-            @reject @mismatched_reduced,
-            operation = Atan2Operation::<ArrayType>::new(),
-            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+    fn test_atan2_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = Atan2Operation::new(),
+            inputs = [Array::scalar(0.5), Array::scalar(-0.25)],
+            expected = Array::scalar(0.5f64.atan2(-0.25)),
         );
     }
 
@@ -296,15 +310,6 @@ mod tests {
             .unwrap();
         assert_eq!(primal.r#type().data_type(), DataType::F8E8M0FNU);
         assert_abs_diff_eq!(tangent.to_f64s()[0], 0.1f32 as f64, epsilon = 1e-6);
-    }
-
-    #[test]
-    fn test_atan2_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = Atan2Operation::new(),
-            inputs = [Array::scalar(0.5), Array::scalar(-0.25)],
-            expected = Array::scalar(0.5f64.atan2(-0.25)),
-        );
     }
 
     #[test]

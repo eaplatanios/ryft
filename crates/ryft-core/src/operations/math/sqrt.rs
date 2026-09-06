@@ -75,20 +75,7 @@ mod tests {
 
     #[test]
     fn test_sqrt() {
-        assert_eq!(Array::scalar(0.25f32).sqrt().unwrap(), Array::scalar(0.5f32));
-        assert_eq!(Array::scalar(0.25f64).sqrt().unwrap(), Array::scalar(0.5f64));
-        assert_eq!(Array::scalar(bf16::from_f32(0.25)).sqrt().unwrap(), Array::scalar(bf16::from_f32(0.5)));
-        assert_eq!(Array::scalar(f16::from_f32(0.25)).sqrt().unwrap(), Array::scalar(f16::from_f32(0.5)));
-        let input = ComplexNumber::new(0.7f64, -0.3f64);
-        assert_abs_diff_eq!(Array::scalar(input).sqrt().unwrap(), Array::scalar(input.sqrt()), epsilon = 1e-12);
-        // The principal branch maps the negative real axis to the positive imaginary axis.
-        assert_abs_diff_eq!(
-            Array::scalar(ComplexNumber::new(-4.0f64, 0.0)).sqrt().unwrap(),
-            Array::scalar(ComplexNumber::new(0.0f64, 2.0)),
-            epsilon = 1e-12,
-        );
-
-        assert_eq!(Array::scalar(4.0).sqrt().unwrap(), Array::scalar(2.0),);
+        assert_eq!(SqrtOperation::<ArrayType>::new().to_string(), "sqrt");
     }
 
     #[test]
@@ -111,6 +98,33 @@ mod tests {
             @reject @unreduced,
             operation = SqrtOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_sqrt_interpretation() {
+        assert_eq!(Array::scalar(0.25f32).sqrt().unwrap(), Array::scalar(0.5f32));
+        assert_eq!(Array::scalar(0.25f64).sqrt().unwrap(), Array::scalar(0.5f64));
+        assert_eq!(Array::scalar(bf16::from_f32(0.25)).sqrt().unwrap(), Array::scalar(bf16::from_f32(0.5)));
+        assert_eq!(Array::scalar(f16::from_f32(0.25)).sqrt().unwrap(), Array::scalar(f16::from_f32(0.5)));
+        let input = ComplexNumber::new(0.7f64, -0.3f64);
+        assert_abs_diff_eq!(Array::scalar(input).sqrt().unwrap(), Array::scalar(input.sqrt()), epsilon = 1e-12);
+        // The principal branch maps the negative real axis to the positive imaginary axis.
+        assert_abs_diff_eq!(
+            Array::scalar(ComplexNumber::new(-4.0f64, 0.0)).sqrt().unwrap(),
+            Array::scalar(ComplexNumber::new(0.0f64, 2.0)),
+            epsilon = 1e-12,
+        );
+
+        assert_eq!(Array::scalar(4.0).sqrt().unwrap(), Array::scalar(2.0),);
+    }
+
+    #[test]
+    fn test_sqrt_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = SqrtOperation::new(),
+            inputs = [Array::scalar(4.0)],
+            expected = Array::scalar(2.0),
         );
     }
 
@@ -188,15 +202,6 @@ mod tests {
                 in (%2, %6)
             "}
             .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_sqrt_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = SqrtOperation::new(),
-            inputs = [Array::scalar(4.0)],
-            expected = Array::scalar(2.0),
         );
     }
 

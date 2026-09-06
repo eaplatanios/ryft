@@ -1,5 +1,8 @@
 use super::*;
 
+/// Canonical operation name for [`DotOperation`].
+pub const DOT_OPERATION_NAME: &str = "dot";
+
 /// Primitive representing a generalized dot (tensor contraction).
 ///
 /// [`DotOperation`] is the unified primitive for matrix multiplication, batched matrix multiplication, vector inner
@@ -251,6 +254,9 @@ where
             .remove(0)
     }
 }
+
+/// Canonical operation name for [`RaggedDotOperation`].
+pub const RAGGED_DOT_OPERATION_NAME: &str = "ragged_dot_general";
 
 /// Primitive representing a grouped generalized dot with explicit group sizes.
 ///

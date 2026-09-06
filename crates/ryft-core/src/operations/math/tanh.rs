@@ -78,14 +78,7 @@ mod tests {
 
     #[test]
     fn test_tanh() {
-        assert_eq!(Array::scalar(0.5f32).tanh().unwrap(), Array::scalar(0.5f32.tanh()));
-        assert_eq!(Array::scalar(0.5f64).tanh().unwrap(), Array::scalar(0.5f64.tanh()));
-        assert_eq!(Array::scalar(bf16::from_f32(0.5)).tanh().unwrap(), Array::scalar(bf16::from_f32(0.5f32.tanh())),);
-        assert_eq!(Array::scalar(f16::from_f32(0.5)).tanh().unwrap(), Array::scalar(f16::from_f32(0.5f32.tanh())),);
-        let input = ComplexNumber::new(0.7f64, -0.3f64);
-        assert_abs_diff_eq!(Array::scalar(input).tanh().unwrap(), Array::scalar(input.tanh()), epsilon = 1e-12);
-
-        assert_eq!(Array::scalar(0.7).tanh().unwrap(), Array::scalar(0.7f64.tanh()),);
+        assert_eq!(TanhOperation::<ArrayType>::new().to_string(), "tanh");
     }
 
     #[test]
@@ -108,6 +101,27 @@ mod tests {
             @reject @unreduced,
             operation = TanhOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_tanh_interpretation() {
+        assert_eq!(Array::scalar(0.5f32).tanh().unwrap(), Array::scalar(0.5f32.tanh()));
+        assert_eq!(Array::scalar(0.5f64).tanh().unwrap(), Array::scalar(0.5f64.tanh()));
+        assert_eq!(Array::scalar(bf16::from_f32(0.5)).tanh().unwrap(), Array::scalar(bf16::from_f32(0.5f32.tanh())),);
+        assert_eq!(Array::scalar(f16::from_f32(0.5)).tanh().unwrap(), Array::scalar(f16::from_f32(0.5f32.tanh())),);
+        let input = ComplexNumber::new(0.7f64, -0.3f64);
+        assert_abs_diff_eq!(Array::scalar(input).tanh().unwrap(), Array::scalar(input.tanh()), epsilon = 1e-12);
+
+        assert_eq!(Array::scalar(0.7).tanh().unwrap(), Array::scalar(0.7f64.tanh()),);
+    }
+
+    #[test]
+    fn test_tanh_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = TanhOperation::new(),
+            inputs = [Array::scalar(0.7)],
+            expected = Array::scalar(0.7f64.tanh()),
         );
     }
 
@@ -162,15 +176,6 @@ mod tests {
                 .gradient(|input| { input.tanh().unwrap() })
                 .unwrap(),
             epsilon = 1e-12,
-        );
-    }
-
-    #[test]
-    fn test_tanh_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = TanhOperation::new(),
-            inputs = [Array::scalar(0.7)],
-            expected = Array::scalar(0.7f64.tanh()),
         );
     }
 

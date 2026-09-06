@@ -137,10 +137,10 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for IotaOper
 {
 }
 
-impl_non_differentiable_operation!(IotaOperation<ArrayType>);
-impl_nullary_transposable_operation!(IotaOperation<ArrayType>);
 impl_nullary_batchable_operation!(@replicated IotaOperation<ArrayType>);
 impl_nullary_batchable_operation!(@member<ArrayIrType, ArrayIrBatching> IotaOperation<ArrayType>);
+impl_non_differentiable_operation!(IotaOperation<ArrayType>);
+impl_nullary_transposable_operation!(IotaOperation<ArrayType>);
 
 impl_member_operation_for_array_ir_constant_operation!(IotaOperation<ArrayType>);
 impl_member_interpretable_operation_for_array_ir_constant_operation!(
@@ -276,9 +276,11 @@ mod tests {
     };
     use crate::batching::{BatchAxis, BatchingContext};
     use crate::contexts::EagerContext;
+    use crate::differentiation::{TransposableOperation, TranspositionContext};
     use crate::interpretation::InterpretableOperation;
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder};
+    use crate::tracing::TracingContext;
 
     use super::*;
 
@@ -296,40 +298,12 @@ mod tests {
                 .unwrap_err(),
             TypeError::invalid("`iota` requires a numeric element type but has bool"),
         );
-        let complex_type = ArrayType::new(DataType::C64, Shape::new(vec![Dimension::Static(2)]));
-        assert_eq!(
-            IotaOperation::new(complex_type.clone(), 0).unwrap().infer_output_types(&[], &[]),
-            Ok(vec![complex_type]),
-        );
-        let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
-        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(variable.clone())]));
-        assert_eq!(
-            IotaOperation::new(dynamic_type, 0).unwrap().infer_output_types(&[], &[]),
-            Err(TypeError::invalid(format!(
-                "`iota` cannot construct type f64[extent] without operands because it references identity {variable}",
-            ))),
-        );
-
         // Verify the operation's stored type and axis, identity, and rendering.
         let operation = IotaOperation::new(r#type.clone(), 1).unwrap();
         assert_eq!(operation.name(), IOTA_OPERATION_NAME);
         assert_eq!(format!("{operation}"), "iota [type=f64[2, 3], dimension=1]");
         assert_eq!(operation.r#type(), &r#type);
         assert_eq!(operation.dimension(), 1);
-        assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![r#type.clone()]));
-
-        // Eager interpretation along axis one varies between columns and repeats across rows.
-        let context = EagerContext::<Array, IotaOperation<ArrayType>>::new();
-        let expected = Array::from_f64s(r#type.clone(), vec![0.0, 1.0, 2.0, 0.0, 1.0, 2.0]);
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array, IotaOperation<ArrayType>>>::interpret(
-                &operation,
-                &context,
-                &EmptyRegionDriver,
-                &[],
-            ),
-            Ok(vec![expected.clone()]),
-        );
 
         // Verify the operation's textual form when it appears in a program.
         let mut builder = ProgramBuilder::<Array, IotaOperation<ArrayType>>::new();
@@ -347,7 +321,43 @@ mod tests {
     }
 
     #[test]
-    fn test_eager_context_iota() {
+    fn test_iota_type_inference() {
+        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        let operation = IotaOperation::new(r#type.clone(), 1).unwrap();
+        assert_eq!(operation.infer_output_types(&[], &[]), Ok(vec![r#type.clone()]));
+
+        let complex_type = ArrayType::new(DataType::C64, Shape::new(vec![Dimension::Static(2)]));
+        assert_eq!(
+            IotaOperation::new(complex_type.clone(), 0).unwrap().infer_output_types(&[], &[]),
+            Ok(vec![complex_type]),
+        );
+        let variable = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
+        let dynamic_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(variable.clone())]));
+        assert_eq!(
+            IotaOperation::new(dynamic_type, 0).unwrap().infer_output_types(&[], &[]),
+            Err(TypeError::invalid(format!(
+                "`iota` cannot construct type f64[extent] without operands because it references identity {variable}",
+            ))),
+        );
+    }
+
+    #[test]
+    fn test_iota_interpretation() {
+        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        let operation = IotaOperation::new(r#type.clone(), 1).unwrap();
+        // Eager interpretation along axis one varies between columns and repeats across rows.
+        let context = EagerContext::<Array, IotaOperation<ArrayType>>::new();
+        let expected = Array::from_f64s(r#type.clone(), vec![0.0, 1.0, 2.0, 0.0, 1.0, 2.0]);
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array, IotaOperation<ArrayType>>>::interpret(
+                &operation,
+                &context,
+                &EmptyRegionDriver,
+                &[],
+            ),
+            Ok(vec![expected.clone()]),
+        );
+
         let context = EagerContext::<Array>::new();
 
         // Each selected axis varies independently and repeats along every other axis.
@@ -394,6 +404,52 @@ mod tests {
                  `ArrayIrOperation`, whose `DynamicIota` constructor consumes one dimension operand per dynamic axis",
             ))),
         );
+    }
+
+    #[test]
+    fn test_iota_partial_evaluation() {
+        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let output_type = ArrayType::new_static(DataType::I32, [2, 3]);
+        let output = context.iota(&output_type, 1).unwrap();
+        let expected = Array::from_elements(output_type, &[0i32, 1, 2, 0, 1, 2]).unwrap();
+        assert_eq!(output.value().unwrap().as_known(), Some(&expected));
+    }
+
+    #[test]
+    fn test_iota_batching() {
+        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
+        let output_type = ArrayType::new_static(DataType::I32, [2, 3]);
+        let output = context.iota(&output_type, 1).unwrap();
+        assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
+        assert_eq!(output.batch().value(), &Array::from_elements(output_type, &[0i32, 1, 2, 0, 1, 2]).unwrap(),);
+    }
+
+    #[test]
+    fn test_iota_differentiation() {
+        let context = DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let output_type = ArrayType::new_static(DataType::F32, [2, 3]);
+        let output = context.iota(&output_type, 1).unwrap();
+        assert_eq!(
+            output.primal(),
+            &Array::from_elements(output_type.clone(), &[0.0f32, 1.0, 2.0, 0.0, 1.0, 2.0]).unwrap(),
+        );
+        assert!(matches!(output.tangent(), MaybeZero::Zero(r#type) if r#type == &output_type));
+    }
+
+    #[test]
+    fn test_iota_transposition() {
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let output_cotangent = context.input(ArrayType::new_static(DataType::F64, [2]));
+        let input_cotangents = IotaOperation::new(ArrayType::new_static(DataType::F64, [2]), 0)
+            .unwrap()
+            .transpose(
+                &mut TranspositionContext::new(context),
+                &EmptyRegionDriver,
+                &[],
+                &[MaybeZero::Value(output_cotangent)],
+            )
+            .unwrap();
+        assert!(input_cotangents.is_empty());
     }
 
     #[test]
@@ -445,35 +501,5 @@ mod tests {
             "}
             .trim_end(),
         );
-    }
-
-    #[test]
-    fn test_partial_evaluation_context_iota() {
-        let context = PartialEvaluationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
-        let output_type = ArrayType::new_static(DataType::I32, [2, 3]);
-        let output = context.iota(&output_type, 1).unwrap();
-        let expected = Array::from_elements(output_type, &[0i32, 1, 2, 0, 1, 2]).unwrap();
-        assert_eq!(output.value().unwrap().as_known(), Some(&expected));
-    }
-
-    #[test]
-    fn test_batching_context_iota() {
-        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
-        let output_type = ArrayType::new_static(DataType::I32, [2, 3]);
-        let output = context.iota(&output_type, 1).unwrap();
-        assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
-        assert_eq!(output.batch().value(), &Array::from_elements(output_type, &[0i32, 1, 2, 0, 1, 2]).unwrap(),);
-    }
-
-    #[test]
-    fn test_differentiation_context_iota() {
-        let context = DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
-        let output_type = ArrayType::new_static(DataType::F32, [2, 3]);
-        let output = context.iota(&output_type, 1).unwrap();
-        assert_eq!(
-            output.primal(),
-            &Array::from_elements(output_type.clone(), &[0.0f32, 1.0, 2.0, 0.0, 1.0, 2.0]).unwrap(),
-        );
-        assert!(matches!(output.tangent(), MaybeZero::Zero(r#type) if r#type == &output_type));
     }
 }

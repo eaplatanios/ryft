@@ -19,12 +19,12 @@ use crate::batching::{
 use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    LinearCallOperation, MemberDifferentiableOperation, TransposableOperation, TranspositionContext,
-    TranspositionDriver,
+    MemberDifferentiableOperation, TransposableOperation, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
 use crate::operations::constants::constant::ConstantOperation;
+use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::DynamicBroadcastOperation;
@@ -268,203 +268,6 @@ impl ParallelSumScatterOperation {
     }
 }
 
-impl_shape_changing_collective_member_operation!(
-    ParallelSumScatterOperation,
-    infer_explicit_parallel_sum_scatter_output_types
-);
-
-/// Stages a sum-scatter with first-class dynamic tiled extents and rank-changing untiled semantics.
-pub trait ParallelSumScatter: Sized {
-    /// Sums participants and consumes `scatter_axis`, whose extent must equal the effective participant count.
-    #[inline]
-    fn parallel_sum_scatter(&self, axis_name: &str, scatter_axis: usize) -> Result<Self, ProgramError> {
-        self.parallel_sum_scatter_with_options(axis_name, scatter_axis, CollectiveOptions::default())
-    }
-
-    /// Sums participants and scatters equal chunks along the existing `scatter_axis`.
-    #[inline]
-    fn parallel_sum_scatter_tiled(&self, axis_name: &str, scatter_axis: usize) -> Result<Self, ProgramError> {
-        self.parallel_sum_scatter_with_options(axis_name, scatter_axis, CollectiveOptions::new(CollectiveMode::Tiled))
-    }
-
-    /// Sums and scatters participants using explicit shape and grouping semantics.
-    fn parallel_sum_scatter_with_options(
-        &self,
-        axis_name: &str,
-        scatter_axis: usize,
-        options: CollectiveOptions,
-    ) -> Result<Self, ProgramError>;
-}
-
-impl<V> ParallelSumScatter for V
-where
-    V: Value<Type = ArrayIrType> + DimensionSize<V> + ValueProjection<DimensionType>,
-    V::DispatchDomain: Context<Type = ArrayIrType> + NamedAxes,
-    <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
-    <V::DispatchDomain as Domain>::Operation: From<ParallelSumScatterOperation>,
-    <V as ValueProjection<DimensionType>>::Projected: DimensionRequirement + Div,
-{
-    fn parallel_sum_scatter_with_options(
-        &self,
-        axis_name: &str,
-        scatter_axis: usize,
-        options: CollectiveOptions,
-    ) -> Result<Self, ProgramError> {
-        let context = self.dispatch_domain();
-        let axis_size = resolve_named_axis_size(&context, axis_name)?;
-        let effective_axis_size = options.effective_axis_size(PARALLEL_SUM_SCATTER_OPERATION_NAME, axis_size)?;
-        let operation =
-            ParallelSumScatterOperation::new(axis_name.to_string(), axis_size, scatter_axis, options.clone());
-        let mut output_extents = collective_input_extents(&context, self)?;
-        if scatter_axis >= output_extents.len() {
-            return Err(TypeError::invalid(format!(
-                "`parallel_sum_scatter` scatter axis {scatter_axis} is out of bounds for rank {}",
-                output_extents.len(),
-            ))
-            .into());
-        }
-        match options.mode {
-            CollectiveMode::Untiled => {
-                require_collective_axis_extent(&context, &output_extents[scatter_axis], effective_axis_size)?;
-                output_extents.remove(scatter_axis);
-            }
-            CollectiveMode::Tiled => {
-                output_extents[scatter_axis] =
-                    divided_collective_extent(&context, &output_extents[scatter_axis], effective_axis_size)?;
-            }
-        };
-        let inputs = std::iter::once(self.clone()).chain(output_extents).collect::<Vec<_>>();
-        Ok(context.bind(operation, Vec::new(), inputs.as_slice())?.remove(0))
-    }
-}
-
-impl<V> ParallelSumScatter for ProjectedValue<ArrayType, V>
-where
-    V: ParallelSumScatter + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
-{
-    fn parallel_sum_scatter_with_options(
-        &self,
-        axis_name: &str,
-        scatter_axis: usize,
-        options: CollectiveOptions,
-    ) -> Result<Self, ProgramError> {
-        self.value()
-            .parallel_sum_scatter_with_options(axis_name, scatter_axis, options)?
-            .into_projected()
-            .map_err(Into::into)
-    }
-}
-
-// Mixed array IR JVP for sum-scatter. Explicit output extents are retained as ordinary residual values, and
-// the transposed linear region applies varying all-gather to the output cotangent.
-impl<C> MemberDifferentiableOperation<C> for ParallelSumScatterOperation
-where
-    C: Context<Type = ArrayIrType>,
-    C::Operation: From<AllGatherOperation>
-        + From<DimensionSizeOperation>
-        + From<LinearCallOperation<ArrayIrType>>
-        + From<ParallelSumScatterOperation>
-        + From<ConstantOperation<DimensionValue>>
-        + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
-{
-    fn jvp_in_parent<D: DifferentiationDriver<C>>(
-        &self,
-        context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        jvp_shape_changing_collective_with_adjoint(
-            self,
-            AllGatherOperation::new(
-                self.axis_name().to_string(),
-                self.axis_size(),
-                self.scatter_axis(),
-                self.options().clone(),
-                AllGatherOutputVariance::Varying,
-            ),
-            context,
-            inputs,
-        )
-    }
-}
-
-/// Returns the physical scatter axis and mapped result axis for a forwarded sum-scatter.
-fn forwarded_parallel_sum_scatter_axes(mode: CollectiveMode, scatter_axis: usize, batch_axis: usize) -> (usize, usize) {
-    let physical_scatter_axis = scatter_axis + usize::from(scatter_axis >= batch_axis);
-    let output_batch_axis = match mode {
-        CollectiveMode::Tiled => batch_axis,
-        CollectiveMode::Untiled if scatter_axis < batch_axis => batch_axis - 1,
-        CollectiveMode::Untiled => batch_axis,
-    };
-    (physical_scatter_axis, output_batch_axis)
-}
-
-/// Applies the matching-axis sum-scatter batching semantics over the policy-selected extent representation.
-fn batch_parallel_sum_scatter_matching_axis<C, P>(
-    operation: &ParallelSumScatterOperation,
-    context: &BatchingContext<C, ArrayBatching<P>>,
-    input: &ArrayBatch<C::Value>,
-    logical_input_rank: usize,
-    output_extents: Vec<P::ShapeExtent>,
-    output_sharding: Option<Sharding>,
-) -> Result<ArrayBatch<C::Value>, BatchingError>
-where
-    C: Context<Type = ArrayType>,
-    C::Value: Reduce + Transpose,
-    P: CollectiveBatchingPolicy<C>,
-{
-    if operation.options.axis_index_groups.is_some() {
-        return Err(BatchingError::UnsupportedOperation {
-            message: "`parallel_sum_scatter` axis index groups are not supported when a batch transform binds the \
-                      collective axis"
-                .to_string(),
-        });
-    }
-    if operation.scatter_axis >= logical_input_rank {
-        return Err(BatchingError::UnsupportedOperation {
-            message: format!(
-                "`parallel_sum_scatter` scatter axis {} is out of bounds for rank {logical_input_rank}",
-                operation.scatter_axis,
-            ),
-        });
-    }
-
-    let axis_extent = P::collective_axis_extent(
-        context,
-        PARALLEL_SUM_SCATTER_OPERATION_NAME,
-        &operation.axis_name,
-        operation.axis_size,
-    )?;
-
-    let mut input_extents = output_extents.clone();
-    match operation.options.mode {
-        CollectiveMode::Untiled => input_extents.insert(operation.scatter_axis, axis_extent.clone()),
-        CollectiveMode::Tiled => {
-            input_extents[operation.scatter_axis] = output_extents[operation.scatter_axis].mul(&axis_extent)?;
-        }
-    }
-    let input = P::match_collective_axis(context, input, input_extents.as_slice())?;
-    let summed = input.into_value().reduce(&[0], ReductionKind::Sum);
-    let scattered = match operation.options.mode {
-        CollectiveMode::Untiled => summed.move_axis(operation.scatter_axis, 0)?,
-        CollectiveMode::Tiled => {
-            let mut split_extents = output_extents.clone();
-            split_extents.insert(operation.scatter_axis, axis_extent.clone());
-            P::reshape_collective(context, summed, split_extents.as_slice(), None)?
-                .move_axis(operation.scatter_axis, 0)?
-        }
-    };
-    let mut physical_output_extents = Vec::with_capacity(output_extents.len() + 1);
-    physical_output_extents.push(axis_extent);
-    physical_output_extents.extend(output_extents);
-    let physical_output_sharding = output_sharding
-        .map(|sharding| lift_output_sharding_for_leading_batch_axis(&sharding, context.axis_sharding().clone()))
-        .transpose()?;
-    let output =
-        P::reshape_collective(context, scattered, physical_output_extents.as_slice(), physical_output_sharding)?;
-    ArrayBatch::new(output, BatchAxis::from_position(0))
-}
-
 // Batching rule for [`ParallelSumScatterOperation`]. A matching `batch` level consumes the mapped batch axis by
 // summing over it and re-mapping the chunks of the per-item `scatter_axis` onto it: the sum's `scatter_axis` is split
 // into `(b, d_s / b)` chunks and the new chunk axis becomes the output batch axis, so batch item `i` receives chunk
@@ -524,6 +327,43 @@ where
         .into())
     }
 }
+
+shape_changing_collective!(@differentiation ParallelSumScatterOperation);
+
+// Transpose rule for [`ParallelSumScatterOperation`]. A sum-scatter is the adjoint of a varying all-gather with the
+// same mode, axis, and participant groups, so the operand cotangent is an [`AllGatherOperation`] of the output
+// cotangent.
+impl<V, O> TransposableOperation<V, O> for ParallelSumScatterOperation
+where
+    V: Value<Type = ArrayType>,
+    O: Operation<Type = ArrayType> + From<AllGatherOperation>,
+{
+    fn transpose<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TranspositionContext<'_, V, O>,
+        _driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        transpose_shape_changing_collective(
+            context,
+            inputs,
+            outputs,
+            AllGatherOperation::new(
+                self.axis_name.clone(),
+                self.axis_size,
+                self.scatter_axis,
+                self.options.clone(),
+                AllGatherOutputVariance::Varying,
+            ),
+        )
+    }
+}
+
+impl_shape_changing_collective_member_operation!(
+    ParallelSumScatterOperation,
+    infer_explicit_parallel_sum_scatter_output_types
+);
 
 // Batching rule for explicit-extent [`ParallelSumScatterOperation`]. The explicit result extents remain the only
 // source for dynamic reshape geometry while matching-axis array mechanics reuse the homogeneous collective kernel.
@@ -618,34 +458,196 @@ where
     }
 }
 
-// Transpose rule for [`ParallelSumScatterOperation`]. A sum-scatter is the adjoint of a varying all-gather with the
-// same mode, axis, and participant groups, so the operand cotangent is an [`AllGatherOperation`] of the output
-// cotangent.
-impl<V, O> TransposableOperation<V, O> for ParallelSumScatterOperation
+// Mixed array IR JVP for sum-scatter. Explicit output extents are retained as ordinary residual values, and
+// the transposed linear region applies varying all-gather to the output cotangent.
+impl<C> MemberDifferentiableOperation<C> for ParallelSumScatterOperation
 where
-    V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType> + From<AllGatherOperation>,
+    C: Context<Type = ArrayIrType>,
+    C::Operation: From<AllGatherOperation>
+        + From<DimensionSizeOperation>
+        + From<LinearCallOperation<ArrayIrType>>
+        + From<ParallelSumScatterOperation>
+        + From<ConstantOperation<DimensionValue>>
+        + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
 {
-    fn transpose<D: TranspositionDriver<V, O>>(
+    fn jvp_in_parent<D: DifferentiationDriver<C>>(
         &self,
-        context: &mut TranspositionContext<'_, V, O>,
+        context: &C,
         _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        transpose_shape_changing_collective(
-            context,
-            inputs,
-            outputs,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        jvp_shape_changing_collective_with_adjoint(
+            self,
             AllGatherOperation::new(
-                self.axis_name.clone(),
-                self.axis_size,
-                self.scatter_axis,
-                self.options.clone(),
+                self.axis_name().to_string(),
+                self.axis_size(),
+                self.scatter_axis(),
+                self.options().clone(),
                 AllGatherOutputVariance::Varying,
             ),
+            context,
+            inputs,
         )
     }
+}
+
+/// Stages a sum-scatter with first-class dynamic tiled extents and rank-changing untiled semantics.
+pub trait ParallelSumScatter: Sized {
+    /// Sums participants and consumes `scatter_axis`, whose extent must equal the effective participant count.
+    #[inline]
+    fn parallel_sum_scatter(&self, axis_name: &str, scatter_axis: usize) -> Result<Self, ProgramError> {
+        self.parallel_sum_scatter_with_options(axis_name, scatter_axis, CollectiveOptions::default())
+    }
+
+    /// Sums participants and scatters equal chunks along the existing `scatter_axis`.
+    #[inline]
+    fn parallel_sum_scatter_tiled(&self, axis_name: &str, scatter_axis: usize) -> Result<Self, ProgramError> {
+        self.parallel_sum_scatter_with_options(axis_name, scatter_axis, CollectiveOptions::new(CollectiveMode::Tiled))
+    }
+
+    /// Sums and scatters participants using explicit shape and grouping semantics.
+    fn parallel_sum_scatter_with_options(
+        &self,
+        axis_name: &str,
+        scatter_axis: usize,
+        options: CollectiveOptions,
+    ) -> Result<Self, ProgramError>;
+}
+
+impl<V> ParallelSumScatter for V
+where
+    V: Value<Type = ArrayIrType> + DimensionSize<V> + ValueProjection<DimensionType>,
+    V::DispatchDomain: Context<Type = ArrayIrType> + NamedAxes,
+    <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+    <V::DispatchDomain as Domain>::Operation: From<ParallelSumScatterOperation>,
+    <V as ValueProjection<DimensionType>>::Projected: DimensionRequirement + Div,
+{
+    fn parallel_sum_scatter_with_options(
+        &self,
+        axis_name: &str,
+        scatter_axis: usize,
+        options: CollectiveOptions,
+    ) -> Result<Self, ProgramError> {
+        let context = self.dispatch_domain();
+        let axis_size = resolve_named_axis_size(&context, axis_name)?;
+        let effective_axis_size = options.effective_axis_size(PARALLEL_SUM_SCATTER_OPERATION_NAME, axis_size)?;
+        let operation =
+            ParallelSumScatterOperation::new(axis_name.to_string(), axis_size, scatter_axis, options.clone());
+        let mut output_extents = collective_input_extents(&context, self)?;
+        if scatter_axis >= output_extents.len() {
+            return Err(TypeError::invalid(format!(
+                "`parallel_sum_scatter` scatter axis {scatter_axis} is out of bounds for rank {}",
+                output_extents.len(),
+            ))
+            .into());
+        }
+        match options.mode {
+            CollectiveMode::Untiled => {
+                require_collective_axis_extent(&context, &output_extents[scatter_axis], effective_axis_size)?;
+                output_extents.remove(scatter_axis);
+            }
+            CollectiveMode::Tiled => {
+                output_extents[scatter_axis] =
+                    divided_collective_extent(&context, &output_extents[scatter_axis], effective_axis_size)?;
+            }
+        };
+        let inputs = std::iter::once(self.clone()).chain(output_extents).collect::<Vec<_>>();
+        Ok(context.bind(operation, Vec::new(), inputs.as_slice())?.remove(0))
+    }
+}
+
+impl<V> ParallelSumScatter for ProjectedValue<ArrayType, V>
+where
+    V: ParallelSumScatter + ValueProjection<ArrayType, Projected = ProjectedValue<ArrayType, V>>,
+{
+    fn parallel_sum_scatter_with_options(
+        &self,
+        axis_name: &str,
+        scatter_axis: usize,
+        options: CollectiveOptions,
+    ) -> Result<Self, ProgramError> {
+        self.value()
+            .parallel_sum_scatter_with_options(axis_name, scatter_axis, options)?
+            .into_projected()
+            .map_err(Into::into)
+    }
+}
+
+/// Returns the physical scatter axis and mapped result axis for a forwarded sum-scatter.
+fn forwarded_parallel_sum_scatter_axes(mode: CollectiveMode, scatter_axis: usize, batch_axis: usize) -> (usize, usize) {
+    let physical_scatter_axis = scatter_axis + usize::from(scatter_axis >= batch_axis);
+    let output_batch_axis = match mode {
+        CollectiveMode::Tiled => batch_axis,
+        CollectiveMode::Untiled if scatter_axis < batch_axis => batch_axis - 1,
+        CollectiveMode::Untiled => batch_axis,
+    };
+    (physical_scatter_axis, output_batch_axis)
+}
+
+/// Applies the matching-axis sum-scatter batching semantics over the policy-selected extent representation.
+fn batch_parallel_sum_scatter_matching_axis<C, P>(
+    operation: &ParallelSumScatterOperation,
+    context: &BatchingContext<C, ArrayBatching<P>>,
+    input: &ArrayBatch<C::Value>,
+    logical_input_rank: usize,
+    output_extents: Vec<P::ShapeExtent>,
+    output_sharding: Option<Sharding>,
+) -> Result<ArrayBatch<C::Value>, BatchingError>
+where
+    C: Context<Type = ArrayType>,
+    C::Value: Reduce + Transpose,
+    P: CollectiveBatchingPolicy<C>,
+{
+    if operation.options.axis_index_groups.is_some() {
+        return Err(BatchingError::UnsupportedOperation {
+            message: "`parallel_sum_scatter` axis index groups are not supported when a batch transform binds the \
+                      collective axis"
+                .to_string(),
+        });
+    }
+    if operation.scatter_axis >= logical_input_rank {
+        return Err(BatchingError::UnsupportedOperation {
+            message: format!(
+                "`parallel_sum_scatter` scatter axis {} is out of bounds for rank {logical_input_rank}",
+                operation.scatter_axis,
+            ),
+        });
+    }
+
+    let axis_extent = P::collective_axis_extent(
+        context,
+        PARALLEL_SUM_SCATTER_OPERATION_NAME,
+        &operation.axis_name,
+        operation.axis_size,
+    )?;
+
+    let mut input_extents = output_extents.clone();
+    match operation.options.mode {
+        CollectiveMode::Untiled => input_extents.insert(operation.scatter_axis, axis_extent.clone()),
+        CollectiveMode::Tiled => {
+            input_extents[operation.scatter_axis] = output_extents[operation.scatter_axis].mul(&axis_extent)?;
+        }
+    }
+    let input = P::match_collective_axis(context, input, input_extents.as_slice())?;
+    let summed = input.into_value().reduce(&[0], ReductionKind::Sum);
+    let scattered = match operation.options.mode {
+        CollectiveMode::Untiled => summed.move_axis(operation.scatter_axis, 0)?,
+        CollectiveMode::Tiled => {
+            let mut split_extents = output_extents.clone();
+            split_extents.insert(operation.scatter_axis, axis_extent.clone());
+            P::reshape_collective(context, summed, split_extents.as_slice(), None)?
+                .move_axis(operation.scatter_axis, 0)?
+        }
+    };
+    let mut physical_output_extents = Vec::with_capacity(output_extents.len() + 1);
+    physical_output_extents.push(axis_extent);
+    physical_output_extents.extend(output_extents);
+    let physical_output_sharding = output_sharding
+        .map(|sharding| lift_output_sharding_for_leading_batch_axis(&sharding, context.axis_sharding().clone()))
+        .transpose()?;
+    let output =
+        P::reshape_collective(context, scattered, physical_output_extents.as_slice(), physical_output_sharding)?;
+    ArrayBatch::new(output, BatchAxis::from_position(0))
 }
 
 #[cfg(test)]
@@ -660,29 +662,6 @@ mod tests {
     use crate::operations::collectives::tests::f32_vector;
 
     use super::*;
-
-    #[test]
-    fn test_parallel_sum_scatter_type_inference() {
-        use crate::macros::check_operation_type_inference;
-
-        check_operation_type_inference!(
-            operation = ParallelSumScatterOperation::new("x".to_string(), 4, 0, CollectiveOptions::tiled()),
-            cases = [
-                {
-                    input_types = [f32_vector(8)],
-                    output_types = [f32_vector(2)],
-                },
-                {
-                    input_types = [f32_vector(6)],
-                    error = "`parallel_sum_scatter` scatter axis 0 size 6 is not divisible by group size 4",
-                },
-                {
-                    input_types = [ArrayType::scalar(DataType::F32)],
-                    error = "`parallel_sum_scatter` scatter axis 0 is out of bounds for rank 0",
-                },
-            ],
-        );
-    }
 
     #[test]
     fn test_parallel_sum_scatter_forwarded_axes_account_for_the_mapped_axis() {
@@ -718,6 +697,29 @@ mod tests {
                 message: "`parallel_sum_scatter` does not support bounded ragged dimension `length` on operand 0"
                     .to_string(),
             }),
+        );
+    }
+
+    #[test]
+    fn test_parallel_sum_scatter_type_inference() {
+        use crate::macros::check_operation_type_inference;
+
+        check_operation_type_inference!(
+            operation = ParallelSumScatterOperation::new("x".to_string(), 4, 0, CollectiveOptions::tiled()),
+            cases = [
+                {
+                    input_types = [f32_vector(8)],
+                    output_types = [f32_vector(2)],
+                },
+                {
+                    input_types = [f32_vector(6)],
+                    error = "`parallel_sum_scatter` scatter axis 0 size 6 is not divisible by group size 4",
+                },
+                {
+                    input_types = [ArrayType::scalar(DataType::F32)],
+                    error = "`parallel_sum_scatter` scatter axis 0 is out of bounds for rank 0",
+                },
+            ],
         );
     }
 

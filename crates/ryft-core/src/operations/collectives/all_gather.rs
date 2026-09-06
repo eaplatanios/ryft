@@ -19,12 +19,12 @@ use crate::batching::{
 use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    LinearCallOperation, MemberDifferentiableOperation, TransposableOperation, TranspositionContext,
-    TranspositionDriver,
+    MemberDifferentiableOperation, TransposableOperation, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
 use crate::operations::constants::constant::ConstantOperation;
+use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalarOperation;
 use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
 use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
@@ -307,7 +307,395 @@ impl AllGatherOperation {
     }
 }
 
+// Batching rule for [`AllGatherOperation`]. A matching `batch` level consumes the mapped batch axis by
+// materializing the gather: the batch axis is transposed to sit immediately before the per-item `concat_axis` and
+// merged into it, laying the gathered chunks out item-major (item 0's chunk first), which matches the tiled
+// StableHLO `all_gather` ordering. Every batch item sees the same gathered value, so the output is replicated. A
+// non-matching level forwards the collective untouched to the parent context via [`forward_collective_to_parent`].
+impl<C, P: CollectiveBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for AllGatherOperation
+where
+    C: Context<Type = ArrayType>,
+    C::Operation: From<AllGatherOperation>,
+    <C as Domain>::Value: Transpose,
+{
+    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+        &self,
+        context: &BatchingContext<C, ArrayBatching<P>>,
+        _driver: &D,
+        inputs: &[ArrayBatch<<C as Domain>::Value>],
+    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+        if context.axis_name() != Some(self.axis_name.as_str()) {
+            reject_ragged_collective_inputs(self.name(), inputs)?;
+            let [input] = inputs else {
+                return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
+            };
+            let Some(batch_axis) = input.batch_axis_position() else {
+                return Ok(forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs)?.into());
+            };
+            let (concat_axis, output_batch_axis) =
+                forwarded_all_gather_axes(self.options.mode, self.concat_axis, batch_axis);
+            let operation = Self::new(
+                self.axis_name.clone(),
+                self.axis_size,
+                concat_axis,
+                self.options.clone(),
+                self.output_variance,
+            );
+            return Ok(forward_shape_changing_collective(
+                context,
+                C::Operation::from(operation),
+                input,
+                Some(output_batch_axis),
+            )?
+            .into());
+        }
+        let [input] = inputs else {
+            return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
+        };
+        if self.options.mode == CollectiveMode::Tiled && !input.ragged_axes().is_empty() {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "tiled `all_gather` cannot represent participant-specific bounded ragged extents after the \
+                          participant and concatenation axes are fused"
+                    .to_string(),
+            });
+        }
+        let input_type = if input.ragged_axes().is_empty() {
+            input.unbatched_type()
+        } else {
+            input.value().r#type().unbatched_type(input.batch_axis())?
+        };
+        let mut output_types = self.infer_output_types(std::slice::from_ref(&input_type), &[])?;
+        let output_type = output_types.remove(0);
+        let output_extents = output_type
+            .shape()
+            .dimensions()
+            .iter()
+            .map(|dimension| P::collective_extent_from_dimension(context, dimension))
+            .collect::<Result<Vec<_>, _>>()?;
+        let input_batch_axis = input.batch_axis_position();
+        let ragged_axes = input.ragged_axes().to_vec();
+        let mut output = batch_all_gather_matching_axis::<C, P>(
+            self,
+            context,
+            input,
+            input_type.rank(),
+            output_extents,
+            output_type.sharding().cloned(),
+        )?;
+        if !ragged_axes.is_empty() {
+            let ragged_axes =
+                gathered_ragged_axes::<C, P>(self, context, ragged_axes, input_batch_axis, input_type.rank())?;
+            output = output.with_ragged_axes(ragged_axes)?;
+        }
+        Ok(vec![output].into())
+    }
+}
+
+shape_changing_collective!(@differentiation AllGatherOperation);
+
+// Transpose rule for [`AllGatherOperation`]. A varying all-gather is the adjoint of a sum-scatter with the same
+// mode, axis, and participant groups, so the operand cotangent is a [`ParallelSumScatterOperation`] of the output
+// cotangent. Invariant and reduced variance require the residual-aware composite adjoints because their pullbacks
+// depend on participant-indexed runtime geometry.
+impl<V, O> TransposableOperation<V, O> for AllGatherOperation
+where
+    V: Value<Type = ArrayType>,
+    O: Operation<Type = ArrayType> + From<ParallelSumScatterOperation>,
+{
+    fn transpose<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TranspositionContext<'_, V, O>,
+        _driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        if self.output_variance == AllGatherOutputVariance::Invariant {
+            return Err(ProgramError::UnsupportedOperation {
+                message: "direct transposition of invariant `all_gather` cannot represent the participant-indexed \
+                          slice; linearize so that the current participant can select its gathered chunk"
+                    .to_string(),
+            }
+            .into());
+        }
+        transpose_shape_changing_collective(
+            context,
+            inputs,
+            outputs,
+            ParallelSumScatterOperation::new(
+                self.axis_name.clone(),
+                self.axis_size,
+                self.concat_axis,
+                self.options.clone(),
+            ),
+        )
+    }
+}
+
 impl_shape_changing_collective_member_operation!(AllGatherOperation, infer_explicit_all_gather_output_types);
+
+// Batching rule for explicit-extent [`AllGatherOperation`]. The logical result extents remain ordinary replicated
+// dimension SSA operands; matching-axis batching delegates its array mechanics to the homogeneous collective kernel.
+impl<C> MemberBatchableOperation<C, ArrayIrBatching> for AllGatherOperation
+where
+    C: Context<
+            Type = ArrayIrType,
+            Operation: From<AllGatherOperation>
+                           + From<DynamicBroadcastOperation>
+                           + From<ConstantOperation<DimensionValue>>
+                           + From<DimensionSizeOperation>
+                           + From<DynamicReshapeOperation>
+                           + OperationProjection<ArrayType>,
+        >,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Value:
+        ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>> + ValueProjection<DimensionType>,
+    <C::Value as ValueProjection<DimensionType>>::Projected:
+        DimensionRequirement + Div + Mul + Value<Type = DimensionType>,
+{
+    fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatching>>(
+        &self,
+        context: &BatchingContext<C, ArrayIrBatching>,
+        _driver: &D,
+        inputs: &[ArrayIrBatch<C::Value>],
+    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
+        let (array, output_extents) = explicit_collective_inputs(inputs)?;
+        let logical_input_types = inputs.iter().map(|input| input.unbatched_type().clone()).collect::<Vec<_>>();
+        let mut logical_output_types = infer_explicit_all_gather_output_types(self, logical_input_types.as_slice())?;
+        let logical_output_type = <&ArrayType>::try_from(&logical_output_types.remove(0))?.clone();
+
+        if context.axis_name() != Some(self.axis_name()) {
+            if let Some(ragged_axis) = array.ragged_axes().first() {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "`{}` does not support bounded ragged dimension `{}` on operand 0",
+                        self.name(),
+                        ragged_axis.dimension(),
+                    ),
+                });
+            }
+            validate_explicit_collective_output_extents(output_extents)?;
+            if array.batch_axis().is_replicated() {
+                return Ok(forward_explicit_collective(self.clone(), context, array, output_extents, None)?.into());
+            }
+            let input_batch_axis = array.batch_axis_position().unwrap();
+            let (physical_concat_axis, output_batch_axis) =
+                forwarded_all_gather_axes(self.options().mode(), self.concat_axis(), input_batch_axis);
+            let operation = Self::new(
+                self.axis_name().to_string(),
+                self.axis_size(),
+                physical_concat_axis,
+                self.options().clone(),
+                self.output_variance(),
+            );
+            return Ok(forward_explicit_collective(
+                operation,
+                context,
+                array,
+                output_extents,
+                Some(output_batch_axis),
+            )?
+            .into());
+        }
+
+        if self.options().mode() == CollectiveMode::Tiled && !array.ragged_axes().is_empty() {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "tiled `all_gather` cannot represent participant-specific bounded ragged extents after the \
+                          participant and concatenation axes are fused"
+                    .to_string(),
+            });
+        }
+
+        let input_batch_axis = array.batch_axis_position();
+        let ragged_axes = array
+            .ragged_axes()
+            .iter()
+            .map(|ragged_axis| {
+                let logical_axis =
+                    ragged_axis.axis() - usize::from(input_batch_axis.is_some_and(|axis| axis < ragged_axis.axis()));
+                let output_axis = logical_axis + usize::from(logical_axis >= self.concat_axis());
+                let output_extent = &output_extents[output_axis];
+                let output_extent_type = output_extent.unbatched_type();
+                let output_extent_type = <&DimensionType>::try_from(&output_extent_type)?;
+                if output_extent_type.variable() != ragged_axis.dimension() {
+                    return Err(BatchingError::InvalidBatchMetadata {
+                        message: format!(
+                            "untiled `all_gather` output axis {output_axis} carries dimension `{}` instead of \
+                             bounded ragged dimension `{}`",
+                            output_extent_type.variable(),
+                            ragged_axis.dimension(),
+                        ),
+                    });
+                }
+                let extents = if let Some(input_batch_axis) = input_batch_axis {
+                    let Some(extents) = output_extent.mapped_dimension_extents() else {
+                        return Err(BatchingError::InvalidBatchMetadata {
+                            message: format!(
+                                "untiled `all_gather` output axis {output_axis} must carry mapped extents for bounded \
+                                 ragged dimension `{}`",
+                                ragged_axis.dimension(),
+                            ),
+                        });
+                    };
+                    let expected_extent_axis = ragged_axis
+                        .extent_axes()
+                        .iter()
+                        .position(|axis| *axis == input_batch_axis)
+                        .map(BatchAxis::from_position)
+                        .ok_or_else(|| BatchingError::InvalidBatchMetadata {
+                            message: format!(
+                                "bounded ragged dimension `{}` does not carry extents for the mapped input axis",
+                                ragged_axis.dimension(),
+                            ),
+                        })?;
+                    if output_extent.batch_axis() != expected_extent_axis {
+                        return Err(BatchingError::InvalidBatchMetadata {
+                            message: format!(
+                                "untiled `all_gather` output axis {output_axis} maps bounded ragged extents on {} \
+                                 instead of {expected_extent_axis}",
+                                output_extent.batch_axis(),
+                            ),
+                        });
+                    }
+                    extents.clone()
+                } else {
+                    output_extent.validate_replicated_dimension()?;
+                    if !ragged_axis.extent_axes().is_empty() {
+                        return Err(BatchingError::InvalidBatchMetadata {
+                            message: format!(
+                                "replicated bounded ragged dimension `{}` must carry scalar extents",
+                                ragged_axis.dimension(),
+                            ),
+                        });
+                    }
+                    ragged_axis.extents().clone()
+                };
+                // The packed capacity comes from the operand axis. A dimension variable's exclusive upper bound
+                // only constrains logical extents and may be looser than that physical capacity.
+                let physical_extent = folded_array_dimension(context.parent(), array.value(), ragged_axis.axis())?;
+                Ok((
+                    output_axis,
+                    physical_extent,
+                    RaggedAxis::new(
+                        ragged_axis.axis(),
+                        <C::Value as ValueProjection<ArrayType>>::into_projected(extents)?,
+                        ragged_axis.dimension().clone(),
+                        ragged_axis.extent_axes().to_vec(),
+                    ),
+                ))
+            })
+            .collect::<Result<Vec<_>, BatchingError>>()?;
+        let array = ArrayBatch::new(
+            <C::Value as ValueProjection<ArrayType>>::into_projected(array.value().clone())?,
+            array.batch_axis(),
+        )?;
+        let input_rank = array.unbatched_type().rank();
+        let projected_context = BatchingContext::<_, ArrayBatching<DynamicArrayBatchingPolicy>>::with_policy(
+            ProjectedContext::new(context.parent().clone()),
+            context.axis_extent().clone(),
+        )
+        .with_axis_name(context.axis_name().map(str::to_string))
+        .with_axis_sharding(context.axis_sharding().clone());
+        let output_extents = output_extents
+            .iter()
+            .enumerate()
+            .map(|(axis, extent)| {
+                if let Some((_, physical_extent, _)) =
+                    ragged_axes.iter().find(|(ragged_output_axis, _, _)| *ragged_output_axis == axis)
+                {
+                    return Ok(<C::Value as ValueProjection<DimensionType>>::into_projected(physical_extent.clone())?);
+                }
+                if extent.mapped_dimension_extents().is_some() {
+                    let extent_type = extent.unbatched_type();
+                    let extent_type = <&DimensionType>::try_from(&extent_type)?;
+                    return Err(BatchingError::InvalidBatchMetadata {
+                        message: format!(
+                            "untiled `all_gather` output axis {axis} has mapped dimension `{}` without a matching \
+                             bounded ragged input axis",
+                            extent_type.variable(),
+                        ),
+                    });
+                }
+                extent.validate_replicated_dimension()?;
+                Ok(<C::Value as ValueProjection<DimensionType>>::into_projected(extent.value().clone())?)
+            })
+            .collect::<Result<Vec<_>, BatchingError>>()?;
+        let ragged_axes = ragged_axes.into_iter().map(|(_, _, ragged_axis)| ragged_axis).collect::<Vec<_>>();
+        let mut output = batch_all_gather_matching_axis::<_, DynamicArrayBatchingPolicy>(
+            self,
+            &projected_context,
+            &array,
+            input_rank,
+            output_extents,
+            logical_output_type.sharding().cloned(),
+        )?;
+        if !ragged_axes.is_empty() {
+            let ragged_axes = gathered_ragged_axes::<_, DynamicArrayBatchingPolicy>(
+                self,
+                &projected_context,
+                ragged_axes,
+                input_batch_axis,
+                input_rank,
+            )?;
+            output = output.with_ragged_axes(ragged_axes)?;
+        }
+        let ragged_axes = output
+            .ragged_axes()
+            .iter()
+            .map(|ragged_axis| {
+                RaggedAxis::new(
+                    ragged_axis.axis(),
+                    <C::Value as ValueProjection<ArrayType>>::from_projected(ragged_axis.extents().clone()),
+                    ragged_axis.dimension().clone(),
+                    ragged_axis.extent_axes().to_vec(),
+                )
+            })
+            .collect();
+        let output =
+            ArrayIrBatch::replicated(<C::Value as ValueProjection<ArrayType>>::from_projected(output.into_value()))
+                .with_ragged_axes(ragged_axes)?;
+        Ok(vec![output].into())
+    }
+}
+
+// Mixed array IR JVP for all-gather. Explicit output extents are retained as ordinary residual values, and an
+// invariant result uses participant-indexed slicing in its transposed linear region.
+impl<C> MemberDifferentiableOperation<C> for AllGatherOperation
+where
+    C: Context<Type = ArrayIrType>,
+    C::Operation: From<AllGatherOperation>
+        + From<DimensionFromScalarOperation>
+        + From<DimensionSizeOperation>
+        + From<DynamicShapeSliceOperation>
+        + From<LinearCallOperation<ArrayIrType>>
+        + From<ParallelSumScatterOperation>
+        + From<DynamicReshapeOperation>
+        + From<ConstantOperation<DimensionValue>>
+        + OperationProjection<ArrayType>
+        + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
+    <C::Operation as OperationProjection<ArrayType>>::Projected: From<AxisIndexOperation>,
+{
+    fn jvp_in_parent<D: DifferentiationDriver<C>>(
+        &self,
+        context: &C,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        if self.output_variance() == AllGatherOutputVariance::Invariant {
+            return jvp_invariant_all_gather(self, context, inputs);
+        }
+        jvp_shape_changing_collective_with_adjoint(
+            self,
+            ParallelSumScatterOperation::new(
+                self.axis_name().to_string(),
+                self.axis_size(),
+                self.concat_axis(),
+                self.options().clone(),
+            ),
+            context,
+            inputs,
+        )
+    }
+}
 
 /// Stages an all-gather with first-class dynamic tiled extents and rank-changing untiled semantics.
 pub trait AllGather: Sized {
@@ -551,46 +939,6 @@ where
     Ok(vec![DifferentiationDual::new(primal, tangent)?])
 }
 
-// Mixed array IR JVP for all-gather. Explicit output extents are retained as ordinary residual values, and an
-// invariant result uses participant-indexed slicing in its transposed linear region.
-impl<C> MemberDifferentiableOperation<C> for AllGatherOperation
-where
-    C: Context<Type = ArrayIrType>,
-    C::Operation: From<AllGatherOperation>
-        + From<DimensionFromScalarOperation>
-        + From<DimensionSizeOperation>
-        + From<DynamicShapeSliceOperation>
-        + From<LinearCallOperation<ArrayIrType>>
-        + From<ParallelSumScatterOperation>
-        + From<DynamicReshapeOperation>
-        + From<ConstantOperation<DimensionValue>>
-        + OperationProjection<ArrayType>
-        + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
-    <C::Operation as OperationProjection<ArrayType>>::Projected: From<AxisIndexOperation>,
-{
-    fn jvp_in_parent<D: DifferentiationDriver<C>>(
-        &self,
-        context: &C,
-        _driver: &D,
-        inputs: &[DifferentiationDual<C::Value>],
-    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        if self.output_variance() == AllGatherOutputVariance::Invariant {
-            return jvp_invariant_all_gather(self, context, inputs);
-        }
-        jvp_shape_changing_collective_with_adjoint(
-            self,
-            ParallelSumScatterOperation::new(
-                self.axis_name().to_string(),
-                self.axis_size(),
-                self.concat_axis(),
-                self.options().clone(),
-            ),
-            context,
-            inputs,
-        )
-    }
-}
-
 /// Returns the physical concat axis and mapped result axis for a forwarded all-gather.
 fn forwarded_all_gather_axes(mode: CollectiveMode, concat_axis: usize, batch_axis: usize) -> (usize, usize) {
     match mode {
@@ -702,352 +1050,6 @@ where
         .collect()
 }
 
-// Batching rule for [`AllGatherOperation`]. A matching `batch` level consumes the mapped batch axis by
-// materializing the gather: the batch axis is transposed to sit immediately before the per-item `concat_axis` and
-// merged into it, laying the gathered chunks out item-major (item 0's chunk first), which matches the tiled
-// StableHLO `all_gather` ordering. Every batch item sees the same gathered value, so the output is replicated. A
-// non-matching level forwards the collective untouched to the parent context via [`forward_collective_to_parent`].
-impl<C, P: CollectiveBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for AllGatherOperation
-where
-    C: Context<Type = ArrayType>,
-    C::Operation: From<AllGatherOperation>,
-    <C as Domain>::Value: Transpose,
-{
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
-        &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
-        _driver: &D,
-        inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
-        if context.axis_name() != Some(self.axis_name.as_str()) {
-            reject_ragged_collective_inputs(self.name(), inputs)?;
-            let [input] = inputs else {
-                return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
-            };
-            let Some(batch_axis) = input.batch_axis_position() else {
-                return Ok(forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs)?.into());
-            };
-            let (concat_axis, output_batch_axis) =
-                forwarded_all_gather_axes(self.options.mode, self.concat_axis, batch_axis);
-            let operation = Self::new(
-                self.axis_name.clone(),
-                self.axis_size,
-                concat_axis,
-                self.options.clone(),
-                self.output_variance,
-            );
-            return Ok(forward_shape_changing_collective(
-                context,
-                C::Operation::from(operation),
-                input,
-                Some(output_batch_axis),
-            )?
-            .into());
-        }
-        let [input] = inputs else {
-            return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
-        };
-        if self.options.mode == CollectiveMode::Tiled && !input.ragged_axes().is_empty() {
-            return Err(BatchingError::UnsupportedOperation {
-                message: "tiled `all_gather` cannot represent participant-specific bounded ragged extents after the \
-                          participant and concatenation axes are fused"
-                    .to_string(),
-            });
-        }
-        let input_type = if input.ragged_axes().is_empty() {
-            input.unbatched_type()
-        } else {
-            input.value().r#type().unbatched_type(input.batch_axis())?
-        };
-        let mut output_types = self.infer_output_types(std::slice::from_ref(&input_type), &[])?;
-        let output_type = output_types.remove(0);
-        let output_extents = output_type
-            .shape()
-            .dimensions()
-            .iter()
-            .map(|dimension| P::collective_extent_from_dimension(context, dimension))
-            .collect::<Result<Vec<_>, _>>()?;
-        let input_batch_axis = input.batch_axis_position();
-        let ragged_axes = input.ragged_axes().to_vec();
-        let mut output = batch_all_gather_matching_axis::<C, P>(
-            self,
-            context,
-            input,
-            input_type.rank(),
-            output_extents,
-            output_type.sharding().cloned(),
-        )?;
-        if !ragged_axes.is_empty() {
-            let ragged_axes =
-                gathered_ragged_axes::<C, P>(self, context, ragged_axes, input_batch_axis, input_type.rank())?;
-            output = output.with_ragged_axes(ragged_axes)?;
-        }
-        Ok(vec![output].into())
-    }
-}
-
-// Batching rule for explicit-extent [`AllGatherOperation`]. The logical result extents remain ordinary replicated
-// dimension SSA operands; matching-axis batching delegates its array mechanics to the homogeneous collective kernel.
-impl<C> MemberBatchableOperation<C, ArrayIrBatching> for AllGatherOperation
-where
-    C: Context<
-            Type = ArrayIrType,
-            Operation: From<AllGatherOperation>
-                           + From<DynamicBroadcastOperation>
-                           + From<ConstantOperation<DimensionValue>>
-                           + From<DimensionSizeOperation>
-                           + From<DynamicReshapeOperation>
-                           + OperationProjection<ArrayType>,
-        >,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value:
-        ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>> + ValueProjection<DimensionType>,
-    <C::Value as ValueProjection<DimensionType>>::Projected:
-        DimensionRequirement + Div + Mul + Value<Type = DimensionType>,
-{
-    fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatching>>(
-        &self,
-        context: &BatchingContext<C, ArrayIrBatching>,
-        _driver: &D,
-        inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
-        let (array, output_extents) = explicit_collective_inputs(inputs)?;
-        let logical_input_types = inputs.iter().map(|input| input.unbatched_type().clone()).collect::<Vec<_>>();
-        let mut logical_output_types = infer_explicit_all_gather_output_types(self, logical_input_types.as_slice())?;
-        let logical_output_type = <&ArrayType>::try_from(&logical_output_types.remove(0))?.clone();
-
-        if context.axis_name() != Some(self.axis_name()) {
-            if let Some(ragged_axis) = array.ragged_axes().first() {
-                return Err(BatchingError::UnsupportedOperation {
-                    message: format!(
-                        "`{}` does not support bounded ragged dimension `{}` on operand 0",
-                        self.name(),
-                        ragged_axis.dimension(),
-                    ),
-                });
-            }
-            validate_explicit_collective_output_extents(output_extents)?;
-            if array.batch_axis().is_replicated() {
-                return Ok(forward_explicit_collective(self.clone(), context, array, output_extents, None)?.into());
-            }
-            let input_batch_axis = array.batch_axis_position().unwrap();
-            let (physical_concat_axis, output_batch_axis) =
-                forwarded_all_gather_axes(self.options().mode(), self.concat_axis(), input_batch_axis);
-            let operation = Self::new(
-                self.axis_name().to_string(),
-                self.axis_size(),
-                physical_concat_axis,
-                self.options().clone(),
-                self.output_variance(),
-            );
-            return Ok(forward_explicit_collective(
-                operation,
-                context,
-                array,
-                output_extents,
-                Some(output_batch_axis),
-            )?
-            .into());
-        }
-
-        if self.options().mode() == CollectiveMode::Tiled && !array.ragged_axes().is_empty() {
-            return Err(BatchingError::UnsupportedOperation {
-                message: "tiled `all_gather` cannot represent participant-specific bounded ragged extents after the \
-                          participant and concatenation axes are fused"
-                    .to_string(),
-            });
-        }
-
-        let input_batch_axis = array.batch_axis_position();
-        let ragged_axes = array
-            .ragged_axes()
-            .iter()
-            .map(|ragged_axis| {
-                let logical_axis =
-                    ragged_axis.axis() - usize::from(input_batch_axis.is_some_and(|axis| axis < ragged_axis.axis()));
-                let output_axis = logical_axis + usize::from(logical_axis >= self.concat_axis());
-                let output_extent = &output_extents[output_axis];
-                let output_extent_type = output_extent.unbatched_type();
-                let output_extent_type = <&DimensionType>::try_from(&output_extent_type)?;
-                if output_extent_type.variable() != ragged_axis.dimension() {
-                    return Err(BatchingError::InvalidBatchMetadata {
-                        message: format!(
-                            "untiled `all_gather` output axis {output_axis} carries dimension `{}` instead of \
-                             bounded ragged dimension `{}`",
-                            output_extent_type.variable(),
-                            ragged_axis.dimension(),
-                        ),
-                    });
-                }
-                let extents = if let Some(input_batch_axis) = input_batch_axis {
-                    let Some(extents) = output_extent.mapped_dimension_extents() else {
-                        return Err(BatchingError::InvalidBatchMetadata {
-                            message: format!(
-                                "untiled `all_gather` output axis {output_axis} must carry mapped extents for bounded \
-                                 ragged dimension `{}`",
-                                ragged_axis.dimension(),
-                            ),
-                        });
-                    };
-                    let expected_extent_axis = ragged_axis
-                        .extent_axes()
-                        .iter()
-                        .position(|axis| *axis == input_batch_axis)
-                        .map(BatchAxis::from_position)
-                        .ok_or_else(|| BatchingError::InvalidBatchMetadata {
-                            message: format!(
-                                "bounded ragged dimension `{}` does not carry extents for the mapped input axis",
-                                ragged_axis.dimension(),
-                            ),
-                        })?;
-                    if output_extent.batch_axis() != expected_extent_axis {
-                        return Err(BatchingError::InvalidBatchMetadata {
-                            message: format!(
-                                "untiled `all_gather` output axis {output_axis} maps bounded ragged extents on {} \
-                                 instead of {expected_extent_axis}",
-                                output_extent.batch_axis(),
-                            ),
-                        });
-                    }
-                    extents.clone()
-                } else {
-                    output_extent.validate_replicated_dimension()?;
-                    if !ragged_axis.extent_axes().is_empty() {
-                        return Err(BatchingError::InvalidBatchMetadata {
-                            message: format!(
-                                "replicated bounded ragged dimension `{}` must carry scalar extents",
-                                ragged_axis.dimension(),
-                            ),
-                        });
-                    }
-                    ragged_axis.extents().clone()
-                };
-                // The packed capacity comes from the operand axis. A dimension variable's exclusive upper bound
-                // only constrains logical extents and may be looser than that physical capacity.
-                let physical_extent = folded_array_dimension(context.parent(), array.value(), ragged_axis.axis())?;
-                Ok((
-                    output_axis,
-                    physical_extent,
-                    RaggedAxis::new(
-                        ragged_axis.axis(),
-                        <C::Value as ValueProjection<ArrayType>>::into_projected(extents)?,
-                        ragged_axis.dimension().clone(),
-                        ragged_axis.extent_axes().to_vec(),
-                    ),
-                ))
-            })
-            .collect::<Result<Vec<_>, BatchingError>>()?;
-        let array = ArrayBatch::new(
-            <C::Value as ValueProjection<ArrayType>>::into_projected(array.value().clone())?,
-            array.batch_axis(),
-        )?;
-        let input_rank = array.unbatched_type().rank();
-        let projected_context = BatchingContext::<_, ArrayBatching<DynamicArrayBatchingPolicy>>::with_policy(
-            ProjectedContext::new(context.parent().clone()),
-            context.axis_extent().clone(),
-        )
-        .with_axis_name(context.axis_name().map(str::to_string))
-        .with_axis_sharding(context.axis_sharding().clone());
-        let output_extents = output_extents
-            .iter()
-            .enumerate()
-            .map(|(axis, extent)| {
-                if let Some((_, physical_extent, _)) =
-                    ragged_axes.iter().find(|(ragged_output_axis, _, _)| *ragged_output_axis == axis)
-                {
-                    return Ok(<C::Value as ValueProjection<DimensionType>>::into_projected(physical_extent.clone())?);
-                }
-                if extent.mapped_dimension_extents().is_some() {
-                    let extent_type = extent.unbatched_type();
-                    let extent_type = <&DimensionType>::try_from(&extent_type)?;
-                    return Err(BatchingError::InvalidBatchMetadata {
-                        message: format!(
-                            "untiled `all_gather` output axis {axis} has mapped dimension `{}` without a matching \
-                             bounded ragged input axis",
-                            extent_type.variable(),
-                        ),
-                    });
-                }
-                extent.validate_replicated_dimension()?;
-                Ok(<C::Value as ValueProjection<DimensionType>>::into_projected(extent.value().clone())?)
-            })
-            .collect::<Result<Vec<_>, BatchingError>>()?;
-        let ragged_axes = ragged_axes.into_iter().map(|(_, _, ragged_axis)| ragged_axis).collect::<Vec<_>>();
-        let mut output = batch_all_gather_matching_axis::<_, DynamicArrayBatchingPolicy>(
-            self,
-            &projected_context,
-            &array,
-            input_rank,
-            output_extents,
-            logical_output_type.sharding().cloned(),
-        )?;
-        if !ragged_axes.is_empty() {
-            let ragged_axes = gathered_ragged_axes::<_, DynamicArrayBatchingPolicy>(
-                self,
-                &projected_context,
-                ragged_axes,
-                input_batch_axis,
-                input_rank,
-            )?;
-            output = output.with_ragged_axes(ragged_axes)?;
-        }
-        let ragged_axes = output
-            .ragged_axes()
-            .iter()
-            .map(|ragged_axis| {
-                RaggedAxis::new(
-                    ragged_axis.axis(),
-                    <C::Value as ValueProjection<ArrayType>>::from_projected(ragged_axis.extents().clone()),
-                    ragged_axis.dimension().clone(),
-                    ragged_axis.extent_axes().to_vec(),
-                )
-            })
-            .collect();
-        let output =
-            ArrayIrBatch::replicated(<C::Value as ValueProjection<ArrayType>>::from_projected(output.into_value()))
-                .with_ragged_axes(ragged_axes)?;
-        Ok(vec![output].into())
-    }
-}
-
-// Transpose rule for [`AllGatherOperation`]. A varying all-gather is the adjoint of a sum-scatter with the same
-// mode, axis, and participant groups, so the operand cotangent is a [`ParallelSumScatterOperation`] of the output
-// cotangent. Invariant and reduced variance require the residual-aware composite adjoints because their pullbacks
-// depend on participant-indexed runtime geometry.
-impl<V, O> TransposableOperation<V, O> for AllGatherOperation
-where
-    V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType> + From<ParallelSumScatterOperation>,
-{
-    fn transpose<D: TranspositionDriver<V, O>>(
-        &self,
-        context: &mut TranspositionContext<'_, V, O>,
-        _driver: &D,
-        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        if self.output_variance == AllGatherOutputVariance::Invariant {
-            return Err(ProgramError::UnsupportedOperation {
-                message: "direct transposition of invariant `all_gather` cannot represent the participant-indexed \
-                          slice; linearize so that the current participant can select its gathered chunk"
-                    .to_string(),
-            }
-            .into());
-        }
-        transpose_shape_changing_collective(
-            context,
-            inputs,
-            outputs,
-            ParallelSumScatterOperation::new(
-                self.axis_name.clone(),
-                self.axis_size,
-                self.concat_axis,
-                self.options.clone(),
-            ),
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use pretty_assertions::assert_eq;
@@ -1108,112 +1110,6 @@ mod tests {
     }
 
     #[test]
-    fn test_all_gather_type_inference() {
-        use crate::macros::check_operation_type_inference;
-
-        let operation = AllGatherOperation::new(
-            "x".to_string(),
-            4,
-            0,
-            CollectiveOptions::tiled(),
-            AllGatherOutputVariance::Varying,
-        );
-        assert_eq!(operation.axis_name(), "x");
-        assert_eq!(operation.axis_size(), 4);
-        assert_eq!(operation.concat_axis(), 0);
-        assert_eq!(operation.name(), ALL_GATHER_OPERATION_NAME);
-        assert_eq!(
-            operation.to_string(),
-            indoc::indoc! {r#"
-                all_gather [
-                    axis_name="x",
-                    axis_size=4,
-                    concat_axis=0,
-                    options=Tiled,
-                    output_variance=Varying,
-                ]
-            "#}
-            .trim_end(),
-        );
-        check_operation_type_inference!(
-            operation = operation,
-            cases = [
-                {
-                    input_types = [f32_vector(2)],
-                    output_types = [f32_vector(8)],
-                },
-                {
-                    input_types = [ArrayType::scalar(DataType::F32)],
-                    error = "`all_gather` concat axis 0 is out of bounds for rank 0",
-                },
-                {
-                    input_types = [ArrayType::new(
-                        DataType::F32,
-                        Shape::new(vec![Dimension::Dynamic(
-                            DimensionVariable::new("dynamic", DimensionBounds::unbounded()),
-                        )]),
-                    )],
-                    error = "`all_gather` does not support dynamically shaped operands",
-                },
-            ],
-        );
-        check_operation_type_inference!(
-            @reject @unreduced,
-            operation = AllGatherOperation::new(
-                "x".to_string(),
-                4,
-                0,
-                CollectiveOptions::tiled(),
-                AllGatherOutputVariance::Varying,
-            ),
-            input_types = [f32_vector(2)],
-        );
-    }
-
-    #[test]
-    fn test_all_gather_interpretation_requires_an_enclosing_binder() {
-        use crate::interpretation::InterpretableOperation;
-
-        // A single-participant axis is degenerate: the gather concatenates exactly one operand, so interpretation is
-        // the identity.
-        let outputs = AllGatherOperation::new(
-            "x".to_string(),
-            1,
-            0,
-            CollectiveOptions::tiled(),
-            AllGatherOutputVariance::Varying,
-        )
-        .interpret(
-            &EagerContext::<Array, ArrayOperation<Array>>::new(),
-            &crate::EmptyRegionDriver,
-            &[Array::vector(vec![1.0, 2.0])],
-        )
-        .unwrap();
-        assert_eq!(outputs.len(), 1);
-        assert_eq!(outputs[0].to_f64s(), vec![1.0, 2.0]);
-
-        // Any larger axis has no per-item semantics: the other participants do not exist outside an enclosing binder.
-        let error = AllGatherOperation::new(
-            "x".to_string(),
-            2,
-            0,
-            CollectiveOptions::tiled(),
-            AllGatherOutputVariance::Varying,
-        )
-        .interpret(
-            &EagerContext::<Array, ArrayOperation<Array>>::new(),
-            &crate::EmptyRegionDriver,
-            &[Array::vector(vec![1.0, 2.0])],
-        )
-        .unwrap_err();
-        assert!(matches!(
-            error,
-            ProgramError::UnsupportedOperation { message }
-                if message == "cannot interpret `all_gather` over axis `x` of size 2 without an enclosing binder",
-        ));
-    }
-
-    #[test]
     fn test_all_gather_over_unbound_axis_is_rejected() {
         use crate::batching::BatchingTracer;
 
@@ -1238,34 +1134,6 @@ mod tests {
         assert_eq!(forwarded_all_gather_axes(CollectiveMode::Tiled, 0, 1), (0, 1));
         assert_eq!(forwarded_all_gather_axes(CollectiveMode::Untiled, 0, 0), (0, 1));
         assert_eq!(forwarded_all_gather_axes(CollectiveMode::Untiled, 1, 0), (2, 0));
-    }
-
-    #[test]
-    fn test_all_gather_over_batched_axis_materializes_the_gather() {
-        use crate::batching::BatchingTracer;
-
-        // The batch binds the axis `"x"` that the `all_gather` names, so the matching batching rule consumes the
-        // mapped axis: every item receives the item-major concatenation of all items along `concat_axis`,
-        // replicated across the batch. With items `[1, 2]` and `[3, 4]` the gathered value is `[1, 2, 3, 4]`,
-        // matching the verified cross-device `shard_map` execution semantics of the tiled StableHLO `all_gather`.
-        let output: ArrayIrValue<Array> = batch(
-            |item: BatchingTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>, ArrayIrBatching>| {
-                item.all_gather_tiled("x", 0)
-            },
-            ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
-            BatchAxis::new(0),
-            BatchAxis::replicated(),
-            BatchAxisSpecification::named("x"),
-        )
-        .unwrap();
-        assert_eq!(
-            output.r#type().into_owned(),
-            ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4)]))),
-        );
-        let ArrayIrValue::Array(output) = output else {
-            panic!("`all_gather` must preserve the array member kind");
-        };
-        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0, 4.0]);
     }
 
     #[test]
@@ -1544,5 +1412,139 @@ mod tests {
         let pullback = program.transpose_with_respect_to(&[0]).unwrap();
         assert!(matches!(pullback.instructions()[0].operation(), ArrayOperation::ParallelSumScatter(_)));
         assert_eq!(pullback.output_types(), vec![input_type.cotangent().unwrap()]);
+    }
+
+    #[test]
+    fn test_all_gather_type_inference() {
+        use crate::macros::check_operation_type_inference;
+
+        let operation = AllGatherOperation::new(
+            "x".to_string(),
+            4,
+            0,
+            CollectiveOptions::tiled(),
+            AllGatherOutputVariance::Varying,
+        );
+        assert_eq!(operation.axis_name(), "x");
+        assert_eq!(operation.axis_size(), 4);
+        assert_eq!(operation.concat_axis(), 0);
+        assert_eq!(operation.name(), ALL_GATHER_OPERATION_NAME);
+        assert_eq!(
+            operation.to_string(),
+            indoc::indoc! {r#"
+                all_gather [
+                    axis_name="x",
+                    axis_size=4,
+                    concat_axis=0,
+                    options=Tiled,
+                    output_variance=Varying,
+                ]
+            "#}
+            .trim_end(),
+        );
+        check_operation_type_inference!(
+            operation = operation,
+            cases = [
+                {
+                    input_types = [f32_vector(2)],
+                    output_types = [f32_vector(8)],
+                },
+                {
+                    input_types = [ArrayType::scalar(DataType::F32)],
+                    error = "`all_gather` concat axis 0 is out of bounds for rank 0",
+                },
+                {
+                    input_types = [ArrayType::new(
+                        DataType::F32,
+                        Shape::new(vec![Dimension::Dynamic(
+                            DimensionVariable::new("dynamic", DimensionBounds::unbounded()),
+                        )]),
+                    )],
+                    error = "`all_gather` does not support dynamically shaped operands",
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            @reject @unreduced,
+            operation = AllGatherOperation::new(
+                "x".to_string(),
+                4,
+                0,
+                CollectiveOptions::tiled(),
+                AllGatherOutputVariance::Varying,
+            ),
+            input_types = [f32_vector(2)],
+        );
+    }
+
+    #[test]
+    fn test_all_gather_interpretation_requires_an_enclosing_binder() {
+        use crate::interpretation::InterpretableOperation;
+
+        // A single-participant axis is degenerate: the gather concatenates exactly one operand, so interpretation is
+        // the identity.
+        let outputs = AllGatherOperation::new(
+            "x".to_string(),
+            1,
+            0,
+            CollectiveOptions::tiled(),
+            AllGatherOutputVariance::Varying,
+        )
+        .interpret(
+            &EagerContext::<Array, ArrayOperation<Array>>::new(),
+            &crate::EmptyRegionDriver,
+            &[Array::vector(vec![1.0, 2.0])],
+        )
+        .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].to_f64s(), vec![1.0, 2.0]);
+
+        // Any larger axis has no per-item semantics: the other participants do not exist outside an enclosing binder.
+        let error = AllGatherOperation::new(
+            "x".to_string(),
+            2,
+            0,
+            CollectiveOptions::tiled(),
+            AllGatherOutputVariance::Varying,
+        )
+        .interpret(
+            &EagerContext::<Array, ArrayOperation<Array>>::new(),
+            &crate::EmptyRegionDriver,
+            &[Array::vector(vec![1.0, 2.0])],
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ProgramError::UnsupportedOperation { message }
+                if message == "cannot interpret `all_gather` over axis `x` of size 2 without an enclosing binder",
+        ));
+    }
+
+    #[test]
+    fn test_all_gather_over_batched_axis_materializes_the_gather() {
+        use crate::batching::BatchingTracer;
+
+        // The batch binds the axis `"x"` that the `all_gather` names, so the matching batching rule consumes the
+        // mapped axis: every item receives the item-major concatenation of all items along `concat_axis`,
+        // replicated across the batch. With items `[1, 2]` and `[3, 4]` the gathered value is `[1, 2, 3, 4]`,
+        // matching the verified cross-device `shard_map` execution semantics of the tiled StableHLO `all_gather`.
+        let output: ArrayIrValue<Array> = batch(
+            |item: BatchingTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>, ArrayIrBatching>| {
+                item.all_gather_tiled("x", 0)
+            },
+            ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
+            BatchAxis::new(0),
+            BatchAxis::replicated(),
+            BatchAxisSpecification::named("x"),
+        )
+        .unwrap();
+        assert_eq!(
+            output.r#type().into_owned(),
+            ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4)]))),
+        );
+        let ArrayIrValue::Array(output) = output else {
+            panic!("`all_gather` must preserve the array member kind");
+        };
+        assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0, 4.0]);
     }
 }

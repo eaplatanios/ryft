@@ -230,6 +230,38 @@ mod tests {
 
     #[test]
     fn test_erf() {
+        assert_eq!(ErfOperation::<ArrayType>::new().to_string(), "erf");
+    }
+
+    #[test]
+    fn test_erf_type_inference() {
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = ErfOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::F64],
+                    output_data_types = [DataType::F64],
+                },
+                {
+                    input_data_types = [DataType::C64],
+                    error = "`erf` does not support input data type c64",
+                },
+                {
+                    input_data_types = [DataType::I32],
+                    error = "`erf` does not support input data type i32",
+                },
+            ],
+        );
+        check_operation_type_inference!(
+            @reject @unreduced,
+            operation = ErfOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_erf_interpretation() {
         // Exact fixed points and symmetry.
         assert_eq!(Array::scalar(0.0f64).erf().unwrap(), Array::scalar(0.0f64));
         assert_eq!(Array::scalar(f64::INFINITY).erf().unwrap(), Array::scalar(1.0f64));
@@ -258,29 +290,11 @@ mod tests {
     }
 
     #[test]
-    fn test_erf_type_inference() {
-        check_operation_type_inference!(
-            @elementwise @unary,
-            operation = ErfOperation,
-            cases = [
-                {
-                    input_data_types = [DataType::F64],
-                    output_data_types = [DataType::F64],
-                },
-                {
-                    input_data_types = [DataType::C64],
-                    error = "`erf` does not support input data type c64",
-                },
-                {
-                    input_data_types = [DataType::I32],
-                    error = "`erf` does not support input data type i32",
-                },
-            ],
-        );
-        check_operation_type_inference!(
-            @reject @unreduced,
-            operation = ErfOperation::<ArrayType>::new(),
-            input_types = [ArrayType::scalar(DataType::F64)],
+    fn test_erf_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = ErfOperation::new(),
+            inputs = [Array::scalar(0.5)],
+            expected = Array::scalar(ERF_HALF),
         );
     }
 
@@ -326,15 +340,6 @@ mod tests {
             at = Array::vector(vec![-2.5f64, -0.3, 0.0, 0.9, 3.0]),
             step = 1e-6,
             tolerance = 1e-6,
-        );
-    }
-
-    #[test]
-    fn test_erf_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = ErfOperation::new(),
-            inputs = [Array::scalar(0.5)],
-            expected = Array::scalar(ERF_HALF),
         );
     }
 

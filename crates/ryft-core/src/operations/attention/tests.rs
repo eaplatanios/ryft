@@ -11,21 +11,6 @@ use crate::tracing::TracingContext;
 use super::*;
 
 #[test]
-fn test_attention_inputs() {
-    let signature = AttentionOperandSignature::new(true, true, true, true);
-    let values = (0..7).map(|size| ArrayType::new_static(DataType::F32, [size])).collect::<Vec<_>>();
-    let inputs = AttentionInputs::from_values(signature, values.as_slice()).unwrap();
-
-    assert_eq!(inputs.signature(), signature);
-    assert_eq!(inputs.into_values(), values);
-    assert!(matches!(
-        AttentionInputs::from_values(signature, &values[..6]),
-        Err(TypeError::Invalid { message, .. })
-            if message == "attention input signature expects 7 values but got 6",
-    ));
-}
-
-#[test]
 fn test_attention_configuration() {
     let configuration = AttentionConfiguration::new()
         .with_scale(0.25)
@@ -42,6 +27,47 @@ fn test_attention_configuration() {
     assert!(configuration.return_residual());
     assert_eq!(configuration.dropout(), Some((0.1, 7)));
     assert_eq!(AttentionConfiguration::new().with_symmetric_local_window(3).local_window(), Some((3, 3)));
+}
+
+#[test]
+fn test_attention_inputs() {
+    let signature = AttentionOperandSignature::new(true, true, true, true);
+    let values = (0..7).map(|size| ArrayType::new_static(DataType::F32, [size])).collect::<Vec<_>>();
+    let inputs = AttentionInputs::from_values(signature, values.as_slice()).unwrap();
+
+    assert_eq!(inputs.signature(), signature);
+    assert_eq!(inputs.into_values(), values);
+    assert!(matches!(
+        AttentionInputs::from_values(signature, &values[..6]),
+        Err(TypeError::Invalid { message, .. })
+            if message == "attention input signature expects 7 values but got 6",
+    ));
+}
+
+#[test]
+fn test_dot_product_attention() {
+    let operation = DotProductAttentionOperation::new(
+        AttentionConfiguration::new()
+            .with_scale(0.125)
+            .with_causal(true)
+            .with_local_window((2, 0))
+            .with_implementation(AttentionImplementation::Portable)
+            .with_residual(true),
+        AttentionOperandSignature::new(true, false, true, true),
+    );
+
+    assert_eq!(
+        operation.to_string(),
+        indoc! {"
+                dot_product_attention [
+                    scale=0.125,
+                    causal=true,
+                    local_window=(2, 0),
+                    implementation=portable,
+                    residual=true,
+                    signature=AttentionOperandSignature { bias: true, mask: false, query_sequence_lengths: true, key_value_sequence_lengths: true },
+                ]"},
+    );
 }
 
 #[test]
@@ -91,7 +117,7 @@ fn test_dot_product_attention_type_inference() {
 }
 
 #[test]
-fn test_dot_product_attention() {
+fn test_dot_product_attention_interpretation() {
     // Rank-three operands normalize through an implicit batch. The arbitrary mask, asymmetric local window, and
     // query lengths compose independently, while the omitted scale defaults to `1 / sqrt(head_dimension)`.
     let query = Array::from_f64s(ArrayType::new_static(DataType::F32, [2, 1, 2]), vec![1.0, 0.0, 0.0, 1.0]);
@@ -162,32 +188,6 @@ fn test_dot_product_attention() {
         .iter()
         .zip(repeated.to_f64s())
         .for_each(|(actual, expected)| assert_abs_diff_eq!(actual, &expected, epsilon = 1e-6));
-}
-
-#[test]
-fn test_dot_product_attention_rendering() {
-    let operation = DotProductAttentionOperation::new(
-        AttentionConfiguration::new()
-            .with_scale(0.125)
-            .with_causal(true)
-            .with_local_window((2, 0))
-            .with_implementation(AttentionImplementation::Portable)
-            .with_residual(true),
-        AttentionOperandSignature::new(true, false, true, true),
-    );
-
-    assert_eq!(
-        operation.to_string(),
-        indoc! {"
-                dot_product_attention [
-                    scale=0.125,
-                    causal=true,
-                    local_window=(2, 0),
-                    implementation=portable,
-                    residual=true,
-                    signature=AttentionOperandSignature { bias: true, mask: false, query_sequence_lengths: true, key_value_sequence_lengths: true },
-                ]"},
-    );
 }
 
 #[test]

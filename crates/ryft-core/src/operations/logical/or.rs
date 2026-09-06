@@ -67,19 +67,25 @@ impl_capability_for_primitive!(usize);
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, DataType};
+    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
+    use crate::contexts::EagerContext;
+    use crate::differentiation::{
+        DifferentiableOperation, DifferentiationDual, DifferentiationError, TransposableOperation, TranspositionContext,
+    };
     use crate::macros::{check_operation_batching, check_operation_partial_evaluation, check_operation_type_inference};
+    use crate::partial::PartialValue;
+    use crate::programs::{EmptyRegionDriver, MaybeZero, ProgramError};
+    use crate::tracing::TracingContext;
 
     use super::*;
 
     #[test]
     fn test_or() {
-        // Check elementwise and scalar-broadcast eager value semantics.
-        let left = Array::vector(vec![true, true, false, false]);
-        let right = Array::vector(vec![true, false, true, false]);
-        assert_eq!((left | right).elements::<bool>(), Ok(vec![true, true, true, false]));
-        assert_eq!((Array::vector(vec![true, false]) | Array::scalar(false)).elements::<bool>(), Ok(vec![true, false]));
+        assert_eq!(OrOperation::<ArrayType>::new().to_string(), "or");
+    }
 
+    #[test]
+    fn test_or_type_inference() {
         // Check the shared elementwise type-inference contract in both type universes.
         check_operation_type_inference!(
             @elementwise @binary,
@@ -89,7 +95,29 @@ mod tests {
                 output_data_types = [DataType::Boolean],
             }],
         );
+    }
 
+    #[test]
+    fn test_or_interpretation() {
+        // Check elementwise and scalar-broadcast eager value semantics.
+        let left = Array::vector(vec![true, true, false, false]);
+        let right = Array::vector(vec![true, false, true, false]);
+        assert_eq!((left | right).elements::<bool>(), Ok(vec![true, true, true, false]));
+        assert_eq!((Array::vector(vec![true, false]) | Array::scalar(false)).elements::<bool>(), Ok(vec![true, false]));
+    }
+
+    #[test]
+    fn test_or_partial_evaluation() {
+        // Check that known inputs fold and unknown inputs residualize.
+        check_operation_partial_evaluation!(
+            operation = OrOperation::new(),
+            inputs = [Array::scalar(true), Array::scalar(false)],
+            expected = Array::scalar(true),
+        );
+    }
+
+    #[test]
+    fn test_or_batching() {
         // Check mixed mapped/replicated batching.
         check_operation_batching!(
             @exact,
@@ -103,13 +131,44 @@ mod tests {
                 outputs = [(@mapped(axis = 0), Array::vector(vec![true, false]))],
             }],
         );
+    }
 
-        // Check that known inputs fold and unknown inputs residualize.
-        check_operation_partial_evaluation!(
-            operation = OrOperation::new(),
-            inputs = [Array::scalar(true), Array::scalar(false)],
-            expected = Array::scalar(true),
+    #[test]
+    fn test_or_differentiation() {
+        let outputs = OrOperation::<ArrayType>::new()
+            .jvp(
+                &EagerContext::<Array, ArrayOperation<Array>>::new(),
+                &EmptyRegionDriver,
+                &[
+                    DifferentiationDual::new_with_zero_tangent(Array::scalar(true)).unwrap(),
+                    DifferentiationDual::new_with_zero_tangent(Array::scalar(false)).unwrap(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].primal(), &Array::scalar(true));
+        assert!(
+            matches!(outputs[0].tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::Zero))
         );
+    }
+
+    #[test]
+    fn test_or_transposition() {
+        // Program transposition elides zero-space Boolean cotangents, so check the primitive's rejection directly.
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        assert!(matches!(
+            OrOperation::<ArrayType>::new().transpose(
+                &mut TranspositionContext::new(context),
+                &EmptyRegionDriver,
+                &[
+                    PartialValue::Unknown(ArrayType::scalar(DataType::Boolean)),
+                    PartialValue::Unknown(ArrayType::scalar(DataType::Boolean)),
+                ],
+                &[MaybeZero::Zero(ArrayType::scalar(DataType::Zero))],
+            ),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "operation `or` is not transposable",
+        ));
     }
 
     #[test]

@@ -122,29 +122,7 @@ mod tests {
 
     #[test]
     fn test_max() {
-        assert_eq!(Array::scalar(2i32).max(&Array::scalar(5i32)).unwrap(), Array::scalar(5i32));
-        assert_eq!(Array::scalar(-2i64).max(&Array::scalar(-5i64)).unwrap(), Array::scalar(-2i64));
-        assert_eq!(Array::scalar(3u32).max(&Array::scalar(7u32)).unwrap(), Array::scalar(7u32));
-        assert_eq!(Array::scalar(2.5f32).max(&Array::scalar(1.5f32)).unwrap(), Array::scalar(2.5f32));
-        // Mixed-precision operands promote before comparing.
-        assert_eq!(Array::scalar(2.5f32).max(&Array::scalar(3.5f64)).unwrap(), Array::scalar(3.5f64));
-        assert_eq!(
-            Array::scalar(bf16::from_f32(2.0)).max(&Array::scalar(bf16::from_f32(3.0))).unwrap(),
-            Array::scalar(bf16::from_f32(3.0)),
-        );
-        assert_eq!(
-            Array::scalar(f16::from_f32(2.0)).max(&Array::scalar(f16::from_f32(3.0))).unwrap(),
-            Array::scalar(f16::from_f32(3.0)),
-        );
-        // NaNs propagate and `-0.0` orders below `+0.0`.
-        assert!(Array::scalar(f64::NAN).max(&Array::scalar(1.0f64)).unwrap().to_f64s()[0].is_nan());
-        assert!(Array::scalar(1.0f64).max(&Array::scalar(f64::NAN)).unwrap().to_f64s()[0].is_nan());
-        let zero = Array::scalar(-0.0f64).max(&Array::scalar(0.0f64)).unwrap().to_f64s()[0];
-        assert!(zero == 0.0 && zero.is_sign_positive());
-        assert_eq!(
-            Array::vector(vec![0.7, -1.0]).max(&Array::vector(vec![0.3, 2.0])).unwrap(),
-            Array::vector(vec![0.7, 2.0]),
-        );
+        assert_eq!(MaxOperation::<ArrayType>::new().to_string(), "max");
     }
 
     #[test]
@@ -171,6 +149,42 @@ mod tests {
             @reject @unreduced,
             operation = MaxOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_max_interpretation() {
+        assert_eq!(Array::scalar(2i32).max(&Array::scalar(5i32)).unwrap(), Array::scalar(5i32));
+        assert_eq!(Array::scalar(-2i64).max(&Array::scalar(-5i64)).unwrap(), Array::scalar(-2i64));
+        assert_eq!(Array::scalar(3u32).max(&Array::scalar(7u32)).unwrap(), Array::scalar(7u32));
+        assert_eq!(Array::scalar(2.5f32).max(&Array::scalar(1.5f32)).unwrap(), Array::scalar(2.5f32));
+        // Mixed-precision operands promote before comparing.
+        assert_eq!(Array::scalar(2.5f32).max(&Array::scalar(3.5f64)).unwrap(), Array::scalar(3.5f64));
+        assert_eq!(
+            Array::scalar(bf16::from_f32(2.0)).max(&Array::scalar(bf16::from_f32(3.0))).unwrap(),
+            Array::scalar(bf16::from_f32(3.0)),
+        );
+        assert_eq!(
+            Array::scalar(f16::from_f32(2.0)).max(&Array::scalar(f16::from_f32(3.0))).unwrap(),
+            Array::scalar(f16::from_f32(3.0)),
+        );
+        // NaNs propagate and `-0.0` orders below `+0.0`.
+        assert!(Array::scalar(f64::NAN).max(&Array::scalar(1.0f64)).unwrap().to_f64s()[0].is_nan());
+        assert!(Array::scalar(1.0f64).max(&Array::scalar(f64::NAN)).unwrap().to_f64s()[0].is_nan());
+        let zero = Array::scalar(-0.0f64).max(&Array::scalar(0.0f64)).unwrap().to_f64s()[0];
+        assert!(zero == 0.0 && zero.is_sign_positive());
+        assert_eq!(
+            Array::vector(vec![0.7, -1.0]).max(&Array::vector(vec![0.3, 2.0])).unwrap(),
+            Array::vector(vec![0.7, 2.0]),
+        );
+    }
+
+    #[test]
+    fn test_max_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = MaxOperation::new(),
+            inputs = [Array::scalar(0.7), Array::scalar(0.3)],
+            expected = Array::scalar(0.7),
         );
     }
 
@@ -250,15 +264,6 @@ mod tests {
             .interpret(vec![Array::scalar(2.0), Array::scalar(2.0), Array::scalar(3.0), Array::scalar(5.0)])
             .unwrap();
         assert_eq!(outputs, vec![Array::scalar(2.0), Array::scalar(3.0)]);
-    }
-
-    #[test]
-    fn test_max_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = MaxOperation::new(),
-            inputs = [Array::scalar(0.7), Array::scalar(0.3)],
-            expected = Array::scalar(0.7),
-        );
     }
 
     #[test]

@@ -37,86 +37,6 @@ use crate::programs::{
 /// Canonical operation name for [`DimensionFromScalarOperation`].
 pub const DIMENSION_FROM_SCALAR_OPERATION_NAME: &str = "dimension_from_scalar";
 
-/// Converts ordinary rank-zero integer array data into a checked first-class dimension.
-///
-/// This is the explicit boundary that converts numerical data into a dimension value. `result` declares the fresh
-/// [`DimensionVariable`] and authoritative bounds of the produced dimension. Eager execution rejects negative,
-/// out-of-bounds, host-unrepresentable, and backend-width-incompatible values before returning the dimension.
-///
-/// The input may use any signed or unsigned integer element type. It must be rank zero. Under batching, a mapped
-/// scalar produces one checked extent per item. Those extents remain packed scalar-array data on the transform-owned
-/// batch carrier and become ragged geometry only when a shape-consuming batching rule accepts them.
-///
-/// # Example
-///
-/// ```rust
-/// # use ryft_core::arrays::{DimensionBounds, DimensionVariable};
-/// # use ryft_core::{ArrayIrValue, DimensionFromScalar, DimensionValue, Mul, ProgramError};
-/// # use ryft_core::arrays::Array;
-/// # fn main() -> Result<(), ProgramError> {
-/// let scalar = ArrayIrValue::Array(Array::scalar(5_i32));
-/// let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
-/// let dimension = scalar.to_dimension(batch)?;
-/// let ArrayIrValue::Dimension(dimension) = dimension else {
-///     unreachable!("dimension_from_scalar always returns a dimension member");
-/// };
-/// assert_eq!(dimension.extent(), 5);
-/// let doubled = dimension.mul(&DimensionValue::constant(2)?)?;
-/// assert_eq!(doubled.extent(), 10);
-/// # Ok(())
-/// # }
-/// ```
-///
-/// Extract vector elements with ordinary array operations before crossing this gateway. This keeps indexing a general
-/// array concern and makes this operation the only numerical-data-to-dimension boundary:
-///
-/// ```rust
-/// # use ryft_core::arrays::{DimensionBounds, DimensionVariable, Shape};
-/// # use ryft_core::{DimensionFromScalar, ProgramError, Reshape, Slice};
-/// # use ryft_core::arrays::Array;
-/// # fn main() -> Result<(), ProgramError> {
-/// let extents = Array::vector(vec![3_i32, 5_i32]);
-/// let sequence = extents.slice(&[1], &[2], &[1])?.reshape(Shape::scalar())?;
-/// let sequence = sequence.to_dimension(DimensionVariable::new(
-///     "sequence",
-///     DimensionBounds::new(1, Some(9))?,
-/// ))?;
-/// assert_eq!(sequence.extent(), 5);
-/// # Ok(())
-/// # }
-/// ```
-pub trait DimensionFromScalar<Output = Self>: Typed + Sized {
-    /// Returns this rank-zero integer array as a first-class dimension described by `result`.
-    fn to_dimension(&self, result: DimensionVariable) -> Result<Output, ProgramError>;
-}
-
-impl<V: Value<Type = ArrayIrType>> DimensionFromScalar<V> for V
-where
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<DimensionFromScalarOperation>,
-{
-    fn to_dimension(&self, result: DimensionVariable) -> Result<V, ProgramError> {
-        Ok(self
-            .dispatch_domain()
-            .bind(DimensionFromScalarOperation::new(result), Vec::new(), std::slice::from_ref(self))?
-            .remove(0))
-    }
-}
-
-impl<V: Value<Type = ArrayIrType>> DimensionFromScalar<V> for ProjectedValue<ArrayType, V>
-where
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<DimensionFromScalarOperation>,
-{
-    fn to_dimension(&self, result: DimensionVariable) -> Result<V, ProgramError> {
-        Ok(self
-            .value()
-            .dispatch_domain()
-            .bind(DimensionFromScalarOperation::new(result), Vec::new(), std::slice::from_ref(self.value()))?
-            .remove(0))
-    }
-}
-
 /// Mixed scalar-array-to-dimension operation used by [`DimensionFromScalar`].
 ///
 /// Refer to [`DimensionFromScalar`] for semantic details and an example.
@@ -214,8 +134,6 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionFromScalarOperation
 {
 }
 
-impl_reference_free_dischargeable_operation!(DimensionFromScalarOperation);
-
 // Batching converts a mapped scalar array into one checked extent per batch item. The extents remain ordinary packed
 // integer SSA data and are exposed as a mapped dimension only through [`ArrayIrBatch`]; no raggedness is added to
 // [`ArrayIrType`]. A carry-free scan applies this ordered-assertion gateway to every scalar and converts each checked
@@ -285,6 +203,88 @@ where
 
 impl_non_differentiable_operation!(DimensionFromScalarOperation);
 impl_non_transposable_operation!(DimensionFromScalarOperation);
+
+impl_reference_free_dischargeable_operation!(DimensionFromScalarOperation);
+
+/// Converts ordinary rank-zero integer array data into a checked first-class dimension.
+///
+/// This is the explicit boundary that converts numerical data into a dimension value. `result` declares the fresh
+/// [`DimensionVariable`] and authoritative bounds of the produced dimension. Eager execution rejects negative,
+/// out-of-bounds, host-unrepresentable, and backend-width-incompatible values before returning the dimension.
+///
+/// The input may use any signed or unsigned integer element type. It must be rank zero. Under batching, a mapped
+/// scalar produces one checked extent per item. Those extents remain packed scalar-array data on the transform-owned
+/// batch carrier and become ragged geometry only when a shape-consuming batching rule accepts them.
+///
+/// # Example
+///
+/// ```rust
+/// # use ryft_core::arrays::{DimensionBounds, DimensionVariable};
+/// # use ryft_core::{ArrayIrValue, DimensionFromScalar, DimensionValue, Mul, ProgramError};
+/// # use ryft_core::arrays::Array;
+/// # fn main() -> Result<(), ProgramError> {
+/// let scalar = ArrayIrValue::Array(Array::scalar(5_i32));
+/// let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
+/// let dimension = scalar.to_dimension(batch)?;
+/// let ArrayIrValue::Dimension(dimension) = dimension else {
+///     unreachable!("dimension_from_scalar always returns a dimension member");
+/// };
+/// assert_eq!(dimension.extent(), 5);
+/// let doubled = dimension.mul(&DimensionValue::constant(2)?)?;
+/// assert_eq!(doubled.extent(), 10);
+/// # Ok(())
+/// # }
+/// ```
+///
+/// Extract vector elements with ordinary array operations before crossing this gateway. This keeps indexing a general
+/// array concern and makes this operation the only numerical-data-to-dimension boundary:
+///
+/// ```rust
+/// # use ryft_core::arrays::{DimensionBounds, DimensionVariable, Shape};
+/// # use ryft_core::{DimensionFromScalar, ProgramError, Reshape, Slice};
+/// # use ryft_core::arrays::Array;
+/// # fn main() -> Result<(), ProgramError> {
+/// let extents = Array::vector(vec![3_i32, 5_i32]);
+/// let sequence = extents.slice(&[1], &[2], &[1])?.reshape(Shape::scalar())?;
+/// let sequence = sequence.to_dimension(DimensionVariable::new(
+///     "sequence",
+///     DimensionBounds::new(1, Some(9))?,
+/// ))?;
+/// assert_eq!(sequence.extent(), 5);
+/// # Ok(())
+/// # }
+/// ```
+pub trait DimensionFromScalar<Output = Self>: Typed + Sized {
+    /// Returns this rank-zero integer array as a first-class dimension described by `result`.
+    fn to_dimension(&self, result: DimensionVariable) -> Result<Output, ProgramError>;
+}
+
+impl<V: Value<Type = ArrayIrType>> DimensionFromScalar<V> for V
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<DimensionFromScalarOperation>,
+{
+    fn to_dimension(&self, result: DimensionVariable) -> Result<V, ProgramError> {
+        Ok(self
+            .dispatch_domain()
+            .bind(DimensionFromScalarOperation::new(result), Vec::new(), std::slice::from_ref(self))?
+            .remove(0))
+    }
+}
+
+impl<V: Value<Type = ArrayIrType>> DimensionFromScalar<V> for ProjectedValue<ArrayType, V>
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<DimensionFromScalarOperation>,
+{
+    fn to_dimension(&self, result: DimensionVariable) -> Result<V, ProgramError> {
+        Ok(self
+            .value()
+            .dispatch_domain()
+            .bind(DimensionFromScalarOperation::new(result), Vec::new(), std::slice::from_ref(self.value()))?
+            .remove(0))
+    }
+}
 
 #[cfg(test)]
 mod tests {

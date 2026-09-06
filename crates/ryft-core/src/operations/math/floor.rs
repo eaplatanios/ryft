@@ -54,21 +54,14 @@ mod tests {
     use crate::arrays::{Array, ArrayType, DataType};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
-        check_operation_type_inference,
+        check_operation_transposition, check_operation_type_inference,
     };
 
     use super::*;
 
     #[test]
     fn test_floor() {
-        assert_eq!(Array::scalar(2.7f32).floor().unwrap(), Array::scalar(2.0f32));
-        assert_eq!(Array::scalar(-2.3f64).floor().unwrap(), Array::scalar(-3.0f64));
-        assert_eq!(Array::scalar(bf16::from_f32(2.7)).floor().unwrap(), Array::scalar(bf16::from_f32(2.7f32.floor())),);
-        assert_eq!(Array::scalar(f16::from_f32(2.7)).floor().unwrap(), Array::scalar(f16::from_f32(2.7f32.floor())),);
-        // NaNs pass through unchanged.
-        assert!(Array::scalar(f64::NAN).floor().unwrap().to_f64s()[0].is_nan());
-
-        assert_eq!(Array::vector(vec![-0.7, 0.0, 2.5]).floor().unwrap(), Array::vector(vec![-1.0, 0.0, 2.0]),);
+        assert_eq!(FloorOperation::<ArrayType>::new().to_string(), "floor");
     }
 
     #[test]
@@ -95,6 +88,27 @@ mod tests {
             @reject @unreduced,
             operation = FloorOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_floor_interpretation() {
+        assert_eq!(Array::scalar(2.7f32).floor().unwrap(), Array::scalar(2.0f32));
+        assert_eq!(Array::scalar(-2.3f64).floor().unwrap(), Array::scalar(-3.0f64));
+        assert_eq!(Array::scalar(bf16::from_f32(2.7)).floor().unwrap(), Array::scalar(bf16::from_f32(2.7f32.floor())),);
+        assert_eq!(Array::scalar(f16::from_f32(2.7)).floor().unwrap(), Array::scalar(f16::from_f32(2.7f32.floor())),);
+        // NaNs pass through unchanged.
+        assert!(Array::scalar(f64::NAN).floor().unwrap().to_f64s()[0].is_nan());
+
+        assert_eq!(Array::vector(vec![-0.7, 0.0, 2.5]).floor().unwrap(), Array::vector(vec![-1.0, 0.0, 2.0]),);
+    }
+
+    #[test]
+    fn test_floor_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = FloorOperation::new(),
+            inputs = [Array::scalar(2.7)],
+            expected = Array::scalar(2.0),
         );
     }
 
@@ -126,11 +140,15 @@ mod tests {
     }
 
     #[test]
-    fn test_floor_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = FloorOperation::new(),
-            inputs = [Array::scalar(2.7)],
-            expected = Array::scalar(2.0),
+    fn test_floor_transposition() {
+        check_operation_transposition!(
+            @exact,
+            operation = FloorOperation::<ArrayType>::new(),
+            cases = [{
+                inputs = [(@linear(type = ArrayType::scalar(DataType::F64)))],
+                output_cotangents = [Array::scalar(3.0)],
+                input_cotangents = [Array::scalar(0.0)],
+            }],
         );
     }
 

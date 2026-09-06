@@ -67,15 +67,19 @@ impl_capability_for_primitive!(usize);
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayOperation, DataType};
+    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
     use crate::contexts::EagerContext;
-    use crate::differentiation::{DifferentiationTracer, differentiate_at};
+    use crate::differentiation::{
+        DifferentiationError, DifferentiationTracer, TransposableOperation, TranspositionContext, differentiate_at,
+    };
     use crate::macros::{check_operation_batching, check_operation_partial_evaluation, check_operation_type_inference};
     use crate::operations::compare::{Compare, ComparisonDirection};
     use crate::operations::constants::one_like::OneLike;
     use crate::operations::constants::zero_like::ZeroLike;
     use crate::operations::control_flow::select::Select;
-    use crate::programs::ProgramError;
+    use crate::partial::PartialValue;
+    use crate::programs::{EmptyRegionDriver, MaybeZero, ProgramError};
+    use crate::tracing::TracingContext;
 
     use super::*;
 
@@ -91,12 +95,11 @@ mod tests {
 
     #[test]
     fn test_and() {
-        // Check elementwise and scalar-broadcast eager value semantics.
-        let left = Array::vector(vec![true, true, false, false]);
-        let right = Array::vector(vec![true, false, true, false]);
-        assert_eq!((left & right).elements::<bool>(), Ok(vec![true, false, false, false]));
-        assert_eq!((Array::vector(vec![true, false]) & Array::scalar(true)).elements::<bool>(), Ok(vec![true, false]));
+        assert_eq!(AndOperation::<ArrayType>::new().to_string(), "and");
+    }
 
+    #[test]
+    fn test_and_type_inference() {
         // Check the shared elementwise type-inference contract in both type universes.
         check_operation_type_inference!(
             @elementwise @binary,
@@ -106,7 +109,29 @@ mod tests {
                 output_data_types = [DataType::Boolean],
             }],
         );
+    }
 
+    #[test]
+    fn test_and_interpretation() {
+        // Check elementwise and scalar-broadcast eager value semantics.
+        let left = Array::vector(vec![true, true, false, false]);
+        let right = Array::vector(vec![true, false, true, false]);
+        assert_eq!((left & right).elements::<bool>(), Ok(vec![true, false, false, false]));
+        assert_eq!((Array::vector(vec![true, false]) & Array::scalar(true)).elements::<bool>(), Ok(vec![true, false]));
+    }
+
+    #[test]
+    fn test_and_partial_evaluation() {
+        // Check that known inputs fold and unknown inputs residualize.
+        check_operation_partial_evaluation!(
+            operation = AndOperation::new(),
+            inputs = [Array::scalar(true), Array::scalar(false)],
+            expected = Array::scalar(false),
+        );
+    }
+
+    #[test]
+    fn test_and_batching() {
         // Check both mixed mapped/replicated operand orderings.
         check_operation_batching!(
             @exact,
@@ -129,7 +154,10 @@ mod tests {
                 },
             ],
         );
+    }
 
+    #[test]
+    fn test_and_differentiation() {
         // The logical conjunction of two Boolean comparisons drives the select, so the derivative is 2 when both
         // predicates hold (x > 1) and 3 otherwise.
         let (primal, tangent) = differentiate_at(Array::scalar(2.0)).jvp(Array::scalar(1.0), masked_select).unwrap();
@@ -139,13 +167,25 @@ mod tests {
         let (primal, tangent) = differentiate_at(Array::scalar(0.5)).jvp(Array::scalar(1.0), masked_select).unwrap();
         assert_eq!(primal.to_f64s(), vec![1.5]);
         assert_eq!(tangent.to_f64s(), vec![3.0]);
+    }
 
-        // Check that known inputs fold and unknown inputs residualize.
-        check_operation_partial_evaluation!(
-            operation = AndOperation::new(),
-            inputs = [Array::scalar(true), Array::scalar(false)],
-            expected = Array::scalar(false),
-        );
+    #[test]
+    fn test_and_transposition() {
+        // Program transposition elides zero-space Boolean cotangents, so check the primitive's rejection directly.
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        assert!(matches!(
+            AndOperation::<ArrayType>::new().transpose(
+                &mut TranspositionContext::new(context),
+                &EmptyRegionDriver,
+                &[
+                    PartialValue::Unknown(ArrayType::scalar(DataType::Boolean)),
+                    PartialValue::Unknown(ArrayType::scalar(DataType::Boolean)),
+                ],
+                &[MaybeZero::Zero(ArrayType::scalar(DataType::Zero))],
+            ),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "operation `and` is not transposable",
+        ));
     }
 
     #[test]

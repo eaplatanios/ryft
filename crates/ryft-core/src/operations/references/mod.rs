@@ -10,14 +10,10 @@
 use crate::batching::{BatchingContext, BatchingDriver, BatchingError, BatchingPolicy};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationError};
-use crate::programs::ProgramError;
-use crate::programs::atoms::MaybeZero;
-use crate::programs::operations::Operation;
-use crate::programs::types::{Type, Typed};
-use crate::programs::values::Value;
-
-use super::discharge::{ReferenceDischargePolicy, ReferenceDischargeValue};
-use super::types::ReferenceType;
+use crate::programs::{
+    MaybeZero, Operation, ProgramError, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceType, Type, Typed,
+    Value,
+};
 
 macro_rules! define_reference_primitive_payload {
     // Defines one type-indexed zero-sized payload without deriving unnecessary bounds on its phantom type parameters.
@@ -238,25 +234,19 @@ pub(crate) mod tests {
     use std::borrow::Cow;
     use std::fmt::{Debug, Display};
 
-    use indoc::indoc;
-    use pretty_assertions::assert_eq;
-
     use crate::contexts::{Context, EagerContext};
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::check_count;
-    use crate::operations::{Add, AddOperation};
+    use crate::operations::math::add::{Add, AddOperation};
     use crate::parameters::{Parameter, Parameterized, Placeholder};
-    use crate::programs::builders::ProgramBuilder;
-    use crate::programs::effects::Effects;
-    use crate::programs::identities::{TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming};
-    use crate::programs::references::discharge::{
-        ReferenceAccumulationPolicy, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargeReference,
-        ReferenceDischargeableOperation, ReferenceDischargeableType, discharge_reference_free_operation,
+    use crate::programs::{
+        Effects, EmptyRegionDriver, ProgramBuilder, ReferenceAccumulationPolicy, ReferenceDischargeContext,
+        ReferenceDischargeDriver, ReferenceDischargeReference, ReferenceDischargeableOperation,
+        ReferenceDischargeableType, ReferenceType, RegionInterface, Type, TypeError, TypeIdentity,
+        TypeIdentityPosition, TypeIdentityRenaming, Value, discharge_reference_free_operation,
     };
-    use crate::programs::references::types::ReferenceType;
-    use crate::programs::regions::{EmptyRegionDriver, RegionInterface};
-    use crate::programs::types::{Type, TypeError};
-    use crate::programs::values::Value;
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
 
     use super::*;
 

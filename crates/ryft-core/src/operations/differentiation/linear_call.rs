@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt::Display;
 
 use crate::batching::{
@@ -5,15 +6,13 @@ use crate::batching::{
     ProgramBatchingOutputAxesPolicy,
 };
 use crate::contexts::{Context, Domain};
-use crate::differentiation::DifferentiationError;
-use crate::differentiation::batching::CotangentBatchingPolicy;
-use crate::differentiation::forward::{DifferentiableOperation, DifferentiationDriver, DifferentiationDual};
-use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
-use crate::differentiation::types::DifferentiableType;
-use crate::differentiation::zeros::ResidualZeroProvider;
+use crate::differentiation::{
+    CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
+};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types, impl_reference_free_dischargeable_operation};
-use crate::operations::Zero;
+use crate::operations::constants::zero::Zero;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OutputRegionProvenance, ProgramError, RegionInterface, RegionSlot,
@@ -135,7 +134,7 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
     /// its unavailable forward map.
     ///
     /// This operation is consuming so lifting a linear call into a composite type universe can move and map its stored
-    /// types without cloning them or exposing the private [`LinearCallInterface`] representation.
+    /// types without cloning them or exposing their private representation.
     ///
     /// # Parameters
     ///
@@ -245,7 +244,7 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
     }
 
     /// Batches an invocation to this [`LinearCallOperation`] by structurally batching its two attached
-    /// [`Region`](crate::Region)s. Both [`LinearCallInterface`] forms preserve a completely replicated call unchanged
+    /// [`Region`](crate::Region)s. Both interface forms preserve a completely replicated call unchanged
     /// when the batching level is _unnamed_, which is precisely when no attached region can observe it.
     ///
     /// Every other [`LinearCallInterface::ForwardAndTranspose`] call batches its forward region to discover the batched
@@ -359,10 +358,8 @@ impl<T: DifferentiableType> LinearCallOperation<T> {
         // results are plain values that cannot carry batch metadata, so each output carrier is restored through the
         // driver from the source region's per-item logical output type and the input carriers; wrapping them as bare
         // `P::batch` carriers would present bound padding as live data.
-        let boundary_operands = P::boundary_operands(context.axis_extent());
-        let mut packed_inputs = Vec::with_capacity(boundary_operands.len() + input_values.len());
-        let boundary_operand_count = boundary_operands.len();
-        packed_inputs.extend(boundary_operands);
+        let mut packed_inputs = P::boundary_operands(context.axis_extent());
+        let boundary_operand_count = packed_inputs.len();
         packed_inputs.extend(input_values);
         let forward_input_types = packed_inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
         let forward_output_types = driver.region(0)?.output_types();
@@ -426,36 +423,29 @@ impl<T: DifferentiableType> Operation for LinearCallOperation<T> {
         input_types: &[T],
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<Option<Vec<T>>>, TypeError> {
-        match &self.interface {
+        check_count!("region", region_interfaces, self.region_slots().len(), TypeError);
+        let output_types = match &self.interface {
             LinearCallInterface::ForwardAndTranspose => {
-                check_count!("region", region_interfaces, 2, TypeError);
                 let forward = &region_interfaces[0];
                 let renaming = T::derive_identity_renaming(forward.input_types(), input_types)?;
-                let output_types = forward
-                    .output_types()
-                    .iter()
-                    .map(|r#type| r#type.rename_identities(&renaming))
-                    .collect::<Result<Vec<_>, _>>()?;
-                let (residual_types, _) = self.split_inputs(input_types)?;
-                let mut transpose_input_types = residual_types.to_vec();
-                transpose_input_types.extend(output_types.iter().map(DifferentiableType::cotangent).collect::<Result<
-                    Vec<_>,
-                    DifferentiationError,
-                >>(
-                )?);
-                Ok(vec![Some(input_types.to_vec()), Some(transpose_input_types)])
+                Cow::Owned(
+                    forward
+                        .output_types()
+                        .iter()
+                        .map(|r#type| r#type.rename_identities(&renaming))
+                        .collect::<Result<Vec<_>, _>>()?,
+                )
             }
-            LinearCallInterface::TransposeOnly { output_types, .. } => {
-                check_count!("region", region_interfaces, 1, TypeError);
-                let (residual_types, _) = self.split_inputs(input_types)?;
-                let mut transpose_input_types = residual_types.to_vec();
-                transpose_input_types.extend(output_types.iter().map(DifferentiableType::cotangent).collect::<Result<
-                    Vec<_>,
-                    DifferentiationError,
-                >>(
-                )?);
-                Ok(vec![Some(transpose_input_types)])
-            }
+            LinearCallInterface::TransposeOnly { output_types, .. } => Cow::Borrowed(output_types.as_slice()),
+        };
+        let (residual_types, _) = self.split_inputs(input_types)?;
+        let mut transpose_input_types = residual_types.to_vec();
+        transpose_input_types
+            .extend(output_types.iter().map(DifferentiableType::cotangent).collect::<Result<Vec<_>, _>>()?);
+        if self.is_transpose_only() {
+            Ok(vec![Some(transpose_input_types)])
+        } else {
+            Ok(vec![Some(input_types.to_vec()), Some(transpose_input_types)])
         }
     }
 
@@ -464,63 +454,35 @@ impl<T: DifferentiableType> Operation for LinearCallOperation<T> {
         input_types: &[T],
         region_interfaces: &[RegionInterface<T>],
     ) -> Result<Vec<T>, TypeError> {
-        match &self.interface {
+        check_count!("region", region_interfaces, self.region_slots().len(), TypeError);
+        let (residual_types, linear_types, output_types, descriptor) = match &self.interface {
             LinearCallInterface::ForwardAndTranspose => {
-                check_count!("region", region_interfaces, 2, TypeError);
                 let forward = &region_interfaces[0];
-                let transpose = &region_interfaces[1];
                 check_types!(@same, "linear call forward input", [input_types, forward.input_types()]);
                 let (residual_types, linear_types) = self.split_inputs(input_types)?;
-                let mut transpose_input_types = residual_types.to_vec();
-                transpose_input_types.extend(
-                    forward
-                        .output_types()
-                        .iter()
-                        .map(DifferentiableType::cotangent)
-                        .collect::<Result<Vec<_>, DifferentiationError>>()?,
-                );
-                let transpose_output_types = linear_types.iter().map(DifferentiableType::cotangent).collect::<Result<
-                    Vec<_>,
-                    DifferentiationError,
-                >>(
-                )?;
-                check_types!(@same, "linear call transpose input", [
-                    &transpose_input_types,
-                    transpose.input_types(),
-                ]);
-                check_types!(@same, "linear call transpose output", [
-                    &transpose_output_types,
-                    transpose.output_types(),
-                ]);
-                Ok(forward.output_types().to_vec())
+                (residual_types, linear_types, forward.output_types(), "linear call")
             }
             LinearCallInterface::TransposeOnly { input_types: linear_types, output_types } => {
-                check_count!("region", region_interfaces, 1, TypeError);
-                let transpose = &region_interfaces[0];
                 let (residual_types, actual_linear_types) = self.split_inputs(input_types)?;
                 check_types!(@same, "transpose-only linear call input", [linear_types, actual_linear_types]);
-                let mut transpose_input_types = residual_types.to_vec();
-                transpose_input_types.extend(output_types.iter().map(DifferentiableType::cotangent).collect::<Result<
-                    Vec<_>,
-                    DifferentiationError,
-                >>(
-                )?);
-                let transpose_output_types = linear_types.iter().map(DifferentiableType::cotangent).collect::<Result<
-                    Vec<_>,
-                    DifferentiationError,
-                >>(
-                )?;
-                check_types!(@same, "transpose-only linear call transpose input", [
-                    &transpose_input_types,
-                    transpose.input_types(),
-                ]);
-                check_types!(@same, "transpose-only linear call transpose output", [
-                    &transpose_output_types,
-                    transpose.output_types(),
-                ]);
-                Ok(output_types.clone())
+                (residual_types, linear_types.as_slice(), output_types.as_slice(), "transpose-only linear call")
             }
-        }
+        };
+        let transpose = region_interfaces.last().unwrap();
+        let mut transpose_input_types = residual_types.to_vec();
+        transpose_input_types
+            .extend(output_types.iter().map(DifferentiableType::cotangent).collect::<Result<Vec<_>, _>>()?);
+        let transpose_output_types =
+            linear_types.iter().map(DifferentiableType::cotangent).collect::<Result<Vec<_>, _>>()?;
+        check_types!(@same, format!("{descriptor} transpose input"), [
+            &transpose_input_types,
+            transpose.input_types(),
+        ]);
+        check_types!(@same, format!("{descriptor} transpose output"), [
+            &transpose_output_types,
+            transpose.output_types(),
+        ]);
+        Ok(output_types.to_vec())
     }
 
     #[inline]
@@ -637,14 +599,15 @@ impl<C: Context<Type: DifferentiableType, Operation: ResidualZeroProvider<C::Typ
         let forward = driver.region(0)?;
         let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         if inputs.iter().all(|input| input.tangent().is_zero()) {
-            let primal_outputs = forward.interpret_in_context(context, primals, None)?;
+            let primal_outputs = forward.interpret_in_context(context, primals)?;
             return primal_outputs.into_iter().map(DifferentiationDual::new_with_zero_tangent).collect();
         }
 
         // Higher-order differentiation must include the dependence of the linear map on its residual parameters.
         // Replay the ordinary fused JVP of the attached forward region instead of assuming residual tangents are zero.
         // The derived program is only interpreted here, never re-attached, so the shared handle is simply dereferenced.
-        let jvp = driver.jvp_program(forward)?;
+        // Every forward input is active; a linear call over references is not supported yet.
+        let jvp = driver.jvp_program(forward, &vec![true; forward.input_ids().len()])?;
         let mut jvp_inputs = primals;
         for input in inputs {
             if !input.tangent().r#type().is_zero_space() {
@@ -685,7 +648,7 @@ impl<
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        context: &mut TracingContext<V, O>,
+        context: &mut TranspositionContext<'_, V, O>,
         driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -698,6 +661,8 @@ impl<
             ))
             .into());
         }
+        // The rule stages into the tracing context only, so the transposition context is narrowed once up front.
+        let context: &TracingContext<V, O> = context;
         let (residual_inputs, linear_inputs) = inputs.split_at(self.residual_count);
         let residuals = residual_inputs
             .iter()
@@ -760,7 +725,7 @@ impl<
         let input_cotangents = if self.is_transpose_only() {
             // The transpose-only form's region is a user-supplied backward program with no linearity contract of its
             // own, so it cannot be re-transposed and is replayed inline into the pullback.
-            transpose.interpret_in_context(context, transpose_inputs, None)?
+            transpose.interpret_in_context(context, transpose_inputs)?
         } else {
             // The forward-and-transpose form transposes by *swapping* its regions: the pullback stages the same
             // operation with the transpose region leading, over the same residuals followed by the output
@@ -817,16 +782,23 @@ mod tests {
         ProjectedMemberType, ProjectedMemberValue, ProjectedProgramType, ProjectedProgramValue,
     };
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::DifferentiationError;
-    use crate::differentiation::reverse::{TransposableOperation, TranspositionDriver};
-    use crate::operations::{
-        AddOperation, ConvertElementTypeOperation, DimensionFromScalar, DynamicBroadcast, MulOperation, Reduce,
-        ReductionKind, ZeroLikeOperation, ZeroOperation,
+    use crate::differentiation::{
+        CotangentDestinationKind, DifferentiationError, TransposableOperation, TranspositionContext,
+        TranspositionDriver,
     };
+    use crate::operations::constants::zero::ZeroOperation;
+    use crate::operations::constants::zero_like::ZeroLikeOperation;
+    use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalar;
+    use crate::operations::manipulation::broadcasting::DynamicBroadcast;
+    use crate::operations::manipulation::conversion::ConvertElementTypeOperation;
+    use crate::operations::math::add::AddOperation;
+    use crate::operations::math::mul::MulOperation;
+    use crate::operations::math::reduce::{Reduce, ReductionKind};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::{
-        Effects, MaybeZero, Program, ProgramBuilder, ProgramError, RegionDriver, RegionRef, RegionSlot, ValueProjection,
+        EffectClasses, MaybeZero, Program, ProgramBuilder, ProgramError, RegionDriver, RegionRef, RegionSlot,
+        ValueProjection,
     };
     use crate::tracing::TracingContext;
 
@@ -882,6 +854,7 @@ mod tests {
             &self,
             _region: RegionRef<'_, Array, ArrayOperation<Array>>,
             _input_linearity: &[bool],
+            _destination_kinds: &[CotangentDestinationKind],
         ) -> Result<Arc<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>, DifferentiationError> {
             Err(ProgramError::UnsupportedOperation {
                 message: "test driver does not transpose nested regions".to_string(),
@@ -937,7 +910,7 @@ mod tests {
         let transpose_interface = RegionInterface::new(
             vec![residual_type.clone(), tangent_type.clone()],
             vec![tangent_type.clone()],
-            Effects::PURE,
+            EffectClasses::NONE,
         );
         assert_eq!(
             LinearCallOperation::transpose_only(1, vec![tangent_type.clone()], vec![tangent_type.clone()])
@@ -1004,7 +977,7 @@ mod tests {
 
         // A residual count larger than the operand count is a malformed call rather than a silently truncated split,
         // and inference rejects it before any region interface is consulted.
-        let transpose_interface = RegionInterface::new(vec![r#type.clone()], vec![r#type.clone()], Effects::PURE);
+        let transpose_interface = RegionInterface::new(vec![r#type.clone()], vec![r#type.clone()], EffectClasses::NONE);
         assert!(matches!(
             LinearCallOperation::transpose_only(2, Vec::new(), Vec::new())
                 .infer_output_types(&[], std::slice::from_ref(&transpose_interface)),
@@ -1015,10 +988,10 @@ mod tests {
         // whose operands were pruned after inference ran.
         let transpose = scalar_multiply_program();
         let driver = TestTranspositionDriver { region: transpose.entry_region_ref() };
-        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         assert!(matches!(
             LinearCallOperation::transpose_only(3, vec![r#type.clone()], vec![r#type.clone()]).transpose(
-                &mut context,
+                &mut TranspositionContext::new(context.clone()),
                 &driver,
                 &[],
                 &[],
@@ -1032,7 +1005,7 @@ mod tests {
         let output_cotangent = context.input(r#type.clone());
         assert!(matches!(
             LinearCallOperation::transpose_only(1, vec![r#type.clone()], vec![r#type.clone()]).transpose(
-                &mut context,
+                &mut TranspositionContext::new(context.clone()),
                 &driver,
                 &[PartialValue::Unknown(r#type.clone()), PartialValue::Unknown(r#type)],
                 &[MaybeZero::Value(output_cotangent)],
@@ -1456,6 +1429,7 @@ mod tests {
                 &self,
                 _region: RegionRef<'_, Array, ArrayOperation<Array>>,
                 _input_linearity: &[bool],
+                _destination_kinds: &[CotangentDestinationKind],
             ) -> Result<Arc<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>, DifferentiationError>
             {
                 unreachable!("linear call transposition swaps regions and never re-enters transposition")
@@ -1481,11 +1455,11 @@ mod tests {
 
         // A structural-zero output cotangent returns structural zeros for both the residual and the linear operand
         // without replaying either region or staging a materialized array zero.
-        let mut zero_context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let zero_context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let residual = zero_context.input(r#type.clone());
         let zero_cotangents = LinearCallOperation::new(1)
             .transpose(
-                &mut zero_context,
+                &mut TranspositionContext::new(zero_context.clone()),
                 &driver,
                 &[PartialValue::Known(residual), PartialValue::Unknown(r#type.clone())],
                 &[MaybeZero::Zero(r#type.clone())],
@@ -1495,7 +1469,7 @@ mod tests {
         assert!(zero_cotangents.iter().all(MaybeZero::is_zero));
         assert!(zero_context.builder().borrow().instructions().is_empty());
 
-        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let residual = context.input(r#type.clone());
         let output_cotangent = context.input(r#type.clone());
 
@@ -1503,7 +1477,7 @@ mod tests {
         // unknown linear input's cotangent.
         let cotangents = LinearCallOperation::new(1)
             .transpose(
-                &mut context,
+                &mut TranspositionContext::new(context.clone()),
                 &driver,
                 &[PartialValue::Known(residual), PartialValue::Unknown(r#type)],
                 &[MaybeZero::Value(output_cotangent)],
@@ -1567,7 +1541,7 @@ mod tests {
             )
             .unwrap();
         let driver = TestTranspositionDriver { region: transpose.entry_region_ref() };
-        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let residual = context.input(r#type.clone());
         let known_linear = context.input(r#type.clone());
         let output_cotangent = context.input(r#type.clone());
@@ -1575,7 +1549,7 @@ mod tests {
         let linear_types = vec![r#type.clone(), r#type.clone()];
         let cotangents = LinearCallOperation::transpose_only(1, linear_types, vec![r#type.clone()])
             .transpose(
-                &mut context,
+                &mut TranspositionContext::new(context.clone()),
                 &driver,
                 &[PartialValue::Known(residual), PartialValue::Unknown(r#type), PartialValue::Known(known_linear)],
                 &[MaybeZero::Value(output_cotangent)],
@@ -1609,11 +1583,11 @@ mod tests {
             .build::<Vec<Array>, Vec<Array>>(vec![zero], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let driver = TestTranspositionDriver { region: transpose.entry_region_ref() };
-        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = context.input(cotangent_type.clone());
         let cotangents = LinearCallOperation::transpose_only(0, vec![tangent_type.clone()], vec![tangent_type.clone()])
             .transpose(
-                &mut context,
+                &mut TranspositionContext::new(context.clone()),
                 &driver,
                 &[PartialValue::Unknown(tangent_type.clone())],
                 &[MaybeZero::Value(output_cotangent)],
@@ -1632,11 +1606,11 @@ mod tests {
             .build::<Vec<Array>, Vec<Array>>(vec![zero_like], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let driver = TestTranspositionDriver { region: transpose.entry_region_ref() };
-        let mut context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = context.input(cotangent_type.clone());
         let cotangents = LinearCallOperation::transpose_only(0, vec![tangent_type.clone()], vec![tangent_type])
             .transpose(
-                &mut context,
+                &mut TranspositionContext::new(context.clone()),
                 &driver,
                 &[PartialValue::Unknown(primal_type.tangent().unwrap())],
                 &[MaybeZero::Value(output_cotangent)],

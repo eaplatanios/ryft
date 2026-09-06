@@ -23,9 +23,6 @@ use crate::programs::{
 
 // TODO(eaplatanios): Review this module.
 
-/// Canonical operation name for [`SortOperation`].
-pub const SORT_OPERATION_NAME: &str = "sort";
-
 /// Direction in which a [`SortOperation`] orders its key operand.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum SortDirection {
@@ -44,6 +41,9 @@ impl Display for SortDirection {
         }
     }
 }
+
+/// Canonical operation name for [`SortOperation`].
+pub const SORT_OPERATION_NAME: &str = "sort";
 
 /// [`Operation`] that sorts one or more same-shaped operands along one axis by the values of its first `key_count`
 /// operands (the keys): elements are ordered lexicographically by the keys in operand order — key 0 decides, ties on
@@ -211,49 +211,6 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for SortOper
 {
 }
 
-impl_differentiable_operation! {
-    SortOperation,
-    jvp<C>
-    where
-        C: Context<Type = ArrayType>,
-        C::Operation: From<SortOperation>,
-    {
-        |operation, context, _driver, inputs| {
-            // Forward-mode rule for [`SortOperation`]: sorting co-permutes every non-key operand by the keys'
-            // lexicographic order, so the live tangents ride one staged sort as extra passenger operands after the
-            // primals — the first half of the outputs are the primal outputs and the rest are the co-permuted tangents
-            // (the same trick JAX's sort JVP uses). The staged sort carries the original `key_count`, and because the
-            // tangents append after every primal operand they always land in the passenger positions. Structural-zero
-            // tangents stay symbolic because any permutation of zeros is zero.
-            let mut operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-            let live_indices = inputs
-                .iter()
-                .enumerate()
-                .filter_map(|(index, input)| input.tangent().as_value().map(|tangent| (index, tangent.clone())))
-                .collect::<Vec<_>>();
-            operands.extend(live_indices.iter().map(|(_, tangent)| tangent.clone()));
-            let mut outputs = context.bind(*operation, Vec::new(), operands.as_slice())?;
-            let output_tangents = outputs.split_off(inputs.len());
-            let mut tangent_by_output = vec![None; inputs.len()];
-            for ((index, _), tangent) in live_indices.iter().zip(output_tangents) {
-                tangent_by_output[*index] = Some(tangent);
-            }
-            outputs
-                .into_iter()
-                .zip(tangent_by_output)
-                .map(|(primal, tangent)| {
-                    let tangent = match tangent {
-                        Some(tangent) => MaybeZero::Value(tangent),
-                        None => MaybeZero::Zero(primal.r#type().tangent()?),
-                    };
-                    DifferentiationDual::new(primal, tangent).map_err(DifferentiationError::from)
-                })
-                .collect()
-        }
-    },
-    transpose = @nonlinear,
-}
-
 /// Batching rule for [`SortOperation`]: every mapped operand's batch axis moves to the leading physical position,
 /// replicated operands broadcast to the batched physical shape (all sort operands must agree on shape), and the
 /// sort axis lifts past the inserted leading batch dimension while the `key_count` carries through unchanged.
@@ -303,6 +260,49 @@ where
             )?
             .into())
     }
+}
+
+impl_differentiable_operation! {
+    SortOperation,
+    jvp<C>
+    where
+        C: Context<Type = ArrayType>,
+        C::Operation: From<SortOperation>,
+    {
+        |operation, context, _driver, inputs| {
+            // Forward-mode rule for [`SortOperation`]: sorting co-permutes every non-key operand by the keys'
+            // lexicographic order, so the live tangents ride one staged sort as extra passenger operands after the
+            // primals — the first half of the outputs are the primal outputs and the rest are the co-permuted tangents
+            // (the same trick JAX's sort JVP uses). The staged sort carries the original `key_count`, and because the
+            // tangents append after every primal operand they always land in the passenger positions. Structural-zero
+            // tangents stay symbolic because any permutation of zeros is zero.
+            let mut operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            let live_indices = inputs
+                .iter()
+                .enumerate()
+                .filter_map(|(index, input)| input.tangent().as_value().map(|tangent| (index, tangent.clone())))
+                .collect::<Vec<_>>();
+            operands.extend(live_indices.iter().map(|(_, tangent)| tangent.clone()));
+            let mut outputs = context.bind(*operation, Vec::new(), operands.as_slice())?;
+            let output_tangents = outputs.split_off(inputs.len());
+            let mut tangent_by_output = vec![None; inputs.len()];
+            for ((index, _), tangent) in live_indices.iter().zip(output_tangents) {
+                tangent_by_output[*index] = Some(tangent);
+            }
+            outputs
+                .into_iter()
+                .zip(tangent_by_output)
+                .map(|(primal, tangent)| {
+                    let tangent = match tangent {
+                        Some(tangent) => MaybeZero::Value(tangent),
+                        None => MaybeZero::Zero(primal.r#type().tangent()?),
+                    };
+                    DifferentiationDual::new(primal, tangent).map_err(DifferentiationError::from)
+                })
+                .collect()
+        }
+    },
+    transpose = @nonlinear,
 }
 
 /// Represents the ability to sort same-shaped operands along one axis by the values of its leading key operands.
@@ -636,32 +636,6 @@ mod tests {
             Err(ProgramError::UnsupportedOperation { message }) if message == "`sort` key_count must be at least 1",
         ));
 
-        // An ascending key-value sort co-permutes the passenger by the key's order, and the sort is stable: both
-        // `3.0` keys keep their original relative order, so the first one's payload `10.0` precedes `30.0`.
-        let keys = Array::vector(vec![3.0, 1.0, 3.0, 2.0]);
-        let payload = Array::vector(vec![10.0, 20.0, 30.0, 40.0]);
-        let outputs = InterpretableOperation::<EagerContext<Array>>::interpret(
-            &operation,
-            &EagerContext::new(),
-            &EmptyRegionDriver,
-            &[keys.clone(), payload.clone()],
-        )
-        .unwrap();
-        assert_eq!(outputs.len(), 2);
-        assert_eq!(outputs[0], Array::vector(vec![1.0, 2.0, 3.0, 3.0]));
-        assert_eq!(outputs[1], Array::vector(vec![20.0, 40.0, 10.0, 30.0]));
-
-        // Descending reverses the key comparison while keeping equal keys in their original order.
-        let outputs = InterpretableOperation::<EagerContext<Array>>::interpret(
-            &SortOperation::new(0, SortDirection::Descending),
-            &EagerContext::new(),
-            &EmptyRegionDriver,
-            &[keys, payload],
-        )
-        .unwrap();
-        assert_eq!(outputs[0], Array::vector(vec![3.0, 3.0, 2.0, 1.0]));
-        assert_eq!(outputs[1], Array::vector(vec![10.0, 30.0, 40.0, 20.0]));
-
         // A one-operand sort stages as a single-output instruction.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(vector_type(4));
@@ -741,6 +715,36 @@ mod tests {
     }
 
     #[test]
+    fn test_sort_interpretation() {
+        let operation = SortOperation::new(0, SortDirection::Ascending);
+        // An ascending key-value sort co-permutes the passenger by the key's order, and the sort is stable: both
+        // `3.0` keys keep their original relative order, so the first one's payload `10.0` precedes `30.0`.
+        let keys = Array::vector(vec![3.0, 1.0, 3.0, 2.0]);
+        let payload = Array::vector(vec![10.0, 20.0, 30.0, 40.0]);
+        let outputs = InterpretableOperation::<EagerContext<Array>>::interpret(
+            &operation,
+            &EagerContext::new(),
+            &EmptyRegionDriver,
+            &[keys.clone(), payload.clone()],
+        )
+        .unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0], Array::vector(vec![1.0, 2.0, 3.0, 3.0]));
+        assert_eq!(outputs[1], Array::vector(vec![20.0, 40.0, 10.0, 30.0]));
+
+        // Descending reverses the key comparison while keeping equal keys in their original order.
+        let outputs = InterpretableOperation::<EagerContext<Array>>::interpret(
+            &SortOperation::new(0, SortDirection::Descending),
+            &EagerContext::new(),
+            &EmptyRegionDriver,
+            &[keys, payload],
+        )
+        .unwrap();
+        assert_eq!(outputs[0], Array::vector(vec![3.0, 3.0, 2.0, 1.0]));
+        assert_eq!(outputs[1], Array::vector(vec![10.0, 30.0, 40.0, 20.0]));
+    }
+
+    #[test]
     fn test_sort_multi_axis() {
         let input = Array::matrix(2, 3, vec![3.0, 1.0, 2.0, 0.0, 5.0, 4.0]);
         // Axis 0 sorts every column independently.
@@ -793,6 +797,61 @@ mod tests {
             Sort::sort_with_key_count(&operands, 0, SortDirection::Ascending, 0),
             Err(ProgramError::UnsupportedOperation { message }) if message == "`sort` key_count must be at least 1",
         ));
+    }
+
+    #[test]
+    fn test_sort_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            backend = (Array, ArrayOperation<Array>),
+            operation = SortOperation::new(0, SortDirection::Ascending),
+            cases = [
+                {
+                    inputs = [(@known, Array::vector(vec![3.0, 1.0, 2.0]))],
+                    outputs = [(@known, Array::vector(vec![1.0, 2.0, 3.0]))],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [(@unknown(
+                        type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])),
+                        replay = Array::vector(vec![3.0, 1.0, 2.0])
+                    ))],
+                    outputs = [(@residual, Array::vector(vec![1.0, 2.0, 3.0]))],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+        // A multi-key sort folds and residualizes like the single-key sort, resolving key-0 ties through key 1.
+        check_operation_partial_evaluation!(
+            backend = (Array, ArrayOperation<Array>),
+            operation = SortOperation::new(0, SortDirection::Ascending).with_key_count(2).unwrap(),
+            cases = [
+                {
+                    inputs = [
+                        (@known, Array::vector(vec![2.0, 1.0, 2.0])),
+                        (@known, Array::vector(vec![5.0, 9.0, 4.0])),
+                    ],
+                    outputs = [
+                        (@known, Array::vector(vec![1.0, 2.0, 2.0])),
+                        (@known, Array::vector(vec![9.0, 4.0, 5.0])),
+                    ],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [
+                        (@unknown(
+                            type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])),
+                            replay = Array::vector(vec![2.0, 1.0, 2.0])
+                        )),
+                        (@known, Array::vector(vec![5.0, 9.0, 4.0])),
+                    ],
+                    outputs = [
+                        (@residual, Array::vector(vec![1.0, 2.0, 2.0])),
+                        (@residual, Array::vector(vec![9.0, 4.0, 5.0])),
+                    ],
+                    residual_instructions = 1,
+                },
+            ],
+        );
     }
 
     #[test]
@@ -900,61 +959,6 @@ mod tests {
     }
 
     #[test]
-    fn test_sort_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            backend = (Array, ArrayOperation<Array>),
-            operation = SortOperation::new(0, SortDirection::Ascending),
-            cases = [
-                {
-                    inputs = [(@known, Array::vector(vec![3.0, 1.0, 2.0]))],
-                    outputs = [(@known, Array::vector(vec![1.0, 2.0, 3.0]))],
-                    residual_instructions = 0,
-                },
-                {
-                    inputs = [(@unknown(
-                        type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])),
-                        replay = Array::vector(vec![3.0, 1.0, 2.0])
-                    ))],
-                    outputs = [(@residual, Array::vector(vec![1.0, 2.0, 3.0]))],
-                    residual_instructions = 1,
-                },
-            ],
-        );
-        // A multi-key sort folds and residualizes like the single-key sort, resolving key-0 ties through key 1.
-        check_operation_partial_evaluation!(
-            backend = (Array, ArrayOperation<Array>),
-            operation = SortOperation::new(0, SortDirection::Ascending).with_key_count(2).unwrap(),
-            cases = [
-                {
-                    inputs = [
-                        (@known, Array::vector(vec![2.0, 1.0, 2.0])),
-                        (@known, Array::vector(vec![5.0, 9.0, 4.0])),
-                    ],
-                    outputs = [
-                        (@known, Array::vector(vec![1.0, 2.0, 2.0])),
-                        (@known, Array::vector(vec![9.0, 4.0, 5.0])),
-                    ],
-                    residual_instructions = 0,
-                },
-                {
-                    inputs = [
-                        (@unknown(
-                            type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)])),
-                            replay = Array::vector(vec![2.0, 1.0, 2.0])
-                        )),
-                        (@known, Array::vector(vec![5.0, 9.0, 4.0])),
-                    ],
-                    outputs = [
-                        (@residual, Array::vector(vec![1.0, 2.0, 2.0])),
-                        (@residual, Array::vector(vec![9.0, 4.0, 5.0])),
-                    ],
-                    residual_instructions = 1,
-                },
-            ],
-        );
-    }
-
-    #[test]
     fn test_sort_transposition() {
         check_operation_transposition!(
             @rejected,
@@ -1029,33 +1033,6 @@ mod tests {
     }
 
     #[test]
-    fn test_argmax_and_argmin() {
-        /// Returns the expected `i32` index array of the provided static dimensions.
-        fn index_array(dimensions: Vec<usize>, indices: Vec<i32>) -> Array {
-            let shape = Shape::new(dimensions.into_iter().map(Dimension::Static).collect());
-            Array::from_elements(ArrayType::new(DataType::I32, shape), &indices).unwrap()
-        }
-
-        // NaN orders above `+∞` in the descending total order, so `argmax` reports the NaN's index, while `argmin`
-        // reports the smallest ordinary value's index (a positive NaN orders last ascending as well).
-        let with_nan = Array::vector(vec![1.0, f64::NAN, 3.0]);
-        assert_eq!(with_nan.argmax(0), Ok(index_array(vec![], vec![1])));
-        assert_eq!(with_nan.argmin(0), Ok(index_array(vec![], vec![0])));
-
-        // Ties select the lowest index because the ranking sort is stable.
-        let tie = Array::vector(vec![2.0, 2.0]);
-        assert_eq!(tie.argmax(0), Ok(index_array(vec![], vec![0])));
-        assert_eq!(tie.argmin(0), Ok(index_array(vec![], vec![0])));
-
-        // The reduced axis is dropped from the result shape, and the indices are `i32`.
-        let matrix = Array::matrix(2, 3, vec![1.0, 5.0, 3.0, 4.0, 0.0, 2.0]);
-        assert_eq!(matrix.argmax(0), Ok(index_array(vec![3], vec![1, 0, 0])));
-        assert_eq!(matrix.argmax(1), Ok(index_array(vec![2], vec![1, 0])));
-        assert_eq!(matrix.argmin(0), Ok(index_array(vec![3], vec![0, 1, 1])));
-        assert_eq!(matrix.argmin(1), Ok(index_array(vec![2], vec![0, 1])));
-    }
-
-    #[test]
     fn test_top_k_stages_through_the_tracer_capability() {
         // Staging `top_k` on a tracer composes the sort-plus-slice idiom that XLA's top-k rewriter recognizes: an
         // index iota rides a descending sort as a passenger and both outputs are sliced to the leading `k` entries.
@@ -1106,5 +1083,32 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_argmax_and_argmin() {
+        /// Returns the expected `i32` index array of the provided static dimensions.
+        fn index_array(dimensions: Vec<usize>, indices: Vec<i32>) -> Array {
+            let shape = Shape::new(dimensions.into_iter().map(Dimension::Static).collect());
+            Array::from_elements(ArrayType::new(DataType::I32, shape), &indices).unwrap()
+        }
+
+        // NaN orders above `+∞` in the descending total order, so `argmax` reports the NaN's index, while `argmin`
+        // reports the smallest ordinary value's index (a positive NaN orders last ascending as well).
+        let with_nan = Array::vector(vec![1.0, f64::NAN, 3.0]);
+        assert_eq!(with_nan.argmax(0), Ok(index_array(vec![], vec![1])));
+        assert_eq!(with_nan.argmin(0), Ok(index_array(vec![], vec![0])));
+
+        // Ties select the lowest index because the ranking sort is stable.
+        let tie = Array::vector(vec![2.0, 2.0]);
+        assert_eq!(tie.argmax(0), Ok(index_array(vec![], vec![0])));
+        assert_eq!(tie.argmin(0), Ok(index_array(vec![], vec![0])));
+
+        // The reduced axis is dropped from the result shape, and the indices are `i32`.
+        let matrix = Array::matrix(2, 3, vec![1.0, 5.0, 3.0, 4.0, 0.0, 2.0]);
+        assert_eq!(matrix.argmax(0), Ok(index_array(vec![3], vec![1, 0, 0])));
+        assert_eq!(matrix.argmax(1), Ok(index_array(vec![2], vec![1, 0])));
+        assert_eq!(matrix.argmin(0), Ok(index_array(vec![3], vec![0, 1, 1])));
+        assert_eq!(matrix.argmin(1), Ok(index_array(vec![2], vec![0, 1])));
     }
 }

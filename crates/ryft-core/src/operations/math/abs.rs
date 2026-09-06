@@ -199,26 +199,7 @@ mod tests {
 
     #[test]
     fn test_abs() {
-        let operation = AbsOperation::new();
-
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Array::scalar(-2.0)],
-            ),
-            Ok(vec![Array::scalar(2.0)]),
-        );
-        assert_eq!(
-            InterpretableOperation::<EagerContext<Array>>::interpret(
-                &operation,
-                &EagerContext::new(),
-                &EmptyRegionDriver,
-                &[Array::scalar(ComplexNumber::new(3.0f64, -4.0f64))],
-            ),
-            Ok(vec![Array::scalar(5.0)]),
-        );
+        assert_eq!(AbsOperation::<ArrayType>::new().to_string(), "abs");
     }
 
     #[test]
@@ -266,6 +247,30 @@ mod tests {
             @reject @unreduced,
             operation = AbsOperation::<ArrayType>::new(),
             input_types = [ArrayType::scalar(DataType::F32)],
+        );
+    }
+
+    #[test]
+    fn test_abs_interpretation() {
+        let operation = AbsOperation::new();
+
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(-2.0)],
+            ),
+            Ok(vec![Array::scalar(2.0)]),
+        );
+        assert_eq!(
+            InterpretableOperation::<EagerContext<Array>>::interpret(
+                &operation,
+                &EagerContext::new(),
+                &EmptyRegionDriver,
+                &[Array::scalar(ComplexNumber::new(3.0f64, -4.0f64))],
+            ),
+            Ok(vec![Array::scalar(5.0)]),
         );
     }
 
@@ -323,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn test_abx_differentiation_at_zero() {
+    fn test_abs_differentiation_at_zero() {
         // The real rule chooses the right derivative at zero and remains constant under another derivative.
         assert_abs_diff_eq!(
             differentiate_at(Array::scalar(0.0f64)).gradient(|x| x.abs().unwrap()).unwrap(),
