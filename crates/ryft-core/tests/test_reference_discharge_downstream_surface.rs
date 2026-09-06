@@ -57,16 +57,17 @@ use ryft_core::{
     ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, RecursiveBatchingPolicy,
     RecursiveReferenceDischargeDriver, Reference, ReferenceAccessMode, ReferenceAddUpdate,
     ReferenceAddUpdateOperationProvider, ReferenceAlias, ReferenceAliasEdge, ReferenceAliasKind, ReferenceAliasOrigin,
-    ReferenceBoundaryError, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeRegionBoundary, ReferenceDischargeRegionStateInsertion, ReferenceDischargeResult,
-    ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType,
-    ReferenceEffect, ReferenceFreeze, ReferenceFreezeOperation, ReferenceId, ReferenceNew, ReferenceNewOperation,
-    ReferenceNewOperationProvider, ReferenceRead, ReferenceReadOperation, ReferenceSource, ReferenceSwap,
-    ReferenceSwapOperation, ReferenceType, ReferenceView, ReferenceViewOperation, ReferenceViewPath, ReferenceViewStep,
-    ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation, RegionId, RegionInterface, RegionRef,
-    RegionSlot, Trace, Tracer, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, Type,
-    TypeError, Typed, Value, ValueId, ViewOverlap, ViewSymbol, ViewSymbolBinding, Zero, ZeroOperation, batch,
-    batch_reference_view_operation, differentiate_at, discharge_reference_free_operation, validate_reference_boundary,
+    ReferenceBoundary, ReferenceBoundaryError, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion,
+    ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    ReferenceDischargeableType, ReferenceEffect, ReferenceFreeze, ReferenceFreezeOperation, ReferenceId, ReferenceNew,
+    ReferenceNewOperation, ReferenceNewOperationProvider, ReferenceRead, ReferenceReadOperation, ReferenceSource,
+    ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceView, ReferenceViewOperation, ReferenceViewPath,
+    ReferenceViewStep, ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation, RegionId,
+    RegionInterface, RegionRef, RegionSlot, Trace, Tracer, TracingContext, TransposableOperation, TranspositionContext,
+    TranspositionDriver, Type, TypeError, Typed, Value, ValueId, ViewOverlap, ViewSymbol, ViewSymbolBinding, Zero,
+    ZeroOperation, batch, batch_reference_view_operation, differentiate_at, discharge_reference_free_operation,
+    validate_reference_boundary,
 };
 
 /// Destination universe of the downstream programs: the eager context over the register family, which is what a
@@ -995,8 +996,12 @@ where
                         self,
                         0,
                         declared,
-                        ReferenceDischargeRegionStateInsertion::new(entering.clone(), inputs.len()),
-                        ReferenceDischargeRegionStateInsertion::new(widening.published().to_vec(), source_output_count),
+                        ReferenceDischargeRegionBoundaryInsertion::new(entering.clone(), inputs.len()),
+                        [ReferenceDischargeRegionBoundaryInsertion::new(
+                            widening.published().to_vec(),
+                            source_output_count,
+                        )
+                        .into()],
                     ),
                 )?;
                 result.validate_predicted_mutations(widening.published(), self.name())?;
@@ -2391,6 +2396,39 @@ fn test_downstream_value_reports_reference_identity_for_live_handles() {
         ),
         Err(ReferenceBoundaryError::Aliased { .. }),
     ));
+}
+
+#[test]
+fn test_downstream_reference_boundary_accepts_owned_positions() {
+    /// Backend-defined port name, without `Copy`, `Default`, or `Display` requirements.
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Port(String);
+
+    let context = RegisterDestination::new();
+    let source = RegisterValue::Reference(Reference::new(RegisterValue::Register(3)).unwrap());
+    let cache = RegisterValue::Reference(Reference::new(RegisterValue::Register(5)).unwrap());
+    let result = RegisterValue::Reference(Reference::new(RegisterValue::Register(7)).unwrap());
+    let source_port = Port("source".to_string());
+    let cache_port = Port("cache".to_string());
+    let result_port = Port("result".to_string());
+    let boundary =
+        ReferenceBoundary::new(&context, [(source_port.clone(), &source), (cache_port.clone(), &cache)]).unwrap();
+
+    assert_eq!(boundary.validate(&context, [(result_port.clone(), &result)]), Ok(()));
+    assert_eq!(
+        ReferenceBoundary::new(&context, [(source_port.clone(), &source), (cache_port.clone(), &source)]).unwrap_err(),
+        ReferenceBoundaryError::Aliased { position: cache_port.clone(), other: source_port.clone() },
+    );
+    assert_eq!(
+        boundary.validate(&context, [(result_port.clone(), &source)]),
+        Err(ReferenceBoundaryError::AliasedRetained { position: result_port.clone(), other: source_port }),
+    );
+    assert_eq!(
+        boundary.validate(&context, [(result_port.clone(), &result), (cache_port.clone(), &result)]),
+        Err(ReferenceBoundaryError::Aliased { position: cache_port, other: result_port.clone() }),
+    );
+    // Validation checks later arguments without adding them to the retained boundary.
+    assert_eq!(boundary.validate(&context, [(result_port, &result)]), Ok(()));
 }
 
 #[test]
