@@ -39,7 +39,9 @@ pub use operations::{
 };
 pub use reference_analysis::{ArrayReferenceAnalysis, ArrayReferenceAnalysisError};
 pub use reference_discharge::ArrayReferenceDischarge;
-pub use reference_views::{ArrayReference, ArrayReferenceView, ArrayReferenceViewError, ArrayReferenceViewTransform};
+pub use reference_views::{
+    ArrayReference, ArrayReferenceView, ArrayReferenceViewError, ArrayReferenceViewTransform, ViewIndex,
+};
 pub use sharding::{
     Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProcessIndex, Sharding, ShardingDimension,
     ShardingError, ShardingVisualization,

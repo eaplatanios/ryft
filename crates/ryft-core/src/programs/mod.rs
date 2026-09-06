@@ -174,10 +174,9 @@ pub use references::{
     discharge_positional_region_operation, discharge_reference_free_operation, validate_reference_boundary,
 };
 pub use regions::{
-    BindingRegionDriver, CalleeRegionDriver, DestinationRegionMapping, EagerInterpretationValidation,
-    EmptyRegionDriver, InputRegionProvenance, OutputRegionProvenance, Region, RegionArena, RegionArenaIterator,
-    RegionDriver, RegionId, RegionInterface, RegionRef, RegionReplayMappings, RegionRole, RegionSlot,
-    RegionWithMetadata, ReplayRegionDriver,
+    BindingRegionDriver, CalleeRegionDriver, DestinationRegionMapping, EmptyRegionDriver, InputRegionProvenance,
+    OutputRegionProvenance, Region, RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface,
+    RegionRef, RegionReplayMappings, RegionRole, RegionSlot, RegionWithMetadata, ReplayRegionDriver,
 };
 pub use statistics::{AttachedRegionStatistics, ProgramStatistics, RegionStatistics};
 pub use transforms::{Transform, TransformArtifact, TransformCache};

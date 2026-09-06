@@ -2170,11 +2170,9 @@ mod tests {
                 Ok(vec![value.clone()]),
             );
             assert_eq!(
-                program.entry_region_ref().interpret_in_context(
-                    &context,
-                    vec![TestValue::Array(Array::scalar(predicate)), value.clone()],
-                    None,
-                ),
+                program
+                    .entry_region_ref()
+                    .interpret_in_context(&context, vec![TestValue::Array(Array::scalar(predicate)), value.clone()],),
                 Ok(vec![value.clone()]),
             );
         }
