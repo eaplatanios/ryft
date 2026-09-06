@@ -1,10 +1,12 @@
 //! Generic reference types, operations, eager runtime state, and staged discharge.
 //!
 //! References are Ryft's second-class mutable-state values. A reference may be created, aliased, read, replaced,
-//! updated, and consumed inside a program, but it is not immutable value data: numeric operations cannot consume
-//! it directly, a local reference cannot escape as a public output, and an external reference denotes state owned by
-//! the caller. Reference operations carry ordered-state effects so that optimization and transformation machinery
-//! cannot reorder or duplicate them as if they were pure computations.
+//! updated, and consumed inside a program, but it is not immutable value data: numeric operations cannot consume it
+//! directly, a local reference escapes as a public output only to a caller that keeps it as a reference (discharge and
+//! backend lowering reject it), and an external reference denotes state owned by the caller. Reference operations carry
+//! ordered-state effects so that optimization and transformation machinery cannot reorder or duplicate them as if they
+//! were pure computations, while the transforms themselves operate on references directly (refer to the "Transforms"
+//! section below).
 //!
 //! This module owns the value-family-independent reference language. It does not assume that a referent is an array
 //! or that an alias is an array view. Array-specific view geometry, eager view traversal, and the array discharge
@@ -32,15 +34,17 @@
 //!
 //! - A **reference allocation** is the canonical mutable storage cell that a reference family denotes. Only
 //!   [`reference_new`](ReferenceNewOperation) mints one. Eagerly, the allocation is the reference allocation whose
-//!   synchronized state every [`Reference`] clone shares; in operation semantics, it is the identity that
-//!   [`ReferenceOutput::Allocation`] introduces and [`ReferenceOutput::Alias`] preserves; during discharge, it is the
-//!   unit of state threading, named by a [`ReferenceDischargeAllocationId`].
+//!   synchronized state every [`Reference`] clone shares; in operation effect declarations, it is the identity that
+//!   [`ReferenceEffect::Allocate`](crate::ReferenceEffect::Allocate) introduces and
+//!   [`ReferenceAlias`](crate::ReferenceAlias) preserves; during discharge, it is the unit of state threading, named
+//!   by a [`ReferenceDischargeAllocationId`].
 //! - The **referent** is the structural type of the value a handle exposes, written `ref<T>` as [`ReferenceType`].
 //!   The allocation has its own referent — the type of the complete stored value — and a view's handle-local referent may
 //!   be narrower.
 //! - A **handle** is one name for an allocation: a program value of reference type, or an eager [`Reference`] clone.
 //! - An **alias** is a reference created from another reference. It always denotes the same allocation, either
-//!   identically or through operation-owned view metadata ([`ReferenceAliasKind`]).
+//!   identically or through operation-owned view metadata ([`ReferenceAliasKind`](crate::ReferenceAliasKind)).
+
 //! - A **view** is a narrowing alias, such as the result of
 //!   [`reference_slice`](crate::arrays::ReferenceSliceOperation) or
 //!   [`reference_index`](crate::arrays::ReferenceIndexOperation): it selects part of the allocation's value while every
@@ -68,16 +72,14 @@
 //! - `values.rs` defines the eager [`Reference`] value, coherent backend [`ReferenceObservation`]s, backend-neutral
 //!   completion dependencies, and the synchronized state machine for each reference allocation, including identity,
 //!   generations, guards, read leases, pending completion, and terminal poisoning.
-//! - `semantics.rs` defines the operation-local [`ReferenceOperationSemantics`] descriptor, access modes, and
-//!   allocation/alias classifications.
 //! - `analysis.rs` defines the generic program-level [`ReferenceAnalysis`]: canonical [`ReferenceRoot`]s, alias
-//!   edges, accesses, capture scopes, root-only region boundaries, lifetime validation, and per-instruction transitive
-//!   access summaries. It is kernel-owned validation infrastructure invoked explicitly by its consumers rather than a
-//!   standing lint on every program.
-//! - `views.rs` defines the value-family-generic static view contract [`ReferenceViewOperation`] (owned per-edge view
-//!   descriptions, their type-level validation, and their reapplication to a transformed reference) and the retained
-//!   [`ReferenceViewAnalysis`] overlay that composes those descriptions into one [`ReferenceViewPath`] per
-//!   reference-typed value of a closure.
+//!   edges, accesses, capture scopes, region boundaries (complete handles, plus the views an operation creates for its
+//!   own region inputs), lifetime validation, and per-instruction transitive access summaries. It is kernel-owned
+//!   validation infrastructure invoked explicitly by its consumers rather than a standing lint on every program.
+//! - `views.rs` defines the value-family-generic view contract [`ReferenceViewOperation`] (owned per-edge view
+//!   descriptions with static or symbolic coordinates, their type-level validation, their reapplication to a
+//!   transformed reference, their batching, and their overlap query) and the retained [`ReferenceViewAnalysis`]
+//!   overlay that composes those descriptions into one [`ReferenceViewPath`] per reference-typed value of a closure.
 //! - `operations/` defines the six generic primitives in separate modules together with their value-level
 //!   capabilities: allocation ([`ReferenceNew`]), immutable reads ([`ReferenceRead`]), write-only replacement
 //!   ([`ReferenceWrite`]), swapping ([`ReferenceSwap`]), ordered additive updates ([`ReferenceAddUpdate`]), and
@@ -100,13 +102,83 @@
 //! operations into explicit state dataflow. A local allocation disappears entirely after that rewrite. An external
 //! allocation becomes a state value input and, when mutated, a hidden final-state output described by a
 //! [`ExternalReferenceBinding`]; the backend's stateful invocation surface snapshots and publishes those values through
-//! the caller's reference. [`Program::discharge_references`] exposes the generic program-level entry point for this
-//! rewrite; the discharge module documentation contains a concrete before-and-after example.
+//! the caller's reference. [`Program::discharge_references`](crate::Program::discharge_references) exposes the generic
+//! program-level entry point for this rewrite; the discharge module documentation contains a concrete before-and-after
+//! example.
 //!
 //! [`PartialReferenceDischargeResult`] supports the kernel use case in which selected implementation-owned allocations
 //! become immutable state while other references deliberately remain in the program. A full
 //! [`ReferenceDischargeResult`] additionally proves that no reference type or reference operation survives anywhere
 //! in the rewritten region closure.
+//!
+//! # Transforms
+//!
+//! Transforms operate directly on references, using cached [`ReferenceAnalysis`] for roots, aliases, and access modes:
+//!
+//! - Forward mode pairs active primal references with caller-supplied tangent references. Linearization executes primal
+//!   accesses and stages tangent accesses, using a dedicated partial-evaluation mode that preserves each root's order.
+//! - Reverse mode accumulates state cotangents into references selected through
+//!   [`CotangentDestination`](crate::CotangentDestination).
+//! - Batching gives a reference a batch axis by giving its referent one.
+//! - Ordinary partial evaluation preserves global ordered-effect and failure order, threading live references into the
+//!   residual program. Rematerialization recomputes local lifecycles and saves external reads.
+//! - Custom derivatives, `jit_call`, and `shard_map` thread references positionally under the contracts below.
+//!
+//! Reference types are never zero-space: their tangents and cotangents are references over the referent's tangent and
+//! cotangent types. [`MaybeZero::Zero`](crate::MaybeZero::Zero) marks an inactive reference tangent or an unallocated
+//! cotangent inside transforms; generic zero materialization rejects it. Internal region JVP and linearization
+//! boundaries omit inactive reference tangent outputs while preserving the primal handle's identity across calls and
+//! control flow. The lifetime-enforcement section below describes validation of runtime and staged boundary identities.
+//!
+//! # Reference Semantics and JAX Comparison
+//!
+//! The following contracts describe supported reference behavior and explicit restrictions. Comparisons identify
+//! specific differences or equivalent capabilities; they do not imply complete transform parity.
+//!
+//! - **Reference-typed carries and outputs with positional identity.** A structured operation may return a reference
+//!   when it states which input root it forwards, and a program may return an escaping local allocation to a caller
+//!   that keeps it as a reference. JAX restricts reference outputs from
+//!   [jitted functions and higher-order bodies](https://docs.jax.dev/en/latest/array_refs.html#restrictions).
+//!   Forward mode forwards the tangent reference by identity, reverse mode shares the input's accumulator, batching
+//!   carries the root's axis, and backend lowering rejects escaping allocations because the stateful ABI has no result
+//!   reconstruction protocol.
+//! - **Partial discharge preserving internal allocations.**
+//!   [`Program::partially_discharge_references`](crate::Program::partially_discharge_references) rewrites only the
+//!   selected allocations and leaves the others as live references. A kernel pipeline can normalize its own state
+//!   while preserving references that a later kernel lowering consumes.
+//! - **`condition` with an unbatched predicate mutating references under `vmap`.** When the predicate is replicated,
+//!   only the selected branch runs, so its reference mutations execute unmasked; a batched predicate rejects any
+//!   transitive reference access or local allocation in either branch, because effectful state cannot be masked per
+//!   batch item. JAX's current
+//!   [`cond` batching rule](https://github.com/jax-ml/jax/blob/main/jax/_src/lax/control_flow/conditionals.py) rejects
+//!   branch reference effects even with an unbatched predicate; its batched-predicate path uses selection.
+//! - **Mutating `while` conditions rotated with shared writes allowed.** Discharge rotates a `while` whose condition
+//!   mutates references into do-while form and admits a root written by both the condition and the body (body first,
+//!   then condition). The current
+//!   [JAX state-discharge rule](https://github.com/jax-ml/jax/blob/main/jax/_src/lax/control_flow/loops.py) rejects
+//!   writes to the same reference in both regions.
+//! - **Explicit cotangent destinations.** [`CotangentDestination`](crate::CotangentDestination) selects returned
+//!   values, accumulation into caller-owned references, or discarded gradients. This is comparable to
+//!   [JAX's `VJP.with_refs`](https://docs.jax.dev/en/latest/301/refs.html#gradient-refs-for-value-arguments), which
+//!   supports reference gradient destinations for both reference and array arguments; reference gradients are not a
+//!   divergence by themselves.
+//! - **Reference ownership under `shard_map`.** Ryft makes reference inputs read-only along replicated manual axes;
+//!   writes require an owned shard. JAX also supports explicitly passed reference operands: its
+//!   [reference-argument test](https://github.com/jax-ml/jax/blob/main/tests/shard_map_test.py#L4238-L4249) updates a
+//!   sharded reference, and its
+//!   [discharge rule](https://github.com/jax-ml/jax/blob/main/jax/_src/shard_map.py#L2002-L2031)
+//!   returns updated reference values under the corresponding input specs. JAX's documented restriction concerns
+//!   [functions that close over references](https://docs.jax.dev/en/latest/array_refs.html#restrictions).
+//!   Ryft's replicated-read-only rule is a separate ownership policy; support for reference operands and support for
+//!   captured references must be compared separately.
+//! - **Custom-derivative reference outputs rejected outright.** `custom_jvp` and `custom_vjp` accept references only
+//!   in their leading non-differentiated segment and never as outputs, even where a forwarded output would be
+//!   well-defined, because neither derivative interface can name the output's tangent or cotangent reference.
+//! - **Scanning over a reference stack.** A `scan` accepts a reference-typed stacked operand and presents its body
+//!   the per-iteration slice of the referent as a reference view created at the region boundary, which forward mode,
+//!   transposition, and batching restate with the scan and which discharge rewrites into the scan's own stacked operand
+//!   and stacked output. Presenting the slice as a view lets state be indexed per iteration without dynamic indexing
+//!   and discharges to the scan's own stacking rather than to a gather and scatter per iteration.
 //!
 //! # Lifetime Enforcement
 //!
@@ -118,11 +190,13 @@
 //!    atomic replacement semantics across its alias family.
 //! 3. Discharge validates the complete rewrite it observes, including use after consumption, unbound allocations,
 //!    invalid structured-region threading, escaping local allocations, and surviving references in a claimed full result.
-//! 4. [`validate_reference_boundary`] checks the concrete values bound at every public transform boundary (eager
-//!    differentiation, batching, and jit staging) for runtime aliasing by [`ReferenceId`]: the same allocation at two
-//!    positions, a reference both captured and passed, and values that misreport their identity.
+//! 4. Transform boundaries reject the same allocation at two positions, a reference both captured and passed, and
+//!    values that misreport their identity. [`validate_reference_boundary`] checks concrete values by [`ReferenceId`].
+//!    [`ReferenceBoundary`] resolves runtime and staged identities through the context, accepting caller-defined
+//!    positions and validation order. Each transform owns its argument roles and aliasing policy, including whether
+//!    later arguments must avoid retained allocations. Program interpretation performs no such boundary check.
 //!
-//! These checks are complementary. Construction sees the source call but only atoms and declared semantics, so it
+//! These checks are complementary. Construction sees the source call but only atoms and declared effects, so it
 //! cannot detect two positions bound to the same runtime allocation; the eager reference sees runtime aliases and
 //! concurrency; discharge sees the state-threading transformation and complete attached-region closure; and the
 //! boundary validator sees the live values a transform is about to bind.
@@ -182,44 +256,46 @@ pub enum ReferenceError {
 mod analysis;
 mod discharge;
 mod operations;
-mod semantics;
 mod types;
 mod values;
 mod views;
 
 pub use analysis::{
-    ReferenceAccess, ReferenceAliasEdge, ReferenceAnalysis, ReferenceAnalysisError, ReferenceRegionInputBinding,
-    ReferenceRoot, ReferenceTransitiveAccess,
+    ReferenceAccess, ReferenceAliasEdge, ReferenceAliasOrigin, ReferenceAnalysis, ReferenceAnalysisError,
+    ReferenceRegionInputBinding, ReferenceRoot, ReferenceTransitiveAccess,
 };
 pub use discharge::{
     ExternalReferenceBinding, PartialReferenceDischargeResult, RecursiveReferenceDischargeDriver,
     ReferenceAccumulationPolicy, ReferenceDischargeAllocationId, ReferenceDischargeBoundaryWidening,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeReference,
-    ReferenceDischargeRegionBoundary, ReferenceDischargeRegionResult, ReferenceDischargeRegionStateInsertion,
-    ReferenceDischargeRegionSummary, ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceSource,
-    discharge_positional_region_operation, discharge_reference_free_operation,
+    ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeRegionInput,
+    ReferenceDischargeRegionOutput, ReferenceDischargeRegionResult, ReferenceDischargeRegionSummary,
+    ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    ReferenceDischargeableType, ReferenceSource, discharge_positional_region_operation,
+    discharge_reference_free_operation,
 };
 pub use operations::{
     REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME,
     REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME, ReferenceAddUpdate,
-    ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
-    ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
-    ReferenceWriteOperation,
-};
-pub use semantics::{
-    ReferenceAccessMode, ReferenceAliasKind, ReferenceInput, ReferenceOperationSemantics, ReferenceOutput,
+    ReferenceAddUpdateOperation, ReferenceAddUpdateOperationProvider, ReferenceFreeze, ReferenceFreezeOperation,
+    ReferenceNew, ReferenceNewOperation, ReferenceNewOperationProvider, ReferenceRead, ReferenceReadOperation,
+    ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation,
 };
 pub use types::{ReferenceType, ReferenceTypeRefinements};
+
 pub use values::{
-    PreparedReferenceReplacement, ReadyOrPendingReferenceGuard, ReadyReferenceGuard, Reference, ReferenceBoundaryError,
-    ReferenceBoundaryPosition, ReferenceCompletion, ReferenceCompletionBackend, ReferenceGeneration, ReferenceId,
-    ReferenceObservation, ReferenceReplacementPreparation, ReferenceReplacementTransaction, TakenReferenceGuard,
-    ValidatedPendingReplacementTransaction, validate_reference_boundary,
+    PreparedReferenceReplacement, ReadyOrPendingReferenceGuard, ReadyReferenceGuard, Reference, ReferenceBoundary,
+    ReferenceBoundaryError, ReferenceBoundaryPosition, ReferenceCompletion, ReferenceCompletionBackend,
+    ReferenceGeneration, ReferenceId, ReferenceIdentity, ReferenceObservation, ReferenceReplacementPreparation,
+    ReferenceReplacementTransaction, TakenReferenceGuard, ValidatedPendingReplacementTransaction,
+    validate_reference_boundary,
 };
+
+pub(crate) use operations::forwarded_tangent;
 pub use views::{
-    ReferenceViewAnalysis, ReferenceViewAnalysisError, ReferenceViewOperation, ReferenceViewPath,
-    ReferenceViewValidationError,
+    NoBinding, ReferenceView, ReferenceViewAnalysis, ReferenceViewAnalysisError, ReferenceViewOperation,
+    ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError, ViewOverlap, ViewSymbol, ViewSymbolBinding,
+    batch_reference_view_operation,
 };
 
 #[cfg(test)]
