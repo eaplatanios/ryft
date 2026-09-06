@@ -18,9 +18,10 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    CotangentDestinationKind, DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, ReferenceOperandCotangents, ResidualZeroProvider, TransposableOperation,
-    TranspositionContext, TranspositionDriver, reference_operand_cotangents,
+    CotangentDestinationKind, DifferentiableOperation, DifferentiableType, DifferentiationContext,
+    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
+    ReferenceOperandCotangents, ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
+    reference_operand_cotangents,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
@@ -247,11 +248,11 @@ where
             // to branch on. A known-but-symbolic predicate — or a program constant payload that exposes no concrete
             // boolean, such as an abstract backend capture reference — keeps the conditional on both sides of the
             // split instead.
-            if let Some(predicate) = context.parent().resolve(predicate).into_constant() {
-                if let Ok(predicate) = predicate.concretize() {
-                    let index = if predicate { 0 } else { 1 };
-                    return driver.partially_evaluate_region(context, index, inputs[1..].to_vec());
-                }
+            if let Some(predicate) = context.parent().resolve(predicate).into_constant()
+                && let Ok(predicate) = predicate.concretize()
+            {
+                let index = if predicate { 0 } else { 1 };
+                return driver.partially_evaluate_region(context, index, inputs[1..].to_vec());
             }
             if inputs.iter().all(PartialEvaluationValue::is_known) {
                 return context.fold_or_residualize(
@@ -650,9 +651,9 @@ impl<C: Context<Type: ConditionTypeSemantics + DifferentiableType> + Zero<C::Val
 where
     C::Operation: ResidualZeroProvider<C::Type> + From<ConditionOperation<C::Constant>>,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -673,46 +674,97 @@ where
         let output_activity = true_branch.tangent_output_activity(&activity)?;
         let tangent_output_count = output_activity.iter().filter(|&&active| active).count();
 
-        // Build both fused jvp branches — through each branch region's retained transform cache, so that a branch
-        // shared by several programs is differentiated once — and stage one fused conditional over the predicate
-        // primal followed by the operand primals and tangents. The shared branch handles are attached directly, so
-        // repeated binds of one derived branch intern by `Arc` identity instead of copying it again.
-        let fused_branches =
-            [driver.jvp_program(true_branch, &activity)?, driver.jvp_program(driver.region(1)?, &activity)?];
-        let fused_condition = ConditionOperation::new();
-        let mut condition_operands = Vec::with_capacity(2 * operands.len() + 1);
-        condition_operands.push(predicate_primal);
-        condition_operands.extend(operands.iter().map(|operand| operand.primal().clone()));
+        let primal_input_count = operands.len();
+        let live_input_count = activity.iter().filter(|&&active| active).count();
+        let mut condition_inputs = vec![predicate_primal];
+        condition_inputs.extend(operands.iter().map(|operand| operand.primal().clone()));
         for (operand, &active) in operands.iter().zip(&activity) {
             if active {
-                // The operand primal names every runtime quantity a reference-bearing tangent type omits, because
-                // the tangent type derivation preserves geometry exactly.
-                condition_operands.push(C::Operation::materialize_zero_from_residual_sources(
-                    context,
+                let primal = context.primal_to_tangent(operand.primal().clone())?;
+                condition_inputs.push(C::Operation::materialize_zero_from_residual_sources(
+                    context.tangent(),
                     operand.tangent().clone(),
-                    std::iter::once(operand.primal()),
+                    std::iter::once(&primal),
                 )?);
             }
         }
-        let outputs = context.bind(fused_condition, CalleeRegionDriver::new(&fused_branches), &condition_operands)?;
+        let outputs = if std::ptr::eq(context.primal(), context.tangent()) {
+            let branches =
+                [driver.jvp_program(true_branch, &activity)?, driver.jvp_program(driver.region(1)?, &activity)?];
+            context
+                .primal()
+                .bind(ConditionOperation::new(), CalleeRegionDriver::new(&branches), &condition_inputs)?
+        } else {
+            let mut partitions = Vec::with_capacity(2);
+            let mut branch_input_types = true_branch.input_types();
+            for branch in [true_branch, driver.region(1)?] {
+                let (primal, tangent, residual_count) = driver.linearize_program(branch, &activity)?.into_parts();
+                if partitions.is_empty() {
+                    branch_input_types.extend(tangent.input_types().into_iter().take(live_input_count));
+                }
+                partitions.push(PartitionedProgram::from_parts(
+                    primal,
+                    tangent,
+                    (0..primal_input_count).collect(),
+                    (primal_input_count..primal_input_count + live_input_count)
+                        .map(PartialEvaluationInput::Unknown)
+                        .chain((0..residual_count).map(PartialEvaluationInput::Known))
+                        .collect(),
+                    (0..output_count)
+                        .map(PartialEvaluationOutput::Known)
+                        .chain((0..tangent_output_count).map(PartialEvaluationOutput::Unknown))
+                        .collect(),
+                ));
+            }
+            let input_known = (0..primal_input_count + live_input_count)
+                .map(|index| index < primal_input_count)
+                .collect::<Vec<_>>();
+            let false_partition = partitions.pop().unwrap();
+            let true_partition = partitions.pop().unwrap();
+            reconstruct_partitioned_condition(
+                &branch_input_types,
+                output_count + tangent_output_count,
+                &condition_inputs,
+                &input_known,
+                true_partition,
+                false_partition,
+                |operation, programs, inputs| context.primal().bind(operation, programs, inputs),
+                |operation, programs, inputs| {
+                    let operands = inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(index, value)| {
+                            if index == 0 || index > live_input_count {
+                                context.primal_to_tangent(value.clone()).map_err(ProgramError::from)
+                            } else {
+                                Ok(value.clone())
+                            }
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    context.tangent().bind(operation, programs, &operands)
+                },
+            )?
+            .ok_or_else(|| ProgramError::UnsupportedOperation {
+                message: "condition linearization cannot construct a shared residual boundary for its branches"
+                    .to_string(),
+            })?
+        };
         check_count!("output", outputs, output_count + tangent_output_count, ProgramError);
 
-        // The fused conditional's outputs are the primal outputs followed by only the live tangent outputs. Restore
-        // structural zeros at the dual boundary for zero differential spaces.
         let (primal_outputs, tangent_outputs) = outputs.split_at(output_count);
         let mut tangent_outputs = tangent_outputs.iter().cloned();
-        Ok(primal_outputs
+        primal_outputs
             .iter()
             .cloned()
             .zip(output_activity)
             .map(|(primal, active)| {
-                if !active {
-                    DifferentiationDual::new_with_zero_tangent(primal)
-                } else {
+                if active {
                     DifferentiationDual::new(primal, tangent_outputs.next().unwrap())
+                } else {
+                    DifferentiationDual::new_with_zero_tangent(primal)
                 }
             })
-            .collect::<Result<Vec<_>, _>>()?)
+            .collect()
     }
 }
 
@@ -844,8 +896,6 @@ where
     let branch_input_types = true_branch.input_types();
     check_count!("input", branch_inputs, branch_input_types.len(), ProgramError);
     let input_known = branch_inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<bool>>();
-    let output_count = true_branch.output_types().len();
-
     // Partition each branch through its own fresh known-side context, requested through the driver so that this rule
     // carries no fresh-trace semantic bounds of its own. Unlike the branches' derived forward-mode and transposed
     // programs, a partition is not retained by the branch region's transform cache: it carries known outputs that are
@@ -853,7 +903,46 @@ where
     let true_partition = driver.partition_program(context, true_branch, input_known.as_slice())?;
     let false_partition = driver.partition_program(context, false_branch, input_known.as_slice())?;
 
-    // In addition to the ordered-effect guard, reject reference-typed known feeders and executable reference
+    if let Some(outputs) = reconstruct_partitioned_condition(
+        &branch_input_types,
+        true_branch.output_types().len(),
+        inputs,
+        &input_known,
+        true_partition,
+        false_partition,
+        |operation, programs, inputs| context.fold_or_residualize(operation, programs, inputs),
+        |operation, programs, inputs| context.residualize(operation, programs, inputs),
+    )? {
+        return Ok(outputs);
+    }
+    context.fold_or_residualize(
+        O::from(condition.clone()),
+        vec![true_branch.to_program(), false_branch.to_program()],
+        inputs,
+    )
+}
+
+/// Rebuilds both halves of a conditional over one shared residual signature. Returns `None` when a branch requires
+/// a residual placeholder that cannot be constructed or when the split contains no known work.
+fn reconstruct_partitioned_condition<V, O, Input, KnownBind, ResidualBind>(
+    branch_input_types: &[V::Type],
+    output_count: usize,
+    inputs: &[Input],
+    input_known: &[bool],
+    true_partition: PartitionedProgram<V, O>,
+    false_partition: PartitionedProgram<V, O>,
+    mut bind_known: KnownBind,
+    mut bind_residual: ResidualBind,
+) -> Result<Option<Vec<Input>>, ProgramError>
+where
+    V: Value,
+    O: Operation<Type = V::Type> + From<ConditionOperation<V>> + ZeroOperationProvider<V::Type>,
+    Input: Clone,
+    KnownBind: FnMut(O, Vec<Program<V, O, Vec<V>, Vec<V>>>, &[Input]) -> Result<Vec<Input>, ProgramError>,
+    ResidualBind: FnMut(O, Vec<Program<V, O, Vec<V>, Vec<V>>>, &[Input]) -> Result<Vec<Input>, ProgramError>,
+{
+    let branch_inputs = &inputs[1..];
+    // Reject reference-typed known feeders and executable reference
     // constants. A reference feeder has no typed zero for the other branch's edge slot, and splitting branches must
     // not expose a reference through either an edge or a captured constant without accounting for its identity.
     if [&true_partition, &false_partition].into_iter().any(|partition| {
@@ -864,11 +953,7 @@ where
                 })
             })
     }) {
-        return context.fold_or_residualize(
-            O::from(condition.clone()),
-            vec![true_branch.to_program(), false_branch.to_program()],
-            inputs,
-        );
+        return Ok(None);
     }
 
     // An output is known only when both branches folded it.
@@ -925,18 +1010,18 @@ where
         }
         let mut instantiated_edge_ordinals = vec![None; output_count];
         for (index, output) in outputs.iter().enumerate() {
-            if !out_known[index] {
-                if let PartialEvaluationOutput::Known(output) = output {
-                    let output_type = known_program_output_types.get(*output).ok_or_else(|| {
+            if !out_known[index]
+                && let PartialEvaluationOutput::Known(output) = output
+            {
+                let output_type = known_program_output_types.get(*output).ok_or_else(|| {
                         ProgramError::MalformedProgram(format!(
                             "{CONDITION_OPERATION_NAME} branch partition output {index} references missing known-program output \
                              {output}",
                         ))
                     })?;
-                    instantiated_edge_ordinals[index] = Some(edge_types.len());
-                    edge_types.push(output_type.clone());
-                    edge_program_outputs.push(*output);
-                }
+                instantiated_edge_ordinals[index] = Some(edge_types.len());
+                edge_types.push(output_type.clone());
+                edge_program_outputs.push(*output);
             }
         }
         Ok(ConditionBranchSplit {
@@ -952,17 +1037,15 @@ where
     let true_split = collect_branch(true_partition)?;
     let false_split = collect_branch(false_partition)?;
 
-    // An empty known side (no known output and no edge on either branch) means the split folds nothing; residualize
+    // An empty known side (no outputs, edges, or effects on either branch) folds nothing; residualize
     // the condition unchanged through the default rule, with the symbolic predicate as a known feeder.
     let known_side_is_empty = !out_known.iter().any(|&known| known)
         && true_split.edge_program_outputs.is_empty()
-        && false_split.edge_program_outputs.is_empty();
+        && false_split.edge_program_outputs.is_empty()
+        && true_split.known_program.effects().classes().is_empty()
+        && false_split.known_program.effects().classes().is_empty();
     if known_side_is_empty {
-        return context.fold_or_residualize(
-            O::from(condition.clone()),
-            vec![true_branch.to_program(), false_branch.to_program()],
-            inputs,
-        );
+        return Ok(None);
     }
 
     // Reconciling the known branches requires each branch to produce placeholder zeros for the other branch's
@@ -975,11 +1058,7 @@ where
         .chain(&false_split.edge_types)
         .any(|r#type| r#type.identities().next().is_some())
     {
-        return context.fold_or_residualize(
-            O::from(condition.clone()),
-            vec![true_branch.to_program(), false_branch.to_program()],
-            inputs,
-        );
+        return Ok(None);
     }
 
     // Build each known branch over the shared `[known outputs..., true edges..., false edges...]` output signature,
@@ -1063,11 +1142,8 @@ where
             .filter(|(_, known)| **known)
             .map(|(input, _)| input.clone()),
     );
-    let known_outputs = context.fold_or_residualize(
-        O::from(known_condition),
-        vec![known_true, known_false],
-        known_condition_inputs.as_slice(),
-    )?;
+    let known_outputs =
+        bind_known(O::from(known_condition), vec![known_true, known_false], known_condition_inputs.as_slice())?;
     let known_output_count = out_known.iter().filter(|&&known| known).count();
     let true_edge_offset = known_output_count;
     let false_edge_offset = known_output_count + true_split.edge_types.len();
@@ -1191,7 +1267,7 @@ where
                 ))
             })?);
         }
-        context.residualize(
+        bind_residual(
             O::from(residual_condition),
             vec![residual_true, residual_false],
             residual_condition_inputs.as_slice(),
@@ -1227,7 +1303,8 @@ where
                 })
             }
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 /// Reconciles one partially-evaluated `condition` branch into a branch program over the shared concatenated input
@@ -1480,7 +1557,7 @@ where
     // `[branch_tangent_cotangents...]`, where a live reference tangent's cotangent is its cotangent reference itself
     // and a dead reference tangent has no cotangent slot at all.
     let mut branch_linear = vec![true; branch_tangent_count];
-    branch_linear.extend(std::iter::repeat(false).take(residual_count));
+    branch_linear.extend(std::iter::repeat_n(false, residual_count));
     let branch_destination_kinds = &cotangents.destination_kinds()[1..];
     let transposed_branches = [
         driver.transpose_program(driver.region(0)?, branch_linear.as_slice(), branch_destination_kinds)?,
@@ -1564,7 +1641,7 @@ mod tests {
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
     use crate::captures::CaptureReference;
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::forward::JvpTransform;
+    use crate::differentiation::forward::LinearizationTransform;
     use crate::differentiation::reverse::TranspositionTransform;
     use crate::differentiation::{Differentiate, ReverseModeDifferentiate, differentiate_at};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
@@ -3142,9 +3219,9 @@ mod tests {
         let second = conditional_program(&true_branch, &false_branch, 2).linearize().unwrap();
         assert_ne!(first.tangent().to_string(), second.tangent().to_string());
 
-        // Each branch's fused forward-mode program is derived by the first program and served to the second.
+        // Each branch's linearization is derived by the first program and served to the second.
         for branch in [&true_branch, &false_branch] {
-            let statistics = branch.entry_region_ref().transform_statistics::<JvpTransform>().unwrap();
+            let statistics = branch.entry_region_ref().transform_statistics::<LinearizationTransform>().unwrap();
             assert_eq!((statistics.productions, statistics.hits), (1, 1));
         }
 

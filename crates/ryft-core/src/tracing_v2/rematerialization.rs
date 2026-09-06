@@ -81,7 +81,7 @@ use crate::programs::{
     OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceAccessMode, ReferenceAnalysis,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceRoot, Region, RegionId, RegionInterface, RegionSlot, Type, TypeError,
-    Typed, Value, ValueId, discharge_local_reference_regions,
+    Typed, Value, ValueId, discharge_local_reference_operation,
 };
 use crate::tracing::{DomainTracer, Trace, TracingContext};
 
@@ -453,7 +453,7 @@ where
         driver: &D,
         inputs: &[ReferenceDischargeValue<C, P>],
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
-        discharge_local_reference_regions(self, context, driver, inputs)
+        discharge_local_reference_operation(self, context, driver, inputs)
     }
 }
 

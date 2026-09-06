@@ -68,8 +68,9 @@
 //!   [`ReferenceAccumulationPolicy`] when it supports ordered additive updates.
 //! - Every operation implements [`ReferenceDischargeableOperation`], the rule that rewrites one application of that
 //!   operation. Reference primitives rewrite their own accesses, region-carrying operations decide how state is added
-//!   to their region boundaries, and everything else replays unchanged. Two shared rule bodies cover the common cases:
-//!   [`discharge_reference_free_operation`] for operations that touch no reference, and
+//!   to their region boundaries, and everything else replays unchanged. Three shared rule bodies cover the common cases:
+//!   [`discharge_reference_free_operation`] for operations that touch no reference,
+//!   [`discharge_local_reference_operation`] for operations whose reference state stays within individual regions, and
 //!   [`discharge_positional_region_operation`] for region-carrying operations that forward their operands to their
 //!   regions positionally, such as a condition or a call. Loop-shaped operations such as `while` and `scan` write their
 //!   own rules on top of the same machinery.
@@ -4232,9 +4233,10 @@ impl<
 /// operation with ordered or other effects replays here unchanged, because the replay reproduces those effects in the
 /// destination exactly as the source performed them. Attached regions are copied into the destination as they stand,
 /// which is the complete rewrite for regions that hold no state to thread. An application is rejected as soon as a
-/// reference appears among its operands or anywhere inside an attached region's closure, because how a reference
-/// boundary widens is knowledge that belongs to the operation, which must then implement its own rule. For the common
-/// case of a region-carrying operation that forwards its operands to its regions positionally, that rule is
+/// reference appears among its operands or anywhere inside an attached region's closure. If references are confined
+/// to individual regions, [`discharge_local_reference_operation`] rebuilds those regions without adding state inputs
+/// or outputs. If references cross a region boundary, the operation's rule must specify how state is threaded through
+/// that boundary. For operations that forward their operands to their regions positionally, use
 /// [`discharge_positional_region_operation`].
 ///
 /// # Parameters
@@ -4281,14 +4283,111 @@ pub fn discharge_reference_free_operation<
     Ok(outputs.into_iter().map(ReferenceDischargeValue::Value).collect())
 }
 
+/// Discharges one region-carrying [`Operation`] application whose reference state is confined to its attached regions.
+/// This is a shared rule body for [`ReferenceDischargeableOperation`] implementations that can rewrite each region
+/// independently without adding state operands or outputs to the operation or its regions. The regions need not share
+/// an interface or receive the operation's operands positionally, which allows the same rule to handle custom
+/// derivative operations whose primal and derivative regions have different signatures.
+///
+/// Unlike [`discharge_reference_free_operation`], which copies reference-free regions unchanged, this function
+/// rebuilds every attached region to discharge its local reference state, including derivative regions that are not
+/// executed by the primal operation. Unlike [`discharge_positional_region_operation`], it does not widen boundaries
+/// to thread caller state through the regions. Reference operands, reference region inputs, and region closures that
+/// reach caller allocations are therefore rejected. The operation is then rebound unchanged with the rebuilt regions,
+/// so its own interface validation checks their compatibility.
+///
+/// # Parameters
+///
+///   - `operation`: Operation application being rewritten without adding state operands or outputs.
+///   - `context`: Active [`ReferenceDischargeContext`] owning the allocation environment.
+///   - `driver`: Application-scoped [`ReferenceDischargeDriver`] supplying all attached regions.
+///   - `inputs`: Carrier [`ReferenceDischargeValue`]s supplied as this application's operands,
+///     in operation-defined order.
+///
+/// # Errors
+///
+/// Returns [`ProgramError::UnsupportedOperation`] when an operand or declared region input is a reference, or a region
+/// closure reaches a caller allocation. Propagates errors from region-count validation, reference analysis, region
+/// rebuilding, mutation validation, and binding the rewritten application in the destination.
+pub fn discharge_local_reference_operation<
+    O: Operation<Type = C::Type>,
+    C: Context<Operation: From<O>>,
+    P: ReferenceDischargePolicy<C>,
+    D: ReferenceDischargeDriver<C, P>,
+>(
+    operation: &O,
+    context: &ReferenceDischargeContext<C, P>,
+    driver: &D,
+    inputs: &[ReferenceDischargeValue<C, P>],
+) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+    let name = operation.name();
+    operation.validate_region_count(driver.region_count())?;
+    if let Some(position) = inputs.iter().position(|input| matches!(input, ReferenceDischargeValue::Reference(_))) {
+        return Err(ProgramError::UnsupportedOperation {
+            message: format!(
+                "`{name}` does not thread external references through discharge, but operand {position} is a \
+                 reference; pass reference-free operands or discharge external references first",
+            ),
+        });
+    }
+
+    // Reference-free operands leave the primal and forward boundaries reference-free, but a hand-built call may
+    // still declare reference inputs on its rule regions (through a reference-typed residual in the forward tail).
+    // Those inputs are bound by the transform that instantiates the rule rather than by any operand, so no caller
+    // allocation can be threaded into them. So, they are rejected here, under the operand diagnostic, instead of
+    // failing the region rebuild with an internal boundary error.
+    for index in 0..driver.region_count() {
+        if let Some(position) = driver.region(index)?.input_types().iter().position(Type::is_reference) {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "`{name}` does not thread external references through discharge, but input {position} of \
+                     region {index} is a reference; pass reference-free operands or discharge external \
+                     references first",
+                ),
+            });
+        }
+    }
+    let mut regions = Vec::with_capacity(driver.region_count());
+    for index in 0..driver.region_count() {
+        let region = driver.region(index)?;
+        let declared_input_allocations = vec![None; region.input_ids().len()];
+        let summary = context.region_summary(operation, index, region, declared_input_allocations.as_slice())?;
+        if let Some(allocation) = summary.reached_allocations().next() {
+            return Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "`{name}` does not thread external references through discharge, but its region {index} \
+                     reaches {allocation}; discharge external references first",
+                ),
+            });
+        }
+        let boundary = ReferenceDischargeRegionBoundary::new(
+            operation,
+            index,
+            declared_input_allocations,
+            ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), region.input_ids().len()),
+            [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), region.output_ids().len())],
+        );
+        let result = driver.rebuild_region(context, index, &boundary)?;
+        result.validate_predicted_mutations(&[], name)?;
+        regions.push(result.into_program());
+    }
+    let operands = inputs.iter().map(|input| context.operand_value(input)).collect::<Result<Vec<_>, _>>()?;
+    let outputs = context.parent().bind(operation.clone(), regions, operands.as_slice())?;
+    Ok(outputs.into_iter().map(ReferenceDischargeValue::Value).collect())
+}
+
 /// Discharges one region-carrying [`Operation`] application whose [`Region`](crate::Region)s positionally forward its
 /// operands, so that the references its region closures touch become explicit immutable state. This is the rule body
 /// that a [`ReferenceDischargeableOperation`] implementation delegates to for structured operations whose attached
 /// regions all mirror the operand list after a constant number of leading operands and whose outputs are each
 /// region's own outputs, such as a condition, whose branches follow its predicate, and a call, whose callee follows
 /// nothing. Loop-shaped operations such as `while` and `scan` carry their state symmetrically through a fixed point
-/// and need a rule of their own built on [`ReferenceDischargeRegionBoundary::symmetric`]. When nothing the
-/// application touches is a reference, use [`discharge_reference_free_operation`] instead.
+/// and need a rule of their own built on [`ReferenceDischargeRegionBoundary::symmetric`]. When the application touches
+/// no references, [`discharge_reference_free_operation`] can replay it unchanged. When reference state is confined to
+/// individual regions and their interfaces need no additional state inputs or outputs,
+/// [`discharge_local_reference_operation`] can rebuild them independently without requiring positional forwarding.
+/// This function additionally supports references crossing the regions' boundaries by explicitly threading their
+/// state through a shared positional interface.
 ///
 /// All attached regions receive one shared boundary, which is widened as follows:
 ///
@@ -6460,7 +6559,7 @@ mod tests {
         // reference-typed inputs are bound by the transform that instantiates them and therefore declare no input
         // provenance. Summarizing a condition branch containing such a call skips those rules exactly as the reference
         // analysis does, so discharging the program reaches the call's own discharge rule, which reports that a
-        // reference-carrying custom VJP has no rule, instead of failing on the undeclared provenance.
+        // caller reference cannot cross the custom VJP boundary, instead of failing on undeclared provenance.
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let identity = |input_types: Vec<ArrayIrType>, output_positions: Vec<usize>| {
@@ -6520,7 +6619,8 @@ mod tests {
         assert!(matches!(
             program.discharge_references::<ArrayReferenceDischarge>(0),
             Err(ProgramError::UnsupportedOperation { message })
-                if message == "`custom_vjp` carries reference state but has no reference discharge rule",
+                if message == "`custom_vjp` does not thread external references through discharge, but operand 0 is a \
+                    reference; pass reference-free operands or discharge external references first",
         ));
     }
 

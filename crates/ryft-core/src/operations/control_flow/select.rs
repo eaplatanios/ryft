@@ -197,7 +197,7 @@ impl_select_differentiation! {
             let condition = &inputs[0];
             let on_true = &inputs[1];
             let on_false = &inputs[2];
-            let mut primal = context.bind(
+            let mut primal = context.primal().bind(
                 SelectOperation::new(),
                 Vec::new(),
                 &[condition.primal().clone(), on_true.primal().clone(), on_false.primal().clone()],
@@ -208,16 +208,18 @@ impl_select_differentiation! {
                 MaybeZero::Zero(primal.r#type().tangent()?)
             } else {
                 // A `select` needs both branch tangents as real values, so materialize the structurally zero side.
-                let on_true_tangent = on_true.tangent().clone().materialize(context)?;
-                let on_false_tangent = on_false.tangent().clone().materialize(context)?;
-                let mut tangents = context.bind(
+                let on_true_tangent = on_true.tangent().clone().materialize(context.tangent())?;
+                let on_false_tangent = on_false.tangent().clone().materialize(context.tangent())?;
+                let condition = context.primal_to_tangent(condition.primal().clone())?;
+                let exemplar = context.primal_to_tangent(primal.clone())?;
+                let mut tangents = context.tangent().bind(
                     SelectOperation::new(),
                     Vec::new(),
-                    &[condition.primal().clone(), on_true_tangent, on_false_tangent],
+                    &[condition, on_true_tangent, on_false_tangent],
                 )?;
                 check_count!("output", tangents, 1, ProgramError);
                 let output_tangent_type = primal.r#type().tangent()?;
-                MaybeZero::Value(tangents.remove(0).align_tangent(&output_tangent_type, &primal)?)
+                MaybeZero::Value(tangents.remove(0).align_tangent(&output_tangent_type, &exemplar)?)
             };
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }

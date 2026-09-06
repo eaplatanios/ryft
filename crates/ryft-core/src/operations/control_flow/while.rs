@@ -27,8 +27,9 @@ use crate::batching::{
 use crate::captures::CaptureReference;
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    DifferentiationTracer, ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, DifferentiationTracer, ResidualZeroProvider, TransposableOperation,
+    TranspositionContext, TranspositionDriver, interpret_partitioned_jvp, primal_to_tangent_duals,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
@@ -98,11 +99,13 @@ pub const WHILE_OPERATION_NAME: &str = "while";
 ///     loop carries an iteration bound `B`, the rule stages an augmented primal while that *stores* every
 ///     per-iteration pushforward residual into a preallocated `[B, …]` stack (plus a Boolean validity mask), and the
 ///     tangent side becomes one masked linear [`scan`](super::scan::ScanOperation) of length `B` whose per-iteration
-///     `select` passes tangents through unchanged on the iterations beyond the actual trip count. The linear scan
-///     transposes totally, so reverse mode composes through staged bounded loops.
-///   - **Unbounded staged (recompute loop, forward-only).** Without a bound, no statically shaped residual
-///     stack exists, so the rule stages a doubled-state linear loop that recomputes its residuals forward; that loop
-///     rejects transposition, exactly like JAX's `while_loop`.
+///     `select` passes tangents through unchanged on the iterations beyond the actual trip count. Reverse mode
+///     transposes that scan when its residual types support the required storage and transposition operations.
+///   - **Unbounded staged (forward-only).** Shared forward-mode execution stages one fused loop over primal and
+///     tangent state. Separate linearization can split a pure loop when its predicate depends only on known primal
+///     state: the tangent loop recomputes the primal values it needs because no statically shaped residual stack is
+///     available. Loops that cannot satisfy this partition are rejected, and unbounded tangent loops do not support
+///     transposition.
 ///
 /// The `T` parameter fixes the loop's type universe in the payload itself. Consequently, one concrete
 /// [`WhileOperation<T>`](WhileOperation) has exactly one [`Operation<Type = T>`](Operation) contract even though the
@@ -685,9 +688,9 @@ where
     C::Operation: ZeroOperationProvider<C::Type>,
     for<'operation> &'operation WhileOperation<C::Type>: TryFrom<&'operation C::Operation>,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -695,7 +698,7 @@ where
         // region 1 the body), which keeps its bounds free of the operation family's own semantic traits.
         let condition = driver.region(0)?.to_program();
         let body = driver.region(1)?.to_program();
-        if context.is_eager()
+        if context.primal().is_eager()
             && let Some(outputs) = jvp_while_eagerly(self, &condition, &body, context, driver, inputs)?
         {
             return Ok(outputs);
@@ -1403,12 +1406,10 @@ fn rebuild_while_program<C: Context<Type = ArrayType>>(
 /// final values. The residual loop is the **original loop unchanged**: its unknown outputs are the unknown state
 /// elements' finals, and any known per-iteration values the unknown side reads are *recomputed inside the loop*
 /// rather than streamed as residual edges, because a loop with a data-dependent trip count has no statically shaped
-/// residual stream. This primal duplication is exactly what
-/// [JAX's `_while_partial_eval`](https://github.com/jax-ml/jax/blob/main/jax/_src/lax/control_flow/loops.py)
-/// accepts when linearizing `lax.while_loop`, and it is what makes [`Program::linearize`] total over the fused
-/// doubled-state loops staged by the unbounded `while` forward-mode rule: the known (primal) side recovers the
-/// primal outputs while the tangent program keeps the fused loop whole. The known-state outputs of the residual
-/// loop are left dead.
+/// residual stream. For an eligible fused forward-mode loop, this duplication lets the known side recover the
+/// primal outputs while the tangent program keeps the complete loop. The residual loop's known-state outputs are
+/// left dead. This does not support arbitrary unbounded-loop linearization: the split requires pure regions and a
+/// predicate that depends only on the closed known state.
 ///
 /// The split does not apply — and the caller residualizes unchanged — when the converged known subset is empty or
 /// complete (an all-known loop folds whole through the default rule), or when the predicate reads unknown state.
@@ -1632,11 +1633,11 @@ where
     /// programs; refer to the documentation of [`DifferentiableOperation::jvp`] for the contract. The scoped
     /// `driver` serves the rule's nested forward-mode and linearization requests over rebuilt body forms,
     /// keeping the rule free of operation-family semantic bounds.
-    fn jvp_while<D: DifferentiationDriver<C>>(
+    fn jvp_while<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         operation: &WhileOperation<Self>,
         condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         body: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>;
@@ -1826,11 +1827,11 @@ where
 /// capture, and the single outer transpose flips the scan direction and transposes the body — the masked pushforward
 /// side receives a zero cotangent on inactive batch items while the carried side receives the full cotangent, so
 /// cotangents pass through inactive batch items unchanged.
-fn jvp_array_backed_while<C, D: DifferentiationDriver<C>, A>(
+fn jvp_array_backed_while<C, D: DifferentiationDriver<C>, A, P: DifferentiationPolicy<C>>(
     operation: &WhileOperation<C::Type>,
     condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
     body: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
-    context: &C,
+    context: &DifferentiationContext<C, P>,
     driver: &D,
     inputs: &[DifferentiationDual<C::Value>],
 ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
@@ -1864,7 +1865,7 @@ where
         let (masked_condition, masked_body) = masked_while_programs::<_, _, A>(condition, body)?;
         let masked_while = WhileOperation::new().with_iteration_bound(operation.iteration_bound())?;
         let primal_operands = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-        let mut initial_mask = condition.interpret_in_context(context, primal_operands)?;
+        let mut initial_mask = condition.interpret_in_context(context.primal(), primal_operands)?;
         check_count!("output", initial_mask, 1, ProgramError);
         let mut extended_inputs = inputs.to_vec();
         extended_inputs.push(DifferentiationDual::new_with_zero_tangent(initial_mask.remove(0))?);
@@ -1881,7 +1882,7 @@ where
         return Ok(outputs);
     }
 
-    jvp_while_bounded::<_, _, A>(condition, context, driver, inputs, bound)
+    jvp_while_bounded::<_, _, A, _>(condition, context, driver, inputs, bound)
 }
 
 impl<C: Context<Type = ArrayType> + Zero<C::Value>> WhileJvp<C> for ArrayType
@@ -1893,22 +1894,22 @@ where
         + From<ScanOperation<C::Constant>>
         + WhileResidualStackOperation<ArrayType, C::Constant>,
 {
-    fn jvp_while<D: DifferentiationDriver<C>>(
+    fn jvp_while<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         operation: &WhileOperation<ArrayType>,
         condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         body: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        jvp_array_backed_while::<_, _, C::Constant>(operation, condition, body, context, driver, inputs)
+        jvp_array_backed_while::<_, _, C::Constant, _>(operation, condition, body, context, driver, inputs)
     }
 }
 
 /// Shared reverse-capable forward rule for a bounded, scalar-predicate, array-backed `while` loop.
-fn jvp_while_bounded<C, D: DifferentiationDriver<C>, A>(
+fn jvp_while_bounded<C, D: DifferentiationDriver<C>, A, P: DifferentiationPolicy<C>>(
     condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
-    context: &C,
+    context: &DifferentiationContext<C, P>,
     driver: &D,
     inputs: &[DifferentiationDual<C::Value>],
     bound: usize,
@@ -1990,11 +1991,12 @@ where
     for zero_state_type in
         std::iter::once(&counter_type).chain(stack_types.iter()).chain(std::iter::once(&mask_stack_type))
     {
-        let mut zeros = context.bind(C::Operation::residual_stack_zero(zero_state_type.clone()), Vec::new(), &[])?;
+        let mut zeros =
+            context.primal().bind(C::Operation::residual_stack_zero(zero_state_type.clone()), Vec::new(), &[])?;
         check_count!("output", zeros, 1, ProgramError);
         primal_operands.push(zeros.remove(0));
     }
-    let mut while_outputs = context.bind(
+    let mut while_outputs = context.primal().bind(
         C::Operation::from(WhileOperation::new().with_iteration_bound(bound)?),
         vec![extended_condition, augmented_body],
         primal_operands.as_slice(),
@@ -2153,27 +2155,35 @@ where
 
     // The tangent scan consumes invariant dimension residuals, live tangent carries, stored residual stacks, and one
     // scalar validity stack.
+    let tangent_inputs = primal_to_tangent_duals(context, inputs)?;
     let mut tangent_operands = invariant_residual_sources
         .iter()
         .flatten()
-        .map(|&state_index| inputs[state_index].primal().clone())
+        .map(|&state_index| tangent_inputs[state_index].primal().clone())
         .collect::<Vec<_>>();
     // Each state element's own primal names every runtime quantity a reference-bearing tangent type omits, because
     // the tangent type derivation preserves geometry exactly.
-    for (input, &active) in inputs.iter().zip(&element_has_tangent) {
+    for (input, &active) in tangent_inputs.iter().zip(&element_has_tangent) {
         if active {
             tangent_operands.push(C::Operation::materialize_zero_from_residual_sources(
-                context,
+                context.tangent(),
                 input.tangent().clone(),
                 std::iter::once(input.primal()),
             )?);
         }
     }
-    tangent_operands.extend(residual_stacks);
-    tangent_operands.push(mask_stack);
+    tangent_operands.extend(
+        residual_stacks
+            .into_iter()
+            .map(|value| context.primal_to_tangent(value))
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    tangent_operands.push(context.primal_to_tangent(mask_stack)?);
     let tangent_scan = ScanOperation::<C::Constant>::new(invariant_residual_count + tangent_state_count, bound);
     let tangent_outputs =
-        context.bind(C::Operation::from(tangent_scan), vec![scan_body], tangent_operands.as_slice())?;
+        context
+            .tangent()
+            .bind(C::Operation::from(tangent_scan), vec![scan_body], tangent_operands.as_slice())?;
     check_count!("output", tangent_outputs, invariant_residual_count + tangent_state_count, ProgramError);
 
     let mut tangent_outputs = tangent_outputs.into_iter().skip(invariant_residual_count);
@@ -2188,7 +2198,6 @@ where
             }
         })
         .collect::<Result<Vec<_>, _>>()
-        .map_err(Into::into)
 }
 
 impl<C: Context<Type = ArrayIrType> + Zero<C::Value>> WhileJvp<C> for ArrayIrType
@@ -2201,15 +2210,15 @@ where
         + From<ScanOperation<C::Constant>>
         + WhileResidualStackOperation<ArrayIrType, <C::Constant as ValueProjection<ArrayType>>::Projected>,
 {
-    fn jvp_while<D: DifferentiationDriver<C>>(
+    fn jvp_while<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         operation: &WhileOperation<ArrayIrType>,
         condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
         body: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-        jvp_array_backed_while::<_, _, <C::Constant as ValueProjection<ArrayType>>::Projected>(
+        jvp_array_backed_while::<_, _, <C::Constant as ValueProjection<ArrayType>>::Projected, _>(
             operation, condition, body, context, driver, inputs,
         )
     }
@@ -2226,17 +2235,12 @@ where
 /// tangent boundary input or output, and their output duals are restored as structural zeros. Because no residuals
 /// are stored, the rule applies to loops with *no* [`WhileOperation::iteration_bound`].
 ///
-/// The primal/tangent separation that linearization needs is recovered by partial evaluation rather than by this
-/// rule: the fused loop's primal half is *closed* (its next state and the predicate fold from primal state alone),
-/// so the `while` closed-knownness split (see the crate-private `split_while_by_closed_knownness`) rebinds a known
-/// primal-only loop on the known side and keeps the fused loop whole on the residual side, recomputing primal state
-/// there — the same primal duplication JAX's linearize-of-`while_loop` performs. Because the fused loop stores no
-/// per-iteration residuals, its linearized form is **not transposable**: reverse mode through a staged unbounded
-/// loop still reports the `while` transposition error, exactly like JAX's `lax.while_loop`.
-fn jvp_while_fused<C, D: DifferentiationDriver<C>>(
+/// Shared construction binds the fused loop directly. Separate construction partitions the generated loop while
+/// requiring every primal state output to remain known; loops that require an unbounded history are rejected.
+fn jvp_while_fused<C, D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
     operation: &WhileOperation<C::Type>,
     condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
-    context: &C,
+    context: &DifferentiationContext<C, P>,
     driver: &D,
     inputs: &[DifferentiationDual<C::Value>],
 ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
@@ -2288,19 +2292,38 @@ where
     operands.extend(inputs.iter().map(|input| input.primal().clone()));
     for (input, &has_tangent) in inputs.iter().zip(&element_has_tangent) {
         if has_tangent {
+            let primal = context.primal_to_tangent(input.primal().clone())?;
             operands.push(C::Operation::materialize_zero_from_residual_sources(
-                context,
+                context.tangent(),
                 input.tangent().clone(),
-                std::iter::once(input.primal()),
+                std::iter::once(&primal),
             )?);
         }
     }
     let fused_regions = [Arc::new(fused_condition), fused_body];
-    let outputs = context.bind(C::Operation::from(fused_while), CalleeRegionDriver::new(&fused_regions), &operands)?;
+    let outputs = if std::ptr::eq(context.primal(), context.tangent()) {
+        context
+            .primal()
+            .bind(C::Operation::from(fused_while), CalleeRegionDriver::new(&fused_regions), &operands)?
+    } else {
+        let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
+        let arguments = operands.iter().map(|value| builder.add_input(value.r#type().into_owned())).collect::<Vec<_>>();
+        let regions = fused_regions.iter().map(|program| builder.import_region(program.entry_region_ref())).collect();
+        let outputs = builder.add_instruction(C::Operation::from(fused_while), regions, arguments, None)?.to_vec();
+        let program = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
+            outputs,
+            vec![Placeholder; fused_state_count],
+            vec![Placeholder; fused_state_count],
+        )?;
+        let input_known = (0..fused_state_count).map(|index| index < state_count).collect::<Vec<_>>();
+        let required_outputs = (0..state_count).collect::<Vec<_>>();
+        let partition = driver.partition_jvp_program(program.entry_region_ref(), &input_known, &required_outputs)?;
+        interpret_partitioned_jvp(context, &partition, &operands, state_count)?
+    };
     check_count!("output", outputs, fused_state_count, ProgramError);
     let (primal_outputs, tangent_outputs) = outputs.split_at(state_count);
     let mut tangent_outputs = tangent_outputs.iter().cloned();
-    Ok(primal_outputs
+    primal_outputs
         .iter()
         .cloned()
         .zip(element_has_tangent)
@@ -2311,7 +2334,7 @@ where
                 DifferentiationDual::new_with_zero_tangent(primal)
             }
         })
-        .collect::<Result<Vec<_>, _>>()?)
+        .collect::<Result<Vec<_>, _>>()
 }
 
 /// Runs a `while` loop's forward-mode rule directly at concrete duals for an
@@ -2330,11 +2353,11 @@ where
 /// This rule derives no program from the body region and therefore consults no per-region transform cache: it
 /// interprets the body once per iteration at the concrete duals reached by the loop, so its work is a function of the
 /// runtime values rather than of the region's contents alone.
-fn jvp_while_eagerly<C, D: DifferentiationDriver<C>>(
+fn jvp_while_eagerly<C, D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
     operation: &WhileOperation<C::Type>,
     condition: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
     body: &Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
-    context: &C,
+    context: &DifferentiationContext<C, P>,
     driver: &D,
     inputs: &[DifferentiationDual<C::Value>],
 ) -> Result<Option<Vec<DifferentiationDual<C::Value>>>, ProgramError>
@@ -2360,7 +2383,7 @@ where
         }
 
         // Concretize the condition on the current concrete primal carries to decide whether another iteration runs.
-        let mut condition_outputs = condition.interpret_in_context(context, primal_carries.clone())?;
+        let mut condition_outputs = condition.interpret_in_context(context.primal(), primal_carries.clone())?;
         check_count!("output", condition_outputs, 1, ProgramError);
         let predicate = match condition_outputs.remove(0).concretize() {
             Ok(predicate) => predicate,
@@ -2388,7 +2411,7 @@ where
         let body_region = body.entry_region_ref();
         let output_duals = body_region.interpret_with::<_, ProgramError, _, _>(
             input_duals,
-            |_, constant| Ok(DifferentiationDual::new_with_zero_tangent(context.lift(constant.clone())?)?),
+            |_, constant| Ok(DifferentiationDual::new_with_zero_tangent(context.primal().lift(constant.clone())?)?),
             |instruction, input_duals| {
                 let programs = instruction
                     .regions()
@@ -2399,6 +2422,7 @@ where
                 {
                     let primal_inputs = input_duals.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
                     context
+                        .primal()
                         .bind(instruction.operation().clone(), programs, primal_inputs.as_slice())?
                         .into_iter()
                         .map(DifferentiationDual::new_with_zero_tangent)
@@ -2736,7 +2760,7 @@ impl<C: Context<Type = ArrayType>> WhilePredicate for BatchingTracer<C, ArrayBat
 {
 }
 
-impl<C: Context<Type: DifferentiableType>> WhilePredicate for DifferentiationTracer<C> where
+impl<C: Context<Type: DifferentiableType>, P: DifferentiationPolicy<C>> WhilePredicate for DifferentiationTracer<C, P> where
     C::Value: Concretizable<bool>
 {
 }

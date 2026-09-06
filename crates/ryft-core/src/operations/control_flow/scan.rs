@@ -22,9 +22,10 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
-    CotangentDestinationKind, DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, ReferenceOperandCotangents, ResidualZeroProvider, TransposableOperation,
-    TranspositionContext, TranspositionDriver, reference_operand_cotangents,
+    CotangentDestinationKind, DifferentiableOperation, DifferentiableType, DifferentiationContext,
+    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
+    ReferenceOperandCotangents, ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
+    reference_operand_cotangents,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
@@ -951,31 +952,16 @@ where
     }
 }
 
-// Capture-free forward-mode (JVP) rule for [`ScanOperation`], staging **one fused** jvp `scan` with compact
-// live-tangent carries and scanned inputs as an ordinary primal-enum `scan` operation over the shared builder.
-//
-// The rule builds the body's compact fused jvp program through its instruction-scoped differentiation driver
-// (boundary entries whose tangent type is a zero differential space carry no tangent entry) and permutes its
-// signature into scan order, giving a fused body
-// `[primal_carries..., live(tangent_carries)..., primal_slices..., live(tangent_slices)...] ->
-// [primal_next_carries..., live(tangent_next_carries)..., primal_outputs..., live(tangent_outputs)...]`, and stages
-// one scan whose carries are the primal carries followed by the live tangent carries. Pure forward mode therefore
-// runs a single loop pass and stores **no** per-iteration residual stacks — the JAX jvp-of-`scan` shape.
-//
-// The primal/tangent separation that reverse mode needs is deferred to partial evaluation: the known-ness split of
-// [`Program::linearize`](crate::Program::linearize) marks the primal halves known and the tangent halves unknown,
-// and the scan known-ness split (ryft's `_scan_partial_eval` analogue) separates the fused scan into a known
-// primal scan — stacking exactly the per-iteration known→unknown edges the tangent side consumes — and a residual
-// tangent scan over `[tangent_carries..., tangent_slices..., edge_slices...]`, the transposable linear-scan shape.
-// Residual stacks therefore exist only when linearization actually demands them.
-impl<C: Context<Type: DifferentiableType + ScanTypeSemantics> + Zero<C::Value>> DifferentiableOperation<C>
-    for ScanOperation<C::Constant>
+// Shared-destination JVP stages one fused scan without residual stacks. Separated destinations linearize the body
+// and reuse the ordinary partition reconstruction to stack varying residuals and thread invariant residuals.
+impl<C: Context<Type: DifferentiableType + ScanTypeSemantics + TemporalResidualType> + Zero<C::Value>>
+    DifferentiableOperation<C> for ScanOperation<C::Constant>
 where
-    C::Operation: ResidualZeroProvider<C::Type> + From<ScanOperation<C::Constant>>,
+    C::Operation: ResidualZeroProvider<C::Type> + From<ScanOperation<C::Constant>> + TemporalResidualOperation<C::Type>,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -988,9 +974,9 @@ where
 
         // The fused body is compact: it carries a tangent input exactly for the active body inputs and a tangent output
         // exactly for the body outputs whose tangent type is not a zero differential space. The input mask is the
-        // operand duals' activity (carries and scanned inputs map onto the body inputs positionally): a numeric operand
-        // is active (a symbolic zero is materialized below), while a plumbing reference operand and a zero-space
-        // operand are inactive and receive no tangent input. Carries keep positional identity, so the carry mask is the
+        // operand duals' activity (carries and scanned inputs map onto the body inputs positionally). Plumbing
+        // references and zero-space operands are inactive. Separated linearization also omits structural-zero scanned
+        // tangents, which remain zero on every iteration. Carries keep positional identity, so the carry mask is the
         // operand mask: a numeric carry's activity is fixed by its type, and a reference carry's tangent can only come
         // from its input, so the carry activity fixed point is trivial and a reference carry cannot become active
         // through iteration.
@@ -999,84 +985,143 @@ where
         let runtime_length_count = usize::from(length.variable().is_some());
         check_count!("input", inputs, body_input_count + runtime_length_count, ProgramError);
         let (body_inputs, runtime_length_inputs) = inputs.split_at(body_input_count);
-        let input_has_tangent = body_inputs.iter().map(DifferentiationDual::is_active).collect::<Vec<_>>();
+        let shared_destinations = std::ptr::eq(context.primal(), context.tangent());
+        // A structural-zero scanned tangent stays zero on every iteration, so separated linearization can omit it
+        // from the body interface. Carries may acquire a tangent from other inputs and retain their existing activity.
+        let input_has_tangent = body_inputs
+            .iter()
+            .enumerate()
+            .map(|(index, input)| {
+                input.is_active() && (shared_destinations || index < carry_count || !input.tangent().is_zero())
+            })
+            .collect::<Vec<_>>();
         let output_has_tangent = body.tangent_output_activity(&input_has_tangent)?;
         let body_output_count = output_has_tangent.len();
         let live_carry_count = input_has_tangent[..carry_count].iter().filter(|&&live| live).count();
 
-        // The fused jvp body is over `[primal_body_inputs..., live(tangent_body_inputs)...]`; permute its compact
-        // signature into scan order (carries lead scanned inputs on both the primal and live tangent sides). The
-        // unpermuted program comes from the body region's retained transform cache, so a body shared by several
-        // programs is differentiated once; the permutation into scan order is a boundary convention of this rule
-        // rather than a property of the body, so it is reapplied per use instead of being retained against the body.
-        let fused_body = driver.jvp_program(body, &input_has_tangent)?;
-        check_count!(
-            "input",
-            fused_body.input_types(),
-            body_input_count + input_has_tangent.iter().filter(|&&live| live).count(),
-            ProgramError,
-        );
+        let live_input_count = input_has_tangent.iter().filter(|&&live| live).count();
+        let live_output_count = output_has_tangent.iter().filter(|&&live| live).count();
         let input_order = live_scan_signature_permutation(&input_has_tangent, carry_count)?;
         let output_order = live_scan_signature_permutation(&output_has_tangent, carry_count)?;
-        let fused_body = reorder_program_boundary(&fused_body, &input_order, &output_order)?;
-
-        // Stage the fused scan over
-        // `[primal_carry_inits..., live(tangent_carry_inits)..., primal_stacks..., live(tangent_stacks)...]`.
+        let mut fused_inputs = body_inputs.iter().map(|input| (input.primal().clone(), true)).collect::<Vec<_>>();
+        for (input, &active) in body_inputs.iter().zip(&input_has_tangent) {
+            if active {
+                let primal = context.primal_to_tangent(input.primal().clone())?;
+                let tangent = C::Operation::materialize_zero_from_residual_sources(
+                    context.tangent(),
+                    input.tangent().clone(),
+                    std::iter::once(&primal),
+                )?;
+                fused_inputs.push((tangent, false));
+            }
+        }
+        let mut scan_inputs = input_order.iter().map(|&index| fused_inputs[index].clone()).collect::<Vec<_>>();
+        scan_inputs.extend(runtime_length_inputs.iter().map(|input| (input.primal().clone(), true)));
         let fused_scan = ScanOperation::<C::Constant>::new(carry_count + live_carry_count, length)
             .with_reverse(reverse)
             .with_unroll(unroll)?;
-        // The fused scan takes each live carry and scanned tangent as a real program input, so materialize their
-        // structural zeros at this sub-program boundary. Each operand's own primal names every runtime quantity a
-        // reference-bearing tangent type omits, because the tangent type derivation preserves geometry exactly.
-        let mut operands = Vec::with_capacity(fused_body.input_types().len());
-        for (inputs, activity) in [
-            (&body_inputs[..carry_count], &input_has_tangent[..carry_count]),
-            (&body_inputs[carry_count..], &input_has_tangent[carry_count..]),
-        ] {
-            operands.extend(inputs.iter().map(|input| input.primal().clone()));
-            for (input, &active) in inputs.iter().zip(activity) {
+        let outputs = if shared_destinations {
+            let fused_body = driver.jvp_program(body, &input_has_tangent)?;
+            let fused_body = reorder_program_boundary(&fused_body, &input_order, &output_order)?;
+            let operands = scan_inputs.iter().map(|(value, _)| value.clone()).collect::<Vec<_>>();
+            context
+                .primal()
+                .bind(C::Operation::from(fused_scan), vec![fused_body], &operands)?
+                .into_iter()
+                .map(|value| (value, false))
+                .collect::<Vec<_>>()
+        } else {
+            let (primal_program, tangent_program, residual_count) =
+                driver.linearize_program(body, &input_has_tangent)?.into_parts();
+            let mut fused_input_types = body.input_types();
+            fused_input_types.extend(tangent_program.input_types().into_iter().take(live_input_count));
+            let reordered_input_types =
+                input_order.iter().map(|&index| fused_input_types[index].clone()).collect::<Vec<_>>();
+            let input_known = input_order.iter().map(|&index| index < body_input_count).collect::<Vec<_>>();
+            let known_input_indices =
+                input_known.iter().enumerate().filter_map(|(index, &known)| known.then_some(index)).collect();
+            let residual_inputs = (0..live_input_count)
+                .map(|index| {
+                    PartialEvaluationInput::Unknown(
+                        input_order.iter().position(|&source| source == body_input_count + index).unwrap(),
+                    )
+                })
+                .chain((0..residual_count).map(PartialEvaluationInput::Known))
+                .collect();
+            let partition_outputs = output_order
+                .iter()
+                .map(|&index| {
+                    if index < body_output_count {
+                        PartialEvaluationOutput::Known(index)
+                    } else {
+                        PartialEvaluationOutput::Unknown(index - body_output_count)
+                    }
+                })
+                .collect();
+            let partition = PartitionedProgram::from_parts(
+                primal_program,
+                tangent_program,
+                known_input_indices,
+                residual_inputs,
+                partition_outputs,
+            );
+            reconstruct_partitioned_scan(
+                &fused_scan,
+                &reordered_input_types,
+                body_output_count + live_output_count,
+                &scan_inputs,
+                &input_known,
+                &input_known[..carry_count + live_carry_count],
+                partition,
+                |operation, programs, inputs| {
+                    let inputs = inputs.iter().map(|(value, _)| value.clone()).collect::<Vec<_>>();
+                    Ok(context
+                        .primal()
+                        .bind(operation, programs, &inputs)?
+                        .into_iter()
+                        .map(|value| (value, true))
+                        .collect())
+                },
+                |operation, programs, inputs| {
+                    let inputs = inputs
+                        .iter()
+                        .map(|(value, known)| {
+                            if *known {
+                                context.primal_to_tangent(value.clone()).map_err(ProgramError::from)
+                            } else {
+                                Ok(value.clone())
+                            }
+                        })
+                        .collect::<Result<Vec<_>, _>>()?;
+                    Ok(context
+                        .tangent()
+                        .bind(operation, programs, &inputs)?
+                        .into_iter()
+                        .map(|value| (value, false))
+                        .collect())
+                },
+            )?
+            .ok_or_else(|| ProgramError::UnsupportedOperation {
+                message: "scan linearization cannot store the residual boundary required by its body".to_string(),
+            })?
+        };
+        let mut original_outputs = vec![None; body_output_count + live_output_count];
+        for (&index, (value, _)) in output_order.iter().zip(outputs) {
+            original_outputs[index] = Some(value);
+        }
+        let mut tangent_outputs = original_outputs.split_off(body_output_count).into_iter();
+        original_outputs
+            .into_iter()
+            .zip(output_has_tangent)
+            .map(|(primal, active)| {
+                let primal = primal.unwrap();
                 if active {
-                    operands.push(C::Operation::materialize_zero_from_residual_sources(
-                        context,
-                        input.tangent().clone(),
-                        std::iter::once(input.primal()),
-                    )?);
+                    DifferentiationDual::new(primal, tangent_outputs.next().unwrap().unwrap())
+                } else {
+                    DifferentiationDual::new_with_zero_tangent(primal)
                 }
-            }
-        }
-        operands.extend(runtime_length_inputs.iter().map(|input| input.primal().clone()));
-        let outputs = context.bind(C::Operation::from(fused_scan), vec![fused_body], &operands)?;
-        let live_scanned_output_count = output_has_tangent[carry_count..].iter().filter(|&&live| live).count();
-        check_count!("output", outputs, body_output_count + live_carry_count + live_scanned_output_count, ProgramError,);
-
-        // The fused scan's outputs are `[primal_final_carries..., live(tangent_final_carries)..., primal_stacked...,
-        // live(tangent_stacked)...]`; zip the live halves back into `DifferentiationDual`s in the original output
-        // order, restoring structural zeros for the omitted zero-space outputs.
-        let scanned_output_count = body_output_count - carry_count;
-        let stacked_primals_start = carry_count + live_carry_count;
-        let stacked_tangents_start = stacked_primals_start + scanned_output_count;
-        let mut jvp_outputs = Vec::with_capacity(body_output_count);
-        let mut carry_tangents = outputs[carry_count..stacked_primals_start].iter().cloned();
-        for index in 0..carry_count {
-            // Scan's carry fixed point makes the carry input and output tangent liveness masks identical.
-            jvp_outputs.push(if input_has_tangent[index] {
-                DifferentiationDual::new(outputs[index].clone(), carry_tangents.next().unwrap())?
-            } else {
-                DifferentiationDual::new_with_zero_tangent(outputs[index].clone())?
-            });
-        }
-        let mut stacked_tangents = outputs[stacked_tangents_start..].iter().cloned();
-        for index in 0..scanned_output_count {
-            jvp_outputs.push(if output_has_tangent[carry_count + index] {
-                DifferentiationDual::new(
-                    outputs[stacked_primals_start + index].clone(),
-                    stacked_tangents.next().unwrap(),
-                )?
-            } else {
-                DifferentiationDual::new_with_zero_tangent(outputs[stacked_primals_start + index].clone())?
-            });
-        }
-        Ok(jvp_outputs)
+            })
+            .collect()
     }
 }
 
@@ -2148,8 +2193,7 @@ where
 // emitted over the original scan inputs unchanged.
 //
 /// Splits `scan` into a *known scan* bound in the enclosing known-side context and an *unknown scan* emitted into the
-/// residual program, by a fixed point over carry known-ness — ryft's analogue of JAX's `_scan_partial_eval`, which
-/// keeps time-varying known chains known instead of demoting them.
+/// residual program, using a fixed point over carry knownness that preserves time-varying known computations.
 ///
 /// A carry stays known iff the body computes its next value from known values alone (its init must be known); known
 /// stacked inputs are known throughout. Unlike the loop-*invariance* fixed point (which folds a carry once and
@@ -2165,9 +2209,11 @@ where
 /// eager context and staging it into the outer program under a staging one). The *unknown scan*'s body consumes the
 /// unknown carries, the unknown stacked slices, and one slice of each stacked edge per iteration; a known body
 /// next-carry belonging to an *unknown* carry (one whose value the unknown side threads) is instantiated as one more
-/// residual edge that the unknown body passes through, mirroring JAX's `instantiate` flag. An effectful unknown body
-/// still produces a zero-output residual scan when every boundary result belongs to the known side. If the split turns
-/// out to have an empty known side, the scan residualizes unchanged through the default rule instead.
+/// residual edge that the unknown body passes through. A known scan with no carries or instructions that only
+/// returns its input slices at a static length is replaced by the corresponding stacked operands. An effectful
+/// unknown body still produces a zero-output residual scan when every boundary result belongs to the known side.
+/// If the known side has no outputs, residual edges, or effects, the original scan residualizes unchanged through
+/// the default rule.
 fn split_scan_by_knownness<V, O, C, PartitionRegion>(
     context: &PartialEvaluationContext<C>,
     scan: &ScanOperation<V>,
@@ -2186,7 +2232,7 @@ where
     let body_output_count = body.output_types().len();
     let runtime_length_count = usize::from(scan.length.variable().is_some());
     check_count!("input", inputs, body_input_types.len() + runtime_length_count, ProgramError);
-    let (body_inputs, runtime_length_inputs) = inputs.split_at(body_input_types.len());
+    let (body_inputs, _) = inputs.split_at(body_input_types.len());
     let input_known = body_inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<bool>>();
 
     // Fixed point over carry known-ness, each round partitioning the borrowed body through a fresh staging context.
@@ -2214,23 +2260,59 @@ where
         carry_known = refined;
     };
 
-    // The split runs every known iteration before any residual one. Ordinary partial evaluation must keep ordered
-    // work on both sides interleaved by iteration, even when those effects involve different reference roots or no
-    // references at all. Linearization deliberately separates primal execution from later tangent execution.
-    // Reference feeders cannot be stacked as per-iteration residual values, and executable reference constants
-    // require conservative placement because their identities may connect iterations without a feeder. One-sided
-    // ordered effects may split because their relative execution order is unchanged.
-    let splits_ordered_effects = !context.is_linearizing()
-        && partition.known_program().effects().classes().is_ordered()
-        && partition.residual_program().effects().classes().is_ordered();
+    // The partition records the effect constraints of its construction contract. Ordinary specialization keeps
+    // global ordering; separately invoked residual work can exchange only independent reference resources.
+    if partition.has_cross_partition_effect_dependencies() {
+        return context.fold_or_residualize(O::from(scan.clone()), vec![body.to_program()], inputs);
+    }
+    if let Some(outputs) = reconstruct_partitioned_scan(
+        scan,
+        &body_input_types,
+        body_output_count,
+        inputs,
+        &input_known,
+        &carry_known,
+        partition,
+        |operation, programs, inputs| context.fold_or_residualize(operation, programs, inputs),
+        |operation, programs, inputs| context.residualize(operation, programs, inputs),
+    )? {
+        return Ok(outputs);
+    }
+    context.fold_or_residualize(O::from(scan.clone()), vec![body.to_program()], inputs)
+}
+
+/// Rebuilds two scans from a partitioned iteration body, storing each varying residual once per iteration. Returns
+/// `None` when a reference cannot cross the resulting boundary or the split has no known work.
+// These arguments keep source validation, boundary wiring, and the two binding destinations explicit.
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_partitioned_scan<V, O, Input, KnownBind, ResidualBind>(
+    scan: &ScanOperation<V>,
+    body_input_types: &[V::Type],
+    body_output_count: usize,
+    inputs: &[Input],
+    input_known: &[bool],
+    carry_known: &[bool],
+    partition: PartitionedProgram<V, O>,
+    mut bind_known: KnownBind,
+    mut bind_residual: ResidualBind,
+) -> Result<Option<Vec<Input>>, ProgramError>
+where
+    V: Value<Type: ScanTypeSemantics + TemporalResidualType>,
+    O: Operation<Type = V::Type> + From<ScanOperation<V>> + TemporalResidualOperation<V::Type>,
+    Input: Clone,
+    KnownBind: FnMut(O, Vec<Program<V, O, Vec<V>, Vec<V>>>, &[Input]) -> Result<Vec<Input>, ProgramError>,
+    ResidualBind: FnMut(O, Vec<Program<V, O, Vec<V>, Vec<V>>>, &[Input]) -> Result<Vec<Input>, ProgramError>,
+{
+    let carry_count = scan.carry_count;
+    let (body_inputs, runtime_length_inputs) = inputs.split_at(body_input_types.len());
     let contains_reference_constants =
         [partition.known_program(), partition.residual_program()].into_iter().any(|program| {
             program.entry_region_ref().computation_regions().any(|region| {
                 region.atoms().iter().any(|atom| atom.as_constant().is_some() && atom.r#type().is_reference())
             })
         });
-    if splits_ordered_effects || partition.known_reference_inputs().next().is_some() || contains_reference_constants {
-        return context.fold_or_residualize(O::from(scan.clone()), vec![body.to_program()], inputs);
+    if partition.known_reference_inputs().next().is_some() || contains_reference_constants {
+        return Ok(None);
     }
     let (known_program, residual_program, known_input_indices, residual_inputs, partition_outputs) =
         partition.into_parts();
@@ -2327,20 +2409,20 @@ where
     }
     let mut instantiated_edge_positions = vec![None; carry_count];
     for index in 0..carry_count {
-        if !carry_known[index] {
-            if let PartialEvaluationOutput::Known(output) = &partition_outputs[index] {
-                let output_type = known_program_output_types.get(*output).ok_or_else(|| {
+        if !carry_known[index]
+            && let PartialEvaluationOutput::Known(output) = &partition_outputs[index]
+        {
+            let output_type = known_program_output_types.get(*output).ok_or_else(|| {
                     ProgramError::MalformedProgram(format!(
                         "{SCAN_OPERATION_NAME} body partition output {index} references missing known-program output {output}",
                     ))
                 })?;
-                instantiated_edge_positions[index] = Some((edge_types.len(), known_program_output_indices.len()));
-                let edge = edge_types.len();
-                edge_types.push(output_type.clone());
-                edge_carry_sources.push(None);
-                known_program_output_indices.push(*output);
-                known_program_output_edges.push(Some(edge));
-            }
+            instantiated_edge_positions[index] = Some((edge_types.len(), known_program_output_indices.len()));
+            let edge = edge_types.len();
+            edge_types.push(output_type.clone());
+            edge_carry_sources.push(None);
+            known_program_output_indices.push(*output);
+            known_program_output_edges.push(Some(edge));
         }
     }
     let mut invariant_carry_sources = Vec::new();
@@ -2366,8 +2448,8 @@ where
         .collect::<Result<Vec<_>, TypeError>>()?;
 
     // An empty known side means the split folds nothing; residualize unchanged through the default rule.
-    if known_program_output_indices.is_empty() {
-        return context.fold_or_residualize(O::from(scan.clone()), vec![body.to_program()], inputs);
+    if known_program_output_indices.is_empty() && known_program.effects().classes().is_empty() {
+        return Ok(None);
     }
 
     // Bind the known scan into the enclosing known-side context over the original known inputs.
@@ -2415,8 +2497,30 @@ where
     let known_scan = ScanOperation::<V>::new(known_carry_count, scan.length.clone())
         .with_reverse(scan.reverse)
         .with_unroll(scan.unroll)?;
-    let known_outputs =
-        context.fold_or_residualize(O::from(known_scan), vec![known_body], known_scan_inputs.as_slice())?;
+    // A coefficient-only scan can merely return its input slices. Stacking those slices restores the original
+    // operands, including under reverse iteration, so rebuilding another loop would only hide their producers.
+    // Keep runtime-length scans explicit because their outputs may refine the operands' symbolic extent types.
+    let forwarded_outputs = (matches!(scan.length(), Dimension::Static(_))
+        && known_carry_count == 0
+        && known_body.instructions().is_empty())
+    .then(|| {
+        known_body
+            .output_ids()
+            .iter()
+            .map(|output| {
+                known_body
+                    .input_ids()
+                    .iter()
+                    .position(|input| input == output)
+                    .map(|index| known_scan_inputs[index].clone())
+            })
+            .collect::<Option<Vec<_>>>()
+    })
+    .flatten();
+    let known_outputs = match forwarded_outputs {
+        Some(outputs) => outputs,
+        None => bind_known(O::from(known_scan), vec![known_body], known_scan_inputs.as_slice())?,
+    };
 
     // Assemble the unknown body over `[unknown carries..., unknown stacked slices..., edge slices...]`, splicing the
     // residual body program over its unknown inputs and edge inputs, with instantiated known next-carries passed
@@ -2556,8 +2660,7 @@ where
             })?);
         }
         unknown_scan_inputs.extend_from_slice(runtime_length_inputs);
-        residual_outputs =
-            context.residualize(O::from(unknown_scan), vec![unknown_body], unknown_scan_inputs.as_slice())?;
+        residual_outputs = bind_residual(O::from(unknown_scan), vec![unknown_body], unknown_scan_inputs.as_slice())?;
     }
 
     // Reassemble the original scan's outputs from the two sides.
@@ -2586,7 +2689,8 @@ where
                 )
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>, _>>()
+        .map(Some)
 }
 
 // A scan carries state in its leading carry prefix, so discharged state joins that prefix rather than following the
@@ -3490,7 +3594,7 @@ mod tests {
     use crate::batching::{BatchingTracer, batch};
     use crate::captures::{CaptureReference, ClosedProgram};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::forward::JvpTransform;
+    use crate::differentiation::forward::LinearizationTransform;
     use crate::differentiation::reverse::TranspositionTransform;
     use crate::differentiation::{
         CotangentDestination, CotangentSeed, Differentiate, LinearizationTracer, ReverseModeDifferentiate,
@@ -6976,8 +7080,8 @@ mod tests {
         let second = scanning_program(&body, 2).linearize().unwrap();
         assert_ne!(first.tangent().to_string(), second.tangent().to_string());
 
-        // The body's fused forward-mode program is derived by the first program and served to the second.
-        let statistics = body.entry_region_ref().transform_statistics::<JvpTransform>().unwrap();
+        // The body's linearization is derived by the first program and served to the second.
+        let statistics = body.entry_region_ref().transform_statistics::<LinearizationTransform>().unwrap();
         assert_eq!((statistics.productions, statistics.hits), (1, 1));
 
         // An independently built copy of the same body shares no retained transforms, so it exercises the uncached
