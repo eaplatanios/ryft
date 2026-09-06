@@ -37,7 +37,9 @@
 
 use crate::arrays::{ArrayType, Dimension, ShardingDimension, StaticShape};
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{DifferentiationDriver, DifferentiationDual, DifferentiationError};
+use crate::differentiation::{
+    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
+};
 use crate::macros::check_count;
 use crate::operations::constants::zero::{Zero, ZeroOperationProvider};
 use crate::operations::manipulation::concatenation::{Concatenate, ConcatenateOperation};
@@ -344,8 +346,8 @@ type DecompositionTracer<C> = Tracer<TracingContext<<C as Domain>::Constant, <C 
 ///   - `axis`: Scanned axis.
 ///   - `reverse`: Whether the scan accumulates from the end of the scanned axis toward its start.
 ///   - `combine`: Member's associative operator, staged over the nested trace's values.
-pub(crate) fn jvp_through_associative_scan<C, D, F>(
-    context: &C,
+pub(crate) fn jvp_through_associative_scan<C, D, F, P: DifferentiationPolicy<C>>(
+    context: &DifferentiationContext<C, P>,
     driver: &D,
     primal: &C::Value,
     tangent: &C::Value,
@@ -367,11 +369,23 @@ where
         |value: DecompositionTracer<C>| associative_scan(&value, axis, reverse, &combine),
         primal.r#type().into_owned(),
     )?;
-    let fused = driver.jvp_program(decomposition.entry_region_ref(), &[true])?;
-    let mut outputs = fused.interpret_in_context(context, vec![primal.clone(), tangent.clone()])?;
-    check_count!("output", outputs, 2, ProgramError);
-    let output_tangent = outputs.remove(1);
-    Ok(DifferentiationDual::new(outputs.remove(0), MaybeZero::Value(output_tangent))?)
+    if std::ptr::eq(context.primal(), context.tangent()) {
+        let fused = driver.jvp_program(decomposition.entry_region_ref(), &[true])?;
+        let mut outputs = fused.interpret_in_context(context.primal(), vec![primal.clone(), tangent.clone()])?;
+        check_count!("output", outputs, 2, ProgramError);
+        let output_tangent = outputs.remove(1);
+        return DifferentiationDual::new(outputs.remove(0), MaybeZero::Value(output_tangent));
+    }
+    let linearization = driver.linearize_program(decomposition.entry_region_ref(), &[true])?;
+    let mut primal_outputs = linearization.primal().interpret_in_context(context.primal(), vec![primal.clone()])?;
+    check_count!("output", primal_outputs, 1 + linearization.residual_count(), ProgramError);
+    let residuals = primal_outputs.split_off(1);
+    let mut tangent_inputs = vec![tangent.clone()];
+    tangent_inputs
+        .extend(residuals.into_iter().map(|value| context.primal_to_tangent(value)).collect::<Result<Vec<_>, _>>()?);
+    let mut tangent_outputs = linearization.tangent().interpret_in_context(context.tangent(), tangent_inputs)?;
+    check_count!("output", tangent_outputs, 1, ProgramError);
+    DifferentiationDual::new(primal_outputs.remove(0), MaybeZero::Value(tangent_outputs.remove(0)))
 }
 
 /// Returns the elements of `value` at positions `start`, `start + stride`, ... below `limit` along `axis`, keeping
@@ -641,9 +655,9 @@ macro_rules! define_cumulative_operation {
                 + ZeroOperationProvider<ArrayType>,
             C::Value: $capability,
         {
-            fn jvp<D: DifferentiationDriver<C>>(
+            fn jvp<D: DifferentiationDriver<C>, P: $crate::DifferentiationPolicy<C>>(
                 &self,
-                context: &C,
+                context: &$crate::DifferentiationContext<C, P>,
                 driver: &D,
                 inputs: &[DifferentiationDual<C::Value>],
             ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -704,14 +718,14 @@ macro_rules! define_cumulative_operation {
         {
             #[inline]
             fn $forward(&self, axis: usize) -> Result<Self, ProgramError> {
-                Ok(self.dispatch_domain().bind($operation::new(axis), Vec::new(), &[self.clone()])?.remove(0))
+                Ok(self.dispatch_domain().bind($operation::new(axis), Vec::new(), std::slice::from_ref(self))?.remove(0))
             }
 
             #[inline]
             fn $reverse(&self, axis: usize) -> Result<Self, ProgramError> {
                 Ok(self
                     .dispatch_domain()
-                    .bind($operation::new(axis).with_reverse(true), Vec::new(), &[self.clone()])?
+                    .bind($operation::new(axis).with_reverse(true), Vec::new(), std::slice::from_ref(self))?
                     .remove(0))
             }
         }

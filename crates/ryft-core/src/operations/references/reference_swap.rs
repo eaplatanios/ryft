@@ -91,24 +91,6 @@ where
     }
 }
 
-impl<T, U, C> InterpretableOperation<C> for ReferenceSwapOperation<T, U>
-where
-    T: Type,
-    U: Type,
-    ReferenceSwapOperation<T, U>: Operation<Type = U>,
-    C: Domain<Type = U, Value: ReferenceSwap<C::Value>>,
-{
-    fn interpret<D: InterpretationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        check_count!("input", inputs, 2, ProgramError);
-        Ok(vec![inputs[0].swap(&inputs[1])?])
-    }
-}
-
 impl<T, U, C, P> ReferenceDischargeableOperation<C, P> for ReferenceSwapOperation<T, U>
 where
     T: Type,
@@ -132,6 +114,24 @@ where
         // rule re-derives the operand relationship its own inference already states.
         validate_operand_types(self, inputs)?;
         Ok(vec![ReferenceDischargeValue::Value(context.swap(reference, replacement)?)])
+    }
+}
+
+impl<T, U, C> InterpretableOperation<C> for ReferenceSwapOperation<T, U>
+where
+    T: Type,
+    U: Type,
+    ReferenceSwapOperation<T, U>: Operation<Type = U>,
+    C: Domain<Type = U, Value: ReferenceSwap<C::Value>>,
+{
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        check_count!("input", inputs, 2, ProgramError);
+        Ok(vec![inputs[0].swap(&inputs[1])?])
     }
 }
 

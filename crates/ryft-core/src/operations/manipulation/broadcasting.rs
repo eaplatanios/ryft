@@ -127,6 +127,8 @@ impl Operation for DynamicBroadcastOperation {
     }
 }
 
+impl_reference_free_dischargeable_operation!(DynamicBroadcastOperation);
+
 impl<C> InterpretableOperation<C> for DynamicBroadcastOperation
 where
     C: Domain<Type = ArrayIrType>,
@@ -532,8 +534,6 @@ where
         Ok(cotangents)
     }
 }
-
-impl_reference_free_dischargeable_operation!(DynamicBroadcastOperation);
 
 /// [`Operation`] that performs general N-dimensional broadcasting over the homogeneous array language.
 ///

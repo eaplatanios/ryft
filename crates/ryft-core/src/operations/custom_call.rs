@@ -1488,6 +1488,8 @@ impl Operation for CustomCallOperation<ArrayIrType> {
     }
 }
 
+impl_reference_free_dischargeable_operation!(<T> CustomCallOperation<T> where T: Type);
+
 impl<C: Domain<Type = ArrayType, Value: CustomCall>> InterpretableOperation<C> for CustomCallOperation<ArrayType> {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -1900,8 +1902,6 @@ impl_differentiable_operation! {
     },
     transpose = @nonlinear,
 }
-
-impl_reference_free_dischargeable_operation!(<T> CustomCallOperation<T> where T: Type);
 
 /// Represents the ability to call foreign kernels registered with the executing backend. [`CustomCall`] stages or
 /// executes a [`CustomCallOperation`]; refer to its documentation for the calling convention and the transform

@@ -28,8 +28,8 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionContext, TranspositionDriver,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, TransposableOperation, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -202,6 +202,21 @@ impl Operation for ReferenceIndexOperation {
     }
 }
 
+impl<C, P> ReferenceDischargeableOperation<C, P> for ReferenceIndexOperation
+where
+    C: Context<Type = ArrayIrType, Operation: From<ReferenceIndexOperation>>,
+    P: ReferenceDischargePolicy<C, Referent = ArrayType, Alias = ArrayReferenceView<C::Value>>,
+{
+    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
+        &self,
+        context: &ReferenceDischargeContext<C, P>,
+        _driver: &D,
+        inputs: &[ReferenceDischargeValue<C, P>],
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        discharge_reference_view(self, self.transform(), context, inputs)
+    }
+}
+
 impl<C: Domain<Type = ArrayIrType, Value: ReferenceIndex<C::Value>>> InterpretableOperation<C>
     for ReferenceIndexOperation
 {
@@ -268,6 +283,21 @@ impl Operation for ReferenceSliceOperation {
     fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
         OperationFormatter::new(formatter, indentation, self.name())?
             .bracketed(|operation| operation.field("axes", format_args!("{:?}", self.axes)))
+    }
+}
+
+impl<C, P> ReferenceDischargeableOperation<C, P> for ReferenceSliceOperation
+where
+    C: Context<Type = ArrayIrType, Operation: From<ReferenceSliceOperation>>,
+    P: ReferenceDischargePolicy<C, Referent = ArrayType, Alias = ArrayReferenceView<C::Value>>,
+{
+    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
+        &self,
+        context: &ReferenceDischargeContext<C, P>,
+        _driver: &D,
+        inputs: &[ReferenceDischargeValue<C, P>],
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        discharge_reference_view(self, self.transform(), context, inputs)
     }
 }
 
@@ -363,36 +393,6 @@ where
     ])
 }
 
-impl<C, P> ReferenceDischargeableOperation<C, P> for ReferenceIndexOperation
-where
-    C: Context<Type = ArrayIrType, Operation: From<ReferenceIndexOperation>>,
-    P: ReferenceDischargePolicy<C, Referent = ArrayType, Alias = ArrayReferenceView<C::Value>>,
-{
-    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
-        &self,
-        context: &ReferenceDischargeContext<C, P>,
-        _driver: &D,
-        inputs: &[ReferenceDischargeValue<C, P>],
-    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
-        discharge_reference_view(self, self.transform(), context, inputs)
-    }
-}
-
-impl<C, P> ReferenceDischargeableOperation<C, P> for ReferenceSliceOperation
-where
-    C: Context<Type = ArrayIrType, Operation: From<ReferenceSliceOperation>>,
-    P: ReferenceDischargePolicy<C, Referent = ArrayType, Alias = ArrayReferenceView<C::Value>>,
-{
-    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
-        &self,
-        context: &ReferenceDischargeContext<C, P>,
-        _driver: &D,
-        inputs: &[ReferenceDischargeValue<C, P>],
-    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
-        discharge_reference_view(self, self.transform(), context, inputs)
-    }
-}
-
 // The default partial-evaluation behavior applies to both views: a view carries no effect of its own and is placed
 // wherever its reference operand is.
 impl<C: Context<Type = ArrayIrType, Operation: From<ReferenceIndexOperation>>> PartiallyEvaluatableOperation<C>
@@ -436,9 +436,9 @@ impl<C: Context<Type = ArrayIrType, Value: ReferenceIndex<C::Value>>> Differenti
     // A view is pure aliasing metadata, so the tangent reference receives the same view as the primal reference. A
     // plumbing reference (i.e., a reference dual whose tangent is a symbolic zero) carries no tangent reference, so its
     // view stays plumbing.
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        _context: &C,
+        _context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -454,9 +454,9 @@ impl<C: Context<Type = ArrayIrType, Value: ReferenceSlice<C::Value>>> Differenti
     for ReferenceSliceOperation
 {
     // As in the `ReferenceIndexOperation` rule, the tangent reference receives the same view as the primal reference.
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        _context: &C,
+        _context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -1579,7 +1579,7 @@ mod tests {
         let reference = PartialEvaluationValue::known(TestValue::Reference(live.clone()));
         let replacement = PartialEvaluationValue::known(TestValue::Array(Array::scalar(2.0_f32)));
         let staging =
-            PartialEvaluationContext::new_with_reference_placement(TestContext::new(), ReferencePlacement::Stage);
+            PartialEvaluationContext::new(TestContext::new()).with_reference_placement(ReferencePlacement::Stage);
         assert!(
             staging
                 .fold_or_residualize(

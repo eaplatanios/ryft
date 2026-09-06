@@ -269,6 +269,8 @@ impl Operation for RngBitGeneratorOperation<ArrayIrType> {
     }
 }
 
+impl_reference_free_dischargeable_operation!(<T> RngBitGeneratorOperation<T> where T: Type);
+
 impl<C: Domain<Type = ArrayType, Value: RngBitGenerator>> InterpretableOperation<C>
     for RngBitGeneratorOperation<ArrayType>
 {
@@ -443,8 +445,6 @@ where
         .into())
     }
 }
-
-impl_reference_free_dischargeable_operation!(<T> RngBitGeneratorOperation<T> where T: Type);
 
 /// Represents the ability to generate deterministic random bits from a counter-based generator state.
 /// [`RngBitGenerator`] stages or executes an [`RngBitGeneratorOperation`]; refer to its documentation for the

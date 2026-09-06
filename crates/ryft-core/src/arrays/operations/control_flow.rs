@@ -1194,7 +1194,8 @@ mod tests {
             .unwrap();
 
         let linearization = program.linearize().unwrap();
-        assert_eq!(linearization.residual_count(), 2);
+        // Only the changing extent is needed by the linear body; the primal state is not a coefficient.
+        assert_eq!(linearization.residual_count(), 1);
         let rendered_primal = linearization.primal().to_string();
         let rendered_tangent = linearization.tangent().to_string();
         assert!(rendered_primal.contains("dimension_to_scalar"), "{rendered_primal}");

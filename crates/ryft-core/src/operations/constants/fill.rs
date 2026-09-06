@@ -1,7 +1,9 @@
 use crate::arrays::{Array, ArrayBatch, ArrayBatching, ArrayElement, ArrayType};
 use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext};
-use crate::differentiation::{DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationTracer};
+use crate::differentiation::{
+    DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationPolicy, DifferentiationTracer,
+};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::manipulation::broadcasting::{BROADCAST_OPERATION_NAME, Broadcast};
 use crate::operations::manipulation::conversion::ConvertElementType;
@@ -74,11 +76,11 @@ impl<L, C: Context<Type = ArrayType> + Fill<L, C::Value>> Fill<L, BatchingTracer
     }
 }
 
-impl<L, C: Context<Type: DifferentiableType> + Fill<L, C::Value>> Fill<L, DifferentiationTracer<C>>
-    for DifferentiationContext<C>
+impl<L, C: Context<Type: DifferentiableType> + Fill<L, C::Value>, P: DifferentiationPolicy<C>>
+    Fill<L, DifferentiationTracer<C, P>> for DifferentiationContext<C, P>
 {
     #[inline]
-    fn fill(&self, r#type: &C::Type, value: L) -> Result<DifferentiationTracer<C>, ProgramError> {
+    fn fill(&self, r#type: &C::Type, value: L) -> Result<DifferentiationTracer<C, P>, ProgramError> {
         let dual = DifferentiationDual::new_with_zero_tangent(self.parent().fill(r#type, value)?)?;
         Ok(DifferentiationTracer::new(dual, self.clone()))
     }

@@ -405,12 +405,14 @@ mod tests {
         ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation, ScanOperation, WhileOperation,
     };
     use crate::parameters::Placeholder;
+    use crate::partial::PartialValue;
     use crate::programs::{
         EffectClasses, Effects, ExternalReferenceBinding, InputRegionProvenance, Instruction, InstructionId, Operation,
         OutputRegionProvenance, Program, ProgramBuilder, ReferenceDischargeContext, ReferenceDischargeDriver,
         ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation,
         ReferenceSource, ReferenceType, ReferenceViewOperation, ReferenceViewValidationError, RegionInterface,
-        RegionSlot, TypeError, ViewSymbol, discharge_positional_region_operation, discharge_reference_free_operation,
+        RegionSlot, Type, TypeError, ViewSymbol, discharge_positional_region_operation,
+        discharge_reference_free_operation,
     };
     use crate::tracing::{Trace, Tracer, TracingContext};
 
@@ -3094,6 +3096,59 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_discharge_composes_with_partial_evaluation() {
+        let array_type = ArrayType::scalar(DataType::F32);
+        let reference_type = ReferenceType::new(array_type.clone());
+        let mut body_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let reference = body_builder.add_input(reference_type.clone().into());
+        let update = body_builder.add_constant(ArrayIrValue::Array(Array::scalar(1.0_f32)));
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let body = body_builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![reference],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(array_type.clone().into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let body = builder.import_region(body.entry_region_ref());
+        let reference = builder
+            .add_instruction(ScanOperation::<ArrayIrValue<Array>>::new(1, 3), vec![body], vec![reference], None)
+            .unwrap()[0];
+        let output =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        // Discharge turns the scan's mutated reference into an ordinary carry before partial evaluation runs, so an
+        // unknown boundary residualizes the whole three-iteration loop as a pure reference-free program.
+        let evaluation = source
+            .discharge_references(0)
+            .unwrap()
+            .into_program_without_external_references()
+            .unwrap()
+            .partially_evaluate(&[PartialValue::Unknown(array_type.into())])
+            .unwrap();
+        assert!(evaluation.program().effects().classes().is_empty());
+        assert!(!evaluation.program().entry_region_ref().contains_atom_type_in_closure(Type::is_reference));
+        assert_eq!(
+            evaluation.program().interpret(vec![ArrayIrValue::Array(Array::scalar(3.0_f32))]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(6.0_f32))]),
+        );
+    }
+
+    #[test]
     fn test_scan_discharge_appends_the_synthesized_carry_after_the_declared_carry_prefix() {
         // A scan that already declares an ordinary carry pins the synthesized-state placement exactly: the state
         // operand joins the carry prefix behind every declared carry and ahead of the trailing stacked inputs, on the
@@ -3398,6 +3453,47 @@ mod tests {
             }
         }
 
+        // A third-party call-shaped family participates in structured discharge by reaching the shared positional
+        // rewrite, exactly as the backend `jit_call` does, with no companion declaration surface beyond the generic
+        // provenance hooks it already implements. Its reference primitives delegate to the universe-generic rules the
+        // primitives own, and every other native payload replays as the enclosing enum, which is the same split a
+        // dispatch derive generates.
+        impl<C, P> ReferenceDischargeableOperation<C, P> for CallingOperation
+        where
+            C: Context<Type = ArrayIrType, Operation = CallingOperation>,
+            P: ReferenceAccumulationPolicy<C, Referent = ArrayType>,
+        {
+            fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
+                &self,
+                context: &ReferenceDischargeContext<C, P>,
+                driver: &D,
+                inputs: &[ReferenceDischargeValue<C, P>],
+            ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+                match self {
+                    Self::Native(ArrayIrOperation::ReferenceNew(operation)) => {
+                        operation.discharge_references(context, driver, inputs)
+                    }
+                    Self::Native(ArrayIrOperation::ReferenceRead(operation)) => {
+                        operation.discharge_references(context, driver, inputs)
+                    }
+                    Self::Native(ArrayIrOperation::ReferenceWrite(operation)) => {
+                        operation.discharge_references(context, driver, inputs)
+                    }
+                    Self::Native(ArrayIrOperation::ReferenceSwap(operation)) => {
+                        operation.discharge_references(context, driver, inputs)
+                    }
+                    Self::Native(ArrayIrOperation::ReferenceAddUpdate(operation)) => {
+                        operation.discharge_references(context, driver, inputs)
+                    }
+                    Self::Native(ArrayIrOperation::ReferenceFreeze(operation)) => {
+                        operation.discharge_references(context, driver, inputs)
+                    }
+                    Self::Native(_) => discharge_reference_free_operation(self, context, driver, inputs),
+                    Self::Call => discharge_positional_region_operation(self, context, driver, inputs, 0),
+                }
+            }
+        }
+
         impl From<ReferenceIndexOperation> for CallingOperation {
             fn from(operation: ReferenceIndexOperation) -> Self {
                 Self::Native(operation.into())
@@ -3476,47 +3572,6 @@ mod tests {
         impl_calling_operation_from_reference_primitive!(ReferenceSwapOperation);
         impl_calling_operation_from_reference_primitive!(ReferenceAddUpdateOperation);
         impl_calling_operation_from_reference_primitive!(ReferenceFreezeOperation);
-
-        // A third-party call-shaped family participates in structured discharge by reaching the shared positional
-        // rewrite, exactly as the backend `jit_call` does, with no companion declaration surface beyond the generic
-        // provenance hooks it already implements. Its reference primitives delegate to the universe-generic rules the
-        // primitives own, and every other native payload replays as the enclosing enum, which is the same split a
-        // dispatch derive generates.
-        impl<C, P> ReferenceDischargeableOperation<C, P> for CallingOperation
-        where
-            C: Context<Type = ArrayIrType, Operation = CallingOperation>,
-            P: ReferenceAccumulationPolicy<C, Referent = ArrayType>,
-        {
-            fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
-                &self,
-                context: &ReferenceDischargeContext<C, P>,
-                driver: &D,
-                inputs: &[ReferenceDischargeValue<C, P>],
-            ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
-                match self {
-                    Self::Native(ArrayIrOperation::ReferenceNew(operation)) => {
-                        operation.discharge_references(context, driver, inputs)
-                    }
-                    Self::Native(ArrayIrOperation::ReferenceRead(operation)) => {
-                        operation.discharge_references(context, driver, inputs)
-                    }
-                    Self::Native(ArrayIrOperation::ReferenceWrite(operation)) => {
-                        operation.discharge_references(context, driver, inputs)
-                    }
-                    Self::Native(ArrayIrOperation::ReferenceSwap(operation)) => {
-                        operation.discharge_references(context, driver, inputs)
-                    }
-                    Self::Native(ArrayIrOperation::ReferenceAddUpdate(operation)) => {
-                        operation.discharge_references(context, driver, inputs)
-                    }
-                    Self::Native(ArrayIrOperation::ReferenceFreeze(operation)) => {
-                        operation.discharge_references(context, driver, inputs)
-                    }
-                    Self::Native(_) => discharge_reference_free_operation(self, context, driver, inputs),
-                    Self::Call => discharge_positional_region_operation(self, context, driver, inputs, 0),
-                }
-            }
-        }
 
         // The callee mutates the allocation it receives and returns only the old snapshot, so its declared boundary
         // hides

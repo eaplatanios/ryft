@@ -114,6 +114,8 @@ impl Operation for DimensionFromScalarOperation {
     }
 }
 
+impl_reference_free_dischargeable_operation!(DimensionFromScalarOperation);
+
 impl<C: Domain<Type = ArrayIrType, Value: DimensionFromScalar<C::Value>>> InterpretableOperation<C>
     for DimensionFromScalarOperation
 {
@@ -203,8 +205,6 @@ where
 
 impl_non_differentiable_operation!(DimensionFromScalarOperation);
 impl_non_transposable_operation!(DimensionFromScalarOperation);
-
-impl_reference_free_dischargeable_operation!(DimensionFromScalarOperation);
 
 /// Converts ordinary rank-zero integer array data into a checked first-class dimension.
 ///

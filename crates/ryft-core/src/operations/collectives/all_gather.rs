@@ -18,8 +18,9 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    MemberDifferentiableOperation, TransposableOperation, TranspositionContext, TranspositionDriver,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, TransposableOperation,
+    TranspositionContext, TranspositionDriver, primal_to_tangent_duals,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
@@ -674,9 +675,9 @@ where
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: From<AxisIndexOperation>,
 {
-    fn jvp_in_parent<D: DifferentiationDriver<C>>(
+    fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -807,9 +808,9 @@ where
 
 /// Applies the mixed array IR JVP for invariant all-gather. Its transpose selects the current participant's
 /// gathered chunk using the retained input geometry and reshapes an untiled size-one participant axis away.
-fn jvp_invariant_all_gather<C>(
+fn jvp_invariant_all_gather<C, P: DifferentiationPolicy<C>>(
     operation: &AllGatherOperation,
-    context: &C,
+    context: &DifferentiationContext<C, P>,
     inputs: &[DifferentiationDual<C::Value>],
 ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
 where
@@ -825,14 +826,17 @@ where
         + OperationProjection<DimensionType, Projected = DimensionOperation<DimensionValue>>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: From<AxisIndexOperation>,
 {
-    let Some((array, output_extents)) = inputs.split_first() else {
+    let Some((array, _)) = inputs.split_first() else {
         return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
     };
     let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-    let primal = context.bind(operation.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
+    let primal = context.primal().bind(operation.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
     let tangent = match array.tangent() {
         MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
         MaybeZero::Value(array_tangent) => {
+            let tangent_inputs = primal_to_tangent_duals(context, inputs)?;
+            let (array, output_extents) = tangent_inputs.split_first().unwrap();
+            let context = context.tangent();
             let mut residuals = LinearResiduals::new();
             let output_extents = residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
             let input_shape = residuals.retain_shape(context, array.primal())?;

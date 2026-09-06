@@ -156,6 +156,8 @@ impl Operation for CompareOperation<ArrayIrType> {
     }
 }
 
+impl_reference_free_dischargeable_operation!(<T> CompareOperation<T> where T: Type);
+
 impl ElementwiseOperation for CompareOperation<ArrayType> {
     #[inline]
     fn input_count(&self) -> usize {
@@ -220,8 +222,6 @@ where
 
 impl_non_differentiable_operation!(<T> CompareOperation<T> where T: Type);
 impl_non_transposable_operation!(<T> CompareOperation<T> where T: Type);
-
-impl_reference_free_dischargeable_operation!(<T> CompareOperation<T> where T: Type);
 
 /// Represents the ability to perform a pairwise comparison between two values. For array values,
 /// `left.compare(right, direction)` produces a Boolean-valued result whose `i`-th element is the result of comparing

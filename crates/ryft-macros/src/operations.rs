@@ -877,7 +877,6 @@ impl OperationEnum {
             quote!(allows_reference_access_through_region_input),
             quote!(, region_index, mode),
         );
-        let reference_semantics_arms = self.operation_forwarding_arms(quote!(reference_semantics), quote!());
         let effects_arms = self.operation_forwarding_arms(quote!(effects), quote!());
         let render_arms = self.operation_forwarding_arms(quote!(render), quote!(, formatter, indentation));
 
@@ -919,7 +918,7 @@ impl OperationEnum {
                     &self,
                     region_index: usize,
                     input_index: usize,
-                ) -> ::std::option::Option<usize> {
+                ) -> ::std::option::Option<#ryft::InputRegionProvenance> {
                     match self { #(#input_region_provenance_arms)* }
                 }
 
@@ -950,11 +949,7 @@ impl OperationEnum {
                     match self { #(#allows_reference_access_through_region_input_arms)* }
                 }
 
-                fn reference_semantics(&self) -> std::borrow::Cow<'_, #ryft::ReferenceOperationSemantics> {
-                    match self { #(#reference_semantics_arms)* }
-                }
-
-                fn effects(&self) -> #ryft::Effects {
+                fn effects(&self) -> ::std::borrow::Cow<'_, #ryft::Effects> {
                     match self { #(#effects_arms)* }
                 }
 
@@ -1556,12 +1551,16 @@ impl OperationEnum {
                             {
                                 let tangent_type =
                                     <#member_type as #ryft::DifferentiableType>::tangent(output_type)?;
-                                let mut tangents = context.bind(
+                                let tangent_inputs = primal_inputs
+                                    .iter()
+                                    .map(|value| context.primal_to_tangent(value.clone()))
+                                    .collect::<::std::result::Result<::std::vec::Vec<_>, _>>()?;
+                                let mut tangents = context.tangent().bind(
                                     <#differentiation_self_type as ::std::convert::From<
                                         #ryft::ZeroOperation<#member_type>,
                                     >>::from(#ryft::ZeroOperation::new(tangent_type)),
                                     ::std::vec::Vec::new(),
-                                    primal_inputs.as_slice(),
+                                    tangent_inputs.as_slice(),
                                 )?;
                                 #ryft::check_count!("output", tangents, 1, ProgramError);
                                 return #ryft::DifferentiationDual::new(
@@ -1585,7 +1584,7 @@ impl OperationEnum {
                             let output_types = <#operation_type as #ryft::MemberOperation<#primary_type>>::
                                 infer_parent_output_types(#receiver, input_types.as_slice(), &[])?;
                             let primals =
-                                context.bind(self.clone(), ::std::vec::Vec::new(), primal_inputs.as_slice())?;
+                                context.primal().bind(self.clone(), ::std::vec::Vec::new(), primal_inputs.as_slice())?;
                             #ryft::check_count!("output", primals, output_types.len(), ProgramError);
                             primals
                                 .into_iter()
@@ -1600,7 +1599,7 @@ impl OperationEnum {
                 }
                 OperationVariantClass::ProjectedMember { structural: true, .. } => quote! {
                     Self::#variant_ident(_) => {
-                        context
+                        context.primal()
                             .bind(
                                 self.clone(),
                                 ::std::vec::Vec::new(),
@@ -1626,9 +1625,9 @@ impl OperationEnum {
                 for #differentiation_self_type
             #differentiation_where_clause
             {
-                fn jvp<__D: #ryft::DifferentiationDriver<__DifferentiationContext>>(
+                fn jvp<__D: #ryft::DifferentiationDriver<__DifferentiationContext>, __Policy: #ryft::DifferentiationPolicy<__DifferentiationContext>>(
                     &self,
-                    context: &__DifferentiationContext,
+                    context: &#ryft::DifferentiationContext<__DifferentiationContext, __Policy>,
                     driver: &__D,
                     inputs: &[#ryft::DifferentiationDual<
                         <__DifferentiationContext as #ryft::Domain>::Value,
@@ -1798,7 +1797,8 @@ impl OperationEnum {
                     #operation_self_type,
                 >>(
                     &self,
-                    context: &mut #ryft::TracingContext<
+                    context: &mut #ryft::TranspositionContext<
+                        '_,
                         #transposed_value_type,
                         #operation_self_type,
                     >,

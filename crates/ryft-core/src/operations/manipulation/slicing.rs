@@ -613,6 +613,8 @@ impl Operation for DynamicShapeSliceOperation {
     }
 }
 
+impl_reference_free_dischargeable_operation!(DynamicShapeSliceOperation);
+
 // Eager interpretation of [`DynamicShapeSliceOperation`] resolves its first-class start and size operands and then
 // delegates to the array value's ordinary static [`Slice`] implementation. Staged contexts bind the operation
 // directly and therefore do not call this rule.
@@ -815,8 +817,6 @@ impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> Transposabl
         .into())
     }
 }
-
-impl_reference_free_dischargeable_operation!(DynamicShapeSliceOperation);
 
 /// Represents the ability to extract a (possibly strided) sub-array using static start, limit, and stride values.
 /// Its semantics follow StableHLO's [`slice`](https://openxla.org/stablehlo/spec#slice) operation.

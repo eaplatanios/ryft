@@ -82,24 +82,6 @@ where
     }
 }
 
-impl<T, U, C> InterpretableOperation<C> for ReferenceReadOperation<T, U>
-where
-    T: Type,
-    U: Type,
-    ReferenceReadOperation<T, U>: Operation<Type = U>,
-    C: Domain<Type = U, Value: ReferenceRead<C::Value>>,
-{
-    fn interpret<D: InterpretationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].read()?])
-    }
-}
-
 impl<T, U, C, P> ReferenceDischargeableOperation<C, P> for ReferenceReadOperation<T, U>
 where
     T: Type,
@@ -117,6 +99,24 @@ where
         check_count!("input", inputs, 1, ProgramError);
         let reference = inputs[0].try_as_reference("a reference to read")?;
         Ok(vec![ReferenceDischargeValue::Value(context.read(reference)?)])
+    }
+}
+
+impl<T, U, C> InterpretableOperation<C> for ReferenceReadOperation<T, U>
+where
+    T: Type,
+    U: Type,
+    ReferenceReadOperation<T, U>: Operation<Type = U>,
+    C: Domain<Type = U, Value: ReferenceRead<C::Value>>,
+{
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
+        Ok(vec![inputs[0].read()?])
     }
 }
 

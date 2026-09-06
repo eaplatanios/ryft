@@ -114,6 +114,26 @@ where
     }
 }
 
+impl<T, U, C, P> ReferenceDischargeableOperation<C, P> for ReferenceFreezeOperation<T, U>
+where
+    T: Type,
+    U: Type,
+    ReferenceFreezeOperation<T, U>: Operation<Type = U>,
+    C: Context<Type = U, Operation: From<ReferenceFreezeOperation<T, U>>>,
+    P: ReferenceDischargePolicy<C, Referent = T>,
+{
+    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
+        &self,
+        context: &ReferenceDischargeContext<C, P>,
+        _driver: &D,
+        inputs: &[ReferenceDischargeValue<C, P>],
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
+        let reference = inputs[0].try_as_reference("a reference to freeze")?;
+        Ok(vec![ReferenceDischargeValue::Value(context.consume(reference)?)])
+    }
+}
+
 impl<T, U, C> InterpretableOperation<C> for ReferenceFreezeOperation<T, U>
 where
     T: Type,
@@ -136,26 +156,6 @@ where
         // handle is held to it while the program is traced, and an eager clone shares the allocation that reports the
         // misuse.
         Ok(vec![inputs[0].clone().freeze()?])
-    }
-}
-
-impl<T, U, C, P> ReferenceDischargeableOperation<C, P> for ReferenceFreezeOperation<T, U>
-where
-    T: Type,
-    U: Type,
-    ReferenceFreezeOperation<T, U>: Operation<Type = U>,
-    C: Context<Type = U, Operation: From<ReferenceFreezeOperation<T, U>>>,
-    P: ReferenceDischargePolicy<C, Referent = T>,
-{
-    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
-        &self,
-        context: &ReferenceDischargeContext<C, P>,
-        _driver: &D,
-        inputs: &[ReferenceDischargeValue<C, P>],
-    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
-        check_count!("input", inputs, 1, ProgramError);
-        let reference = inputs[0].try_as_reference("a reference to freeze")?;
-        Ok(vec![ReferenceDischargeValue::Value(context.consume(reference)?)])
     }
 }
 

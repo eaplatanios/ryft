@@ -816,6 +816,31 @@ pub(crate) mod tests {
         }
     }
 
+    // The family delegates each variant to the primitive rule that owns it, which is exactly what a dispatch derive
+    // generates, and is what lets the program-level entry point drive these rules over this universe.
+    impl<C, P> ReferenceDischargeableOperation<C, P> for TestOperation
+    where
+        C: Context<Type = TestType, Operation = TestOperation>,
+        P: ReferenceAccumulationPolicy<C, Referent = TestReferent>,
+    {
+        fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
+            &self,
+            context: &ReferenceDischargeContext<C, P>,
+            driver: &D,
+            inputs: &[ReferenceDischargeValue<C, P>],
+        ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+            match self {
+                Self::Add => discharge_reference_free_operation(self, context, driver, inputs),
+                Self::New(operation) => operation.discharge_references(context, driver, inputs),
+                Self::Read(operation) => operation.discharge_references(context, driver, inputs),
+                Self::Write(operation) => operation.discharge_references(context, driver, inputs),
+                Self::Swap(operation) => operation.discharge_references(context, driver, inputs),
+                Self::AddUpdate(operation) => operation.discharge_references(context, driver, inputs),
+                Self::Freeze(operation) => operation.discharge_references(context, driver, inputs),
+            }
+        }
+    }
+
     // Only the addition is executable: a reference primitive reaches an eager destination exclusively as the replay of
     // an access to a preserved reference, and a preserved reference lives in the staging destination, which records
     // rather than executes.
@@ -856,31 +881,6 @@ pub(crate) mod tests {
     impl_test_operation_from_reference_primitive!(Swap, Swap);
     impl_test_operation_from_reference_primitive!(AddUpdate, AddUpdate);
     impl_test_operation_from_reference_primitive!(Freeze, Freeze);
-
-    // The family delegates each variant to the primitive rule that owns it, which is exactly what a dispatch derive
-    // generates, and is what lets the program-level entry point drive these rules over this universe.
-    impl<C, P> ReferenceDischargeableOperation<C, P> for TestOperation
-    where
-        C: Context<Type = TestType, Operation = TestOperation>,
-        P: ReferenceAccumulationPolicy<C, Referent = TestReferent>,
-    {
-        fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
-            &self,
-            context: &ReferenceDischargeContext<C, P>,
-            driver: &D,
-            inputs: &[ReferenceDischargeValue<C, P>],
-        ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
-            match self {
-                Self::Add => discharge_reference_free_operation(self, context, driver, inputs),
-                Self::New(operation) => operation.discharge_references(context, driver, inputs),
-                Self::Read(operation) => operation.discharge_references(context, driver, inputs),
-                Self::Write(operation) => operation.discharge_references(context, driver, inputs),
-                Self::Swap(operation) => operation.discharge_references(context, driver, inputs),
-                Self::AddUpdate(operation) => operation.discharge_references(context, driver, inputs),
-                Self::Freeze(operation) => operation.discharge_references(context, driver, inputs),
-            }
-        }
-    }
 
     /// Destination value of the discharge-rule tests: one integer payload carrying its own referent type.
     #[derive(Copy, Clone, Debug, PartialEq)]

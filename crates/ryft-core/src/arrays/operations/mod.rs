@@ -20,8 +20,9 @@ use crate::arrays::types::ir::ArrayIrType;
 use crate::axes::AxisIndexOperation;
 use crate::contexts::{Context, ProjectedContext};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    MemberDifferentiableOperation, ResidualZeroProvider, jvp_projected_operation,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, ResidualZeroProvider,
+    jvp_projected_operation,
 };
 use crate::operations::attention::{
     DotProductAttention, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
@@ -837,11 +838,11 @@ impl<A: Value<Type = ArrayType>> From<ConstantOperation<DimensionValue>> for Arr
 ///
 /// # Parameters
 ///
-///   - `context`: [`Context`] that owns the primal trace, in which the extent reads and the replications are bound.
+///   - `context`: Construction destinations for extent reads and primal and tangent replications.
 ///   - `operation`: Elementwise [`ArrayOperation`] whose operands are being replicated.
 ///   - `inputs`: Input [`DifferentiationDual`]s that the rule received.
-fn replicated_elementwise_duals<A, C>(
-    context: &C,
+fn replicated_elementwise_duals<A, C, P: DifferentiationPolicy<C>>(
+    context: &DifferentiationContext<C, P>,
     operation: &ArrayOperation<A>,
     inputs: &[DifferentiationDual<C::Value>],
 ) -> Result<Option<Vec<DifferentiationDual<C::Value>>>, DifferentiationError>
@@ -903,7 +904,7 @@ where
         let extent = match dimension {
             Dimension::Static(extent) => {
                 let extent = DimensionValue::constant(*extent).map_err(ProgramError::from)?;
-                context.bind(ConstantOperation::new(extent), Vec::new(), &[])?.remove(0)
+                context.primal().bind(ConstantOperation::new(extent), Vec::new(), &[])?.remove(0)
             }
             Dimension::Dynamic(_) => {
                 let source = input_types.iter().enumerate().find_map(|(index, input_type)| {
@@ -919,6 +920,7 @@ where
                     .into());
                 };
                 context
+                    .primal()
                     .bind(
                         DimensionSizeOperation::new(&input_types[index], input_axis)?,
                         Vec::new(),
@@ -945,15 +947,25 @@ where
             let mut replication_inputs = Vec::with_capacity(1 + extents.len());
             replication_inputs.push(input.primal().clone());
             replication_inputs.extend(extents.iter().cloned());
-            let primal = context.bind(replication.clone(), Vec::new(), replication_inputs.as_slice())?.remove(0);
+            let primal =
+                context.primal().bind(replication.clone(), Vec::new(), replication_inputs.as_slice())?.remove(0);
             let tangent = match input.tangent() {
                 MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
                 MaybeZero::Value(tangent) => {
-                    replication_inputs[0] = tangent.clone();
-                    MaybeZero::Value(context.bind(replication, Vec::new(), replication_inputs.as_slice())?.remove(0))
+                    let mut tangent_inputs = vec![tangent.clone()];
+                    tangent_inputs.extend(
+                        extents
+                            .iter()
+                            .cloned()
+                            .map(|value| context.primal_to_tangent(value))
+                            .collect::<Result<Vec<_>, _>>()?,
+                    );
+                    MaybeZero::Value(
+                        context.tangent().bind(replication, Vec::new(), tangent_inputs.as_slice())?.remove(0),
+                    )
                 }
             };
-            Ok(DifferentiationDual::new(primal, tangent)?)
+            DifferentiationDual::new(primal, tangent)
         })
         .collect::<Result<Vec<_>, DifferentiationError>>()
         .map(Some)
@@ -979,9 +991,9 @@ where
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     ArrayOperation<A>: Operation<Type = ArrayType> + DifferentiableOperation<ProjectedContext<C, ArrayType>>,
 {
-    fn jvp_in_parent<D: DifferentiationDriver<C>>(
+    fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -1013,27 +1025,30 @@ where
                 let tangent_array_type = <&ArrayType>::try_from(&tangent_type)?;
                 let primal_type = primal.r#type();
                 let primal_data_type = <&ArrayType>::try_from(primal_type.as_ref())?.data_type();
+                let tangent_primal = context.primal_to_tangent(primal.clone())?;
                 let exemplar = if tangent_array_type.data_type() == primal_data_type {
-                    primal.clone()
+                    tangent_primal.clone()
                 } else {
                     context
+                        .tangent()
                         .bind(
                             ArrayIrOperation::<A>::Array(ArrayOperation::ConvertElementType(
                                 ConvertElementTypeOperation::new(tangent_array_type.data_type()),
                             )),
                             Vec::new(),
-                            std::slice::from_ref(&primal),
+                            std::slice::from_ref(&tangent_primal),
                         )?
                         .remove(0)
                 };
                 let tangent = context
+                    .tangent()
                     .bind(
                         ArrayIrOperation::<A>::Array(ArrayOperation::ZeroLike(ZeroLikeOperation::new())),
                         Vec::new(),
                         &[exemplar],
                     )?
                     .remove(0);
-                DifferentiationDual::new(primal, MaybeZero::Value(tangent)).map_err(Into::into)
+                DifferentiationDual::new(primal, MaybeZero::Value(tangent))
             })
             .collect()
     }

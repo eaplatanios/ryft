@@ -67,6 +67,8 @@ impl Operation for DimensionToScalarOperation {
     }
 }
 
+impl_reference_free_dischargeable_operation!(DimensionToScalarOperation);
+
 impl<C: Domain<Type = ArrayIrType, Value: DimensionToScalar<C::Value>>> InterpretableOperation<C>
     for DimensionToScalarOperation
 {
@@ -118,8 +120,6 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>
 
 impl_non_differentiable_operation!(DimensionToScalarOperation);
 impl_non_transposable_operation!(DimensionToScalarOperation);
-
-impl_reference_free_dischargeable_operation!(DimensionToScalarOperation);
 
 /// Converts a first-class dimension into ordinary rank-zero signed 64-bit array data.
 ///

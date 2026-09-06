@@ -217,6 +217,8 @@ impl Operation for ConcatenateOperation<ArrayType> {
     }
 }
 
+impl_reference_free_dischargeable_operation!(<T> ConcatenateOperation<T> where T: Type);
+
 impl<C: Domain<Type = ArrayType, Value: Concatenate>> InterpretableOperation<C> for ConcatenateOperation<ArrayType> {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
@@ -836,8 +838,6 @@ where
         Ok(cotangents)
     }
 }
-
-impl_reference_free_dischargeable_operation!(<T> ConcatenateOperation<T> where T: Type);
 
 /// Represents the ability to join one or more arrays end to end along one axis. This is the direct analogue of JAX's
 /// [`lax.concatenate`](https://docs.jax.dev/en/latest/_autosummary/jax.lax.concatenate.html) and has the semantics of

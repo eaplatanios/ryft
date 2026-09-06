@@ -75,6 +75,16 @@ impl<T: Type> RegionInterface<T> {
     }
 }
 
+/// Stand-in for `ryft_core::InputRegionProvenance`.
+#[derive(Debug, PartialEq, Eq)]
+enum InputRegionProvenance {
+    /// The region receives the operation input unchanged.
+    Forwarded { input_index: usize },
+
+    /// The region receives a view derived from the operation input.
+    View { input_index: usize },
+}
+
 /// Stand-in for `ryft_core::OutputRegionProvenance`.
 #[derive(Debug, PartialEq, Eq)]
 struct OutputRegionProvenance {
@@ -223,17 +233,11 @@ where
 }
 
 /// Stand-in for `ryft_core::Effects`.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 enum Effects {
+    #[default]
     Pure,
     Ordered,
-}
-
-/// Stand-in for `ryft_core::ReferenceOperationSemantics`.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-enum ReferenceOperationSemantics {
-    #[default]
-    None,
     Read,
 }
 
@@ -279,7 +283,7 @@ trait Operation: Clone {
         region_interfaces: &[RegionInterface<Self::Type>],
     ) -> Result<Vec<Self::Type>, TypeError>;
 
-    fn input_region_provenance(&self, _region_index: usize, _input_index: usize) -> Option<usize> {
+    fn input_region_provenance(&self, _region_index: usize, _input_index: usize) -> Option<InputRegionProvenance> {
         None
     }
 
@@ -308,12 +312,8 @@ trait Operation: Clone {
         false
     }
 
-    fn reference_semantics(&self) -> std::borrow::Cow<'_, ReferenceOperationSemantics> {
-        std::borrow::Cow::Owned(ReferenceOperationSemantics::None)
-    }
-
-    fn effects(&self) -> Effects {
-        Effects::Pure
+    fn effects(&self) -> std::borrow::Cow<'_, Effects> {
+        std::borrow::Cow::Owned(Effects::Pure)
     }
 
     fn rename_type_identities(
@@ -472,6 +472,27 @@ impl<V: Value, O: Operation<Type = V::Type>> Value for Tracer<TracingContext<V, 
     type Type = V::Type;
 }
 
+/// Stand-in for `ryft_core::TranspositionContext`. Mirrors the real context's region lifetime and its dereferencing to
+/// the wrapped tracing context, which is what generated transposition dispatchers pass through to payload rules.
+struct TranspositionContext<'r, V: Value, O: Operation<Type = V::Type>> {
+    context: TracingContext<V, O>,
+    marker: PhantomData<&'r ()>,
+}
+
+impl<V: Value, O: Operation<Type = V::Type>> std::ops::Deref for TranspositionContext<'_, V, O> {
+    type Target = TracingContext<V, O>;
+
+    fn deref(&self) -> &TracingContext<V, O> {
+        &self.context
+    }
+}
+
+impl<V: Value, O: Operation<Type = V::Type>> std::ops::DerefMut for TranspositionContext<'_, V, O> {
+    fn deref_mut(&mut self) -> &mut TracingContext<V, O> {
+        &mut self.context
+    }
+}
+
 /// Stand-in for `ryft_core::MaybeZero`. The manual trait implementations avoid bounding the value parameter, which
 /// is instantiated at the `Debug`-less `Tracer` stand-in.
 struct MaybeZero<V> {
@@ -503,7 +524,7 @@ impl<V> Eq for MaybeZero<V> {}
 trait TransposableOperation<V: Value, O: Operation<Type = V::Type>>: Operation<Type = V::Type> {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        context: &mut TracingContext<V, O>,
+        context: &mut TranspositionContext<'_, V, O>,
         driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -606,11 +627,40 @@ impl<V> std::fmt::Debug for DifferentiationDual<V> {
     }
 }
 
+/// Stand-in for `ryft_core::DifferentiationPolicy` used by generated rule dispatchers.
+trait DifferentiationPolicy<C: Context>: Copy + Clone + std::fmt::Debug {}
+
+/// Stand-in for the default fused policy.
+#[derive(Copy, Clone, Debug)]
+struct FusedDifferentiation;
+
+impl<C: Context> DifferentiationPolicy<C> for FusedDifferentiation {}
+
+/// Stand-in for the concrete rule construction context.
+struct DifferentiationContext<C: Context, P: DifferentiationPolicy<C> = FusedDifferentiation> {
+    primal: C,
+    policy: PhantomData<P>,
+}
+
+impl<C: Context> DifferentiationContext<C> {
+    /// Creates the fused context used by these dispatcher tests.
+    fn new(primal: C) -> Self {
+        Self { primal, policy: PhantomData }
+    }
+}
+
+impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
+    /// Returns the underlying context.
+    fn primal(&self) -> &C {
+        &self.primal
+    }
+}
+
 /// Stand-in for `ryft_core::DifferentiableOperation`.
 trait DifferentiableOperation<C: Context>: Operation<Type = C::Type> {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>;
@@ -916,9 +966,9 @@ impl<T: Type, C: Context<Type = T>> partial::PartiallyEvaluatableOperation<C> fo
 }
 
 impl<T: Type, C: Context<Type = T>> DifferentiableOperation<C> for ZeroOperation<T> {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        _context: &C,
+        _context: &DifferentiationContext<C, P>,
         _driver: &D,
         _inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -929,7 +979,7 @@ impl<T: Type, C: Context<Type = T>> DifferentiableOperation<C> for ZeroOperation
 impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>> TransposableOperation<V, O> for ZeroOperation<T> {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        _context: &mut TracingContext<V, O>,
+        _context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -976,7 +1026,7 @@ impl<C: Context<Type = DataType>> partial::PartiallyEvaluatableOperation<C> for 
 impl<V: Value<Type = DataType>, O: Operation<Type = DataType>> TransposableOperation<V, O> for AddOperation {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        _context: &mut TracingContext<V, O>,
+        _context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -1017,8 +1067,12 @@ impl Operation for PrintOperation {
         Ok(input_types.to_vec())
     }
 
-    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
-        (region_index == 0).then_some(input_index)
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
+        match region_index {
+            0 => Some(InputRegionProvenance::Forwarded { input_index }),
+            1 => Some(InputRegionProvenance::View { input_index: input_index + 1 }),
+            _ => None,
+        }
     }
 
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
@@ -1041,12 +1095,8 @@ impl Operation for PrintOperation {
         output_index == 3
     }
 
-    fn effects(&self) -> Effects {
-        Effects::Ordered
-    }
-
-    fn reference_semantics(&self) -> std::borrow::Cow<'_, ReferenceOperationSemantics> {
-        std::borrow::Cow::Owned(ReferenceOperationSemantics::Read)
+    fn effects(&self) -> std::borrow::Cow<'_, Effects> {
+        std::borrow::Cow::Owned(Effects::Read)
     }
 
     fn rename_type_identities(
@@ -1120,7 +1170,7 @@ impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>, F: Clone> Transposable
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        _context: &mut TracingContext<V, O>,
+        _context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -1170,9 +1220,9 @@ where
 }
 
 impl<T: Type, Constant: Clone, C: Context<Type = T>> DifferentiableOperation<C> for ConstantOperation<T, Constant> {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        _context: &C,
+        _context: &DifferentiationContext<C, P>,
         _driver: &D,
         _inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -1288,7 +1338,7 @@ impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>, F: Clone> Transposable
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        _context: &mut TracingContext<V, O>,
+        _context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -1404,8 +1454,8 @@ fn test_operation_generates_operation_forwarding() {
     let add = DataOperation::<ScalarFactor>::from(AddOperation);
     let print = DataOperation::<ScalarFactor>::from(PrintOperation);
 
-    assert_eq!(add.effects(), Effects::Pure);
-    assert_eq!(print.effects(), Effects::Ordered);
+    assert_eq!(add.effects().into_owned(), Effects::Pure);
+    assert_eq!(print.effects().into_owned(), Effects::Read);
     assert_eq!(print.region_slots(), &[RegionSlot { name: "body", role: RegionRole::Rule }]);
     assert_eq!(print.region_role(0), Some(RegionRole::Rule));
     assert_eq!(print.rename_type_identities(&TypeIdentityRenaming::new()), Ok(print.clone()));
@@ -1423,13 +1473,11 @@ fn test_operation_generates_operation_forwarding() {
     assert!(!print.allows_reference_access_through_region_input(0, ReferenceAccessMode::ReadWrite));
     assert!(!print.allows_reference_access_through_region_input(1, ReferenceAccessMode::Read));
     assert_eq!(add.input_region_provenance(0, 0), None);
-    assert_eq!(print.input_region_provenance(0, 2), Some(2));
-    assert_eq!(print.input_region_provenance(1, 2), None);
+    assert_eq!(print.input_region_provenance(0, 2), Some(InputRegionProvenance::Forwarded { input_index: 2 }),);
+    assert_eq!(print.input_region_provenance(1, 2), Some(InputRegionProvenance::View { input_index: 3 }),);
     assert!(!add.is_zero(0));
     assert!(print.is_zero(3));
     assert!(!print.is_zero(4));
-    assert_eq!(add.reference_semantics().into_owned(), ReferenceOperationSemantics::None);
-    assert_eq!(print.reference_semantics().into_owned(), ReferenceOperationSemantics::Read);
     assert_eq!(print.to_string(), "rendered print");
 }
 
@@ -1472,11 +1520,12 @@ mod mixed_members {
     use ryft::arrays::Array;
     use ryft::{
         ArrayIrType, ArrayIrValue, ArrayType, Context, DataType, DifferentiableOperation, DifferentiableType,
-        DifferentiationDriver, DifferentiationDual, Dimension, DimensionBounds, DimensionOperation, DimensionType,
-        DimensionValue, DimensionVariable, EmptyRegionDriver, MaybeZero, MemberDifferentiableOperation,
-        MemberInterpretableOperation, MemberOperation, Operation, PartialValue, ProgramError, RegionInterface, Shape,
-        StagingContext, Tracer, TracingContext, TransposableOperation, TranspositionDriver, TypeError,
-        TypeIdentityRenaming, Typed, Value, ZeroOperation, ZeroOperationProvider,
+        DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationPolicy, Dimension,
+        DimensionBounds, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, EmptyRegionDriver,
+        MaybeZero, MemberDifferentiableOperation, MemberInterpretableOperation, MemberOperation, Operation,
+        PartialValue, ProgramError, RegionInterface, Shape, StagingContext, Tracer, TracingContext,
+        TransposableOperation, TranspositionContext, TranspositionDriver, TypeError, TypeIdentityRenaming, Typed,
+        Value, ZeroOperation, ZeroOperationProvider,
     };
 
     /// Member payload whose parent instruction interleaves its two array data operands with two first-class dimension
@@ -1550,12 +1599,13 @@ mod mixed_members {
     impl<C: Context<Type = ArrayIrType, Operation: From<InterleavedOperation>>> MemberDifferentiableOperation<C>
         for InterleavedOperation
     {
-        fn jvp_in_parent<D: DifferentiationDriver<C>>(
+        fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
             &self,
-            context: &C,
+            context: &DifferentiationContext<C, P>,
             _driver: &D,
             inputs: &[DifferentiationDual<C::Value>],
         ) -> Result<Vec<DifferentiationDual<C::Value>>, ryft::DifferentiationError> {
+            let context = context.primal();
             // A linear payload pushes its tangents through the same mixed instruction, keeping the geometry operands
             // as primals.
             let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
@@ -1567,7 +1617,7 @@ mod mixed_members {
     impl<V: Value<Type = ArrayType>, O: Operation<Type = ArrayType>> TransposableOperation<V, O> for InterleavedOperation {
         fn transpose<D: TranspositionDriver<V, O>>(
             &self,
-            _context: &mut TracingContext<V, O>,
+            _context: &mut TranspositionContext<'_, V, O>,
             _driver: &D,
             inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
             outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -1661,7 +1711,7 @@ mod mixed_members {
     {
         fn transpose<D: TranspositionDriver<V, O>>(
             &self,
-            _context: &mut TracingContext<V, O>,
+            _context: &mut TranspositionContext<'_, V, O>,
             _driver: &D,
             inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
             _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -1717,12 +1767,13 @@ mod mixed_members {
         A: Value<Type = ArrayType>,
         C: Context<Type = ArrayIrType, Operation: From<MixedMemberOperation<A>>>,
     {
-        fn jvp_in_parent<D: DifferentiationDriver<C>>(
+        fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
             &self,
-            context: &C,
+            context: &DifferentiationContext<C, P>,
             _driver: &D,
             inputs: &[DifferentiationDual<C::Value>],
         ) -> Result<Vec<DifferentiationDual<C::Value>>, ryft::DifferentiationError> {
+            let context = context.primal();
             // The fixture's member family is only the projection target of this operation family, so its
             // parent-universe rule stages the member instruction and reports constant outputs.
             let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
@@ -1779,11 +1830,11 @@ mod mixed_members {
 
         // Transposing that interleaved instruction delegates the array operands, in operand order, to the payload's
         // homogeneous rule and gives each interleaved dimension operand a structural zero cotangent.
-        let mut context = TracingContext::<ArrayIrValue<Array>, Operation>::new();
+        let context = TracingContext::<ArrayIrValue<Array>, Operation>::new();
         let output_cotangent = context.input(array_type.clone().into());
         let cotangents = operation
             .transpose(
-                &mut context,
+                &mut TranspositionContext::new(context.clone()),
                 &EmptyRegionDriver,
                 &[
                     PartialValue::Unknown(array_type.clone().into()),
@@ -1823,7 +1874,7 @@ mod mixed_members {
             dimension_type: dimension_type.clone(),
         });
         let context = TracingContext::<ArrayIrValue<Array>, Operation>::new();
-        let duals = operation.jvp(&context, &EmptyRegionDriver, &[]).unwrap();
+        let duals = operation.jvp(&DifferentiationContext::new(context.clone()), &EmptyRegionDriver, &[]).unwrap();
 
         assert_eq!(duals.len(), 2);
         assert_eq!(duals[0].primal().r#type().as_ref(), &ArrayIrType::from(array_type.clone()));
@@ -1919,7 +1970,7 @@ impl<C: Context<Type = ArrayType>> partial::PartiallyEvaluatableOperation<C> for
 impl<V: Value<Type = ArrayType>, O: Operation<Type = ArrayType>> TransposableOperation<V, O> for BackendPayload {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        _context: &mut TracingContext<V, O>,
+        _context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -1968,9 +2019,9 @@ where
     C: Context<Type = ArrayType>,
     C::Constant: SpecialDifferentiableValue,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        _context: &C,
+        _context: &DifferentiationContext<C, P>,
         _driver: &D,
         _inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -1985,7 +2036,7 @@ where
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        _context: &mut TracingContext<V, O>,
+        _context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -2017,7 +2068,7 @@ fn test_operation_propagates_differentiation_payload_bounds() {
 
     let context = TestContext::<Factor, Operation> { marker: PhantomData };
     let operation = Operation::from(SpecialOperation);
-    let outputs = operation.jvp(&context, &EmptyRegionDriver, &[]).unwrap();
+    let outputs = operation.jvp(&DifferentiationContext::new(context), &EmptyRegionDriver, &[]).unwrap();
 
     assert_eq!(outputs.len(), 1);
     assert_eq!(outputs[0].label, "special");
@@ -2102,7 +2153,7 @@ impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>, W: Clone, P: Clone> Tr
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        _context: &mut TracingContext<V, O>,
+        _context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -2155,7 +2206,7 @@ impl<V: Value<Type = ArrayType>, O: Operation<Type = ArrayType>, P: Operation<Ty
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        _context: &mut TracingContext<V, O>,
+        _context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -2210,7 +2261,7 @@ impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>, C: Clone, P: Clone, F:
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        _context: &mut TracingContext<V, O>,
+        _context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -2310,7 +2361,10 @@ fn test_transposable_operation_dispatches_to_payloads() {
     type Operation = LinearScalarOperation<ScalarFactor>;
 
     let operation = Operation::from(ZeroOperation { r#type: DataType });
-    let mut context = TracingContext::<ScalarFactor, Operation> { marker: PhantomData };
+    let mut context = TranspositionContext::<ScalarFactor, Operation> {
+        context: TracingContext { marker: PhantomData },
+        marker: PhantomData,
+    };
 
     assert_eq!(operation.transpose(&mut context, &EmptyRegionDriver, &[], &[]).unwrap(), vec![transposed("zero")],);
 }
@@ -2998,8 +3052,8 @@ impl Operation for ReferenceAwareExtensionOperation {
         Ok(input_types.to_vec())
     }
 
-    fn reference_semantics(&self) -> std::borrow::Cow<'_, ReferenceOperationSemantics> {
-        std::borrow::Cow::Owned(ReferenceOperationSemantics::Read)
+    fn effects(&self) -> std::borrow::Cow<'_, Effects> {
+        std::borrow::Cow::Owned(Effects::Read)
     }
 }
 
@@ -3123,11 +3177,14 @@ fn test_operation_generates_all_selected_dispatchers() {
         vec![ReferenceDischargeValue::labeled("zero_rule")],
     );
 
-    let differentiated = operation.jvp(&context, &EmptyRegionDriver, &[]).unwrap();
+    let differentiated = operation.jvp(&DifferentiationContext::new(context), &EmptyRegionDriver, &[]).unwrap();
     assert_eq!(differentiated.len(), 1);
     assert_eq!(differentiated[0].label, "zero");
 
-    let mut transposition_context = TracingContext::<Factor, Operation> { marker: PhantomData };
+    let mut transposition_context = TranspositionContext {
+        context: TracingContext::<Factor, Operation> { marker: PhantomData },
+        marker: PhantomData,
+    };
     assert_eq!(
         operation.transpose(&mut transposition_context, &EmptyRegionDriver, &[], &[]).unwrap(),
         vec![transposed("zero")],

@@ -6,7 +6,9 @@ use crate::arrays::{
 };
 use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
-use crate::differentiation::{DifferentiationContext, DifferentiationDual, DifferentiationTracer};
+use crate::differentiation::{
+    DifferentiationContext, DifferentiationDual, DifferentiationPolicy, DifferentiationTracer,
+};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
     check_count, impl_non_differentiable_operation, impl_nullary_batchable_operation,
@@ -257,9 +259,11 @@ impl<C: Context<Type = ArrayType> + Iota<C::Value>> Iota<BatchingTracer<C, Array
     }
 }
 
-impl<C: Context<Type = ArrayType> + Iota<C::Value>> Iota<DifferentiationTracer<C>> for DifferentiationContext<C> {
+impl<C: Context<Type = ArrayType> + Iota<C::Value>, P: DifferentiationPolicy<C>> Iota<DifferentiationTracer<C, P>>
+    for DifferentiationContext<C, P>
+{
     #[inline]
-    fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<DifferentiationTracer<C>, ProgramError> {
+    fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<DifferentiationTracer<C, P>, ProgramError> {
         let dual = DifferentiationDual::new_with_zero_tangent(self.parent().iota(r#type, dimension)?)?;
         Ok(DifferentiationTracer::new(dual, self.clone()))
     }

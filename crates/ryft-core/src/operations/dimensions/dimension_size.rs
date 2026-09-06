@@ -170,6 +170,8 @@ impl Operation for DimensionSizeOperation {
     }
 }
 
+impl_reference_free_dischargeable_operation!(DimensionSizeOperation);
+
 impl<C: Domain<Type = ArrayIrType, Value: DimensionSize<C::Value>>> InterpretableOperation<C>
     for DimensionSizeOperation
 {
@@ -249,8 +251,6 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>> Ba
 
 impl_non_differentiable_operation!(DimensionSizeOperation);
 impl_non_transposable_operation!(DimensionSizeOperation);
-
-impl_reference_free_dischargeable_operation!(DimensionSizeOperation);
 
 /// Reads the runtime extent of one array axis.
 ///

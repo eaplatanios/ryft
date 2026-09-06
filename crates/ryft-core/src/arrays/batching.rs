@@ -2825,7 +2825,8 @@ where
     ArrayIrBatching: BatchingPolicyProjection<C, T>,
     C::Constant:
         ValueProjection<ArrayType, Projected: Value<Type = ArrayType>> + ValueProjection<T, Projected: Value<Type = T>>,
-    C::Value: ValueProjection<T, Projected: Value<Type = T>>,
+    C::Value: ValueProjection<T, Projected: Value<Type = T>>
+        + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     C::Operation: BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayIrBatching>
         + From<DynamicBroadcastOperation>
         + From<ConstantOperation<DimensionValue>>
@@ -3331,7 +3332,7 @@ fn ragged_mask_identity_scalar(data_type: DataType, identity: RaggedMaskIdentity
 /// replicated array with the context's first-class extent. A reference's batch axis is fixed by its referent, so a
 /// reference batch is returned unchanged when it already carries `axis` and rejected otherwise; first-class dimensions
 /// have no packed axis and are always rejected. The mapped move transposes through the value's projected
-/// [`Transpose`] capability; refer to [`align_array_batch_with`] for the shared geometry.
+/// [`Transpose`] capability. Dynamic broadcasts are emitted through the parent context.
 pub(crate) fn align_array_batch<C>(
     context: &BatchingContext<C, ArrayIrBatching>,
     batch: ArrayIrBatch<C::Value>,
@@ -3342,39 +3343,9 @@ where
             Type = ArrayIrType,
             Operation: From<DynamicBroadcastOperation>
                            + From<ConstantOperation<DimensionValue>>
-                           + From<DimensionSizeOperation>
-                           + OperationProjection<ArrayType>,
-        >,
-    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
-{
-    align_array_batch_with(context, batch, axis, |value, permutation| {
-        let projected = <C::Value as ValueProjection<ArrayType>>::into_projected(value)?;
-        Ok(C::Value::from_projected(projected.transpose(permutation)?))
-    })
-}
-
-/// Shared geometry of [`align_array_batch`]: validates the carrier kind, stages the dynamic broadcast of a replicated
-/// array directly on the parent context through its mixed operation family, and delegates only the transposition of
-/// a mapped array to `transpose_fn`, which receives the packed value and the complete axis permutation (element `i`
-/// names the input axis routed to output axis `i`). The two materialization strategies differ solely in how they
-/// reach a transpose: [`align_array_batch`] goes through the projected value's [`Transpose`] capability, while the
-/// [`RecursiveBatchingPolicy::align_batch_axis`] implementation of [`ArrayIrBatching`] lifts a projected
-/// [`TransposeOperation`] into the parent's operation family, because that implementation must hold without bounds
-/// on `C::Value`.
-pub(crate) fn align_array_batch_with<C, F>(
-    context: &BatchingContext<C, ArrayIrBatching>,
-    batch: ArrayIrBatch<C::Value>,
-    axis: Axis,
-    transpose_fn: F,
-) -> Result<ArrayIrBatch<C::Value>, BatchingError>
-where
-    C: Context<
-            Type = ArrayIrType,
-            Operation: From<DynamicBroadcastOperation>
-                           + From<ConstantOperation<DimensionValue>>
                            + From<DimensionSizeOperation>,
         >,
-    F: FnOnce(C::Value, Vec<usize>) -> Result<C::Value, BatchingError>,
+    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
 {
     // Only an array member has a packed axis to align, so both a mapped and a replicated first-class dimension are
     // rejected here. The per-item type covers both spellings of a dimension carrier: a mapped dimension records its
@@ -3437,7 +3408,8 @@ where
     }
     let mut permutation = (0..rank).filter(|axis| *axis != current_position).collect::<Vec<_>>();
     permutation.insert(position, current_position);
-    let value = transpose_fn(batch.value, permutation)?;
+    let projected = <C::Value as ValueProjection<ArrayType>>::into_projected(batch.value)?;
+    let value = C::Value::from_projected(projected.transpose(permutation)?);
     let ragged_axes = batch
         .ragged_axes
         .into_iter()
@@ -3653,6 +3625,7 @@ where
 impl<C> RecursiveBatchingPolicy<C> for ArrayIrBatching
 where
     C: Context<Type = ArrayIrType>,
+    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: BatchableOperation<C, ArrayIrBatching>
         + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayIrBatching>
@@ -3667,14 +3640,7 @@ where
         batch: Self::Batch,
         axis: Axis,
     ) -> Result<Self::Batch, BatchingError> {
-        // This implementation has no bounds on `C::Value`, so a mapped array's transpose lifts the projected array
-        // operation into the parent's mixed operation family instead of going through the projected value's own
-        // `Transpose` capability.
-        align_array_batch_with(context, batch, axis, |value, permutation| {
-            let operation =
-                <C::Operation as OperationProjection<ArrayType>>::Projected::from(TransposeOperation::new(permutation));
-            Ok(context.parent().bind(C::Operation::from(operation), Vec::new(), &[value])?.remove(0))
-        })
+        align_array_batch(context, batch, axis)
     }
 
     fn restore_batch(
@@ -3872,6 +3838,7 @@ where
 impl<C> NamedAxes for BatchingContext<C, ArrayIrBatching>
 where
     C: NamedAxes<Type = ArrayIrType>,
+    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected = DimensionValue>,
     C::Operation: BatchableOperation<C, ArrayIrBatching>

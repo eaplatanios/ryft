@@ -50,11 +50,11 @@ use ryft_core::{
     AddOperation, AtomId, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableType, BatchedOutputs,
     BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError, BatchingPolicy,
     BoundaryPreservingBatchedProgram, Context, CotangentDestination, CotangentDestinationKind, CotangentSeed,
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    Domain, EagerContext, EffectClass, EffectClasses, Effects, ExternalReferenceBinding, InputRegionProvenance,
-    InstructionId, InterpretableOperation, InterpretationDriver, MaybeZero, NoIdentity, Operation,
-    OutputRegionProvenance, Parameter, PartialValue, PartiallyEvaluatableOperation, Placeholder, Program,
-    ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, RecursiveBatchingPolicy,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, Domain, EagerContext, EffectClass, EffectClasses, Effects,
+    ExternalReferenceBinding, InputRegionProvenance, InstructionId, InterpretableOperation, InterpretationDriver,
+    MaybeZero, NoIdentity, Operation, OutputRegionProvenance, Parameter, PartialValue, PartiallyEvaluatableOperation,
+    Placeholder, Program, ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, RecursiveBatchingPolicy,
     RecursiveReferenceDischargeDriver, Reference, ReferenceAccessMode, ReferenceAddUpdate,
     ReferenceAddUpdateOperationProvider, ReferenceAlias, ReferenceAliasEdge, ReferenceAliasKind, ReferenceAliasOrigin,
     ReferenceBoundary, ReferenceBoundaryError, ReferenceDischargeContext, ReferenceDischargeDriver,
@@ -721,6 +721,139 @@ impl Operation for RegisterOperation {
     }
 }
 
+impl<C> ReferenceDischargeableOperation<C, RegisterReferenceDischarge> for RegisterOperation
+where
+    C: Context<Type = RegisterIrType, Operation: From<RegisterOperation>>,
+{
+    fn discharge_references<D: ReferenceDischargeDriver<C, RegisterReferenceDischarge>>(
+        &self,
+        context: &ReferenceDischargeContext<C, RegisterReferenceDischarge>,
+        driver: &D,
+        inputs: &[ReferenceDischargeValue<C, RegisterReferenceDischarge>],
+    ) -> Result<Vec<ReferenceDischargeValue<C, RegisterReferenceDischarge>>, ProgramError> {
+        // Access arms see only discharged references: the dispatch path replays accesses to preserved references verbatim
+        // before any rule runs, so only the allocation arm still distinguishes selected from preserved.
+        match self {
+            Self::Negate | Self::Add(_) | Self::Zero(_) | Self::BitExtract | Self::BitInsert => {
+                discharge_reference_free_operation(self, context, driver, inputs)
+            }
+            Self::ReferenceNew(_) => {
+                check_count!("input", inputs, 1, ProgramError);
+                let initial = inputs[0].try_as_value("an initial state")?.clone();
+                if context.selects_internal(driver.source_instruction_id(), 0) {
+                    return Ok(vec![context.bind_discharged(ReferenceType::new(RegisterType), initial)?.into()]);
+                }
+                let mut outputs = context.parent().bind(self.clone(), Vec::new(), std::slice::from_ref(&initial))?;
+                check_count!("output", outputs, 1, ProgramError);
+                Ok(vec![context.bind_preserved(ReferenceType::new(RegisterType), outputs.remove(0))?.into()])
+            }
+            Self::Read(_) => {
+                check_count!("input", inputs, 1, ProgramError);
+                let reference = inputs[0].try_as_reference("a reference to read")?;
+                Ok(vec![ReferenceDischargeValue::Value(context.read(reference)?)])
+            }
+            Self::Write(_) => {
+                check_count!("input", inputs, 2, ProgramError);
+                let reference = inputs[0].try_as_reference("a reference to write")?;
+                let replacement = inputs[1].try_as_value("a replacement value")?.clone();
+                context.write(reference, replacement)?;
+                Ok(Vec::new())
+            }
+            Self::Swap(_) => {
+                check_count!("input", inputs, 2, ProgramError);
+                let reference = inputs[0].try_as_reference("a reference to replace")?;
+                let replacement = inputs[1].try_as_value("a replacement value")?.clone();
+                Ok(vec![ReferenceDischargeValue::Value(context.swap(reference, replacement)?)])
+            }
+            Self::Freeze(_) => {
+                check_count!("input", inputs, 1, ProgramError);
+                let reference = inputs[0].try_as_reference("a reference to freeze")?;
+                Ok(vec![ReferenceDischargeValue::Value(context.consume(reference)?)])
+            }
+            // The bit view composes its step onto the operand's alias, closed over the destination value of its index,
+            // exactly as the array family's view rules do; on a preserved allocation the view replays verbatim over the
+            // parent destination reference.
+            Self::Bit => {
+                check_count!("input", inputs, 2, ProgramError);
+                let reference = inputs[0].try_as_reference("a reference to view")?;
+                let index = inputs[1].try_as_value("a bit index")?.clone();
+                let alias = reference.alias().with_step(RegisterView::Bit(ViewSymbol::Operand(1)), vec![index.clone()]);
+                let viewed = context.alias_reference(reference, alias, ReferenceType::new(RegisterType), |parent| {
+                    bind_register_output(context.parent(), Self::Bit, &[parent.clone(), index])
+                })?;
+                Ok(vec![viewed.into()])
+            }
+            // The non-accumulating discharge policy has no accumulation capability for the additive update, and the
+            // static two-output view has no discharge rule, so both are rejected by name.
+            Self::AddUpdate | Self::Halves => Err(ProgramError::UnsupportedOperation {
+                message: format!("`{}` has no discharge rule in the register universe", self.name()),
+            }),
+            // The hand-rolled structured widening a backend-owned region operation performs: summarize the closure,
+            // widen the boundary with the reached state, rebuild the region in isolation, validate the result
+            // against the summary's predictions, and merge every published successor state back. This is the same
+            // shape a future kernel-call rule needs, expressed purely through the public discharge surface.
+            Self::Call => {
+                let region = driver.region(0)?;
+                check_count!("input", region.input_ids(), inputs.len(), ProgramError);
+                let mut declared = Vec::with_capacity(inputs.len());
+                for input in inputs {
+                    declared.push(context.operand_allocation(input, self.name())?);
+                }
+                let summary = context.region_summary(self, 0, region, declared.as_slice())?;
+                if summary.output_allocations().iter().any(Option::is_some) {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "`{}` does not return references from its callee",
+                        self.name(),
+                    )));
+                }
+                let operand_allocations = declared.iter().copied().flatten().collect::<BTreeSet<_>>();
+                let widening = context.boundary_widening(&summary, &operand_allocations)?;
+                let entering = widening.entering().to_vec();
+                let source_output_count = region.output_ids().len();
+
+                let result = driver.rebuild_region(
+                    context,
+                    0,
+                    &ReferenceDischargeRegionBoundary::new(
+                        self,
+                        0,
+                        declared,
+                        ReferenceDischargeRegionBoundaryInsertion::new(entering.clone(), inputs.len()),
+                        [ReferenceDischargeRegionBoundaryInsertion::new(
+                            widening.published().to_vec(),
+                            source_output_count,
+                        )
+                        .into()],
+                    ),
+                )?;
+                result.validate_predicted_mutations(widening.published(), self.name())?;
+                result.validate_predicted_output_allocations(summary.output_allocations(), self.name())?;
+
+                let mut operands = Vec::with_capacity(inputs.len() + entering.len());
+                for input in inputs {
+                    operands.push(context.operand_value(input)?);
+                }
+                for allocation in &entering {
+                    operands.push(context.discharged_state(*allocation)?);
+                }
+                let outputs = context.parent().bind(self.clone(), vec![result.into_program()], operands.as_slice())?;
+                check_count!("output", outputs, source_output_count + widening.published().len(), ProgramError);
+
+                let mut results = Vec::with_capacity(source_output_count);
+                for (position, output) in outputs.into_iter().enumerate() {
+                    if position < source_output_count {
+                        results.push(ReferenceDischargeValue::Value(output));
+                    } else {
+                        let allocation = widening.published()[position - source_output_count];
+                        context.merge_boundary_state(&summary, &widening, allocation, output)?;
+                    }
+                }
+                Ok(results)
+            }
+        }
+    }
+}
+
 /// Static half selector of `register.halves`: which half of a register one of its outputs selects.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 enum RegisterHalf {
@@ -899,139 +1032,6 @@ impl<C: Domain<Type = RegisterIrType, Value = RegisterValue>> InterpretableOpera
     }
 }
 
-impl<C> ReferenceDischargeableOperation<C, RegisterReferenceDischarge> for RegisterOperation
-where
-    C: Context<Type = RegisterIrType, Operation: From<RegisterOperation>>,
-{
-    fn discharge_references<D: ReferenceDischargeDriver<C, RegisterReferenceDischarge>>(
-        &self,
-        context: &ReferenceDischargeContext<C, RegisterReferenceDischarge>,
-        driver: &D,
-        inputs: &[ReferenceDischargeValue<C, RegisterReferenceDischarge>],
-    ) -> Result<Vec<ReferenceDischargeValue<C, RegisterReferenceDischarge>>, ProgramError> {
-        // Access arms see only discharged references: the dispatch path replays accesses to preserved references verbatim
-        // before any rule runs, so only the allocation arm still distinguishes selected from preserved.
-        match self {
-            Self::Negate | Self::Add(_) | Self::Zero(_) | Self::BitExtract | Self::BitInsert => {
-                discharge_reference_free_operation(self, context, driver, inputs)
-            }
-            Self::ReferenceNew(_) => {
-                check_count!("input", inputs, 1, ProgramError);
-                let initial = inputs[0].try_as_value("an initial state")?.clone();
-                if context.selects_internal(driver.source_instruction_id(), 0) {
-                    return Ok(vec![context.bind_discharged(ReferenceType::new(RegisterType), initial)?.into()]);
-                }
-                let mut outputs = context.parent().bind(self.clone(), Vec::new(), std::slice::from_ref(&initial))?;
-                check_count!("output", outputs, 1, ProgramError);
-                Ok(vec![context.bind_preserved(ReferenceType::new(RegisterType), outputs.remove(0))?.into()])
-            }
-            Self::Read(_) => {
-                check_count!("input", inputs, 1, ProgramError);
-                let reference = inputs[0].try_as_reference("a reference to read")?;
-                Ok(vec![ReferenceDischargeValue::Value(context.read(reference)?)])
-            }
-            Self::Write(_) => {
-                check_count!("input", inputs, 2, ProgramError);
-                let reference = inputs[0].try_as_reference("a reference to write")?;
-                let replacement = inputs[1].try_as_value("a replacement value")?.clone();
-                context.write(reference, replacement)?;
-                Ok(Vec::new())
-            }
-            Self::Swap(_) => {
-                check_count!("input", inputs, 2, ProgramError);
-                let reference = inputs[0].try_as_reference("a reference to replace")?;
-                let replacement = inputs[1].try_as_value("a replacement value")?.clone();
-                Ok(vec![ReferenceDischargeValue::Value(context.swap(reference, replacement)?)])
-            }
-            Self::Freeze(_) => {
-                check_count!("input", inputs, 1, ProgramError);
-                let reference = inputs[0].try_as_reference("a reference to freeze")?;
-                Ok(vec![ReferenceDischargeValue::Value(context.consume(reference)?)])
-            }
-            // The bit view composes its step onto the operand's alias, closed over the destination value of its index,
-            // exactly as the array family's view rules do; on a preserved allocation the view replays verbatim over the
-            // parent destination reference.
-            Self::Bit => {
-                check_count!("input", inputs, 2, ProgramError);
-                let reference = inputs[0].try_as_reference("a reference to view")?;
-                let index = inputs[1].try_as_value("a bit index")?.clone();
-                let alias = reference.alias().with_step(RegisterView::Bit(ViewSymbol::Operand(1)), vec![index.clone()]);
-                let viewed = context.alias_reference(reference, alias, ReferenceType::new(RegisterType), |parent| {
-                    bind_register_output(context.parent(), Self::Bit, &[parent.clone(), index])
-                })?;
-                Ok(vec![viewed.into()])
-            }
-            // The non-accumulating discharge policy has no accumulation capability for the additive update, and the
-            // static two-output view has no discharge rule, so both are rejected by name.
-            Self::AddUpdate | Self::Halves => Err(ProgramError::UnsupportedOperation {
-                message: format!("`{}` has no discharge rule in the register universe", self.name()),
-            }),
-            // The hand-rolled structured widening a backend-owned region operation performs: summarize the closure,
-            // widen the boundary with the reached state, rebuild the region in isolation, validate the result
-            // against the summary's predictions, and merge every published successor state back. This is the same
-            // shape a future kernel-call rule needs, expressed purely through the public discharge surface.
-            Self::Call => {
-                let region = driver.region(0)?;
-                check_count!("input", region.input_ids(), inputs.len(), ProgramError);
-                let mut declared = Vec::with_capacity(inputs.len());
-                for input in inputs {
-                    declared.push(context.operand_allocation(input, self.name())?);
-                }
-                let summary = context.region_summary(self, 0, region, declared.as_slice())?;
-                if summary.output_allocations().iter().any(Option::is_some) {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "`{}` does not return references from its callee",
-                        self.name(),
-                    )));
-                }
-                let operand_allocations = declared.iter().copied().flatten().collect::<BTreeSet<_>>();
-                let widening = context.boundary_widening(&summary, &operand_allocations)?;
-                let entering = widening.entering().to_vec();
-                let source_output_count = region.output_ids().len();
-
-                let result = driver.rebuild_region(
-                    context,
-                    0,
-                    &ReferenceDischargeRegionBoundary::new(
-                        self,
-                        0,
-                        declared,
-                        ReferenceDischargeRegionBoundaryInsertion::new(entering.clone(), inputs.len()),
-                        [ReferenceDischargeRegionBoundaryInsertion::new(
-                            widening.published().to_vec(),
-                            source_output_count,
-                        )
-                        .into()],
-                    ),
-                )?;
-                result.validate_predicted_mutations(widening.published(), self.name())?;
-                result.validate_predicted_output_allocations(summary.output_allocations(), self.name())?;
-
-                let mut operands = Vec::with_capacity(inputs.len() + entering.len());
-                for input in inputs {
-                    operands.push(context.operand_value(input)?);
-                }
-                for allocation in &entering {
-                    operands.push(context.discharged_state(*allocation)?);
-                }
-                let outputs = context.parent().bind(self.clone(), vec![result.into_program()], operands.as_slice())?;
-                check_count!("output", outputs, source_output_count + widening.published().len(), ProgramError);
-
-                let mut results = Vec::with_capacity(source_output_count);
-                for (position, output) in outputs.into_iter().enumerate() {
-                    if position < source_output_count {
-                        results.push(ReferenceDischargeValue::Value(output));
-                    } else {
-                        let allocation = widening.published()[position - source_output_count];
-                        context.merge_boundary_state(&summary, &widening, allocation, output)?;
-                    }
-                }
-                Ok(results)
-            }
-        }
-    }
-}
-
 /// Binds a region-free single-output register operation and checks its output count.
 fn bind_register_output<C: Context<Type = RegisterIrType, Operation: From<RegisterOperation>>>(
     context: &C,
@@ -1053,9 +1053,9 @@ impl<C: Context<Type = RegisterIrType, Operation: From<RegisterOperation>>> Part
 impl<C: Context<Type = RegisterIrType, Operation = RegisterOperation> + Zero<C::Value>> DifferentiableOperation<C>
     for RegisterOperation
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -1063,31 +1063,39 @@ impl<C: Context<Type = RegisterIrType, Operation = RegisterOperation> + Zero<C::
         match self {
             Self::Negate => {
                 check_count!("input", inputs, 1, ProgramError);
-                let primal = bind_register_output(context, self.clone(), &primals)?;
+                let primal = bind_register_output(context.primal(), self.clone(), &primals)?;
                 let tangent = match inputs[0].tangent() {
-                    MaybeZero::Value(tangent) => {
-                        MaybeZero::Value(bind_register_output(context, self.clone(), std::slice::from_ref(tangent))?)
-                    }
+                    MaybeZero::Value(tangent) => MaybeZero::Value(bind_register_output(
+                        context.tangent(),
+                        self.clone(),
+                        std::slice::from_ref(tangent),
+                    )?),
                     MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.clone()),
                 };
                 Ok(vec![DifferentiationDual::new(primal, tangent)?])
             }
             Self::Add(_) => {
                 check_count!("input", inputs, 2, ProgramError);
-                let primal = bind_register_output(context, self.clone(), &primals)?;
+                let primal = bind_register_output(context.primal(), self.clone(), &primals)?;
                 let tangent = match (inputs[0].tangent(), inputs[1].tangent()) {
                     (MaybeZero::Zero(r#type), MaybeZero::Zero(_)) => MaybeZero::Zero(r#type.clone()),
                     (MaybeZero::Value(tangent), MaybeZero::Zero(_))
                     | (MaybeZero::Zero(_), MaybeZero::Value(tangent)) => MaybeZero::Value(tangent.clone()),
-                    (MaybeZero::Value(left), MaybeZero::Value(right)) => {
-                        MaybeZero::Value(bind_register_output(context, self.clone(), &[left.clone(), right.clone()])?)
-                    }
+                    (MaybeZero::Value(left), MaybeZero::Value(right)) => MaybeZero::Value(bind_register_output(
+                        context.tangent(),
+                        self.clone(),
+                        &[left.clone(), right.clone()],
+                    )?),
                 };
                 Ok(vec![DifferentiationDual::new(primal, tangent)?])
             }
             Self::Zero(_) => {
                 check_count!("input", inputs, 0, ProgramError);
-                Ok(vec![DifferentiationDual::new_with_zero_tangent(bind_register_output(context, self.clone(), &[])?)?])
+                Ok(vec![DifferentiationDual::new_with_zero_tangent(bind_register_output(
+                    context.primal(),
+                    self.clone(),
+                    &[],
+                )?)?])
             }
             Self::ReferenceNew(operation) => operation.jvp(context, driver, inputs),
             Self::Read(operation) => operation.jvp(context, driver, inputs),
@@ -1099,11 +1107,11 @@ impl<C: Context<Type = RegisterIrType, Operation = RegisterOperation> + Zero<C::
                 if inputs[0].tangent().is_zero() && !inputs[1].tangent().is_zero() {
                     return Err(DifferentiationError::PlumbingReferenceTangent { operation: self.name() });
                 }
-                context.bind(self.clone(), Vec::new(), &primals)?;
+                context.primal().bind(self.clone(), Vec::new(), &primals)?;
                 if let (MaybeZero::Value(reference), MaybeZero::Value(tangent)) =
                     (inputs[0].tangent(), inputs[1].tangent())
                 {
-                    context.bind(self.clone(), Vec::new(), &[reference.clone(), tangent.clone()])?;
+                    context.tangent().bind(self.clone(), Vec::new(), &[reference.clone(), tangent.clone()])?;
                 }
                 Ok(Vec::new())
             }
@@ -1111,12 +1119,12 @@ impl<C: Context<Type = RegisterIrType, Operation = RegisterOperation> + Zero<C::
             // index is a coordinate, so its tangent is dropped); a plumbing reference yields a plumbing view.
             Self::Bit => {
                 check_count!("input", inputs, 2, ProgramError);
-                let primal = bind_register_output(context, self.clone(), &primals)?;
+                let primal = bind_register_output(context.primal(), self.clone(), &primals)?;
                 let tangent = match inputs[0].tangent() {
                     MaybeZero::Value(reference) => MaybeZero::Value(bind_register_output(
-                        context,
+                        context.tangent(),
                         self.clone(),
-                        &[reference.clone(), primals[1].clone()],
+                        &[reference.clone(), context.primal_to_tangent(primals[1].clone())?],
                     )?),
                     MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().into_owned()),
                 };
@@ -1325,7 +1333,7 @@ impl<C: Context<Type = RegisterIrType>> RecursiveBatchingPolicy<C> for RegisterB
 }
 
 impl<C: Context<Type = RegisterIrType>> BatchingEntrypointPolicy<C> for RegisterBatching {
-    fn prepare_inputs(
+    fn pack_inputs(
         context: &C,
         inputs: Vec<C::Value>,
         input_batch_axes: Vec<BatchAxis>,

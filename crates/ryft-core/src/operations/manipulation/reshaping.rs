@@ -139,6 +139,8 @@ impl Operation for DynamicReshapeOperation {
     }
 }
 
+impl_reference_free_dischargeable_operation!(DynamicReshapeOperation);
+
 impl<C> InterpretableOperation<C> for DynamicReshapeOperation
 where
     C: Domain<Type = ArrayIrType>,
@@ -482,8 +484,6 @@ where
         Ok(cotangents)
     }
 }
-
-impl_reference_free_dischargeable_operation!(DynamicReshapeOperation);
 
 /// Semantic parameters accepted by [`Reshape`].
 ///

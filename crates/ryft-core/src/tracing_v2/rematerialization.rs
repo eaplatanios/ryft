@@ -415,25 +415,6 @@ impl<T: DifferentiableType> Operation for RematerializeOperation<T> {
     }
 }
 
-impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for RematerializeOperation<C::Type> {
-    fn interpret<D: InterpretationDriver<C>>(
-        &self,
-        context: &C,
-        driver: &D,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        driver.interpret_region(context, 0, inputs.to_vec())
-    }
-}
-
-// Partial evaluation defers to the default fold-or-residualize behavior of [`Program::partially_evaluate`] for a
-// [`RematerializeOperation`]: a call with all-known operands folds by interpreting its primal, and otherwise
-// residualizes unchanged.
-impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for RematerializeOperation<C::Type> where
-    C::Operation: From<RematerializeOperation<C::Type>>
-{
-}
-
 // Rematerialization discharges each of its four regions independently. Reference operands are rejected: the derived
 // rule regions bind a reference operand through the forward tail and through cotangent destinations rather than
 // positionally, so discharge has no state boundary through which to thread caller state, and a caller that needs a
@@ -455,6 +436,25 @@ where
     ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
         discharge_local_reference_operation(self, context, driver, inputs)
     }
+}
+
+impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for RematerializeOperation<C::Type> {
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        context: &C,
+        driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        driver.interpret_region(context, 0, inputs.to_vec())
+    }
+}
+
+// Partial evaluation defers to the default fold-or-residualize behavior of `Program::partially_evaluate` for a
+// `RematerializeOperation`: a call with all-known operands folds by interpreting its primal, and otherwise
+// residualizes unchanged.
+impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for RematerializeOperation<C::Type> where
+    C::Operation: From<RematerializeOperation<C::Type>>
+{
 }
 
 // The forward region produces primal outputs and saved residuals. The tangent region and its already-derived

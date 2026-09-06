@@ -300,12 +300,12 @@ impl_differentiable_operation! {
                 }
                 .into());
             }
-            let primal = stage_collective(context, operation, inputs[0].primal())?;
+            let primal = stage_collective(context.primal(), operation, inputs[0].primal())?;
             // A collective of a structural zero stays a structural zero, keeping `collective(zero)` out of the
             // tangent program.
             let tangent = match inputs[0].tangent() {
                 MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.clone()),
-                MaybeZero::Value(tangent) => MaybeZero::Value(stage_collective(context, operation, tangent)?),
+                MaybeZero::Value(tangent) => MaybeZero::Value(stage_collective(context.tangent(), operation, tangent)?),
             };
             Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
@@ -482,8 +482,11 @@ where
         if context.named_axis(axis_name).is_none() {
             return Err(BatchingError::Axis(AxisError::UnboundAxisName { name: axis_name.to_string() }).into());
         }
-        let mut outputs =
-            context.bind(ParallelReduceOperation::new(axis_name.to_string(), kind), Vec::new(), &[self.clone()])?;
+        let mut outputs = context.bind(
+            ParallelReduceOperation::new(axis_name.to_string(), kind),
+            Vec::new(),
+            std::slice::from_ref(self),
+        )?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -497,7 +500,7 @@ where
         let context = self.dispatch_domain();
         let axis_size = resolve_named_axis_size(&context, axis_name)?;
         let operation = ParallelReduceOperation::grouped(axis_name.to_string(), kind, axis_size, axis_index_groups)?;
-        let mut outputs = context.bind(operation, Vec::new(), &[self.clone()])?;
+        let mut outputs = context.bind(operation, Vec::new(), std::slice::from_ref(self))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }

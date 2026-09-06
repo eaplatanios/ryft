@@ -178,6 +178,28 @@ where
     }
 }
 
+// A condition's branches mirror its operand list after the leading predicate, and its results are each branch's own
+// outputs, which is exactly the positionally forwarding shape the shared structured rewrite serves. Both branches
+// therefore receive one shared state boundary: every root either branch touches enters, and only the roots one of them
+// mutates are published back, so a condition whose branches merely read keeps its source boundary unchanged.
+impl<F, C, P> ReferenceDischargeableOperation<C, P> for ConditionOperation<F>
+where
+    F: Value,
+    ConditionOperation<F>: Operation<Type = C::Type>,
+    C: Context<Operation: From<ConditionOperation<F>>>,
+    C::Type: From<P::Referent>,
+    P: ReferenceDischargePolicy<C>,
+{
+    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
+        &self,
+        context: &ReferenceDischargeContext<C, P>,
+        driver: &D,
+        inputs: &[ReferenceDischargeValue<C, P>],
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        discharge_positional_region_operation(self, context, driver, inputs, 1)
+    }
+}
+
 // Interpretation rule for [`ConditionOperation`]: extracts the concrete Boolean predicate from the first input and
 // interprets only the selected branch region over the remaining inputs (region 0 for `true` and region 1 for
 // `false`), so the untaken branch never runs.
@@ -273,11 +295,9 @@ where
         // below run through the *live* known-side context and would execute or stage a branch's effects
         // speculatively (the predicate is unknown, so neither branch is selected yet); and symbolic knowns, because
         // the reconciled branch programs must embed folded known values as inline constants, which a live-trace
-        // tracer cannot be. Residualizing the whole conditional through `fold_or_residualize` advances the enclosing
-        // ordered-effect frontier once for every root either branch can touch (its reference-typed inputs), while the
-        // probes below run only for pure branches (every reference operation is `OrderedState`) and so never execute
-        // a reference operation or advance a frontier; the mutually exclusive branches therefore never advance each
-        // other's frontier.
+        // tracer cannot be. Residualizing the whole conditional records that later ordered effects must remain
+        // residual if either branch has ordered effects. Pure arithmetic or pure views do not impose that restriction;
+        // analyzing the mutually exclusive branches does not change the active context's ordering state.
         let true_branch = driver.region(0)?;
         let false_branch = driver.region(1)?;
         if !true_branch.effects().classes().is_empty()
@@ -785,28 +805,6 @@ where
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         <V::Type>::transpose_condition(context, driver, inputs, outputs)
-    }
-}
-
-// A condition's branches mirror its operand list after the leading predicate, and its results are each branch's own
-// outputs, which is exactly the positionally forwarding shape the shared structured rewrite serves. Both branches
-// therefore receive one shared state boundary: every root either branch touches enters, and only the roots one of them
-// mutates are published back, so a condition whose branches merely read keeps its source boundary unchanged.
-impl<F, C, P> ReferenceDischargeableOperation<C, P> for ConditionOperation<F>
-where
-    F: Value,
-    ConditionOperation<F>: Operation<Type = C::Type>,
-    C: Context<Operation: From<ConditionOperation<F>>>,
-    C::Type: From<P::Referent>,
-    P: ReferenceDischargePolicy<C>,
-{
-    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
-        &self,
-        context: &ReferenceDischargeContext<C, P>,
-        driver: &D,
-        inputs: &[ReferenceDischargeValue<C, P>],
-    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
-        discharge_positional_region_operation(self, context, driver, inputs, 1)
     }
 }
 
@@ -1474,7 +1472,8 @@ where
 ///   - `operation`: Primal input-predicate condition staged into the tangent program.
 ///   - `context`: Active transpose tracing context the pullback is staged into.
 ///   - `inputs`: Per-operand [`PartialValue`] knowledge. The [`Unknown`](PartialValue::Unknown) entries are the branch
-///     tangents; the [`Known`](PartialValue::Known) entries carry the predicate and residual tracers the pullback reads.
+///     tangents; the [`Known`](PartialValue::Known) entries carry the predicate and residual tracers the pullback
+/// reads.
 ///   - `outputs`: Symbolic cotangents for the condition's outputs.
 ///   - `cotangents`: Cotangent destinations of the operands (refer to the documentation of
 ///     [`reference_operand_cotangents`]). Both branches are transposed with the

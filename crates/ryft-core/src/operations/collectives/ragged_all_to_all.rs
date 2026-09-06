@@ -18,9 +18,9 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, ProjectedContext, ValueResolution};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    MemberDifferentiableOperation, TransposableOperation, TranspositionContext, TranspositionDriver,
-    jvp_projected_operation,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, TransposableOperation,
+    TranspositionContext, TranspositionDriver, jvp_projected_operation, primal_to_tangent_duals,
 };
 use crate::interpretation::{
     InterpretableOperation, InterpretationDriver, MemberInterpretableOperation, interpret_projected_operation,
@@ -680,9 +680,9 @@ impl<C: Context<Type = ArrayType, Value: ZeroLike>> DifferentiableOperation<C> f
 where
     C::Operation: From<RaggedAllToAllOperation>,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -698,12 +698,17 @@ where
             output_offsets.primal().clone(),
             receive_sizes.primal().clone(),
         ];
-        let mut primal_outputs = context.bind(self.clone(), Vec::new(), &primal_inputs)?;
+        let mut primal_outputs = context.primal().bind(self.clone(), Vec::new(), &primal_inputs)?;
         check_count!("output", primal_outputs, 1, ProgramError);
         let primal = primal_outputs.remove(0);
         let tangent = if operand.tangent().is_zero() && output.tangent().is_zero() {
             MaybeZero::Zero(primal.r#type().tangent()?)
         } else {
+            let tangent_inputs = primal_to_tangent_duals(context, inputs)?;
+            let [operand, output, input_offsets, send_sizes, output_offsets, receive_sizes] = tangent_inputs.as_slice()
+            else {
+                unreachable!();
+            };
             let operand_tangent = match operand.tangent() {
                 MaybeZero::Zero(_) => operand.primal().zero_like()?,
                 MaybeZero::Value(tangent) => tangent.clone(),
@@ -720,7 +725,7 @@ where
                 output_offsets.primal().clone(),
                 receive_sizes.primal().clone(),
             ];
-            let mut tangent_outputs = context.bind(self.clone(), Vec::new(), &tangent_inputs)?;
+            let mut tangent_outputs = context.tangent().bind(self.clone(), Vec::new(), &tangent_inputs)?;
             check_count!("output", tangent_outputs, 1, ProgramError);
             MaybeZero::Value(tangent_outputs.remove(0))
         };
@@ -915,9 +920,9 @@ where
     <C::Operation as OperationProjection<ArrayType>>::Projected:
         DifferentiableOperation<ProjectedContext<C, ArrayType>> + From<RaggedAllToAllOperation>,
 {
-    fn jvp_in_parent<D: DifferentiationDriver<C>>(
+    fn jvp_in_parent<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -2499,7 +2504,10 @@ mod tests {
         };
 
         let evaluate = |inputs: Vec<DifferentiationDual<Array>>| {
-            operation.jvp(&context, &EmptyRegionDriver, inputs.as_slice()).unwrap().remove(0)
+            operation
+                .jvp(&DifferentiationContext::new(context.clone()), &EmptyRegionDriver, inputs.as_slice())
+                .unwrap()
+                .remove(0)
         };
         let zero = evaluate(duals(structural_zero(&operand), structural_zero(&output)));
         assert_eq!(zero.primal().to_f64s(), vec![11.0, 12.0, 102.0, 103.0]);

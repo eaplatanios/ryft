@@ -17,8 +17,8 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionContext, TranspositionDriver,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, TransposableOperation, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -191,9 +191,9 @@ where
     C::Operation: From<CumulativeSumOperation>,
     C::Value: CumulativeSum,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        _context: &C,
+        _context: &DifferentiationContext<C, P>,
         _driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -264,7 +264,7 @@ where
     fn cumulative_sum(&self, axis: usize) -> Result<Self, ProgramError> {
         Ok(self
             .dispatch_domain()
-            .bind(CumulativeSumOperation::new(axis), Vec::new(), &[self.clone()])?
+            .bind(CumulativeSumOperation::new(axis), Vec::new(), std::slice::from_ref(self))?
             .remove(0))
     }
 
@@ -272,7 +272,7 @@ where
     fn reverse_cumulative_sum(&self, axis: usize) -> Result<Self, ProgramError> {
         Ok(self
             .dispatch_domain()
-            .bind(CumulativeSumOperation::new(axis).with_reverse(true), Vec::new(), &[self.clone()])?
+            .bind(CumulativeSumOperation::new(axis).with_reverse(true), Vec::new(), std::slice::from_ref(self))?
             .remove(0))
     }
 }

@@ -89,24 +89,6 @@ where
     }
 }
 
-impl<T, U, C> InterpretableOperation<C> for ReferenceNewOperation<T, U>
-where
-    T: Type,
-    U: Type,
-    ReferenceNewOperation<T, U>: Operation<Type = U>,
-    C: Domain<Type = U, Value: ReferenceNew<C::Value>>,
-{
-    fn interpret<D: InterpretationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        check_count!("input", inputs, 1, ProgramError);
-        Ok(vec![inputs[0].reference_new()?])
-    }
-}
-
 impl<T, U, C, P> ReferenceDischargeableOperation<C, P> for ReferenceNewOperation<T, U>
 where
     T: Type,
@@ -145,6 +127,24 @@ where
         let mut outputs = context.parent().bind(*self, Vec::new(), std::slice::from_ref(&initial))?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(vec![context.bind_preserved(r#type, outputs.remove(0))?.into()])
+    }
+}
+
+impl<T, U, C> InterpretableOperation<C> for ReferenceNewOperation<T, U>
+where
+    T: Type,
+    U: Type,
+    ReferenceNewOperation<T, U>: Operation<Type = U>,
+    C: Domain<Type = U, Value: ReferenceNew<C::Value>>,
+{
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        check_count!("input", inputs, 1, ProgramError);
+        Ok(vec![inputs[0].reference_new()?])
     }
 }
 

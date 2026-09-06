@@ -6,7 +6,9 @@ use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingTracer,
 };
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
-use crate::differentiation::{DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationTracer};
+use crate::differentiation::{
+    DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationPolicy, DifferentiationTracer,
+};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
 use crate::partial::PartiallyEvaluatableOperation;
@@ -195,11 +197,11 @@ impl<C: Context<Type = ArrayType> + Constant<C::Value, Stored>, Stored>
     }
 }
 
-impl<C: Context<Type: DifferentiableType>> Constant<DifferentiationTracer<C>, C::Constant>
-    for DifferentiationContext<C>
+impl<C: Context<Type: DifferentiableType>, P: DifferentiationPolicy<C>>
+    Constant<DifferentiationTracer<C, P>, C::Constant> for DifferentiationContext<C, P>
 {
     #[inline]
-    fn constant(&self, value: C::Constant) -> Result<DifferentiationTracer<C>, ProgramError> {
+    fn constant(&self, value: C::Constant) -> Result<DifferentiationTracer<C, P>, ProgramError> {
         let dual = DifferentiationDual::new_with_zero_tangent(self.parent().lift(value)?)?;
         Ok(DifferentiationTracer::new(dual, self.clone()))
     }

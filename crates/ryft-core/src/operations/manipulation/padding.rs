@@ -349,6 +349,8 @@ impl Operation for PadOperation<ArrayIrType> {
     }
 }
 
+impl_reference_free_dischargeable_operation!(<T> PadOperation<T> where T: Type);
+
 impl<C: Domain<Type = ArrayType, Value: Pad>> InterpretableOperation<C> for PadOperation<ArrayType> {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -1154,8 +1156,6 @@ where
         Ok(cotangents)
     }
 }
-
-impl_reference_free_dischargeable_operation!(<T> PadOperation<T> where T: Type);
 
 /// Represents the ability to resize an array by adding edge and interior padding filled with a scalar padding value,
 /// with the semantics of StableHLO's [`pad`](https://openxla.org/stablehlo/spec#pad) operation. Negative edge padding

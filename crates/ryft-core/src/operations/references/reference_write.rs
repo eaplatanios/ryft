@@ -91,25 +91,6 @@ where
     }
 }
 
-impl<T, U, C> InterpretableOperation<C> for ReferenceWriteOperation<T, U>
-where
-    T: Type,
-    U: Type,
-    ReferenceWriteOperation<T, U>: Operation<Type = U>,
-    C: Domain<Type = U, Value: ReferenceWrite<C::Value>>,
-{
-    fn interpret<D: InterpretationDriver<C>>(
-        &self,
-        _context: &C,
-        _driver: &D,
-        inputs: &[C::Value],
-    ) -> Result<Vec<C::Value>, ProgramError> {
-        check_count!("input", inputs, 2, ProgramError);
-        inputs[0].write(&inputs[1])?;
-        Ok(Vec::new())
-    }
-}
-
 impl<T, U, C, P> ReferenceDischargeableOperation<C, P> for ReferenceWriteOperation<T, U>
 where
     T: Type,
@@ -129,6 +110,25 @@ where
         let replacement = inputs[1].try_as_value("a replacement value")?.clone();
         validate_operand_types(self, inputs)?;
         context.write(reference, replacement)?;
+        Ok(Vec::new())
+    }
+}
+
+impl<T, U, C> InterpretableOperation<C> for ReferenceWriteOperation<T, U>
+where
+    T: Type,
+    U: Type,
+    ReferenceWriteOperation<T, U>: Operation<Type = U>,
+    C: Domain<Type = U, Value: ReferenceWrite<C::Value>>,
+{
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        check_count!("input", inputs, 2, ProgramError);
+        inputs[0].write(&inputs[1])?;
         Ok(Vec::new())
     }
 }

@@ -6,7 +6,9 @@ use crate::arrays::{
 };
 use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
-use crate::differentiation::{DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationTracer};
+use crate::differentiation::{
+    DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationPolicy, DifferentiationTracer,
+};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
     check_count, impl_non_differentiable_operation, impl_nullary_batchable_operation,
@@ -240,9 +242,11 @@ impl<C: Context<Type = ArrayType> + One<C::Value>> One<BatchingTracer<C, ArrayBa
     }
 }
 
-impl<C: Context<Type: DifferentiableType> + One<C::Value>> One<DifferentiationTracer<C>> for DifferentiationContext<C> {
+impl<C: Context<Type: DifferentiableType> + One<C::Value>, P: DifferentiationPolicy<C>> One<DifferentiationTracer<C, P>>
+    for DifferentiationContext<C, P>
+{
     #[inline]
-    fn one(&self, r#type: &C::Type) -> Result<DifferentiationTracer<C>, ProgramError> {
+    fn one(&self, r#type: &C::Type) -> Result<DifferentiationTracer<C, P>, ProgramError> {
         let dual = DifferentiationDual::new_with_zero_tangent(self.parent().one(r#type)?)?;
         Ok(DifferentiationTracer::new(dual, self.clone()))
     }

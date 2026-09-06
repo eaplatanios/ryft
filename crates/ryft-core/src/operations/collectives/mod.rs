@@ -25,7 +25,10 @@ use crate::arrays::{
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{BatchAxis, BatchingContext, BatchingError};
 use crate::contexts::{Context, Domain, ProjectedContext};
-use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationError};
+use crate::differentiation::{
+    DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
+    primal_to_tangent_duals,
+};
 use crate::macros::check_count;
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::differentiation::linear_call::LinearCallOperation;
@@ -750,22 +753,22 @@ macro_rules! shape_changing_collective {
         where
             C::Operation: From<$operation>,
         {
-            fn jvp<D: DifferentiationDriver<C>>(
+            fn jvp<D: DifferentiationDriver<C>, P: $crate::DifferentiationPolicy<C>>(
                 &self,
-                context: &C,
+                context: &$crate::DifferentiationContext<C, P>,
                 _driver: &D,
                 inputs: &[DifferentiationDual<C::Value>],
             ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
                 check_count!("input", inputs, 1, ProgramError);
                 let mut primal_outputs =
-                    context.bind(self.clone(), Vec::new(), std::slice::from_ref(inputs[0].primal()))?;
+                    context.primal().bind(self.clone(), Vec::new(), std::slice::from_ref(inputs[0].primal()))?;
                 check_count!("output", primal_outputs, 1, ProgramError);
                 let primal = primal_outputs.remove(0);
                 let tangent = match inputs[0].tangent() {
                     MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
                     MaybeZero::Value(tangent) => {
                         let mut tangent_outputs =
-                            context.bind(self.clone(), Vec::new(), std::slice::from_ref(tangent))?;
+                            context.tangent().bind(self.clone(), Vec::new(), std::slice::from_ref(tangent))?;
                         check_count!("output", tangent_outputs, 1, ProgramError);
                         MaybeZero::Value(tangent_outputs.remove(0))
                     }
@@ -1020,10 +1023,10 @@ where
 
 /// Applies the mixed array IR JVP shared by shape-changing collectives whose transpose is another collective.
 /// Explicit output extents and the exact input shape become ordinary residuals of one linear call.
-pub(super) fn jvp_shape_changing_collective_with_adjoint<C, Forward, Adjoint>(
+pub(super) fn jvp_shape_changing_collective_with_adjoint<C, Forward, Adjoint, P: DifferentiationPolicy<C>>(
     operation: &Forward,
     adjoint: Adjoint,
-    context: &C,
+    context: &DifferentiationContext<C, P>,
     inputs: &[DifferentiationDual<C::Value>],
 ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
 where
@@ -1036,14 +1039,17 @@ where
     Forward: Clone + Operation<Type = ArrayType>,
     Adjoint: Operation<Type = ArrayType>,
 {
-    let Some((array, output_extents)) = inputs.split_first() else {
+    let Some((array, _)) = inputs.split_first() else {
         return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
     };
     let primal_inputs = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
-    let primal = context.bind(operation.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
+    let primal = context.primal().bind(operation.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
     let tangent = match array.tangent() {
         MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
         MaybeZero::Value(array_tangent) => {
+            let tangent_inputs = primal_to_tangent_duals(context, inputs)?;
+            let (array, output_extents) = tangent_inputs.split_first().unwrap();
+            let context = context.tangent();
             let mut residuals = LinearResiduals::new();
             let output_extents = residuals.retain_all(output_extents.iter().map(|extent| extent.primal().clone()));
             let input_shape = residuals.retain_shape(context, array.primal())?;
@@ -1253,7 +1259,7 @@ mod tests {
             AllGatherOutputVariance::Varying,
         )
         .jvp_in_parent(
-            &context,
+            &DifferentiationContext::new(context.clone()),
             &crate::EmptyRegionDriver,
             &[
                 DifferentiationDual::new(primal, MaybeZero::Value(tangent))?,

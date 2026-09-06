@@ -360,6 +360,240 @@ where
     }
 }
 
+// Every trailing body input is the per-iteration slice of a stacked operand. A stacked *reference* operand enters the
+// body as a boundary view of its allocation (`ReferenceDischargeRegionInput::View`), never as a carry: a discharged one
+// becomes an ordinary stacked array operand carrying the allocation's current state and, when the body mutates the
+// view, gains one stacked output whose slices are the view's final states and whose stacked type is the allocation's
+// referent type, so it is installed as the allocation's successor state (a zero-length scan publishes the state
+// unchanged). A preserved one keeps its reference-typed stacked operand and the body replays through the view. The
+// view's state is region-local inside the rebuilt body, so the view must be the only handle of its allocation there,
+// which is checked through the view overlap query before the body is rebuilt.
+impl<Capture, C, P> ReferenceDischargeableOperation<C, P> for ScanOperation<Capture>
+where
+    Capture: Value,
+    ScanOperation<Capture>: Operation<Type = C::Type>,
+    C: Context<Operation: ReferenceViewOperation + From<ScanOperation<Capture>>>,
+    C::Type: From<P::Referent> + From<ReferenceType<P::Referent>>,
+    P: ReferenceDischargePolicy<C>,
+{
+    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
+        &self,
+        context: &ReferenceDischargeContext<C, P>,
+        driver: &D,
+        inputs: &[ReferenceDischargeValue<C, P>],
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        let name = self.name();
+        self.validate_region_count(driver.region_count())?;
+        let carry_count = self.carry_count();
+        if inputs.len() < carry_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "operation `{name}` declares {carry_count} carries but the application has {} operands",
+                inputs.len(),
+            )));
+        }
+        let (carry_operands, stacked_operands) = inputs.split_at(carry_count);
+        let carries = carry_operands
+            .iter()
+            .map(|input| context.operand_allocation(input, name))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Only the carries forward positionally into the body. Every remaining body input is the per-iteration slice of
+        // a stacked operand: a value for a stacked array, and a boundary view of the operand's allocation for a stacked
+        // reference, which the summary attributes to that allocation exactly like a forwarded handle. Any operand past
+        // the body's inputs (i.e., a dynamic length) is a value.
+        let body = driver.region(0)?;
+        let body_input_types = body.input_types();
+        if body_input_types.len() < carry_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "operation `{name}` declares {carry_count} carries but its body declares {} inputs",
+                body_input_types.len(),
+            )));
+        }
+        if inputs.len() < body_input_types.len() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "operation `{name}` attaches a body with {} inputs but the application has {} operands",
+                body_input_types.len(),
+                inputs.len(),
+            )));
+        }
+        let mut body_allocations = carries.clone();
+        for input in &inputs[carry_count..body_input_types.len()] {
+            body_allocations.push(context.operand_allocation(input, name)?);
+        }
+        let summary = context.region_summary(self, 0, body, body_allocations.as_slice())?;
+
+        // A per-iteration view is region-local state inside the rebuilt body, so it must be the only handle of its
+        // allocation there: another view of the same allocation must select provably different coordinates on every
+        // iteration, while a carry is a complete handle that always overlaps. The paths compared are the ones the
+        // reference view analysis derives for the body's inputs, namely the empty path for a carry and the boundary
+        // view closed over the body region for a stacked operand. Rebuilding resolves captures in the isolated region
+        // environment: inherited whole-allocation captures cannot resolve through a view-only boundary, while nested
+        // capture prefixes may bind the existing view.
+        let operation = C::Operation::from(self.clone());
+        let stacked_path = |position: usize| {
+            let view = operation.region_input_view(0, position).ok_or_else(|| {
+                ProgramError::MalformedProgram(format!(
+                    "operation `{name}` passes a reference into body input {position} without describing its \
+                     boundary view",
+                ))
+            })?;
+            let bindings = view
+                .symbols()
+                .into_iter()
+                .map(|symbol| match symbol {
+                    ViewSymbol::Iteration => Ok(ViewSymbolBinding::Iteration(body.id())),
+                    ViewSymbol::Operand(operand_index) => Err(ProgramError::MalformedProgram(format!(
+                        "operation `{name}` describes the boundary view of body input {position} through operand \
+                         {operand_index}, which a scan body cannot bind",
+                    ))),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok::<_, ProgramError>(ReferenceViewPath::root().with_step(view, bindings))
+        };
+        for (position, allocation) in body_allocations.iter().enumerate().skip(carry_count) {
+            let Some(allocation) = *allocation else {
+                continue;
+            };
+            let view_path = stacked_path(position)?;
+            let root = C::Type::from(context.allocation_reference(allocation)?.r#type().clone());
+            for (other_position, other) in body_allocations.iter().enumerate() {
+                if other_position == position || *other != Some(allocation) {
+                    continue;
+                }
+                let (role, other_path) = match other_position < carry_count {
+                    true => ("carry", ReferenceViewPath::root()),
+                    false => ("stacked operand", stacked_path(other_position)?),
+                };
+                if view_path.overlap(&other_path, &root) != ViewOverlap::Disjoint {
+                    return Err(ProgramError::MalformedProgram(format!(
+                        "operation `{name}` passes the allocation of stacked reference operand {position} also as \
+                         {role} {other_position}, whose handles may address the same coordinates inside the body; a \
+                         per-iteration view must be the only handle of its allocation inside the body",
+                    )));
+                }
+            }
+        }
+
+        // An allocation the body returns is threaded even if the body never accesses it, so that a boundary the loop's
+        // fixed
+        // point requires is reported as a broken fixed point rather than as a reference the rebuilt body cannot
+        // resolve. A preserved reference already in the carry list stays at its declared position; one reached only
+        // through a capture gains a reference-typed carry rather than a state carry. A stacked reference allocation
+        // crosses at its declared position as a view, so it gains no carry either, and it is published exactly when the
+        // body mutates it through that view.
+        let declared = body_allocations.iter().copied().flatten().collect::<BTreeSet<_>>();
+        let widening = context.boundary_widening(&summary, &declared)?;
+        let entering = widening.entering().to_vec();
+        let declared_inputs = body_allocations
+            .iter()
+            .enumerate()
+            .map(|(position, allocation)| match *allocation {
+                None => ReferenceDischargeRegionInput::Value,
+                Some(allocation) if position < carry_count => ReferenceDischargeRegionInput::Allocation(allocation),
+                Some(allocation) => ReferenceDischargeRegionInput::View(allocation),
+            })
+            .collect::<Vec<_>>();
+
+        let view_outputs = body_allocations
+            .iter()
+            .enumerate()
+            .skip(carry_count)
+            .filter_map(|(position, allocation)| {
+                allocation
+                    .filter(|allocation| widening.published().contains(allocation))
+                    .map(|_| ReferenceDischargeRegionOutput::View(position))
+            })
+            .collect();
+        let state = ReferenceDischargeRegionBoundaryInsertion::new(entering.clone(), carry_count);
+        let boundary = ReferenceDischargeRegionBoundary::new(
+            self,
+            0,
+            declared_inputs,
+            state.clone(),
+            [
+                state.into(),
+                ReferenceDischargeRegionBoundaryInsertion::new(view_outputs, driver.region(0)?.output_ids().len()),
+            ],
+        );
+        let result = driver.rebuild_region(context, 0, &boundary)?;
+        result.validate_predicted_mutations(widening.published(), name)?;
+        result.validate_predicted_output_allocations(summary.output_allocations(), name)?;
+
+        // A carry must leave the body as the reference it entered with, or a zero-length scan would not return its
+        // entering state.
+        let source_output_count = result.output_allocations().len();
+        if source_output_count < carry_count {
+            return Err(ProgramError::MalformedProgram(format!(
+                "operation `{name}` declares {carry_count} carries but its body declares {source_output_count} outputs",
+            )));
+        }
+        for (position, (returned, carry)) in result.output_allocations()[..carry_count].iter().zip(&carries).enumerate()
+        {
+            if returned != carry {
+                return Err(ProgramError::MalformedProgram(format!(
+                    "operation `{name}` does not return carry {position} as the reference it entered with, so its \
+                     scan state has no fixed point",
+                )));
+            }
+        }
+
+        // A stacked reference operand contributes its allocation's current state when discharged and its destination
+        // reference when preserved, exactly like a carry does.
+        let mut operands = Vec::with_capacity(inputs.len() + entering.len());
+        for input in carry_operands {
+            operands.push(context.operand_value(input)?);
+        }
+        for allocation in &entering {
+            operands.push(context.allocation_value(*allocation)?);
+        }
+        for input in stacked_operands {
+            operands.push(context.operand_value(input)?);
+        }
+        let published_views = boundary
+            .added_outputs()
+            .iter()
+            .flat_map(|group| group.sources())
+            .filter_map(|output| match output {
+                ReferenceDischargeRegionOutput::View(position) => Some(*position),
+                ReferenceDischargeRegionOutput::Allocation(_) => None,
+            })
+            .collect::<Vec<_>>();
+        let outputs = context.parent().bind(
+            self.with_added_carries(entering.len())?,
+            vec![result.into_program()],
+            operands.as_slice(),
+        )?;
+        let published_offset = source_output_count + entering.len();
+        check_count!("output", outputs, published_offset + published_views.len(), ProgramError);
+
+        let mut results = Vec::with_capacity(source_output_count);
+        for (position, output) in outputs.into_iter().enumerate() {
+            if position < carry_count {
+                match carries[position] {
+                    Some(allocation) => {
+                        context.merge_boundary_state(&summary, &widening, allocation, output)?;
+                        results.push(carry_operands[position].clone());
+                    }
+                    None => results.push(ReferenceDischargeValue::Value(output)),
+                }
+            } else if position < carry_count + entering.len() {
+                let allocation = entering[position - carry_count];
+                context.merge_boundary_state(&summary, &widening, allocation, output)?;
+            } else if position < published_offset {
+                results.push(ReferenceDischargeValue::Value(output));
+            } else {
+                // The appended stacked outputs are the final per-iteration states of the published views, in declared
+                // input order. Their stacked type is the allocation's referent type, so each installs its allocation's
+                // successor state directly; a published view always names an allocation, by construction of the
+                // boundary above.
+                let allocation = body_allocations[published_views[position - published_offset]].unwrap();
+                context.set_discharged_state(allocation, output, true)?;
+            }
+        }
+        Ok(results)
+    }
+}
+
 impl<Capture, C: Domain> InterpretableOperation<C> for ScanOperation<Capture>
 where
     C::Type: ScanInterpretation<C>,
@@ -424,7 +658,7 @@ where
         // discarded contexts and remain safe (see the effect placement contract on
         // `PartialEvaluationContext::fold_or_residualize`). Every reference operation is `OrderedState`, so a body
         // touching references is never pure and no probe below can execute a reference operation, hoist a reference
-        // carry, or advance an ordered-effect frontier.
+        // carry, or change the active context's effect-ordering state.
         if !body.effects().classes().is_empty() {
             let time_varying_known = inputs.iter().any(PartialEvaluationValue::is_known);
             if time_varying_known {
@@ -1143,239 +1377,6 @@ where
         outputs: &[MaybeZero<Tracer<TracingContext<V, Target>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, DifferentiationError> {
         <V::Type>::transpose_scan(self, context, driver, inputs, outputs)
-    }
-}
-
-// Every trailing body input is the per-iteration slice of a stacked operand. A stacked *reference* operand enters the
-// body as a boundary view of its allocation (`ReferenceDischargeRegionInput::View`), never as a carry: a discharged one
-// becomes an ordinary stacked array operand carrying the allocation's current state and, when the body mutates the
-// view, gains one stacked output whose slices are the view's final states and whose stacked type is the allocation's
-// referent type, so it is installed as the allocation's successor state (a zero-length scan publishes the state
-// unchanged). A preserved one keeps its reference-typed stacked operand and the body replays through the view. The
-// view's state is region-local inside the rebuilt body, so the view must be the only handle of its allocation there,
-// which is checked through the view overlap query before the body is rebuilt.
-impl<Capture, C, P> ReferenceDischargeableOperation<C, P> for ScanOperation<Capture>
-where
-    Capture: Value,
-    ScanOperation<Capture>: Operation<Type = C::Type>,
-    C: Context<Operation: ReferenceViewOperation + From<ScanOperation<Capture>>>,
-    C::Type: From<P::Referent> + From<ReferenceType<P::Referent>>,
-    P: ReferenceDischargePolicy<C>,
-{
-    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
-        &self,
-        context: &ReferenceDischargeContext<C, P>,
-        driver: &D,
-        inputs: &[ReferenceDischargeValue<C, P>],
-    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
-        let name = self.name();
-        self.validate_region_count(driver.region_count())?;
-        let carry_count = self.carry_count();
-        if inputs.len() < carry_count {
-            return Err(ProgramError::MalformedProgram(format!(
-                "operation `{name}` declares {carry_count} carries but the application has {} operands",
-                inputs.len(),
-            )));
-        }
-        let (carry_operands, stacked_operands) = inputs.split_at(carry_count);
-        let carries = carry_operands
-            .iter()
-            .map(|input| context.operand_allocation(input, name))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // Only the carries forward positionally into the body. Every remaining body input is the per-iteration slice of
-        // a stacked operand: a value for a stacked array, and a boundary view of the operand's allocation for a stacked
-        // reference, which the summary attributes to that allocation exactly like a forwarded handle. Any operand past
-        // the body's inputs (i.e., a dynamic length) is a value.
-        let body = driver.region(0)?;
-        let body_input_types = body.input_types();
-        if body_input_types.len() < carry_count {
-            return Err(ProgramError::MalformedProgram(format!(
-                "operation `{name}` declares {carry_count} carries but its body declares {} inputs",
-                body_input_types.len(),
-            )));
-        }
-        if inputs.len() < body_input_types.len() {
-            return Err(ProgramError::MalformedProgram(format!(
-                "operation `{name}` attaches a body with {} inputs but the application has {} operands",
-                body_input_types.len(),
-                inputs.len(),
-            )));
-        }
-        let mut body_allocations = carries.clone();
-        for input in &inputs[carry_count..body_input_types.len()] {
-            body_allocations.push(context.operand_allocation(input, name)?);
-        }
-        let summary = context.region_summary(self, 0, body, body_allocations.as_slice())?;
-
-        // A per-iteration view is region-local state inside the rebuilt body, so it must be the only handle of its
-        // allocation there: another view of the same allocation must select provably different coordinates on every
-        // iteration, while a carry is a complete handle that always overlaps. The paths compared are the ones the
-        // reference view analysis derives for the body's inputs, namely the empty path for a carry and the boundary
-        // view closed over the body region for a stacked operand. Rebuilding resolves captures in the isolated region
-        // environment: inherited whole-allocation captures cannot resolve through a view-only boundary, while nested
-        // capture prefixes may bind the existing view.
-        let operation = C::Operation::from(self.clone());
-        let stacked_path = |position: usize| {
-            let view = operation.region_input_view(0, position).ok_or_else(|| {
-                ProgramError::MalformedProgram(format!(
-                    "operation `{name}` passes a reference into body input {position} without describing its \
-                     boundary view",
-                ))
-            })?;
-            let bindings = view
-                .symbols()
-                .into_iter()
-                .map(|symbol| match symbol {
-                    ViewSymbol::Iteration => Ok(ViewSymbolBinding::Iteration(body.id())),
-                    ViewSymbol::Operand(operand_index) => Err(ProgramError::MalformedProgram(format!(
-                        "operation `{name}` describes the boundary view of body input {position} through operand \
-                         {operand_index}, which a scan body cannot bind",
-                    ))),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok::<_, ProgramError>(ReferenceViewPath::root().with_step(view, bindings))
-        };
-        for (position, allocation) in body_allocations.iter().enumerate().skip(carry_count) {
-            let Some(allocation) = *allocation else {
-                continue;
-            };
-            let view_path = stacked_path(position)?;
-            let root = C::Type::from(context.allocation_reference(allocation)?.r#type().clone());
-            for (other_position, other) in body_allocations.iter().enumerate() {
-                if other_position == position || *other != Some(allocation) {
-                    continue;
-                }
-                let (role, other_path) = match other_position < carry_count {
-                    true => ("carry", ReferenceViewPath::root()),
-                    false => ("stacked operand", stacked_path(other_position)?),
-                };
-                if view_path.overlap(&other_path, &root) != ViewOverlap::Disjoint {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "operation `{name}` passes the allocation of stacked reference operand {position} also as \
-                         {role} {other_position}, whose handles may address the same coordinates inside the body; a \
-                         per-iteration view must be the only handle of its allocation inside the body",
-                    )));
-                }
-            }
-        }
-
-        // An allocation the body returns is threaded even if the body never accesses it, so that a boundary the loop's fixed
-        // point requires is reported as a broken fixed point rather than as a reference the rebuilt body cannot
-        // resolve. A preserved reference already in the carry list stays at its declared position; one reached only
-        // through a capture gains a reference-typed carry rather than a state carry. A stacked reference allocation
-        // crosses at its declared position as a view, so it gains no carry either, and it is published exactly when the
-        // body mutates it through that view.
-        let declared = body_allocations.iter().copied().flatten().collect::<BTreeSet<_>>();
-        let widening = context.boundary_widening(&summary, &declared)?;
-        let entering = widening.entering().to_vec();
-        let declared_inputs = body_allocations
-            .iter()
-            .enumerate()
-            .map(|(position, allocation)| match *allocation {
-                None => ReferenceDischargeRegionInput::Value,
-                Some(allocation) if position < carry_count => ReferenceDischargeRegionInput::Allocation(allocation),
-                Some(allocation) => ReferenceDischargeRegionInput::View(allocation),
-            })
-            .collect::<Vec<_>>();
-
-        let view_outputs = body_allocations
-            .iter()
-            .enumerate()
-            .skip(carry_count)
-            .filter_map(|(position, allocation)| {
-                allocation
-                    .filter(|allocation| widening.published().contains(allocation))
-                    .map(|_| ReferenceDischargeRegionOutput::View(position))
-            })
-            .collect();
-        let state = ReferenceDischargeRegionBoundaryInsertion::new(entering.clone(), carry_count);
-        let boundary = ReferenceDischargeRegionBoundary::new(
-            self,
-            0,
-            declared_inputs,
-            state.clone(),
-            [
-                state.into(),
-                ReferenceDischargeRegionBoundaryInsertion::new(view_outputs, driver.region(0)?.output_ids().len()),
-            ],
-        );
-        let result = driver.rebuild_region(context, 0, &boundary)?;
-        result.validate_predicted_mutations(widening.published(), name)?;
-        result.validate_predicted_output_allocations(summary.output_allocations(), name)?;
-
-        // A carry must leave the body as the reference it entered with, or a zero-length scan would not return its
-        // entering state.
-        let source_output_count = result.output_allocations().len();
-        if source_output_count < carry_count {
-            return Err(ProgramError::MalformedProgram(format!(
-                "operation `{name}` declares {carry_count} carries but its body declares {source_output_count} outputs",
-            )));
-        }
-        for (position, (returned, carry)) in result.output_allocations()[..carry_count].iter().zip(&carries).enumerate()
-        {
-            if returned != carry {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "operation `{name}` does not return carry {position} as the reference it entered with, so its \
-                     scan state has no fixed point",
-                )));
-            }
-        }
-
-        // A stacked reference operand contributes its allocation's current state when discharged and its destination
-        // reference when preserved, exactly like a carry does.
-        let mut operands = Vec::with_capacity(inputs.len() + entering.len());
-        for input in carry_operands {
-            operands.push(context.operand_value(input)?);
-        }
-        for allocation in &entering {
-            operands.push(context.allocation_value(*allocation)?);
-        }
-        for input in stacked_operands {
-            operands.push(context.operand_value(input)?);
-        }
-        let published_views = boundary
-            .added_outputs()
-            .iter()
-            .flat_map(|group| group.sources())
-            .filter_map(|output| match output {
-                ReferenceDischargeRegionOutput::View(position) => Some(*position),
-                ReferenceDischargeRegionOutput::Allocation(_) => None,
-            })
-            .collect::<Vec<_>>();
-        let outputs = context.parent().bind(
-            self.with_added_carries(entering.len())?,
-            vec![result.into_program()],
-            operands.as_slice(),
-        )?;
-        let published_offset = source_output_count + entering.len();
-        check_count!("output", outputs, published_offset + published_views.len(), ProgramError);
-
-        let mut results = Vec::with_capacity(source_output_count);
-        for (position, output) in outputs.into_iter().enumerate() {
-            if position < carry_count {
-                match carries[position] {
-                    Some(allocation) => {
-                        context.merge_boundary_state(&summary, &widening, allocation, output)?;
-                        results.push(carry_operands[position].clone());
-                    }
-                    None => results.push(ReferenceDischargeValue::Value(output)),
-                }
-            } else if position < carry_count + entering.len() {
-                let allocation = entering[position - carry_count];
-                context.merge_boundary_state(&summary, &widening, allocation, output)?;
-            } else if position < published_offset {
-                results.push(ReferenceDischargeValue::Value(output));
-            } else {
-                // The appended stacked outputs are the final per-iteration states of the published views, in declared
-                // input order. Their stacked type is the allocation's referent type, so each installs its allocation's
-                // successor state directly; a published view always names an allocation, by construction of the
-                // boundary above.
-                let allocation = body_allocations[published_views[position - published_offset]].unwrap();
-                context.set_discharged_state(allocation, output, true)?;
-            }
-        }
-        Ok(results)
     }
 }
 
@@ -2262,7 +2263,7 @@ where
 
     // The partition records the effect constraints of its construction contract. Ordinary specialization keeps
     // global ordering; separately invoked residual work can exchange only independent reference resources.
-    if partition.has_cross_partition_effect_dependencies() {
+    if partition.has_effect_ordering_conflicts() {
         return context.fold_or_residualize(O::from(scan.clone()), vec![body.to_program()], inputs);
     }
     if let Some(outputs) = reconstruct_partitioned_scan(
@@ -3175,7 +3176,8 @@ where
 ///
 ///   - `operation`: Primal scan staged into the tangent program.
 ///   - `context`: Active transpose tracing context the pullback is staged into.
-///   - `inputs`: Per-operand [`PartialValue`] knowledge, mirroring the body inputs as `[carries..., scanned_inputs...]`.
+///   - `inputs`: Per-operand [`PartialValue`] knowledge, mirroring the body inputs as `[carries...,
+/// scanned_inputs...]`.
 ///     A linear operand is [`Unknown`](PartialValue::Unknown); a known operand is
 ///     [`Known`](PartialValue::Known) of the residual-stack tracer the pullback reads.
 ///   - `outputs`: Symbolic cotangents for the scan's outputs.
@@ -3392,7 +3394,8 @@ where
     )?;
     check_count!("output", scan_cotangents, retained_carry_count + linear_scanned_count, ProgramError);
 
-    // Reassemble one cotangent per operand. The reversed scan outputs `[carry_cotangent..., scanned_input_cotangent...]`,
+    // Reassemble one cotangent per operand. The reversed scan outputs `[carry_cotangent...,
+    // scanned_input_cotangent...]`,
     // the carry cotangents (including the re-inserted zeros for known carries, and excluding the dropped dead reference
     // carries) leading the scanned-input cotangents over the *linear* non-reference scanned inputs. Every carry operand
     // precedes every scanned operand, so a single sequential drain hands each retained carry operand the next carry
@@ -6018,6 +6021,67 @@ mod tests {
         assert_eq!(reassembled[0].to_f64s(), vec![73.0]);
         assert_eq!(reassembled[1].to_f64s(), vec![2.0]);
         assert_eq!(reassembled[2].to_f64s(), vec![21.0, 45.0, 73.0]);
+    }
+
+    #[test]
+    fn test_scan_partial_evaluation_residualizes_reference_carry_whole() {
+        // `f(r, xs) = { for x in xs { write(r, 1); add_update(r, x) }; read(r) }` with the reference carried through the scan.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let reference_type = ReferenceType::new(scalar_type.clone());
+        let mut body_builder = ProgramBuilder::<TestIrValue, ArrayIrOperation<Array>>::new();
+        let reference = body_builder.add_input(reference_type.clone().into());
+        let x = body_builder.add_input(scalar_type.clone().into());
+        let one = body_builder.add_constant(TestIrValue::Array(Array::scalar(1.0_f32)));
+        body_builder
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, one], None)
+            .unwrap();
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, x], None)
+            .unwrap();
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![reference], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestIrValue, ArrayIrOperation<Array>>::new();
+        let body = builder.import_program(body);
+        let reference = builder.add_input(reference_type.into());
+        let xs = builder.add_input(ArrayType::new_static(DataType::F32, [3]).into());
+        let reference = builder
+            .add_instruction(ScanOperation::<TestIrValue>::new(1, 3), vec![body], vec![reference, xs], None)
+            .unwrap()[0];
+        let read =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![read], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        // Moving the known write into a separate scan would run all resets before the unknown updates. Keeping
+        // each reset beside its update produces 1 + 3 = 4, rather than 1 + (1 + 2 + 3) = 7.
+        let live = ArrayReference::new(Array::scalar(2.0_f32));
+        let evaluation = program
+            .partially_evaluate(&[
+                PartialValue::Known(TestIrValue::Reference(live.clone())),
+                PartialValue::Unknown(ArrayType::new_static(DataType::F32, [3]).into()),
+            ])
+            .unwrap();
+        assert_eq!(live.read(), Ok(Array::scalar(2.0_f32)));
+        assert_eq!(evaluation.known_reference_inputs().collect::<Vec<_>>(), vec![1]);
+        assert_eq!(
+            evaluation
+                .program()
+                .instructions()
+                .iter()
+                .map(|instruction| instruction.operation().name())
+                .collect::<Vec<_>>(),
+            vec!["scan", "reference_read"],
+        );
+        assert_eq!(
+            evaluation.interpret(
+                &EagerContext::<TestIrValue, ArrayIrOperation<Array>>::new(),
+                &[TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0]))],
+            ),
+            Ok(vec![TestIrValue::Array(Array::scalar(4.0_f32))]),
+        );
+        assert_eq!(live.read(), Ok(Array::scalar(4.0_f32)));
     }
 
     #[test]
