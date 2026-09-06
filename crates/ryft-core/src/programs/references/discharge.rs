@@ -4455,9 +4455,8 @@ mod tests {
     };
     use crate::captures::CaptureReference;
     use crate::contexts::EagerContext;
-    use crate::differentiation::CustomVjpOperation;
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-    use crate::operations::{Add, ConditionOperation};
+    use crate::operations::{Add, ConditionOperation, CustomVjpOperation};
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::ProgramError;
     use crate::programs::atoms::AtomId;

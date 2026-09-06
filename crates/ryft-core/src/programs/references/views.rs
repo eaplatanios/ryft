@@ -968,8 +968,9 @@ mod tests {
     use crate::arrays::types::ir::ArrayIrType;
     use crate::contexts::EagerContext;
     use crate::operations::{
-        ConditionOperation, ReshapeOperation, SCAN_OPERATION_NAME, ScanOperation, SliceOperation, UpdateSliceOperation,
-        WhileOperation,
+        ConditionOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
+        ReferenceWriteOperation, ReshapeOperation, SCAN_OPERATION_NAME, ScanOperation, SliceOperation,
+        UpdateSliceOperation, WhileOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::atoms::AtomId;
@@ -978,9 +979,6 @@ mod tests {
     use crate::programs::instructions::Instruction;
     use crate::programs::programs::Program;
     use crate::programs::references::analysis::{ReferenceAliasEdge, ReferenceAliasOrigin};
-    use crate::programs::references::operations::{
-        ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceWriteOperation,
-    };
     use crate::programs::references::types::ReferenceType;
     use crate::programs::regions::{
         InputRegionProvenance, OutputRegionProvenance, RegionId, RegionInterface, RegionSlot,

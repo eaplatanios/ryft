@@ -61,19 +61,18 @@ pub use compilation::{
 pub use contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext, ValueResolution};
 pub use differentiation::{
     BinaryElementwiseJvpOperands, BroadcastDerivativeAlignment, CotangentBatchingPolicy, CotangentDestination,
-    CotangentDestinationKind, CotangentReferenceAccumulator, CotangentSeed, CustomJvp, CustomJvpOperation, CustomVjp,
-    CustomVjpOperation, DenseDifferentiableType, DerivativeTransform, DifferentiableOperation, DifferentiableType,
-    Differentiate, DifferentiationBoundaryPosition, DifferentiationBuilder, DifferentiationBuilderContext,
-    DifferentiationBuilderExecutionContext, DifferentiationBuilderLinearityMode, DifferentiationContext,
-    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationParameterRole,
-    DifferentiationTracer, ElementwiseDerivativeAlignment, ForwardModeDifferentiate, Hessian, HessianBlock,
-    HolomorphicLinearity, Jacobian, JacobianBlock, LinearCallOperation, Linearization, LinearizationTracer,
-    MemberDifferentiableOperation, Pullback, Pushforward, RealLinearity, ReferenceOperandCotangents,
-    ResidualZeroProvider, ReverseModeDifferentiate, STOP_GRADIENT_OPERATION_NAME, StopGradient, StopGradientOperation,
-    StopGradients, TransposableOperation, TranspositionContext, TranspositionDriver, UnaryElementwiseJvpOperands,
-    WithAuxiliaryOutput, WithCapture, WithContext, WithoutAuxiliaryOutput, WithoutCapture, WithoutContext,
-    binary_elementwise_jvp, custom_jvp, custom_vjp, differentiate_at, jvp_projected_operation,
-    reference_operand_cotangents, transpose_mixed_operation, transpose_projected_operation, unary_elementwise_jvp,
+    CotangentDestinationKind, CotangentReferenceAccumulator, CotangentSeed, DenseDifferentiableType,
+    DerivativeTransform, DifferentiableOperation, DifferentiableType, Differentiate, DifferentiationBoundaryPosition,
+    DifferentiationBuilder, DifferentiationBuilderContext, DifferentiationBuilderExecutionContext,
+    DifferentiationBuilderLinearityMode, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationParameterRole, DifferentiationTracer, ElementwiseDerivativeAlignment,
+    ForwardModeDifferentiate, Hessian, HessianBlock, HolomorphicLinearity, Jacobian, JacobianBlock, Linearization,
+    LinearizationTracer, MemberDifferentiableOperation, Pullback, Pushforward, RealLinearity,
+    ReferenceOperandCotangents, ResidualZeroProvider, ReverseModeDifferentiate, TransposableOperation,
+    TranspositionContext, TranspositionDriver, UnaryElementwiseJvpOperands, WithAuxiliaryOutput, WithCapture,
+    WithContext, WithoutAuxiliaryOutput, WithoutCapture, WithoutContext, binary_elementwise_jvp, differentiate_at,
+    jvp_projected_operation, reference_operand_cotangents, transpose_mixed_operation, transpose_projected_operation,
+    unary_elementwise_jvp,
 };
 pub use errors::{CustomError, Error, MaybeFallible};
 pub use interpretation::{
@@ -97,6 +96,11 @@ pub use operations::cumulative::{
     CUMULATIVE_PRODUCT_OPERATION_NAME, CUMULATIVE_SUM_OPERATION_NAME, CumulativeLogSumExp,
     CumulativeLogSumExpOperation, CumulativeMax, CumulativeMaxOperation, CumulativeMin, CumulativeMinOperation,
     CumulativeProduct, CumulativeProductOperation, CumulativeSum, CumulativeSumOperation,
+};
+pub use operations::differentiation::{
+    CUSTOM_JVP_OPERATION_NAME, CUSTOM_VJP_OPERATION_NAME, CustomJvp, CustomJvpOperation, CustomVjp, CustomVjpOperation,
+    LinearCallOperation, STOP_GRADIENT_OPERATION_NAME, StopGradient, StopGradientOperation, StopGradients, custom_jvp,
+    custom_vjp,
 };
 pub use operations::dot::{
     DOT_OPERATION_NAME, Dot, DotDimensionNumbers, DotOperation, DotOps, RAGGED_DOT_OPERATION_NAME, RaggedDot,
@@ -133,6 +137,13 @@ pub use operations::math::{
     TANH_OPERATION_NAME, Tanh, TanhOperation,
 };
 pub use operations::quantization::{BlockQuantize, SCALED_DOT_OPERATION_NAME, ScaledDot, ScaledDotOperation};
+pub use operations::references::{
+    REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME,
+    REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME, ReferenceAddUpdate,
+    ReferenceAddUpdateOperation, ReferenceAddUpdateOperationProvider, ReferenceFreeze, ReferenceFreezeOperation,
+    ReferenceNew, ReferenceNewOperation, ReferenceNewOperationProvider, ReferenceRead, ReferenceReadOperation,
+    ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation,
+};
 pub use operations::sharding::{
     ConstrainSharding, RESHARD_OPERATION_NAME, Reshard, ReshardOperation, SHARDING_CONSTRAINT_OPERATION_NAME,
     ShardingConstraintOperation,
@@ -172,30 +183,25 @@ pub use programs::{
     OperationProvider, OutputRegionProvenance, ParameterProjection, PartialReferenceDischargeResult,
     PreparedReferenceReplacement, Program, ProgramBuilder, ProgramBuilderId, ProgramError, ProgramLiveSets,
     ProgramRenderingMode, ProgramStatistics, ProjectedValue, Provenance, ProvenanceScope, ProvenanceState,
-    REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME,
-    REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME,
     ReadyOrPendingReferenceGuard, ReadyReferenceGuard, RecursiveReferenceDischargeDriver, Reference, ReferenceAccess,
-    ReferenceAccessMode, ReferenceAccumulationPolicy, ReferenceAddUpdate, ReferenceAddUpdateOperation,
-    ReferenceAddUpdateOperationProvider, ReferenceAlias, ReferenceAliasEdge, ReferenceAliasKind, ReferenceAliasOrigin,
-    ReferenceAnalysis, ReferenceAnalysisError, ReferenceBoundary, ReferenceBoundaryError, ReferenceBoundaryPosition,
-    ReferenceCompletion, ReferenceCompletionBackend, ReferenceDischargeAllocationId,
+    ReferenceAccessMode, ReferenceAccumulationPolicy, ReferenceAlias, ReferenceAliasEdge, ReferenceAliasKind,
+    ReferenceAliasOrigin, ReferenceAnalysis, ReferenceAnalysisError, ReferenceBoundary, ReferenceBoundaryError,
+    ReferenceBoundaryPosition, ReferenceCompletion, ReferenceCompletionBackend, ReferenceDischargeAllocationId,
     ReferenceDischargeBoundaryWidening, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
     ReferenceDischargeReference, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion,
     ReferenceDischargeRegionInput, ReferenceDischargeRegionOutput, ReferenceDischargeRegionResult,
     ReferenceDischargeRegionSummary, ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceEffect, ReferenceError, ReferenceFreeze,
-    ReferenceFreezeOperation, ReferenceGeneration, ReferenceId, ReferenceIdentity, ReferenceNew, ReferenceNewOperation,
-    ReferenceNewOperationProvider, ReferenceObservation, ReferenceRead, ReferenceReadOperation,
-    ReferenceRegionInputBinding, ReferenceReplacementPreparation, ReferenceReplacementTransaction, ReferenceRoot,
-    ReferenceSource, ReferenceSwap, ReferenceSwapOperation, ReferenceTransitiveAccess, ReferenceType,
+    ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceEffect, ReferenceError, ReferenceGeneration,
+    ReferenceId, ReferenceIdentity, ReferenceObservation, ReferenceRegionInputBinding, ReferenceReplacementPreparation,
+    ReferenceReplacementTransaction, ReferenceRoot, ReferenceSource, ReferenceTransitiveAccess, ReferenceType,
     ReferenceTypeRefinements, ReferenceView, ReferenceViewAnalysis, ReferenceViewAnalysisError, ReferenceViewOperation,
-    ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation,
-    Region, RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionRef, RegionReplayMappings,
-    RegionRole, RegionSlot, RegionStatistics, RegionWithMetadata, ReplayRegionDriver, TakenReferenceGuard, Transform,
-    TransformArtifact, TransformCache, Type, TypeError, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming,
-    TypeIdentitySignature, TypeRefinements, Typed, ValidatedPendingReplacementTransaction, Value, ValueId,
-    ValueProjection, ViewOverlap, ViewSymbol, ViewSymbolBinding, batch_reference_view_operation,
-    discharge_positional_region_operation, discharge_reference_free_operation, infer_projected_operation_output_types,
+    ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError, Region, RegionArena, RegionArenaIterator,
+    RegionDriver, RegionId, RegionInterface, RegionRef, RegionReplayMappings, RegionRole, RegionSlot, RegionStatistics,
+    RegionWithMetadata, ReplayRegionDriver, TakenReferenceGuard, Transform, TransformArtifact, TransformCache, Type,
+    TypeError, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature, TypeRefinements, Typed,
+    ValidatedPendingReplacementTransaction, Value, ValueId, ValueProjection, ViewOverlap, ViewSymbol,
+    ViewSymbolBinding, batch_reference_view_operation, discharge_positional_region_operation,
+    discharge_reference_free_operation, infer_projected_operation_output_types,
     infer_projected_operation_region_input_types, validate_reference_boundary,
 };
 pub use specialization::{
@@ -226,14 +232,15 @@ pub(crate) mod tests {
     };
     use crate::contexts::Context;
     use crate::macros::check_count;
-    use crate::operations::ConditionOperation;
+    use crate::operations::{
+        ConditionOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation,
+        ReferenceReadOperation, ReferenceSwapOperation,
+    };
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::transforms::{RegionTransformCache, RegionTransformRegistry};
     use crate::programs::{
-        EffectClass, EffectClasses, Effects, Operation, Program, ProgramBuilder, ReferenceAddUpdateOperation,
-        ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation, ReferenceType,
-        Region, RegionDriver, RegionInterface, RegionRef, RegionSlot, Transform, TransformArtifact, TypeError, Typed,
-        Value,
+        EffectClass, EffectClasses, Effects, Operation, Program, ProgramBuilder, ReferenceType, Region, RegionDriver,
+        RegionInterface, RegionRef, RegionSlot, Transform, TransformArtifact, TypeError, Typed, Value,
     };
 
     use crate::specialization::SpecializationCacheStatistics;

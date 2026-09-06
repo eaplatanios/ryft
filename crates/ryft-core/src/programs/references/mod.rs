@@ -33,11 +33,11 @@
 //! The reference terms used throughout this module and its consumers are defined relative to one concept:
 //!
 //! - A **reference allocation** is the canonical mutable storage cell that a reference family denotes. Only
-//!   [`reference_new`](ReferenceNewOperation) mints one. Eagerly, the allocation is the reference allocation whose
-//!   synchronized state every [`Reference`] clone shares; in operation effect declarations, it is the identity that
-//!   [`ReferenceEffect::Allocate`](crate::ReferenceEffect::Allocate) introduces and
-//!   [`ReferenceAlias`](crate::ReferenceAlias) preserves; during discharge, it is the unit of state threading, named
-//!   by a [`ReferenceDischargeAllocationId`].
+//!   [`reference_new`](crate::operations::ReferenceNewOperation) mints one. Eagerly, the allocation is the reference
+//!   allocation whose synchronized state every [`Reference`] clone shares; in operation effect declarations, it is the
+//!   identity that [`ReferenceEffect::Allocate`](crate::ReferenceEffect::Allocate) introduces and
+//!   [`ReferenceAlias`](crate::ReferenceAlias) preserves; during discharge, it is the unit of state threading, named by
+//!   a [`ReferenceDischargeAllocationId`].
 //! - The **referent** is the structural type of the value a handle exposes, written `ref<T>` as [`ReferenceType`].
 //!   The allocation has its own referent — the type of the complete stored value — and a view's handle-local referent may
 //!   be narrower.
@@ -55,14 +55,14 @@
 //!   crosses a structured-region or discharge boundary is always represented by a complete-value handle; views are
 //!   created from that reference inside the region that needs them.
 //!
-//! Every handle resolves to exactly one allocation: multi-source aliases (e.g., a hypothetical `select_reference(a, b)`)
-//! are structurally unrepresentable rather than merely rejected, so analyses reason about state per allocation.
+//! Every handle resolves to exactly one allocation: multi-source aliases (e.g., a hypothetical `select_reference(a,
+//! b)`) are structurally unrepresentable rather than merely rejected, so analyses reason about state per allocation.
 //! Access-mode summaries, discharge state threading, and race validation are per-allocation facts, and consumption
-//! ([`reference_freeze`](ReferenceFreezeOperation)) is a complete-value lifetime event that invalidates the complete
-//! family, which is why consuming through a narrowing view is rejected. Allocations also split by provenance: a *local*
-//! allocation is created inside the program and disappears entirely after discharge, while an *external* allocation
-//! denotes caller-owned state entering through an input or capture ([`ReferenceSource`]) and is what a
-//! [`ExternalReferenceBinding`] describes to the backend.
+//! ([`reference_freeze`](crate::operations::ReferenceFreezeOperation)) is a complete-value lifetime event that
+//! invalidates the complete family, which is why consuming through a narrowing view is rejected. Allocations also split
+//! by provenance: a *local* allocation is created inside the program and disappears entirely after discharge, while an
+//! *external* allocation denotes caller-owned state entering through an input or capture ([`ReferenceSource`]) and is
+//! what a [`ExternalReferenceBinding`] describes to the backend.
 //!
 //! # Module Structure
 //!
@@ -80,11 +80,13 @@
 //!   descriptions with static or symbolic coordinates, their type-level validation, their reapplication to a
 //!   transformed reference, their batching, and their overlap query) and the retained [`ReferenceViewAnalysis`]
 //!   overlay that composes those descriptions into one [`ReferenceViewPath`] per reference-typed value of a closure.
-//! - `operations/` defines the six generic primitives in separate modules together with their value-level
-//!   capabilities: allocation ([`ReferenceNew`]), immutable reads ([`ReferenceRead`]), write-only replacement
-//!   ([`ReferenceWrite`]), swapping ([`ReferenceSwap`]), ordered additive updates ([`ReferenceAddUpdate`]), and
-//!   consuming finalization ([`ReferenceFreeze`]). Each primitive module also owns its type inference, effects, eager
-//!   interpretation, discharge rule, and unit tests.
+//! - [`crate::operations::references`] defines the six generic primitives in separate modules together with their
+//!   value-level capabilities: allocation ([`ReferenceNew`](crate::operations::ReferenceNew)), immutable reads
+//!   ([`ReferenceRead`](crate::operations::ReferenceRead)), write-only replacement
+//!   ([`ReferenceWrite`](crate::operations::ReferenceWrite)), swapping ([`ReferenceSwap`](crate::operations::ReferenceSwap)),
+//!   ordered additive updates ([`ReferenceAddUpdate`](crate::operations::ReferenceAddUpdate)), and consuming finalization
+//!   ([`ReferenceFreeze`](crate::operations::ReferenceFreeze)). Each primitive module also owns its type inference,
+//!   effects, eager interpretation, discharge rule, and unit tests.
 //! - `discharge.rs` implements an interpreter-style transform that replaces selected mutable allocations with
 //!   explicitly threaded immutable values. Its policy, context, driver, and operation-rule contracts keep the transform
 //!   open to non-array value families and to third-party operations.
@@ -255,7 +257,6 @@ pub enum ReferenceError {
 
 mod analysis;
 mod discharge;
-mod operations;
 mod types;
 mod values;
 mod views;
@@ -274,13 +275,6 @@ pub use discharge::{
     ReferenceDischargeableType, ReferenceSource, discharge_positional_region_operation,
     discharge_reference_free_operation,
 };
-pub use operations::{
-    REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME,
-    REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME, ReferenceAddUpdate,
-    ReferenceAddUpdateOperation, ReferenceAddUpdateOperationProvider, ReferenceFreeze, ReferenceFreezeOperation,
-    ReferenceNew, ReferenceNewOperation, ReferenceNewOperationProvider, ReferenceRead, ReferenceReadOperation,
-    ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation,
-};
 pub use types::{ReferenceType, ReferenceTypeRefinements};
 
 pub use values::{
@@ -291,7 +285,6 @@ pub use values::{
     validate_reference_boundary,
 };
 
-pub(crate) use operations::forwarded_tangent;
 pub use views::{
     NoBinding, ReferenceView, ReferenceViewAnalysis, ReferenceViewAnalysisError, ReferenceViewOperation,
     ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError, ViewOverlap, ViewSymbol, ViewSymbolBinding,

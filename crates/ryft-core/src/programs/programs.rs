@@ -2028,16 +2028,15 @@ mod tests {
     use crate::macros::check_count;
     use crate::operations::{
         AddOperation, CompareOperation, ComparisonDirection, ConditionOperation, MulOperation, NegOperation,
-        PrintOperation, ScanOperation, WhileOperation,
+        PrintOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceWriteOperation, ScanOperation,
+        WhileOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::effects::{EffectClass, EffectClasses, Effects, ReferenceEffect};
     use crate::programs::operations::OperationFormatter;
     use crate::programs::provenance::{Provenance, ProvenanceScope};
-    use crate::programs::references::{
-        ReferenceNewOperation, ReferenceReadOperation, ReferenceType, ReferenceWriteOperation,
-    };
+    use crate::programs::references::ReferenceType;
     use crate::programs::regions::{RegionInterface, RegionSlot};
     use crate::programs::types::TypeError;
     use crate::tests::{TestOrderedStateOperation, TestRegionOperation};

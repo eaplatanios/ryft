@@ -49,6 +49,9 @@ Use this file as the single detailed reference for `ryft` testing conventions.
 - Use `pub(crate) mod tests` only when the module intentionally exposes shared test helpers to sibling modules.
 - Put local test helpers near the top of the test module, before the first `#[test]`.
 - Define test-only types inside the single test that uses them; keep module-level test types for shared test fixtures.
+- Inline a type alias used by only one test. When the same alias is used by multiple tests, define it once near the top
+  of the owning test module. Use a more specific name when `TestValue` or `TestOperation` would collide with another
+  test fixture in that module.
 - Prefer one focused test per behavior family. Avoid broad omnibus tests unless the setup cost is high and the behavior
   is naturally exercised as one scenario.
 - Prefer flat sequences of explicit assertions over local helper closures or loops. Compact table or array loops are
@@ -90,9 +93,12 @@ Use this file as the single detailed reference for `ryft` testing conventions.
 ## Operations, Types, And Attributes
 
 - For `ryft-core`:
-  - Prefer one consolidated `test_<operation>` test per operation type. Add separate tests only for independently useful
-    public helper types or for substantial contracts that the primary test cannot express clearly, such as specialized
-    sharding behavior, dynamic-index transforms, backend kernels, or nested transformation composition.
+  - For simple operations, order primary tests as `test_<operation>`, `test_<operation>_type_inference`,
+    `test_<operation>_interpretation` using `Array` values, `test_<operation>_partial_evaluation`,
+    `test_<operation>_batching`, `test_<operation>_differentiation`, and `test_<operation>_transposition`, where those
+    behaviors apply. Use `operations/math/add.rs` as the reference layout. Keep substantial edge cases beside the
+    corresponding primary test, including specialized sharding behavior, dynamic-index transforms, backend kernels,
+    and nested transformation composition, and test independently useful public helper types separately.
   - Use default or unknown locations for ordinary operation tests. Use specific file locations only when location
     behavior itself matters.
   - For operation constructor tests, verify the containing operation or module, then compare the complete rendered

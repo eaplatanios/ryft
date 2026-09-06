@@ -1764,7 +1764,10 @@ mod tests {
     use crate::captures::CaptureReference;
     use crate::contexts::EagerContext;
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
-    use crate::operations::{AddOperation, ConditionOperation, WhileOperation};
+    use crate::operations::{
+        AddOperation, ConditionOperation, ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceWriteOperation,
+        WhileOperation,
+    };
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::ProgramError;
     use crate::programs::atoms::AtomId;
@@ -1776,9 +1779,6 @@ mod tests {
     use crate::programs::instructions::{Instruction, InstructionId};
     use crate::programs::operations::Operation;
     use crate::programs::programs::Program;
-    use crate::programs::references::operations::{
-        ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceWriteOperation,
-    };
     use crate::programs::references::types::ReferenceType;
     use crate::programs::regions::{OutputRegionProvenance, RegionId, RegionInterface, RegionSlot};
     use crate::programs::types::{Type, TypeError};

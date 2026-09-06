@@ -1627,13 +1627,14 @@ mod tests {
         Shape,
     };
     use crate::contexts::EagerContext;
+    use crate::operations::{ReferenceNewOperation, ReferenceReadOperation};
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::ProgramError;
     use crate::programs::builders::ProgramBuilder;
     use crate::programs::effects::EffectClass;
     use crate::programs::identities::TypeIdentity;
     use crate::programs::programs::Program;
-    use crate::programs::references::{ReferenceNewOperation, ReferenceReadOperation, ReferenceType};
+    use crate::programs::references::ReferenceType;
     use crate::tests::TestRegionOperation;
 
     use super::*;
