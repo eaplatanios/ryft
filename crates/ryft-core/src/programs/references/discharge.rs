@@ -9051,6 +9051,140 @@ mod tests {
     }
 
     #[test]
+    fn test_discharge_local_reference_operation() {
+        // The destination cannot interpret reference primitives: executing the rebuilt callee therefore also
+        // verifies that its local allocation, update, and consumption were discharged into ordinary values.
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let input = builder.add_input(ListIrType::List(ListType { length: 2 }));
+        let reference = builder.add_instruction(ListOperation::ReferenceNew, Vec::new(), vec![input], None).unwrap()[0];
+        builder.add_instruction(ListOperation::AddUpdate, Vec::new(), vec![reference, input], None).unwrap();
+        let output = builder.add_instruction(ListOperation::Freeze, Vec::new(), vec![reference], None).unwrap()[0];
+        let callee = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let regions = [callee];
+        let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
+        let context = ListDischargeContext::new(ListDestination::new());
+        assert_eq!(
+            discharge_local_reference_operation(
+                &ListOperation::Call,
+                &context,
+                &driver,
+                &[ReferenceDischargeValue::Value(ListIrValue::List(vec![3, 4]))],
+            ),
+            Ok(vec![ReferenceDischargeValue::Value(ListIrValue::List(vec![6, 8]))]),
+        );
+        assert_eq!(
+            discharge_local_reference_operation(
+                &ListOperation::Call,
+                &context,
+                &driver,
+                &[ReferenceDischargeValue::Value(ListIrValue::List(vec![7, 8]))],
+            ),
+            Ok(vec![ReferenceDischargeValue::Value(ListIrValue::List(vec![14, 16]))]),
+        );
+    }
+
+    #[test]
+    fn test_discharge_local_reference_operation_rejects_reference_operands() {
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let input = builder.add_input(ListIrType::List(ListType { length: 2 }));
+        let callee = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let regions = [callee];
+        let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
+        let context = ListDischargeContext::new(ListDestination::new());
+        let reference = context
+            .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
+            .unwrap();
+        assert_eq!(
+            discharge_local_reference_operation(&ListOperation::Call, &context, &driver, &[reference.clone().into()]),
+            Err(ProgramError::UnsupportedOperation {
+                message: "`list.call` does not thread external references through discharge, but operand 0 is a \
+                          reference; pass reference-free operands or discharge external references first"
+                    .to_string(),
+            }),
+        );
+        assert_eq!(context.read(&reference), Ok(ListIrValue::List(vec![1, 2])));
+        assert_eq!(context.is_mutated(reference.allocation_id()), Ok(false));
+    }
+
+    #[test]
+    fn test_discharge_local_reference_operation_rejects_reference_region_inputs() {
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let reference = builder.add_input(ListIrType::Reference(ReferenceType::new(ListType { length: 2 })));
+        let output = builder.add_instruction(ListOperation::Read, Vec::new(), vec![reference], None).unwrap()[0];
+        let callee = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let regions = [callee];
+        let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
+        let context = ListDischargeContext::new(ListDestination::new());
+        assert_eq!(
+            discharge_local_reference_operation(
+                &ListOperation::Call,
+                &context,
+                &driver,
+                &[ReferenceDischargeValue::Value(ListIrValue::List(vec![1, 2]))],
+            ),
+            Err(ProgramError::UnsupportedOperation {
+                message: "`list.call` does not thread external references through discharge, but input 0 of region 0 \
+                          is a reference; pass reference-free operands or discharge external references first"
+                    .to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_discharge_local_reference_operation_rejects_captured_references() {
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let captured = builder.add_constant(ListIrValue::Reference(ReferenceType::new(ListType { length: 2 })));
+        let output = builder.add_instruction(ListOperation::Read, Vec::new(), vec![captured], None).unwrap()[0];
+        let callee = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![output], Vec::new(), vec![Placeholder])
+            .unwrap();
+        let regions = [callee];
+        let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
+        let context = ListDischargeContext::new(ListDestination::new());
+        let reference = context
+            .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
+            .unwrap();
+        let allocation = reference.allocation_id();
+        let context = context.with_captures(ReferenceDischargeCaptureScope::new(vec![None, None, Some(allocation)]));
+        assert_eq!(
+            discharge_local_reference_operation(&ListOperation::Call, &context, &driver, &[]),
+            Err(ProgramError::UnsupportedOperation {
+                message: format!(
+                    "`list.call` does not thread external references through discharge, but its region 0 reaches \
+                     {allocation}; discharge external references first",
+                ),
+            }),
+        );
+        assert_eq!(context.read(&reference), Ok(ListIrValue::List(vec![1, 2])));
+        assert_eq!(context.is_mutated(allocation), Ok(false));
+    }
+
+    #[test]
+    fn test_discharge_local_reference_operation_validates_region_count() {
+        let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
+        let input = builder.add_input(ListIrType::List(ListType { length: 2 }));
+        let callee = builder
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let regions = [callee];
+        let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
+        let context = ListDischargeContext::new(ListDestination::new());
+        let input = ReferenceDischargeValue::Value(ListIrValue::List(vec![1, 2]));
+        assert_eq!(
+            discharge_local_reference_operation(&ListOperation::Add, &context, &driver, &[input.clone(), input]),
+            Err(ProgramError::MalformedProgram(
+                "operation `list.add` declares no region slots but 1 regions were attached".to_string(),
+            )),
+        );
+    }
+
+    #[test]
     fn test_discharge_positional_region_operation() {
         // The callee writes the forwarded reference and returns a snapshot of it. The forwarded allocation is
         // discharged, so the rewritten call publishes its final state through an appended output, which the rule merges
