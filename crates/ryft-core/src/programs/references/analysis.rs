@@ -847,7 +847,7 @@ impl ReferenceAnalysis {
         region: RegionRef<'_, V, O>,
         capture_count: usize,
     ) -> Result<Self, ReferenceAnalysisError> {
-        Self::new_with_constants(region, Some(capture_count), false)
+        Self::new_with_constants(region, Some(capture_count), false, &[])
     }
 
     /// Runs the same traversal with optional resolution of constants inherited by an open region. Explicit nested
@@ -856,6 +856,7 @@ impl ReferenceAnalysis {
         region: RegionRef<'_, V, O>,
         capture_scope: Option<usize>,
         resolve_constants: bool,
+        consumable_inputs: &[usize],
     ) -> Result<Self, ReferenceAnalysisError> {
         let capture_count = capture_scope.unwrap_or(0);
         let input_ids = region.input_ids();
@@ -881,6 +882,7 @@ impl ReferenceAnalysis {
         let mut traversal = Traversal {
             entry: region,
             capture_count,
+            consumable_inputs: consumable_inputs.to_vec(),
             analysis: Self {
                 region: region.id(),
                 roots: BTreeMap::new(),
@@ -1049,6 +1051,9 @@ pub(crate) struct ReferenceAnalysisTransformArguments {
 
     /// Region identifiers of the analyzed closure in first-encounter structural order.
     regions: Vec<RegionId>,
+
+    /// Entry input indices whose ownership is transferred to this region. All other external roots remain borrowed.
+    consumable_inputs: Vec<usize>,
 }
 
 impl ReferenceAnalysisTransformArguments {
@@ -1060,7 +1065,12 @@ impl ReferenceAnalysisTransformArguments {
         region: RegionRef<'_, V, O>,
         capture_count: usize,
     ) -> Self {
-        Self { capture_scope: Some(capture_count), regions: region.region_ids_in_closure(), resolve_constants: false }
+        Self {
+            capture_scope: Some(capture_count),
+            regions: region.region_ids_in_closure(),
+            resolve_constants: false,
+            consumable_inputs: Vec::new(),
+        }
     }
 }
 
@@ -1088,6 +1098,20 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
         let mut arguments = ReferenceAnalysisTransformArguments::new(self, capture_scope.unwrap_or(0));
         arguments.capture_scope = capture_scope;
         arguments.resolve_constants = true;
+        self.reference_analysis_with_arguments(&arguments)
+    }
+
+    /// Analyzes a region whose caller transfers ownership of the listed input references to it. Those inputs may
+    /// be consumed directly in this region; consumption through a view or inside an attached region remains invalid.
+    /// Captures remain borrowed even if listed in `consumable_inputs`. The ownership list participates in the cache
+    /// key so this analysis cannot bypass validation for callers using the default borrowed-input contract.
+    pub(crate) fn reference_analysis_with_consumable_inputs(
+        self,
+        capture_count: usize,
+        consumable_inputs: Vec<usize>,
+    ) -> Result<Arc<ReferenceAnalysis>, ReferenceAnalysisError> {
+        let mut arguments = ReferenceAnalysisTransformArguments::new(self, capture_count);
+        arguments.consumable_inputs = consumable_inputs;
         self.reference_analysis_with_arguments(&arguments)
     }
 
@@ -1127,6 +1151,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
                     region,
                     arguments.capture_scope,
                     arguments.resolve_constants,
+                    &arguments.consumable_inputs,
                 )?;
                 Ok(TransformArtifact::new(Vec::new(), Arc::new(analysis)))
             },
@@ -1284,6 +1309,9 @@ struct Traversal<'r, V: Value, O: Operation<Type = V::Type>> {
 
     /// Number of leading analyzed-region inputs that originate in a lifted capture table.
     capture_count: usize,
+
+    /// Entry input indices that may be consumed directly in the entry region, excluding lifted captures.
+    consumable_inputs: Vec<usize>,
 
     /// Original inherited scope when constants can be resolved before capture lifting.
     constant_scope: Option<CaptureScope>,
@@ -1705,7 +1733,8 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
         })
     }
 
-    /// Rejects consumption of `root` unless `region` is the region that allocated it.
+    /// Rejects consumption outside an allocation's creation region, unless the entry boundary explicitly transfers
+    /// ownership of that input to the entry region. This exception does not transfer ownership to attached regions.
     fn validate_consumption(
         &self,
         operation: &'static str,
@@ -1715,6 +1744,14 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
     ) -> Result<(), ReferenceAnalysisError> {
         match root {
             ReferenceRoot::Allocation { instruction: allocation, .. } if allocation.region() == region => Ok(()),
+            ReferenceRoot::RegionInput { region: root_region, input_index }
+                if root_region == self.entry.id()
+                    && region == root_region
+                    && input_index >= self.capture_count
+                    && self.consumable_inputs.contains(&input_index) =>
+            {
+                Ok(())
+            }
             ReferenceRoot::RegionInput { region: root_region, input_index } if root_region == self.entry.id() => {
                 Err(ReferenceAnalysisError::ConsumeExternal {
                     operation,
@@ -3995,6 +4032,39 @@ mod tests {
             Err(ReferenceAnalysisError::InvalidCaptureScope { region, message })
                 if region == RegionId::new(1)
                     && message == "the capture prefix of 4 inputs exceeds the region's 3 inputs",
+        ));
+    }
+
+    #[test]
+    fn test_region_ref_reference_analysis_with_consumable_inputs() {
+        let mut builder = TestBuilder::new();
+        let reference = builder.add_input(reference_type(0));
+        let output = builder.add_instruction(TestOperation::Consume, Vec::new(), vec![reference], None).unwrap()[0];
+        let program = build(builder, vec![output]);
+        let region = program.entry_region_ref();
+        let analysis = region.reference_analysis_with_consumable_inputs(0, vec![0]).unwrap();
+        assert_eq!(analysis.consumer(input_root(0, 0)), Some(id(0, 0)));
+        assert!(Arc::ptr_eq(&analysis, &region.reference_analysis_with_consumable_inputs(0, vec![0]).unwrap()));
+
+        // An ownership-aware cache entry must not satisfy a borrowed-input or capture-boundary request.
+        assert!(matches!(
+            region.reference_analysis(0),
+            Err(ReferenceAnalysisError::ConsumeExternal { external_source: ReferenceSource::Input { index: 0 }, .. })
+        ));
+        assert!(matches!(
+            region.reference_analysis_with_consumable_inputs(1, vec![0]),
+            Err(ReferenceAnalysisError::ConsumeExternal { external_source: ReferenceSource::Capture { index: 0 }, .. })
+        ));
+
+        // Ownership belongs to the analyzed entry region; passing its input to a child does not transfer it again.
+        let mut builder = TestBuilder::new();
+        let callee = builder.import_region(region);
+        let reference = builder.add_input(reference_type(0));
+        let output = builder.add_instruction(TestOperation::Call, vec![callee], vec![reference], None).unwrap()[0];
+        let program = build(builder, vec![output]);
+        assert!(matches!(
+            program.entry_region_ref().reference_analysis_with_consumable_inputs(0, vec![0]),
+            Err(ReferenceAnalysisError::ConsumeOutsideCreationScope { operation: "test.consume", .. })
         ));
     }
 

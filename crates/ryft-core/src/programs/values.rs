@@ -3,7 +3,7 @@ use std::fmt::{Debug, Display};
 
 use ryft_macros::Parameter;
 
-use crate::arrays::{ArrayBatch, ArrayType};
+use crate::arrays::{ArrayBatch, ArrayIrBatch, ArrayIrType, ArrayType};
 use crate::batching::{BatchingPolicy, BatchingTracer};
 use crate::captures::CaptureReference;
 use crate::contexts::{Context, Domain, ProjectedContext};
@@ -225,6 +225,19 @@ impl<C: Context<Value: Concretizable<bool>>, P: DifferentiationPolicy<C>> Concre
 }
 
 impl<V: Value<Type = ArrayType> + Concretizable<bool>> Concretizable<bool> for ArrayBatch<V> {
+    #[inline]
+    fn concretize(&self) -> Result<bool, ProgramError> {
+        if let Some(axis) = self.batch_axis().axis() {
+            return Err(ProgramError::Concretization {
+                message: format!("cannot extract a concrete boolean from a value batched along axis {axis}"),
+            });
+        }
+        self.value().concretize()
+    }
+}
+
+impl<V: Value<Type = ArrayIrType> + Concretizable<bool>> Concretizable<bool> for ArrayIrBatch<V> {
+    #[inline]
     fn concretize(&self) -> Result<bool, ProgramError> {
         if let Some(axis) = self.batch_axis().axis() {
             return Err(ProgramError::Concretization {
