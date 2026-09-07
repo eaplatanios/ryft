@@ -2460,6 +2460,53 @@ pub struct ThreadedExtentBatchedProgram<V: Typed<Type = ArrayIrType> + Parameter
     output_axes: Vec<BatchAxis>,
 }
 
+impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> ThreadedExtentBatchedProgram<V, O> {
+    /// Creates a new [`ThreadedExtentBatchedProgram`] with one leading mapped extent input and a forwarded output.
+    pub(crate) fn new(
+        program: Program<V, O, Vec<V>, Vec<V>>,
+        output_axes: Vec<BatchAxis>,
+    ) -> Result<Self, ProgramError> {
+        if program.input_count() == 0 || program.output_count() == 0 {
+            return Err(ProgramError::MalformedProgram(
+                "a structurally batched program with a threaded extent must have a leading input and output"
+                    .to_string(),
+            ));
+        }
+        check_count!("output", output_axes, program.output_count() - 1, ProgramError);
+        if !matches!(program.inputs().next().unwrap().r#type().as_ref(), ArrayIrType::Dimension(_)) {
+            return Err(ProgramError::MalformedProgram(
+                "a structurally batched program's leading threaded extent input must be a dimension".to_string(),
+            ));
+        }
+        if !matches!(program.outputs().next().unwrap().r#type().as_ref(), ArrayIrType::Dimension(_)) {
+            return Err(ProgramError::MalformedProgram(
+                "a structurally batched program's leading threaded extent output must be a dimension".to_string(),
+            ));
+        }
+        if program.output_ids()[0] != program.input_ids()[0] {
+            return Err(ProgramError::MalformedProgram(
+                "a structurally batched program's leading threaded extent output must forward its leading input"
+                    .to_string(),
+            ));
+        }
+        Ok(Self { program, output_axes })
+    }
+}
+
+impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> BatchedProgram<V, O>
+    for ThreadedExtentBatchedProgram<V, O>
+{
+    #[inline]
+    fn output_axes(&self) -> &[BatchAxis] {
+        self.output_axes.as_slice()
+    }
+
+    #[inline]
+    fn into_parts(self) -> (Program<V, O, Vec<V>, Vec<V>>, Vec<BatchAxis>) {
+        (self.program, self.output_axes)
+    }
+}
+
 /// [`BatchingPolicy`] for [`Program`]s over [`ArrayIrValue`](crate::ArrayIrValue)s.
 ///
 /// [`ArrayIrType::Array`] members may carry a mapped axis. [`ArrayIrType::Dimension`] members are shared shape values
@@ -2474,58 +2521,6 @@ pub struct ThreadedExtentBatchedProgram<V: Typed<Type = ArrayIrType> + Parameter
 /// rejected even when another input supplies a usable extent; reading mutable contents is not used to guess geometry.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ArrayIrBatchingPolicy;
-
-// TODO(eaplatanios): Review from here onwards.
-
-impl ArrayIrBatchingPolicy {
-    /// Lifts and batches one structurally replayed constant through the checked composite policy boundary.
-    fn batch_constant<C: Context<Type = ArrayIrType>>(
-        context: &C,
-        constant: C::Constant,
-    ) -> Result<ArrayIrBatch<C::Value>, BatchingError> {
-        <Self as BatchingPolicy<C>>::batch(context.lift(constant)?, BatchAxis::replicated())
-    }
-
-    /// Replays one region through composite batching using the checked constant and operation boundaries.
-    fn batch_region_values<C>(
-        context: &BatchingContext<C, Self>,
-        region: RegionRef<'_, C::Constant, C::Operation>,
-        inputs: Vec<ArrayIrBatch<C::Value>>,
-    ) -> Result<Vec<ArrayIrBatch<C::Value>>, BatchingError>
-    where
-        C: Context<Type = ArrayIrType, Operation: BatchableOperation<C, Self>>,
-        Self: RecursiveBatchingPolicy<C> + BatchingPolicy<C, Batch = ArrayIrBatch<C::Value>>,
-    {
-        let region_mappings = RegionReplayMappings::new();
-        region.interpret_with(
-            inputs,
-            // The shared replay helper uses the checked constructor; the infallible replicated wrapper would let a
-            // reference-typed capture constant ride through structural batching unchanged.
-            |_, constant| Self::batch_constant(context.parent(), constant.clone()),
-            |instruction, instruction_inputs| {
-                // Run the batching rule inside the source instruction's recorded origin so that every staged
-                // instruction records where it came from.
-                let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
-                let (outputs, evidence) = context
-                    .invoke_with_provenance_origin(instruction.provenance().clone(), || {
-                        instruction.operation().batch(
-                            context,
-                            &RecursiveBatchingDriver::new(&regions),
-                            instruction_inputs,
-                        )
-                    })?
-                    .into_parts();
-                <Self as BatchingPolicy<C>>::validate_operation_outputs(
-                    instruction.operation().name(),
-                    instruction_inputs,
-                    outputs.as_slice(),
-                    &evidence,
-                )?;
-                Ok(outputs)
-            },
-        )
-    }
-}
 
 impl<C: Context<Type = ArrayIrType>> BatchingPolicy<C> for ArrayIrBatchingPolicy {
     type Batch = ArrayIrBatch<C::Value>;
@@ -2558,51 +2553,48 @@ impl<C: Context<Type = ArrayIrType>> BatchingPolicy<C> for ArrayIrBatchingPolicy
         batch.r#type()
     }
 
-    /// Every bounded ragged dimension carried by an operand must survive the rule that consumed it, either as a ragged
-    /// output axis, as a mapped output dimension holding its per-item extents, or as a dimension the rule's evidence
-    /// claims it consumed deliberately. Anything else would silently forget per-item extents that no [`ArrayIrType`]
-    /// records, so the operation is rejected while naming the exact dimension that was lost.
     fn validate_operation_outputs(
         operation_name: &'static str,
         inputs: &[Self::Batch],
         outputs: &[Self::Batch],
         evidence: &Self::Evidence,
     ) -> Result<(), BatchingError> {
-        let preserves_dimension = |dimension: &DimensionVariable| {
-            evidence.contains(dimension)
-                || outputs.iter().any(|output| {
-                    output.ragged_axes().iter().any(|axis| axis.dimension() == dimension)
-                        || (output.mapped_dimension_extents().is_some()
-                            && matches!(
-                                output.unbatched_type(),
-                                ArrayIrType::Dimension(r#type) if r#type.variable() == dimension
-                            ))
-                })
-        };
-        let lost_dimension = inputs
+        // Every bounded ragged dimension carried by an operand must survive the rule that consumed it, either as a
+        // ragged output axis, as a mapped output dimension holding its per-item extents, or as a dimension the rule's
+        // evidence claims it consumed deliberately. Anything else would silently forget per-item extents that no
+        // `ArrayIrType` records, and so the operation is rejected while naming the exact dimension that was lost.
+        inputs
             .iter()
             .flat_map(ArrayIrBatch::ragged_axes)
             .map(RaggedAxis::dimension)
-            .find(|dimension| !preserves_dimension(dimension));
-        match lost_dimension {
-            Some(dimension) => Err(BatchingError::UnsupportedOperation {
-                message: format!(
-                    "operation `{operation_name}` neither preserves nor consumes bounded ragged dimension \
-                     `{dimension}`",
-                ),
-            }),
-            None => Ok(()),
-        }
+            .find(|&dimension| {
+                !evidence.contains(dimension)
+                    && !outputs.iter().any(|output| {
+                        output.ragged_axes().iter().any(|axis| axis.dimension() == dimension)
+                            || (output.mapped_dimension_extents().is_some()
+                                && matches!(
+                                    output.unbatched_type(),
+                                    ArrayIrType::Dimension(r#type) if r#type.variable() == dimension
+                                ))
+                    })
+            })
+            .map_or(Ok(()), |dimension| {
+                Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "operation `{operation_name}` neither preserves nor consumes bounded ragged dimension \
+                         `{dimension}`",
+                    ),
+                })
+            })
     }
 
-    /// The adapted program's leading input still defines the [`DimensionVariable`] referenced by every inserted
-    /// dynamic batch dimension, so the first-class mapped-extent value must become its matching operand.
     #[inline]
     fn boundary_operands(axis_extent: &Self::Extent) -> Vec<C::Value> {
+        // The adapted program's leading input still defines the `DimensionVariable` referenced by every inserted
+        // dynamic batch dimension, so the first-class mapped extent value must become its matching operand.
         vec![axis_extent.clone()]
     }
 
-    /// Drops the leading forwarded-extent bookkeeping output that exists only for extent-threading consumers.
     #[inline]
     fn adapt_batched_program<CollapseFn>(
         program: Self::BatchedProgram,
@@ -2616,6 +2608,7 @@ impl<C: Context<Type = ArrayIrType>> BatchingPolicy<C> for ArrayIrBatchingPolicy
             Axis,
         ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError>,
     {
+        // Drop the leading forwarded extent bookkeeping output that exists only for extent-threading consumers.
         let (program, output_axes) = program.into_parts();
         BoundaryPreservingBatchedProgram::from_widened_boundary(
             program,
@@ -2631,56 +2624,8 @@ impl BatchableType for ArrayIrType {
     type Policy = ArrayIrBatchingPolicy;
 }
 
-impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> ThreadedExtentBatchedProgram<V, O> {
-    /// Creates a batched array IR program with one leading mapped-extent input and forwarded output.
-    pub(crate) fn new(
-        program: Program<V, O, Vec<V>, Vec<V>>,
-        output_axes: Vec<BatchAxis>,
-    ) -> Result<Self, ProgramError> {
-        if program.input_count() == 0 || program.output_count() == 0 {
-            return Err(ProgramError::MalformedProgram(
-                "a structurally batched program with a threaded extent must have a leading input and output"
-                    .to_string(),
-            ));
-        }
-        check_count!("output", output_axes, program.output_count() - 1, ProgramError);
+// TODO(eaplatanios): Review from here onwards.
 
-        if !matches!(program.inputs().next().unwrap().r#type().as_ref(), ArrayIrType::Dimension(_)) {
-            return Err(ProgramError::MalformedProgram(
-                "a structurally batched program's leading threaded-extent input must be a dimension".to_string(),
-            ));
-        }
-        if !matches!(program.outputs().next().unwrap().r#type().as_ref(), ArrayIrType::Dimension(_)) {
-            return Err(ProgramError::MalformedProgram(
-                "a structurally batched program's leading threaded-extent output must be a dimension".to_string(),
-            ));
-        }
-        if program.output_ids()[0] != program.input_ids()[0] {
-            return Err(ProgramError::MalformedProgram(
-                "a structurally batched program's leading threaded-extent output must forward its leading input"
-                    .to_string(),
-            ));
-        }
-
-        Ok(Self { program, output_axes })
-    }
-}
-
-impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> BatchedProgram<V, O>
-    for ThreadedExtentBatchedProgram<V, O>
-{
-    #[inline]
-    fn output_axes(&self) -> &[BatchAxis] {
-        self.output_axes.as_slice()
-    }
-
-    #[inline]
-    fn into_parts(self) -> (Program<V, O, Vec<V>, Vec<V>>, Vec<BatchAxis>) {
-        (self.program, self.output_axes)
-    }
-}
-
-// TODO(eaplatanios): Review this.
 impl<V, O> Program<V, O, Vec<V>, Vec<V>>
 where
     V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -3907,7 +3852,37 @@ where
         region: RegionRef<'_, C::Constant, C::Operation>,
         inputs: Vec<Self::Batch>,
     ) -> Result<Vec<Self::Batch>, BatchingError> {
-        Self::batch_region_values(context, region, inputs)
+        // Regions are replayed through the checked constant and operation boundaries.
+        let region_mappings = RegionReplayMappings::new();
+        region.interpret_with(
+            inputs,
+            // Constants are lifted through the checked constructor; the infallible replicated wrapper would let a
+            // reference-typed capture constant ride through structural batching unchanged.
+            |_, constant| {
+                <Self as BatchingPolicy<C>>::batch(context.parent().lift(constant.clone())?, BatchAxis::replicated())
+            },
+            |instruction, instruction_inputs| {
+                // Run the batching rule inside the source instruction's recorded origin so that every staged
+                // instruction records where it came from.
+                let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
+                let (outputs, evidence) = context
+                    .invoke_with_provenance_origin(instruction.provenance().clone(), || {
+                        instruction.operation().batch(
+                            context,
+                            &RecursiveBatchingDriver::new(&regions),
+                            instruction_inputs,
+                        )
+                    })?
+                    .into_parts();
+                <Self as BatchingPolicy<C>>::validate_operation_outputs(
+                    instruction.operation().name(),
+                    instruction_inputs,
+                    outputs.as_slice(),
+                    &evidence,
+                )?;
+                Ok(outputs)
+            },
+        )
     }
 
     fn batch_program(
@@ -3987,7 +3962,11 @@ where
                 })
                 .collect::<Result<Vec<_>, BatchingError>>()?;
 
-            let outputs = Self::batch_region_values(&batching_context, region, inputs)?;
+            let outputs = <Self as RecursiveBatchingPolicy<TracingContext<C::Constant, C::Operation>>>::batch_region(
+                &batching_context,
+                region,
+                inputs,
+            )?;
 
             let output_target_axes = match &output_axes_policy {
                 ProgramBatchingOutputAxesPolicy::Natural => vec![None; outputs.len()],
@@ -5943,7 +5922,7 @@ mod tests {
         )?;
         let Err(ProgramError::MalformedProgram(message)) = ThreadedExtentBatchedProgram::new(program, Vec::new())
         else {
-            panic!("threaded-extent batching accepted a missing bookkeeping boundary");
+            panic!("threaded extent batching accepted a missing bookkeeping boundary");
         };
         assert_eq!(
             message,
@@ -5960,9 +5939,9 @@ mod tests {
         )?;
         let Err(ProgramError::MalformedProgram(message)) = ThreadedExtentBatchedProgram::new(program, Vec::new())
         else {
-            panic!("threaded-extent batching accepted a non-dimension bookkeeping input");
+            panic!("threaded extent batching accepted a non-dimension bookkeeping input");
         };
-        assert_eq!(message, "a structurally batched program's leading threaded-extent input must be a dimension",);
+        assert_eq!(message, "a structurally batched program's leading threaded extent input must be a dimension",);
 
         // The leading bookkeeping output must also be a first-class dimension.
         let mut builder = TestProgramBuilder::new();
@@ -5976,9 +5955,9 @@ mod tests {
         )?;
         let Err(ProgramError::MalformedProgram(message)) = ThreadedExtentBatchedProgram::new(program, Vec::new())
         else {
-            panic!("threaded-extent batching accepted a non-dimension bookkeeping output");
+            panic!("threaded extent batching accepted a non-dimension bookkeeping output");
         };
-        assert_eq!(message, "a structurally batched program's leading threaded-extent output must be a dimension",);
+        assert_eq!(message, "a structurally batched program's leading threaded extent output must be a dimension",);
 
         // A merely compatible dimension output is insufficient: the program must forward the exact input atom.
         let mut builder = TestProgramBuilder::new();
@@ -5994,11 +5973,11 @@ mod tests {
         )?;
         let Err(ProgramError::MalformedProgram(message)) = ThreadedExtentBatchedProgram::new(program, Vec::new())
         else {
-            panic!("threaded-extent batching accepted a substituted bookkeeping output");
+            panic!("threaded extent batching accepted a substituted bookkeeping output");
         };
         assert_eq!(
             message,
-            "a structurally batched program's leading threaded-extent output must forward its leading input",
+            "a structurally batched program's leading threaded extent output must forward its leading input",
         );
 
         // A well-formed threaded boundary preserves its program and excludes the bookkeeping output from its axes.
@@ -6489,13 +6468,13 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_batch_constant_replicates_reference() {
-        // A captured reference is unbatched by definition, so lifting one as a constant produces a replicated carrier
-        // whose per-item type is the reference type itself.
+    fn test_array_ir_batching_policy_batch_replicates_reference() {
+        // A captured reference is unbatched by definition, so batching one at the replicated axis through the checked
+        // policy boundary produces a replicated carrier whose per-item type is the reference type itself.
         let reference = ArrayReference::new(Array::scalar(1.0_f32));
-        let batch = ArrayIrBatchingPolicy::batch_constant(
-            &ArrayIrEagerContext::new(),
+        let batch = <ArrayIrBatchingPolicy as BatchingPolicy<ArrayIrEagerContext>>::batch(
             ArrayIrValue::Reference(reference.clone()),
+            BatchAxis::replicated(),
         )
         .unwrap();
         assert_eq!(batch.batch_axis(), BatchAxis::replicated());
@@ -7506,7 +7485,7 @@ mod tests {
                 if *r#type == shared_dimension_type && axis == BatchAxis::new(0),
         ));
 
-        // Exact static extents use the identical threaded-extent boundary contract and instruction count. Only the
+        // Exact static extents use the identical threaded extent boundary contract and instruction count. Only the
         // boundary types differ, so structural IR does not grow with or specialize on the mapped extent's runtime
         // value.
         let static_trace = TraceContext::new();
