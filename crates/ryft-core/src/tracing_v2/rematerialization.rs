@@ -70,7 +70,7 @@ use crate::differentiation::{
     TransposableOperation, interpret_partitioned_jvp,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, check_types};
+use crate::macros::{check_count, check_types, impl_reference_dischargeable_operation};
 use crate::operations::{
     AddOperation, DotOperation, LinearCallOperation, TagOperation, TransferToMemoryOperation, Zero,
 };
@@ -79,9 +79,7 @@ use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
 use crate::programs::{
     Atom, AtomId, EffectClass, EffectClasses, InputRegionProvenance, InstructionId, Operation, OperationFormatter,
     OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceAccessMode, ReferenceAnalysis,
-    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceRoot, Region, RegionId, RegionInterface, RegionSlot, Type, TypeError,
-    Typed, Value, ValueId, discharge_local_reference_operation,
+    ReferenceRoot, Region, RegionId, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueId,
 };
 use crate::tracing::{DomainTracer, Trace, TracingContext};
 
@@ -421,22 +419,7 @@ impl<T: DifferentiableType> Operation for RematerializeOperation<T> {
 // discharged program discharges before rematerializing. Without reference operands no caller allocation enters any
 // region, so a local lifecycle inside a region discharges within that region, and every region summary must report
 // that no caller allocation is reached, including through a capture constant.
-impl<T, C, P> ReferenceDischargeableOperation<C, P> for RematerializeOperation<T>
-where
-    T: DifferentiableType,
-    RematerializeOperation<T>: Operation<Type = C::Type>,
-    C: Context<Operation: From<RematerializeOperation<T>>>,
-    P: ReferenceDischargePolicy<C>,
-{
-    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
-        &self,
-        context: &ReferenceDischargeContext<C, P>,
-        driver: &D,
-        inputs: &[ReferenceDischargeValue<C, P>],
-    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
-        discharge_local_reference_operation(self, context, driver, inputs)
-    }
-}
+impl_reference_dischargeable_operation!(@local_reference <T> RematerializeOperation<T> where T: DifferentiableType);
 
 impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for RematerializeOperation<C::Type> {
     fn interpret<D: InterpretationDriver<C>>(

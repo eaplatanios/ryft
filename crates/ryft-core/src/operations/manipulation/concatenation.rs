@@ -21,7 +21,7 @@ use crate::differentiation::{
     transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_differentiable_operation, impl_reference_free_dischargeable_operation};
+use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::constants::zero_like::ZeroLikeOperation;
@@ -217,7 +217,7 @@ impl Operation for ConcatenateOperation<ArrayType> {
     }
 }
 
-impl_reference_free_dischargeable_operation!(<T> ConcatenateOperation<T> where T: Type);
+impl_reference_dischargeable_operation!(@reference_free <T> ConcatenateOperation<T> where T: Type);
 
 impl<C: Domain<Type = ArrayType, Value: Concatenate>> InterpretableOperation<C> for ConcatenateOperation<ArrayType> {
     #[inline]

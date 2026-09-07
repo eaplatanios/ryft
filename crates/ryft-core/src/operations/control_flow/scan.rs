@@ -3635,6 +3635,20 @@ mod tests {
         program.interface()
     }
 
+    /// Builds a three-carry shift body `[first, second, third, item] -> [second, third, item, first]`.
+    /// Dependence on an unknown third carry reaches the second carry after one partition pass and the first after two.
+    fn shifting_carry_body() -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let inputs = (0..4).map(|_| builder.add_input(ArrayType::scalar(DataType::F64))).collect::<Vec<_>>();
+        builder
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![inputs[1], inputs[2], inputs[3], inputs[0]],
+                vec![Placeholder; 4],
+                vec![Placeholder; 4],
+            )
+            .unwrap()
+    }
+
     /// Builds a cumulative-product body program that maps `[carry, x]` to `[carry * x, carry * x]`: the new carry is
     /// the running product and each iteration also emits that product as a stacked output slice.
     fn product_body() -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
@@ -6024,6 +6038,62 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_partial_evaluation_propagates_unknownness_across_carry_dependencies() {
+        let scalar = ArrayType::scalar(DataType::F64);
+        let stacked = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(4)]));
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let body = builder.import_region(shifting_carry_body().entry_region_ref());
+        let inputs = vec![
+            builder.add_input(scalar.clone()),
+            builder.add_input(scalar.clone()),
+            builder.add_input(scalar.clone()),
+            builder.add_input(stacked.clone()),
+        ];
+        let outputs = builder
+            .add_instruction(ArrayOperation::Scan(ScanOperation::new(3, 4)), vec![body], inputs, None)
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 4], vec![Placeholder; 4])
+            .unwrap();
+
+        // Equal known initializers make the first carry appear invariant in the first probe. The second carry
+        // becomes unknown first, and only the next pass reveals that the first carry must also remain residual.
+        let evaluation = program
+            .partially_evaluate(&[
+                PartialValue::Known(Array::scalar(0.0)),
+                PartialValue::Known(Array::scalar(0.0)),
+                PartialValue::Unknown(scalar),
+                PartialValue::Unknown(stacked),
+            ])
+            .unwrap();
+        assert_eq!(
+            evaluation.outputs,
+            vec![
+                PartialEvaluationOutput::Unknown(0),
+                PartialEvaluationOutput::Unknown(1),
+                PartialEvaluationOutput::Unknown(2),
+                PartialEvaluationOutput::Unknown(3),
+            ],
+        );
+        let expected =
+            vec![Array::scalar(2.0), Array::scalar(3.0), Array::scalar(4.0), Array::vector(vec![0.0, 0.0, 10.0, 1.0])];
+        assert_eq!(
+            program.interpret(vec![
+                Array::scalar(0.0),
+                Array::scalar(0.0),
+                Array::scalar(10.0),
+                Array::vector(vec![1.0, 2.0, 3.0, 4.0]),
+            ]),
+            Ok(expected.clone()),
+        );
+        assert_eq!(
+            evaluation.interpret(&EagerContext::new(), &[Array::scalar(10.0), Array::vector(vec![1.0, 2.0, 3.0, 4.0])]),
+            Ok(expected),
+        );
+    }
+
+    #[test]
     fn test_scan_partial_evaluation_residualizes_reference_carry_whole() {
         // `f(r, xs) = { for x in xs { write(r, 1); add_update(r, x) }; read(r) }` with the reference carried through the scan.
         let scalar_type = ArrayType::scalar(DataType::F32);
@@ -7181,6 +7251,51 @@ mod tests {
                 .unwrap()
                 .to_string(),
         );
+    }
+
+    #[test]
+    fn test_scan_linearization_propagates_tangents_across_carry_dependencies() {
+        let (outputs, pushforward) = differentiate_at(vec![
+            Array::scalar(0.0),
+            Array::scalar(0.0),
+            Array::scalar(10.0),
+            Array::vector(vec![1.0, 2.0, 3.0, 4.0]),
+        ])
+        .linearize(|inputs: Vec<LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>>| {
+            inputs[0].context().bind(
+                ArrayOperation::Scan(ScanOperation::new(3, 4)),
+                vec![shifting_carry_body()],
+                &inputs,
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            outputs,
+            vec![Array::scalar(2.0), Array::scalar(3.0), Array::scalar(4.0), Array::vector(vec![0.0, 0.0, 10.0, 1.0])],
+        );
+
+        // Tangents must travel through all three carry slots on every invocation; reusing the pushforward must
+        // not reuse a prior invocation's final carries or its stacked history.
+        let tangents =
+            vec![Array::scalar(0.0), Array::scalar(0.0), Array::scalar(2.0), Array::vector(vec![1.0, 1.0, 1.0, 1.0])];
+        let expected =
+            vec![Array::scalar(1.0), Array::scalar(1.0), Array::scalar(1.0), Array::vector(vec![0.0, 0.0, 2.0, 1.0])];
+        assert_eq!(pushforward.apply(tangents.clone()), Ok(expected.clone()));
+        assert_eq!(
+            pushforward.apply(vec![
+                Array::scalar(0.0),
+                Array::scalar(0.0),
+                Array::scalar(5.0),
+                Array::vector(vec![2.0, 3.0, 4.0, 5.0]),
+            ]),
+            Ok(vec![
+                Array::scalar(3.0),
+                Array::scalar(4.0),
+                Array::scalar(5.0),
+                Array::vector(vec![0.0, 0.0, 5.0, 2.0])
+            ]),
+        );
+        assert_eq!(pushforward.apply(tangents), Ok(expected));
     }
 
     #[test]

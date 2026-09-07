@@ -14,7 +14,7 @@ use crate::differentiation::{
     TranspositionContext, TranspositionDriver, primal_to_tangent_duals, transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_differentiable_operation, impl_reference_free_dischargeable_operation};
+use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::ZeroOperation;
 use crate::operations::constants::zero_like::ZeroLikeOperation;
@@ -127,7 +127,7 @@ impl Operation for DynamicBroadcastOperation {
     }
 }
 
-impl_reference_free_dischargeable_operation!(DynamicBroadcastOperation);
+impl_reference_dischargeable_operation!(@reference_free DynamicBroadcastOperation);
 
 impl<C> InterpretableOperation<C> for DynamicBroadcastOperation
 where

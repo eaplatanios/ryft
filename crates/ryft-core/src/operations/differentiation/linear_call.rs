@@ -609,12 +609,17 @@ impl<C: Context<Type: DifferentiableType, Operation: ResidualZeroProvider<C::Typ
         let mut tangent_inputs = Vec::new();
         for input in inputs {
             if !input.tangent().r#type().is_zero_space() {
-                let source = context.primal_to_tangent(input.primal().clone())?;
-                tangent_inputs.push(C::Operation::materialize_zero_from_residual_sources(
-                    context.tangent(),
-                    input.tangent().clone(),
-                    std::iter::once(&source),
-                )?);
+                tangent_inputs.push(match input.tangent() {
+                    MaybeZero::Value(value) => value.clone(),
+                    MaybeZero::Zero(_) => {
+                        let source = context.primal_to_tangent(input.primal().clone())?;
+                        C::Operation::materialize_zero_from_residual_sources(
+                            context.tangent(),
+                            input.tangent().clone(),
+                            std::iter::once(&source),
+                        )?
+                    }
+                });
             }
         }
         tangent_inputs.extend(
@@ -789,7 +794,7 @@ mod tests {
     use crate::operations::math::add::AddOperation;
     use crate::operations::math::mul::MulOperation;
     use crate::operations::math::reduce::{Reduce, ReductionKind};
-    use crate::operations::references::{ReferenceFreezeOperation, ReferenceNewOperation};
+    use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::{
@@ -1459,6 +1464,71 @@ mod tests {
                 Array::scalar(7.0),
             ]),
             Ok(vec![Array::scalar(6.0), Array::scalar(29.0)]),
+        );
+    }
+
+    #[test]
+    fn test_linear_call_operation_jvp_keeps_local_tangent_references_fresh_per_invocation() {
+        // The identity map accumulates into a zero-initialized reference and consumes it. Its transpose is the
+        // same map. Hoisting tangent state into the primal program would reuse a consumed reference on the next call.
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let zero = builder.add_constant(Array::scalar(0.0_f32).into());
+        let reference = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![zero], None).unwrap()[0];
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, input], None)
+            .unwrap();
+        let output =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let region = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let forward = builder.import_region(region.entry_region_ref());
+        let transpose = builder.import_region(region.entry_region_ref());
+        let output = builder
+            .add_instruction(LinearCallOperation::new(0), vec![forward, transpose], vec![input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+        let mut primal_outputs = linearization.primal().interpret(vec![Array::scalar(3.0_f32).into()]).unwrap();
+        let residuals = primal_outputs.split_off(1);
+        assert_eq!(primal_outputs, vec![Array::scalar(3.0_f32).into()]);
+
+        // Reuse the same primal residuals with different tangents, then repeat the first tangent.
+        let outputs = [2.0_f32, 5.0, 2.0].map(|tangent| {
+            let mut inputs = vec![Array::scalar(tangent).into()];
+            inputs.extend(residuals.clone());
+            linearization.tangent().interpret(inputs).unwrap()
+        });
+        assert_eq!(
+            outputs,
+            [
+                vec![Array::scalar(2.0_f32).into()],
+                vec![Array::scalar(5.0_f32).into()],
+                vec![Array::scalar(2.0_f32).into()],
+            ],
+        );
+        assert_eq!(
+            linearization
+                .tangent()
+                .instructions()
+                .iter()
+                .filter(|instruction| instruction.operation().name() == "reference_new")
+                .count(),
+            1,
         );
     }
 

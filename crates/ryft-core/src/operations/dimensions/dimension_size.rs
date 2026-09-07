@@ -17,7 +17,7 @@ use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
     check_count, impl_non_differentiable_operation, impl_non_transposable_operation,
-    impl_reference_free_dischargeable_operation,
+    impl_reference_dischargeable_operation,
 };
 use crate::parameters::Parameter;
 use crate::partial::PartiallyEvaluatableOperation;
@@ -170,7 +170,7 @@ impl Operation for DimensionSizeOperation {
     }
 }
 
-impl_reference_free_dischargeable_operation!(DimensionSizeOperation);
+impl_reference_dischargeable_operation!(@reference_free DimensionSizeOperation);
 
 impl<C: Domain<Type = ArrayIrType, Value: DimensionSize<C::Value>>> InterpretableOperation<C>
     for DimensionSizeOperation

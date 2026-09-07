@@ -2844,6 +2844,50 @@ mod tests {
         program.interface()
     }
 
+    /// Builds a loop over `[counter, first, second, source]` whose body returns
+    /// `[counter - 1, second, source, source]` while the counter is positive.
+    fn chained_carry_while_program() -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        let mut condition_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let condition_inputs = (0..4).map(|_| condition_builder.add_input(scalar_type.clone())).collect::<Vec<_>>();
+        let zero = condition_builder.add_constant(Array::scalar(0.0));
+        let predicate = condition_builder
+            .add_instruction(
+                CompareOperation::new(ComparisonDirection::GreaterThan),
+                Vec::new(),
+                vec![condition_inputs[0], zero],
+                None,
+            )
+            .unwrap()[0];
+        let condition = condition_builder
+            .build::<Vec<Array>, Vec<Array>>(vec![predicate], vec![Placeholder; 4], vec![Placeholder])
+            .unwrap();
+        let mut body_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let body_inputs = (0..4).map(|_| body_builder.add_input(scalar_type.clone())).collect::<Vec<_>>();
+        let one = body_builder.add_constant(Array::scalar(1.0));
+        let next_counter = body_builder
+            .add_instruction(SubOperation::new(), Vec::new(), vec![body_inputs[0], one], None)
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<Array>, Vec<Array>>(
+                vec![next_counter, body_inputs[2], body_inputs[3], body_inputs[3]],
+                vec![Placeholder; 4],
+                vec![Placeholder; 4],
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let inputs = (0..4).map(|_| builder.add_input(scalar_type.clone())).collect::<Vec<_>>();
+        let condition_region = builder.import_region(condition.entry_region_ref());
+        let body_region = builder.import_region(body.entry_region_ref());
+        let outputs = builder
+            .add_instruction(WhileOperation::new(), vec![condition_region, body_region], inputs, None)
+            .unwrap()
+            .to_vec();
+        builder
+            .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 4], vec![Placeholder; 4])
+            .unwrap()
+    }
+
     #[test]
     fn test_while_composite_type_contract() {
         let extent = DimensionVariable::new("extent", DimensionBounds::positive(Some(8)).unwrap());
@@ -4325,6 +4369,97 @@ mod tests {
             .collect::<Vec<_>>();
         let residual_outputs = evaluation.program.interpret(arguments).unwrap();
         assert_eq!(residual_outputs.last().unwrap().to_f64s(), vec![16.0]);
+    }
+
+    #[test]
+    fn test_while_partial_evaluation_propagates_unknown_carries_across_multiple_rounds() {
+        // With initially known `first` and `second`, the body first discovers that `second` depends on the unknown
+        // `source`. Only another round discovers that `first` must also become unknown. Equal initial values keep
+        // `first` provisionally invariant as well, exercising both constant-invariance and symbolic-knownness probes.
+        let program = chained_carry_while_program();
+        let arguments = vec![Array::scalar(3.0), Array::scalar(1.0), Array::scalar(1.0), Array::scalar(7.0)];
+        let expected = vec![Array::scalar(0.0), Array::scalar(7.0), Array::scalar(7.0), Array::scalar(7.0)];
+        assert_eq!(program.interpret(arguments.clone()), Ok(expected.clone()));
+
+        // Eager specialization must not retain either initial value after the dependency propagates through carries.
+        let evaluation = program
+            .partially_evaluate(&[
+                PartialValue::Known(arguments[0].clone()),
+                PartialValue::Known(arguments[1].clone()),
+                PartialValue::Known(arguments[2].clone()),
+                PartialValue::Unknown(ArrayType::scalar(DataType::F64)),
+            ])
+            .unwrap();
+        assert_eq!(evaluation.outputs[0], PartialEvaluationOutput::Known(Array::scalar(0.0)));
+        assert_eq!(
+            evaluation.outputs[1..].iter().map(PartialEvaluationOutput::is_known).collect::<Vec<_>>(),
+            vec![false; 3],
+        );
+        assert_eq!(evaluation.interpret(&EagerContext::new(), &[arguments[3].clone()]), Ok(expected.clone()));
+    }
+
+    #[test]
+    fn test_while_partition_propagates_unknown_carries_across_multiple_rounds() {
+        let program = chained_carry_while_program();
+        let arguments = vec![Array::scalar(3.0), Array::scalar(1.0), Array::scalar(1.0), Array::scalar(7.0)];
+        let expected = vec![Array::scalar(0.0), Array::scalar(7.0), Array::scalar(7.0), Array::scalar(7.0)];
+        // Partitioning uses symbolic known inputs, so its separate knownness loop must reach the same result.
+        let partition = program.partition(&[true, true, true, false]).unwrap();
+        assert_eq!(
+            partition.outputs().iter().map(PartialEvaluationOutput::is_known).collect::<Vec<_>>(),
+            vec![true, false, false, false],
+        );
+        let known_inputs = partition.known_input_indices().iter().map(|&index| arguments[index].clone()).collect();
+        let known_outputs = partition.known_program().interpret(known_inputs).unwrap();
+        // Feeder indices count only the residual edges, which follow the fully known outputs in the known program.
+        let known_output_count = partition.outputs().iter().filter(|output| output.is_known()).count();
+        let residual_inputs = partition
+            .residual_inputs()
+            .iter()
+            .map(|input| match input {
+                PartialEvaluationInput::Known(index) => known_outputs[known_output_count + index].clone(),
+                PartialEvaluationInput::Unknown(index) => arguments[*index].clone(),
+            })
+            .collect();
+        let residual_outputs = partition.residual_program().interpret(residual_inputs).unwrap();
+        let outputs = partition
+            .outputs()
+            .iter()
+            .map(|output| match output {
+                PartialEvaluationOutput::Known(index) => known_outputs[*index].clone(),
+                PartialEvaluationOutput::Unknown(index) => residual_outputs[*index].clone(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outputs, expected);
+    }
+
+    #[test]
+    fn test_while_differentiation_linearization_propagates_tangent_carries_across_multiple_rounds() {
+        // Only `source` has a nonzero tangent. That tangent reaches `second` after one iteration and `first` after
+        // two, so the linearized body must retain the entire dependent carry chain across repeated applications.
+        let linearization = chained_carry_while_program().linearize().unwrap();
+        let mut primal_outputs = linearization
+            .primal()
+            .interpret(vec![Array::scalar(3.0), Array::scalar(1.0), Array::scalar(1.0), Array::scalar(7.0)])
+            .unwrap();
+        let residuals = primal_outputs.split_off(4);
+        assert_eq!(
+            primal_outputs,
+            vec![Array::scalar(0.0), Array::scalar(7.0), Array::scalar(7.0), Array::scalar(7.0)]
+        );
+        let outputs = [2.0, 5.0, 2.0].map(|tangent| {
+            let mut inputs = vec![Array::scalar(0.0), Array::scalar(0.0), Array::scalar(0.0), Array::scalar(tangent)];
+            inputs.extend(residuals.clone());
+            linearization.tangent().interpret(inputs).unwrap()
+        });
+        assert_eq!(
+            outputs,
+            [
+                vec![Array::scalar(0.0), Array::scalar(2.0), Array::scalar(2.0), Array::scalar(2.0)],
+                vec![Array::scalar(0.0), Array::scalar(5.0), Array::scalar(5.0), Array::scalar(5.0)],
+                vec![Array::scalar(0.0), Array::scalar(2.0), Array::scalar(2.0), Array::scalar(2.0)],
+            ]
+        );
     }
 
     #[test]

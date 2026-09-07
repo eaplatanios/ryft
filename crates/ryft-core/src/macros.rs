@@ -1035,22 +1035,29 @@ macro_rules! define_elementwise_capability {
     };
 }
 
-/// Implements the [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation) trait
-/// for an [`Operation`](crate::Operation) as a verbatim replay/interpretation, by delegating to
-/// [`discharge_reference_free_operation`](crate::discharge_reference_free_operation). The generated rule replays the
-/// application over its rewritten operands, so an eager context executes it and a staging context records it. That is
-/// the complete implementation for an operation that touches no reference, and a checked rejecting placeholder for one
-/// that does, until that operation gets a discharge implementation of its own.
+/// Implements [`ReferenceDischargeableOperation`](crate::ReferenceDischargeableOperation) by delegating to one of
+/// two shared rules, selected explicitly at the call site:
 ///
-/// Note that the precondition this macro states is _reference freedom_ and not effect purity. An operation with ordered
+///   - `@reference_free` delegates to
+///     [`discharge_reference_free_operation`](crate::discharge_reference_free_operation). The operation is replayed
+///     verbatim, executing eagerly or staging according to the parent context. Attached regions are copied unchanged,
+///     and reference operands or references anywhere in their closures are rejected.
+///   - `@local_reference` delegates to
+///     [`discharge_local_reference_operation`](crate::discharge_local_reference_operation). Every attached region is
+///     rebuilt to discharge local reference state, including dormant derivative regions. Reference operands, reference
+///     region inputs, and captures reaching caller allocations are rejected. This rule does not widen interfaces to
+///     thread external state. Each region is rewritten independently, so their signatures need not match. The operation
+///     is rebound with those regions and validates their rebuilt interfaces.
+///
+/// The `@reference_free` precondition is _reference freedom_, not effect purity. An operation with ordered
 /// or other effects replays here perfectly well, because replaying it reproduces those effects in the destination
 /// exactly as the source performed them. Only a reference makes the rewrite the operation's own business.
 ///
-/// An application that carries regions still replays verbatim when nothing in their closure touches a reference: the
-/// regions are copied into the destination as they stand. The generated implementation is a rejection rather than a
-/// rewrite in the two cases it cannot serve: a region closure that does reach a reference, because how a reference
-/// boundary widens is knowledge that belongs to the operation, and an operand that is a live reference handle, because
-/// a reference-touching operation owns its own rewrite. Both diagnostics name the operation.
+/// With `@reference_free`, an application carrying regions replays verbatim when their closures are reference-free
+/// (i.e., the regions are copied into the destination as they stand). The generated implementation is a rejection
+/// rather than a rewrite in the two cases it cannot serve: (i) a region closure that does reach a reference, because
+/// how a reference boundary widens is knowledge that belongs to the operation, and (ii) an operand that is a live
+/// reference handle, because a reference-touching operation owns its own rewrite. Both diagnostics name the operation.
 ///
 /// The optional leading generic list declares operation-specific type parameters, and an optional `where` clause can
 /// provide any bounds needed to make the operation type well-formed.
@@ -1061,25 +1068,34 @@ macro_rules! define_elementwise_capability {
 ///   - `$operation`: The operation type for which the implementation is generated.
 ///   - `$bounds`: Optional bounds required to make `$operation` well-formed.
 #[macro_export]
-macro_rules! impl_reference_free_dischargeable_operation {
-    // This branch accepts a generic operation with additional well-formedness bounds.
-    (<$($generic:ident),+> $operation:ty where $($bounds:tt)+) => {
-        $crate::impl_reference_free_dischargeable_operation!(@impl [$($generic),+] ($operation) { $($bounds)+ });
+macro_rules! impl_reference_dischargeable_operation {
+    // Selects verbatim replay, rejecting references in operands or attached region closures.
+    (@reference_free $($arguments:tt)+) => {
+        $crate::impl_reference_dischargeable_operation!(@parse discharge_reference_free_operation; $($arguments)+);
     };
 
-    // This branch accepts a generic operation whose `Operation` implementation supplies all required bounds.
-    (<$($generic:ident),+> $operation:ty $(,)?) => {
-        $crate::impl_reference_free_dischargeable_operation!(@impl [$($generic),+] ($operation) {});
+    // Selects independent discharge of region-local state, including dormant derivative regions.
+    (@local_reference $($arguments:tt)+) => {
+        $crate::impl_reference_dischargeable_operation!(@parse discharge_local_reference_operation; $($arguments)+);
     };
 
-    // This branch accepts the common non-generic operation form.
-    ($operation:ty $(,)?) => {
-        $crate::impl_reference_free_dischargeable_operation!(@impl [] ($operation) {});
+    // Normalizes a generic operation with additional well-formedness bounds.
+    (@parse $function:ident; <$($generic:ident),+> $operation:ty where $($bounds:tt)+) => {
+        $crate::impl_reference_dischargeable_operation!(@impl $function [$($generic),+] ($operation) { $($bounds)+ });
     };
 
-    // This internal helper emits the shared reference-free replay rule for every public invocation form. The
-    // destination is bounded by `Context` rather than `Domain` because replaying the application binds it.
-    (@impl [$($generic:ident),*] ($operation:ty) { $($bounds:tt)* }) => {
+    // Normalizes a generic operation whose `Operation` implementation supplies all required bounds.
+    (@parse $function:ident; <$($generic:ident),+> $operation:ty $(,)?) => {
+        $crate::impl_reference_dischargeable_operation!(@impl $function [$($generic),+] ($operation) {});
+    };
+
+    // Normalizes a non-generic operation.
+    (@parse $function:ident; $operation:ty $(,)?) => {
+        $crate::impl_reference_dischargeable_operation!(@impl $function [] ($operation) {});
+    };
+
+    // Emits the common implementation, delegating to the selected rule. Rebinding requires a `Context`.
+    (@impl $function:ident [$($generic:ident),*] ($operation:ty) { $($bounds:tt)* }) => {
         impl<
             __C: $crate::Context,
             __P: $crate::ReferenceDischargePolicy<__C>
@@ -1098,7 +1114,7 @@ macro_rules! impl_reference_free_dischargeable_operation {
                 driver: &__D,
                 inputs: &[$crate::ReferenceDischargeValue<__C, __P>],
             ) -> Result<Vec<$crate::ReferenceDischargeValue<__C, __P>>, $crate::ProgramError> {
-                $crate::discharge_reference_free_operation(self, context, driver, inputs)
+                $crate::$function(self, context, driver, inputs)
             }
         }
     };
@@ -4652,7 +4668,7 @@ pub use crate::{
     define_elementwise_capability, define_elementwise_operation, define_tracer_operator,
     dispatch_on_array_element_type, impl_differentiable_elementwise_operation, impl_differentiable_operation,
     impl_non_differentiable_operation, impl_non_transposable_operation, impl_nullary_batchable_operation,
-    impl_nullary_transposable_operation, impl_reference_free_dischargeable_operation,
+    impl_nullary_transposable_operation, impl_reference_dischargeable_operation,
 };
 
 #[cfg(test)]
@@ -4704,7 +4720,7 @@ mod tests {
         check_array_types = [@no_unreduced],
     );
 
-    impl_reference_free_dischargeable_operation!(TestUnaryOperation<ArrayType>);
+    impl_reference_dischargeable_operation!(@reference_free TestUnaryOperation<ArrayType>);
 
     define_elementwise_operation!(
         @binary
@@ -4714,6 +4730,8 @@ mod tests {
         check_data_types = [@numeric, @real],
         check_array_types = [@same_unreduced_axes, @same_reduced_axes],
     );
+
+    impl_reference_dischargeable_operation!(@local_reference <T> TestBinaryOperation<T> where T: Type);
 
     const TEST_MAGNITUDE_OPERATION_NAME: &str = "test_magnitude";
     const TEST_STRICT_ADD_OPERATION_NAME: &str = "test_strict_add";
@@ -6060,7 +6078,7 @@ mod tests {
     }
 
     #[test]
-    fn test_impl_reference_free_dischargeable_operation() {
+    fn test_impl_reference_dischargeable_operation() {
         // The array universe has no reference-typed spelling, which is valid here because the generated rule only
         // replays ordinary operands and rejects every live reference handle before inspecting its type.
         #[derive(Copy, Clone, Debug, PartialEq)]
@@ -6118,6 +6136,30 @@ mod tests {
             Err(ProgramError::MalformedProgram(format!(
                 "reference discharge expected a value operand 0 of `test_unary` but received {reference}",
             ))),
+        );
+
+        // The local-reference selector uses the same replay path for a region-free application, but rejects external
+        // references with the local-state rule's boundary diagnostic rather than the reference-free replay error.
+        let context = ReferenceDischargeContext::<
+            EagerContext<Array, TestBinaryOperation<ArrayType>>,
+            TestArrayReferenceDischarge,
+        >::new(EagerContext::new());
+        let operation = TestBinaryOperation::<ArrayType>::new();
+        let inputs = [ReferenceDischargeValue::Value(Array::scalar(2.0f32))];
+        assert_eq!(
+            operation.discharge_references(&context, &EmptyRegionDriver, &[inputs[0].clone(), inputs[0].clone()]),
+            Ok(vec![ReferenceDischargeValue::Value(Array::scalar(4.0f32))]),
+        );
+        let reference = context
+            .bind_discharged(ReferenceType::new(ArrayType::scalar(DataType::F32)), Array::scalar(1.0f32))
+            .unwrap();
+        assert_eq!(
+            operation.discharge_references(&context, &EmptyRegionDriver, &[reference.into(), inputs[0].clone()]),
+            Err(ProgramError::UnsupportedOperation {
+                message: "`test_binary` does not thread external references through discharge, but operand 0 is a \
+                          reference; pass reference-free operands or discharge external references first"
+                    .to_string(),
+            }),
         );
     }
 

@@ -20,7 +20,7 @@ use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
     check_count, impl_non_differentiable_operation, impl_non_transposable_operation,
-    impl_reference_free_dischargeable_operation,
+    impl_reference_dischargeable_operation,
 };
 use crate::operations::{
     ConstantOperation, DimensionSizeOperation, DimensionToScalarOperation, DynamicBroadcastOperation, ScanOperation,
@@ -114,7 +114,7 @@ impl Operation for DimensionFromScalarOperation {
     }
 }
 
-impl_reference_free_dischargeable_operation!(DimensionFromScalarOperation);
+impl_reference_dischargeable_operation!(@reference_free DimensionFromScalarOperation);
 
 impl<C: Domain<Type = ArrayIrType, Value: DimensionFromScalar<C::Value>>> InterpretableOperation<C>
     for DimensionFromScalarOperation

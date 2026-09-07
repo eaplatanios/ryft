@@ -17,7 +17,7 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_differentiable_operation, impl_reference_free_dischargeable_operation};
+use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::control_flow::scan::ScanOperation;
 use crate::operations::differentiation::custom_jvp::CUSTOM_JVP_OPERATION_NAME;
@@ -1488,7 +1488,7 @@ impl Operation for CustomCallOperation<ArrayIrType> {
     }
 }
 
-impl_reference_free_dischargeable_operation!(<T> CustomCallOperation<T> where T: Type);
+impl_reference_dischargeable_operation!(@reference_free <T> CustomCallOperation<T> where T: Type);
 
 impl<C: Domain<Type = ArrayType, Value: CustomCall>> InterpretableOperation<C> for CustomCallOperation<ArrayType> {
     fn interpret<D: InterpretationDriver<C>>(

@@ -20,7 +20,7 @@ use crate::differentiation::{
     transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_reference_free_dischargeable_operation};
+use crate::macros::{check_count, impl_reference_dischargeable_operation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::one::{One, OneOperation};
 use crate::operations::constants::zero::{Zero, ZeroOperation};
@@ -349,7 +349,7 @@ impl Operation for PadOperation<ArrayIrType> {
     }
 }
 
-impl_reference_free_dischargeable_operation!(<T> PadOperation<T> where T: Type);
+impl_reference_dischargeable_operation!(@reference_free <T> PadOperation<T> where T: Type);
 
 impl<C: Domain<Type = ArrayType, Value: Pad>> InterpretableOperation<C> for PadOperation<ArrayType> {
     fn interpret<D: InterpretationDriver<C>>(

@@ -17,7 +17,7 @@ use crate::differentiation::{
     TransposableOperation, TranspositionContext, TranspositionDriver, jvp_projected_operation, primal_to_tangent_duals,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_reference_free_dischargeable_operation};
+use crate::macros::{check_count, impl_reference_dischargeable_operation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::constants::zero_like::ZeroLike;
@@ -613,7 +613,7 @@ impl Operation for DynamicShapeSliceOperation {
     }
 }
 
-impl_reference_free_dischargeable_operation!(DynamicShapeSliceOperation);
+impl_reference_dischargeable_operation!(@reference_free DynamicShapeSliceOperation);
 
 // Eager interpretation of [`DynamicShapeSliceOperation`] resolves its first-class start and size operands and then
 // delegates to the array value's ordinary static [`Slice`] implementation. Staged contexts bind the operation

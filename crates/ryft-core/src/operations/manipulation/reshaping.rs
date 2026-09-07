@@ -15,7 +15,7 @@ use crate::differentiation::{
     TranspositionContext, TranspositionDriver, primal_to_tangent_duals, transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, impl_differentiable_operation, impl_reference_free_dischargeable_operation};
+use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
@@ -139,7 +139,7 @@ impl Operation for DynamicReshapeOperation {
     }
 }
 
-impl_reference_free_dischargeable_operation!(DynamicReshapeOperation);
+impl_reference_dischargeable_operation!(@reference_free DynamicReshapeOperation);
 
 impl<C> InterpretableOperation<C> for DynamicReshapeOperation
 where
