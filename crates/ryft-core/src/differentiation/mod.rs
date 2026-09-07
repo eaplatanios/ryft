@@ -237,6 +237,10 @@ pub enum DifferentiationError {
     #[error("gradient output type {output_type} is non-differentiable and carries no cotangent space")]
     NonDifferentiableGradientOutput { output_type: String },
 
+    /// Error returned when a transposition rule receives a different number of cotangent accumulators than expected.
+    #[error("invalid number of accumulators; expected {expected} but got {actual}")]
+    InvalidAccumulatorCount { expected: usize, actual: usize },
+
     /// Error returned when reverse mode differentiation is requested through a plain (i.e., non-holomorphic) gradient
     /// entry point for a function whose scalar output is complex. A single reverse mode seed recovers the derivative
     /// of a complex-output function only when the function is holomorphic (i.e., complex-differentiable), a promise

@@ -804,9 +804,9 @@ pub(crate) mod tests {
         Array, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, Shape,
     };
     use crate::differentiation::{
-        DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
-        DifferentiationDual, DifferentiationError, DifferentiationPolicy, DifferentiationTracer, TransposableOperation,
-        TranspositionContext, TranspositionDriver,
+        CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext,
+        DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, DifferentiationTracer,
+        TransposableOperation, TranspositionContext, TranspositionDriver,
     };
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::macros::check_count;
@@ -1123,17 +1123,15 @@ pub(crate) mod tests {
     {
         fn transpose<D: TranspositionDriver<V, O>>(
             &self,
-            _context: &mut TranspositionContext<'_, V, O>,
+            context: &mut TranspositionContext<'_, V, O>,
             _driver: &D,
             inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
             outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+            accumulators: &[CotangentAccumulator],
+        ) -> Result<(), DifferentiationError> {
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
-            Ok(vec![match &inputs[0] {
-                PartialValue::Unknown(_) => outputs[0].clone(),
-                PartialValue::Known(_) => MaybeZero::Zero(inputs[0].r#type().cotangent()?),
-            }])
+            accumulators[0].accumulate(context, outputs[0].clone())
         }
     }
 

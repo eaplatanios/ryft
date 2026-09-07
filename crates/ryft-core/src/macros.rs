@@ -19,6 +19,15 @@ macro_rules! check_count {
         }
     }};
 
+    // This branch reports a cotangent accumulator-count mismatch with the dedicated differentiation error variant.
+    ("accumulator", $values:expr, $expected:expr, DifferentiationError $(,)?) => {{
+        let values = &$values;
+        let expected = $expected;
+        if values.len() != expected {
+            return Err($crate::DifferentiationError::InvalidAccumulatorCount { expected, actual: values.len() }.into());
+        }
+    }};
+
     // This branch reports a type-level count mismatch using the caller's singular descriptor.
     ($descriptor:expr, $values:expr, $expected:expr, TypeError $(,)?) => {{
         let values = &$values;
@@ -1472,7 +1481,7 @@ macro_rules! impl_differentiable_operation {
                 $outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<$value, $operations>>>],
                 $accumulators: &[$crate::CotangentAccumulator],
             ) -> Result<(), $crate::DifferentiationError> {
-                $crate::check_count!("input", $accumulators, $inputs.len(), ProgramError);
+                $crate::check_count!("accumulator", $accumulators, $inputs.len(), DifferentiationError);
                 let $self = self;
                 $body
             }
@@ -1636,7 +1645,7 @@ macro_rules! impl_differentiable_elementwise_operation {
             ) -> Result<(), $crate::DifferentiationError> {
                 $crate::check_count!("input", inputs, 1, ProgramError);
                 $crate::check_count!("output", outputs, 1, ProgramError);
-                $crate::check_count!("accumulators", accumulators, 1, ProgramError);
+                $crate::check_count!("accumulator", accumulators, 1, DifferentiationError);
                 Ok(())
             }
         }
@@ -1690,7 +1699,7 @@ macro_rules! impl_differentiable_elementwise_operation {
             ) -> Result<(), $crate::DifferentiationError> {
                 $crate::check_count!("input", inputs, 1, ProgramError);
                 $crate::check_count!("output", outputs, 1, ProgramError);
-                $crate::check_count!("accumulators", accumulators, 1, ProgramError);
+                $crate::check_count!("accumulator", accumulators, 1, DifferentiationError);
                 accumulators[0].accumulate(context, outputs[0].clone())
             }
         }
@@ -1732,7 +1741,7 @@ macro_rules! impl_differentiable_elementwise_operation {
             ) -> Result<(), $crate::DifferentiationError> {
                 $crate::check_count!("input", inputs, 1, ProgramError);
                 $crate::check_count!("output", outputs, 1, ProgramError);
-                $crate::check_count!("accumulators", accumulators, 1, ProgramError);
+                $crate::check_count!("accumulator", accumulators, 1, DifferentiationError);
                 Ok(())
             }
         }
@@ -2097,7 +2106,7 @@ macro_rules! impl_differentiable_elementwise_operation {
             ) -> Result<(), $crate::DifferentiationError> {
                 $crate::check_count!("input", inputs, 1, ProgramError);
                 $crate::check_count!("output", outputs, 1, ProgramError);
-                $crate::check_count!("accumulators", accumulators, 1, ProgramError);
+                $crate::check_count!("accumulator", accumulators, 1, DifferentiationError);
                 if accumulators[0].is_needed() {
                     // Unary linear operations preserve the cotangent type; only their declared sign changes it.
                     let contribution = outputs[0].clone().map(|cotangent| {
@@ -2212,7 +2221,7 @@ macro_rules! impl_differentiable_elementwise_operation {
             ) -> Result<(), $crate::DifferentiationError> {
                 $crate::check_count!("input", inputs, 2, ProgramError);
                 $crate::check_count!("output", outputs, 1, ProgramError);
-                $crate::check_count!("accumulators", accumulators, 2, ProgramError);
+                $crate::check_count!("accumulator", accumulators, 2, DifferentiationError);
                 if let $crate::MaybeZero::Value(cotangent) = &outputs[0] {
                     // Demand is separate from primal knownness: avoid unalignment and negation for unused inputs.
                     let operation_name = $crate::Operation::name(self);
@@ -2813,7 +2822,7 @@ macro_rules! impl_nullary_transposable_operation {
                 $crate::check_count!("input", inputs, 0, ProgramError);
                 let output_count = $crate::Operation::infer_output_types(self, &[], &[])?.len();
                 $crate::check_count!("output", outputs, output_count, ProgramError);
-                $crate::check_count!("accumulators", accumulators, 0, ProgramError);
+                $crate::check_count!("accumulator", accumulators, 0, DifferentiationError);
                 Ok(())
             }
         }
@@ -4855,7 +4864,7 @@ mod tests {
             |_operation, context, _driver, inputs, outputs, accumulators| {
                 check_count!("input", inputs, 2, ProgramError);
                 check_count!("output", outputs, 1, ProgramError);
-                check_count!("accumulators", accumulators, 2, ProgramError);
+                check_count!("accumulator", accumulators, 2, DifferentiationError);
                 {
                     let contribution = outputs[0].clone();
                     accumulators[0].accumulate(context, contribution)?;
@@ -5239,6 +5248,10 @@ mod tests {
             check_count!("output", values, 2, ProgramError);
             Ok(())
         };
+        let check_accumulator = |values: &[usize]| -> Result<(), DifferentiationError> {
+            check_count!("accumulator", values, 1, DifferentiationError);
+            Ok(())
+        };
         let check_operand = |values: &[usize], expected: usize| -> Result<(), TypeError> {
             check_count!("operand", values, expected, TypeError);
             Ok(())
@@ -5247,6 +5260,15 @@ mod tests {
         assert_eq!(check_input(&[]), Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }));
         assert_eq!(check_output(&[0, 1]), Ok(()));
         assert_eq!(check_output(&[0]), Err(ProgramError::InvalidOutputCount { expected: 2, actual: 1 }));
+        assert_eq!(check_accumulator(&[0]), Ok(()));
+        assert_eq!(
+            check_accumulator(&[]),
+            Err(DifferentiationError::InvalidAccumulatorCount { expected: 1, actual: 0 }),
+        );
+        assert_eq!(
+            check_accumulator(&[]).unwrap_err().to_string(),
+            "invalid number of accumulators; expected 1 but got 0",
+        );
         assert_eq!(check_operand(&[0], 1), Ok(()));
         assert_eq!(check_operand(&[], 1), Err(TypeError::invalid("expected 1 operand but got 0".to_string())),);
         assert_eq!(check_operand(&[0], 2), Err(TypeError::invalid("expected 2 operands but got 1".to_string())),);
