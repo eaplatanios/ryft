@@ -1,7 +1,9 @@
 use std::fmt::Display;
 use std::ops::{Mul as StandardMul, Sub as StandardSub};
 
-use crate::arrays::{ArrayBatch, ArrayBatching, ArrayType, DataType, RaggedArrayBatchingPolicy, RaggedMaskIdentity};
+use crate::arrays::{
+    ArrayBatch, ArrayBatchingPolicy, ArrayType, DataType, RaggedArrayExtentBatchingPolicy, RaggedMaskIdentity,
+};
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
@@ -131,17 +133,17 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for LogSumEx
 // dimension with `lift_reduce_axes` and hands the lifted operation to the shared axis-collapsing skeleton of
 // `batch_reducing_operation`. The identity written over the padding of a reduced ragged axis is negative infinity,
 // because `exp(-∞) = 0` is the additive identity of the inner sum.
-impl<C: Context<Type = ArrayType>, P: RaggedArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
+impl<C: Context<Type = ArrayType>, P: RaggedArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
     for LogSumExpOperation
 where
     LogSumExpOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         let Some(batch_axis) = inputs[0].batch_axis_position() else {
             return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
@@ -287,7 +289,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::DynamicArrayBatchingPolicy;
+    use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, Dimension, DimensionBounds, DimensionType, DimensionVariable,
         LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension,
@@ -468,7 +470,7 @@ mod tests {
                 .into(),
         );
         let extents = trace.input(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(items)])).into());
-        let context = BatchingContext::<_, ArrayBatching<DynamicArrayBatchingPolicy>>::with_policy(
+        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
             ProjectedContext::new(trace.clone()),
             batch_extent,
         );

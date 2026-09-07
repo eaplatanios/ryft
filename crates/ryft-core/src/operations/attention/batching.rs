@@ -69,14 +69,15 @@ fn attention_backward_batch_roles(
 /// normalization, and a bias cotangent is reduced over precisely the axes broadcast by its logical operand.
 fn batch_attention_static<C, O>(
     operation: &O,
-    context: &BatchingContext<C, ArrayBatching<StaticArrayBatchingPolicy>>,
+    context: &BatchingContext<C, ArrayBatchingPolicy<StaticArrayExtentBatchingPolicy>>,
     inputs: &[ArrayBatch<C::Value>],
     input_roles: &[AttentionBatchInput],
     output_roles: &[AttentionBatchOutput],
 ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
 where
     C: Context<Type = ArrayType, Value: Broadcast + Reduce + Reshape + Transpose>,
-    O: Operation<Type = ArrayType> + InterpretableBatchableOperation<C, ArrayBatching<StaticArrayBatchingPolicy>>,
+    O: Operation<Type = ArrayType>
+        + InterpretableBatchableOperation<C, ArrayBatchingPolicy<StaticArrayExtentBatchingPolicy>>,
 {
     check_count!("input", input_roles, inputs.len(), ProgramError);
     let Some(axis_size) = ArrayBatch::common_batch_size(inputs)? else {
@@ -263,7 +264,7 @@ where
 /// dynamic mapped extent, logical batch, or sequence length never becomes host metadata or a specialization key.
 fn batch_attention_dynamic<C, O>(
     operation: &O,
-    context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<DynamicArrayBatchingPolicy>>,
+    context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>,
     inputs: &[ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>],
     input_roles: &[AttentionBatchInput],
     output_roles: &[AttentionBatchOutput],
@@ -297,7 +298,7 @@ where
 
     let aligned_inputs = inputs
         .iter()
-        .map(|input| DynamicArrayBatchingPolicy::match_axis(context, input, 0.into()))
+        .map(|input| DynamicArrayExtentBatchingPolicy::match_axis(context, input, 0.into()))
         .collect::<Result<Vec<_>, _>>()?;
     let query_type = inputs[0].unbatched_type();
     let query_rank = query_type.rank();
@@ -461,16 +462,16 @@ where
 /// Batching rule for [`DotProductAttentionOperation`]: one mapped batch level folds into the operation's own batch
 /// dimension through the shared static-extent normalization adapter.
 impl<C: Context<Type = ArrayType, Value: Broadcast + Reduce + Reshape + Transpose>>
-    BatchableOperation<C, ArrayBatching<StaticArrayBatchingPolicy>> for DotProductAttentionOperation
+    BatchableOperation<C, ArrayBatchingPolicy<StaticArrayExtentBatchingPolicy>> for DotProductAttentionOperation
 where
     DotProductAttentionOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<StaticArrayBatchingPolicy>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<StaticArrayExtentBatchingPolicy>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<StaticArrayBatchingPolicy>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<StaticArrayExtentBatchingPolicy>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<StaticArrayBatchingPolicy>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<StaticArrayExtentBatchingPolicy>>, BatchingError> {
         let (input_roles, output_roles) = attention_forward_batch_roles(self.signature(), self.configuration());
         Ok(batch_attention_static(self, context, inputs, input_roles.as_slice(), output_roles.as_slice())?.into())
     }
@@ -479,16 +480,16 @@ where
 /// Batching rule for [`DotProductAttentionBackwardOperation`]: the same static-extent normalization as the forward
 /// operation, additionally restoring a broadcast bias-cotangent batch dimension.
 impl<C: Context<Type = ArrayType, Value: Broadcast + Reduce + Reshape + Transpose>>
-    BatchableOperation<C, ArrayBatching<StaticArrayBatchingPolicy>> for DotProductAttentionBackwardOperation
+    BatchableOperation<C, ArrayBatchingPolicy<StaticArrayExtentBatchingPolicy>> for DotProductAttentionBackwardOperation
 where
     DotProductAttentionBackwardOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<StaticArrayBatchingPolicy>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<StaticArrayExtentBatchingPolicy>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<StaticArrayBatchingPolicy>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<StaticArrayExtentBatchingPolicy>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<StaticArrayBatchingPolicy>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<StaticArrayExtentBatchingPolicy>>, BatchingError> {
         let (input_roles, mut output_roles, bias_index) = attention_backward_batch_roles(self.signature());
         if let Some(index) = bias_index {
             let cotangent_type = inputs[index].unbatched_type().cotangent().map_err(TypeError::from)?;
@@ -501,7 +502,7 @@ where
 }
 
 /// First-class-extent batching rule for [`DotProductAttentionOperation`].
-impl<C> BatchableOperation<ProjectedContext<C, ArrayType>, ArrayBatching<DynamicArrayBatchingPolicy>>
+impl<C> BatchableOperation<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>
     for DotProductAttentionOperation
 where
     C: Context<
@@ -518,20 +519,27 @@ where
     <C::Operation as OperationProjection<ArrayType>>::Projected:
         From<DotProductAttentionOperation> + From<ReduceOperation>,
 {
-    fn batch<D: BatchingDriver<ProjectedContext<C, ArrayType>, ArrayBatching<DynamicArrayBatchingPolicy>>>(
+    fn batch<
+        D: BatchingDriver<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>,
+    >(
         &self,
-        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<DynamicArrayBatchingPolicy>>,
+        context: &BatchingContext<
+            ProjectedContext<C, ArrayType>,
+            ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>,
+        >,
         _driver: &D,
         inputs: &[ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>],
-    ) -> Result<BatchedOutputs<ProjectedContext<C, ArrayType>, ArrayBatching<DynamicArrayBatchingPolicy>>, BatchingError>
-    {
+    ) -> Result<
+        BatchedOutputs<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>,
+        BatchingError,
+    > {
         let (input_roles, output_roles) = attention_forward_batch_roles(self.signature(), self.configuration());
         Ok(batch_attention_dynamic(self, context, inputs, input_roles.as_slice(), output_roles.as_slice())?.into())
     }
 }
 
 /// First-class-extent batching rule for [`DotProductAttentionBackwardOperation`].
-impl<C> BatchableOperation<ProjectedContext<C, ArrayType>, ArrayBatching<DynamicArrayBatchingPolicy>>
+impl<C> BatchableOperation<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>
     for DotProductAttentionBackwardOperation
 where
     C: Context<
@@ -548,13 +556,20 @@ where
     <C::Operation as OperationProjection<ArrayType>>::Projected:
         From<DotProductAttentionBackwardOperation> + From<ReduceOperation>,
 {
-    fn batch<D: BatchingDriver<ProjectedContext<C, ArrayType>, ArrayBatching<DynamicArrayBatchingPolicy>>>(
+    fn batch<
+        D: BatchingDriver<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>,
+    >(
         &self,
-        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<DynamicArrayBatchingPolicy>>,
+        context: &BatchingContext<
+            ProjectedContext<C, ArrayType>,
+            ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>,
+        >,
         _driver: &D,
         inputs: &[ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>],
-    ) -> Result<BatchedOutputs<ProjectedContext<C, ArrayType>, ArrayBatching<DynamicArrayBatchingPolicy>>, BatchingError>
-    {
+    ) -> Result<
+        BatchedOutputs<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>,
+        BatchingError,
+    > {
         let (input_roles, mut output_roles, bias_index) = attention_backward_batch_roles(self.signature());
         if let Some(index) = bias_index {
             let cotangent_type = inputs[index].unbatched_type().cotangent().map_err(TypeError::from)?;

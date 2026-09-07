@@ -49,7 +49,9 @@ use thiserror::Error;
 
 use ryft_macros::Parameter;
 
-use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, DataType, Dimension, Shape};
+use crate::arrays::{
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType, DataType, Dimension, Shape,
+};
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext};
 use crate::differentiation::{
@@ -369,10 +371,10 @@ where
     }
 }
 
-impl<C: NamedAxes<Type = ArrayType, Value: Broadcast + Transpose>> NamedAxes for BatchingContext<C, ArrayBatching>
+impl<C: NamedAxes<Type = ArrayType, Value: Broadcast + Transpose>> NamedAxes for BatchingContext<C, ArrayBatchingPolicy>
 where
-    C::Operation: BatchableOperation<C, ArrayBatching>
-        + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayBatching>
+    C::Operation: BatchableOperation<C, ArrayBatchingPolicy>
+        + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayBatchingPolicy>
         + From<TransposeOperation>
         + From<BroadcastOperation>,
 {
@@ -404,7 +406,7 @@ where
         // A `DifferentiationContext` binds no named axes of its own: axis-name resolution passes through to the inner
         // context, so collectives inside a differentiated closure resolve against the enclosing batching levels and
         // mesh regions.
-        self.parent().named_axis(name)
+        self.primal().named_axis(name)
     }
 }
 
@@ -570,15 +572,15 @@ impl_nullary_transposable_operation!(AxisIndexOperation);
 
 impl<
     C: Context<Type = ArrayType, Operation: From<IotaOperation<ArrayType>> + From<AxisIndexOperation>>,
-    P: ArrayBatchingPolicy<C>,
-> BatchableOperation<C, ArrayBatching<P>> for AxisIndexOperation
+    P: ArrayExtentBatchingPolicy<C>,
+> BatchableOperation<C, ArrayBatchingPolicy<P>> for AxisIndexOperation
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         _inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         if context.axis_name() == Some(self.axis_name.as_str()) {
             // This level binds the axis. The per-item index is the length-`size` `iota(0)`, bound into the parent and
             // mapped on this level's batch axis (position 0). The mapped packed `[size]` dimension is then stripped

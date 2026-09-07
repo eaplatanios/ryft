@@ -703,7 +703,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::arrays::Array;
-    use crate::arrays::batching::{ArrayIrBatch, ArrayIrBatching};
+    use crate::arrays::batching::{ArrayIrBatch, ArrayIrBatchingPolicy};
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::encoding::i4;
     use crate::arrays::ir::ArrayIrValue;
@@ -2650,7 +2650,7 @@ in (%4)
         );
 
         type Parent = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-        let batching_context = BatchingContext::<_, ArrayIrBatching>::new(
+        let batching_context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             Parent::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
         )

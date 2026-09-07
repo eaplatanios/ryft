@@ -1,7 +1,7 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
-use crate::arrays::{Array, ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType};
+use crate::arrays::{Array, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType};
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -81,15 +81,15 @@ impl<T: Type, C: Context<Type = T, Operation: From<StopGradientOperation<T>>>> P
 {
 }
 
-impl<C: Context<Type = ArrayType, Operation: From<StopGradientOperation<ArrayType>>>, P: ArrayBatchingPolicy<C>>
-    BatchableOperation<C, ArrayBatching<P>> for StopGradientOperation<ArrayType>
+impl<C: Context<Type = ArrayType, Operation: From<StopGradientOperation<ArrayType>>>, P: ArrayExtentBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatchingPolicy<P>> for StopGradientOperation<ArrayType>
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         // Batching preserves every operand's batch metadata while recursively rebinding the gradient barrier through
         // the parent context. Rebinding is essential when a packed value is itself a differentiation or batching
         // tracer, because treating it as an interpreted identity would silently expose its tangent to an enclosing

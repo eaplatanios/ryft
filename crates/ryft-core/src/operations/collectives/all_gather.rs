@@ -6,10 +6,10 @@
 
 use std::fmt::Display;
 
-use crate::arrays::batching::{DynamicArrayBatchingPolicy, folded_array_dimension};
+use crate::arrays::batching::{DynamicArrayExtentBatchingPolicy, folded_array_dimension};
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, Dimension, DimensionOperation,
-    DimensionType, DimensionValue, DimensionVariable, LinearResiduals, RaggedAxis, Shape, Sharding,
+    ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, Dimension,
+    DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LinearResiduals, RaggedAxis, Shape, Sharding,
 };
 use crate::axes::{AxisIndexOperation, NamedAxes};
 use crate::batching::{
@@ -45,8 +45,8 @@ use crate::tracing::{Tracer, TracingContext};
 
 use super::parallel_sum_scatter::ParallelSumScatterOperation;
 use super::{
-    CollectiveBatchingPolicy, CollectiveMode, CollectiveOptions, collective_extent_constant, collective_input_extents,
-    explicit_collective_inputs, forward_collective_to_parent, forward_explicit_collective,
+    CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, collective_extent_constant,
+    collective_input_extents, explicit_collective_inputs, forward_collective_to_parent, forward_explicit_collective,
     forward_shape_changing_collective, impl_shape_changing_collective_member_operation,
     infer_explicit_shape_changing_collective_output_type, interpret_degenerate_collective,
     jvp_shape_changing_collective_with_adjoint, multiplied_collective_extent, reject_ragged_collective_inputs,
@@ -313,18 +313,18 @@ impl AllGatherOperation {
 // merged into it, laying the gathered chunks out item-major (item 0's chunk first), which matches the tiled
 // StableHLO `all_gather` ordering. Every batch item sees the same gathered value, so the output is replicated. A
 // non-matching level forwards the collective untouched to the parent context via [`forward_collective_to_parent`].
-impl<C, P: CollectiveBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for AllGatherOperation
+impl<C, P: CollectiveArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>> for AllGatherOperation
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<AllGatherOperation>,
     <C as Domain>::Value: Transpose,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         if context.axis_name() != Some(self.axis_name.as_str()) {
             reject_ragged_collective_inputs(self.name(), inputs)?;
             let [input] = inputs else {
@@ -444,7 +444,7 @@ impl_shape_changing_collective_member_operation!(AllGatherOperation, infer_expli
 
 // Batching rule for explicit-extent [`AllGatherOperation`]. The logical result extents remain ordinary replicated
 // dimension SSA operands; matching-axis batching delegates its array mechanics to the homogeneous collective kernel.
-impl<C> MemberBatchableOperation<C, ArrayIrBatching> for AllGatherOperation
+impl<C> MemberBatchableOperation<C, ArrayIrBatchingPolicy> for AllGatherOperation
 where
     C: Context<
             Type = ArrayIrType,
@@ -461,12 +461,12 @@ where
     <C::Value as ValueProjection<DimensionType>>::Projected:
         DimensionRequirement + Div + Mul + Value<Type = DimensionType>,
 {
-    fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatching>>(
+    fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C, ArrayIrBatching>,
+        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         let (array, output_extents) = explicit_collective_inputs(inputs)?;
         let logical_input_types = inputs.iter().map(|input| input.unbatched_type().clone()).collect::<Vec<_>>();
         let mut logical_output_types = infer_explicit_all_gather_output_types(self, logical_input_types.as_slice())?;
@@ -598,12 +598,13 @@ where
             array.batch_axis(),
         )?;
         let input_rank = array.unbatched_type().rank();
-        let projected_context = BatchingContext::<_, ArrayBatching<DynamicArrayBatchingPolicy>>::with_policy(
-            ProjectedContext::new(context.parent().clone()),
-            context.axis_extent().clone(),
-        )
-        .with_axis_name(context.axis_name().map(str::to_string))
-        .with_axis_sharding(context.axis_sharding().clone());
+        let projected_context =
+            BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
+                ProjectedContext::new(context.parent().clone()),
+                context.axis_extent().clone(),
+            )
+            .with_axis_name(context.axis_name().map(str::to_string))
+            .with_axis_sharding(context.axis_sharding().clone());
         let output_extents = output_extents
             .iter()
             .enumerate()
@@ -629,7 +630,7 @@ where
             })
             .collect::<Result<Vec<_>, BatchingError>>()?;
         let ragged_axes = ragged_axes.into_iter().map(|(_, _, ragged_axis)| ragged_axis).collect::<Vec<_>>();
-        let mut output = batch_all_gather_matching_axis::<_, DynamicArrayBatchingPolicy>(
+        let mut output = batch_all_gather_matching_axis::<_, DynamicArrayExtentBatchingPolicy>(
             self,
             &projected_context,
             &array,
@@ -638,7 +639,7 @@ where
             logical_output_type.sharding().cloned(),
         )?;
         if !ragged_axes.is_empty() {
-            let ragged_axes = gathered_ragged_axes::<_, DynamicArrayBatchingPolicy>(
+            let ragged_axes = gathered_ragged_axes::<_, DynamicArrayExtentBatchingPolicy>(
                 self,
                 &projected_context,
                 ragged_axes,
@@ -963,7 +964,7 @@ fn forwarded_all_gather_axes(mode: CollectiveMode, concat_axis: usize, batch_axi
 /// Applies the matching-axis all-gather batching semantics over the policy-selected extent representation.
 fn batch_all_gather_matching_axis<C, P>(
     operation: &AllGatherOperation,
-    context: &BatchingContext<C, ArrayBatching<P>>,
+    context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
     input: &ArrayBatch<C::Value>,
     logical_input_rank: usize,
     output_extents: Vec<P::ShapeExtent>,
@@ -972,7 +973,7 @@ fn batch_all_gather_matching_axis<C, P>(
 where
     C: Context<Type = ArrayType>,
     C::Value: Transpose,
-    P: CollectiveBatchingPolicy<C>,
+    P: CollectiveArrayExtentBatchingPolicy<C>,
 {
     if operation.options.axis_index_groups.is_some() {
         return Err(BatchingError::UnsupportedOperation {
@@ -1023,14 +1024,14 @@ where
 /// Relocates bounded-ragged metadata through a matching untiled all-gather.
 fn gathered_ragged_axes<C, P>(
     operation: &AllGatherOperation,
-    context: &BatchingContext<C, ArrayBatching<P>>,
+    context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
     ragged_axes: Vec<RaggedAxis<C::Value>>,
     input_batch_axis: Option<usize>,
     input_rank: usize,
 ) -> Result<Vec<RaggedAxis<C::Value>>, BatchingError>
 where
     C: Context<Type = ArrayType>,
-    P: CollectiveBatchingPolicy<C>,
+    P: CollectiveArrayExtentBatchingPolicy<C>,
 {
     if let Some(input_batch_axis) = input_batch_axis {
         return Ok(ragged_axes
@@ -1129,9 +1130,10 @@ mod tests {
         // Axis-size resolution fails fast at staging time with `AxisError::UnboundAxisName` rather than silently
         // acting as identity.
         let result: Result<ArrayIrValue<Array>, BatchingError> = batch(
-            |item: BatchingTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>, ArrayIrBatching>| {
-                item.all_gather_tiled("x", 0)
-            },
+            |item: BatchingTracer<
+                EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
+                ArrayIrBatchingPolicy,
+            >| { item.all_gather_tiled("x", 0) },
             ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
             BatchAxis::new(0),
             BatchAxis::replicated(),
@@ -1235,12 +1237,9 @@ mod tests {
         .unwrap();
         let extent =
             |value| ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(value).unwrap()));
-        let ragged_extent = ArrayIrBatch::mapped_dimension(
-            extents.clone(),
-            BatchAxis::new(0),
-            DimensionType::new(variable.clone()),
-        )
-        .unwrap();
+        let ragged_extent =
+            ArrayIrBatch::mapped_dimension(extents.clone(), BatchAxis::new(0), DimensionType::new(variable.clone()))
+                .unwrap();
         let context = BatchingContext::new(
             EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
@@ -1544,9 +1543,10 @@ mod tests {
         // replicated across the batch. With items `[1, 2]` and `[3, 4]` the gathered value is `[1, 2, 3, 4]`,
         // matching the verified cross-device `shard_map` execution semantics of the tiled StableHLO `all_gather`.
         let output: ArrayIrValue<Array> = batch(
-            |item: BatchingTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>, ArrayIrBatching>| {
-                item.all_gather_tiled("x", 0)
-            },
+            |item: BatchingTracer<
+                EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
+                ArrayIrBatchingPolicy,
+            >| { item.all_gather_tiled("x", 0) },
             ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
             BatchAxis::new(0),
             BatchAxis::replicated(),

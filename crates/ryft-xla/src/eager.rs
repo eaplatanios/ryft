@@ -140,10 +140,10 @@ impl DimensionFromScalar<DimensionValue> for Array<'_> {
     }
 }
 
-/// Batched while-predicate semantics for [`Array`], mirroring the reference semantics of
-/// [`Array`](ryft_core::arrays::Array): [`WhilePredicate::any_true`] reduces the whole Boolean payload with
-/// `or` via device-to-host readback of every shard, and [`WhilePredicate::mask_select`] broadcasts the predicate
-/// against the operands along its leading (prefix) axes on device before selecting.
+// Batched while-predicate semantics for [`Array`], mirroring the reference semantics of
+// [`Array`](ryft_core::arrays::Array): [`WhilePredicate::any_true`] reduces the whole Boolean payload with
+// `or` via device-to-host readback of every shard, and [`WhilePredicate::mask_select`] broadcasts the predicate
+// against the operands along its leading (prefix) axes on device before selecting.
 impl WhilePredicate for Array<'_> {
     fn any_true(&self) -> Result<bool, ProgramError> {
         if !self.data_type().is_boolean() {
@@ -850,13 +850,13 @@ mod tests {
     /// preserves the result's ragged metadata, and lets a downstream sum mask the padded suffix.
     #[test]
     fn test_eager_ragged_custom_call_contract_composes_with_masked_reduction() {
-        use ryft_core::arrays::batching::DynamicArrayBatchingPolicy;
+        use ryft_core::arrays::batching::DynamicArrayExtentBatchingPolicy;
         use ryft_core::operations::custom_call::{
             CustomCallBatching, CustomCallOperation, CustomCallRaggedContract, CustomCallRaggedInputBinding,
             CustomCallRaggedOutputBinding,
         };
         use ryft_core::{
-            ArrayBatch, ArrayBatching, ArrayIrValue, BatchableOperation, BatchingContext, DimensionValue,
+            ArrayBatch, ArrayBatchingPolicy, ArrayIrValue, BatchableOperation, BatchingContext, DimensionValue,
             EmptyRegionDriver, RaggedAxis, ReduceOperation,
         };
 
@@ -888,7 +888,7 @@ mod tests {
         )
         .unwrap();
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(5)).unwrap());
-        let context = BatchingContext::<_, ArrayBatching<DynamicArrayBatchingPolicy>>::with_policy(
+        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
             input.execution_domain(),
             ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
         );
@@ -1877,7 +1877,7 @@ mod tests {
         let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         let domain = x.execution_domain();
         let (value, pullback) = domain.vjp(|x, ()| Ok(vec![Mul::mul(&x, &x)?]), x.clone(), ()).unwrap();
-        let (pullback, residuals) = pullback.into_parts();
+        let (pullback, residuals) = pullback.into_transposed_parts().unwrap();
         assert_eq!(read_f32s(&value[0]), vec![1.0, 4.0, 9.0]);
 
         // The direct-transpose pullback consumes `[output_cotangents ++ residuals]` and produces the flat input

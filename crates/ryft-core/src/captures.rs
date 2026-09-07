@@ -313,7 +313,7 @@ where
 
     #[inline]
     fn capture(&self, value: Self::Capture) -> Result<Self::Constant, ProgramError> {
-        self.parent().capture(value)
+        self.primal().capture(value)
     }
 }
 

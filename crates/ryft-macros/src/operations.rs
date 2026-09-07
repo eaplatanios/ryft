@@ -1138,7 +1138,7 @@ impl OperationEnum {
         let batching_policy: syn::Type = if has_explicit_operation_family {
             syn::parse_quote!(__BatchingPolicy)
         } else {
-            syn::parse_quote!(#ryft::ArrayBatching<__P>)
+            syn::parse_quote!(#ryft::ArrayBatchingPolicy<__P>)
         };
         let parent_value_type: syn::Type = syn::parse_quote!(<__ParentContext as #ryft::Domain>::Value);
         let batch_type: syn::Type = if has_explicit_operation_family {
@@ -1174,7 +1174,7 @@ impl OperationEnum {
         } else {
             batching_where_clause
                 .predicates
-                .push(syn::parse_quote!(__P: #ryft::ArrayBatchingPolicy<__ParentContext>));
+                .push(syn::parse_quote!(__P: #ryft::ArrayExtentBatchingPolicy<__ParentContext>));
         }
         for variant in variants {
             let operation_type = &variant.program_payload_type;

@@ -6,10 +6,10 @@
 
 use std::fmt::Display;
 
-use crate::arrays::batching::DynamicArrayBatchingPolicy;
+use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, Dimension, DimensionOperation,
-    DimensionType, DimensionValue, DimensionVariable, Shape, Sharding,
+    ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, Dimension,
+    DimensionOperation, DimensionType, DimensionValue, DimensionVariable, Shape, Sharding,
 };
 use crate::axes::NamedAxes;
 use crate::batching::{
@@ -44,9 +44,9 @@ use crate::programs::{
 use crate::tracing::{Tracer, TracingContext};
 
 use super::{
-    CollectiveBatchingPolicy, CollectiveMode, CollectiveOptions, collective_extent_constant, collective_input_extents,
-    divided_collective_extent, explicit_collective_inputs, forward_collective_to_parent, forward_explicit_collective,
-    forward_shape_changing_collective, impl_shape_changing_collective_member_operation,
+    CollectiveArrayExtentBatchingPolicy, CollectiveMode, CollectiveOptions, collective_extent_constant,
+    collective_input_extents, divided_collective_extent, explicit_collective_inputs, forward_collective_to_parent,
+    forward_explicit_collective, forward_shape_changing_collective, impl_shape_changing_collective_member_operation,
     infer_explicit_shape_changing_collective_output_type, interpret_degenerate_collective,
     jvp_shape_changing_collective_with_adjoint, multiplied_collective_extent, require_collective_axis_divisible,
     require_collective_axis_extent, resolve_named_axis_size, shape_changing_collective,
@@ -294,18 +294,18 @@ impl AllToAllOperation {
 // then merged item-major into the per-item `concat_axis` — batch item `i` receives every item's chunk `i`,
 // concatenated along `concat_axis`. A non-matching level forwards the collective untouched to the parent context
 // via [`forward_collective_to_parent`].
-impl<C, P: CollectiveBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for AllToAllOperation
+impl<C, P: CollectiveArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>> for AllToAllOperation
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<AllToAllOperation>,
     <C as Domain>::Value: Transpose,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         if let Some(ragged_axis) = inputs.iter().find_map(|input| input.ragged_axes().first()) {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!(
@@ -405,7 +405,7 @@ impl_shape_changing_collective_member_operation!(AllToAllOperation, infer_explic
 
 // Batching rule for explicit-extent [`AllToAllOperation`]. Dimension SSA supplies its temporary split and merge
 // shapes directly, while matching-axis array mechanics reuse the homogeneous collective kernel.
-impl<C> MemberBatchableOperation<C, ArrayIrBatching> for AllToAllOperation
+impl<C> MemberBatchableOperation<C, ArrayIrBatchingPolicy> for AllToAllOperation
 where
     C: Context<
             Type = ArrayIrType,
@@ -422,12 +422,12 @@ where
     <C::Value as ValueProjection<DimensionType>>::Projected:
         DimensionRequirement + Div + Mul + Value<Type = DimensionType>,
 {
-    fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatching>>(
+    fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C, ArrayIrBatching>,
+        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         let (array, output_extents) = explicit_collective_inputs(inputs)?;
         if let Some(ragged_axis) = array.ragged_axes().first() {
             return Err(BatchingError::UnsupportedOperation {
@@ -479,13 +479,14 @@ where
             .iter()
             .map(|extent| <C::Value as ValueProjection<DimensionType>>::into_projected(extent.value().clone()))
             .collect::<Result<Vec<_>, _>>()?;
-        let projected_context = BatchingContext::<_, ArrayBatching<DynamicArrayBatchingPolicy>>::with_policy(
-            ProjectedContext::new(context.parent().clone()),
-            context.axis_extent().clone(),
-        )
-        .with_axis_name(context.axis_name().map(str::to_string))
-        .with_axis_sharding(context.axis_sharding().clone());
-        let output = batch_all_to_all_matching_axis::<_, DynamicArrayBatchingPolicy>(
+        let projected_context =
+            BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
+                ProjectedContext::new(context.parent().clone()),
+                context.axis_extent().clone(),
+            )
+            .with_axis_name(context.axis_name().map(str::to_string))
+            .with_axis_sharding(context.axis_sharding().clone());
+        let output = batch_all_to_all_matching_axis::<_, DynamicArrayExtentBatchingPolicy>(
             self,
             &projected_context,
             &array,
@@ -677,7 +678,7 @@ fn forwarded_all_to_all_axes(
 /// Applies the matching-axis all-to-all batching semantics over the policy-selected extent representation.
 fn batch_all_to_all_matching_axis<C, P>(
     operation: &AllToAllOperation,
-    context: &BatchingContext<C, ArrayBatching<P>>,
+    context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
     input: &ArrayBatch<C::Value>,
     logical_input_rank: usize,
     output_extents: Vec<P::ShapeExtent>,
@@ -686,7 +687,7 @@ fn batch_all_to_all_matching_axis<C, P>(
 where
     C: Context<Type = ArrayType>,
     C::Value: Transpose,
-    P: CollectiveBatchingPolicy<C>,
+    P: CollectiveArrayExtentBatchingPolicy<C>,
 {
     if operation.options.axis_index_groups.is_some() {
         return Err(BatchingError::UnsupportedOperation {
@@ -880,9 +881,10 @@ mod tests {
         // cross-device `shard_map` execution semantics of StableHLO's `all_to_all`.
         let x = Array::matrix(2, 4, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]);
         let output: ArrayIrValue<Array> = batch(
-            |item: BatchingTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>, ArrayIrBatching>| {
-                item.all_to_all_tiled("x", 0, 0)
-            },
+            |item: BatchingTracer<
+                EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
+                ArrayIrBatchingPolicy,
+            >| { item.all_to_all_tiled("x", 0, 0) },
             ArrayIrValue::Array(x),
             BatchAxis::new(0),
             BatchAxis::new(0),
@@ -918,9 +920,10 @@ mod tests {
             vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
         );
         let output: ArrayIrValue<Array> = batch(
-            |item: BatchingTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>, ArrayIrBatching>| {
-                item.all_to_all_tiled("x", 0, 1)
-            },
+            |item: BatchingTracer<
+                EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>,
+                ArrayIrBatchingPolicy,
+            >| { item.all_to_all_tiled("x", 0, 1) },
             ArrayIrValue::Array(x),
             BatchAxis::new(0),
             BatchAxis::new(0),

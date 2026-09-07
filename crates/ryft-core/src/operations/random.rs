@@ -3,8 +3,8 @@ use std::marker::PhantomData;
 
 use crate::arrays::batching::align_array_batch;
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, DataType,
-    Dimension, DimensionType, DimensionValue, DimensionVariable, Shape, ShardingDimension,
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
+    ArrayType, DataType, Dimension, DimensionType, DimensionValue, DimensionVariable, Shape, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -306,18 +306,18 @@ where
 //
 // A *replicated* state is rejected: every batch item would see the same state and silently draw identical,
 // correlated bits, so callers derive one state per batch item with [`split_key`] and map over the states instead.
-impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
     for RngBitGeneratorOperation<ArrayType>
 where
     C::Value: Transpose,
     C::Operation: From<RngBitGeneratorOperation<ArrayType>> + From<ScanOperation<C::Constant>>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         if inputs[0].batch_axis().is_replicated() {
             return Err(BatchingError::UnsupportedOperation {
@@ -357,7 +357,8 @@ where
 // Composite batching rule for [`RngBitGeneratorOperation`]. Replicated first-class output extents become invariant
 // scan carries, while one mapped state row is consumed per iteration. This preserves one independently advanced state
 // and one dynamically shaped bits value per batch item without duplicating the generator state.
-impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatching> for RngBitGeneratorOperation<ArrayIrType>
+impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy>
+    for RngBitGeneratorOperation<ArrayIrType>
 where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
@@ -369,12 +370,12 @@ where
         + OperationProjection<ArrayType>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: From<TransposeOperation>,
 {
-    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
+    fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C, ArrayIrBatching>,
+        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         let Some((state, output_extents)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
@@ -1109,7 +1110,7 @@ mod tests {
         let column_extent = trace.input(DimensionType::new(columns.clone()).into());
         let input_ids = [batch_extent.clone(), states.clone(), row_extent.clone(), column_extent.clone()]
             .map(|input| input.atom_id().unwrap());
-        let context = BatchingContext::<_, ArrayIrBatching>::new(trace.clone(), batch_extent);
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), batch_extent);
         let outputs = context.bind(
             ArrayIrOperation::RngBitGenerator(RngBitGeneratorOperation::new(
                 RandomAlgorithm::ThreeFry,
@@ -1166,8 +1167,8 @@ mod tests {
         let nested_trace = Context::new();
         let outer = DimensionVariable::new("outer", DimensionBounds::new(1, Some(5))?);
         let outer_extent = nested_trace.input(DimensionType::new(outer.clone()).into());
-        let nested_context = BatchingContext::<_, ArrayIrBatching>::new(nested_trace, outer_extent);
-        let nested = <ArrayIrBatching as RecursiveBatchingPolicy<Context>>::batch_program(
+        let nested_context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(nested_trace, outer_extent);
+        let nested = <ArrayIrBatchingPolicy as RecursiveBatchingPolicy<Context>>::batch_program(
             &nested_context,
             program.entry_region_ref(),
             &[BatchAxis::replicated(), BatchAxis::new(0), BatchAxis::replicated(), BatchAxis::replicated()],
@@ -1191,7 +1192,7 @@ mod tests {
     /// Returns an active batching frame over an eager reference-backend parent for direct batching-rule tests.
     fn batching_context(
         axis_size: usize,
-    ) -> BatchingContext<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching> {
+    ) -> BatchingContext<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy> {
         BatchingContext::new(EagerContext::new(), axis_size)
     }
 

@@ -136,7 +136,7 @@ mod tests {
     fn test_xor_differentiation() {
         let outputs = XorOperation::<ArrayType>::new()
             .jvp(
-                &DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new()),
+                &DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new()),
                 &EmptyRegionDriver,
                 &[
                     DifferentiationDual::new_with_zero_tangent(Array::scalar(true)).unwrap(),

@@ -1,19 +1,19 @@
 use super::*;
 
-// Alignment delegates mapped-axis materialization to `ArrayBatchingPolicy::match_axis`, so a dynamic mapped extent
-// remains a first-class value. The lifted contraction zeroes contracted ragged padding and relocates every free ragged
-// axis through the dot's output layout.
-impl<C: Context<Type = ArrayType>, P: RaggedArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
+// Alignment delegates mapped-axis materialization to `ArrayExtentBatchingPolicy::match_axis`, so a dynamic mapped
+// extent remains a first-class value. The lifted contraction zeroes contracted ragged padding and relocates every free
+// ragged axis through the dot's output layout.
+impl<C: Context<Type = ArrayType>, P: RaggedArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
     for DotOperation
 where
     DotOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         check_count!("input", inputs, 2, ProgramError);
         let batch_axes: Vec<Option<usize>> = inputs.iter().map(|input| input.batch_axis_position()).collect();
         // A replicated ragged operand is rejected before alignment, because the broadcast that materializes its batch
@@ -161,7 +161,7 @@ where
     }
 }
 
-impl<C: Context<Type = ArrayType>, P: RaggedArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
+impl<C: Context<Type = ArrayType>, P: RaggedArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
     for RaggedDotOperation
 where
     RaggedDotOperation: InterpretableOperation<C>,
@@ -169,12 +169,12 @@ where
     // The explicit group metadata and both data operands must be mapped over their leading axis, matching the exact
     // leading-axis restriction of the grouped-dot contract. Bounded ragged-axis metadata is rejected because explicit
     // `group_sizes` are the sole source of raggedness for this primitive.
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         check_count!("input", inputs, 3, ProgramError);
         if let Some(ragged_axis) = inputs.iter().flat_map(ArrayBatch::ragged_axes).next() {
             return Err(BatchingError::UnsupportedOperation {

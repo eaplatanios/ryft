@@ -1,8 +1,8 @@
 use std::fmt::Display;
 
 use crate::arrays::{
-    Array, ArrayBatch, ArrayBatching, ArrayElement, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrType,
-    ArrayIrValue, ArrayOperation, ArrayType, DataType, dispatch_on_array_element_type,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation,
+    ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, dispatch_on_array_element_type,
 };
 use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
@@ -117,7 +117,7 @@ impl<T: Type, C: Context<Type = T, Operation: From<ZeroOperation<T>>>> Partially
 }
 
 impl_nullary_batchable_operation!(@replicated ZeroOperation<ArrayType>);
-impl_nullary_batchable_operation!(@member<ArrayIrType, ArrayIrBatching> ZeroOperation<ArrayType>);
+impl_nullary_batchable_operation!(@member<ArrayIrType, ArrayIrBatchingPolicy> ZeroOperation<ArrayType>);
 impl_non_differentiable_operation!(<T> ZeroOperation<T> where T: Type);
 impl_nullary_transposable_operation!(<T> ZeroOperation<T> where T: Type);
 
@@ -245,21 +245,21 @@ where
     }
 }
 
-impl<C: Context<Type = ArrayType> + Zero<C::Value>> Zero<BatchingTracer<C, ArrayBatching>>
-    for BatchingContext<C, ArrayBatching>
+impl<C: Context<Type = ArrayType> + Zero<C::Value>> Zero<BatchingTracer<C, ArrayBatchingPolicy>>
+    for BatchingContext<C, ArrayBatchingPolicy>
 {
     #[inline]
-    fn zero(&self, r#type: &ArrayType) -> Result<BatchingTracer<C, ArrayBatching>, ProgramError> {
+    fn zero(&self, r#type: &ArrayType) -> Result<BatchingTracer<C, ArrayBatchingPolicy>, ProgramError> {
         let batch = ArrayBatch::new(self.parent().zero(r#type)?, BatchAxis::replicated())?;
         Ok(BatchingTracer::new(self.clone(), batch))
     }
 }
 
-impl<C: Context<Type = ArrayIrType> + Zero<C::Value>> Zero<BatchingTracer<C, ArrayIrBatching>>
-    for BatchingContext<C, ArrayIrBatching>
+impl<C: Context<Type = ArrayIrType> + Zero<C::Value>> Zero<BatchingTracer<C, ArrayIrBatchingPolicy>>
+    for BatchingContext<C, ArrayIrBatchingPolicy>
 {
     #[inline]
-    fn zero(&self, r#type: &ArrayIrType) -> Result<BatchingTracer<C, ArrayIrBatching>, ProgramError> {
+    fn zero(&self, r#type: &ArrayIrType) -> Result<BatchingTracer<C, ArrayIrBatchingPolicy>, ProgramError> {
         let batch = ArrayIrBatch::new(self.parent().zero(r#type)?, BatchAxis::replicated())?;
         Ok(BatchingTracer::new(self.clone(), batch))
     }
@@ -270,7 +270,7 @@ impl<C: Context<Type: DifferentiableType> + Zero<C::Value>, P: DifferentiationPo
 {
     #[inline]
     fn zero(&self, r#type: &C::Type) -> Result<DifferentiationTracer<C, P>, ProgramError> {
-        let dual = DifferentiationDual::new_with_zero_tangent(self.parent().zero(r#type)?)?;
+        let dual = DifferentiationDual::new_with_zero_tangent(self.primal().zero(r#type)?)?;
         Ok(DifferentiationTracer::new(dual, self.clone()))
     }
 }
@@ -282,7 +282,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayBatch, ArrayBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, DataType,
+        Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, DataType,
         Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
     };
     use crate::batching::{BatchAxis, BatchableOperation, BatchingContext};
@@ -442,13 +442,14 @@ mod tests {
         assert_eq!(outputs[0].r#type().into_owned(), scalar_type);
         assert_eq!(outputs[0].value().to_f64s(), vec![0.0]);
 
-        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
+        let context =
+            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
         let output_type = ArrayType::new_static(DataType::F32, [2]);
         let output = context.zero(&output_type).unwrap();
         assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
         assert_eq!(output.batch().value(), &Array::from_elements(output_type, &[0.0f32; 2]).unwrap());
 
-        let context = BatchingContext::<_, ArrayIrBatching>::new(
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(4).unwrap()),
         );
@@ -459,7 +460,7 @@ mod tests {
 
     #[test]
     fn test_zero_differentiation() {
-        let context = DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let context = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new());
         let output_type = ArrayType::new_static(DataType::F32, [2]);
         let output = context.zero(&output_type).unwrap();
         assert_eq!(output.primal(), &Array::from_elements(output_type.clone(), &[0.0f32; 2]).unwrap());

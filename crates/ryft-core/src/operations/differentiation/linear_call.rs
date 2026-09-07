@@ -773,7 +773,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayBatch, ArrayBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
+        Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
         ArrayReferenceDischarge, ArrayType, DataType, Dimension, DimensionBounds, DimensionValue, DimensionVariable,
         LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
@@ -1282,8 +1282,9 @@ mod tests {
         // value varies per batch item even though its single operand is replicated.
         let regions = vec![axis_scaled_multiply_program(), axis_scaled_multiply_program()];
         let driver = RecursiveBatchingDriver::new(&regions);
-        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3)
-            .with_axis_name("items".to_string());
+        let context =
+            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3)
+                .with_axis_name("items".to_string());
 
         // Batching must therefore rewrite both regions instead of taking the all-replicated fast path, which would bind
         // the call unchanged and leave the `axis_index` unresolved (it then reaches eager interpretation and reports
@@ -1354,8 +1355,9 @@ mod tests {
         // still computes `r · u` and reports its output replicated.
         let regions = vec![scalar_multiply_program(), scalar_multiply_program()];
         let driver = RecursiveBatchingDriver::new(&regions);
-        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
-            .with_axis_name("items".to_string());
+        let context =
+            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2)
+                .with_axis_name("items".to_string());
         let outputs = LinearCallOperation::new(1)
             .batch(
                 &context,

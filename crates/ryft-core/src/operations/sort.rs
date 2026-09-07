@@ -1,7 +1,8 @@
 use std::fmt::Display;
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, DataType, Dimension, Shape, ShardingDimension,
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType, DataType, Dimension, Shape,
+    ShardingDimension,
 };
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
@@ -214,17 +215,17 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for SortOper
 /// Batching rule for [`SortOperation`]: every mapped operand's batch axis moves to the leading physical position,
 /// replicated operands broadcast to the batched physical shape (all sort operands must agree on shape), and the
 /// sort axis lifts past the inserted leading batch dimension while the `key_count` carries through unchanged.
-impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>, P: ArrayBatchingPolicy<C>>
-    BatchableOperation<C, ArrayBatching<P>> for SortOperation
+impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>, P: ArrayExtentBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatchingPolicy<P>> for SortOperation
 where
     SortOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         let Some(axis_size) = ArrayBatch::common_batch_size(inputs)? else {
             return Ok(self
                 .interpret_with_batch_axes(context, inputs, &vec![BatchAxis::replicated(); inputs.len()])?

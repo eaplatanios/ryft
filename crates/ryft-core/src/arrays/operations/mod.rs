@@ -1095,7 +1095,7 @@ mod tests {
 
     use crate::arrays::addressing::ArraySliceAxis;
     use crate::arrays::arrays::Array;
-    use crate::arrays::batching::{ArrayBatching, ArrayIrBatch, ArrayIrBatching};
+    use crate::arrays::batching::{ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy};
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, DimensionOperation};
@@ -1146,7 +1146,7 @@ mod tests {
         requires_array_operations::<Array>();
         requires_array_operations::<Tracer<ArrayTracingContext>>();
         requires_array_operations::<LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>>();
-        requires_array_operations::<BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching>>();
+        requires_array_operations::<BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>>();
     }
 
     #[test]
@@ -2133,7 +2133,7 @@ mod tests {
         let trace = TracingContext::<TestValue, TestOperation>::new();
         let extent_input = trace.input(DimensionType::new(extent.clone()).into());
         let mapped = trace.input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent)])).into());
-        let context = BatchingContext::<_, ArrayIrBatching>::new(trace.clone(), extent_input);
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), extent_input);
         let input = BatchingTracer::new(context.clone(), ArrayIrBatch::new(mapped, BatchAxis::new(0)).unwrap());
         let output = context.bind(operation, regions, std::slice::from_ref(&input)).unwrap().remove(0);
         let batch_axis = output.batch().batch_axis();
@@ -2337,7 +2337,10 @@ mod tests {
         };
         let linear = ArrayIrValue::Array(Array::vector(vec![2.0_f64, 5.0]));
         let output: TestValue = batch(
-            |(residual, linear): (BatchingTracer<_, ArrayIrBatching>, BatchingTracer<_, ArrayIrBatching>)| {
+            |(residual, linear): (
+                BatchingTracer<_, ArrayIrBatchingPolicy>,
+                BatchingTracer<_, ArrayIrBatchingPolicy>,
+            )| {
                 let context = residual.context().clone();
                 Ok(context
                     .bind(
@@ -2741,7 +2744,7 @@ mod tests {
         );
 
         // Batching inserts one physical leading axis while the extent remains a replicated shape value.
-        let batching_context = BatchingContext::<_, ArrayIrBatching>::new(
+        let batching_context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
         );
@@ -2863,7 +2866,7 @@ mod tests {
         );
         let axis_extent_id = axis_extent.atom_id().unwrap();
         let packed_id = packed.atom_id().unwrap();
-        let batching_context = BatchingContext::<_, ArrayIrBatching>::new(trace.clone(), axis_extent);
+        let batching_context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), axis_extent);
         let batched_output = program
             .interpret_in_context(
                 &batching_context,

@@ -17,10 +17,11 @@
 
 use std::fmt::Debug;
 
-use crate::arrays::batching::{DynamicArrayBatchingPolicy, broadcast_array};
+use crate::arrays::batching::{DynamicArrayExtentBatchingPolicy, broadcast_array};
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, Dimension,
-    DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, StaticArrayBatchingPolicy,
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
+    ArrayType, Dimension, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding,
+    StaticArrayExtentBatchingPolicy,
 };
 use crate::axes::{AxisError, NamedAxes, NamedAxis};
 use crate::batching::{BatchAxis, BatchingContext, BatchingError};
@@ -215,8 +216,8 @@ pub(super) fn reject_ragged_collective_inputs<V: Value<Type = ArrayType>>(
 /// [`BatchingContext`] — whose own rule dispatch repeats this name
 /// resolution at the next level — or an ordinary tracing context. Batching rules for custom collective-like
 /// operations should use this helper for their "not my axis" arm.
-pub fn forward_collective_to_parent<C, P: ArrayBatchingPolicy<C>>(
-    context: &BatchingContext<C, ArrayBatching<P>>,
+pub fn forward_collective_to_parent<C, P: ArrayExtentBatchingPolicy<C>>(
+    context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
     parent_operation: C::Operation,
     inputs: &[ArrayBatch<<C as Domain>::Value>],
 ) -> Result<Vec<ArrayBatch<<C as Domain>::Value>>, BatchingError>
@@ -363,13 +364,15 @@ pub(super) fn interpret_degenerate_collective<V: Clone>(
 ///
 /// The collective kernels own every formula. This trait exposes only the extent representation and the alignment and
 /// reshape encodings that differ between homogeneous arrays and composite array/dimension programs.
-pub(crate) trait CollectiveBatchingPolicy<C: Context<Type = ArrayType>>: ArrayBatchingPolicy<C> {
+pub(crate) trait CollectiveArrayExtentBatchingPolicy<C: Context<Type = ArrayType>>:
+    ArrayExtentBatchingPolicy<C>
+{
     /// Extent representation consumed by the shared collective kernels.
     type ShapeExtent: Clone + Debug + Div + Mul;
 
     /// Returns and validates the active mapped-axis extent in the kernel's representation.
     fn collective_axis_extent(
-        context: &BatchingContext<C, ArrayBatching<Self>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
         operation_name: &str,
         axis_name: &str,
         axis_size: usize,
@@ -377,13 +380,13 @@ pub(crate) trait CollectiveBatchingPolicy<C: Context<Type = ArrayType>>: ArrayBa
 
     /// Materializes a statically known extent in the kernel's representation.
     fn collective_extent_constant(
-        context: &BatchingContext<C, ArrayBatching<Self>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
         extent: usize,
     ) -> Result<Self::ShapeExtent, BatchingError>;
 
     /// Materializes a statically known type-level dimension in the kernel's representation.
     fn collective_extent_from_dimension(
-        context: &BatchingContext<C, ArrayBatching<Self>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
         dimension: &Dimension,
     ) -> Result<Self::ShapeExtent, BatchingError> {
         let extent = dimension.value().ok_or_else(|| BatchingError::UnsupportedOperation {
@@ -400,28 +403,28 @@ pub(crate) trait CollectiveBatchingPolicy<C: Context<Type = ArrayType>>: ArrayBa
 
     /// Aligns `batch` to the leading mapped axis using its complete logical input extents.
     fn match_collective_axis(
-        context: &BatchingContext<C, ArrayBatching<Self>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
         batch: &ArrayBatch<C::Value>,
         input_extents: &[Self::ShapeExtent],
     ) -> Result<ArrayBatch<C::Value>, BatchingError>;
 
     /// Reshapes `value` using a complete extent list in this policy's representation.
     fn reshape_collective(
-        context: &BatchingContext<C, ArrayBatching<Self>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
         value: C::Value,
         output_extents: &[Self::ShapeExtent],
         output_sharding: Option<Sharding>,
     ) -> Result<C::Value, BatchingError>;
 }
 
-impl<C> CollectiveBatchingPolicy<C> for StaticArrayBatchingPolicy
+impl<C> CollectiveArrayExtentBatchingPolicy<C> for StaticArrayExtentBatchingPolicy
 where
     C: Context<Type = ArrayType, Value: Broadcast + Reshape + Transpose>,
 {
     type ShapeExtent = usize;
 
     fn collective_axis_extent(
-        context: &BatchingContext<C, ArrayBatching<Self>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
         operation_name: &str,
         axis_name: &str,
         axis_size: usize,
@@ -439,7 +442,7 @@ where
     }
 
     fn collective_extent_constant(
-        _context: &BatchingContext<C, ArrayBatching<Self>>,
+        _context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
         extent: usize,
     ) -> Result<Self::ShapeExtent, BatchingError> {
         Ok(extent)
@@ -458,7 +461,7 @@ where
     }
 
     fn match_collective_axis(
-        context: &BatchingContext<C, ArrayBatching<Self>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
         batch: &ArrayBatch<C::Value>,
         _input_extents: &[Self::ShapeExtent],
     ) -> Result<ArrayBatch<C::Value>, BatchingError> {
@@ -466,7 +469,7 @@ where
     }
 
     fn reshape_collective(
-        _context: &BatchingContext<C, ArrayBatching<Self>>,
+        _context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
         value: C::Value,
         output_extents: &[Self::ShapeExtent],
         output_sharding: Option<Sharding>,
@@ -479,7 +482,7 @@ where
     }
 }
 
-impl<C> CollectiveBatchingPolicy<ProjectedContext<C, ArrayType>> for DynamicArrayBatchingPolicy
+impl<C> CollectiveArrayExtentBatchingPolicy<ProjectedContext<C, ArrayType>> for DynamicArrayExtentBatchingPolicy
 where
     C: Context<
             Type = ArrayIrType,
@@ -498,7 +501,7 @@ where
     type ShapeExtent = <C::Value as ValueProjection<DimensionType>>::Projected;
 
     fn collective_axis_extent(
-        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<Self>>,
+        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<Self>>,
         _operation_name: &str,
         _axis_name: &str,
         axis_size: usize,
@@ -510,7 +513,7 @@ where
     }
 
     fn collective_extent_constant(
-        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<Self>>,
+        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<Self>>,
         extent: usize,
     ) -> Result<Self::ShapeExtent, BatchingError> {
         let value = DimensionValue::constant(extent).map_err(ProgramError::from)?;
@@ -527,7 +530,7 @@ where
     }
 
     fn match_collective_axis(
-        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<Self>>,
+        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<Self>>,
         batch: &ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>,
         input_extents: &[Self::ShapeExtent],
     ) -> Result<ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>, BatchingError> {
@@ -567,7 +570,7 @@ where
     }
 
     fn reshape_collective(
-        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<Self>>,
+        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<Self>>,
         value: <C::Value as ValueProjection<ArrayType>>::Projected,
         output_extents: &[Self::ShapeExtent],
         output_sharding: Option<Sharding>,
@@ -584,14 +587,14 @@ where
 
 /// Forwards one shape-changing collective while updating its mapped result axis.
 pub(super) fn forward_shape_changing_collective<C, P>(
-    context: &BatchingContext<C, ArrayBatching<P>>,
+    context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
     operation: C::Operation,
     input: &ArrayBatch<C::Value>,
     output_batch_axis: Option<usize>,
 ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError>
 where
     C: Context<Type = ArrayType>,
-    P: ArrayBatchingPolicy<C>,
+    P: ArrayExtentBatchingPolicy<C>,
 {
     let mut outputs = context.parent().bind(operation, Vec::new(), std::slice::from_ref(input.value()))?;
     check_count!("output", outputs, 1, ProgramError);
@@ -1105,7 +1108,7 @@ pub(super) fn validate_explicit_collective_output_extents<V: Value<Type = ArrayI
 /// extents. Replicated arrays require no lifting and remain replicated.
 pub(super) fn forward_explicit_collective<C, O>(
     operation: O,
-    context: &BatchingContext<C, ArrayIrBatching>,
+    context: &BatchingContext<C, ArrayIrBatchingPolicy>,
     array: &ArrayIrBatch<C::Value>,
     output_extents: &[ArrayIrBatch<C::Value>],
     output_batch_axis: Option<usize>,
@@ -1258,7 +1261,7 @@ mod tests {
             AllGatherOutputVariance::Varying,
         )
         .jvp_in_parent(
-            &DifferentiationContext::new(context.clone()),
+            &DifferentiationContext::fused(context.clone()),
             &crate::EmptyRegionDriver,
             &[
                 DifferentiationDual::new(primal, MaybeZero::Value(tangent))?,

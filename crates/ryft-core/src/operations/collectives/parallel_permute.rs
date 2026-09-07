@@ -6,7 +6,7 @@
 
 use std::fmt::Display;
 
-use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrType, ArrayType, RaggedAxis};
+use crate::arrays::{ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayType, RaggedAxis};
 use crate::axes::NamedAxes;
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
@@ -83,18 +83,18 @@ impl ParallelPermuteOperation {
 // reassembling it in target order: for each position `t` along the batch axis, the output receives the slice of the
 // source item that sends to `t`, or a zero slice when no pair targets `t`. A non-matching level forwards the
 // collective untouched to the parent context via [`forward_collective_to_parent`].
-impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for ParallelPermuteOperation
+impl<C, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>> for ParallelPermuteOperation
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<ParallelPermuteOperation>,
     <C as Domain>::Value: Concatenate + Slice + Transpose + ZeroLike,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         if context.axis_name() != Some(self.axis_name.as_str()) {
             return Ok(forward_collective_to_parent(context, C::Operation::from(self.clone()), inputs)?.into());
         }
@@ -318,10 +318,10 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::DynamicArrayBatchingPolicy;
+    use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use crate::arrays::{
-        Array, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension,
-        DimensionBounds, DimensionValue, DimensionVariable, RaggedAxis, Shape,
+        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType,
+        Dimension, DimensionBounds, DimensionValue, DimensionVariable, RaggedAxis, Shape,
     };
     use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingContext, BatchingTracer, batch};
     use crate::contexts::{EagerContext, ProjectedContext};
@@ -334,7 +334,7 @@ mod tests {
     fn test_parallel_shuffle_composes_parallel_permute_in_the_composite_domain() {
         type Parent = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
-        let context = BatchingContext::<_, ArrayIrBatching>::new(
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             Parent::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
         )
@@ -446,7 +446,7 @@ mod tests {
             .unwrap()
             .with_ragged_axes(vec![RaggedAxis::new(1, Array::scalar(1_i32), variable.clone(), Vec::new())])
             .unwrap();
-        let context = BatchingContext::<_, ArrayBatching<DynamicArrayBatchingPolicy>>::with_policy(
+        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
             ProjectedContext::new(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
         )
@@ -527,7 +527,7 @@ mod tests {
         // The rotation `[(0, 1), (1, 0)]` swaps the two batch items: item 0 receives item 1's `[3, 4]` and item 1
         // receives item 0's `[1, 2]`.
         let output: Array = batch(
-            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching>| {
+            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
                 item.parallel_permute("x", vec![(0, 1), (1, 0)])
             },
             Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),
@@ -550,7 +550,7 @@ mod tests {
         // With the single pair `(0, 1)`, item 1 receives item 0's `[1, 2]` while no pair targets item 0, so it
         // receives zeros, matching JAX's `ppermute` semantics for untargeted participants.
         let output: Array = batch(
-            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching>| {
+            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
                 item.parallel_permute("x", vec![(0, 1)])
             },
             Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0]),

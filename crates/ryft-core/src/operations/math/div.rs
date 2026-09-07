@@ -300,7 +300,7 @@ mod tests {
         let smallest_positive = f64::from_bits(1);
         let outputs = DivOperation::<ArrayType>::new()
             .jvp(
-                &DifferentiationContext::new(context.clone()),
+                &DifferentiationContext::fused(context.clone()),
                 &EmptyRegionDriver,
                 &[
                     DifferentiationDual::new(Array::scalar(0.0), Array::scalar(smallest_positive)).unwrap(),

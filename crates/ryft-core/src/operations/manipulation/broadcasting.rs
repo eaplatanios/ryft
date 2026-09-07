@@ -2,8 +2,8 @@ use std::fmt::Display;
 
 use crate::arrays::batching::{RaggedAxis, align_array_batch, dimension_constant};
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, Dimension,
-    DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, ShardingDimension,
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
+    ArrayType, Dimension, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -194,7 +194,7 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DynamicBroadcastOperation>>>
 /// represented in both the lifted output extents and the input-to-output axis mapping. A mapped output extent uses its
 /// declared finite bound as physical packed storage and records its per-item extent vector as transform-owned ragged
 /// metadata; replicated extents retain their existing first-class representation.
-impl<C> BatchableOperation<C, ArrayIrBatching> for DynamicBroadcastOperation
+impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for DynamicBroadcastOperation
 where
     C: Context<Type = ArrayIrType>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -205,12 +205,12 @@ where
         + OperationProjection<ArrayType>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: From<TransposeOperation>,
 {
-    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
+    fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C, ArrayIrBatching>,
+        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         let Some((input, output_extents)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
@@ -637,15 +637,15 @@ impl<C: Context<Type = ArrayType, Operation: From<BroadcastOperation>>> Partiall
 {
 }
 
-impl<C: Context<Type = ArrayType, Value: Broadcast>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
-    for BroadcastOperation
+impl<C: Context<Type = ArrayType, Value: Broadcast>, P: ArrayExtentBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatchingPolicy<P>> for BroadcastOperation
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        _context: &BatchingContext<C, ArrayBatching<P>>,
+        _context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         match inputs[0].batch_axis_position() {
             None => {
@@ -1817,7 +1817,7 @@ mod tests {
         let input_id = input.atom_id().unwrap();
         let axis_extent = trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
         let axis_extent_id = axis_extent.atom_id().unwrap();
-        let context = BatchingContext::<_, ArrayIrBatching>::new(trace.clone(), axis_extent);
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), axis_extent);
 
         let [output] = DynamicBroadcastOperation::new(vec![0])
             .batch(

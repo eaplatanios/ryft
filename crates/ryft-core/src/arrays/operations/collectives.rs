@@ -294,7 +294,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::arrays::Array;
-    use crate::arrays::batching::ArrayIrBatching;
+    use crate::arrays::batching::ArrayIrBatchingPolicy;
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, DimensionOperation};
@@ -430,7 +430,7 @@ mod tests {
     #[test]
     fn test_array_ragged_all_to_all_matches_documented_and_grouped_reference_exchanges() {
         type TestContext = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-        type TestTracer = BatchingTracer<TestContext, ArrayIrBatching>;
+        type TestTracer = BatchingTracer<TestContext, ArrayIrBatchingPolicy>;
 
         let operand = vec![1_i32, 2, 2, 3, 4, 0];
         let output_seed = vec![0_i32; 8];

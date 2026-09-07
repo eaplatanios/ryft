@@ -10,7 +10,9 @@
 
 use std::fmt::Display;
 
-use crate::arrays::{ArrayBatch, ArrayBatching, ArrayType, DataType, RaggedArrayBatchingPolicy, RaggedMaskIdentity};
+use crate::arrays::{
+    ArrayBatch, ArrayBatchingPolicy, ArrayType, DataType, RaggedArrayExtentBatchingPolicy, RaggedMaskIdentity,
+};
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
@@ -144,17 +146,17 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for Cumulati
 // dimension with `lift_cumulative_axis` and re-interprets the lifted scan over the physical batched value. Padding
 // along a *scanned* ragged axis is neutralized with the zero identity first, and the operand's ragged axes ride
 // through onto the result because a scan consumes none of them.
-impl<C: Context<Type = ArrayType>, P: RaggedArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
+impl<C: Context<Type = ArrayType>, P: RaggedArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
     for CumulativeSumOperation
 where
     CumulativeSumOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         // A replicated operand carries no inserted batch dimension, so its scanned axis needs no shift. Ragged axes
         // are packed positions in both cases, and so the masking and rewrapping below use the lifted axis.
@@ -308,7 +310,7 @@ mod tests {
     use num_complex::Complex as ComplexNumber;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::DynamicArrayBatchingPolicy;
+    use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable,
         LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension,
@@ -531,7 +533,7 @@ mod tests {
                 .into(),
         );
         let extents = trace.input(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(items)])).into());
-        let context = BatchingContext::<_, ArrayBatching<DynamicArrayBatchingPolicy>>::with_policy(
+        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
             ProjectedContext::new(trace.clone()),
             batch_extent,
         );

@@ -138,7 +138,7 @@ mod tests {
     fn test_or_differentiation() {
         let outputs = OrOperation::<ArrayType>::new()
             .jvp(
-                &DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new()),
+                &DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new()),
                 &EmptyRegionDriver,
                 &[
                     DifferentiationDual::new_with_zero_tangent(Array::scalar(true)).unwrap(),

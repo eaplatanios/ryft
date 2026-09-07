@@ -18,7 +18,7 @@ use ryft_core::operations::collectives::{
     ParallelSwapAxes,
 };
 use ryft_core::{
-    Array as CpuArray, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType,
+    Array as CpuArray, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType,
     BatchAxis, BatchingContext, BatchingTracer, ConvertElementTypeOperation, DataType, Device, DeviceMesh, Dimension,
     DimensionBounds, DimensionFromScalarOperation, DimensionValue, DimensionVariable, DotDimensionNumbers,
     DynamicShapeSliceOperation, EagerContext, LogicalMesh, MeshAxis, MeshAxisType, Placeholder, ProgramBuilder,
@@ -298,7 +298,7 @@ fn emit_parallel_shuffle() -> Result<DifferentialObservation, Box<dyn Error>> {
         input_values.as_slice(),
     )?;
     type Parent = EagerContext<ArrayIrValue<CpuArray>, ArrayIrOperation<CpuArray>>;
-    let context = BatchingContext::<_, ArrayIrBatching>::new(
+    let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
         Parent::new(),
         ArrayIrValue::Dimension(DimensionValue::constant(4)?),
     )

@@ -3,7 +3,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use crate::arrays::{
-    Array, ArrayAddressing, ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, Shape, Sharding,
+    Array, ArrayAddressing, ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType, Shape, Sharding,
 };
 use crate::axes::{Axes, Axis};
 use crate::batching::{
@@ -214,17 +214,17 @@ impl<C: Context<Type = ArrayType, Operation: From<TransposeOperation>>> Partiall
 {
 }
 
-impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
     for TransposeOperation
 where
     TransposeOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         let (lifted_permutation, output_axis) = match inputs[0].batch_axis_position() {
             Some(batch_axis) => {
@@ -1238,7 +1238,7 @@ mod tests {
         let primal = context.input(cycle_input_type.clone());
         let duals = TransposeOperation::new([2, 0, 1])
             .jvp(
-                &DifferentiationContext::new(context.clone()),
+                &DifferentiationContext::fused(context.clone()),
                 &EmptyRegionDriver,
                 &[DifferentiationDual::new_with_zero_tangent(primal).unwrap()],
             )

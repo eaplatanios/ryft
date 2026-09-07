@@ -12,7 +12,7 @@ use ryft_macros::Parameter;
 
 use crate::arrays::batching::{align_array_batch, array_dimension};
 use crate::arrays::{
-    ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, DimensionType, DimensionValue, DimensionVariable,
+    ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, DimensionType, DimensionValue, DimensionVariable,
 };
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -140,7 +140,7 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionFromScalarOperation
 // integer SSA data and are exposed as a mapped dimension only through [`ArrayIrBatch`]; no raggedness is added to
 // [`ArrayIrType`]. A carry-free scan applies this ordered-assertion gateway to every scalar and converts each checked
 // dimension back to scalar data for packing, so the gateway's bounds diagnostics remain exact.
-impl<C> BatchableOperation<C, ArrayIrBatching> for DimensionFromScalarOperation
+impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for DimensionFromScalarOperation
 where
     C: Context<Type = ArrayIrType>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -154,12 +154,12 @@ where
         + OperationProjection<ArrayType>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: From<TransposeOperation>,
 {
-    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
+    fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C, ArrayIrBatching>,
+        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         let [input] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
         };

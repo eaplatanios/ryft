@@ -10,7 +10,8 @@ use std::fmt::Display;
 use std::ops::Mul as StdMul;
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayType, DataType, RaggedArrayBatchingPolicy, RaggedAxis, RaggedMaskIdentity, Shape,
+    ArrayBatch, ArrayBatchingPolicy, ArrayType, DataType, RaggedArrayExtentBatchingPolicy, RaggedAxis,
+    RaggedMaskIdentity, Shape,
 };
 use crate::axes::{AxisError, NamedAxes};
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -247,18 +248,18 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for Parallel
 // The consuming arm collapses the mapped axis through `collective_reduce_batch` and binds a `Mean`'s `1 / N`
 // rank-0 fill into the parent context — interpreted eagerly under an eager parent and staged into the enclosing
 // trace under a staging parent — so one rule serves eager and staged batching alike.
-impl<C, P: RaggedArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for ParallelReduceOperation
+impl<C, P: RaggedArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>> for ParallelReduceOperation
 where
     C: Context<Type = ArrayType> + Fill<f64, C::Value>,
     C::Operation: From<ParallelReduceOperation>,
     <C as Domain>::Value: Reduce + StdMul<Output = <C as Domain>::Value>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         if context.axis_name() != Some(self.axis_name.as_str()) {
             let parent_operation = C::Operation::from(self.clone());
             return Ok(forward_collective_to_parent(context, parent_operation, inputs)?.into());
@@ -354,7 +355,7 @@ impl_differentiable_operation! {
 /// `make_parallel_mean_factor`-produced rank-0 factor (relying on implicit rank-0 broadcasting in the multiplication).
 /// Outside a matching batching context (no mapped axis), it is an identity pass-through.
 fn collective_reduce_batch<C, P, MakeParallelMeanFactor>(
-    context: &BatchingContext<C, ArrayBatching<P>>,
+    context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
     kind: ParallelReductionKind,
     inputs: &[ArrayBatch<C::Value>],
     make_parallel_mean_factor: MakeParallelMeanFactor,
@@ -362,7 +363,7 @@ fn collective_reduce_batch<C, P, MakeParallelMeanFactor>(
 where
     C: Context<Type = ArrayType>,
     C::Value: Reduce + StdMul<Output = C::Value>,
-    P: RaggedArrayBatchingPolicy<C>,
+    P: RaggedArrayExtentBatchingPolicy<C>,
     MakeParallelMeanFactor: FnOnce(ArrayType, f64) -> Result<C::Value, ProgramError>,
 {
     check_count!("input", inputs, 1, ProgramError);
@@ -515,7 +516,7 @@ where
 mod tests {
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::DynamicArrayBatchingPolicy;
+    use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, Dimension, DimensionBounds, DimensionType,
         DimensionValue, DimensionVariable, RaggedAxis, Shape,
@@ -532,7 +533,7 @@ mod tests {
     /// contains every operation the collective batching rule may bind (notably constants and broadcasts for `Mean`).
     fn batching_context(
         axis_size: usize,
-    ) -> BatchingContext<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching> {
+    ) -> BatchingContext<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy> {
         BatchingContext::new(EagerContext::new(), axis_size).with_axis_name("i".to_string())
     }
 
@@ -554,7 +555,7 @@ mod tests {
             );
             let extents =
                 trace.input(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(items)])).into());
-            let context = BatchingContext::<_, ArrayBatching<DynamicArrayBatchingPolicy>>::with_policy(
+            let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
                 ProjectedContext::new(trace),
                 batch_extent,
             )
@@ -596,7 +597,7 @@ mod tests {
     fn test_parallel_sum_and_max_numerically_mask_ragged_padding() -> Result<(), BatchingError> {
         let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
         let parent = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let context = BatchingContext::<_, ArrayBatching<DynamicArrayBatchingPolicy>>::with_policy(
+        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
             ProjectedContext::new(parent),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
         )
@@ -652,7 +653,7 @@ mod tests {
         // rides the `ProgramError::Custom` channel as a `BatchingError::Axis` and is re-typed at the public `batch`
         // boundary, so the surfaced error is exactly that variant.
         let result: Result<Array, BatchingError> = batch(
-            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching>| {
+            |item: BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>| {
                 item.parallel_reduce("j", ParallelReductionKind::Sum)
             },
             Array::vector(vec![1.0, 2.0, 3.0]),

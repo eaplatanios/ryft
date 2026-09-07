@@ -6,10 +6,10 @@
 
 use std::fmt::Display;
 
-use crate::arrays::batching::DynamicArrayBatchingPolicy;
+use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
 use crate::arrays::{
-    Array, ArrayBatch, ArrayBatching, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, DataType, Dimension,
-    DimensionVariable, Shape,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, DataType,
+    Dimension, DimensionVariable, Shape,
 };
 use crate::axes::NamedAxes;
 use crate::batching::{
@@ -57,8 +57,8 @@ use crate::tracing::{Tracer, TracingContext};
 
 use super::all_to_all::AllToAllOperation;
 use super::{
-    CollectiveBatchingPolicy, CollectiveOptions, effective_collective_axis_size, reject_ragged_collective_inputs,
-    resolve_named_axis_size,
+    CollectiveArrayExtentBatchingPolicy, CollectiveOptions, effective_collective_axis_size,
+    reject_ragged_collective_inputs, resolve_named_axis_size,
 };
 
 /// Operand representation carried by [`RaggedAllToAllOperation`].
@@ -463,7 +463,8 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for RaggedAl
 // because no existing slicing primitive carries a dynamic segment length. A non-matching mapped axis merges its batch
 // into the packed leading data and metadata axes with sender/receiver offsets rebased by the mapped item index. An
 // all-replicated application can be forwarded unchanged.
-impl<C, P: CollectiveBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for RaggedAllToAllOperation
+impl<C, P: CollectiveArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
+    for RaggedAllToAllOperation
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<ConstantOperation<Array>>
@@ -471,15 +472,15 @@ where
         + From<IotaOperation<ArrayType>>
         + From<RaggedAllToAllOperation>,
     C::Value: Broadcast + Transpose,
-    AddOperation<ArrayType>: BatchableOperation<C, ArrayBatching<P>>,
-    MulOperation<ArrayType>: BatchableOperation<C, ArrayBatching<P>>,
+    AddOperation<ArrayType>: BatchableOperation<C, ArrayBatchingPolicy<P>>,
+    MulOperation<ArrayType>: BatchableOperation<C, ArrayBatchingPolicy<P>>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         reject_ragged_collective_inputs(self.name(), inputs)?;
         check_count!("input", inputs, 6, ProgramError);
 
@@ -872,7 +873,7 @@ where
     }
 }
 
-impl<C> MemberBatchableOperation<C, ArrayIrBatching> for RaggedAllToAllOperation
+impl<C> MemberBatchableOperation<C, ArrayIrBatchingPolicy> for RaggedAllToAllOperation
 where
     C: Context<
             Type = ArrayIrType,
@@ -887,14 +888,14 @@ where
             Operation = <C::Operation as OperationProjection<ArrayType>>::Projected,
         >,
     RaggedAllToAllOperation:
-        BatchableOperation<ProjectedContext<C, ArrayType>, ArrayBatching<DynamicArrayBatchingPolicy>>,
+        BatchableOperation<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>,
 {
-    fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatching>>(
+    fn batch_in_parent<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C, ArrayIrBatching>,
+        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         batch_projected_operation(context, self, inputs)
     }
 }
@@ -2373,8 +2374,8 @@ mod tests {
         let context = TestContext::new();
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5)).unwrap());
         let batch_extent = context.input(DimensionType::new(batch.clone()).into());
-        let batching_context =
-            BatchingContext::<_, ArrayIrBatching>::new(context.clone(), batch_extent).with_axis_name("y".to_string());
+        let batching_context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(context.clone(), batch_extent)
+            .with_axis_name("y".to_string());
         let packed_type = |data_type, dimensions: &[usize]| {
             ArrayType::new(
                 data_type,
@@ -2495,7 +2496,7 @@ mod tests {
 
         let evaluate = |inputs: Vec<DifferentiationDual<Array>>| {
             operation
-                .jvp(&DifferentiationContext::new(context.clone()), &EmptyRegionDriver, inputs.as_slice())
+                .jvp(&DifferentiationContext::fused(context.clone()), &EmptyRegionDriver, inputs.as_slice())
                 .unwrap()
                 .remove(0)
         };

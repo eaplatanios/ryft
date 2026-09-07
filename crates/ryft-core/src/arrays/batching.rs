@@ -811,9 +811,9 @@ pub(crate) fn normalized_batch_axis_type(
 
 /// Source of an output dimension of an elementwise batching broadcast operation. The shared elementwise batching
 /// algorithm owns all broadcast geometry. For every batched output axis, it identifies the source of that dimension
-/// and passes it to [`ArrayBatchingPolicy::broadcast_input`]. [`StaticArrayBatchingPolicy`] ignores these sources
-/// because its output metadata already carries every extent, while a dimension-valued policy materializes each source
-/// as a first-class value without re-deriving any geometry.
+/// and passes it to [`ArrayExtentBatchingPolicy::broadcast_input`]. [`StaticArrayExtentBatchingPolicy`] ignores these
+/// sources because its output metadata already carries every extent, while a dimension-valued policy materializes each
+/// source as a first-class value without re-deriving any geometry.
 #[derive(Clone, Debug)]
 pub enum DimensionSource<V> {
     /// Dimension with the provided static extent.
@@ -845,7 +845,7 @@ pub enum DimensionSource<V> {
 ///     across the mapped axis. Ordinary batching can use broadcasting operation with static output metadata, while
 ///     projected batching must stage the mixed broadcast that consumes explicit dimension operands.
 ///
-/// An [`ArrayBatchingPolicy`] is a type-level selector packaging those two differences, so each policy owns the
+/// An [`ArrayExtentBatchingPolicy`] is a type-level selector packaging those two differences, so each policy owns the
 /// complete translation from a homogeneous rule's extent and broadcast requests to its universe's operations. Every
 /// policy also implements [`BatchingPolicy`] with `Batch = ArrayBatch<C::Value>` and `BatchedProgram =
 /// BoundaryPreservingBatchedProgram<C::Constant, C::Operation>`: homogeneous rules bind structurally batched branch
@@ -855,14 +855,14 @@ pub enum DimensionSource<V> {
 /// that reduces a ragged axis away) states that claim identically under every array policy. Currently, only
 /// [`ArrayIrBatchingPolicy`] reads the claim, because it is the only policy whose carriers can hold ragged axes in the
 /// first place; the others always produce an empty claim. The shared rules are then written once against the nominal
-/// [`ArrayBatching<P>`] family rather than as a `P: ArrayBatchingPolicy` blanket, because Rust coherence cannot use the
-/// _absence_ of a trait implementation to prove such a blanket disjoint from the genuinely mixed composite operation
-/// rules registered for other policies.
+/// [`ArrayBatchingPolicy<P>`] family rather than as a `P: ArrayExtentBatchingPolicy` blanket, because Rust coherence
+/// cannot use the _absence_ of a trait implementation to prove such a blanket disjoint from the genuinely mixed
+/// composite operation rules registered for other policies.
 ///
 /// Keeping this capability on the batching transform, rather than on [`ProjectedContext`], [`ArrayBatch`], or [`Type`],
 /// means that neither the carrier nor the type contract needs to know anything about dynamic-shape state that only
 /// batching needs.
-pub trait ArrayBatchingPolicy<C: Context<Type = ArrayType>>:
+pub trait ArrayExtentBatchingPolicy<C: Context<Type = ArrayType>>:
     BatchingPolicy<
         C,
         Batch = ArrayBatch<C::Value>,
@@ -871,29 +871,29 @@ pub trait ArrayBatchingPolicy<C: Context<Type = ArrayType>>:
     >
 {
     /// Returns the mapped-axis [`Dimension`] to insert when building a batched [`ArrayType`].
-    /// [`StaticArrayBatchingPolicy`] derives an exact [`Dimension::Static`] from the context's mapped-axis extent,
-    /// while a dimension-valued policy returns the possibly dynamic dimension described by its first-class extent
-    /// value's type. Shape computations can therefore construct batched types without forcing the extent to
-    /// be statically known.
-    fn axis_dimension(context: &BatchingContext<C, ArrayBatching<Self>>) -> Result<Dimension, BatchingError>;
+    /// [`StaticArrayExtentBatchingPolicy`] derives an exact [`Dimension::Static`] from the context's mapped-axis
+    /// extent, while a dimension-valued policy returns the possibly dynamic dimension described by its first-class
+    /// extent value's type. Shape computations can therefore construct batched types without forcing the extent to be
+    /// statically known.
+    fn axis_dimension(context: &BatchingContext<C, ArrayBatchingPolicy<Self>>) -> Result<Dimension, BatchingError>;
 
     /// Returns the statically known mapped-axis size. This is the exact-size projection of [`Self::axis_dimension`].
     /// It succeeds when that dimension is static and returns a [`BatchingError::UnsupportedOperation`] when the mapped
     /// extent is genuinely dynamic. Rules that only move or broadcast arrays must use [`Self::match_axis`] and
     /// [`Self::broadcast_input`] instead, so that they keep working with dynamic mapped extents.
     #[inline]
-    fn axis_size(context: &BatchingContext<C, ArrayBatching<Self>>) -> Result<usize, BatchingError> {
+    fn axis_size(context: &BatchingContext<C, ArrayBatchingPolicy<Self>>) -> Result<usize, BatchingError> {
         Self::axis_dimension(context)?.value().ok_or_else(|| BatchingError::UnsupportedOperation {
             message: "this batching rule requires a statically known mapped-axis extent".to_string(),
         })
     }
 
-    /// Aligns `batch` so that its mapped axis sits at position `axis`. A mapped batch moves its existing axis. A
-    /// replicated batch is materialized across the mapped extent by inserting the axis at `axis`.
-    /// [`StaticArrayBatchingPolicy`] broadcasts using the context's exact extent, while a dimension-valued policy
+    /// Aligns `batch` so that its mapped axis sits at position `axis`. A mapped batch moves its existing axis.
+    /// A replicated batch is materialized across the mapped extent by inserting the axis at `axis`.
+    /// [`StaticArrayExtentBatchingPolicy`] broadcasts using the context's exact extent, while a dimension-valued policy
     /// stages the mixed broadcast whose inserted axis is grounded by the transform's first-class extent value.
     fn match_axis(
-        context: &BatchingContext<C, ArrayBatching<Self>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
         batch: &ArrayBatch<C::Value>,
         axis: Axis,
     ) -> Result<ArrayBatch<C::Value>, BatchingError>;
@@ -901,10 +901,10 @@ pub trait ArrayBatchingPolicy<C: Context<Type = ArrayType>>:
     /// Materializes one input/operand at `r#type`, broadcasting its per-item dimensions to the common target
     /// shape and inserting the mapped batch axis. The shared elementwise algorithm computes the complete broadcast
     /// geometry, including one [`DimensionSource`] per batched output axis, and delegates only the materialization
-    /// itself, which is the policy-specific step. [`StaticArrayBatchingPolicy`] broadcasts with static output metadata
-    /// and ignores the sources, while a dimension-valued policy spends each source mechanically (i.e., exact constants
-    /// for static dimensions, `dimension_size` reads of the provided source values for dynamic per-item dimensions,
-    /// and the transform's extent value for the mapped axis itself).
+    /// itself, which is the policy-specific step. [`StaticArrayExtentBatchingPolicy`] broadcasts with static output
+    /// metadata and ignores the sources, while a dimension-valued policy spends each source mechanically (i.e., exact
+    /// constants for static dimensions, `dimension_size` reads of the provided source values for dynamic per-item
+    /// dimensions, and the transform's extent value for the mapped axis itself).
     ///
     /// # Parameters
     ///
@@ -916,7 +916,7 @@ pub trait ArrayBatchingPolicy<C: Context<Type = ArrayType>>:
     ///   - `batch_axis`: Position of the mapped batch axis in `r#type`.
     ///   - `dimension_sources`: Source of each batched output dimension, in axis order.
     fn broadcast_input(
-        context: &BatchingContext<C, ArrayBatching<Self>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
         input: &ArrayBatch<C::Value>,
         r#type: ArrayType,
         output_axes: Vec<usize>,
@@ -925,7 +925,7 @@ pub trait ArrayBatchingPolicy<C: Context<Type = ArrayType>>:
     ) -> Result<ArrayBatch<C::Value>, BatchingError>;
 }
 
-/// Identity element that [`RaggedArrayBatchingPolicy::mask_identity_input`] writes over the padding of a bounded
+/// Identity element that [`RaggedArrayExtentBatchingPolicy::mask_identity_input`] writes over the padding of a bounded
 /// ragged axis. It names the value rather than the combining operator, so one masking hook serves every consumer
 /// whose operator has one of these identities.
 ///
@@ -957,9 +957,9 @@ pub enum RaggedMaskIdentity {
     Highest,
 }
 
-/// Ragged surface of an [`ArrayBatchingPolicy`], providing the per-discipline hooks through which batching rules handle
-/// bounded ragged axes instead of dropping them. Three disciplines share it, and they differ in the value they write
-/// over padding and in who chooses it:
+/// Ragged surface of an [`ArrayExtentBatchingPolicy`], providing the per-discipline hooks through which batching rules
+/// handle bounded ragged axes instead of dropping them. Three disciplines share it, and they differ in the value they
+/// write over padding and in who chooses it:
 ///
 ///   - **Reduction Masking (via [`Self::mask_reduction_input`]):** Writes the identity of a named [`ReductionKind`]
 ///     over the padding of the axes that reduction then collapses, consuming those ragged axes.
@@ -971,13 +971,13 @@ pub enum RaggedMaskIdentity {
 ///
 /// Implementors must make padding along every masked ragged axis unobservable in the operation's result, or reject
 /// inputs for which they cannot do so safely. Policies whose carriers never contain ragged axes may return `input`
-/// unchanged. This capability is separate from [`ArrayBatchingPolicy`] so that unrelated array rules do not inherit
-/// the constructor, comparison, and selection bounds that only ragged masking needs.
-pub trait RaggedArrayBatchingPolicy<C: Context<Type = ArrayType>>: ArrayBatchingPolicy<C> {
+/// unchanged. This capability is separate from [`ArrayExtentBatchingPolicy`] so that unrelated array rules do not
+/// inherit the constructor, comparison, and selection bounds that only ragged masking needs.
+pub trait RaggedArrayExtentBatchingPolicy<C: Context<Type = ArrayType>>: ArrayExtentBatchingPolicy<C> {
     /// Replaces padding along the ragged axes in `reduced_axes` with `kind`'s reduction identity. This is the
     /// reduction-masking discipline, owned by reductions.
     fn mask_reduction_input(
-        context: &BatchingContext<C, ArrayBatching<Self>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
         input: &ArrayBatch<C::Value>,
         reduced_axes: &[usize],
         kind: ReductionKind,
@@ -991,7 +991,7 @@ pub trait RaggedArrayBatchingPolicy<C: Context<Type = ArrayType>>: ArrayBatching
     /// sufficient because zeroing either factor of a contracted pair already neutralizes that product, and it requires
     /// no agreement between the two operands about which of them is ragged.
     fn pad_contraction_input(
-        context: &BatchingContext<C, ArrayBatching<Self>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
         input: &ArrayBatch<C::Value>,
         contracted_axes: &[usize],
     ) -> Result<ArrayBatch<C::Value>, BatchingError>;
@@ -1015,23 +1015,23 @@ pub trait RaggedArrayBatchingPolicy<C: Context<Type = ArrayType>>: ArrayBatching
     ///     set are left untouched.
     ///   - `identity`: Value written over the padding.
     fn mask_identity_input(
-        context: &BatchingContext<C, ArrayBatching<Self>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
         input: &ArrayBatch<C::Value>,
         masked_axes: &[usize],
         identity: RaggedMaskIdentity,
     ) -> Result<ArrayBatch<C::Value>, BatchingError>;
 }
 
-/// [`ArrayBatchingPolicy`] for ordinary homogeneous array batching with a static host extent. This is the default
-/// policy of [`ArrayBatching`] and preserves the established public array batching behavior. The mapped-axis
+/// [`ArrayExtentBatchingPolicy`] for ordinary homogeneous array batching with a static host extent. This is the default
+/// policy of [`ArrayBatchingPolicy`] and preserves the established public array batching behavior. The mapped-axis
 /// extent is one `usize` fixed when the transform is constructed, [`Self::axis_dimension`] is always an exact static
 /// dimension, and replicated arrays are materialized with a broadcasting operation using static output metadata.
 /// [`Self::axis_size`] always succeeds, so every batching rule (including host-side item enumeration) is
 /// available under this policy.
 #[derive(Copy, Clone, Debug, Default)]
-pub struct StaticArrayBatchingPolicy;
+pub struct StaticArrayExtentBatchingPolicy;
 
-impl<C: Context<Type = ArrayType>> BatchingPolicy<C> for StaticArrayBatchingPolicy {
+impl<C: Context<Type = ArrayType>> BatchingPolicy<C> for StaticArrayExtentBatchingPolicy {
     type Batch = ArrayBatch<C::Value>;
     type Extent = usize;
     type Evidence = Vec<DimensionVariable>;
@@ -1085,15 +1085,17 @@ impl<C: Context<Type = ArrayType>> BatchingPolicy<C> for StaticArrayBatchingPoli
     }
 }
 
-impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> ArrayBatchingPolicy<C> for StaticArrayBatchingPolicy {
+impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> ArrayExtentBatchingPolicy<C>
+    for StaticArrayExtentBatchingPolicy
+{
     #[inline]
-    fn axis_dimension(context: &BatchingContext<C, ArrayBatching<Self>>) -> Result<Dimension, BatchingError> {
+    fn axis_dimension(context: &BatchingContext<C, ArrayBatchingPolicy<Self>>) -> Result<Dimension, BatchingError> {
         Ok(Dimension::Static(*context.axis_extent()))
     }
 
     #[inline]
     fn match_axis(
-        context: &BatchingContext<C, ArrayBatching<Self>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
         batch: &ArrayBatch<C::Value>,
         axis: Axis,
     ) -> Result<ArrayBatch<C::Value>, BatchingError> {
@@ -1102,7 +1104,7 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> ArrayBatchingPo
 
     #[inline]
     fn broadcast_input(
-        _context: &BatchingContext<C, ArrayBatching<Self>>,
+        _context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
         input: &ArrayBatch<C::Value>,
         r#type: ArrayType,
         output_axes: Vec<usize>,
@@ -1120,12 +1122,12 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> ArrayBatchingPo
     }
 }
 
-impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> RaggedArrayBatchingPolicy<C>
-    for StaticArrayBatchingPolicy
+impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> RaggedArrayExtentBatchingPolicy<C>
+    for StaticArrayExtentBatchingPolicy
 {
     #[inline]
     fn mask_reduction_input(
-        _context: &BatchingContext<C, ArrayBatching<Self>>,
+        _context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
         input: &ArrayBatch<C::Value>,
         _reduced_axes: &[usize],
         _kind: ReductionKind,
@@ -1145,7 +1147,7 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> RaggedArrayBatc
 
     #[inline]
     fn pad_contraction_input(
-        _context: &BatchingContext<C, ArrayBatching<Self>>,
+        _context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
         input: &ArrayBatch<C::Value>,
         _contracted_axes: &[usize],
     ) -> Result<ArrayBatch<C::Value>, BatchingError> {
@@ -1164,7 +1166,7 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> RaggedArrayBatc
 
     #[inline]
     fn mask_identity_input(
-        _context: &BatchingContext<C, ArrayBatching<Self>>,
+        _context: &BatchingContext<C, ArrayBatchingPolicy<Self>>,
         input: &ArrayBatch<C::Value>,
         masked_axes: &[usize],
         identity: RaggedMaskIdentity,
@@ -1194,34 +1196,35 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> RaggedArrayBatc
 }
 
 impl BatchableType for ArrayType {
-    type Policy = ArrayBatching;
+    type Policy = ArrayBatchingPolicy;
 }
 
-/// Homogeneous-array [`BatchingPolicy`] parameterized by its [`ArrayBatchingPolicy`]. The default
-/// [`StaticArrayBatchingPolicy`] preserves the ordinary public array batching API. Composite programs use a private
-/// dynamic policy whose extent is a parent-owned first-class dimension value. Keeping both policies under this
-/// nominal policy family lets every homogeneous array operation share one generated dispatcher without making those
+/// Homogeneous-array [`BatchingPolicy`] parameterized by its [`ArrayExtentBatchingPolicy`]. The default
+/// [`StaticArrayExtentBatchingPolicy`] preserves the ordinary public array batching API. Composite programs use the
+/// dynamic policy whose extent is a parent-owned first-class dimension value. Keeping both policies under this nominal
+/// policy family lets every homogeneous array operation share one generated dispatcher without making those
 /// implementations overlap genuinely mixed composite-operation rules. The wrapper delegates its batch carrier and
-/// extent representation to `P`. Array-specific alignment is supplied by `P`'s [`ArrayBatchingPolicy`] implementation.
-pub struct ArrayBatching<P = StaticArrayBatchingPolicy>(PhantomData<fn() -> P>);
+/// extent representation to `P`. Array-specific alignment is supplied by `P`'s [`ArrayExtentBatchingPolicy`]
+/// implementation.
+pub struct ArrayBatchingPolicy<P = StaticArrayExtentBatchingPolicy>(PhantomData<fn() -> P>);
 
-impl<P> Copy for ArrayBatching<P> {}
+impl<P> Copy for ArrayBatchingPolicy<P> {}
 
-impl<P> Clone for ArrayBatching<P> {
+impl<P> Clone for ArrayBatchingPolicy<P> {
     #[inline]
     fn clone(&self) -> Self {
         *self
     }
 }
 
-impl<P> Debug for ArrayBatching<P> {
+impl<P> Debug for ArrayBatchingPolicy<P> {
     #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("ArrayBatching")
+        formatter.write_str("ArrayBatchingPolicy")
     }
 }
 
-impl<P> Default for ArrayBatching<P> {
+impl<P> Default for ArrayBatchingPolicy<P> {
     #[inline]
     fn default() -> Self {
         Self(PhantomData)
@@ -1229,7 +1232,7 @@ impl<P> Default for ArrayBatching<P> {
 }
 
 impl<C: Context<Type = ArrayType>, P: BatchingPolicy<C, Batch = ArrayBatch<C::Value>>> BatchingPolicy<C>
-    for ArrayBatching<P>
+    for ArrayBatchingPolicy<P>
 {
     type Batch = P::Batch;
     type Extent = P::Extent;
@@ -1292,7 +1295,7 @@ impl<C: Context<Type = ArrayType>, P: BatchingPolicy<C, Batch = ArrayBatch<C::Va
     }
 }
 
-impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> BatchingEntrypointPolicy<C> for ArrayBatching {
+impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> BatchingEntrypointPolicy<C> for ArrayBatchingPolicy {
     fn pack_inputs(
         context: &C,
         inputs: Vec<C::Value>,
@@ -1388,16 +1391,16 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> BatchingEntrypo
     }
 }
 
-impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> RecursiveBatchingPolicy<C> for ArrayBatching
+impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> RecursiveBatchingPolicy<C> for ArrayBatchingPolicy
 where
-    C::Operation: BatchableOperation<C, ArrayBatching>
-        + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayBatching>
+    C::Operation: BatchableOperation<C, ArrayBatchingPolicy>
+        + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayBatchingPolicy>
         + From<TransposeOperation>
         + From<BroadcastOperation>,
 {
     #[inline]
     fn batch_region(
-        context: &BatchingContext<C, ArrayBatching>,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
         region: RegionRef<'_, C::Constant, C::Operation>,
         inputs: Vec<ArrayBatch<C::Value>>,
     ) -> Result<Vec<ArrayBatch<C::Value>>, BatchingError> {
@@ -1431,7 +1434,7 @@ where
 
     #[inline]
     fn batch_program(
-        context: &BatchingContext<C, ArrayBatching>,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
         region: RegionRef<'_, C::Constant, C::Operation>,
         input_axes: &[BatchAxis],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
@@ -1447,7 +1450,7 @@ where
 
     #[inline]
     fn align_batch_axis(
-        context: &BatchingContext<C, ArrayBatching>,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
         batch: ArrayBatch<C::Value>,
         axis: Axis,
     ) -> Result<ArrayBatch<C::Value>, BatchingError> {
@@ -1499,16 +1502,16 @@ struct ArrayBatchingTransformArguments {
 impl<
     C: Context<Type = ArrayType, Value: Transpose>,
     O: ElementwiseOperation + InterpretableOperation<C>,
-    M: ArrayBatchingPolicy<C>,
-> BatchableOperation<C, ArrayBatching<M>> for O
+    M: ArrayExtentBatchingPolicy<C>,
+> BatchableOperation<C, ArrayBatchingPolicy<M>> for O
 {
     #[inline]
-    fn batch<D: BatchingDriver<C, ArrayBatching<M>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<M>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<M>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<M>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<M>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<M>>, BatchingError> {
         // No input carries the batch axis. Interpret the inputs as given and report every output replicated.
         // Any per-item shape broadcasting between replicated inputs is the operation's own concern.
         let Some(output_batch_axis_position) = inputs.iter().find_map(ArrayBatch::batch_axis_position) else {
@@ -1687,7 +1690,7 @@ impl<
 impl<
     V: Value<Type = ArrayType>,
     O: Operation<Type = ArrayType>
-        + BatchableOperation<TracingContext<V, O>, ArrayBatching>
+        + BatchableOperation<TracingContext<V, O>, ArrayBatchingPolicy>
         + From<TransposeOperation>
         + From<BroadcastOperation>,
 > RegionRef<'_, V, O>
@@ -1696,7 +1699,7 @@ impl<
     /// inputs batched along the specified [`BatchAxis`]s. Staged higher-order [`BatchableOperation`] implementations
     /// use this function to batch captured programs *without* concretizing any batch-item values, so that batched
     /// control-flow and custom-derivative structure can be staged back into the enclosing trace. This function replays
-    /// the region through an [`ArrayBatching`] [`BatchingContext`] over a fresh [`TracingContext`], lifts every
+    /// the region through an [`ArrayBatchingPolicy`] [`BatchingContext`] over a fresh [`TracingContext`], lifts every
     /// instruction through its [`BatchableOperation`] rule, and extracts the resulting staged program together
     /// with the requested [`ProgramBatchingOutputAxesPolicy`].
     ///
@@ -1928,7 +1931,7 @@ impl<
                                     )
                                 })?
                                 .into_parts();
-                            <ArrayBatching as BatchingPolicy<TracingContext<V, O>>>::validate_operation_outputs(
+                            <ArrayBatchingPolicy as BatchingPolicy<TracingContext<V, O>>>::validate_operation_outputs(
                                 instruction.operation().name(),
                                 instruction_inputs,
                                 outputs.as_slice(),
@@ -2002,7 +2005,7 @@ impl<
 impl<
     V: Value<Type = ArrayType>,
     O: Operation<Type = ArrayType>
-        + BatchableOperation<TracingContext<V, O>, ArrayBatching>
+        + BatchableOperation<TracingContext<V, O>, ArrayBatchingPolicy>
         + From<TransposeOperation>
         + From<BroadcastOperation>,
 > Program<V, O, Vec<V>, Vec<V>>
@@ -2683,7 +2686,7 @@ where
     }
 }
 
-/// [`ArrayBatchingPolicy`] used while a homogeneous array rule runs inside an array IR batching transform.
+/// [`ArrayExtentBatchingPolicy`] used while a homogeneous array rule runs inside an array IR batching transform.
 ///
 /// When composite batching reaches an array-member operation, it projects the operation and its batches into the
 /// zero-state [`ProjectedContext`] over [`ArrayType`] and reuses the homogeneous rule unchanged: batches remain
@@ -2691,16 +2694,16 @@ where
 /// extent representation — the mapped-axis extent is the outer composite context's first-class dimension value rather
 /// than a static host `usize`, so a dynamic batch extent stays an ordinary SSA operand edge.
 ///
-/// This [`ArrayBatchingPolicy`] implementation is correspondingly the only place that translates a homogeneous rule's
-/// extent and move-or-broadcast requests into mixed array IR operations: static per-item dimensions become exact
-/// dimension constants, dynamic per-item dimensions become `dimension_size` reads of their broadcast-compatible
-/// source axes, and the mapped axis itself is grounded by the extent value. [`ArrayBatchingPolicy::axis_size`]
-/// succeeds only when the extent value's type proves one exact extent, so rules that genuinely enumerate batch items
-/// fail with a precise error at dynamic extents instead of silently specializing them.
+/// This [`ArrayExtentBatchingPolicy`] implementation is correspondingly the only place that translates a homogeneous
+/// rule's extent and move-or-broadcast requests into mixed array IR operations: static per-item dimensions become exact
+/// dimension constants, dynamic per-item dimensions become `dimension_size` reads of their broadcast-compatible source
+/// axes, and the mapped axis itself is grounded by the extent value. [`ArrayExtentBatchingPolicy::axis_size`] succeeds
+/// only when the extent value's type proves one exact extent, so rules that genuinely enumerate batch items fail with a
+/// precise error at dynamic extents instead of silently specializing them.
 #[derive(Copy, Clone, Debug, Default)]
-pub struct DynamicArrayBatchingPolicy;
+pub struct DynamicArrayExtentBatchingPolicy;
 
-impl<C: Context<Type = ArrayIrType>> BatchingPolicy<ProjectedContext<C, ArrayType>> for DynamicArrayBatchingPolicy
+impl<C: Context<Type = ArrayIrType>> BatchingPolicy<ProjectedContext<C, ArrayType>> for DynamicArrayExtentBatchingPolicy
 where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
@@ -2905,7 +2908,7 @@ where
             Operation = <C::Operation as OperationProjection<ArrayType>>::Projected,
         >,
 {
-    type Projected = ArrayBatching<DynamicArrayBatchingPolicy>;
+    type Projected = ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>;
 
     fn project_batch(
         batch: &Self::Batch,
@@ -3123,7 +3126,7 @@ where
     Ok((value, output_axes))
 }
 
-impl<C> ArrayBatchingPolicy<ProjectedContext<C, ArrayType>> for DynamicArrayBatchingPolicy
+impl<C> ArrayExtentBatchingPolicy<ProjectedContext<C, ArrayType>> for DynamicArrayExtentBatchingPolicy
 where
     C: Context<
             Type = ArrayIrType,
@@ -3136,14 +3139,20 @@ where
     C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
 {
     fn axis_dimension(
-        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<DynamicArrayBatchingPolicy>>,
+        context: &BatchingContext<
+            ProjectedContext<C, ArrayType>,
+            ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>,
+        >,
     ) -> Result<Dimension, BatchingError> {
         let extent_type = context.axis_extent().r#type();
         Ok(<&DimensionType>::try_from(extent_type.as_ref())?.to_dimension())
     }
 
     fn match_axis(
-        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<DynamicArrayBatchingPolicy>>,
+        context: &BatchingContext<
+            ProjectedContext<C, ArrayType>,
+            ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>,
+        >,
         batch: &ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>,
         axis: Axis,
     ) -> Result<ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>, BatchingError> {
@@ -3178,7 +3187,10 @@ where
     }
 
     fn broadcast_input(
-        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<DynamicArrayBatchingPolicy>>,
+        context: &BatchingContext<
+            ProjectedContext<C, ArrayType>,
+            ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>,
+        >,
         input: &ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>,
         r#type: ArrayType,
         output_axes: Vec<usize>,
@@ -3216,7 +3228,7 @@ where
     }
 }
 
-impl<C> RaggedArrayBatchingPolicy<ProjectedContext<C, ArrayType>> for DynamicArrayBatchingPolicy
+impl<C> RaggedArrayExtentBatchingPolicy<ProjectedContext<C, ArrayType>> for DynamicArrayExtentBatchingPolicy
 where
     C: Context<
             Type = ArrayIrType,
@@ -3238,7 +3250,10 @@ where
     // contraction, so those two disciplines are the zero case of the generalized identity masking that serves all
     // three, and they differ only in the discipline-specific validation they perform first.
     fn mask_reduction_input(
-        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<DynamicArrayBatchingPolicy>>,
+        context: &BatchingContext<
+            ProjectedContext<C, ArrayType>,
+            ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>,
+        >,
         input: &ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>,
         reduced_axes: &[usize],
         kind: ReductionKind,
@@ -3257,7 +3272,10 @@ where
 
     #[inline]
     fn pad_contraction_input(
-        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<DynamicArrayBatchingPolicy>>,
+        context: &BatchingContext<
+            ProjectedContext<C, ArrayType>,
+            ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>,
+        >,
         input: &ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>,
         contracted_axes: &[usize],
     ) -> Result<ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>, BatchingError> {
@@ -3266,7 +3284,10 @@ where
 
     #[inline]
     fn mask_identity_input(
-        context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<DynamicArrayBatchingPolicy>>,
+        context: &BatchingContext<
+            ProjectedContext<C, ArrayType>,
+            ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>,
+        >,
         input: &ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>,
         masked_axes: &[usize],
         identity: RaggedMaskIdentity,
@@ -3285,7 +3306,7 @@ where
 /// The staged instructions carry the nested `ryft::batching::ragged_identity_mask` provenance scopes. Those scopes are
 /// purely diagnostic: nothing may match on them for correctness.
 fn mask_ragged_padding<C>(
-    context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatching<DynamicArrayBatchingPolicy>>,
+    context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>,
     input: &ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>,
     masked_axes: &[usize],
     identity: RaggedMaskIdentity,
@@ -4543,7 +4564,7 @@ mod tests {
         // Static array batching never creates ragged carriers and cannot neutralize padding, so it rejects a ragged
         // input instead of returning it unchanged and letting the reduction claim consumption evidence for it.
         assert_eq!(
-            StaticArrayBatchingPolicy::mask_reduction_input(&context, &ragged, &[1], ReductionKind::Sum),
+            StaticArrayExtentBatchingPolicy::mask_reduction_input(&context, &ragged, &[1], ReductionKind::Sum),
             Err(BatchingError::UnsupportedOperation {
                 message: "static array batching cannot mask bounded ragged axes".to_string(),
             }),
@@ -4551,7 +4572,7 @@ mod tests {
 
         // The zero-padding discipline of a contraction needs the same per-item extents and is rejected identically.
         assert_eq!(
-            StaticArrayBatchingPolicy::pad_contraction_input(&context, &ragged, &[1]),
+            StaticArrayExtentBatchingPolicy::pad_contraction_input(&context, &ragged, &[1]),
             Err(BatchingError::UnsupportedOperation {
                 message: "static array batching cannot zero-pad bounded ragged axes".to_string(),
             }),
@@ -4562,7 +4583,7 @@ mod tests {
             [RaggedMaskIdentity::Zero, RaggedMaskIdentity::One, RaggedMaskIdentity::Lowest, RaggedMaskIdentity::Highest]
         {
             assert!(matches!(
-                StaticArrayBatchingPolicy::mask_identity_input(&context, &ragged, &[1], identity),
+                StaticArrayExtentBatchingPolicy::mask_identity_input(&context, &ragged, &[1], identity),
                 Err(BatchingError::UnsupportedOperation { message })
                     if message
                         == format!(
@@ -4574,13 +4595,14 @@ mod tests {
 
         // Axes not selected for masking are left untouched by this hook, even on a defensive ragged carrier.
         assert_eq!(
-            StaticArrayBatchingPolicy::mask_identity_input(&context, &ragged, &[0], RaggedMaskIdentity::Zero,).unwrap(),
+            StaticArrayExtentBatchingPolicy::mask_identity_input(&context, &ragged, &[0], RaggedMaskIdentity::Zero,)
+                .unwrap(),
             ragged,
         );
 
         // A ragged carrier cannot leave the transform either, matching the composite policy's boundary guard.
         assert_eq!(
-            ArrayBatching::materialize_output(&context, ragged, BatchAxis::from_position(0)),
+            ArrayBatchingPolicy::materialize_output(&context, ragged, BatchAxis::from_position(0)),
             Err(BatchingError::UnsupportedOperation {
                 message: "a bounded ragged array cannot cross the batching transform output boundary".to_string(),
             }),
@@ -4596,12 +4618,15 @@ mod tests {
         // batch that already carries the requested axis is returned unchanged.
         let context = BatchingContext::new(Parent::new(), 2);
         let replicated = ArrayBatch::replicated(Array::vector(vec![1.0, 2.0, 3.0]));
-        let broadcasted =
-            <ArrayBatching as RecursiveBatchingPolicy<Parent>>::align_batch_axis(&context, replicated, Axis::from(1))?;
+        let broadcasted = <ArrayBatchingPolicy as RecursiveBatchingPolicy<Parent>>::align_batch_axis(
+            &context,
+            replicated,
+            Axis::from(1),
+        )?;
         assert_eq!(broadcasted.batch_axis(), BatchAxis::new(1));
         assert_eq!(broadcasted.value(), &Array::matrix(3, 2, vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0]));
         let mapped = ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), Some(0))?;
-        let moved = <ArrayBatching as RecursiveBatchingPolicy<Parent>>::align_batch_axis(
+        let moved = <ArrayBatchingPolicy as RecursiveBatchingPolicy<Parent>>::align_batch_axis(
             &context,
             mapped.clone(),
             Axis::from(1),
@@ -4609,7 +4634,7 @@ mod tests {
         assert_eq!(moved.batch_axis(), BatchAxis::new(1));
         assert_eq!(moved.value(), &Array::matrix(3, 2, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]));
         assert_eq!(
-            <ArrayBatching as RecursiveBatchingPolicy<Parent>>::align_batch_axis(
+            <ArrayBatchingPolicy as RecursiveBatchingPolicy<Parent>>::align_batch_axis(
                 &context,
                 mapped.clone(),
                 Axis::from(0)
@@ -4634,7 +4659,7 @@ mod tests {
                 .into(),
         );
         let extents = trace.input(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(items)])).into());
-        let context = BatchingContext::<_, ArrayBatching<DynamicArrayBatchingPolicy>>::with_policy(
+        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
             ProjectedContext::new(trace.clone()),
             batch_extent,
         );
@@ -4642,7 +4667,7 @@ mod tests {
             .with_ragged_axes(vec![RaggedAxis::new(1, extents.into_projected()?, length.clone(), vec![0])])?;
 
         let output =
-            DynamicArrayBatchingPolicy::mask_identity_input(&context, &input, &[1], RaggedMaskIdentity::Highest)?;
+            DynamicArrayExtentBatchingPolicy::mask_identity_input(&context, &input, &[1], RaggedMaskIdentity::Highest)?;
 
         // Masking neutralizes padding without consuming the axis, so the carrier keeps its ragged metadata.
         assert_eq!(output.batch_axis(), BatchAxis::new(0));
@@ -4714,7 +4739,7 @@ mod tests {
         );
         let packed = trace.input(packed_type.clone().into());
         let extents = trace.input(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(items)])).into());
-        let context = BatchingContext::<_, ArrayBatching<DynamicArrayBatchingPolicy>>::with_policy(
+        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
             ProjectedContext::new(trace.clone()),
             batch_extent,
         );
@@ -4723,7 +4748,7 @@ mod tests {
             .with_ragged_axes(vec![RaggedAxis::new(1, extents.into_projected().unwrap(), length, vec![0])])
             .unwrap();
         assert!(matches!(
-            DynamicArrayBatchingPolicy::mask_identity_input(&context, &input, &[1], RaggedMaskIdentity::Highest),
+            DynamicArrayExtentBatchingPolicy::mask_identity_input(&context, &input, &[1], RaggedMaskIdentity::Highest),
             Err(BatchingError::InvalidBatchMetadata { message })
                 if message
                     == format!("ragged axis 1 of packed array type `{packed_type}` has no static physical extent"),
@@ -5563,7 +5588,7 @@ mod tests {
         // With no leaf value to recover a context from, the free `batch` reports an empty batch even when an
         // explicit batch size is provided.
         let error = batch(
-            |x: Vec<BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatching>>| Ok(x),
+            |x: Vec<BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>>| Ok(x),
             Vec::<Array>::new(),
             BatchAxis::replicated(),
             BatchAxis::replicated(),

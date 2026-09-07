@@ -4,7 +4,7 @@
 
 use ryft_core::{
     ArrayIrOperation, ArrayIrType, ArrayType, ComparisonDirection, DYNAMIC_SHAPE_SLICE_OPERATION_NAME, DataType,
-    Dimension, DimensionOperation, DimensionRequirementOperation, DimensionType, Effect, Operation, ProgramError,
+    Dimension, DimensionOperation, DimensionRequirementOperation, DimensionType, EffectClass, Operation, ProgramError,
     Shape,
 };
 use ryft_mlir::dialects::{stable_hlo, tensor};
@@ -399,7 +399,8 @@ where
                         <&DimensionType>::try_from(right_type).map_err(|error| LoweringError::Tracing(error.into()))?;
                     // Bounds-proven arithmetic lowers without assertion overhead. Otherwise, preserve eager checked
                     // semantics with one diagnostic runtime check on the ordered-assertion chain.
-                    let requires_runtime_assertion = operation.effects().contains(Effect::OrderedAssertion);
+                    let requires_runtime_assertion =
+                        operation.effects().classes().contains(EffectClass::OrderedAssertion);
                     if requires_runtime_assertion {
                         lower_dimension_arithmetic_assertion(
                             operation,
@@ -492,7 +493,7 @@ where
                     Ok(vec![result.result(0).unwrap().as_ref()])
                 }
                 DimensionOperation::Requirement(operation) => {
-                    if operation.effects().contains(ryft_core::Effect::OrderedAssertion) {
+                    if operation.effects().classes().contains(ryft_core::EffectClass::OrderedAssertion) {
                         lower_dimension_requirement_to_assertion(
                             operation,
                             operation.name(),
@@ -631,7 +632,13 @@ where
             if operation.output_sharding().is_some() {
                 let output_sharding =
                     output_type.sharding().expect("reshape type inference should preserve requested output sharding");
-                lower_sharding_constraint(&[result], output_sharding, block, location)
+                lower_sharding_constraint(
+                    &[result],
+                    output_sharding,
+                    &collective_state.bound_manual_axes,
+                    block,
+                    location,
+                )
             } else {
                 Ok(vec![result])
             }
@@ -712,7 +719,13 @@ where
                 }
             };
             if broadcast_changes_explicit_sharding(input_type, output_type, operation.output_axes()) {
-                lower_sharding_constraint(&[result], output_type.sharding().unwrap(), block, location)
+                lower_sharding_constraint(
+                    &[result],
+                    output_type.sharding().unwrap(),
+                    &collective_state.bound_manual_axes,
+                    block,
+                    location,
+                )
             } else {
                 Ok(vec![result])
             }
@@ -729,7 +742,7 @@ where
             }
             <&DimensionType>::try_from(result_extent_type).map_err(|error| LoweringError::Tracing(error.into()))?;
 
-            if operation.effects().contains(Effect::OrderedAssertion) {
+            if operation.effects().classes().contains(EffectClass::OrderedAssertion) {
                 // The callback receives every concrete logical input extent and computes their checked sum on the
                 // host. This avoids both overflow in a speculative StableHLO sum and false rejection from conservative
                 // declared maxima. A type-derived proof omits this entire assertion path for static signatures.

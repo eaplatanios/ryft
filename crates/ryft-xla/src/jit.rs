@@ -74,9 +74,10 @@
 //! Local references—including local views and references inside supported conditions, bounded loops, scans, and
 //! nested calls—use the ordinary [`jitted`] or [`compile`] surface: they are discharged to array SSA before StableHLO
 //! lowering and do not change the public ABI. Local-reference batching and automatic differentiation likewise
-//! discharge first. External reference AD, mapped/shared reference batching, custom-derivative rule references,
-//! externally stateful rematerialization, and preserved references outside the experimental kernel boundary are
-//! rejected explicitly.
+//! discharge first. Rematerialization recomputes local reference lifecycles inside its body, saves reads of external
+//! references, and rejects bodies that mutate them. External reference AD, mapped/shared reference batching,
+//! custom-derivative rule references, and preserved references outside the experimental kernel boundary are rejected
+//! explicitly.
 
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -1220,9 +1221,9 @@ where
     }
 }
 
-/// Reverse-mode AD: compiles a new function that computes the gradient of a scalar-valued compiled function with
-/// respect to its inputs. The original closure is never re-executed; [`Self::call`] emits a `jit_call` boundary, and
-/// the active transform rewrites that operation through ordinary JVP and transpose rules.
+// Reverse-mode AD: compiles a new function that computes the gradient of a scalar-valued compiled function with
+// respect to its inputs. The original closure is never re-executed; [`Self::call`] emits a `jit_call` boundary, and
+// the active transform rewrites that operation through ordinary JVP and transpose rules.
 impl<'c, In: Parameterized<ArrayType, To<ArrayType> = In>> CompiledXlaFunction<'c, In, ArrayType>
 where
     In::Family: ParameterizedFamily<ArrayType, To = In>
@@ -1339,7 +1340,7 @@ where
     }
 }
 
-/// Forward-mode JVP packaged as a method. Mirrors `jax.jvp(jax.jit(f))`.
+// Forward-mode JVP packaged as a method. Mirrors `jax.jvp(jax.jit(f))`.
 impl<'c, In: Clone + Parameterized<ArrayType, To<ArrayType> = In>, Out: Parameterized<ArrayType>>
     CompiledXlaFunction<'c, In, Out>
 where
@@ -1852,22 +1853,26 @@ mod tests {
     use ryft_core::operations::random::Random;
     use ryft_core::operations::sort::{ArgMax, TopK};
     use ryft_core::{
-        Add, Array as CpuArray, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceViewTransform,
-        ArrayType, Atan2, Broadcast, CalleeRegionDriver, Compare, ComparisonDirection, Context, Cos,
-        CumulativeLogSumExp, CumulativeSum, DataType, Device, DeviceMesh, DifferentiableType, Differentiate, Dimension,
-        DimensionBounds, DimensionVariable, Div, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice,
-        DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogSumExp,
-        LogicalMesh, Logistic, MeshAxis, MeshAxisType, Mul, OneLike, ProgramError, ProjectedValue, Reduce,
-        ReductionKind, ReferenceAddUpdate, ReferenceCompletion, ReferenceCompletionBackend, ReferenceError,
-        ReferenceFreeze, ReferenceNew, ReferenceRead, ReferenceType, Reshape, Select, Shape, Sharding,
-        ShardingDimension, Sin, StopGradient, StopGradientOperation, Sub, Tanh, Typed, Value, ValueProjection,
-        WhileOperation, ZeroLike,
+        Add, AddOperation, Array as CpuArray, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference,
+        ArrayReferenceViewTransform, ArrayType, Atan2, Broadcast, CalleeRegionDriver, CaptureReference, Compare,
+        ComparisonDirection, Context, Cos, CotangentDestinationKind, CumulativeLogSumExp, CumulativeSum, DataType,
+        Device, DeviceMesh, DifferentiableType, Differentiate, Dimension, DimensionBounds, DimensionVariable, Div,
+        DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice, DynamicUpdateSlice, EagerContext,
+        Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogSumExp, LogicalMesh, Logistic, MeshAxis,
+        MeshAxisType, Mul, MulOperation, OneLike, Placeholder, ProgramBuilder, ProgramError, ProjectedValue, Reduce,
+        ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceCompletion,
+        ReferenceCompletionBackend, ReferenceError, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
+        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceType, Reshape, ScanOperation, Select,
+        Shape, Sharding, ShardingDimension, Sin, StopGradient, StopGradientOperation, Sub, Tanh, Trace, Typed, Value,
+        ValueProjection, ViewIndex, WhileOperation, ZeroLike, differentiate_at,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
     use crate::experimental::XlaDomainError;
     use crate::experimental::domains::StatefulFailureInjection;
-    use crate::experimental::ops::XlaOperation;
+    use crate::experimental::operations::ShardMapOperation;
+    use crate::experimental::ops::{JitCallOperation, XlaConstant, XlaOperation};
+    use crate::experimental::shard_map::ShardMap;
     use crate::jit::{
         CompiledXlaFunction, ExecutableXlaFunction, JittedXlaFunction, StagedXlaFunction, XlaCompileTracer,
         XlaStatefulCompileTracer, compile, compile_statefully, compile_statefully_with_captures, compile_with_captures,
@@ -1957,7 +1962,8 @@ mod tests {
         .unwrap()
     }
 
-    fn two_device_mesh(client: &ryft_pjrt::Client<'_>) -> DeviceMesh {
+    /// Creates a two-device mesh with the axis interpretation required by the test.
+    fn two_device_mesh(client: &ryft_pjrt::Client<'_>, axis_type: MeshAxisType) -> DeviceMesh {
         let devices: Vec<Device> = client
             .addressable_devices()
             .unwrap()
@@ -1965,8 +1971,7 @@ mod tests {
             .take(2)
             .map(|device| Device::from_pjrt(device).unwrap())
             .collect();
-        DeviceMesh::new(LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap(), devices)
-            .unwrap()
+        DeviceMesh::new(LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap(), devices).unwrap()
     }
 
     fn read_f32_array(client: &ryft_pjrt::Client<'_>, array: &Array<'_>) -> Vec<f32> {
@@ -2012,6 +2017,56 @@ mod tests {
             .r#await()
             .unwrap();
         values_from_bytes::<f64>(shard_bytes.as_slice())
+    }
+
+    /// Builds a nonlinear reference body with per-device reads and products. Its derivatives require saved values
+    /// from both operands, so different shard values must survive the primal-to-tangent boundary.
+    fn nonlinear_reference_shard_map_program(
+        mesh: &LogicalMesh,
+        replicated_reference: bool,
+    ) -> ryft_core::Program<XlaConstant, XlaOperation, Vec<XlaConstant>, Vec<XlaConstant>> {
+        let sharded = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let reference_sharding =
+            if replicated_reference { Sharding::replicated(mesh.clone(), 1) } else { sharded.clone() };
+        let reference_type = ArrayType::new_static(DataType::F32, [if replicated_reference { 2 } else { 4 }])
+            .with_sharding(reference_sharding.clone())
+            .unwrap();
+        let value_type = ArrayType::new_static(DataType::F32, [4]).with_sharding(sharded.clone()).unwrap();
+        let shard_map = ShardMap::from_shardings(
+            mesh.clone(),
+            vec![reference_sharding.clone(), sharded.clone()],
+            vec![sharded.clone()],
+            vec!["x".to_string()],
+            true,
+        );
+        let mut body = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let reference =
+            body.add_input(ReferenceType::new(shard_map.local_input_type(0, &reference_type).unwrap()).into());
+        let value = body.add_input(shard_map.local_input_type(1, &value_type).unwrap().into());
+        let state = body.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let output = body.add_instruction(MulOperation::new(), Vec::new(), vec![state, value], None).unwrap()[0];
+        let body = body
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let inputs = vec![ArrayIrType::Reference(ReferenceType::new(reference_type)), ArrayIrType::Array(value_type)];
+        let operation = ShardMapOperation::from_program(
+            &body,
+            inputs.clone(),
+            mesh.clone(),
+            vec![reference_sharding, sharded.clone()],
+            vec![sharded],
+            vec!["x".to_string()],
+            true,
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let inputs = inputs.into_iter().map(|r#type| builder.add_input(r#type)).collect::<Vec<_>>();
+        let body = builder.import_program(body);
+        let outputs = builder
+            .add_instruction(XlaOperation::ShardMap(Box::new(operation)), vec![body], inputs, None)
+            .unwrap();
+        let outputs = outputs.to_vec();
+        builder.build(outputs, vec![Placeholder; 2], vec![Placeholder]).unwrap()
     }
 
     #[test]
@@ -2180,6 +2235,140 @@ mod tests {
     }
 
     #[test]
+    fn test_public_jit_reference_input_value_and_gradient() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let input_type = ArrayType::scalar(DataType::F32)
+            .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
+            .unwrap();
+
+        // The inner gradient differentiates reference contents at entry, while the outer compiled function returns
+        // the scalar objective, the mutated primal state, and an ordinary gradient. Both local references discharge
+        // before lowering, so the public executable retains its ordinary array boundary and placement metadata.
+        let compiled: CompiledXlaFunction<'_, ArrayType, (ArrayType, ArrayType, ArrayType)> = compile(
+            |input| {
+                let reference = input.into_value().reference_new().unwrap();
+                let (value, gradient) = differentiate_at(reference.clone())
+                    .value_and_gradient(|reference| {
+                        let current = reference.read()?;
+                        reference.add_update(&current)?;
+                        let current = ValueProjection::<ArrayType>::into_projected(reference.read()?)?;
+                        current.mul(&current).map(|value| value.into_value())
+                    })
+                    .unwrap();
+                (
+                    ValueProjection::<ArrayType>::into_projected(value).unwrap(),
+                    ValueProjection::<ArrayType>::into_projected(reference.freeze().unwrap()).unwrap(),
+                    ValueProjection::<ArrayType>::into_projected(gradient).unwrap(),
+                )
+            },
+            input_type.clone(),
+            &domain,
+            mesh.clone(),
+        )
+        .unwrap();
+        let executable = compiled.executable_function();
+        assert_eq!(executable.function.input_types(), &[ArrayIrType::Array(input_type.clone())]);
+        assert_eq!(executable.output_types(), &[input_type.clone(), input_type.clone(), input_type.clone()]);
+
+        // Reusing one executable must start each invocation's cotangent state at zero. In particular, returning to
+        // the first input after another call must recover the same derivative instead of accumulating prior results.
+        for (initial, expected_value, expected_state, expected_gradient) in
+            [(3.0_f32, 36.0, 6.0, 24.0), (5.0, 100.0, 10.0, 40.0), (3.0, 36.0, 6.0, 24.0)]
+        {
+            let input = Array::from_host_buffer(
+                &client,
+                input_type.clone(),
+                mesh.clone(),
+                values_to_bytes::<f32>(&[initial]).as_slice(),
+            )
+            .unwrap();
+            let (value, state, gradient) = domain.interpret(&executable, input).unwrap();
+            assert_eq!(read_f32_array(&client, &value), vec![expected_value]);
+            assert_eq!(read_f32_array(&client, &state), vec![expected_state]);
+            assert_eq!(read_f32_array(&client, &gradient), vec![expected_gradient]);
+        }
+    }
+
+    #[test]
+    fn test_public_jit_scan_captures_its_iteration_reference_view_in_nested_call() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(scalar_type));
+
+        // The callee captures the scalar view supplied to this iteration, doubles its contents, and returns the
+        // updated value through capture 0 rather than its input atom. The JIT call's explicit capture prefix binds
+        // that constant to the same local view, not another view of the complete stacked root.
+        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        builder.add_input(reference_type.clone());
+        let reference = builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, reference_type.clone())));
+        let current =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, current], None)
+            .unwrap();
+        let updated =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let callee = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![updated], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let reference = builder.add_input(reference_type);
+        let callee = builder.import_region(callee.entry_region_ref());
+        let outputs = builder
+            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(1)), vec![callee], vec![reference], None)
+            .unwrap()
+            .to_vec();
+        let body = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // Discharge the source directly before compilation can lift captured constants into ordinary operands.
+        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let input = builder.add_input(input_type.clone().into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let body_region = builder.import_region(body.entry_region_ref());
+        let outputs = builder
+            .add_instruction(XlaOperation::Scan(ScanOperation::new(0, 3)), vec![body_region], vec![reference], None)
+            .unwrap()[0];
+        let frozen =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![outputs, frozen], vec![Placeholder], vec![Placeholder; 2])
+            .unwrap();
+        let program = source.discharge_references(0).unwrap().into_program_without_external_references().unwrap();
+
+        let compiled: CompiledXlaFunction<'_, ArrayType, (ArrayType, ArrayType)> = compile(
+            |input| {
+                let input = input.into_value();
+                let outputs = program.interpret_in_context(input.context(), vec![input.clone()]).unwrap();
+                let mut outputs = outputs.into_iter();
+                (
+                    ValueProjection::<ArrayType>::into_projected(outputs.next().unwrap()).unwrap(),
+                    ValueProjection::<ArrayType>::into_projected(outputs.next().unwrap()).unwrap(),
+                )
+            },
+            input_type.clone(),
+            &domain,
+            mesh.clone(),
+        )
+        .unwrap();
+        let input =
+            Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[1.0, 2.0, 3.0]).as_slice())
+                .unwrap();
+        let (outputs, frozen) = domain.interpret(&compiled.executable_function(), input).unwrap();
+        assert_eq!(read_f32_array(&client, &outputs), vec![2.0, 4.0, 6.0]);
+        assert_eq!(read_f32_array(&client, &frozen), vec![2.0, 4.0, 6.0]);
+    }
+
+    #[test]
     fn test_stateful_compiled_function_updates_public_holder_across_calls() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
@@ -2229,6 +2418,191 @@ mod tests {
             assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![expected]);
         }
         assert_eq!(read_f32_array(&client, &retained_snapshot), vec![1.0]);
+    }
+
+    /// Traces `f(reference, update) = { reference += update; read(reference) }` over a `ref<f32[]>` and an `f32[]` into
+    /// the XLA program universe, so that program-level transforms of a reference-bearing program can be replayed into a
+    /// stateful compilation.
+    fn accumulate_and_read_program(
+        reference_type: &ArrayIrType,
+        array_type: &ArrayType,
+    ) -> ryft_core::Program<XlaConstant, XlaOperation, Vec<XlaConstant>, Vec<XlaConstant>> {
+        let (_, program) = <XlaDomain<'_>>::trace(
+            |(reference, update): (DomainTracer<XlaDomain<'_>>, DomainTracer<XlaDomain<'_>>)| {
+                reference.add_update(&update)?;
+                reference.read()
+            },
+            (reference_type.clone(), ArrayIrType::Array(array_type.clone())),
+        )
+        .unwrap();
+        program.into_flat_program()
+    }
+
+    #[test]
+    fn test_stateful_compiled_function_commits_forward_mode_tangent_references() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let array_type = ArrayType::scalar(DataType::F32);
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
+
+        // Staged tracers report no reference identity, so the value-level `jvp` entry cannot run inside a stateful
+        // compilation; the program-level transform derives `[r, x, ṫr, ẋ] ↦ [y, ẏ]` instead, and replaying it into
+        // the stateful trace makes both the reference and its tangent reference public holders of the compiled
+        // function.
+        let jvp = accumulate_and_read_program(&reference_type, &array_type).jvp().unwrap();
+        assert_eq!(
+            jvp.input_types(),
+            vec![
+                reference_type.clone(),
+                ArrayIrType::Array(array_type.clone()),
+                reference_type.clone(),
+                ArrayIrType::Array(array_type.clone()),
+            ],
+        );
+        let compiled =
+            compile_statefully::<_, (ArrayIrType, ArrayIrType, ArrayIrType, ArrayIrType), (ArrayIrType, ArrayIrType)>(
+                |(reference, update, tangent_reference, tangent_update)| {
+                    let context = reference.context().clone();
+                    let mut outputs =
+                        jvp.interpret_in_context(&context, vec![reference, update, tangent_reference, tangent_update])?;
+                    let tangent = outputs.remove(1);
+                    Ok((outputs.remove(0), tangent))
+                },
+                (
+                    reference_type.clone(),
+                    ArrayIrType::Array(array_type.clone()),
+                    reference_type,
+                    ArrayIrType::Array(array_type.clone()),
+                ),
+                &domain,
+                XlaOptions::new(mesh.clone()),
+            )
+            .unwrap();
+
+        // Both references are committed after the call: the primal holder accumulates the update and the tangent
+        // holder accumulates the tangent update, and the outputs read the committed states.
+        let scalar = |value: f32| {
+            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
+        };
+        let reference = ArrayReference::new(scalar(1.0));
+        let tangent_reference = ArrayReference::new(scalar(10.0));
+        let (primal, tangent) = compiled
+            .call_statefully(
+                &domain,
+                (
+                    ArrayIrValue::Reference(reference.clone()),
+                    ArrayIrValue::Array(scalar(3.0)),
+                    ArrayIrValue::Reference(tangent_reference.clone()),
+                    ArrayIrValue::Array(scalar(100.0)),
+                ),
+            )
+            .unwrap();
+        let ArrayIrValue::Array(primal) = primal else { panic!("stateful primal output must be an array") };
+        let ArrayIrValue::Array(tangent) = tangent else { panic!("stateful tangent output must be an array") };
+        assert_eq!(read_f32_array(&client, &primal), vec![4.0]);
+        assert_eq!(read_f32_array(&client, &tangent), vec![110.0]);
+        assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![4.0]);
+        assert_eq!(read_f32_array(&client, &tangent_reference.read().unwrap()), vec![110.0]);
+    }
+
+    #[test]
+    fn test_stateful_compiled_function_commits_reverse_mode_cotangent_references() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let array_type = ArrayType::scalar(DataType::F32);
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
+
+        // The program-level pullback of `y = { r += x; read(r) }` under a `Reference` destination for `r` consumes
+        // `[ȳ, r̄]` and returns `[r̄, x̄]`, where the destination is returned by identity. The stateful ABI cannot
+        // return a forwarded reference, so the compiled closure keeps `x̄` and lets the destination commit as a public
+        // holder.
+        let (_, tangent, residual_count) =
+            accumulate_and_read_program(&reference_type, &array_type).linearize().unwrap().into_parts();
+        assert_eq!(residual_count, 0);
+        let pullback = tangent
+            .transpose_with_respect_to(
+                &[0, 1],
+                &[CotangentDestinationKind::Reference, CotangentDestinationKind::Return],
+            )
+            .unwrap();
+        assert_eq!(pullback.input_types(), vec![ArrayIrType::Array(array_type.clone()), reference_type.clone()]);
+        assert_eq!(pullback.output_types(), vec![reference_type.clone(), ArrayIrType::Array(array_type.clone())]);
+        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
+            |(cotangent_reference, output_cotangent)| {
+                let context = cotangent_reference.context().clone();
+                let mut outputs =
+                    pullback.interpret_in_context(&context, vec![output_cotangent, cotangent_reference])?;
+                Ok(outputs.remove(1))
+            },
+            (reference_type, ArrayIrType::Array(array_type.clone())),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+
+        // The read accumulates `ȳ` into the destination and the accumulation hands the accumulated cotangent to `x̄`
+        // while leaving the destination unchanged, so both end at `5 + 2`.
+        let scalar = |value: f32| {
+            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), value.to_ne_bytes().as_slice()).unwrap()
+        };
+        let cotangent_reference = ArrayReference::new(scalar(5.0));
+        let input_cotangent = compiled
+            .call_statefully(
+                &domain,
+                (ArrayIrValue::Reference(cotangent_reference.clone()), ArrayIrValue::Array(scalar(2.0))),
+            )
+            .unwrap();
+        let ArrayIrValue::Array(input_cotangent) = input_cotangent else {
+            panic!("stateful cotangent output must be an array")
+        };
+        assert_eq!(read_f32_array(&client, &input_cotangent), vec![7.0]);
+        assert_eq!(read_f32_array(&client, &cotangent_reference.read().unwrap()), vec![7.0]);
+    }
+
+    #[test]
+    fn test_stateful_compilation_rejects_escaping_reference_outputs() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = single_device_mesh(&client);
+        let domain = XlaDomain::new(&client);
+        let array_type = ArrayType::scalar(DataType::F32);
+
+        // A reference allocated inside the program has no host identity the ABI could hand back.
+        let error = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+            |input| input.reference_new().map_err(Into::into),
+            ArrayIrType::Array(array_type.clone()),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(
+            error,
+            XlaDomainError::UnsupportedReferenceAbi { reason }
+                if reason == "output 0 is a reference allocated inside the program and cannot be returned through the \
+                              stateful XLA ABI, which has no protocol to turn a backend array into a host reference",
+        ));
+
+        // A forwarded external reference is rejected as well, because the ABI commits holders in place and returns no
+        // reference outputs.
+        let error = compile_statefully::<_, ArrayIrType, ArrayIrType>(
+            Ok,
+            ArrayIrType::Reference(ReferenceType::new(array_type)),
+            &domain,
+            XlaOptions::new(mesh),
+        )
+        .err()
+        .unwrap();
+        assert!(matches!(
+            error,
+            XlaDomainError::UnsupportedReferenceAbi { reason }
+                if reason == "output 0 forwards the external reference bound at input 0, and the stateful XLA ABI \
+                              does not return forwarded references; read the reference after the call instead",
+        ));
     }
 
     #[test]
@@ -2547,7 +2921,9 @@ mod tests {
             Array::from_host_buffer(&client, vector_type, mesh, values_to_bytes::<f32>(&[4.0, 9.0]).as_slice())
                 .unwrap(),
         );
-        let view = root.with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: 1 }).unwrap();
+        let view = root
+            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) })
+            .unwrap();
         assert!(matches!(
             compiled.call_statefully(&domain, ArrayIrValue::Reference(view)),
             Err(XlaDomainError::UnsupportedReferenceAbi { reason })
@@ -2629,7 +3005,7 @@ mod tests {
     fn test_stateful_external_holder_updates_two_device_sharded_state() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
-        let mesh = two_device_mesh(&client);
+        let mesh = two_device_mesh(&client, MeshAxisType::Auto);
         let domain = XlaDomain::new(&client);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
@@ -2699,6 +3075,360 @@ mod tests {
                 if reason == "external state input 0 reference mesh does not match the compiled device mesh",
         ));
         assert_eq!(read_sharded_f32_array(&reversed_reference.read().unwrap()), vec![1.0, 2.0, 3.0, 4.0],);
+    }
+
+    #[test]
+    fn test_stateful_shard_map_jvp_preserves_nonlinear_residuals_on_each_device() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let mesh = two_device_mesh(&client, MeshAxisType::Manual);
+        let logical_mesh = mesh.logical_mesh().clone();
+        let domain = XlaDomain::new(&client);
+        let program = nonlinear_reference_shard_map_program(&logical_mesh, false).jvp().unwrap();
+        let inputs = program.input_types();
+        let array_type = <&ReferenceType<ArrayType>>::try_from(&inputs[0]).unwrap().referent().clone();
+        let compiled = compile_statefully::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>(
+            |inputs| program.interpret_in_context(inputs[0].context(), inputs.clone()).map_err(Into::into),
+            inputs,
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+        let array = |values: &[f32]| {
+            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), values_to_bytes(values).as_slice())
+                .unwrap()
+        };
+        let reference = ArrayReference::new(array(&[2.0, 3.0, 5.0, 7.0]));
+        let tangent_reference = ArrayReference::new(array(&[23.0, 29.0, 31.0, 37.0]));
+        let outputs = compiled
+            .call_statefully(
+                &domain,
+                vec![
+                    ArrayIrValue::Reference(reference.clone()),
+                    ArrayIrValue::Array(array(&[11.0, 13.0, 17.0, 19.0])),
+                    ArrayIrValue::Reference(tangent_reference.clone()),
+                    ArrayIrValue::Array(array(&[41.0, 43.0, 47.0, 53.0])),
+                ],
+            )
+            .unwrap();
+        let outputs = outputs
+            .iter()
+            .map(|output| match output {
+                ArrayIrValue::Array(array) => read_sharded_f32_array(array),
+                _ => panic!("nonlinear outputs are arrays"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outputs, vec![vec![22.0, 39.0, 85.0, 133.0], vec![335.0, 506.0, 762.0, 1074.0]]);
+        assert_eq!(read_sharded_f32_array(&reference.read().unwrap()), vec![2.0, 3.0, 5.0, 7.0]);
+        assert_eq!(read_sharded_f32_array(&tangent_reference.read().unwrap()), vec![23.0, 29.0, 31.0, 37.0]);
+    }
+
+    #[test]
+    fn test_stateful_shard_map_reverse_sums_replicated_reference_contributions() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let mesh = two_device_mesh(&client, MeshAxisType::Manual);
+        let logical_mesh = mesh.logical_mesh().clone();
+        let domain = XlaDomain::new(&client);
+        let program = nonlinear_reference_shard_map_program(&logical_mesh, true);
+        let mut input_types = program.input_types();
+        let reference_type = <&ReferenceType<ArrayType>>::try_from(&input_types[0]).unwrap().referent().clone();
+        let array_type = <&ArrayType>::try_from(&input_types[1]).unwrap().clone();
+        input_types.extend(input_types.clone());
+        let (primal, tangent, _) = program.linearize().unwrap().into_parts();
+        let pullback = tangent
+            .transpose_with_respect_to(
+                &[0, 1],
+                &[CotangentDestinationKind::Reference, CotangentDestinationKind::Return],
+            )
+            .unwrap();
+        let compiled = compile_statefully::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>(
+            |inputs| {
+                let context = inputs[0].context().clone();
+                let mut primals = primal.interpret_in_context(&context, inputs[..2].to_vec())?;
+                let output = primals.remove(0);
+                let mut operands = vec![inputs[3].clone(), inputs[2].clone()];
+                operands.extend(primals);
+                let mut cotangents = pullback.interpret_in_context(&context, operands)?;
+                Ok(vec![output, cotangents.remove(1)])
+            },
+            input_types,
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+        let array = |r#type: &ArrayType, values: &[f32]| {
+            Array::from_host_buffer(&client, r#type.clone(), mesh.clone(), values_to_bytes(values).as_slice()).unwrap()
+        };
+        let reference = ArrayReference::new(array(&reference_type, &[2.0, 3.0]));
+        let destination = ArrayReference::new(array(&reference_type, &[5.0, 7.0]));
+        let outputs = compiled
+            .call_statefully(
+                &domain,
+                vec![
+                    ArrayIrValue::Reference(reference.clone()),
+                    ArrayIrValue::Array(array(&array_type, &[11.0, 13.0, 17.0, 19.0])),
+                    ArrayIrValue::Reference(destination.clone()),
+                    ArrayIrValue::Array(array(&array_type, &[1.0, 2.0, 3.0, 4.0])),
+                ],
+            )
+            .unwrap();
+        let outputs = outputs
+            .iter()
+            .map(|output| match output {
+                ArrayIrValue::Array(array) => read_sharded_f32_array(array),
+                _ => panic!("nonlinear outputs are arrays"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(outputs, vec![vec![22.0, 39.0, 34.0, 57.0], vec![2.0, 6.0, 6.0, 12.0]]);
+        assert_eq!(read_sharded_f32_array(&destination.read().unwrap()), vec![67.0, 109.0, 67.0, 109.0]);
+        assert_eq!(read_sharded_f32_array(&reference.read().unwrap()), vec![2.0, 3.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_stateful_shard_map_reverse_normalizes_replicated_output_seed() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let mesh = two_device_mesh(&client, MeshAxisType::Manual);
+        let logical_mesh = mesh.logical_mesh().clone();
+        let domain = XlaDomain::new(&client);
+        let sharding = Sharding::replicated(logical_mesh.clone(), 1);
+        let array_type = ArrayType::new_static(DataType::F32, [2]).with_sharding(sharding.clone()).unwrap();
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(array_type.clone()));
+        let mut body = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let reference = body.add_input(reference_type.clone());
+        let value = body.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let body = body
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![value], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let operation = ShardMapOperation::from_program(
+            &body,
+            vec![reference_type.clone()],
+            logical_mesh,
+            vec![sharding.clone()],
+            vec![sharding],
+            vec!["x".to_string()],
+            true,
+        )
+        .unwrap();
+        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let reference = builder.add_input(reference_type.clone());
+        let body = builder.import_program(body);
+        let output = builder
+            .add_instruction(XlaOperation::ShardMap(Box::new(operation)), vec![body], vec![reference], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
+        let compiled = compile_statefully::<_, Vec<ArrayIrType>, Vec<ArrayIrType>>(
+            |inputs| {
+                let context = inputs[0].context().clone();
+                let outputs = pullback.interpret_in_context(&context, inputs)?;
+                Ok(vec![context.bind(ReferenceReadOperation::new(), Vec::new(), &outputs)?.remove(0)])
+            },
+            vec![ArrayIrType::Array(array_type.clone()), reference_type],
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+        let array = |values: &[f32]| {
+            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), values_to_bytes(values).as_slice())
+                .unwrap()
+        };
+        let destination = ArrayReference::new(array(&[5.0, 7.0]));
+        compiled
+            .call_statefully(
+                &domain,
+                vec![ArrayIrValue::Array(array(&[1.0, 2.0])), ArrayIrValue::Reference(destination.clone())],
+            )
+            .unwrap();
+        assert_eq!(read_sharded_f32_array(&destination.read().unwrap()), vec![6.0, 9.0, 6.0, 9.0]);
+    }
+
+    /// A manual `shard_map` over a reference sharded along its manual axis, run through the stateful ABI: each device
+    /// adds its shard of the update into the shard of the referent it owns and reads that shard back, so the output
+    /// and the committed global referent both carry every device's write in mesh order.
+    #[test]
+    fn test_stateful_shard_map_updates_two_device_sharded_state() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let mesh = two_device_mesh(&client, MeshAxisType::Manual);
+        let logical_mesh = mesh.logical_mesh().clone();
+        let domain = XlaDomain::new(&client);
+        let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let global_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
+        let sharded_type = global_type.clone().with_sharding(sharded.clone()).unwrap();
+
+        // The boundary is `[r: ref<f32[4]>, x: f32[4]] -> f32[4]`, everything sharded along `x`, and the local body
+        // performs `add_update(r_local, x_local); read(r_local)` over the `f32[2]` shards the device owns.
+        let shard_map = ShardMap::from_shardings(
+            logical_mesh,
+            vec![sharded.clone(), sharded.clone()],
+            vec![sharded.clone()],
+            vec!["x".to_string()],
+            true,
+        );
+        let body = {
+            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let local_referent = shard_map.local_input_type(0, &global_type).unwrap();
+            let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(local_referent)));
+            let update = builder.add_input(ArrayIrType::Array(shard_map.local_input_type(1, &global_type).unwrap()));
+            builder
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+                .unwrap();
+            let output =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let operation = XlaOperation::ShardMap(Box::new(ShardMapOperation::from_boundary(
+            shard_map,
+            vec![
+                ArrayIrType::Reference(ReferenceType::new(sharded_type.clone())),
+                ArrayIrType::Array(sharded_type.clone()),
+            ],
+            vec![ArrayIrType::Array(sharded_type.clone())],
+        )));
+        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
+            |(reference, update)| {
+                let context = reference.dispatch_domain();
+                let mut outputs = context.bind(operation, vec![body], &[reference, update])?;
+                Ok(outputs.pop().unwrap())
+            },
+            (
+                ArrayIrType::Reference(ReferenceType::new(sharded_type.clone())),
+                ArrayIrType::Array(sharded_type.clone()),
+            ),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+
+        let reference = ArrayReference::new(
+            Array::from_host_buffer(
+                &client,
+                sharded_type.clone(),
+                mesh.clone(),
+                values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
+            )
+            .unwrap(),
+        );
+        let update = Array::from_host_buffer(
+            &client,
+            sharded_type,
+            mesh,
+            values_to_bytes::<f32>(&[10.0, 20.0, 30.0, 40.0]).as_slice(),
+        )
+        .unwrap();
+        let ArrayIrValue::Array(output) = compiled
+            .call_statefully(&domain, (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(update)))
+            .unwrap()
+        else {
+            panic!("stateful shard-map output must be an array")
+        };
+
+        // Device 0 owns `[1, 2]` and device 1 owns `[3, 4]`; the concatenation of the per-device shards in mesh order
+        // shows that each device mutated exactly its own shard, both in the read output and in the committed referent.
+        assert_eq!(output.sharding(), &sharded);
+        assert_eq!(read_sharded_f32_array(&output), vec![11.0, 22.0, 33.0, 44.0]);
+        let committed = reference.read().unwrap();
+        assert_eq!(committed.sharding(), &sharded);
+        assert_eq!(read_sharded_f32_array(&committed), vec![11.0, 22.0, 33.0, 44.0]);
+    }
+
+    /// A manual `shard_map` reading a reference replicated along its manual axis, run through the stateful ABI: every
+    /// device sees the whole referent and adds it to the shard of the value input it owns, while the referent itself is
+    /// left untouched on every device.
+    #[test]
+    fn test_stateful_shard_map_reads_replicated_reference_on_every_shard() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let mesh = two_device_mesh(&client, MeshAxisType::Manual);
+        let logical_mesh = mesh.logical_mesh().clone();
+        let domain = XlaDomain::new(&client);
+        let sharded = Sharding::new(logical_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let replicated = Sharding::replicated(logical_mesh.clone(), 1);
+        let referent_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)]));
+        let replicated_type = referent_type.clone().with_sharding(replicated.clone()).unwrap();
+        let global_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]));
+        let sharded_type = global_type.clone().with_sharding(sharded.clone()).unwrap();
+
+        // The boundary is `[r: ref<f32[2]>, x: f32[4]] -> f32[4]` with `r` replicated and `x` and the output sharded
+        // along `x`, and the local body performs `read(r_local) + x_local` over the whole `f32[2]` referent and the
+        // `f32[2]` shard of `x` the device owns.
+        let shard_map = ShardMap::from_shardings(
+            logical_mesh,
+            vec![replicated, sharded.clone()],
+            vec![sharded.clone()],
+            vec!["x".to_string()],
+            true,
+        );
+        let body = {
+            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let local_referent = shard_map.local_input_type(0, &referent_type).unwrap();
+            let reference = builder.add_input(ArrayIrType::Reference(ReferenceType::new(local_referent)));
+            let update = builder.add_input(ArrayIrType::Array(shard_map.local_input_type(1, &global_type).unwrap()));
+            let state =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            let output =
+                builder.add_instruction(AddOperation::new(), Vec::new(), vec![state, update], None).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let operation = XlaOperation::ShardMap(Box::new(ShardMapOperation::from_boundary(
+            shard_map,
+            vec![
+                ArrayIrType::Reference(ReferenceType::new(replicated_type.clone())),
+                ArrayIrType::Array(sharded_type.clone()),
+            ],
+            vec![ArrayIrType::Array(sharded_type.clone())],
+        )));
+        let compiled = compile_statefully::<_, (ArrayIrType, ArrayIrType), ArrayIrType>(
+            |(reference, update)| {
+                let context = reference.dispatch_domain();
+                let mut outputs = context.bind(operation, vec![body], &[reference, update])?;
+                Ok(outputs.pop().unwrap())
+            },
+            (
+                ArrayIrType::Reference(ReferenceType::new(replicated_type.clone())),
+                ArrayIrType::Array(sharded_type.clone()),
+            ),
+            &domain,
+            XlaOptions::new(mesh.clone()),
+        )
+        .unwrap();
+
+        let reference = ArrayReference::new(
+            Array::from_host_buffer(
+                &client,
+                replicated_type,
+                mesh.clone(),
+                values_to_bytes::<f32>(&[100.0, 200.0]).as_slice(),
+            )
+            .unwrap(),
+        );
+        let update = Array::from_host_buffer(
+            &client,
+            sharded_type,
+            mesh,
+            values_to_bytes::<f32>(&[1.0, 2.0, 3.0, 4.0]).as_slice(),
+        )
+        .unwrap();
+        let ArrayIrValue::Array(output) = compiled
+            .call_statefully(&domain, (ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(update)))
+            .unwrap()
+        else {
+            panic!("stateful shard-map output must be an array")
+        };
+
+        // Both devices add the whole `[100, 200]` referent to their own shard of `x`, and the replicated referent
+        // (read here as its per-device copies in mesh order) is unchanged on both devices.
+        assert_eq!(output.sharding(), &sharded);
+        assert_eq!(read_sharded_f32_array(&output), vec![101.0, 202.0, 103.0, 204.0]);
+        assert_eq!(read_sharded_f32_array(&reference.read().unwrap()), vec![100.0, 200.0, 100.0, 200.0]);
     }
 
     #[test]
@@ -2847,11 +3577,15 @@ mod tests {
             XlaOptions::new(mesh),
         )
         .unwrap();
-        assert!(matches!(
-            compiled.call_statefully(&domain, ArrayIrValue::Reference(reference.clone())),
-            Err(XlaDomainError::Tracing(ProgramError::InvalidArgument { message }))
-                if message == "input 0 and capture 0 bind the same reference allocation",
-        ));
+        let error = compiled.call_statefully(&domain, ArrayIrValue::Reference(reference.clone())).err();
+        assert!(
+            matches!(
+                &error,
+                Some(XlaDomainError::Tracing(ProgramError::InvalidArgument { message }))
+                    if message == "capture 0 and input 0 bind the same reference allocation",
+            ),
+            "{error:?}",
+        );
         assert_eq!(read_f32_array(&client, &reference.read().unwrap()), vec![1.0]);
     }
 
@@ -2865,7 +3599,8 @@ mod tests {
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 0))
             .unwrap();
         let reference = ArrayReference::new(
-            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice()).unwrap(),
+            Array::from_host_buffer(&client, array_type.clone(), mesh.clone(), 1.0f32.to_ne_bytes().as_slice())
+                .unwrap(),
         );
         let result = compile_statefully_with_captures::<_, ArrayIrType, ArrayIrType>(
             |captures, _| captures[0].read().map_err(Into::into),
@@ -4736,7 +5471,7 @@ mod tests {
     fn test_compile_with_options_in_shardings_override_replaces_input_sharding() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
-        let mesh = two_device_mesh(&client);
+        let mesh = two_device_mesh(&client, MeshAxisType::Auto);
         let engine = XlaDomain::new(&client);
 
         // input_type carries the abstract shape & dtype but a "wrong" sharding (replicated). The
@@ -4803,7 +5538,7 @@ mod tests {
     fn test_compile_with_options_out_shardings_override_propagates_to_output_array() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
-        let mesh = two_device_mesh(&client);
+        let mesh = two_device_mesh(&client, MeshAxisType::Auto);
         let engine = XlaDomain::new(&client);
 
         let shape = Shape::new(vec![Dimension::Static(4)]);
@@ -4849,7 +5584,7 @@ mod tests {
     fn test_jit_implicitly_reshards_mismatched_inputs() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
-        let mesh = two_device_mesh(&client);
+        let mesh = two_device_mesh(&client, MeshAxisType::Auto);
         let engine = XlaDomain::new(&client);
 
         // The executable expects a 2-way shard along "x", but the caller will pass a fully
@@ -4935,7 +5670,7 @@ mod tests {
     fn test_jit_with_sharding_constraint_constrains_output_sharding() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
-        let mesh = two_device_mesh(&client);
+        let mesh = two_device_mesh(&client, MeshAxisType::Auto);
         let engine = XlaDomain::new(&client);
 
         let shape = Shape::new(vec![Dimension::Static(4)]);

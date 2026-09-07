@@ -4,7 +4,6 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
-use ryft_core::differentiation::operations::{CUSTOM_JVP_OPERATION_NAME, CUSTOM_VJP_OPERATION_NAME};
 use ryft_core::macros::check_count;
 use ryft_core::operations::attention::{
     AttentionInputs, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
@@ -24,10 +23,11 @@ use ryft_core::{
     AXIS_INDEX_OPERATION_NAME, AbsOperation, AddOperation, Array as CpuArray, ArrayIrType, ArrayOperation, ArrayType,
     Atan2Operation, AtomId, AxisIndexOperation, BroadcastOperation, CONDITION_OPERATION_NAME,
     CUMULATIVE_LOG_SUM_EXP_OPERATION_NAME, CUMULATIVE_MAX_OPERATION_NAME, CUMULATIVE_MIN_OPERATION_NAME,
-    CUMULATIVE_PRODUCT_OPERATION_NAME, CUMULATIVE_SUM_OPERATION_NAME, CaptureReference, CeilOperation,
-    ComparisonDirection, ConstantOperation, ConvertElementTypeOperation, CosOperation, DataType, Dimension,
-    DimensionOperation, DimensionRequirementOperation, DimensionRequirementPredicate, DimensionType, DimensionValue,
-    DivOperation, DomainTracingContext, DotDimensionNumbers, DotOperation, Effect, Effects, ErfOperation, ExpOperation,
+    CUMULATIVE_PRODUCT_OPERATION_NAME, CUMULATIVE_SUM_OPERATION_NAME, CUSTOM_JVP_OPERATION_NAME,
+    CUSTOM_VJP_OPERATION_NAME, CaptureReference, CeilOperation, ComparisonDirection, ConstantOperation,
+    ConvertElementTypeOperation, CosOperation, DataType, Dimension, DimensionOperation, DimensionRequirementOperation,
+    DimensionRequirementPredicate, DimensionType, DimensionValue, DivOperation, DomainTracingContext,
+    DotDimensionNumbers, DotOperation, EffectClass, EffectClasses, ErfOperation, ExpOperation,
     ExternalReferenceBinding, FloorOperation, GATHER_OPERATION_NAME, GatherOperation, GatherScatterMode, Instruction,
     IotaOperation, Layout, Log1pOperation, LogAddExpOperation, LogOperation, LogicalMesh, LogisticOperation,
     MAX_DIMENSION_EXTENT, MaxOperation, Memory, MeshAxisType, MinOperation, MulOperation, NegOperation, Operation,
@@ -458,23 +458,23 @@ struct EffectTokens<'b, 'c: 'b, 't: 'c> {
 }
 
 impl<'b, 'c: 'b, 't: 'c> EffectTokens<'b, 'c, 't> {
-    /// Returns the current token for `effect`.
-    fn get(&self, effect: Effect) -> Option<ValueRef<'b, 'c, 't>> {
-        match effect {
-            Effect::OrderedState => unreachable!("ordered state effects must be discharged before XLA lowering"),
-            Effect::OrderedAssertion => self.ordered_assertion,
-            Effect::OrderedIo => self.ordered_io,
-            Effect::UnorderedIo => None,
+    /// Returns the current token for `effect_class`.
+    fn get(&self, effect_class: EffectClass) -> Option<ValueRef<'b, 'c, 't>> {
+        match effect_class {
+            EffectClass::OrderedState => unreachable!("ordered state effects must be discharged before XLA lowering"),
+            EffectClass::OrderedAssertion => self.ordered_assertion,
+            EffectClass::OrderedIo => self.ordered_io,
+            EffectClass::UnorderedIo => None,
         }
     }
 
     /// Replaces the current token for one ordered effect class.
-    fn set(&mut self, effect: Effect, token: ValueRef<'b, 'c, 't>) {
-        match effect {
-            Effect::OrderedState => unreachable!("ordered state effects must be discharged before XLA lowering"),
-            Effect::OrderedAssertion => self.ordered_assertion = Some(token),
-            Effect::OrderedIo => self.ordered_io = Some(token),
-            Effect::UnorderedIo => panic!("unordered effects do not have token slots"),
+    fn set(&mut self, effect_class: EffectClass, token: ValueRef<'b, 'c, 't>) {
+        match effect_class {
+            EffectClass::OrderedState => unreachable!("ordered state effects must be discharged before XLA lowering"),
+            EffectClass::OrderedAssertion => self.ordered_assertion = Some(token),
+            EffectClass::OrderedIo => self.ordered_io = Some(token),
+            EffectClass::UnorderedIo => panic!("unordered effects do not have token slots"),
         }
     }
 }
@@ -495,15 +495,17 @@ where
         region
             .instructions()
             .iter()
-            .any(|instruction| instruction.operation().effects().contains(Effect::OrderedState))
+            .any(|instruction| instruction.operation().effects().classes().contains(EffectClass::OrderedState))
     })
 }
 
-/// Returns `true` if `program` contains a reference-typed atom or intrinsic reference semantics in any region.
+/// Returns `true` if `program` contains a reference-typed atom or an [`Operation`] whose [effects](Operation::effects)
+/// declare a [`ReferenceEffect`](ryft_core::ReferenceEffect) or [`ReferenceAlias`](ryft_core::ReferenceAlias) in any
+/// region.
 ///
 /// This check is independent from [`contains_unresolved_state`]: a pure reference pass-through or forwarded
-/// reference capture can carry reference semantics without executing a stateful instruction. Both predicates back the
-/// pre-compilation state checks and the two direct module-lowering entries; eager binding, dispatch, and staging
+/// reference capture can carry reference declarations without executing a stateful instruction. Both predicates back
+/// the pre-compilation state checks and the two direct module-lowering entries; eager binding, dispatch, and staging
 /// enforce their corresponding boundary invariants separately.
 pub(crate) fn contains_unresolved_references<ProgramInput, ProgramOutput>(
     program: &XlaProgram<ProgramInput, ProgramOutput>,
@@ -513,28 +515,28 @@ where
     ProgramOutput: Parameterized<XlaConstant>,
 {
     // The atom scan dominates for every well-formed program (reference operations always touch a reference-typed
-    // atom); the semantics scan is the independent-verifier arm that still catches a core discharge bug which
+    // atom); the declaration scan is the independent-verifier arm that still catches a core discharge bug which
     // retyped the boundary atoms but left a reference operation behind.
     program.entry_region_ref().contains_atom_type_in_closure(RyftType::is_reference)
         || program.regions().iter().any(|region| {
             region
                 .instructions()
                 .iter()
-                .any(|instruction| !instruction.operation().reference_semantics().is_empty())
+                .any(|instruction| instruction.operation().effects().has_reference_declarations())
         })
 }
 
 /// Returns the effect classes that have StableHLO token slots, in canonical token/result order.
 ///
 /// Token slots are an XLA/StableHLO representation decision, so the classification lives here rather than on the
-/// core [`Effect`] type — but the match is deliberately exhaustive so that adding an effect class forces an explicit
-/// token-slot decision in this backend instead of a silent omission. [`Effect::OrderedState`] has no slot: ordinary
+/// core [`EffectClass`] type — but the match is deliberately exhaustive so that adding a class forces an explicit
+/// token-slot decision in this backend instead of a silent omission. [`EffectClass::OrderedState`] has no slot: ordinary
 /// XLA lowering rejects unresolved state at its module entry boundaries, and no defensive path may accidentally turn
 /// state into an ordinary token-threaded effect.
-fn token_threaded_effects(effects: Effects) -> impl Iterator<Item = Effect> {
+fn token_threaded_effects(effects: EffectClasses) -> impl Iterator<Item = EffectClass> {
     effects.into_iter().filter(|effect| match effect {
-        Effect::OrderedAssertion | Effect::OrderedIo => true,
-        Effect::UnorderedIo | Effect::OrderedState => false,
+        EffectClass::OrderedAssertion | EffectClass::OrderedIo => true,
+        EffectClass::UnorderedIo | EffectClass::OrderedState => false,
     })
 }
 
@@ -1181,8 +1183,8 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for LogisticOperation<Array
     }
 }
 
-/// [`ErfOperation`] lowers to `chlo.erf`, which the XLA compiler legalizes to a rational polynomial approximation
-/// over StableHLO operations during compilation.
+// [`ErfOperation`] lowers to `chlo.erf`, which the XLA compiler legalizes to a rational polynomial approximation
+// over StableHLO operations during compilation.
 impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ErfOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -1359,8 +1361,8 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ComplexOperation<ArrayT
     }
 }
 
-/// StableHLO has no conjugation operation, so `conjugate` lowers to the `complex(real(z), negate(imag(z)))`
-/// composition (the same decomposition JAX's `conj` lowering uses).
+// StableHLO has no conjugation operation, so `conjugate` lowers to the `complex(real(z), negate(imag(z)))`
+// composition (the same decomposition JAX's `conj` lowering uses).
 impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ConjugateOperation<ArrayType> {
     fn lower_to_mlir<'b, 'c: 'b, 't: 'c>(
         &self,
@@ -1894,7 +1896,14 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ReshapeOperation {
         _mode: PlainMlirLoweringMode,
         lowerer: &mut PlainMlirLowerer<'b, 'c, 't>,
     ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
-        lower_reshape_to_mlir(self, input_values, output_types, &mut lowerer.block, lowerer.location)
+        lower_reshape_to_mlir(
+            self,
+            input_values,
+            output_types,
+            &lowerer.collective_state.bound_manual_axes,
+            &mut lowerer.block,
+            lowerer.location,
+        )
     }
 }
 
@@ -1903,6 +1912,7 @@ fn lower_reshape_to_mlir<'b, 'c: 'b, 't: 'c>(
     operation: &ReshapeOperation,
     input_values: &[ValueRef<'b, 'c, 't>],
     output_types: &[ArrayType],
+    bound_manual_axes: &[String],
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
@@ -1931,7 +1941,7 @@ fn lower_reshape_to_mlir<'b, 'c: 'b, 't: 'c>(
         let output_sharding = output_types[0]
             .sharding()
             .expect("reshape type inference should preserve a requested output sharding");
-        lower_sharding_constraint(&[result], output_sharding, block, location)
+        lower_sharding_constraint(&[result], output_sharding, bound_manual_axes, block, location)
     } else {
         Ok(vec![result])
     }
@@ -2158,6 +2168,7 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for BroadcastOperation {
             input_values,
             lowerer.input_types.as_slice(),
             output_types,
+            &lowerer.collective_state.bound_manual_axes,
             &mut lowerer.block,
             lowerer.context,
             lowerer.location,
@@ -2218,6 +2229,7 @@ fn lower_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
     input_values: &[ValueRef<'b, 'c, 't>],
     input_types: &[ArrayType],
     output_types: &[ArrayType],
+    bound_manual_axes: &[String],
     block: &mut BlockRef<'b, 'c, 't>,
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
@@ -2234,7 +2246,7 @@ fn lower_broadcast_to_mlir<'b, 'c: 'b, 't: 'c>(
     )?)?;
     let result = broadcast.result(0).expect("stablehlo.broadcast_in_dim should return one result").as_ref();
     if broadcast_changes_explicit_sharding(&input_types[0], &output_types[0], operation.output_axes()) {
-        lower_sharding_constraint(&[result], output_types[0].sharding().unwrap(), block, location)
+        lower_sharding_constraint(&[result], output_types[0].sharding().unwrap(), bound_manual_axes, block, location)
     } else {
         Ok(vec![result])
     }
@@ -2452,13 +2464,51 @@ fn lower_transfer_to_memory<'b, 'c: 'b, 't: 'c, B: Block<'b, 'c, 't>, L: Copy + 
     Ok(vec![operation.result(0).expect("stablehlo.custom_call should return one result").as_ref()])
 }
 
+/// Lowers a tensor placement constraint after excluding mesh axes bound by enclosing manual regions.
 fn lower_sharding_constraint<'b, 'c: 'b, 't: 'c>(
     input_values: &[ValueRef<'b, 'c, 't>],
     sharding: &Sharding,
+    bound_manual_axes: &[String],
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     check_count!("input", input_values, 1, ProgramError);
+    // Bound manual axes describe ownership outside this local tensor and cannot appear on constraints inside the
+    // manual region. Restrict only the attribute's mesh inventory; its symbol still names the module's full mesh.
+    let local_sharding;
+    let sharding = if bound_manual_axes.is_empty() {
+        sharding
+    } else {
+        let retain = |axis: &String| !bound_manual_axes.contains(axis);
+        let projected = || -> Result<Sharding, ryft_core::ShardingError> {
+            let mesh = LogicalMesh::new(
+                sharding
+                    .mesh()
+                    .axes()
+                    .iter()
+                    .filter(|axis| !bound_manual_axes.iter().any(|bound| bound == axis.name()))
+                    .cloned()
+                    .collect(),
+            )?;
+            let dimensions = sharding
+                .dimensions()
+                .iter()
+                .map(|dimension| match dimension {
+                    ShardingDimension::Sharded(axes) => {
+                        let axes = axes.iter().filter(|axis| retain(axis)).cloned().collect::<Vec<_>>();
+                        if axes.is_empty() { ShardingDimension::Replicated } else { ShardingDimension::Sharded(axes) }
+                    }
+                    dimension => dimension.clone(),
+                })
+                .collect();
+            Sharding::new(mesh, dimensions)?
+                .with_unreduced_axes(sharding.unreduced_axes().iter().filter(|axis| retain(axis)).cloned())?
+                .with_reduced_axes(sharding.reduced_axes().iter().filter(|axis| retain(axis)).cloned())?
+                .with_varying_manual_axes(sharding.varying_manual_axes().iter().filter(|axis| retain(axis)).cloned())
+        };
+        local_sharding = projected().map_err(|error| ProgramError::InvalidArgument { message: error.to_string() })?;
+        &local_sharding
+    };
     let sharding_attribute = sharding.to_mlir(location)?;
     let operation =
         block.append_operation(shardy::sharding_constraint(input_values[0], sharding_attribute, location)?)?;
@@ -2473,17 +2523,17 @@ fn lower_sharding_constraint<'b, 'c: 'b, 't: 'c>(
 /// the final tokens are intentionally omitted from the public function results because their custom calls are marked
 /// side-effecting and the tokens exist only to encode intra-execution ordering.
 fn current_or_new_token<'b, 'c: 'b, 't: 'c>(
-    effect: Effect,
+    effect_class: EffectClass,
     effect_tokens: &mut EffectTokens<'b, 'c, 't>,
     block: &mut BlockRef<'b, 'c, 't>,
     location: LocationRef<'c, 't>,
 ) -> Result<ValueRef<'b, 'c, 't>, LoweringError> {
-    if let Some(token) = effect_tokens.get(effect) {
+    if let Some(token) = effect_tokens.get(effect_class) {
         return Ok(token);
     }
     let created = block.append_operation(stable_hlo::after_all::<ValueRef, _>(&[], location)?)?;
     let created = created.result(0).expect("stablehlo.after_all should return one result").as_ref();
-    effect_tokens.set(effect, created);
+    effect_tokens.set(effect_class, created);
     Ok(created)
 }
 
@@ -2497,7 +2547,7 @@ fn lower_assertion_custom_call<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<(), LoweringError> {
-    let input_token = current_or_new_token(Effect::OrderedAssertion, effect_tokens, block, location)?;
+    let input_token = current_or_new_token(EffectClass::OrderedAssertion, effect_tokens, block, location)?;
     let mut inputs = Vec::with_capacity(2 + observed_values.len());
     inputs.push(predicate);
     inputs.extend_from_slice(observed_values);
@@ -2516,7 +2566,7 @@ fn lower_assertion_custom_call<'b, 'c: 'b, 't: 'c>(
         location,
     )?)?;
     effect_tokens.set(
-        Effect::OrderedAssertion,
+        EffectClass::OrderedAssertion,
         operation.result(0).expect("the assertion custom call should return one token result").as_ref(),
     );
     Ok(())
@@ -2544,7 +2594,7 @@ fn lower_print_to_custom_call<'b, 'c: 'b, 't: 'c>(
     context: &'c MlirContext<'t>,
     location: LocationRef<'c, 't>,
 ) -> Result<(), LoweringError> {
-    let input_token = current_or_new_token(Effect::OrderedIo, effect_tokens, block, location)?;
+    let input_token = current_or_new_token(EffectClass::OrderedIo, effect_tokens, block, location)?;
     let token_type = context.stable_hlo_token_type()?;
     let backend_config = context.dictionary_attribute(&[
         context.named_attribute(context.identifier(PRINT_LABEL_ATTRIBUTE), context.string_attribute(label))
@@ -2563,7 +2613,7 @@ fn lower_print_to_custom_call<'b, 'c: 'b, 't: 'c>(
         location,
     )?)?;
     effect_tokens.set(
-        Effect::OrderedIo,
+        EffectClass::OrderedIo,
         operation.result(0).expect("the print custom call should return one token result").as_ref(),
     );
     Ok(())
@@ -2572,7 +2622,7 @@ fn lower_print_to_custom_call<'b, 'c: 'b, 't: 'c>(
 /// Lowers one retained first-class-dimension requirement to a typed XLA FFI assertion custom call.
 ///
 /// The predicate is computed in StableHLO from the concrete scalar extent operands. The custom call receives that
-/// predicate, the observed extents, and only the [`Effect::OrderedAssertion`] token. Its backend configuration keeps
+/// predicate, the observed extents, and only the [`EffectClass::OrderedAssertion`] token. Its backend configuration keeps
 /// the canonical actor and variable names needed to reconstruct the eager diagnostic if the predicate is false.
 fn lower_dimension_requirement_to_assertion<'b, 'c: 'b, 't: 'c>(
     operation: &DimensionRequirementOperation,
@@ -3330,7 +3380,7 @@ fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c, T: RyftType>(
     let memory_layouts = lower_custom_call_memory_layouts(input_types, output_types, operation.has_side_effect())?;
     let mut lowered_inputs = input_values.to_vec();
     if operation.has_side_effect() {
-        lowered_inputs.push(current_or_new_token(Effect::OrderedIo, effect_tokens, block, location)?);
+        lowered_inputs.push(current_or_new_token(EffectClass::OrderedIo, effect_tokens, block, location)?);
     }
     let mut lowered_output_types = output_types
         .iter()
@@ -3363,7 +3413,7 @@ fn lower_custom_call_to_mlir<'b, 'c: 'b, 't: 'c, T: RyftType>(
     )?)?;
     if operation.has_side_effect() {
         effect_tokens.set(
-            Effect::OrderedIo,
+            EffectClass::OrderedIo,
             lowered
                 .result(output_types.len())
                 .expect("a side-effecting custom call should return one trailing token result")
@@ -3747,12 +3797,20 @@ impl<V: MlirLowerableValue> LowerableXlaOperation<V> for ArrayOperation<V> {
                 mode,
                 lowerer,
             ),
-            ArrayOperation::Reshard(operation) => {
-                lower_sharding_constraint(input_values, operation.sharding(), &mut lowerer.block, lowerer.location)
-            }
-            ArrayOperation::ShardingConstraint(operation) => {
-                lower_sharding_constraint(input_values, operation.sharding(), &mut lowerer.block, lowerer.location)
-            }
+            ArrayOperation::Reshard(operation) => lower_sharding_constraint(
+                input_values,
+                operation.sharding(),
+                &lowerer.collective_state.bound_manual_axes,
+                &mut lowerer.block,
+                lowerer.location,
+            ),
+            ArrayOperation::ShardingConstraint(operation) => lower_sharding_constraint(
+                input_values,
+                operation.sharding(),
+                &lowerer.collective_state.bound_manual_axes,
+                &mut lowerer.block,
+                lowerer.location,
+            ),
             ArrayOperation::Broadcast(operation) => <BroadcastOperation as LowerableXlaOperation<V>>::lower_to_mlir(
                 operation,
                 input_values,
@@ -4416,6 +4474,9 @@ pub(crate) struct CollectiveLoweringState {
     /// Innermost enclosing manual region's [`ShardMap`], or `None` outside manual regions.
     manual_shard_map: Option<Rc<ShardMap>>,
 
+    /// Axes bound by every enclosing manual region, excluded from shard-local placement constraints.
+    bound_manual_axes: Vec<String>,
+
     /// PJRT platform name of the compilation target (e.g., `"cuda"` or `"cpu"`), or `None` when the lowering has
     /// no target information. Platform-gated lowerings such as fused attention consult this and
     /// fall back to their portable form when it is absent.
@@ -4440,6 +4501,7 @@ impl CollectiveLoweringState {
         Self {
             channel_ids: Rc::new(Cell::new(1)),
             manual_shard_map: None,
+            bound_manual_axes: Vec::new(),
             target_platform: None,
             ragged_dot_lowering_strategy: RaggedDotLoweringStrategy::default(),
             named_compositions: None,
@@ -4480,9 +4542,16 @@ impl CollectiveLoweringState {
     /// representation, named compositions, provenance state, and module channel allocator are inherited, while the
     /// provided [`ShardMap`] becomes the innermost manual region.
     pub(crate) fn enter_manual_region(&self, shard_map: ShardMap) -> Self {
+        let mut bound_manual_axes = self.bound_manual_axes.clone();
+        for axis in shard_map.manual_axes() {
+            if !bound_manual_axes.contains(axis) {
+                bound_manual_axes.push(axis.clone());
+            }
+        }
         Self {
             channel_ids: self.channel_ids.clone(),
             manual_shard_map: Some(Rc::new(shard_map)),
+            bound_manual_axes,
             target_platform: self.target_platform.clone(),
             ragged_dot_lowering_strategy: self.ragged_dot_lowering_strategy,
             named_compositions: self.named_compositions.clone(),
@@ -5327,7 +5396,7 @@ where
     Ok(LoweredXlaModule {
         stable_hlo: serialize_lowered_module(&module, &collective_state)?,
         signature,
-        requires_assertion_handler: program.effects().contains(Effect::OrderedAssertion),
+        requires_assertion_handler: program.effects().classes().contains(EffectClass::OrderedAssertion),
     })
 }
 
@@ -5382,9 +5451,9 @@ impl MlirLowerableValue for XlaArrayConstant {
     }
 }
 
-/// [`ArrayType`] is used as the value representation for abstract linear XLA programs. It can type
-/// program atoms, but it is not a concrete literal; lowering paths that need a real value must
-/// supply it through captured arguments instead of materializing it from type metadata.
+// [`ArrayType`] is used as the value representation for abstract linear XLA programs. It can type
+// program atoms, but it is not a concrete literal; lowering paths that need a real value must
+// supply it through captured arguments instead of materializing it from type metadata.
 impl MlirLowerableValue for ArrayType {
     fn to_dense_elements_attribute<'c, 't>(
         &self,
@@ -5395,7 +5464,7 @@ impl MlirLowerableValue for ArrayType {
     }
 }
 
-/// Concrete host literal lowering used by [`ConstantOperation`] and MLIR snapshot tooling.
+// Concrete host literal lowering used by [`ConstantOperation`] and MLIR snapshot tooling.
 impl MlirLowerableValue for CpuArray {
     fn to_dense_elements_attribute<'c, 't>(
         &self,
@@ -5684,7 +5753,7 @@ fn lower_control_flow_region<'b, 'c: 'b, 't: 'c>(
     nested_functions: Option<&Rc<JitCallFunctionMap>>,
     collective_state: &CollectiveLoweringState,
     entry_effect_tokens: EffectTokens<'b, 'c, 't>,
-    threaded_effects: Effects,
+    threaded_effects: EffectClasses,
 ) -> Result<ryft_mlir::DetachedRegion<'c, 't>, LoweringError> {
     let mut region = context.region();
     let block = context.block_with_no_arguments();
@@ -5746,7 +5815,7 @@ fn lower_condition_to_if<'b, 'c: 'b, 't: 'c>(
     let branch_inputs = &input_values[1..];
     // Each ordered class used by either branch is captured and returned independently. Both branches carry the union
     // so their result signatures agree, returning an entry token unchanged when that branch is pure for the class.
-    let threaded_effects = true_branch.effects().union(false_branch.effects());
+    let threaded_effects = true_branch.effects().classes().union(false_branch.effects().classes());
     let mut entry_effect_tokens = *effect_tokens;
     for effect in token_threaded_effects(threaded_effects) {
         let token = current_or_new_token(effect, effect_tokens, block, location)?;
@@ -5841,8 +5910,8 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
     // Therefore, an effectful scalar condition is evaluated before the loop and after each body execution, with its
     // predicate carried through the loop state. This preserves exactly-once condition effects and lets the body
     // return their updated tokens. Batched predicates already use the same carried-predicate shape for masking.
-    let condition_effects = condition.effects();
-    let threaded_predicate = batched_predicate || !condition_effects.is_pure();
+    let condition_effects = condition.effects().classes();
+    let threaded_predicate = batched_predicate || !condition_effects.is_empty();
     let predicate_dimensions = (0..predicate_type.rank()).collect::<Vec<_>>();
     let predicate_offset = if threaded_predicate { 1 } else { 0 };
     // A semantic iteration bound is enforced by threading an internal `i64` iteration counter through the
@@ -5853,7 +5922,7 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
     let counter_offset = if iteration_bound.is_some() { 1 } else { 0 };
     // Carry one trailing token for each ordered class used by either nested program. Each class advances independently
     // through the body; a body that is pure for one active class returns that class's entry token unchanged.
-    let threaded_effects = condition_effects.union(body.effects());
+    let threaded_effects = condition_effects.union(body.effects().classes());
     let threaded_effect_count = token_threaded_effects(threaded_effects).count();
     // State layout: `[counter?, states..., predicate?, ordered-effect tokens...]`.
     let predicate_index = counter_offset + state_count;
@@ -6181,7 +6250,7 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
 ) -> Result<Vec<ValueRef<'b, 'c, 't>>, LoweringError> {
     // The loop carries one trailing token per ordered class used by the body. Fully unrolled bodies update the
     // enclosing scope's chains directly, while pure scans emit no token machinery.
-    let threaded_effects = body_program.effects();
+    let threaded_effects = body_program.effects().classes();
     let body_input_types = body_program.input_types();
     let body_output_types = body_program.output_types();
     let runtime_length_count = usize::from(length.variable().is_some());
@@ -6321,7 +6390,7 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
         state_values.push(initialize_accumulator(y_slice_type, block)?);
         state_types.push(stacked_type.into());
     }
-    // Effect tokens ride at the end of the loop state, so counter/carry/stack/accumulator index math stays untouched.
+    // EffectClass tokens ride at the end of the loop state, so counter/carry/stack/accumulator index math stays untouched.
     let token_start_index = state_types.len();
     let mut lowered_state_types = state_types
         .iter()
@@ -6931,7 +7000,7 @@ where
         let (count, program) = counts.remove(&key).expect("every ordered key was counted");
         // Effectful callees always inline (even when repeated) so their effectful instructions chain onto the
         // caller's effect token in program order; a shared token-free function could not preserve that ordering.
-        if count < 2 || !program.effects().is_pure() {
+        if count < 2 || !program.effects().classes().is_empty() {
             continue;
         }
         let symbol = format!("jit_call_{}", map.order.len());
@@ -7339,7 +7408,7 @@ where
             let location = collective_state.instruction_location(context, instruction.provenance(), location);
             let mut lowerer = PlainMlirLowerer::new(*block, context, location)
                 .with_input_types(input_types)
-                .with_effect_tokens(effect_tokens)
+                .with_effect_tokens(std::mem::take(&mut effect_tokens))
                 .with_collective_state(collective_state.clone());
             let outputs = instruction.operation().lower_to_mlir(
                 inputs,
@@ -7748,7 +7817,7 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
             };
             // Only ordered effects need token threading, which `sdy.manual_computation` cannot express; a body
             // whose effects are all unordered lowers without any token state.
-            if body.effects().is_ordered() {
+            if body.effects().classes().is_ordered() {
                 return Err(LoweringError::EffectfulShardMapBody);
             }
             let simplified_body = body
@@ -7760,12 +7829,20 @@ fn dispatch_lower_shard_map_mlir<'b, 'c: 'b, 't: 'c>(
                 .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(ProgramError::from)?;
+            // References are discharged before lowering, so every global boundary type is an array by the time the
+            // manual computation is lowered.
+            let global_output_types = operation
+                .global_output_types()
+                .iter()
+                .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ProgramError::from)?;
             lowerer.lower_manual_computation(
                 input_values,
                 operation.shard_map(),
                 &simplified_body,
                 local_input_types.as_slice(),
-                operation.global_output_types(),
+                global_output_types.as_slice(),
             )
         }
         _ => unreachable!("member and mixed operations are handled by the canonical core operation family"),
@@ -9706,8 +9783,6 @@ fn unsigned_integer_width(data_type: DataType) -> Result<usize, LoweringError> {
 
 #[cfg(test)]
 mod tests {
-    use std::ops::{Deref, DerefMut};
-
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
@@ -9734,6 +9809,7 @@ mod tests {
     };
 
     use crate::ToPjrt;
+    use crate::experimental::ops::XlaProgramBuilder as CompositeXlaProgramBuilder;
     use crate::tests::values_to_bytes;
 
     use super::super::shard_map::{TracedShardMap, shard_map as traced_shard_map};
@@ -9753,45 +9829,6 @@ mod tests {
 
     fn attention_backward_operation(configuration: AttentionConfiguration) -> DotProductAttentionBackwardOperation {
         DotProductAttentionBackwardOperation::new(configuration, AttentionOperandSignature::default())
-    }
-
-    /// Array-oriented facade over the production composite program builder.
-    struct CompositeXlaProgramBuilder(crate::experimental::ops::XlaProgramBuilder);
-
-    impl CompositeXlaProgramBuilder {
-        /// Creates an empty production composite program builder.
-        fn new() -> Self {
-            Self(crate::experimental::ops::XlaProgramBuilder::new())
-        }
-
-        /// Adds an array input while lifting its descriptor into the composite type universe.
-        fn add_input(&mut self, r#type: ArrayType) -> AtomId {
-            self.0.add_input(ArrayIrType::Array(r#type))
-        }
-
-        /// Finalizes the composite program.
-        fn build<Input: Parameterized<XlaConstant>, Output: Parameterized<XlaConstant>>(
-            self,
-            output_ids: Vec<AtomId>,
-            input_structure: Input::ParameterStructure,
-            output_structure: Output::ParameterStructure,
-        ) -> Result<XlaProgram<Input, Output>, ProgramError> {
-            self.0.build(output_ids, input_structure, output_structure)
-        }
-    }
-
-    impl Deref for CompositeXlaProgramBuilder {
-        type Target = crate::experimental::ops::XlaProgramBuilder;
-
-        fn deref(&self) -> &Self::Target {
-            &self.0
-        }
-    }
-
-    impl DerefMut for CompositeXlaProgramBuilder {
-        fn deref_mut(&mut self) -> &mut Self::Target {
-            &mut self.0
-        }
     }
 
     fn test_manual_mesh(axis_name: &str, axis_size: usize) -> LogicalMesh {
@@ -10207,6 +10244,7 @@ mod tests {
             &ReshapeOperation::new(Shape::new(vec![Dimension::Static(4)])),
             &[],
             &[test_vector_type(4)],
+            &[],
             &mut block,
             location.as_ref(),
         )
@@ -10385,7 +10423,7 @@ mod tests {
     fn test_xla_lowering_rejects_unresolved_reference_state_before_token_threading() {
         use ryft_core::{ReferenceFreezeOperation, ReferenceNewOperation, ReferenceWriteOperation};
 
-        assert_eq!(token_threaded_effects(Effects::single(Effect::OrderedState)).next(), None);
+        assert_eq!(token_threaded_effects(EffectClasses::single(EffectClass::OrderedState)).next(), None);
 
         // The artifact-wide reference scan catches the reference atoms and intrinsic semantics before token threading,
         // so two representative reference operations are enough to pin the diagnostic.
@@ -10804,7 +10842,7 @@ mod tests {
     fn test_to_mlir_module_for_program_lowers_captures_as_hidden_arguments() {
         let array_type = test_vector_type(4);
         let mut builder = CompositeXlaProgramBuilder::new();
-        let input = builder.add_input(array_type.clone());
+        let input = builder.add_input(array_type.clone().into());
         let capture = builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, array_type.clone().into())));
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, capture], None).unwrap()[0];
         let program = builder
@@ -10903,7 +10941,7 @@ mod tests {
         let mut builder = CompositeXlaProgramBuilder::new();
         let true_region = builder.import_program(branch());
         let false_region = builder.import_program(branch());
-        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
         let output = builder
             .add_instruction(
                 XlaOperation::Condition(ConditionOperation::new()),
@@ -10944,8 +10982,8 @@ mod tests {
         let array_type = test_vector_type(4);
         let inner = {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let first_capture = builder.add_input(array_type.clone());
-            let _second_capture = builder.add_input(array_type.clone());
+            let first_capture = builder.add_input(array_type.clone().into());
+            let _second_capture = builder.add_input(array_type.clone().into());
             let second =
                 builder.add_constant(XlaConstant::Captured(CaptureReference::new(1, array_type.clone().into())));
             let output =
@@ -10958,7 +10996,7 @@ mod tests {
         };
         let outer = {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let input = builder.add_input(array_type.clone());
+            let input = builder.add_input(array_type.clone().into());
             let callee_region = builder.intern_callee(&inner, None).unwrap();
             let output = builder
                 .add_instruction(
@@ -10975,7 +11013,7 @@ mod tests {
             )
         };
         let mut builder = CompositeXlaProgramBuilder::new();
-        let input = builder.add_input(array_type.clone());
+        let input = builder.add_input(array_type.clone().into());
         let callee_region = builder.intern_callee(&outer, None).unwrap();
         let output = builder
             .add_instruction(
@@ -11038,7 +11076,7 @@ mod tests {
     /// whether `jit_call` sites share one program (pointer identity) or use structurally-identical distinct programs.
     fn xla_add_self_callee(input_type: ArrayType) -> Arc<FlatXlaProgram> {
         let mut builder = CompositeXlaProgramBuilder::new();
-        let input = builder.add_input(input_type);
+        let input = builder.add_input(input_type.into());
         let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
         Arc::new(builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap())
     }
@@ -11065,7 +11103,7 @@ mod tests {
     fn lower_two_jit_call_module(callees: Vec<Arc<FlatXlaProgram>>) -> String {
         let array_type = test_vector_type(4);
         let mut builder = CompositeXlaProgramBuilder::new();
-        let input = builder.add_input(array_type.clone());
+        let input = builder.add_input(array_type.clone().into());
         let mut accumulator: Option<AtomId> = None;
         for callee in callees {
             let call_output = add_xla_jit_call(&mut builder, &callee, vec![input]);
@@ -11105,7 +11143,7 @@ mod tests {
             body_program,
         );
         let mut builder = CompositeXlaProgramBuilder::new();
-        let input = builder.add_input(vector_type.clone());
+        let input = builder.add_input(vector_type.clone().into());
         let (operation, body) = ShardMapOperation::from_body(body);
         let body = builder.import_program(body);
         let output =
@@ -11199,7 +11237,7 @@ mod tests {
         let callee = xla_add_self_callee(vector_type.clone());
         let body_program = {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let input = builder.add_input(vector_type.clone());
+            let input = builder.add_input(vector_type.clone().into());
             let first = add_xla_jit_call(&mut builder, &callee, vec![input]);
             let second = add_xla_jit_call(&mut builder, &callee, vec![input]);
             let output =
@@ -11238,7 +11276,7 @@ mod tests {
         let vector_type = test_vector_type(4);
         let effectful_body_program = {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let input = builder.add_input(vector_type.clone());
+            let input = builder.add_input(vector_type.clone().into());
             let output =
                 builder.add_instruction(PrintOperation::new("body"), Vec::new(), vec![input], None).unwrap()[0];
             builder
@@ -11262,7 +11300,7 @@ mod tests {
         let vector_type = test_vector_type(4);
         let primal = {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let input = builder.add_input(vector_type.clone());
+            let input = builder.add_input(vector_type.clone().into());
             let printed =
                 builder.add_instruction(PrintOperation::new("primal"), Vec::new(), vec![input], None).unwrap()[0];
             let output =
@@ -11273,8 +11311,8 @@ mod tests {
         };
         let jvp = {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let input = builder.add_input(vector_type.clone());
-            let tangent = builder.add_input(vector_type.clone());
+            let input = builder.add_input(vector_type.clone().into());
+            let tangent = builder.add_input(vector_type.clone().into());
             let output = builder.add_instruction(AddOperation::new(), Vec::new(), vec![input, input], None).unwrap()[0];
             let output_tangent =
                 builder.add_instruction(MulOperation::new(), Vec::new(), vec![tangent, tangent], None).unwrap()[0];
@@ -11290,7 +11328,7 @@ mod tests {
         let mut builder = CompositeXlaProgramBuilder::new();
         let primal_region = builder.import_region(primal.entry_region_ref());
         let jvp_region = builder.import_region(jvp.entry_region_ref());
-        let input = builder.add_input(vector_type.clone());
+        let input = builder.add_input(vector_type.clone().into());
         let output = builder
             .add_instruction(XlaOperation::CustomJvp(operation), vec![primal_region, jvp_region], vec![input], None)
             .unwrap()[0];
@@ -11326,7 +11364,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let primal = {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let input = builder.add_input(scalar_type.clone());
+            let input = builder.add_input(scalar_type.clone().into());
             let output =
                 builder.add_instruction(PrintOperation::new("primal"), Vec::new(), vec![input], None).unwrap()[0];
             builder
@@ -11339,7 +11377,7 @@ mod tests {
         let forward_region = builder.import_region(identity.entry_region_ref());
         let backward_region = builder.import_region(identity.entry_region_ref());
         let tangent_region = builder.import_region(identity.entry_region_ref());
-        let input = builder.add_input(scalar_type.clone());
+        let input = builder.add_input(scalar_type.clone().into());
         let before = builder.add_instruction(PrintOperation::new("before"), Vec::new(), vec![input], None).unwrap()[0];
         let rematerialized = builder
             .add_instruction(
@@ -11379,7 +11417,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::F64);
         let primal = {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let input = builder.add_input(scalar_type.clone());
+            let input = builder.add_input(scalar_type.clone().into());
             let captured = builder
                 .add_constant(XlaConstant::Captured(CaptureReference::new(0, ArrayIrType::Array(scalar_type.clone()))));
             let output =
@@ -11394,7 +11432,7 @@ mod tests {
         let forward_region = builder.import_region(identity.entry_region_ref());
         let backward_region = builder.import_region(identity.entry_region_ref());
         let tangent_region = builder.import_region(identity.entry_region_ref());
-        let input = builder.add_input(scalar_type.clone());
+        let input = builder.add_input(scalar_type.clone().into());
         let output = builder
             .add_instruction(
                 XlaOperation::Rematerialize(RematerializeOperation::new()),
@@ -11428,8 +11466,8 @@ mod tests {
         let vector_type = test_vector_type(4);
         let forward = {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let tangent = builder.add_input(vector_type.clone());
-            let residual = builder.add_input(vector_type.clone());
+            let tangent = builder.add_input(vector_type.clone().into());
+            let residual = builder.add_input(vector_type.clone().into());
             let output =
                 builder.add_instruction(MulOperation::new(), Vec::new(), vec![tangent, residual], None).unwrap()[0];
             builder
@@ -11442,8 +11480,8 @@ mod tests {
         };
         let transpose = {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let residual = builder.add_input(vector_type.clone());
-            let cotangent = builder.add_input(vector_type.clone());
+            let residual = builder.add_input(vector_type.clone().into());
+            let cotangent = builder.add_input(vector_type.clone().into());
             let output =
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![residual, cotangent], None).unwrap()[0];
             builder
@@ -11457,8 +11495,8 @@ mod tests {
         let mut builder = CompositeXlaProgramBuilder::new();
         let forward = builder.import_region(forward.entry_region_ref());
         let transpose = builder.import_region(transpose.entry_region_ref());
-        let tangent = builder.add_input(vector_type.clone());
-        let residual = builder.add_input(vector_type.clone());
+        let tangent = builder.add_input(vector_type.clone().into());
+        let residual = builder.add_input(vector_type.clone().into());
         let output = builder
             .add_instruction(
                 XlaOperation::LinearCall(LinearCallOperation::new(1)),
@@ -11498,8 +11536,8 @@ mod tests {
         let vector_type = test_vector_type(4);
         let backward = {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let residual = builder.add_input(vector_type.clone());
-            let cotangent = builder.add_input(vector_type.clone());
+            let residual = builder.add_input(vector_type.clone().into());
+            let cotangent = builder.add_input(vector_type.clone().into());
             let output =
                 builder.add_instruction(MulOperation::new(), Vec::new(), vec![residual, cotangent], None).unwrap()[0];
             builder
@@ -11517,8 +11555,8 @@ mod tests {
         );
         let mut builder = CompositeXlaProgramBuilder::new();
         let backward_region = builder.import_region(backward.entry_region_ref());
-        let tangent = builder.add_input(vector_type.clone());
-        let residual = builder.add_input(vector_type.clone());
+        let tangent = builder.add_input(vector_type.clone().into());
+        let residual = builder.add_input(vector_type.clone().into());
         let output = builder
             .add_instruction(XlaOperation::LinearCall(operation), vec![backward_region], vec![tangent, residual], None)
             .unwrap()[0];
@@ -11547,8 +11585,8 @@ mod tests {
         let mut builder = CompositeXlaProgramBuilder::new();
         let true_region = builder.import_program(unproject_plain_program(xla_neg_branch(vector_type.clone())));
         let false_region = builder.import_program(unproject_plain_program(xla_identity_branch(vector_type.clone())));
-        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
-        let input = builder.add_input(vector_type);
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let input = builder.add_input(vector_type.into());
         let output = builder
             .add_instruction(
                 XlaOperation::Condition(ConditionOperation::new()),
@@ -11571,8 +11609,8 @@ mod tests {
         let second = xla_condition_callee();
         let vector_type = test_vector_type(4);
         let mut builder = CompositeXlaProgramBuilder::new();
-        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
-        let input = builder.add_input(vector_type.clone());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let input = builder.add_input(vector_type.clone().into());
         let mut accumulator: Option<AtomId> = None;
         for callee in [first.clone(), first, second.clone(), second] {
             let call_output = add_xla_jit_call(&mut builder, &callee, vec![predicate, input]);
@@ -13538,8 +13576,8 @@ mod tests {
         let mut builder = CompositeXlaProgramBuilder::new();
         let true_region = builder.import_program(unproject_plain_program(xla_neg_branch(input_type.clone())));
         let false_region = builder.import_program(unproject_plain_program(xla_identity_branch(input_type.clone())));
-        let predicate = builder.add_input(predicate_type.clone());
-        let input = builder.add_input(input_type.clone());
+        let predicate = builder.add_input(predicate_type.clone().into());
+        let input = builder.add_input(input_type.clone().into());
         let output = builder
             .add_instruction(
                 XlaOperation::Condition(ConditionOperation::new()),
@@ -13579,7 +13617,7 @@ mod tests {
 
         let branch = |double: bool| {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let operand = builder.add_input(scalar_f32.clone());
+            let operand = builder.add_input(scalar_f32.clone().into());
             let output = if double {
                 builder.add_instruction(AddOperation::new(), Vec::new(), vec![operand, operand], None).unwrap()[0]
             } else {
@@ -13591,8 +13629,8 @@ mod tests {
         };
 
         let mut scan_body_builder = CompositeXlaProgramBuilder::new();
-        let carry = scan_body_builder.add_input(scalar_f32.clone());
-        let item = scan_body_builder.add_input(scalar_f32.clone());
+        let carry = scan_body_builder.add_input(scalar_f32.clone().into());
+        let item = scan_body_builder.add_input(scalar_f32.clone().into());
         let next_carry =
             scan_body_builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, item], None).unwrap()[0];
         let scan_body = scan_body_builder
@@ -13604,7 +13642,7 @@ mod tests {
             .unwrap();
 
         let mut while_condition_builder = CompositeXlaProgramBuilder::new();
-        let state = while_condition_builder.add_input(scalar_f32.clone());
+        let state = while_condition_builder.add_input(scalar_f32.clone().into());
         let while_predicate = while_condition_builder
             .add_instruction(
                 XlaOperation::Array(ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::LessThan))),
@@ -13617,7 +13655,7 @@ mod tests {
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![while_predicate], vec![Placeholder], vec![Placeholder])
             .unwrap();
         let mut while_body_builder = CompositeXlaProgramBuilder::new();
-        let state = while_body_builder.add_input(scalar_f32.clone());
+        let state = while_body_builder.add_input(scalar_f32.clone().into());
         let next_state = while_body_builder
             .add_instruction(AddOperation::new(), Vec::new(), vec![state, state], None)
             .unwrap()[0];
@@ -13631,9 +13669,9 @@ mod tests {
         let scan_region = builder.import_region(scan_body.entry_region_ref());
         let while_condition_region = builder.import_region(while_condition.entry_region_ref());
         let while_body_region = builder.import_region(while_body.entry_region_ref());
-        let predicate = builder.add_input(scalar_boolean.clone());
-        let operand = builder.add_input(scalar_f32.clone());
-        let items = builder.add_input(vector_f32.clone());
+        let predicate = builder.add_input(scalar_boolean.clone().into());
+        let operand = builder.add_input(scalar_f32.clone().into());
+        let items = builder.add_input(vector_f32.clone().into());
         let selected = builder
             .add_instruction(
                 XlaOperation::Condition(ConditionOperation::new()),
@@ -13672,9 +13710,9 @@ mod tests {
         // condition and loop operations.
         let mut builder = CompositeXlaProgramBuilder::new();
         let callee = builder.import_region(program.entry_region_ref());
-        let predicate = builder.add_input(scalar_boolean.clone());
-        let operand = builder.add_input(scalar_f32.clone());
-        let items = builder.add_input(vector_f32.clone());
+        let predicate = builder.add_input(scalar_boolean.clone().into());
+        let operand = builder.add_input(scalar_f32.clone().into());
+        let items = builder.add_input(vector_f32.clone().into());
         let outputs = builder
             .add_instruction(
                 XlaOperation::JitCall(crate::experimental::ops::JitCallOperation::new(0)),
@@ -13691,7 +13729,7 @@ mod tests {
         let linearization = program.linearize().unwrap();
         let primal = linearization.primal();
         assert_eq!(linearization.residual_count(), 2);
-        assert_eq!(primal.instructions().len(), 2);
+        assert_eq!(primal.instructions().len(), 1);
         let primal_inputs = vec![scalar_boolean, scalar_f32.clone(), vector_f32.clone()];
         let primal_outputs = primal
             .output_types()
@@ -13883,7 +13921,7 @@ mod tests {
         let mut builder = CompositeXlaProgramBuilder::new();
         let true_region = builder.import_program(unproject_plain_program(xla_neg_branch(input_type.clone())));
         let false_region = builder.import_program(unproject_plain_program(xla_identity_branch(input_type.clone())));
-        let input = builder.add_input(input_type.clone());
+        let input = builder.add_input(input_type.clone().into());
         let predicate =
             builder.add_instruction(OneOperation::new(predicate_type), Vec::new(), vec![], None).unwrap()[0];
         let output = builder
@@ -13916,8 +13954,8 @@ mod tests {
 
         let branch = |negate: bool| {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let branch_extent = builder.0.add_input(extent_type.clone().into());
-            let scalar = builder.add_input(scalar_type.clone());
+            let branch_extent = builder.add_input(extent_type.clone().into());
+            let scalar = builder.add_input(scalar_type.clone().into());
             let scalar = if negate {
                 builder.add_instruction(NegOperation::new(), Vec::new(), vec![scalar], None).unwrap()[0]
             } else {
@@ -13943,9 +13981,9 @@ mod tests {
         let mut builder = CompositeXlaProgramBuilder::new();
         let true_region = builder.import_region(branch(false).entry_region_ref());
         let false_region = builder.import_region(branch(true).entry_region_ref());
-        let vector = builder.add_input(dynamic_vector_type.clone());
-        let predicate = builder.add_input(predicate_type.clone());
-        let scalar = builder.add_input(scalar_type.clone());
+        let vector = builder.add_input(dynamic_vector_type.clone().into());
+        let predicate = builder.add_input(predicate_type.clone().into());
+        let scalar = builder.add_input(scalar_type.clone().into());
         let extent = builder
             .add_instruction(
                 DimensionSizeOperation::new(&dynamic_vector_type, 0).unwrap(),
@@ -13992,7 +14030,7 @@ mod tests {
         let mut builder = CompositeXlaProgramBuilder::new();
         let condition_region = builder.import_program(unproject_plain_program(xla_identity_branch(state_type.clone())));
         let body_region = builder.import_program(unproject_plain_program(xla_identity_branch(state_type.clone())));
-        let state = builder.add_input(state_type.clone());
+        let state = builder.add_input(state_type.clone().into());
         let output = builder
             .add_instruction(
                 XlaOperation::While(WhileOperation::new()),
@@ -14024,7 +14062,7 @@ mod tests {
         let state_type = ArrayType::scalar(DataType::Boolean);
         let condition = {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let state = builder.add_input(state_type.clone());
+            let state = builder.add_input(state_type.clone().into());
             let predicate =
                 builder.add_instruction(PrintOperation::new("condition"), Vec::new(), vec![state], None).unwrap()[0];
             builder
@@ -14034,7 +14072,7 @@ mod tests {
         let mut builder = CompositeXlaProgramBuilder::new();
         let condition_region = builder.import_region(condition.entry_region_ref());
         let body_region = builder.import_program(unproject_plain_program(xla_identity_branch(state_type.clone())));
-        let state = builder.add_input(state_type.clone());
+        let state = builder.add_input(state_type.clone().into());
         let output = builder
             .add_instruction(
                 XlaOperation::While(WhileOperation::new().with_iteration_bound(1).unwrap()),
@@ -14066,7 +14104,7 @@ mod tests {
 
         let condition = {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let extent = builder.0.add_input(extent_type.clone().into());
+            let extent = builder.add_input(extent_type.clone().into());
             let predicate = builder
                 .add_instruction(
                     XlaOperation::Compare(CompareOperation::new(ComparisonDirection::LessThan)),
@@ -14081,7 +14119,7 @@ mod tests {
         };
         let body = {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let extent = builder.0.add_input(extent_type.into());
+            let extent = builder.add_input(extent_type.into());
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![extent], vec![Placeholder], vec![Placeholder])
                 .unwrap()
@@ -14090,8 +14128,8 @@ mod tests {
         let mut builder = CompositeXlaProgramBuilder::new();
         let condition_region = builder.import_region(condition.entry_region_ref());
         let body_region = builder.import_region(body.entry_region_ref());
-        let vector = builder.add_input(dynamic_vector_type.clone());
-        let scalar = builder.add_input(scalar_type.clone());
+        let vector = builder.add_input(dynamic_vector_type.clone().into());
+        let scalar = builder.add_input(scalar_type.clone().into());
         let extent = builder
             .add_instruction(
                 DimensionSizeOperation::new(&dynamic_vector_type, 0).unwrap(),
@@ -14146,7 +14184,7 @@ mod tests {
         let mut builder = CompositeXlaProgramBuilder::new();
         let condition_region = builder.import_program(unproject_plain_program(xla_identity_branch(state_type.clone())));
         let body_region = builder.import_program(unproject_plain_program(xla_identity_branch(state_type.clone())));
-        let state = builder.add_input(state_type.clone());
+        let state = builder.add_input(state_type.clone().into());
         let output = builder
             .add_instruction(
                 XlaOperation::While(while_operation),
@@ -14179,7 +14217,7 @@ mod tests {
         let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let condition = {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let state = builder.add_input(state_type.clone());
+            let state = builder.add_input(state_type.clone().into());
             let zero = builder
                 .add_instruction(ZeroLikeOperation::<ArrayType>::new(), Vec::new(), vec![state], None)
                 .unwrap()[0];
@@ -14198,7 +14236,7 @@ mod tests {
         .unwrap();
         let body = {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let state = builder.add_input(state_type.clone());
+            let state = builder.add_input(state_type.clone().into());
             let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
             let next = builder.add_instruction(SubOperation::new(), Vec::new(), vec![state, one], None).unwrap()[0];
             builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder], vec![Placeholder])
@@ -14207,7 +14245,7 @@ mod tests {
         let mut builder = CompositeXlaProgramBuilder::new();
         let condition_region = builder.import_region(condition.entry_region_ref());
         let body_region = builder.import_region(body.entry_region_ref());
-        let state = builder.add_input(state_type.clone());
+        let state = builder.add_input(state_type.clone().into());
         let output = builder
             .add_instruction(
                 XlaOperation::While(WhileOperation::new()),
@@ -14244,8 +14282,8 @@ mod tests {
         let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let condition = {
             let mut builder = CompositeXlaProgramBuilder::new();
-            builder.0.add_input(extent_type.clone().into());
-            let state = builder.add_input(state_type.clone());
+            builder.add_input(extent_type.clone().into());
+            let state = builder.add_input(state_type.clone().into());
             let zero = builder
                 .add_instruction(ZeroLikeOperation::<ArrayType>::new(), Vec::new(), vec![state], None)
                 .unwrap()[0];
@@ -14268,8 +14306,8 @@ mod tests {
         .unwrap();
         let body = {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let carried_extent = builder.0.add_input(extent_type.into());
-            let state = builder.add_input(state_type.clone());
+            let carried_extent = builder.add_input(extent_type.into());
+            let state = builder.add_input(state_type.clone().into());
             let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
             let next = builder.add_instruction(SubOperation::new(), Vec::new(), vec![state, one], None).unwrap()[0];
             builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(
@@ -14282,8 +14320,8 @@ mod tests {
         let mut builder = CompositeXlaProgramBuilder::new();
         let condition_region = builder.import_region(condition.entry_region_ref());
         let body_region = builder.import_region(body.entry_region_ref());
-        let vector = builder.add_input(dynamic_vector_type.clone());
-        let state = builder.add_input(state_type.clone());
+        let vector = builder.add_input(dynamic_vector_type.clone().into());
+        let state = builder.add_input(state_type.clone().into());
         let extent = builder
             .add_instruction(
                 DimensionSizeOperation::new(&dynamic_vector_type, 0).unwrap(),
@@ -14364,8 +14402,8 @@ mod tests {
 
         let scalar_f32 = ArrayType::scalar(DataType::F32);
         let mut body_builder = CompositeXlaProgramBuilder::new();
-        let carry = body_builder.add_input(scalar_f32.clone());
-        let x = body_builder.add_input(scalar_f32.clone());
+        let carry = body_builder.add_input(scalar_f32.clone().into());
+        let x = body_builder.add_input(scalar_f32.clone().into());
         let product = body_builder.add_instruction(MulOperation::new(), Vec::new(), vec![carry, x], None).unwrap()[0];
         let body = body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
@@ -14378,9 +14416,9 @@ mod tests {
 
         let mut builder = CompositeXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
-        let init = builder.add_input(scalar_f32.clone());
+        let init = builder.add_input(scalar_f32.clone().into());
         let stacked_type = test_vector_type(3);
-        let stacked_inputs = builder.add_input(stacked_type.clone());
+        let stacked_inputs = builder.add_input(stacked_type.clone().into());
         let outputs = builder
             .add_instruction(XlaOperation::Scan(scan), vec![body_region], vec![init, stacked_inputs], None)
             .unwrap()
@@ -14412,8 +14450,8 @@ mod tests {
 
         let body = {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let extent = builder.0.add_input(extent_type.into());
-            let value = builder.add_input(dynamic_vector_type.clone());
+            let extent = builder.add_input(extent_type.into());
+            let value = builder.add_input(dynamic_vector_type.clone().into());
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![extent, value],
@@ -14425,7 +14463,7 @@ mod tests {
 
         let mut builder = CompositeXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
-        let values = builder.add_input(dynamic_vector_type.clone());
+        let values = builder.add_input(dynamic_vector_type.clone().into());
         let extent = builder
             .add_instruction(
                 DimensionSizeOperation::new(&dynamic_vector_type, 0).unwrap(),
@@ -14471,7 +14509,7 @@ mod tests {
 
         let body = {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let carry = builder.add_input(scalar_type.clone());
+            let carry = builder.add_input(scalar_type.clone().into());
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![carry, carry],
@@ -14482,8 +14520,8 @@ mod tests {
         };
         let mut builder = CompositeXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
-        let carry = builder.add_input(scalar_type.clone());
-        let runtime_length = builder.0.add_input(length_type.clone().into());
+        let carry = builder.add_input(scalar_type.clone().into());
+        let runtime_length = builder.add_input(length_type.clone().into());
         let outputs = builder
             .add_instruction(
                 XlaOperation::Scan(ScanOperation::new(1, Dimension::Dynamic(length))),
@@ -14530,7 +14568,7 @@ mod tests {
 
         let body = {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let state = builder.add_input(state_type);
+            let state = builder.add_input(state_type.into());
             let outputs = builder
                 .add_instruction(
                     XlaOperation::RngBitGenerator(RngBitGeneratorOperation::new(RandomAlgorithm::ThreeFry, bits_type)),
@@ -14546,8 +14584,8 @@ mod tests {
         };
         let mut builder = CompositeXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
-        let states = builder.add_input(stacked_state_type.clone());
-        let runtime_batch = builder.0.add_input(batch_type.into());
+        let states = builder.add_input(stacked_state_type.clone().into());
+        let runtime_batch = builder.add_input(batch_type.into());
         let outputs = builder
             .add_instruction(
                 XlaOperation::Scan(ScanOperation::new(0, Dimension::Dynamic(batch))),
@@ -14590,8 +14628,8 @@ mod tests {
 
         let scalar_f32 = ArrayType::scalar(DataType::F32);
         let mut body_builder = CompositeXlaProgramBuilder::new();
-        let carry = body_builder.add_input(scalar_f32.clone());
-        let x = body_builder.add_input(scalar_f32.clone());
+        let carry = body_builder.add_input(scalar_f32.clone().into());
+        let x = body_builder.add_input(scalar_f32.clone().into());
         let product = body_builder.add_instruction(MulOperation::new(), Vec::new(), vec![carry, x], None).unwrap()[0];
         let body = body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
@@ -14604,9 +14642,9 @@ mod tests {
 
         let mut builder = CompositeXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
-        let init = builder.add_input(scalar_f32.clone());
+        let init = builder.add_input(scalar_f32.clone().into());
         let stacked_type = test_vector_type(3);
-        let stacked_inputs = builder.add_input(stacked_type.clone());
+        let stacked_inputs = builder.add_input(stacked_type.clone().into());
         let outputs = builder
             .add_instruction(XlaOperation::Scan(scan), vec![body_region], vec![init, stacked_inputs], None)
             .unwrap()
@@ -14638,8 +14676,8 @@ mod tests {
 
         let scalar_f32 = ArrayType::scalar(DataType::F32);
         let mut body_builder = CompositeXlaProgramBuilder::new();
-        let carry = body_builder.add_input(scalar_f32.clone());
-        let x = body_builder.add_input(scalar_f32.clone());
+        let carry = body_builder.add_input(scalar_f32.clone().into());
+        let x = body_builder.add_input(scalar_f32.clone().into());
         let product = body_builder.add_instruction(MulOperation::new(), Vec::new(), vec![carry, x], None).unwrap()[0];
         let body = body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
@@ -14652,9 +14690,9 @@ mod tests {
 
         let mut builder = CompositeXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
-        let init = builder.add_input(scalar_f32.clone());
+        let init = builder.add_input(scalar_f32.clone().into());
         let stacked_type = test_vector_type(4);
-        let stacked_inputs = builder.add_input(stacked_type.clone());
+        let stacked_inputs = builder.add_input(stacked_type.clone().into());
         let outputs = builder
             .add_instruction(XlaOperation::Scan(scan), vec![body_region], vec![init, stacked_inputs], None)
             .unwrap()
@@ -14848,7 +14886,7 @@ mod tests {
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(9)).unwrap());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)]));
         let mut builder = CompositeXlaProgramBuilder::new();
-        let input = builder.add_input(dynamic_type.clone());
+        let input = builder.add_input(dynamic_type.clone().into());
         let extent = builder
             .add_instruction(DimensionSizeOperation::new(&dynamic_type, 0).unwrap(), Vec::new(), vec![input], None)
             .unwrap()[0];
@@ -15366,10 +15404,10 @@ mod tests {
 
         let mut builder = CompositeXlaProgramBuilder::new();
         let inputs = vec![
-            builder.add_input(element_type.clone()),
-            builder.add_input(element_type.clone()),
-            builder.add_input(scale_type.clone()),
-            builder.add_input(scale_type.clone()),
+            builder.add_input(element_type.clone().into()),
+            builder.add_input(element_type.clone().into()),
+            builder.add_input(scale_type.clone().into()),
+            builder.add_input(scale_type.clone().into()),
         ];
         let first = add_xla_jit_call(&mut builder, &callee, inputs.clone());
         let second = add_xla_jit_call(&mut builder, &callee, inputs);
@@ -16195,8 +16233,8 @@ mod tests {
         // continues the chain (unused here because the program ends right after the scan).
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let mut body_builder = CompositeXlaProgramBuilder::new();
-        let carry = body_builder.add_input(scalar_f64.clone());
-        let x = body_builder.add_input(scalar_f64.clone());
+        let carry = body_builder.add_input(scalar_f64.clone().into());
+        let x = body_builder.add_input(scalar_f64.clone().into());
         let printed =
             body_builder.add_instruction(PrintOperation::new("iteration"), Vec::new(), vec![x], None).unwrap()[0];
         let sum = body_builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, printed], None).unwrap()[0];
@@ -16208,8 +16246,8 @@ mod tests {
         let stacked_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let mut builder = CompositeXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
-        let init = builder.add_input(scalar_f64.clone());
-        let stacked_inputs = builder.add_input(stacked_type.clone());
+        let init = builder.add_input(scalar_f64.clone().into());
+        let stacked_inputs = builder.add_input(stacked_type.clone().into());
         let output = builder
             .add_instruction(XlaOperation::Scan(scan), vec![body_region], vec![init, stacked_inputs], None)
             .unwrap()[0];
@@ -16262,8 +16300,8 @@ mod tests {
         // contributes ordered I/O. The loop state carries two independent trailing tokens in canonical class order.
         let scalar_type = ArrayType::scalar(DataType::I64);
         let mut body_builder = CompositeXlaProgramBuilder::new();
-        let carry = body_builder.add_input(scalar_type.clone());
-        let value = body_builder.add_input(scalar_type.clone());
+        let carry = body_builder.add_input(scalar_type.clone().into());
+        let value = body_builder.add_input(scalar_type.clone().into());
         body_builder
             .add_instruction(
                 DimensionFromScalarOperation::new(DimensionVariable::new(
@@ -16286,8 +16324,8 @@ mod tests {
         let stacked_type = ArrayType::new(DataType::I64, Shape::new(vec![Dimension::Static(3)]));
         let mut builder = CompositeXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
-        let initial = builder.add_input(scalar_type.clone());
-        let stacked = builder.add_input(stacked_type.clone());
+        let initial = builder.add_input(scalar_type.clone().into());
+        let stacked = builder.add_input(stacked_type.clone().into());
         let output = builder
             .add_instruction(XlaOperation::Scan(scan), vec![body_region], vec![initial, stacked], None)
             .unwrap()[0];
@@ -16326,7 +16364,7 @@ mod tests {
         let predicate_type = ArrayType::scalar(DataType::Boolean);
         let input_type = ArrayType::scalar(DataType::F64);
         let mut true_builder = CompositeXlaProgramBuilder::new();
-        let true_input = true_builder.add_input(input_type.clone());
+        let true_input = true_builder.add_input(input_type.clone().into());
         let printed = true_builder
             .add_instruction(PrintOperation::new("taken"), Vec::new(), vec![true_input], None)
             .unwrap()[0];
@@ -16338,8 +16376,8 @@ mod tests {
         let mut builder = CompositeXlaProgramBuilder::new();
         let true_region = builder.import_region(true_branch.entry_region_ref());
         let false_region = builder.import_program(unproject_plain_program(xla_identity_branch(input_type.clone())));
-        let predicate = builder.add_input(predicate_type.clone());
-        let input = builder.add_input(input_type.clone());
+        let predicate = builder.add_input(predicate_type.clone().into());
+        let input = builder.add_input(input_type.clone().into());
         let output = builder
             .add_instruction(
                 XlaOperation::Condition(ConditionOperation::new()),
@@ -16389,7 +16427,7 @@ mod tests {
         let scalar_type = ArrayType::scalar(DataType::I64);
         let true_branch = {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let input = builder.add_input(scalar_type.clone());
+            let input = builder.add_input(scalar_type.clone().into());
             builder
                 .add_instruction(
                     DimensionFromScalarOperation::new(DimensionVariable::new(
@@ -16407,7 +16445,7 @@ mod tests {
         };
         let false_branch = {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let input = builder.add_input(scalar_type.clone());
+            let input = builder.add_input(scalar_type.clone().into());
             let output =
                 builder.add_instruction(PrintOperation::new("false"), Vec::new(), vec![input], None).unwrap()[0];
             builder
@@ -16417,8 +16455,8 @@ mod tests {
         let mut builder = CompositeXlaProgramBuilder::new();
         let true_region = builder.import_region(true_branch.entry_region_ref());
         let false_region = builder.import_region(false_branch.entry_region_ref());
-        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
-        let input = builder.add_input(scalar_type.clone());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let input = builder.add_input(scalar_type.clone().into());
         let output = builder
             .add_instruction(
                 XlaOperation::Condition(ConditionOperation::new()),
@@ -16464,8 +16502,8 @@ mod tests {
         let right_dimension_type = DimensionType::new(right_variable.clone());
 
         let mut builder = CompositeXlaProgramBuilder::new();
-        let left = builder.add_input(scalar_type.clone());
-        let right = builder.add_input(scalar_type.clone());
+        let left = builder.add_input(scalar_type.clone().into());
+        let right = builder.add_input(scalar_type.clone().into());
         let left_dimension = builder
             .add_instruction(DimensionFromScalarOperation::new(left_variable), Vec::new(), vec![left], None)
             .unwrap()[0];
@@ -16538,8 +16576,8 @@ mod tests {
             let left_type = DimensionType::new(left_variable.clone());
             let right_type = DimensionType::new(right_variable.clone());
             let mut builder = CompositeXlaProgramBuilder::new();
-            let left = builder.add_input(scalar_type.clone());
-            let right = builder.add_input(scalar_type.clone());
+            let left = builder.add_input(scalar_type.clone().into());
+            let right = builder.add_input(scalar_type.clone().into());
             let left = builder
                 .add_instruction(DimensionFromScalarOperation::new(left_variable), Vec::new(), vec![left], None)
                 .unwrap()[0];
@@ -16708,8 +16746,8 @@ mod tests {
         // XLA accepts and runs token-carrying loops (not just the flat token chain).
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let mut body_builder = CompositeXlaProgramBuilder::new();
-        let carry = body_builder.add_input(scalar_f64.clone());
-        let x = body_builder.add_input(scalar_f64.clone());
+        let carry = body_builder.add_input(scalar_f64.clone().into());
+        let x = body_builder.add_input(scalar_f64.clone().into());
         let printed =
             body_builder.add_instruction(PrintOperation::new("iteration"), Vec::new(), vec![x], None).unwrap()[0];
         let sum = body_builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, printed], None).unwrap()[0];
@@ -16721,8 +16759,8 @@ mod tests {
         let stacked_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let mut builder = CompositeXlaProgramBuilder::new();
         let body_region = builder.import_region(body.entry_region_ref());
-        let init = builder.add_input(scalar_f64.clone());
-        let stacked_inputs = builder.add_input(stacked_type.clone());
+        let init = builder.add_input(scalar_f64.clone().into());
+        let stacked_inputs = builder.add_input(stacked_type.clone().into());
         let output = builder
             .add_instruction(XlaOperation::Scan(scan), vec![body_region], vec![init, stacked_inputs], None)
             .unwrap()[0];
@@ -16820,7 +16858,7 @@ mod tests {
         let state_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let condition = {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let state = builder.add_input(state_type.clone());
+            let state = builder.add_input(state_type.clone().into());
             let zero = builder
                 .add_instruction(ZeroLikeOperation::<ArrayType>::new(), Vec::new(), vec![state], None)
                 .unwrap()[0];
@@ -16839,7 +16877,7 @@ mod tests {
         .unwrap();
         let body = {
             let mut builder = CompositeXlaProgramBuilder::new();
-            let state = builder.add_input(state_type.clone());
+            let state = builder.add_input(state_type.clone().into());
             let one = builder.add_instruction(OneLikeOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
             let next = builder.add_instruction(SubOperation::new(), Vec::new(), vec![state, one], None).unwrap()[0];
             builder.build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder], vec![Placeholder])
@@ -16848,7 +16886,7 @@ mod tests {
         let mut builder = CompositeXlaProgramBuilder::new();
         let condition_region = builder.import_region(condition.entry_region_ref());
         let body_region = builder.import_region(body.entry_region_ref());
-        let state = builder.add_input(state_type.clone());
+        let state = builder.add_input(state_type.clone().into());
         let output = builder
             .add_instruction(
                 XlaOperation::While(WhileOperation::new()),
@@ -17115,8 +17153,8 @@ mod tests {
         )
         .unwrap();
         let mut builder = CompositeXlaProgramBuilder::new();
-        let first = builder.add_input(first_type.clone());
-        let second = builder.add_input(second_type.clone());
+        let first = builder.add_input(first_type.clone().into());
+        let second = builder.add_input(second_type.clone().into());
         let result_extent = builder
             .add_instruction(
                 DimensionOperation::from(ConstantOperation::new(result_extent)),
@@ -17134,7 +17172,7 @@ mod tests {
                 vec![Placeholder],
             )
             .unwrap();
-        assert_eq!(program.effects(), Effects::PURE);
+        assert_eq!(program.effects().classes(), EffectClasses::NONE);
         let output_type = <&ArrayType>::try_from(&program.output_types()[0]).unwrap().clone();
         let stablehlo = to_mlir_module_for_program(
             &program,
@@ -17173,8 +17211,8 @@ mod tests {
         )
         .unwrap();
         let mut builder = CompositeXlaProgramBuilder::new();
-        let first = builder.add_input(first_type.clone());
-        let second = builder.add_input(second_type.clone());
+        let first = builder.add_input(first_type.clone().into());
+        let second = builder.add_input(second_type.clone().into());
         let first_size = builder.add_instruction(first_size_operation, Vec::new(), vec![first], None).unwrap()[0];
         let second_size = builder.add_instruction(second_size_operation, Vec::new(), vec![second], None).unwrap()[0];
         let result_extent = builder
@@ -17352,7 +17390,7 @@ mod tests {
         let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
             .vjp(|x, ()| Ok(x.slice(&[1], &[3], &[1]).unwrap()), CpuArray::vector(vec![1.0, 2.0, 3.0, 4.0]), ())
             .unwrap();
-        let (pullback, _residuals) = pullback.into_parts();
+        let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
         assert_eq!(
             stablehlo,
@@ -17378,7 +17416,7 @@ mod tests {
                 (),
             )
             .unwrap();
-        let (pullback, _residuals) = pullback.into_parts();
+        let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
         assert_eq!(
             stablehlo,
@@ -17406,7 +17444,7 @@ mod tests {
                 (),
             )
             .unwrap();
-        let (pullback, _residuals) = pullback.into_parts();
+        let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
         assert_eq!(
             stablehlo,
@@ -17444,7 +17482,7 @@ mod tests {
                 (),
             )
             .unwrap();
-        let (pullback, _residuals) = pullback.into_parts();
+        let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
         assert_eq!(
             stablehlo,
@@ -17463,6 +17501,55 @@ mod tests {
     }
 
     #[test]
+    fn test_slicing_vjp_reference_pullback_lowers_without_dense_zero() {
+        use ryft_core::CotangentDestinationKind;
+
+        // The runtime index remains an input after transposition. Functionalizing the buffer update must keep
+        // only the selected-block addition, without constructing a full-size zero cotangent first.
+        let mut builder = CompositeXlaProgramBuilder::new();
+        let input = builder.add_input(ArrayIrType::Array(ArrayType::new_static(DataType::F64, [5])));
+        let start = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::I32)));
+        let output = builder
+            .add_instruction(
+                ArrayOperation::DynamicSlice(DynamicSliceOperation::new(vec![2])),
+                Vec::new(),
+                vec![input, start],
+                None,
+            )
+            .unwrap()[0];
+        let program: FlatXlaProgram = builder.build(vec![output], vec![Placeholder; 2], vec![Placeholder]).unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
+        let discharged = pullback.discharge_references(0).unwrap();
+        let stablehlo = to_mlir_module_for_program(
+            discharged.program(),
+            &[],
+            &vec![
+                ArrayType::new_static(DataType::F64, [2]),
+                ArrayType::new_static(DataType::F64, [5]),
+                ArrayType::scalar(DataType::I32),
+            ],
+            &vec![ArrayType::new_static(DataType::F64, [5])],
+            "main",
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            stablehlo,
+            indoc! {r#"
+                module {
+                  func.func @main(%arg0: tensor<2xf64>, %arg1: tensor<5xf64>, %arg2: tensor<i32>) -> tensor<5xf64> {
+                    %0 = stablehlo.dynamic_slice %arg1, %arg2, sizes = [2] : (tensor<5xf64>, tensor<i32>) -> tensor<2xf64>
+                    %1 = stablehlo.add %0, %arg0 : tensor<2xf64>
+                    %2 = stablehlo.dynamic_update_slice %arg1, %1, %arg2 : (tensor<5xf64>, tensor<2xf64>, tensor<i32>) -> tensor<5xf64>
+                    return %2 : tensor<5xf64>
+                  }
+                }
+            "#},
+        );
+    }
+
+    #[test]
     fn test_plain_scalar_bilinear_sin_vjp_pullback_standalone_stablehlo() {
         // Standalone pullback over the primal operation family, produced by the partition-aware reverse path.
         // The reverse program of `f(x, y) = x * y + sin(x)` consumes `[output_cotangent ++ residuals]`, where the
@@ -17473,7 +17560,7 @@ mod tests {
         let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
             .vjp(|inputs, ()| Ok(scalar_bilinear_sin(inputs)), (CpuArray::scalar(2.0), CpuArray::scalar(3.0)), ())
             .unwrap();
-        let (pullback, _residuals) = pullback.into_parts();
+        let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
 
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
         println!("=== ryft standalone vjp_pullback(x*y + sin(x)) StableHLO ===\n{stablehlo}");
@@ -17497,61 +17584,50 @@ mod tests {
     }
 
     #[test]
-    fn test_rematerialized_vjp_pullback_lowers_without_a_rematerialization_boundary() {
+    fn test_rematerialized_pullback_lowers_without_a_rematerialization_boundary() {
         use ryft_core::tracing_v2::rematerialize;
+        use ryft_core::{Context, DomainTracer, Trace};
 
-        // The value-level `vjp` runs on the partition-aware reverse path, which splices the rematerialized
-        // region's recompute-and-pushforward into the program as ordinary straight-line primal operations and
-        // transposes them like any other computation. The rematerialization boundary is purely a forward-pass memory
-        // tradeoff with no effect on the differentiated result, so the resulting pullback carries no
-        // `stablehlo.optimization_barrier`: it is the same residual-weighted backward pass as the un-rematerialized
-        // body. The `prevent_cse` optimization-barrier hint applies to the forward/JVP lowering of a retained
-        // `RematerializeOperation`, not to this reverse pullback, so toggling it leaves the pullback unchanged. For
-        // `f(x) = sin(x · x)` the pullback consumes `[output_cotangent ++ residuals]` (residuals `cos(x²)` and `x`)
-        // and lowers to the symmetric `d(x · x) = 2x · dx` transpose — two `stablehlo.multiply` branches summed —
-        // scaled by `cos(x²)`.
+        // Rematerialization retains its custom transpose in a linear call. The production lowerer inlines that
+        // call's executable region. The default recompute policy saves only `x`, so the pullback recomputes
+        // `cos(x * x)` before scaling the cotangent. The forward/JVP barrier hint does not change this computation.
         let expected = indoc! {r#"
             module {
-              func.func @main(%arg0: tensor<f64>, %arg1: tensor<f64>, %arg2: tensor<f64>) -> tensor<f64> {
-                %0 = stablehlo.multiply %arg2, %arg0 : tensor<f64>
-                %1 = stablehlo.multiply %arg1, %0 : tensor<f64>
-                %2 = stablehlo.multiply %arg1, %0 : tensor<f64>
-                %3 = stablehlo.add %1, %2 : tensor<f64>
-                return %3 : tensor<f64>
+              func.func @main(%arg0: tensor<f64>, %arg1: tensor<f64>) -> tensor<f64> {
+                %0 = stablehlo.multiply %arg1, %arg1 : tensor<f64>
+                %1 = stablehlo.cosine %0 : tensor<f64>
+                %2 = stablehlo.multiply %1, %arg0 : tensor<f64>
+                %3 = stablehlo.multiply %arg1, %2 : tensor<f64>
+                %4 = stablehlo.multiply %arg1, %2 : tensor<f64>
+                %5 = stablehlo.add %3, %4 : tensor<f64>
+                return %5 : tensor<f64>
               }
             }
         "#};
 
-        let function = rematerialize::<EagerContext<CpuArray, ArrayOperation<CpuArray>>, _, _, _>(
-            |x: ryft_core::tracing::DomainTracer<EagerContext<CpuArray, ArrayOperation<CpuArray>>>| {
-                Ok((x.clone() * x).sin()?)
-            },
-        );
-        let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
-            .vjp(|x, ()| function.call(x), CpuArray::scalar(2.0), ())
+        let scalar_type = ArrayType::scalar(DataType::F64);
+        for prevent_cse in [true, false] {
+            let function = rematerialize::<XlaDomain<'static>, _, _, _>(|x: DomainTracer<XlaDomain<'static>>| {
+                let context = x.context();
+                let squared =
+                    context.bind(ArrayOperation::Mul(MulOperation::new()), Vec::new(), &[x.clone(), x.clone()])?;
+                Ok(context.bind(ArrayOperation::Sin(SinOperation::new()), Vec::new(), &squared)?[0].clone())
+            })
+            .with_prevent_cse(prevent_cse);
+            let (_, program) = XlaDomain::trace(|x| function.call(x), ArrayIrType::Array(scalar_type.clone())).unwrap();
+            let pullback = program.into_flat_program().linearize().unwrap().pullback().unwrap();
+            let stablehlo = to_mlir_module_for_program(
+                &pullback,
+                &[],
+                &vec![scalar_type.clone(); pullback.input_ids().len()],
+                &scalar_type,
+                "main",
+                None,
+                None,
+            )
             .unwrap();
-        let (pullback, _residuals) = pullback.into_parts();
-        let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
-        assert!(
-            !stablehlo.contains("stablehlo.optimization_barrier"),
-            "the reverse path strips the rematerialization boundary, so the pullback should lower without an \
-             optimization barrier, but got:\n{stablehlo}",
-        );
-        assert_eq!(stablehlo, expected);
-
-        // Disabling `prevent_cse` changes nothing about the reverse pullback: the hint only affects forward lowering.
-        let function = rematerialize::<EagerContext<CpuArray, ArrayOperation<CpuArray>>, _, _, _>(
-            |x: ryft_core::tracing::DomainTracer<EagerContext<CpuArray, ArrayOperation<CpuArray>>>| {
-                Ok((x.clone() * x).sin()?)
-            },
-        )
-        .with_prevent_cse(false);
-        let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
-            .vjp(|x, ()| function.call(x), CpuArray::scalar(2.0), ())
-            .unwrap();
-        let (pullback, _residuals) = pullback.into_parts();
-        let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
-        assert_eq!(stablehlo, expected, "the reverse pullback is independent of the prevent_cse hint");
+            assert_eq!(stablehlo, expected, "prevent_cse: {prevent_cse}");
+        }
     }
 
     #[test]
@@ -17702,7 +17778,7 @@ mod tests {
     fn test_to_mlir_module_for_program_erases_static_zero_space_boundary() {
         let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let mut builder = CompositeXlaProgramBuilder::new();
-        let input = builder.add_input(zero_type.clone());
+        let input = builder.add_input(zero_type.clone().into());
         let program: FlatXlaProgram = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
 
         let stablehlo = to_mlir_module_for_program(&program, &[], &zero_type, &zero_type, "main", None, None).unwrap();
@@ -17727,7 +17803,7 @@ mod tests {
 
         let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
         let mut builder = CompositeXlaProgramBuilder::new();
-        let input = builder.add_input(zero_type.clone());
+        let input = builder.add_input(zero_type.clone().into());
         let output = builder.add_instruction(PrintOperation::new("zero"), Vec::new(), vec![input], None).unwrap()[0];
         let program: FlatXlaProgram = builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
@@ -17742,7 +17818,7 @@ mod tests {
     fn test_to_mlir_module_for_program_preserves_dynamic_zero_space_shape_carrier() {
         let zero_type = ArrayType::new(DataType::Zero, Shape::new(vec![dynamic_dimension("zero", Some(3))]));
         let mut builder = CompositeXlaProgramBuilder::new();
-        let input = builder.add_input(zero_type.clone());
+        let input = builder.add_input(zero_type.clone().into());
         let program: FlatXlaProgram = builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
 
         let stablehlo = to_mlir_module_for_program(&program, &[], &zero_type, &zero_type, "main", None, None).unwrap();
@@ -18202,7 +18278,7 @@ mod tests {
         let (_, pullback): (CpuArray, _) = EagerContext::<CpuArray, ArrayOperation<CpuArray>>::new()
             .vjp(|x, ()| Ok(x.transfer_to_memory(Memory::Host { pinned: true })), CpuArray::scalar(2.0), ())
             .unwrap();
-        let (pullback, _residuals) = pullback.into_parts();
+        let (pullback, _residuals) = pullback.into_transposed_parts().unwrap();
         let stablehlo = to_mlir_module_for_plain_program(&pullback, "main").unwrap();
         assert_eq!(stablehlo.matches("stablehlo.custom_call @annotate_device_placement").count(), 1, "{stablehlo}");
         assert!(stablehlo.contains("_xla_buffer_placement = \"device\""), "{stablehlo}");

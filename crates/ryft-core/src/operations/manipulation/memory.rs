@@ -10,7 +10,7 @@ use std::fmt::Display;
 
 use half::{bf16, f16};
 
-use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, Memory, RaggedAxis};
+use crate::arrays::{ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType, Memory, RaggedAxis};
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{DifferentiableType, DifferentiationDual};
@@ -116,15 +116,15 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for Transfer
 /// preserves the operand's batch axis. On traced values this stages the transfer on the batched physical value; on
 /// concrete values it keeps the payload unchanged while re-placing the carried type in the destination, exactly like
 /// interpretation.
-impl<C: Context<Type = ArrayType, Value: TransferToMemory>, P: ArrayBatchingPolicy<C>>
-    BatchableOperation<C, ArrayBatching<P>> for TransferToMemoryOperation
+impl<C: Context<Type = ArrayType, Value: TransferToMemory>, P: ArrayExtentBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatchingPolicy<P>> for TransferToMemoryOperation
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        _context: &BatchingContext<C, ArrayBatching<P>>,
+        _context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         let value = inputs[0].value().transfer_to_memory(self.destination);
         let ragged_axes = inputs[0]

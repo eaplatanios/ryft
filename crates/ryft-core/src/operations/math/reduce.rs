@@ -2,8 +2,8 @@ use std::fmt::Display;
 use std::ops::{Div, Mul};
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayIrType, ArrayType, DataType, Dimension, DimensionOperation, DimensionType,
-    DimensionValue, LinearResiduals, RaggedArrayBatchingPolicy, Shape, Sharding, StaticShape,
+    ArrayBatch, ArrayBatchingPolicy, ArrayIrType, ArrayType, DataType, Dimension, DimensionOperation, DimensionType,
+    DimensionValue, LinearResiduals, RaggedArrayExtentBatchingPolicy, Shape, Sharding, StaticShape,
 };
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
@@ -237,21 +237,21 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for ReduceOp
 // output batch axis position (mirroring the dot batching rule).
 //
 // Reducing a bounded ragged axis away is the one array rule that legitimately consumes an operand's per-item extents:
-// [`RaggedArrayBatchingPolicy::mask_reduction_input`] first replaces the padding along that axis with the reduction's
-// identity, so the result no longer depends on those extents. The rule reports each such
+// [`RaggedArrayExtentBatchingPolicy::mask_reduction_input`] first replaces the padding along that axis with the
+// reduction's identity, so the result no longer depends on those extents. The rule reports each such
 // [`DimensionVariable`](crate::arrays::DimensionVariable) as its [`BatchedOutputs`] evidence, which is how the
 // carrier-invariant validation boundary tells a deliberate consumption apart from a silently dropped extent.
-impl<C: Context<Type = ArrayType>, P: RaggedArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
+impl<C: Context<Type = ArrayType>, P: RaggedArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
     for ReduceOperation
 where
     ReduceOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         let Some(batch_axis) = inputs[0].batch_axis_position() else {
             return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
@@ -975,16 +975,16 @@ fn validate_reduce_output_sharding(
 ///   - `output_axis`: Position of the batch axis in the result.
 ///   - `mask`: Neutralizes the operand's ragged padding along `reduced_axes` with the operation's own identity.
 pub(crate) fn batch_reducing_operation<C, P, O, Mask>(
-    context: &BatchingContext<C, ArrayBatching<P>>,
+    context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
     operation: &O,
     input: &ArrayBatch<C::Value>,
     reduced_axes: &[usize],
     output_axis: usize,
     mask: Mask,
-) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError>
+) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError>
 where
     C: Context<Type = ArrayType>,
-    P: RaggedArrayBatchingPolicy<C>,
+    P: RaggedArrayExtentBatchingPolicy<C>,
     O: InterpretableOperation<C>,
     Mask: FnOnce(&ArrayBatch<C::Value>) -> Result<ArrayBatch<C::Value>, BatchingError>,
 {

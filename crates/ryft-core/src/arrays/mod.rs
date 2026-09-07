@@ -17,9 +17,9 @@ pub mod types;
 pub use addressing::{ArrayAddressing, ArrayIndexRange, ArrayIndexRanges, ArraySliceAxis};
 pub use arrays::Array;
 pub use batching::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, DimensionSource,
-    RaggedArrayBatchingPolicy, RaggedAxis, RaggedMaskIdentity, ReplicatedDimensionBatchingPolicy,
-    StaticArrayBatchingPolicy,
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, DimensionSource,
+    RaggedArrayExtentBatchingPolicy, RaggedAxis, RaggedMaskIdentity, ReplicatedDimensionBatchingPolicy,
+    StaticArrayExtentBatchingPolicy,
 };
 pub use broadcasting::{Broadcastable, BroadcastingError};
 pub use differentiation::{ExactShape, ExactShapeDimension, LinearResiduals, materialize_array_tangent};

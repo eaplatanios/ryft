@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
-use crate::arrays::{ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, DataType, DimensionType};
+use crate::arrays::{ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, DataType, DimensionType};
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -92,15 +92,15 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>
 // Batching converts a replicated first-class dimension into one replicated scalar array. A mapped dimension already
 // stores its per-item extents as packed integer array data on the batch carrier, so conversion exposes that same value
 // as a mapped scalar array without staging another operation.
-impl<C: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>> BatchableOperation<C, ArrayIrBatching>
-    for DimensionToScalarOperation
+impl<C: Context<Type = ArrayIrType, Operation: From<DimensionToScalarOperation>>>
+    BatchableOperation<C, ArrayIrBatchingPolicy> for DimensionToScalarOperation
 {
-    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
+    fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C, ArrayIrBatching>,
+        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         let [input] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
         };

@@ -1,7 +1,9 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
-use crate::arrays::{ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, Broadcastable, DataType, DimensionType};
+use crate::arrays::{
+    ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, Broadcastable, DataType, DimensionType,
+};
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
@@ -195,16 +197,16 @@ where
 
 // Batching rule for first-class dimension comparison. Dimension operands describe one shared array shape and must
 // therefore remain replicated; their Boolean array result is replicated ordinary data.
-impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatching> for CompareOperation<ArrayIrType>
+impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy> for CompareOperation<ArrayIrType>
 where
     C::Operation: From<CompareOperation<ArrayIrType>>,
 {
-    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
+    fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C, ArrayIrBatching>,
+        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         let [left, right] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
         };

@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 
-use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType};
+use crate::arrays::{ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType};
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingTracer,
 };
@@ -121,16 +121,16 @@ impl<V: Value, C: Context<Type = V::Type, Operation: From<ConstantOperation<V>>>
 impl<
     Stored: Value<Type = ArrayType>,
     C: Context<Type = ArrayType, Operation: From<ConstantOperation<Stored>>>,
-    P: ArrayBatchingPolicy<C>,
-> BatchableOperation<C, ArrayBatching<P>> for ConstantOperation<Stored>
+    P: ArrayExtentBatchingPolicy<C>,
+> BatchableOperation<C, ArrayBatchingPolicy<P>> for ConstantOperation<Stored>
 {
     #[inline]
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         check_count!("input", inputs, 0, ProgramError);
         Ok(context
             .parent()
@@ -187,10 +187,10 @@ impl<C: StagingContext> Constant<Tracer<C>, C::Constant> for C {
 }
 
 impl<C: Context<Type = ArrayType> + Constant<C::Value, Stored>, Stored>
-    Constant<BatchingTracer<C, ArrayBatching>, Stored> for BatchingContext<C, ArrayBatching>
+    Constant<BatchingTracer<C, ArrayBatchingPolicy>, Stored> for BatchingContext<C, ArrayBatchingPolicy>
 {
     #[inline]
-    fn constant(&self, value: Stored) -> Result<BatchingTracer<C, ArrayBatching>, ProgramError> {
+    fn constant(&self, value: Stored) -> Result<BatchingTracer<C, ArrayBatchingPolicy>, ProgramError> {
         let value = self.parent().constant(value)?;
         let batch = ArrayBatch::new(value, BatchAxis::replicated())?;
         Ok(BatchingTracer::new(self.clone(), batch))
@@ -202,7 +202,7 @@ impl<C: Context<Type: DifferentiableType>, P: DifferentiationPolicy<C>>
 {
     #[inline]
     fn constant(&self, value: C::Constant) -> Result<DifferentiationTracer<C, P>, ProgramError> {
-        let dual = DifferentiationDual::new_with_zero_tangent(self.parent().lift(value)?)?;
+        let dual = DifferentiationDual::new_with_zero_tangent(self.primal().lift(value)?)?;
         Ok(DifferentiationTracer::new(dual, self.clone()))
     }
 }
@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn test_constant_differentiation() {
-        let context = DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let context = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new());
         let output = context.constant(Array::scalar(3.5)).unwrap();
         assert_eq!(output.primal(), &Array::scalar(3.5));
         assert!(matches!(output.tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::F64)));

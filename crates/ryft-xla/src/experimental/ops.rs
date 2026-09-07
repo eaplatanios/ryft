@@ -15,38 +15,39 @@ use ryft_core::operations::random::RngBitGeneratorOperation;
 use ryft_core::operations::sort::SortOperation;
 use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
 use ryft_core::{
-    AbsOperation, AddOperation, AndOperation, Array as ReferenceArray, ArrayBatch, ArrayBatching, ArrayIrOperation,
-    ArrayIrType, ArrayOperation, ArrayReferenceViewOperation, ArrayReferenceViewTransform, ArrayType, Atan2Operation,
-    AxisIndexOperation, BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver,
-    BatchingError, BroadcastOperation, CalleeRegionDriver, CaptureConstant, CaptureReference, CeilOperation,
-    CompareOperation, CompiledCallOperation, ConcatenateOperation, Concretizable, ConditionOperation,
-    ConstantOperation, Context, ConvertElementTypeOperation, CosOperation, CumulativeLogSumExpOperation,
-    CumulativeMaxOperation, CumulativeMinOperation, CumulativeProductOperation, CumulativeSumOperation,
-    CustomJvpOperation, CustomVjpOperation, DifferentiableOperation, DifferentiableType, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, Dimension, DimensionAddOperation, DimensionDivFloorOperation,
-    DimensionFromScalarOperation, DimensionMaxOperation, DimensionMinOperation, DimensionMulOperation,
-    DimensionOperation, DimensionPowOperation, DimensionRemOperation, DimensionRequirementOperation,
-    DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation,
-    DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
-    DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, ErfOperation,
-    ExpOperation, FloorOperation, GatherOperation, IotaOperation, LinearCallOperation, Log1pOperation,
-    LogAddExpOperation, LogOperation, LogSumExpOperation, LogisticOperation, MaxOperation, MaybeZero, MinOperation,
-    MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation, OperationFormatter,
-    OrOperation, OutputRegionProvenance, PadOperation, ParallelReduceOperation, Parameter, PartialEvaluationContext,
-    PartialEvaluationDriver, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PowOperation,
-    PrintOperation, Program, ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, ProjectedValue,
-    RaggedDotOperation, ReduceOperation, ReferenceAddUpdateOperation, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceFreezeOperation, ReferenceIndexOperation, ReferenceNewOperation, ReferenceReadOperation,
-    ReferenceSliceOperation, ReferenceSwapOperation, ReferenceViewOperation, ReferenceViewValidationError,
-    ReferenceWriteOperation, RegionInterface, RegionSlot, RemOperation, ReshapeOperation, ReshardOperation,
-    ResidualZeroProvider, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation, ScatterOperation,
-    SelectOperation, ShardingConstraintOperation, SignOperation, SinOperation, SliceOperation, SqrtOperation,
-    StagingContext, StopGradientOperation, SubOperation, TagOperation, TanhOperation, Tracer, TracingContext,
-    TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionDriver, Type, TypeError,
-    TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection, WhileOperation, XorOperation, Zero,
-    ZeroLikeOperation, ZeroOperation, ZeroOperationProvider, discharge_positional_region_operation,
-    reapply_array_reference_view, validate_array_reference_view,
+    AbsOperation, AddOperation, AndOperation, Array as ReferenceArray, ArrayBatch, ArrayBatchingPolicy,
+    ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayReferenceViewOperation, ArrayReferenceViewTransform, ArrayType,
+    Atan2Operation, AxisIndexOperation, BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext,
+    BatchingDriver, BatchingError, BroadcastOperation, CalleeRegionDriver, CaptureConstant, CaptureReference,
+    CeilOperation, CompareOperation, CompiledCallOperation, ConcatenateOperation, Concretizable, ConditionOperation,
+    ConstantOperation, Context, ConvertElementTypeOperation, CosOperation, CotangentDestinationKind,
+    CumulativeLogSumExpOperation, CumulativeMaxOperation, CumulativeMinOperation, CumulativeProductOperation,
+    CumulativeSumOperation, CustomJvpOperation, CustomVjpOperation, DifferentiableOperation, DifferentiableType,
+    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
+    Dimension, DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionMaxOperation,
+    DimensionMinOperation, DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
+    DimensionRequirementOperation, DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation,
+    DimensionToScalarOperation, DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation,
+    DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
+    EagerContext, ErfOperation, ExpOperation, FloorOperation, GatherOperation, InputRegionProvenance, IotaOperation,
+    LinearCallOperation, Log1pOperation, LogAddExpOperation, LogOperation, LogSumExpOperation, LogisticOperation,
+    MaxOperation, MaybeZero, MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation,
+    OperandCotangents, Operation, OperationFormatter, OperationProvider, OrOperation, OutputRegionProvenance,
+    PadOperation, ParallelReduceOperation, Parameter, PartialEvaluationContext, PartialEvaluationDriver,
+    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program,
+    ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation, ReduceOperation,
+    ReferenceAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceIndexOperation,
+    ReferenceNewOperation, ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation,
+    ReferenceViewOperation, ReferenceViewValidationError, ReferenceWriteOperation, RegionInterface, RegionSlot,
+    RemOperation, ReshapeOperation, ReshardOperation, ResidualZeroProvider, RoundOperation, RsqrtOperation,
+    ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation,
+    SinOperation, SliceOperation, SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation,
+    TanhOperation, Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation,
+    TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation,
+    Value, ValueProjection, ViewIndex, ViewSymbol, WhileOperation, XorOperation, Zero, ZeroLikeOperation,
+    ZeroOperation, discharge_positional_region_operation, operand_cotangents, reapply_array_reference_view,
+    validate_array_reference_view,
 };
 use ryft_macros::Parameter;
 
@@ -213,9 +214,9 @@ impl From<DimensionValue> for XlaConstant {
     }
 }
 
-/// A captured constant is a reference into a side table rather than the concrete predicate value itself, and an
-/// immediate dimension is an extent rather than Boolean array data, and so neither variant can be read back as a
-/// concrete predicate. Control-flow staging must keep predicates in the IR or add a transform-specific rule instead.
+// A captured constant is a reference into a side table rather than the concrete predicate value itself, and an
+// immediate dimension is an extent rather than Boolean array data, and so neither variant can be read back as a
+// concrete predicate. Control-flow staging must keep predicates in the IR or add a transform-specific rule instead.
 impl Concretizable<bool> for XlaConstant {
     #[inline]
     fn concretize(&self) -> Result<bool, ProgramError> {
@@ -380,11 +381,22 @@ where
     type View = ArrayReferenceViewTransform;
 
     fn reference_view(&self, output_index: usize) -> Option<ArrayReferenceViewTransform> {
-        // The two view derivations are the only members whose reference semantics declare a view alias, each at its
+        // The two view derivations are the only members whose effects declare a view alias, each at its
         // single output; every other member and every backend-owned higher-order operation derives no view.
         match self {
             Self::ReferenceIndex(operation) if output_index == 0 => Some(operation.transform()),
             Self::ReferenceSlice(operation) if output_index == 0 => Some(operation.transform()),
+            _ => None,
+        }
+    }
+
+    fn region_input_view(&self, region_index: usize, input_index: usize) -> Option<ArrayReferenceViewTransform> {
+        // A scan body's trailing inputs are the per-iteration slices of the stacked operands: a reference-typed one is
+        // the stacked reference indexed on its leading axis by the iteration counter.
+        match self {
+            Self::Scan(operation) if region_index == 0 && input_index >= operation.carry_count() => {
+                Some(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Symbolic(ViewSymbol::Iteration) })
+            }
             _ => None,
         }
     }
@@ -401,8 +413,9 @@ where
         context: &C,
         view: &ArrayReferenceViewTransform,
         source: C::Value,
+        symbols: &[C::Value],
     ) -> Result<C::Value, ProgramError> {
-        reapply_array_reference_view(context, view, source)
+        reapply_array_reference_view(context, view, source, symbols)
     }
 }
 
@@ -662,12 +675,25 @@ impl_array_operation_conversion!(
     PrintOperation<ArrayType>,
 );
 
-impl<Constant> ZeroOperationProvider<ArrayIrType> for XlaOperation<Constant>
+impl<Constant> OperationProvider<ArrayIrType, ZeroOperation<ArrayIrType>> for XlaOperation<Constant>
 where
     Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
-    fn zero_operation(r#type: ArrayIrType) -> Result<Self, ProgramError> {
-        Ok(ArrayIrOperation::<Constant::Projected>::zero_operation(r#type)?.into())
+    type Operation = Self;
+
+    fn provide(request: ZeroOperation<ArrayIrType>, input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
+        Ok(ArrayIrOperation::<Constant::Projected>::provide(request, input_types)?.into())
+    }
+}
+
+impl<Constant> OperationProvider<ArrayIrType, OneOperation<ArrayIrType>> for XlaOperation<Constant>
+where
+    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+{
+    type Operation = Self;
+
+    fn provide(request: OneOperation<ArrayIrType>, input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
+        Ok(ArrayIrOperation::<Constant::Projected>::provide(request, input_types)?.into())
     }
 }
 
@@ -886,8 +912,8 @@ impl<T: Type> Operation for JitCallOperation<T> {
     }
 
     #[inline]
-    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
-        (region_index == 0).then_some(input_index)
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
+        (region_index == 0).then_some(InputRegionProvenance::Forwarded { input_index })
     }
 
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
@@ -931,20 +957,20 @@ where
     }
 }
 
-/// Online partial-evaluation rule for a staged jitted call — ryft's analogue of JAX's call partial-evaluation
-/// rules: it splits the callee against the caller's known-ness while preserving the `jit_call` boundary on both
-/// sides.
-///
-/// The split fires only when some known call input does *not* [`resolve`](Context::resolve) to a program constant in
-/// the known-side context — i.e., a genuine tracer into a live outer trace, the mixed-online case this
-/// rule exists for. All-known, all-unknown, and constant-resolved calls defer to the default fold-or-residualize
-/// behavior, which preserves the original boundary (and today's eager behavior) exactly.
-///
-/// When the split fires, the callee is split through the shared
-/// [`PartitionedProgram`](ryft_core::partial::PartitionedProgram) machinery: the known side is bound into the
-/// enclosing known-side context
-/// wrapped in a fresh `jit_call` over the original known call inputs, and the residual side is emitted as the
-/// residual `jit_call` over the surviving unknown call inputs plus the known-side call's residual-edge outputs.
+// Online partial-evaluation rule for a staged jitted call — ryft's analogue of JAX's call partial-evaluation
+// rules: it splits the callee against the caller's known-ness while preserving the `jit_call` boundary on both
+// sides.
+//
+// The split fires only when some known call input does *not* [`resolve`](Context::resolve) to a program constant in
+// the known-side context — i.e., a genuine tracer into a live outer trace, the mixed-online case this
+// rule exists for. All-known, all-unknown, and constant-resolved calls defer to the default fold-or-residualize
+// behavior, which preserves the original boundary (and today's eager behavior) exactly.
+//
+// When the split fires, the callee is split through the shared
+// [`PartitionedProgram`](ryft_core::partial::PartitionedProgram) machinery: the known side is bound into the
+// enclosing known-side context
+// wrapped in a fresh `jit_call` over the original known call inputs, and the residual side is emitted as the
+// residual `jit_call` over the surviving unknown call inputs plus the known-side call's residual-edge outputs.
 impl<V, C> PartiallyEvaluatableOperation<C> for JitCallOperation<ArrayIrType>
 where
     V: PartialEq
@@ -973,6 +999,22 @@ where
         // known-side context wrapped in a fresh `jit_call` over the original known call inputs, emit the residual
         // side as the residual `jit_call`, and reassemble the original output order.
         let callee = driver.region(0)?;
+        // A reference operand, a reference output, or a reference access anywhere in the callee closure keeps the call
+        // whole. Splitting would spread the accesses to one root across two compiled calls whose known side runs
+        // first, and a known reference-typed feeder of the residual side would then mean that both sides access the
+        // same root, the same reordering hazard that keeps a `scan` body whole. The default
+        // rule preserves effect order by placing the whole call on one side instead. An allocation that nothing
+        // accesses is dead intrinsic state
+        // that neither side retains, so it does not pin the boundary, but an allocation that escapes through a
+        // reference output is live state whose later accesses are unknown to the callee, so it does.
+        let accesses_references = inputs.iter().any(|input| input.r#type().is_reference())
+            || callee.output_types().iter().any(Type::is_reference)
+            || callee
+                .instructions_in_closure()
+                .any(|(_, instruction)| instruction.operation().effects().has_accesses());
+        if accesses_references {
+            return context.fold_or_residualize(XlaOperation::JitCall(*self), vec![callee.to_program()], inputs);
+        }
         // Partitioning does not remap the absolute indices of capture constants retained in attached regions, so a
         // split boundary would leave them naming a compacted or absent capture prefix — failing lowering at best and
         // silently aliasing an unrelated leading operand at worst. Preserve the original call boundary for any callee
@@ -983,7 +1025,7 @@ where
             return context.fold_or_residualize(XlaOperation::JitCall(*self), vec![callee.to_program()], inputs);
         }
         let input_known = inputs.iter().map(PartialEvaluationValue::is_known).collect::<Vec<bool>>();
-        let partition = callee.partition(input_known.as_slice())?;
+        let partition = driver.partition_program(context, callee, input_known.as_slice())?;
         // A trivial partition — one whose known program contains no instructions — hoists no work (its known side
         // can only forward known inputs as residual edges), so keep the original boundary and let the default
         // materialize those knowns directly as residual feeders.
@@ -1004,23 +1046,23 @@ where
     }
 }
 
-/// Batching rule for [`JitCallOperation`]: the callee region is rebatched over the mapped input axes (via
-/// [`BatchingDriver::batch_program`]) and the batched call is bound through `context.parent()` with the
-/// batched callee re-attached. An eager
-/// client-backed parent (e.g., [`XlaDomain`](crate::XlaDomain)) compiles and executes the batched call immediately, a
-/// staging parent stages it into the enclosing trace, and a differentiation parent dispatches it through its own
-/// `jit_call` JVP rule — which is what serves `vmap` nested inside `gradient`/`linearize` closures.
-impl<C> BatchableOperation<C, ArrayBatching> for JitCallOperation<ArrayType>
+// Batching rule for [`JitCallOperation`]: the callee region is rebatched over the mapped input axes (via
+// [`BatchingDriver::batch_program`]) and the batched call is bound through `context.parent()` with the
+// batched callee re-attached. An eager
+// client-backed parent (e.g., [`XlaDomain`](crate::XlaDomain)) compiles and executes the batched call immediately, a
+// staging parent stages it into the enclosing trace, and a differentiation parent dispatches it through its own
+// `jit_call` JVP rule — which is what serves `vmap` nested inside `gradient`/`linearize` closures.
+impl<C> BatchableOperation<C, ArrayBatchingPolicy> for JitCallOperation<ArrayType>
 where
     C: Context<Type = ArrayType>,
     C::Operation: From<JitCallOperation<ArrayType>>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching>,
+        context: &BatchingContext<C, ArrayBatchingPolicy>,
         driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy>, BatchingError> {
         let physical_inputs = inputs.iter().map(|input| input.value().clone()).collect::<Vec<_>>();
         // Rebatch the callee region over the mapped input axes when any input carries the batch axis; an
         // all-replicated call binds its original callee unchanged.
@@ -1070,40 +1112,40 @@ where
     }
 }
 
-/// Capture-free forward-mode (JVP) rule for [`JitCallOperation`], binding a primal `jit_call` and a tangent
-/// `jit_call` as ordinary XLA-enum operations through the active context: a staging context stages both calls over
-/// its shared builder, while an eager context (e.g. a client-backed [`XlaDomain`](crate::XlaDomain)) compiles and
-/// executes them immediately, which is what powers top-level `jvp` over concrete arrays.
-///
-/// This realizes the identity `jvp(jit(f)) = jit(jvp f)`: rather than capturing the primal inputs as residual factors
-/// and staging a linear `jit_call`, the rule keeps the compilation boundary and threads every residual as a plain
-/// primal operand edge between two `jit_call`s, so no symbolic capture is ever introduced. The enclosing
-/// partial-evaluation split then discovers the residual operand edges structurally, exactly as it does for the
-/// condition and rematerialize rules.
-///
-/// The rule linearizes the callee program capture-free through
-/// [`Program::linearize`](ryft_core::Program::linearize), giving a primal sub-program
-/// `inputs -> [outputs..., residuals...]` and a tangent sub-program
-/// `[live_input_tangents..., residuals...] -> [live_output_tangents...]` together with the residual count. Tangents
-/// for zero differential spaces are omitted from both compact boundaries. It then:
-///
-///   1. Wraps the primal sub-program in a fresh `jit_call` and stages it over the operand primals, recovering the
-///      primal outputs followed by the residual values (program variables produced by the staged primal call).
-///   2. Wraps the tangent sub-program in a fresh `jit_call` and stages it over the live operand tangents followed by
-///      those residual values, recovering the live output tangents.
-///   3. Pairs each primal output tracer with its tangent output tracer, restoring structural zeros for omitted
-///      zero-space outputs, into a [`DifferentiationDual`].
-///
-/// The callee program is materialized from the instruction's callee region in the context's constant universe `V`
-/// (concretely [`XlaConstant`] for staged XLA programs), so the split halves ride the fresh primal and tangent calls
-/// as shared callee regions. Preserving both `jit_call` boundaries keeps the callee body out of the caller's program,
-/// so forward mode over a jitted call stays compiled rather than inlined.
-///
-/// # Parameters
-///
-///   - `context`: Active evaluation or staging context used to bind the differentiated calls.
-///   - `driver`: Call-scoped access to the attached callee region.
-///   - `inputs`: Primal and tangent values for the call operands.
+// Capture-free forward-mode (JVP) rule for [`JitCallOperation`], binding a primal `jit_call` and a tangent
+// `jit_call` as ordinary XLA-enum operations through the active context: a staging context stages both calls over
+// its shared builder, while an eager context (e.g. a client-backed [`XlaDomain`](crate::XlaDomain)) compiles and
+// executes them immediately, which is what powers top-level `jvp` over concrete arrays.
+//
+// This realizes the identity `jvp(jit(f)) = jit(jvp f)`: rather than capturing the primal inputs as residual factors
+// and staging a linear `jit_call`, the rule keeps the compilation boundary and threads every residual as a plain
+// primal operand edge between two `jit_call`s, so no symbolic capture is ever introduced. The enclosing
+// partial-evaluation split then discovers the residual operand edges structurally, exactly as it does for the
+// condition and rematerialize rules.
+//
+// The rule linearizes the callee program capture-free through
+// [`Program::linearize`](ryft_core::Program::linearize), giving a primal sub-program
+// `inputs -> [outputs..., residuals...]` and a tangent sub-program
+// `[live_input_tangents..., residuals...] -> [live_output_tangents...]` together with the residual count. Tangents
+// for zero differential spaces are omitted from both compact boundaries. It then:
+//
+//   1. Wraps the primal sub-program in a fresh `jit_call` and stages it over the operand primals, recovering the
+//      primal outputs followed by the residual values (program variables produced by the staged primal call).
+//   2. Wraps the tangent sub-program in a fresh `jit_call` and stages it over the live operand tangents followed by
+//      those residual values, recovering the live output tangents.
+//   3. Pairs each primal output tracer with its tangent output tracer, restoring structural zeros for omitted
+//      zero-space outputs, into a [`DifferentiationDual`].
+//
+// The callee program is materialized from the instruction's callee region in the context's constant universe `V`
+// (concretely [`XlaConstant`] for staged XLA programs), so the split halves ride the fresh primal and tangent calls
+// as shared callee regions. Preserving both `jit_call` boundaries keeps the callee body out of the caller's program,
+// so forward mode over a jitted call stays compiled rather than inlined.
+//
+// # Parameters
+//
+//   - `context`: Active evaluation or staging context used to bind the differentiated calls.
+//   - `driver`: Call-scoped access to the attached callee region.
+//   - `inputs`: Primal and tangent values for the call operands.
 impl<C, V> DifferentiableOperation<C> for JitCallOperation<ArrayIrType>
 where
     C: Context<Type = ArrayIrType, Constant = V, Operation = XlaOperation<V>> + Zero<C::Value>,
@@ -1113,9 +1155,9 @@ where
         + CaptureConstant
         + Concretizable<bool>,
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -1125,12 +1167,27 @@ where
         let output_count = output_types.len();
         check_count!("input", inputs, input_types.len(), ProgramError);
 
-        // Linearize the callee capture-free, through the callee region's retained transform cache so that a callee
-        // shared by several outer programs is linearized once. The primal sub-program produces
-        // `[outputs..., residuals...]` and the tangent sub-program consumes `[input_tangents..., residuals...]`; the
-        // residual count is the number of trailing outputs of the primal sub-program beyond the original callee
+        // Linearize the callee through the instruction-scoped driver under the call's activity mask. The callee's
+        // leading lifted-capture inputs are inactive, numeric and reference alike, because a capture is
+        // nondifferentiated plumbing that receives no tangent input; the remaining inputs take the operand duals'
+        // activity (a numeric operand is active, a plumbing reference operand is not). The primal sub-program produces
+        // `[outputs..., residuals...]` and the tangent sub-program consumes `[live(input_tangents)..., residuals...]`;
+        // the residual count is the number of trailing outputs of the primal sub-program beyond the original callee
         // outputs.
-        let (primal_program, tangent_program, _) = callee.linearize_shared()?;
+        let capture_count = self.capture_count();
+        let activity = inputs
+            .iter()
+            .enumerate()
+            .map(|(index, input)| index >= capture_count && input.is_tangent_active())
+            .collect::<Vec<_>>();
+        let input_indices = activity
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &active)| active.then_some(index))
+            .collect::<Vec<_>>();
+        let output_activity = callee.tangent_output_mask(&input_indices)?;
+        let (primal_program, tangent_program, _) = driver.linearize_program(callee, &input_indices)?.into_parts();
+        let (primal_program, tangent_program) = (Arc::new(primal_program), Arc::new(tangent_program));
 
         // Wrap the primal sub-program in a fresh `jit_call` and bind it over the operand primals, recovering the
         // primal outputs followed by the residual values. The shared sub-program handles are attached directly, so
@@ -1140,7 +1197,7 @@ where
         // survives verbatim and its length carries over.
         let primal_call = XlaOperation::JitCall(JitCallOperation::new(self.capture_count()));
         let mut primal_call_outputs =
-            context.bind(primal_call, CalleeRegionDriver::new(&[primal_program]), &primal_operands)?;
+            context.primal().bind(primal_call, CalleeRegionDriver::new(&[primal_program]), &primal_operands)?;
         if primal_call_outputs.len() < output_count {
             return Err(ProgramError::MalformedProgram(format!(
                 "jit_call primal program produced {} outputs which is fewer than its {output_count} primal \
@@ -1152,16 +1209,18 @@ where
         let residuals = primal_call_outputs.split_off(output_count);
         let primal_outputs = primal_call_outputs;
 
-        // Wrap the tangent sub-program in a fresh `jit_call` and bind it over only the live operand tangents followed
-        // by the residual values. Zero-space tangents have no compact callee boundary slot.
-        let input_tangent_types = input_types.iter().map(DifferentiableType::tangent).collect::<Result<Vec<_>, _>>()?;
+        // Wrap the tangent sub-program in a fresh `jit_call` and bind it over only the active operand tangents followed
+        // by the residual values. Inactive operands (the capture prefix, zero-space operands, and plumbing references)
+        // have no compact callee boundary slot.
         let mut tangent_operands = inputs
             .iter()
-            .zip(input_tangent_types)
-            .filter(|(_, tangent_type)| !tangent_type.is_zero_space())
-            .map(|(input, _)| input.tangent().clone().materialize(context))
+            .zip(&activity)
+            .filter(|(_, active)| **active)
+            .map(|(input, _)| input.tangent().clone().materialize(context.tangent()))
             .collect::<Result<Vec<_>, _>>()?;
-        tangent_operands.extend(residuals);
+        tangent_operands.extend(
+            residuals.into_iter().map(|value| context.primal_to_tangent(value)).collect::<Result<Vec<_>, _>>()?,
+        );
         // The tangent callee's inputs are live input tangents followed by residuals — never a lifted-capture prefix.
         // Attached-region capture constants cannot appear in it because fresh-root region traces reject bodies that
         // register captures (`ProgramError::DiscardedCaptures`), and a stale reference that slipped in anyway would
@@ -1169,18 +1228,18 @@ where
         // value.
         let tangent_call = XlaOperation::JitCall(JitCallOperation::new(0));
         let tangent_outputs =
-            context.bind(tangent_call, CalleeRegionDriver::new(&[tangent_program]), &tangent_operands)?;
-        let output_tangent_types =
-            output_types.iter().map(DifferentiableType::tangent).collect::<Result<Vec<_>, _>>()?;
-        let tangent_output_count = output_tangent_types.iter().filter(|r#type| !r#type.is_zero_space()).count();
+            context
+                .tangent()
+                .bind(tangent_call, CalleeRegionDriver::new(&[tangent_program]), &tangent_operands)?;
+        let tangent_output_count = output_activity.iter().filter(|&&active| active).count();
         check_count!("output", tangent_outputs, tangent_output_count, ProgramError);
 
         let mut tangent_outputs = tangent_outputs.into_iter();
         Ok(primal_outputs
             .into_iter()
-            .zip(output_tangent_types)
-            .map(|(primal, tangent_type)| {
-                if tangent_type.is_zero_space() {
+            .zip(output_activity)
+            .map(|(primal, active)| {
+                if !active {
                     DifferentiationDual::new_with_zero_tangent(primal)
                 } else {
                     DifferentiationDual::new(primal, tangent_outputs.next().unwrap())
@@ -1237,42 +1296,22 @@ pub(crate) fn materialize_transpose_cotangent<
                 .collect::<Result<Vec<_>, _>>()?;
             (XlaOperation::from(ZeroOperation::new(array_type.clone())), operands)
         }
-        _ => (XlaOperation::zero_operation(output_type.clone())?, Vec::new()),
+        _ => (XlaOperation::provide(ZeroOperation::new(output_type.clone()), &[])?, Vec::new()),
     };
     let mut outputs = context.stage_operation(operation, Vec::new(), operands.as_slice())?;
     check_count!("output", outputs, 1, ProgramError);
     Ok(outputs.remove(0))
 }
 
-/// Partition-aware transpose rule for a *primal* tangent [`JitCallOperation`], the jitted-call counterpart of
-/// [`transpose_primal_condition`](ryft_core::operations::control_flow::transpose_primal_condition),
-/// [`transpose_primal_scan`](ryft_core::operations::control_flow::transpose_primal_scan), and
-/// [`LinearCallOperation`]'s transpose rule. It is used when the direct reverse transposes a tangent program in the
-/// primal [`XlaOperation`] family rather than re-keying it into a linear operation family.
+/// Transposes a tangent [`JitCallOperation`] while retaining its compilation boundary.
 ///
-/// The forward ([`JitCallOperation::jvp`]) stages the tangent `jit_call` over the operand tangents followed
-/// by the primal call's residual values, wrapping a callee program whose inputs match that operand signature
-/// one-to-one and whose outputs are the output tangents. Each operand is therefore independently linear (an input
-/// tangent the reverse must accumulate) or known (a residual value, or a captured-constant tangent the differentiated
-/// inputs do not flow through), and the linear operands need not form a leading run: a captured compiled function
-/// threads its captured prefix as known leading operands, so a known operand can precede the linear input tangents.
-/// This rule:
+/// The [`TranspositionDriver`] transposes the attached callee under the operands' linearity and cotangent-destination
+/// masks. Known operands supply residual or captured values and may appear anywhere in the input boundary. The
+/// transposed call consumes ordinary output cotangents, live cotangent references, and known operands, in that order.
+/// Reference outputs forward input roots and therefore have no separate output-cotangent slot.
 ///
-///   1. Reads the runtime value of every known operand from `operand_values`, in callee-input order, to feed the
-///      transposed callee's known inputs.
-///   2. Transposes the callee program with [`TranspositionDriver::transpose_program`] under the same per-operand
-///      linearity mask, so the callee's own linear and known inputs match the operands. The
-///      transposed callee maps `[outputs..., known_input_values...]` to `[linear_input_cotangents...]`, in
-///      callee-input order on each side.
-///   3. Re-wraps the transposed callee in a fresh [`JitCallOperation`] and stages it over
-///      `[outputs..., known_input_values...]`, preserving the compilation boundary so that both forward mode
-///      over a jitted call (`jvp ∘ jit`) and reverse mode over it (`transpose ∘ jit`) stay compiled rather than
-///      inlined.
-///
-/// The returned cotangents place the transposed call's outputs at the linear-operand positions and a structural
-/// [`MaybeZero::Zero`] at the known positions, which carry no cotangent. The callee transposition happens through
-/// [`TranspositionDriver::transpose_program`] in the same operation family, so it is value-level and introduces
-/// no recursive transposition obligation on [`XlaOperation`].
+/// Returned cotangents follow the original input order: linear value inputs receive call results, reference inputs
+/// accumulate into their supplied cotangent destinations, and known or ignored inputs receive structural zeros.
 ///
 /// # Parameters
 ///
@@ -1283,6 +1322,11 @@ pub(crate) fn materialize_transpose_cotangent<
 ///     [`Unknown`](PartialValue::Unknown) entries are the input tangents; the [`Known`](PartialValue::Known) entries
 ///     carry the residual and captured-constant-tangent tracers the pullback reads.
 ///   - `outputs`: Symbolic cotangents for the tangent call's outputs.
+///   - `cotangents`: Cotangent destinations of the operands (refer to the documentation of
+///     [`operand_cotangents`]). The callee is transposed with their destination kinds, so a live
+///     (`Reference`-kind) reference operand's cotangent reference is an operand of the transposed call, which
+///     accumulates into it in place and returns it by identity, while a dead (`Ignore`-kind) reference operand has no
+///     slot in the transposed callee at all.
 pub fn transpose_primal_jit_call<
     V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     D: TranspositionDriver<V, XlaOperation<V>>,
@@ -1292,9 +1336,16 @@ pub fn transpose_primal_jit_call<
     driver: &D,
     inputs: &[PartialValue<Tracer<TracingContext<V, XlaOperation<V>>>>],
     outputs: &[MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>],
+    cotangents: &OperandCotangents<Tracer<TracingContext<V, XlaOperation<V>>>>,
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, ProgramError> {
-    // A jitted call with no live output cotangents is a zero linear map, so every operand cotangent is zero.
-    if outputs.iter().all(MaybeZero::is_zero) {
+    // A jitted call with no live output cotangents and no live reference operand is a zero linear map, so every
+    // operand cotangent is zero. A live reference operand keeps the call live, because its accumulated state cotangent
+    // flows through the transposed callee even when no ordinary output cotangent does.
+    check_count!("input", cotangents.destination_kinds(), inputs.len(), ProgramError);
+    if outputs.iter().all(MaybeZero::is_zero)
+        && !cotangents.is_live()
+        && !driver.region(0)?.has_observable_transpose_effects()
+    {
         return inputs
             .iter()
             .map(|input| input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from))
@@ -1308,70 +1359,98 @@ pub fn transpose_primal_jit_call<
     let operand_linear = inputs.iter().map(PartialValue::is_unknown).collect::<Vec<_>>();
     let callee = driver.region(0)?;
     check_count!("input", operand_linear, callee.input_types().len(), ProgramError);
-    let known_values = inputs
-        .iter()
-        .filter(|input| input.is_known())
-        .map(|input| input.as_known().expect("dispatch guarantees a known operand carries its pullback value").clone())
-        .collect::<Vec<_>>();
 
     // Transpose the callee with respect to its linear inputs, through the region's retained transform cache so that a
-    // callee shared by several outer programs is transposed once per linearity mask. The transposed callee maps
-    // `[outputs..., known_input_values...]` to `[linear_input_cotangents...]`, in callee-input order.
-    let transposed_callee = driver.transpose_program(callee, operand_linear.as_slice())?;
+    // callee shared by several outer programs is transposed once per linearity mask. A live reference-typed linear
+    // input is transposed with a `Reference` destination and a dead one with an `Ignore` destination, so the transposed
+    // callee maps `[non_reference_output_cotangents..., cotangent_references..., known_input_values...]` to
+    // `[linear_input_cotangents...]`, in callee-input order, where a live reference input's cotangent is its cotangent
+    // reference itself and a dead reference input has no cotangent slot.
+    let transposed_callee =
+        driver.transpose_program(callee, operand_linear.as_slice(), cotangents.destination_kinds())?;
 
     // Stage the output cotangents, materializing a typed zero for each structurally zero cotangent, then stage a fresh
-    // `jit_call` over the transposed callee on `[outputs..., known_input_values...]`. Its outputs are the
-    // linear-input cotangents.
+    // `jit_call` over the transposed callee on `[outputs..., cotangent_references..., known_input_values...]`. Its
+    // outputs are the linear-input cotangents.
     let output_types = callee.output_types();
     check_count!("output", outputs, output_types.len(), ProgramError);
-    let mut operands = Vec::with_capacity(output_types.len() + known_values.len());
+    let mut operands = Vec::with_capacity(output_types.len() + inputs.len());
     for (cotangent, output_type) in outputs.iter().zip(output_types.iter()) {
+        // A reference output forwards a callee input root whose state cotangent lives in that operand's cotangent
+        // reference, so it owns no cotangent slot.
+        if output_type.is_reference() {
+            continue;
+        }
         let output_cotangent_type = output_type.cotangent()?;
         operands.push(materialize_transpose_cotangent(context, cotangent, &output_cotangent_type, inputs)?);
     }
-    operands.extend(known_values);
-    // The transposed callee's inputs are output cotangents followed by known input values — never a lifted-capture
-    // prefix. Attached-region capture constants cannot appear in it because region bodies are traced through
-    // fresh-root contexts.
+    operands.extend(cotangents.references().iter().cloned());
+    operands.extend(inputs.iter().filter_map(PartialValue::as_known).cloned());
+    // The transposed callee's inputs are output cotangents, cotangent references, and known input values — never a
+    // lifted-capture prefix. Attached-region capture constants cannot appear in it because region bodies are traced
+    // through fresh-root contexts.
     let transposed_call = XlaOperation::JitCall(JitCallOperation::new(0));
     let input_cotangents =
         context.bind(transposed_call, CalleeRegionDriver::new(&[transposed_callee]), operands.as_slice())?;
-    let linear_count = operand_linear.iter().filter(|&&linear| linear).count();
-    check_count!("output", input_cotangents, linear_count, ProgramError);
+    let output_count = (0..inputs.len())
+        .filter(|&index| operand_linear[index] && cotangents.returns_cotangent(index))
+        .count();
+    check_count!("output", input_cotangents, output_count, ProgramError);
 
     // Reassemble one cotangent per operand: the known operands carry structural zeros, while the linear input tangents
-    // receive the transposed call's outputs in callee-input order.
-    let mut input_cotangents = input_cotangents.into_iter().map(MaybeZero::Value);
-    let cotangents = operand_linear
+    // receive the transposed call's outputs in callee-input order. A live reference tangent's output is its cotangent
+    // reference, whose contents were accumulated in place, and a dead one has no output, so every reference operand
+    // receives a structural zero.
+    let mut input_cotangents = input_cotangents.into_iter();
+    operand_linear
         .iter()
         .zip(inputs)
-        .map(|(&linear, input)| {
-            if linear {
-                Ok(input_cotangents.next().unwrap())
-            } else {
+        .enumerate()
+        .map(|(index, (&linear, input))| match cotangents.kind(index) {
+            CotangentDestinationKind::Return if linear => Ok(MaybeZero::Value(input_cotangents.next().unwrap())),
+            CotangentDestinationKind::Reference => {
+                if cotangents.is_reference(index) {
+                    input_cotangents.next();
+                }
+                input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from)
+            }
+            CotangentDestinationKind::Return | CotangentDestinationKind::Ignore => {
                 input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from)
             }
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(cotangents)
+        .collect()
 }
 
-/// Transpose rule for a primal tangent [`JitCallOperation`], forwarding to [`transpose_primal_jit_call`]. The callee
-/// transposition happens on the concretely [`XlaConstant`]-keyed [`FlatXlaProgram`], so the recursion is resolved once
-/// at definition time and instantiating this implementation introduces no recursive [`TransposableOperation`]
-/// obligation on [`XlaOperation`].
+// Transpose rule for a primal tangent [`JitCallOperation`], forwarding to [`transpose_primal_jit_call`] with the
+// cotangent references of its linear reference-typed operands resolved (and allocated on first use) through the
+// enclosing [`TranspositionContext`]. The callee transposition happens on the concretely [`XlaConstant`]-keyed
+// [`FlatXlaProgram`], so the recursion is resolved once at definition time and instantiating this implementation
+// introduces no recursive [`TransposableOperation`] obligation on [`XlaOperation`].
 impl<V> TransposableOperation<V, XlaOperation<V>> for JitCallOperation<ArrayIrType>
 where
     V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
     fn transpose<D: TranspositionDriver<V, XlaOperation<V>>>(
         &self,
-        context: &mut TracingContext<V, XlaOperation<V>>,
+        context: &mut TranspositionContext<'_, V, XlaOperation<V>>,
         driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, XlaOperation<V>>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, DifferentiationError> {
-        transpose_primal_jit_call(self, context, driver, inputs, outputs).map_err(DifferentiationError::from)
+        accumulators: &[ryft_core::CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        check_count!("output", outputs, driver.region(0)?.output_types().len(), ProgramError);
+        check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+        let contributions =
+            (|| -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, DifferentiationError> {
+                let cotangents = operand_cotangents(context, inputs, accumulators)?;
+                transpose_primal_jit_call(self, context, driver, inputs, outputs, &cotangents)
+                    .map_err(DifferentiationError::from)
+            })()?;
+        check_count!("input", contributions, accumulators.len(), ProgramError);
+        for (accumulator, contribution) in accumulators.iter().zip(contributions) {
+            accumulator.accumulate(context, contribution)?;
+        }
+        Ok(())
     }
 }
 
@@ -1382,18 +1461,20 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        AddOperation, ArrayIrOperation, ArrayIrOperations, ArrayIrType, ArrayOperation, ArrayOperations, ArrayType,
-        CaptureReference, CapturingContext, ConditionOperation, Context, CustomJvpOperation, CustomVjpOperation,
-        DataType, DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation,
-        DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, DynamicBroadcastOperation, Effects,
-        EmptyRegionDriver, ExternalReferenceBinding, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation,
+        AddOperation, ArrayIrOperation, ArrayIrOperations, ArrayIrType, ArrayOperation, ArrayOperations,
+        ArrayReferenceViewTransform, ArrayType, CaptureReference, CapturingContext, ConditionOperation, Context,
+        CotangentDestinationKind, CustomJvpOperation, CustomVjpOperation, DataType, DifferentiableType,
+        DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionType, DimensionValue,
+        DimensionVariable, DomainTracingContext, DynamicBroadcastOperation, EffectClasses, ExternalReferenceBinding,
+        InputRegionProvenance, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation, OperandCotangents,
         Operation, OutputRegionProvenance, PartialValue, Placeholder, ProgramBuilder, ProgramError,
         ReferenceAddUpdateOperation, ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceFreezeOperation,
-        ReferenceNewOperation, ReferenceReadOperation, ReferenceSource, ReferenceSwapOperation, ReferenceType,
+        ReferenceIndexOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSource,
+        ReferenceSwapOperation, ReferenceType, ReferenceViewOperation, ReferenceViewValidationError,
         ReferenceWriteOperation, RegionDriver, RegionInterface, RegionRef, RematerializeOperation,
         ResidualZeroProvider, ScanOperation, Shape, Sharding, ShardingDimension, StagingContext, Tracer,
-        TracingContext, TranspositionDriver, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
-        WhileOperation, ZeroOperation,
+        TracingContext, TranspositionDriver, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection, ViewIndex,
+        ViewSymbol, WhileOperation, ZeroOperation,
     };
 
     use crate::Array;
@@ -1429,6 +1510,7 @@ mod tests {
             &self,
             _region: RegionRef<'_, XlaConstant, XlaOperation>,
             _input_linearity: &[bool],
+            _destination_kinds: &[CotangentDestinationKind],
         ) -> Result<Arc<XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>>, DifferentiationError> {
             Ok(Arc::new(self.transposed.clone()))
         }
@@ -1443,7 +1525,7 @@ mod tests {
         // A jitted call forwards its operands to the callee positionally, so region provenance, capture counts, and
         // output provenance are all index-preserving for the single callee region and absent for any other region.
         let operation = JitCallOperation::<ArrayIrType>::new(2);
-        assert_eq!(operation.input_region_provenance(0, 3), Some(3));
+        assert_eq!(operation.input_region_provenance(0, 3), Some(InputRegionProvenance::Forwarded { input_index: 3 }),);
         assert_eq!(operation.input_region_provenance(1, 3), None);
         assert_eq!(operation.region_capture_input_count(0), Some(2));
         assert_eq!(operation.region_capture_input_count(1), None);
@@ -1728,6 +1810,33 @@ mod tests {
     }
 
     #[test]
+    fn test_xla_operation_region_input_view() {
+        // The backend-owned scan creates the same boundary views as the core composite scan: every trailing body input
+        // is the per-iteration slice of its stacked operand, indexed on the leading axis by the iteration counter.
+        let view = ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Symbolic(ViewSymbol::Iteration) };
+        let scan = XlaOperation::<XlaConstant>::Scan(ScanOperation::new(1, 3));
+        assert_eq!(scan.region_input_view(0, 0), None);
+        assert_eq!(scan.region_input_view(0, 1), Some(view.clone()));
+        assert_eq!(scan.region_input_view(0, 2), Some(view.clone()));
+        assert_eq!(scan.region_input_view(1, 1), None);
+        assert_eq!(XlaOperation::<XlaConstant>::While(WhileOperation::new()).region_input_view(0, 0), None);
+        assert_eq!(
+            XlaOperation::<XlaConstant>::ReferenceIndex(ReferenceIndexOperation::new(0, 1)).region_input_view(0, 0),
+            None,
+        );
+        let stacked = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3, 2])));
+        let slice = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2])));
+        assert_eq!(XlaOperation::<XlaConstant>::validate_view(&view, &stacked, &slice), Ok(()));
+        assert_eq!(
+            XlaOperation::<XlaConstant>::validate_view(&view, &stacked, &stacked),
+            Err(ReferenceViewValidationError::TypeMismatch {
+                expected: "f32[2]".to_string(),
+                actual: "f32[3, 2]".to_string(),
+            }),
+        );
+    }
+
+    #[test]
     fn test_core_custom_derivative_and_rematerialization_promotions_preserve_metadata() {
         // These three payloads are promoted by move rather than reconstructed, so their complete stored surface must
         // survive: the non-differentiated operand split of all three, and additionally the rematerialization
@@ -1888,7 +1997,7 @@ mod tests {
         let interface = RegionInterface::new(
             vec![dimension_type.clone()],
             vec![array_type.clone(), dimension_type.clone()],
-            Effects::PURE,
+            EffectClasses::NONE,
         );
         let operation = JitCallOperation::new(0);
 
@@ -1944,6 +2053,446 @@ mod tests {
         let jvp = program.jvp().unwrap();
         assert_eq!(jvp.input_types(), vec![dimension_type.clone(), array_type.clone(), array_type.clone()]);
         assert_eq!(jvp.output_types(), vec![dimension_type, array_type.clone(), array_type]);
+    }
+
+    #[test]
+    fn test_jit_call_jvp_keeps_capture_prefix_inactive() {
+        // The callee's leading input is its lifted capture (`capture_count = 1`). The call's activity mask starts
+        // inactive over that prefix, numeric captures included, so the tangent callee consumes only the live operand
+        // tangent followed by the residuals, and the primal callee keeps the capture prefix verbatim.
+        let r#type = ArrayIrType::Array(vector_type());
+        let callee = {
+            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let captured = builder.add_input(r#type.clone());
+            let input = builder.add_input(r#type.clone());
+            let product =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![captured, input], None).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![product], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let captured = builder.add_input(r#type.clone());
+        let input = builder.add_input(r#type);
+        let output = builder
+            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(1)), vec![callee], vec![captured, input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let jvp = program.jvp().unwrap();
+        let calls = jvp
+            .instructions()
+            .iter()
+            .filter(|instruction| matches!(instruction.operation(), XlaOperation::JitCall(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        let primal_callee = jvp.region_ref(calls[0].regions()[0]).unwrap();
+        assert!(matches!(calls[0].operation(), XlaOperation::JitCall(operation) if operation.capture_count() == 1));
+        assert_eq!(primal_callee.input_types().len(), 2);
+        let residual_count = primal_callee.output_types().len() - 1;
+        assert!(residual_count >= 1);
+        let tangent_callee = jvp.region_ref(calls[1].regions()[0]).unwrap();
+        assert!(matches!(calls[1].operation(), XlaOperation::JitCall(operation) if operation.capture_count() == 0));
+        assert_eq!(tangent_callee.input_types().len(), 1 + residual_count);
+        assert_eq!(calls[1].inputs().len(), 1 + residual_count);
+    }
+
+    #[test]
+    fn test_jit_call_jvp_threads_plumbing_and_active_references() {
+        // The callee reads a captured plumbing reference and mutates an active reference operand:
+        // `f(captured, r, x) = { r += x; read(r) * read(captured) }` behind `jit_call[capture_count=1]`.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let callee = {
+            let mut builder = XlaProgramBuilder::new();
+            let captured = builder.add_input(reference_type.clone());
+            let reference = builder.add_input(reference_type.clone());
+            let update = builder.add_input(scalar_type.clone());
+            builder
+                .add_instruction(
+                    XlaOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
+                    Vec::new(),
+                    vec![reference, update],
+                    None,
+                )
+                .unwrap();
+            let state = builder
+                .add_instruction(
+                    XlaOperation::ReferenceRead(ReferenceReadOperation::new()),
+                    Vec::new(),
+                    vec![reference],
+                    None,
+                )
+                .unwrap()[0];
+            let scale = builder
+                .add_instruction(
+                    XlaOperation::ReferenceRead(ReferenceReadOperation::new()),
+                    Vec::new(),
+                    vec![captured],
+                    None,
+                )
+                .unwrap()[0];
+            let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![state, scale], None).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = XlaProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let captured = builder.add_input(reference_type.clone());
+        let reference = builder.add_input(reference_type.clone());
+        let update = builder.add_input(scalar_type.clone());
+        let output = builder
+            .add_instruction(
+                XlaOperation::JitCall(JitCallOperation::new(1)),
+                vec![callee],
+                vec![captured, reference, update],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+
+        // The plumbing capture is inactive and the active reference receives a tangent reference input, so the fused
+        // program consumes `[captured, r, x, ṫr, ẋ]`: the primal call keeps the capture prefix verbatim, while the
+        // tangent call consumes the tangent reference and the tangent value followed by the residuals.
+        let jvp = program.entry_region_ref().jvp(&[1, 2]).unwrap();
+        assert_eq!(
+            jvp.input_types(),
+            vec![
+                reference_type.clone(),
+                reference_type.clone(),
+                scalar_type.clone(),
+                reference_type.clone(),
+                scalar_type.clone(),
+            ],
+        );
+        assert_eq!(jvp.output_types(), vec![scalar_type.clone(), scalar_type.clone()]);
+        let calls = jvp
+            .instructions()
+            .iter()
+            .filter(|instruction| matches!(instruction.operation(), XlaOperation::JitCall(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        assert!(matches!(calls[0].operation(), XlaOperation::JitCall(operation) if operation.capture_count() == 1));
+        assert_eq!(&calls[0].inputs()[..3], &jvp.input_ids()[..3]);
+        let primal_callee = jvp.region_ref(calls[0].regions()[0]).unwrap();
+        assert_eq!(
+            primal_callee.input_types(),
+            vec![reference_type.clone(), reference_type.clone(), scalar_type.clone()]
+        );
+        let residual_count = primal_callee.output_types().len() - 1;
+        assert!(matches!(calls[1].operation(), XlaOperation::JitCall(operation) if operation.capture_count() == 0));
+        assert_eq!(&calls[1].inputs()[..2], &jvp.input_ids()[3..]);
+        assert_eq!(calls[1].inputs().len(), 2 + residual_count);
+        let tangent_callee = jvp.region_ref(calls[1].regions()[0]).unwrap();
+        assert_eq!(&tangent_callee.input_types()[..2], &[reference_type, scalar_type]);
+    }
+
+    #[test]
+    fn test_jit_call_jvp_omits_inactive_reference_output_tangents() {
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let mut callee_builder = XlaProgramBuilder::new();
+        let reference = callee_builder.add_input(reference_type.clone());
+        let value = callee_builder.add_input(scalar_type.clone());
+        let doubled =
+            callee_builder.add_instruction(AddOperation::new(), Vec::new(), vec![value, value], None).unwrap()[0];
+        let callee = callee_builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![reference, doubled],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let mut builder = XlaProgramBuilder::new();
+        let reference = builder.add_input(reference_type.clone());
+        let value = builder.add_input(scalar_type.clone());
+        let callee = builder.import_region(callee.entry_region_ref());
+        let outputs = builder
+            .add_instruction(
+                XlaOperation::JitCall(JitCallOperation::new(1)),
+                vec![callee],
+                vec![reference, value],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let jvp = program.entry_region_ref().jvp(&[1]).unwrap();
+        assert_eq!(jvp.input_types(), vec![reference_type.clone(), scalar_type.clone(), scalar_type.clone()]);
+        assert_eq!(jvp.output_types(), vec![reference_type, scalar_type.clone(), scalar_type]);
+        let calls = jvp
+            .instructions()
+            .iter()
+            .filter(|instruction| matches!(instruction.operation(), XlaOperation::JitCall(_)))
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(jvp.region_ref(calls[1].regions()[0]).unwrap().output_types().len(), 1);
+    }
+
+    #[test]
+    fn test_jit_call_partial_evaluation_keeps_reference_bearing_callees_whole() {
+        // The callee reads the reference before and after mutating it: `f(r, x) = { a = read(r); r += x; a * read(r) }`
+        // Splitting it against a known `r` would hoist the first read into the outer trace and leave the mutation and
+        // the second read behind the residual call, so the call stays whole instead.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let callee = {
+            let mut builder = XlaProgramBuilder::new();
+            let reference = builder.add_input(reference_type.clone());
+            let update = builder.add_input(scalar_type.clone());
+            let before = builder
+                .add_instruction(
+                    XlaOperation::ReferenceRead(ReferenceReadOperation::new()),
+                    Vec::new(),
+                    vec![reference],
+                    None,
+                )
+                .unwrap()[0];
+            builder
+                .add_instruction(
+                    XlaOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
+                    Vec::new(),
+                    vec![reference, update],
+                    None,
+                )
+                .unwrap();
+            let after = builder
+                .add_instruction(
+                    XlaOperation::ReferenceRead(ReferenceReadOperation::new()),
+                    Vec::new(),
+                    vec![reference],
+                    None,
+                )
+                .unwrap()[0];
+            let output =
+                builder.add_instruction(MulOperation::new(), Vec::new(), vec![before, after], None).unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = XlaProgramBuilder::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let reference = builder.add_input(reference_type.clone());
+        let update = builder.add_input(scalar_type.clone());
+        let output = builder
+            .add_instruction(
+                XlaOperation::JitCall(JitCallOperation::new(0)),
+                vec![callee],
+                vec![reference, update],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let outer = TracingContext::<XlaConstant, XlaOperation>::new();
+        let known = outer.input(reference_type);
+        let evaluation = program
+            .partially_evaluate_in_context(&outer, &[PartialValue::Known(known), PartialValue::Unknown(scalar_type)])
+            .unwrap();
+        let residual = evaluation.program();
+        assert_eq!(residual.instructions().len(), 1);
+        assert!(matches!(residual.instructions()[0].operation(), XlaOperation::JitCall(_)));
+        assert_eq!(residual.instructions()[0].inputs().len(), 2);
+        let residual_names = residual
+            .entry_region_ref()
+            .instructions_in_closure()
+            .map(|(_, instruction)| instruction.operation().name())
+            .collect::<Vec<_>>();
+        assert_eq!(residual_names, vec!["jit_call", "reference_read", "reference_add_update", "reference_read", "mul"]);
+        assert!(outer.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
+    fn test_jit_call_partial_evaluation_keeps_escaping_allocation_callees_whole() {
+        // The callee allocates a reference from the known input and returns it beside a runtime-dependent product:
+        // `f(k, x) = (reference_new(k), k * x)`. The allocation is computable from known inputs alone, but it escapes
+        // through a reference output whose later accesses the callee cannot see, so it is live state rather than dead
+        // intrinsic state, and the call stays whole instead of hoisting the allocation into the known side.
+        let r#type = ArrayIrType::Array(vector_type());
+        let callee = {
+            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let known_input = builder.add_input(r#type.clone());
+            let runtime_input = builder.add_input(r#type.clone());
+            let reference =
+                builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![known_input], None).unwrap()[0];
+            let product = builder
+                .add_instruction(MulOperation::new(), Vec::new(), vec![known_input, runtime_input], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![reference, product],
+                    vec![Placeholder; 2],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        let known_input = builder.add_input(r#type.clone());
+        let runtime_input = builder.add_input(r#type.clone());
+        let callee_region = builder.intern_callee(&Arc::new(callee), None).unwrap();
+        let outputs = builder
+            .add_instruction(
+                XlaOperation::JitCall(JitCallOperation::new(0)),
+                vec![callee_region],
+                vec![known_input, runtime_input],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+        let outer = TracingContext::<XlaConstant, XlaOperation>::new();
+        let known = outer.input(r#type.clone());
+        let evaluation = program
+            .partially_evaluate_in_context(&outer, &[PartialValue::Known(known), PartialValue::Unknown(r#type)])
+            .unwrap();
+        let residual = evaluation.program();
+        assert_eq!(residual.instructions().len(), 1);
+        assert!(matches!(residual.instructions()[0].operation(), XlaOperation::JitCall(_)));
+        let residual_names = residual
+            .entry_region_ref()
+            .instructions_in_closure()
+            .map(|(_, instruction)| instruction.operation().name())
+            .collect::<Vec<_>>();
+        assert_eq!(residual_names, vec!["jit_call", "reference_new", "mul"]);
+        assert!(outer.builder().borrow().instructions().is_empty());
+    }
+
+    #[test]
+    fn test_jit_call_transposition_ignores_dead_reference_operands() {
+        // The linear callee only stores into its reference operand and forwards `x`: `ẏ = { ṫr += ẋ; ẋ }`. Under an
+        // `Ignore` destination for the reference no later instruction accumulated into its root and the callee never
+        // reads it, so the callee is transposed with an `Ignore` destination as well: the transposed call consumes
+        // `[ȳ]` only, returns `x̄` only, and neither it nor its callee stages a cotangent reference.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let callee = {
+            let mut builder = XlaProgramBuilder::new();
+            let reference = builder.add_input(reference_type.clone());
+            let update = builder.add_input(scalar_type.clone());
+            builder
+                .add_instruction(
+                    XlaOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
+                    Vec::new(),
+                    vec![reference, update],
+                    None,
+                )
+                .unwrap();
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![update], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = XlaProgramBuilder::new();
+        let callee_region = builder.import_region(callee.entry_region_ref());
+        let reference = builder.add_input(reference_type.clone());
+        let update = builder.add_input(scalar_type.clone());
+        let output = builder
+            .add_instruction(
+                XlaOperation::JitCall(JitCallOperation::new(0)),
+                vec![callee_region],
+                vec![reference, update],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let destination_kinds = [CotangentDestinationKind::Ignore, CotangentDestinationKind::Return];
+        let transposed = program.transpose_with_respect_to(&[0, 1], &destination_kinds).unwrap();
+        assert_eq!(transposed.input_types(), vec![scalar_type.clone()]);
+        assert_eq!(transposed.output_types(), vec![scalar_type.clone()]);
+        assert_eq!(transposed.instructions().len(), 1);
+        let call = &transposed.instructions()[0];
+        assert!(matches!(call.operation(), XlaOperation::JitCall(_)));
+        assert_eq!(call.inputs(), transposed.input_ids());
+        assert_eq!(call.outputs(), transposed.output_ids());
+        let transposed_callee = transposed.region_ref(call.regions()[0]).unwrap().to_program();
+        assert_eq!(transposed_callee.input_types(), vec![scalar_type.clone()]);
+        assert_eq!(transposed_callee.output_types(), vec![scalar_type]);
+        assert!(transposed_callee.instructions().is_empty());
+        let transposed_names = transposed
+            .entry_region_ref()
+            .instructions_in_closure()
+            .map(|(_, instruction)| instruction.operation().name())
+            .collect::<Vec<_>>();
+        assert_eq!(transposed_names, vec!["jit_call"]);
+    }
+
+    #[test]
+    fn test_jit_call_transposition_threads_cotangent_references() {
+        // The linear callee accumulates into its reference operand and reads it back: `ẏ = { ṫr += ẋ; read(ṫr) }`.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let callee = {
+            let mut builder = XlaProgramBuilder::new();
+            let reference = builder.add_input(reference_type.clone());
+            let update = builder.add_input(scalar_type.clone());
+            builder
+                .add_instruction(
+                    XlaOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
+                    Vec::new(),
+                    vec![reference, update],
+                    None,
+                )
+                .unwrap();
+            let output = builder
+                .add_instruction(
+                    XlaOperation::ReferenceRead(ReferenceReadOperation::new()),
+                    Vec::new(),
+                    vec![reference],
+                    None,
+                )
+                .unwrap()[0];
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = XlaProgramBuilder::new();
+        let callee_region = builder.import_region(callee.entry_region_ref());
+        let reference = builder.add_input(reference_type.clone());
+        let update = builder.add_input(scalar_type.clone());
+        let output = builder
+            .add_instruction(
+                XlaOperation::JitCall(JitCallOperation::new(0)),
+                vec![callee_region],
+                vec![reference, update],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        // Transposed under a `Reference` destination for the reference operand, the pullback consumes `[ȳ, r̄]` and
+        // returns the cotangent reference by identity ahead of `x̄`. The reference operand's cotangent lives in that
+        // destination, which the transposed call accumulates into in place, so the pullback forwards its own
+        // destination input rather than the call's forwarded reference output, while `x̄` is the call's second output.
+        // The transposed callee is exactly the transposition of the inlined callee under the same destinations.
+        let destination_kinds = [CotangentDestinationKind::Reference, CotangentDestinationKind::Return];
+        let transposed = program.transpose_with_respect_to(&[0, 1], &destination_kinds).unwrap();
+        assert_eq!(transposed.input_types(), vec![scalar_type.clone(), reference_type.clone()]);
+        assert_eq!(transposed.output_types(), vec![reference_type.clone(), scalar_type]);
+        assert_eq!(transposed.instructions().len(), 1);
+        let call = &transposed.instructions()[0];
+        assert!(matches!(call.operation(), XlaOperation::JitCall(operation) if operation.capture_count() == 0));
+        assert_eq!(call.inputs(), transposed.input_ids());
+        assert_eq!(call.outputs().len(), 2);
+        assert_eq!(transposed.atoms()[call.outputs()[0].index()].r#type().as_ref(), &reference_type);
+        assert_eq!(transposed.output_ids(), &[transposed.input_ids()[1], call.outputs()[1]]);
+        let transposed_callee = transposed.region_ref(call.regions()[0]).unwrap().to_program();
+        let inlined = callee.transpose_with_respect_to(&[0, 1], &destination_kinds).unwrap();
+        assert_eq!(transposed_callee.to_string(), inlined.to_string());
     }
 
     #[test]
@@ -2062,13 +2611,23 @@ mod tests {
             .unwrap();
         let expected = ArrayIrType::Array(tangent_type.cotangent().unwrap());
         let tangent_type = ArrayIrType::Array(tangent_type);
+        // Zero cotangents skip a pure callee only after its effects have been inspected. Supply the real
+        // identity-region boundary rather than an empty driver that cannot answer that query.
+        let mut source_builder = XlaProgramBuilder::new();
+        let input = source_builder.add_input(tangent_type.clone());
+        let source = source_builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let mut transpose_builder = XlaProgramBuilder::new();
+        let input = transpose_builder.add_input(expected.clone());
+        let transposed = transpose_builder.build(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let driver = TestTranspositionDriver { source, transposed };
         let mut context = TracingContext::<XlaConstant, XlaOperation>::new();
         let cotangents = transpose_primal_jit_call(
             &JitCallOperation::new(0),
             &mut context,
-            &EmptyRegionDriver,
+            &driver,
             &[PartialValue::Unknown(tangent_type.clone())],
             &[MaybeZero::Zero(tangent_type.clone())],
+            &OperandCotangents::without_references([true]),
         )
         .unwrap();
         assert!(matches!(&cotangents[..], [MaybeZero::Zero(actual)] if actual == &expected));
@@ -2077,9 +2636,10 @@ mod tests {
         let cotangents = transpose_primal_jit_call(
             &JitCallOperation::new(0),
             &mut context,
-            &EmptyRegionDriver,
+            &driver,
             &[PartialValue::Known(known)],
             &[MaybeZero::Zero(tangent_type)],
+            &OperandCotangents::without_references([true]),
         )
         .unwrap();
         assert!(matches!(&cotangents[..], [MaybeZero::Zero(actual)] if actual == &expected));
@@ -2157,6 +2717,7 @@ mod tests {
                 MaybeZero::Value(value_cotangent),
                 MaybeZero::Zero(ArrayIrType::Array(predicate_type.cotangent().unwrap())),
             ],
+            &OperandCotangents::without_references([true]),
         )
         .unwrap();
 
@@ -2324,7 +2885,7 @@ mod tests {
     }
 
     #[test]
-    fn test_jit_call_partial_evaluation_rejects_state_before_partitioning() {
+    fn test_jit_call_partial_evaluation_partitions_a_callee_with_a_dead_allocation() {
         let r#type = ArrayIrType::Array(vector_type());
         let callee = {
             let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
@@ -2363,19 +2924,36 @@ mod tests {
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder; 2])
             .unwrap();
 
+        // The callee partitions like any other: its pure prefix over the known input folds into the known side
+        // (staged into the outer trace) while the runtime-dependent product stays in the residual callee, and the
+        // allocation, which nothing observes, is a dead intrinsic-state operation that neither side retains.
         let outer = TracingContext::<XlaConstant, XlaOperation>::new();
         let known = outer.input(r#type.clone());
-        assert_eq!(
-            program
-                .partially_evaluate_in_context(&outer, &[PartialValue::Known(known), PartialValue::Unknown(r#type)],)
-                .map(|_| ()),
-            Err(ProgramError::UnsupportedOperation {
-                // The entry-level up-front closure check identifies the intrinsic state operation before
-                // carrier-specific partitioning can stage any known work.
-                message: "`reference_new` must be discharged before partial evaluation".to_string(),
-            }),
-        );
-        assert!(outer.builder().borrow().instructions().is_empty());
+        let evaluation = program
+            .partially_evaluate_in_context(&outer, &[PartialValue::Known(known), PartialValue::Unknown(r#type)])
+            .unwrap();
+        let residual_names = evaluation
+            .program()
+            .entry_region_ref()
+            .instructions_in_closure()
+            .map(|(_, instruction)| instruction.operation().name())
+            .collect::<Vec<_>>();
+        assert!(residual_names.contains(&"mul"), "{residual_names:?}");
+        assert!(!residual_names.contains(&"add"), "{residual_names:?}");
+        assert!(!residual_names.contains(&"reference_new"), "{residual_names:?}");
+        let known_program = outer
+            .builder()
+            .borrow()
+            .clone()
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(Vec::new(), vec![Placeholder], Vec::new())
+            .unwrap();
+        let known_names = known_program
+            .entry_region_ref()
+            .instructions_in_closure()
+            .map(|(_, instruction)| instruction.operation().name())
+            .collect::<Vec<_>>();
+        assert!(known_names.contains(&"add"), "{known_names:?}");
+        assert!(!known_names.contains(&"reference_new"), "{known_names:?}");
     }
 
     #[test]

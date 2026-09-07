@@ -3060,10 +3060,10 @@ macro_rules! define_tracer_operator {
         }
 
         impl<__C: $crate::Context<Type = $crate::arrays::ArrayType>> $trait
-            for $crate::BatchingTracer<__C, $crate::ArrayBatching>
+            for $crate::BatchingTracer<__C, $crate::ArrayBatchingPolicy>
         where
-            $crate::BatchingContext<__C, $crate::ArrayBatching>: $crate::Context<
-                    Value = $crate::BatchingTracer<__C, $crate::ArrayBatching>,
+            $crate::BatchingContext<__C, $crate::ArrayBatchingPolicy>: $crate::Context<
+                    Value = $crate::BatchingTracer<__C, $crate::ArrayBatchingPolicy>,
                     Operation: ::std::convert::From<$operation<$crate::arrays::ArrayType>>,
                 >,
         {
@@ -3147,7 +3147,7 @@ macro_rules! define_tracer_operator {
         }
 
         impl<__C: $crate::Context<Type = $crate::arrays::ArrayType>> $trait
-            for $crate::BatchingTracer<__C, $crate::ArrayBatching>
+            for $crate::BatchingTracer<__C, $crate::ArrayBatchingPolicy>
         where
             Self: $capability,
         {
@@ -3958,7 +3958,7 @@ macro_rules! check_operation_batching {
         let axis_size = $axis_size;
         let axis_sharding = $axis_sharding;
         let context =
-            $crate::batching::BatchingContext::<_, $crate::ArrayBatching>::new($context, axis_size)
+            $crate::batching::BatchingContext::<_, $crate::ArrayBatchingPolicy>::new($context, axis_size)
             .with_axis_sharding(axis_sharding);
         $(
             let inputs = vec![$($crate::check_operation_batching!(@batch_value $input)),*];
@@ -4703,9 +4703,9 @@ mod tests {
     use num_complex::Complex;
 
     use crate::arrays::{
-        Array, ArrayBatch, ArrayBatching, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Device,
-        DeviceMesh, Dimension, DimensionBounds, DimensionError, DimensionType, DimensionValue, DimensionVariable,
-        LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError,
+        Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType,
+        Device, DeviceMesh, Dimension, DimensionBounds, DimensionError, DimensionType, DimensionValue,
+        DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension, ShardingError,
     };
     use crate::batching::{BatchableOperation, BatchingContext, BatchingError, BatchingTracer};
     use crate::contexts::{Context, Domain, EagerContext, StagingContext};
@@ -5819,7 +5819,7 @@ mod tests {
         ];
         let outputs = TestDifferentiableOperation::<ArrayType>::new()
             .jvp(
-                &DifferentiationContext::new(EagerContext::<Array, TestDifferentiableOperation<ArrayType>>::new()),
+                &DifferentiationContext::fused(EagerContext::<Array, TestDifferentiableOperation<ArrayType>>::new()),
                 &EmptyRegionDriver,
                 &inputs,
             )
@@ -5856,7 +5856,7 @@ mod tests {
         ];
         let outputs = AddOperation::new()
             .jvp(
-                &DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new()),
+                &DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new()),
                 &EmptyRegionDriver,
                 &inputs,
             )
@@ -5907,7 +5907,7 @@ mod tests {
             DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(5.0f32)).unwrap(),
         ];
         let outputs = TestReversedSubOperation::<ArrayType>::new()
-            .jvp(&DifferentiationContext::new(context.clone()), &EmptyRegionDriver, &inputs)
+            .jvp(&DifferentiationContext::fused(context.clone()), &EmptyRegionDriver, &inputs)
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(1.0f32)));
@@ -5916,7 +5916,7 @@ mod tests {
             DifferentiationDual::new_with_zero_tangent(Array::scalar(3.0f32)).unwrap(),
         ];
         let outputs = TestReversedSubOperation::<ArrayType>::new()
-            .jvp(&DifferentiationContext::new(context.clone()), &EmptyRegionDriver, &inputs)
+            .jvp(&DifferentiationContext::fused(context.clone()), &EmptyRegionDriver, &inputs)
             .unwrap();
         assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(-4.0f32)));
         let inputs = [
@@ -5924,7 +5924,7 @@ mod tests {
             DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(5.0f32)).unwrap(),
         ];
         let outputs = TestReversedSubOperation::<ArrayType>::new()
-            .jvp(&DifferentiationContext::new(context.clone()), &EmptyRegionDriver, &inputs)
+            .jvp(&DifferentiationContext::fused(context.clone()), &EmptyRegionDriver, &inputs)
             .unwrap();
         assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(5.0f32)));
 
@@ -5935,7 +5935,7 @@ mod tests {
             DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(5.0f32)).unwrap(),
         ];
         let outputs = TestNegatedAddOperation::<ArrayType>::new()
-            .jvp(&DifferentiationContext::new(context.clone()), &EmptyRegionDriver, &inputs)
+            .jvp(&DifferentiationContext::fused(context.clone()), &EmptyRegionDriver, &inputs)
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(-9.0f32)));
@@ -5944,7 +5944,7 @@ mod tests {
             DifferentiationDual::new(Array::scalar(3.0f32), Array::scalar(5.0f32)).unwrap(),
         ];
         let outputs = TestNegatedAddOperation::<ArrayType>::new()
-            .jvp(&DifferentiationContext::new(context.clone()), &EmptyRegionDriver, &inputs)
+            .jvp(&DifferentiationContext::fused(context.clone()), &EmptyRegionDriver, &inputs)
             .unwrap();
         assert!(matches!(outputs[0].tangent(), MaybeZero::Value(tangent) if tangent == &Array::scalar(-5.0f32)));
     }
@@ -6028,7 +6028,7 @@ mod tests {
     fn test_impl_differentiable_elementwise_operation_unary_jvp_contributions() {
         let outputs = SinOperation::new()
             .jvp(
-                &DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new()),
+                &DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new()),
                 &EmptyRegionDriver,
                 &[DifferentiationDual::new(Array::scalar(0.0f32), Array::scalar(4.0f32)).unwrap()],
             )
@@ -6039,7 +6039,7 @@ mod tests {
 
         let outputs = ExpOperation::new()
             .jvp(
-                &DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new()),
+                &DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new()),
                 &EmptyRegionDriver,
                 &[DifferentiationDual::new(Array::scalar(0.0f32), Array::scalar(3.0f32)).unwrap()],
             )
@@ -6053,7 +6053,7 @@ mod tests {
     fn test_impl_differentiable_elementwise_operation_binary_jvp_contributions() {
         let outputs = MulOperation::new()
             .jvp(
-                &DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new()),
+                &DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new()),
                 &EmptyRegionDriver,
                 &[
                     DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(4.0f32)).unwrap(),
@@ -6201,7 +6201,7 @@ mod tests {
         let input = context.input(ArrayType::scalar(DataType::F32));
         let outputs = SinOperation::new()
             .jvp(
-                &DifferentiationContext::new(context.clone()),
+                &DifferentiationContext::fused(context.clone()),
                 &EmptyRegionDriver,
                 &[DifferentiationDual::new_with_zero_tangent(input).unwrap()],
             )
@@ -6222,7 +6222,7 @@ mod tests {
         let inputs = [DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(1.0f32)).unwrap()];
         let outputs = TestUnaryOperation::<ArrayType>::new()
             .jvp(
-                &DifferentiationContext::new(EagerContext::<Array, TestUnaryOperation<ArrayType>>::new()),
+                &DifferentiationContext::fused(EagerContext::<Array, TestUnaryOperation<ArrayType>>::new()),
                 &EmptyRegionDriver,
                 &inputs,
             )
@@ -6238,7 +6238,7 @@ mod tests {
         let tangent = context.input(ArrayType::scalar(DataType::F32));
         let inputs = [DifferentiationDual::new(primal, tangent).unwrap()];
         let outputs = TestUnaryOperation::<ArrayType>::new()
-            .jvp(&DifferentiationContext::new(context.clone()), &EmptyRegionDriver, &inputs)
+            .jvp(&DifferentiationContext::fused(context.clone()), &EmptyRegionDriver, &inputs)
             .unwrap();
         assert_eq!(context.builder().borrow().instructions().len(), 1);
         assert!(matches!(
@@ -6250,7 +6250,7 @@ mod tests {
         let operation = TestGenericNullaryOperation::<ArrayType>(PhantomData);
         let outputs = operation
             .jvp(
-                &DifferentiationContext::new(EagerContext::<Array, TestGenericNullaryOperation<ArrayType>>::new()),
+                &DifferentiationContext::fused(EagerContext::<Array, TestGenericNullaryOperation<ArrayType>>::new()),
                 &EmptyRegionDriver,
                 &[],
             )
@@ -6344,7 +6344,7 @@ mod tests {
         let context = BatchingContext::new(EagerContext::<Array, TestNullaryOperation<ArrayType>>::new(), 2);
         let outputs = <TestNullaryOperation<ArrayType> as BatchableOperation<
             EagerContext<Array, TestNullaryOperation<ArrayType>>,
-            ArrayBatching,
+            ArrayBatchingPolicy,
         >>::batch(&operation, &context, &EmptyRegionDriver, &[])
         .unwrap()
         .into_parts()
@@ -6357,7 +6357,7 @@ mod tests {
         assert!(matches!(
             <TestNullaryOperation<ArrayType> as BatchableOperation<
                 EagerContext<Array, TestNullaryOperation<ArrayType>>,
-                ArrayBatching,
+                ArrayBatchingPolicy,
             >>::batch(
                 &operation, &context, &EmptyRegionDriver, &[ArrayBatch::replicated(Array::scalar(1.0))],
             ),
@@ -6368,7 +6368,7 @@ mod tests {
         where
             O: Operation<Type = ArrayType>
                 + InterpretableOperation<EagerContext<Array, O>>
-                + BatchableOperation<EagerContext<Array, O>, ArrayBatching>,
+                + BatchableOperation<EagerContext<Array, O>, ArrayBatchingPolicy>,
         {
         }
 
@@ -6407,7 +6407,7 @@ mod tests {
         assert_eq!(output.value(), &Array::scalar(-2.0f32));
         assert!(output.batch_axis().is_replicated());
 
-        let context = DifferentiationContext::new(EagerContext::<Array, TestUnaryOperation<ArrayType>>::new());
+        let context = DifferentiationContext::fused(EagerContext::<Array, TestUnaryOperation<ArrayType>>::new());
         let input = DifferentiationTracer::new(
             DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(1.0f32)).unwrap(),
             context,
@@ -6456,7 +6456,7 @@ mod tests {
         assert_eq!(output.value(), &Array::scalar(5.0f32));
         assert!(output.batch_axis().is_replicated());
 
-        let context = DifferentiationContext::new(EagerContext::<Array, TestBinaryOperation<ArrayType>>::new());
+        let context = DifferentiationContext::fused(EagerContext::<Array, TestBinaryOperation<ArrayType>>::new());
         let left = DifferentiationTracer::new(
             DifferentiationDual::new(Array::scalar(2.0f32), Array::scalar(1.0f32)).unwrap(),
             context.clone(),

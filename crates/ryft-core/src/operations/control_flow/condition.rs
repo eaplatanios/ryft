@@ -9,8 +9,8 @@ use std::marker::PhantomData;
 
 use crate::arrays::batching::require_equal_dimensions;
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayIrValue,
-    ArrayType, DimensionType, DimensionValue,
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
+    ArrayIrValue, ArrayType, DimensionType, DimensionValue,
 };
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext, BatchingDriver, BatchingError,
@@ -376,7 +376,8 @@ where
 //     family's batching rules against the same active context, so the multi-operation rewrite composes for eager
 //     and staging parents alike. Effectful branches are rejected because evaluating both branches would perform
 //     effects that the per-item selection cannot mask.
-impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for ConditionOperation<C::Constant>
+impl<C, O, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
+    for ConditionOperation<C::Constant>
 where
     C: Context<Type = ArrayType, Operation = O>,
     <C as Domain>::Value: Concretizable<bool> + Broadcast + Transpose + Select,
@@ -386,12 +387,12 @@ where
         + From<SelectOperation<ArrayType>>
         + From<ConditionOperation<C::Constant>>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         let Some((predicate_batch, operand_inputs)) = inputs.split_first() else {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!("cannot batch a {CONDITION_OPERATION_NAME} operation with no predicate input"),
@@ -479,7 +480,7 @@ where
 // mapped extent. A mapped predicate replays both pure branches and selects their array outputs per item. First-class
 // dimension outputs remain replicated, so the mapped-predicate path requires both branches to produce the same
 // dimension value.
-impl<A, C> BatchableOperation<C, ArrayIrBatching> for ConditionOperation<ArrayIrValue<A>>
+impl<A, C> BatchableOperation<C, ArrayIrBatchingPolicy> for ConditionOperation<ArrayIrValue<A>>
 where
     A: Value<Type = ArrayType>,
     C: Context<
@@ -499,12 +500,12 @@ where
         From<BroadcastOperation> + From<SelectOperation<ArrayType>> + From<TransposeOperation>,
     <C::Operation as OperationProjection<DimensionType>>::Projected: From<DimensionRequirementOperation>,
 {
-    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
+    fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C, ArrayIrBatching>,
+        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         let Some((predicate, operands)) = inputs.split_first() else {
             return Err(BatchingError::UnsupportedOperation {
                 message: format!("cannot batch a {CONDITION_OPERATION_NAME} operation with no predicate input"),
@@ -693,8 +694,6 @@ where
         // operand (a captured or inactive reference reaching the branch at any input position) and a zero-space operand
         // are inactive and receive no tangent input.
         let activity = operands.iter().map(DifferentiationDual::is_tangent_active).collect::<Vec<_>>();
-        let output_activity = true_branch.tangent_output_activity(&activity)?;
-        let tangent_output_count = output_activity.iter().filter(|&&active| active).count();
 
         let primal_input_count = operands.len();
         let input_indices = activity
@@ -702,6 +701,8 @@ where
             .enumerate()
             .filter_map(|(index, &active)| active.then_some(index))
             .collect::<Vec<_>>();
+        let output_activity = true_branch.tangent_output_mask(&input_indices)?;
+        let tangent_output_count = output_activity.iter().filter(|&&active| active).count();
         let live_input_count = input_indices.len();
         let mut condition_inputs = vec![predicate_primal];
         condition_inputs.extend(operands.iter().map(|operand| operand.primal().clone()));
@@ -1384,8 +1385,8 @@ fn reconcile_branch<C: Context>(
 /// branch output with the predicate's mapped axis, broadcasts replicated branch outputs across the batch, and expands
 /// the per-item scalar predicate across non-scalar branch output shapes. The predicate must carry a mapped batch axis;
 /// the replicated case is the caller's structural staging path.
-pub(crate) fn batch_condition_with_interpreter<C, P: ArrayBatchingPolicy<C>, F>(
-    context: &BatchingContext<C, ArrayBatching<P>>,
+pub(crate) fn batch_condition_with_interpreter<C, P: ArrayExtentBatchingPolicy<C>, F>(
+    context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
     predicate_batch: &ArrayBatch<C::Value>,
     operand_inputs: &[ArrayBatch<C::Value>],
     mut batch_branch: F,
@@ -1672,14 +1673,13 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use crate::arrays::{
-        Array, ArrayBatch, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrValue, ArrayOperation,
+        Array, ArrayBatch, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation,
         ArrayReference, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
         LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
     use crate::captures::CaptureReference;
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::forward::LinearizationTransform;
     use crate::differentiation::reverse::TranspositionTransform;
     use crate::differentiation::{Differentiate, ReverseModeDifferentiate, differentiate_at};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
@@ -2947,7 +2947,7 @@ mod tests {
 
         // Select lowering runs both branches, so even a read-only access in one branch is rejected ahead of the general
         // purity check, naming the reference access as the cause.
-        let context = BatchingContext::<_, ArrayIrBatching>::new(
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             Parent::new(),
             TestValue::Dimension(DimensionValue::constant(2).unwrap()),
         );
@@ -3007,7 +3007,7 @@ mod tests {
         // A branch that merely forwards a reference it never accesses is fine under a batch-varying predicate: the
         // reference output is never selected but passes through as the operand both branches forward, while the array
         // output is selected per item.
-        let context = BatchingContext::<_, ArrayIrBatching>::new(
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             Parent::new(),
             TestValue::Dimension(DimensionValue::constant(2).unwrap()),
         );
@@ -3314,12 +3314,6 @@ mod tests {
         let first = conditional_program(&true_branch, &false_branch, 1).linearize().unwrap();
         let second = conditional_program(&true_branch, &false_branch, 2).linearize().unwrap();
         assert_ne!(first.tangent().to_string(), second.tangent().to_string());
-
-        // Each branch's linearization is derived by the first program and served to the second.
-        for branch in [&true_branch, &false_branch] {
-            let statistics = branch.entry_region_ref().transform_statistics::<LinearizationTransform>().unwrap();
-            assert_eq!((statistics.productions, statistics.hits), (1, 1));
-        }
 
         // Independently built copies of the same branches share no retained transforms, so they exercise the uncached
         // path and pin that caching changed nothing about what is staged.

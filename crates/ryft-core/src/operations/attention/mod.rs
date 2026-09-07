@@ -3,11 +3,11 @@ use std::fmt::Display;
 use ryft_macros::Parameterized;
 
 use crate::arrays::batching::{
-    DynamicArrayBatchingPolicy, broadcast_array, dimension_constant, folded_array_dimension,
+    DynamicArrayExtentBatchingPolicy, broadcast_array, dimension_constant, folded_array_dimension,
 };
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrType, ArrayType, DataType, Dimension, DimensionType,
-    DimensionValue, Shape, Sharding, StaticArrayBatchingPolicy,
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayType, DataType, Dimension,
+    DimensionType, DimensionValue, Shape, Sharding, StaticArrayExtentBatchingPolicy,
 };
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,

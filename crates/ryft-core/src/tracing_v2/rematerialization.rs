@@ -529,7 +529,7 @@ where
             known.resize(tangent_operands.len(), false);
             tangent_operands[..residual_count].clone_from_slice(&primal_residuals);
             let partition = driver.partition_jvp_program(tangent_region, &known, &[])?;
-            context.interpret_partitioned_jvp_program(&partition, &tangent_operands, 0)?
+            partition.interpret_in_context(context, &tangent_operands, 0)?
         } else {
             context.tangent().bind(
                 LinearCallOperation::new(residual_count),

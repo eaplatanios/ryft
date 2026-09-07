@@ -597,17 +597,17 @@ macro_rules! define_cumulative_operation {
         // batch dimension with `lift_cumulative_axis` and re-interprets the lifted scan over the physical batched
         // value. Padding along a *scanned* ragged axis is neutralized with the member's identity first, and the
         // operand's ragged axes ride through onto the result because a scan consumes none of them.
-        impl<C: Context<Type = ArrayType>, P: RaggedArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
-            for $operation
+        impl<C: Context<Type = ArrayType>, P: RaggedArrayExtentBatchingPolicy<C>>
+            BatchableOperation<C, ArrayBatchingPolicy<P>> for $operation
         where
             $operation: InterpretableOperation<C>,
         {
-            fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+            fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
                 &self,
-                context: &BatchingContext<C, ArrayBatching<P>>,
+                context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
                 _driver: &D,
                 inputs: &[ArrayBatch<C::Value>],
-            ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+            ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
                 check_count!("input", inputs, 1, ProgramError);
                 // A replicated operand carries no inserted batch dimension, so its scanned axis needs no shift.
                 // Ragged axes are packed positions in both cases, and so the masking and rewrapping below use the

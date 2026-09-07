@@ -3,8 +3,8 @@
 use std::fmt::{Debug, Display};
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, DataType, DimensionType,
-    DimensionValue,
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, DataType,
+    DimensionType, DimensionValue,
 };
 use crate::axes::Axis;
 use crate::batching::{

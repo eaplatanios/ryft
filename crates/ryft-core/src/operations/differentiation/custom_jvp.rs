@@ -435,7 +435,7 @@ where
             let mut known = vec![true; inputs.len()];
             known.resize(jvp_inputs.len(), false);
             let partition = driver.partition_jvp_program(jvp_region, &known, &(0..output_count).collect::<Vec<_>>())?;
-            context.interpret_partitioned_jvp_program(&partition, &jvp_inputs, output_count)?
+            partition.interpret_in_context(context, &jvp_inputs, output_count)?
         };
         check_count!("output", outputs, 2 * output_count, ProgramError);
         let tangents = outputs.split_off(output_count);
@@ -675,8 +675,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayBatch, ArrayBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference,
-        ArrayReferenceDischarge, ArrayType, DataType, Dimension, Shape, ShardingDimension,
+        Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
+        ArrayReference, ArrayReferenceDischarge, ArrayType, DataType, Dimension, Shape, ShardingDimension,
     };
     use crate::axes::AxisIndexOperation;
     use crate::batching::{
@@ -1068,8 +1068,9 @@ mod tests {
         };
         let regions = vec![primal, jvp];
         let driver = RecursiveBatchingDriver::new(&regions);
-        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3)
-            .with_axis_name("items".to_string());
+        let context =
+            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3)
+                .with_axis_name("items".to_string());
 
         // No operand carries a mapped axis, but `axis_index("items")` observes the active transform inside both
         // regions and naturally produces a mapped output. Batching must therefore inspect the regions rather than
@@ -1591,7 +1592,7 @@ mod tests {
         assert!(jvp.entry_region_ref().contains_effect_in_closure(EffectClass::OrderedState));
         let driver = ReferenceRuleDifferentiationDriver { programs: vec![primal, jvp] };
         let outputs = CustomJvpOperation::<ArrayIrType>::new()
-            .jvp(&DifferentiationContext::new(context.clone()), &driver, std::slice::from_ref(&input))
+            .jvp(&DifferentiationContext::fused(context.clone()), &driver, std::slice::from_ref(&input))
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].primal(), &ArrayIrValue::Array(Array::scalar(1.0_f32)));
@@ -1621,7 +1622,7 @@ mod tests {
             )
             .unwrap(),
         ];
-        let outputs = operation.jvp(&DifferentiationContext::new(context.clone()), &driver, &inputs).unwrap();
+        let outputs = operation.jvp(&DifferentiationContext::fused(context.clone()), &driver, &inputs).unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].primal(), &ArrayIrValue::Array(Array::scalar(3.0_f32)));
         assert!(matches!(outputs[0].tangent(), MaybeZero::Value(ArrayIrValue::Array(tangent))
@@ -1640,7 +1641,7 @@ mod tests {
         assert!(matches!(
             CustomJvpOperation::<ArrayIrType>::new()
                 .with_non_differentiated_count(2)
-                .jvp(&DifferentiationContext::new(context.clone()), &aliasing_driver, &aliased),
+                .jvp(&DifferentiationContext::fused(context.clone()), &aliasing_driver, &aliased),
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
                 if message == "input 1 and input 0 bind the same reference allocation",
         ));
@@ -1648,7 +1649,7 @@ mod tests {
 
         // The same operand in the differentiated segment is rejected by the replayed rule as well.
         assert!(matches!(
-            CustomJvpOperation::<ArrayIrType>::new().jvp(&DifferentiationContext::new(context.clone()), &driver, &inputs),
+            CustomJvpOperation::<ArrayIrType>::new().jvp(&DifferentiationContext::fused(context.clone()), &driver, &inputs),
             Err(DifferentiationError::Program(ProgramError::Type(error)))
                 if error == TypeError::invalid(
                     "custom_jvp accepts reference inputs only in its leading non-differentiated segment; move input \

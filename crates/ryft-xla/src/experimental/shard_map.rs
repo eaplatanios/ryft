@@ -1,3 +1,51 @@
+//! Tracing-backed `shard_map` surface and the supporting manual-computation metadata model.
+//!
+//! # References Under `shard_map`
+//!
+//! This section is the per-shard ownership contract for mutable references crossing a shard-map boundary. The
+//! discharge, forward-mode, partial-evaluation, and reverse-mode rules of [`ShardMapOperation`] implement it, and
+//! `ShardMapOperation::validate_reference_body` checks a body against it before any of those rules does work.
+//! Construct reference-bearing operations through [`ShardMapOperation::from_program`], then attach the checked local
+//! body when binding the operation through a tracing context or program builder. This public constructor derives
+//! output types and reference forwarding from the body. Global referent shapes must be static and divisible by the
+//! manual partition counts. The `shard_map(...)` closure entry accepts array leaves. Batching an XLA shard-map
+//! operation remains unsupported because the XLA operation family has no batching dispatch.
+//!
+//! - **Ownership follows the input spec.** A reference input `ref<T>` is a global reference whose referent `T` carries
+//!   the input's sharding exactly like an array input. The local body receives a local reference `ref<T_local>` whose
+//!   referent is the shard of `T` that the input spec assigns to the executing device, and that device owns exactly
+//!   that shard: a write through the local reference mutates only the owning shard, and no two devices own the same
+//!   element along an active manual axis that the spec shards.
+//! - **Replication is read-only.** Along an active manual axis that the input spec does not shard, every device sees
+//!   the whole referent and none owns it. Reading such a replicated reference is allowed; mutating it is rejected,
+//!   because the devices' writes would have to be proven identical (the `check_vma` argument for values) and the
+//!   contract does not yet define that proof for state. Relaxing this to invariant writes is a later decision.
+//! - **Ordering is per device.** Accesses through one local reference follow the body's program order, exactly as on a
+//!   single device. Accesses on different devices touch disjoint owned shards and have no defined mutual order. A
+//!   reference is never an operand of a collective; only a value read from it can cross devices.
+//! - **Captured references are rejected.** A reference must be an explicit shard-map input with an input spec. A
+//!   reference reaching the body as a captured constant has no spec and therefore no owner.
+//! - **Outputs forward inputs only.** A reference-typed output must forward a reference input by identity, with an
+//!   output spec equal to that input's spec. A reference allocated inside the body cannot escape as an output, and a
+//!   derived view of a reference cannot be returned; both are rejected by index.
+//! - **Discharge threads owned shards.** Discharging a shard-map with reference inputs turns each reference into a
+//!   state carry sharded by its input spec: the body's local state threads through the local program as local arrays,
+//!   the hidden final-state output of a mutated reference carries the input spec, and the stateful ABI commits each
+//!   device's shard into the global referent. Local allocations inside the body discharge within the body.
+//! - **Differentiation preserves local state and residuals.** Tangent references retain their primal input specs.
+//!   Forwarded inactive references keep their primal identity and have no tangent slot. Nonlinear derivatives pass
+//!   ordinary residual values between the primal and tangent maps; varying residuals gain a leading dimension sharded
+//!   across their varying manual axes, preserving distinct per-device values. Replicated residuals keep their shape.
+//! - **Replicated gradients aggregate once.** Reverse mode uses fresh local accumulators for read-only replicated
+//!   reference inputs, sums their contributions across the replicated axes, and adds the resulting value into the
+//!   caller's cotangent reference once. Existing destination contents are retained once. Replicated output seeds are
+//!   divided across their copies before this summation, so returning one replicated global value does not multiply its
+//!   derivative by the device count. Fully sharded destinations accumulate into each device's owned shard.
+//! - **Rules may assume** that distinct reference inputs are distinct allocations (the runtime alias validator checks
+//!   this at the boundary), that each device's lifecycle over its owned shards is independent of every other device's,
+//!   and that the reference analysis of the local body accounts for every access, since the body is an ordinary local
+//!   program over local references.
+
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt::Debug;
@@ -6,7 +54,7 @@ use ryft_core::{
     ArrayIrType, ArrayType, Atom, AtomId, Context, Dimension, Domain, DomainTracingContext, Instruction, LogicalMesh,
     MeshAxisType, NamedAxis, Operation, Parameter, ParameterError, Parameterized, ParameterizedFamily, Placeholder,
     ProgramError, ProgramStatistics, ProjectedValue, ReshardOperation, Shape, Sharding, ShardingConstraintOperation,
-    ShardingDimension, ShardingError, Value, ValueProjection,
+    ShardingDimension, ShardingError, Type, Value, ValueProjection,
 };
 #[cfg(test)]
 use ryft_core::{StagingContext, Typed};
@@ -139,6 +187,10 @@ pub enum ShardMapTraceError {
     /// Error returned when the number of traced output types does not match the number of output shardings.
     #[error("traced body produced {actual} output type(s), but shard_map expects {expected}")]
     OutputTypeCountMismatch { expected: usize, actual: usize },
+
+    /// Error returned when the number of declared output forwardings does not match the number of global outputs.
+    #[error("got {actual} output forwarding(s), but shard_map expects {expected}")]
+    OutputForwardingCountMismatch { expected: usize, actual: usize },
 
     /// Error returned when a traced shard-map type contains a dynamic dimension that is not supported yet.
     #[error("{value_kind} type #{value_index} dimension #{dimension} must be static for traced shard_map")]
@@ -391,30 +443,34 @@ where
             .map(|output| live_atoms.get(output.index()).copied().unwrap_or(false))
             .collect::<Vec<_>>();
         // Project a `shard_map` body only when some outputs are live and some are dead. A fully dead `shard_map` is left
-        // intact for the subsequent `simplified` to drop wholesale, and a fully live one is copied verbatim. Every
-        // other instruction re-attaches its regions through one batch import, preserving source sharing.
+        // intact for the subsequent `simplified` to drop wholesale, and a fully live one is copied verbatim, as is one
+        // with a reference at its boundary: a dead value output of such a `shard_map` is harmless, while dropping a
+        // forwarded reference output would change the boundary that the reference contract was validated against.
+        // Every other instruction re-attaches its regions through one batch import, preserving source sharing.
         let has_dead_output = live_outputs.iter().any(|&live| !live);
         let has_live_output = live_outputs.iter().any(|&live| live);
+        let array_types = |types: &[ArrayIrType]| {
+            types
+                .iter()
+                .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ProgramError::from)
+        };
         let (operation, region_ids) = match instruction.operation() {
-            XlaOperation::ShardMap(shard_map_op) if has_dead_output && has_live_output => {
+            XlaOperation::ShardMap(shard_map_op)
+                if has_dead_output
+                    && has_live_output
+                    && !shard_map_op.global_input_types().iter().any(Type::is_reference)
+                    && !shard_map_op.global_output_types().iter().any(Type::is_reference) =>
+            {
                 let body_program = program.region_ref(instruction.regions()[0])?.to_program();
-                let local_input_types = body_program
-                    .input_types()
-                    .iter()
-                    .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(ProgramError::from)?;
-                let local_output_types = body_program
-                    .output_types()
-                    .iter()
-                    .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(ProgramError::from)?;
+                let local_input_types = array_types(body_program.input_types().as_slice())?;
+                let local_output_types = array_types(body_program.output_types().as_slice())?;
                 let body = FlatTracedShardMap::from_parts(
                     shard_map_op.shard_map().clone(),
-                    shard_map_op.global_input_types().to_vec(),
+                    array_types(shard_map_op.global_input_types())?,
                     local_input_types,
-                    shard_map_op.global_output_types().to_vec(),
+                    array_types(shard_map_op.global_output_types())?,
                     local_output_types,
                     body_program,
                 );
@@ -944,6 +1000,48 @@ impl ShardMap {
             "input",
             input_index,
         )
+    }
+
+    /// Returns the local body type of input `input_index` for the provided global input type: the shard of the global
+    /// array that the input sharding assigns to the executing device, carrying the input sharding with the manual axes
+    /// it shards over (and any the global type already varies along) marked as varying.
+    ///
+    /// # Parameters
+    ///
+    ///   - `input_index`: Index of the input sharding to use.
+    ///   - `global_input_type`: Global input type associated with that input, which must have a static shape.
+    pub(crate) fn local_input_type(
+        &self,
+        input_index: usize,
+        global_input_type: &ArrayType,
+    ) -> Result<ArrayType, ShardMapTraceError> {
+        let global_shape = static_dimensions(global_input_type, "input", input_index)?;
+        let local_shape = self.local_input_shape(input_index, &global_shape)?;
+        let local_sharding = &self.in_shardings[input_index];
+        let local_varying_axes = varying_axes(global_input_type.sharding())
+            .union(&spec_varying_axes(local_sharding, &self.manual_axis_names()))
+            .cloned()
+            .collect();
+        Ok(ArrayType::new(
+            global_input_type.data_type(),
+            Shape::new(local_shape.into_iter().map(Dimension::Static).collect()),
+        )
+        .with_layout(global_input_type.layout().cloned())
+        .with_sharding(sharding_with_varying_manual_axes(local_sharding, local_varying_axes)?)?)
+    }
+
+    /// Returns the active manual axes along which input `input_index` is replicated, in mesh order: the manual axes
+    /// that its input sharding does not shard over. Every device along such an axis sees the whole referent of a
+    /// reference input and none owns it, so a reference input replicated along some manual axis is read-only.
+    pub(crate) fn input_replicated_manual_axes(&self, input_index: usize) -> Vec<String> {
+        let varying_axes = spec_varying_axes(&self.in_shardings[input_index], &self.manual_axis_names());
+        self.manual_axes.iter().filter(|axis| !varying_axes.contains(axis.as_str())).cloned().collect()
+    }
+
+    /// Returns the active manual axes along which output `output_index` is replicated, in mesh order.
+    pub(crate) fn output_replicated_manual_axes(&self, output_index: usize) -> Vec<String> {
+        let varying_axes = spec_varying_axes(&self.out_shardings[output_index], &self.manual_axis_names());
+        self.manual_axes.iter().filter(|axis| !varying_axes.contains(axis.as_str())).cloned().collect()
     }
 
     /// Returns the local body shape for output `output_index`.
@@ -1488,29 +1586,11 @@ fn derive_local_input_types<Input: Parameterized<ArrayType>>(
         });
     }
 
-    let manual_axis_names = shard_map.manual_axis_names();
     let structure = global_input_types.parameter_structure();
     let local_input_types = global_input_types
         .parameters()
-        .cloned()
         .enumerate()
-        .map(|(input_index, global_input_type)| {
-            let global_shape = static_dimensions(&global_input_type, "input", input_index)?;
-            let local_shape = shard_map.local_input_shape(input_index, &global_shape)?;
-            let local_sharding = shard_map.in_shardings()[input_index].clone();
-            let local_varying_axes = varying_axes(global_input_type.sharding())
-                .union(&spec_varying_axes(&local_sharding, &manual_axis_names))
-                .cloned()
-                .collect();
-            Ok::<ArrayType, ShardMapTraceError>(
-                ArrayType::new(
-                    global_input_type.data_type(),
-                    Shape::new(local_shape.into_iter().map(Dimension::Static).collect()),
-                )
-                .with_layout(global_input_type.layout().cloned())
-                .with_sharding(sharding_with_varying_manual_axes(&local_sharding, local_varying_axes)?)?,
-            )
-        })
+        .map(|(input_index, global_input_type)| shard_map.local_input_type(input_index, global_input_type))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Input::from_parameters(structure, local_input_types)?)
 }

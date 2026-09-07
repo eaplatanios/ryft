@@ -4,8 +4,9 @@
 //! (`experimental::lowering`). A kernel body is the one place where references are *preserved* instead: its array
 //! operands enter as reference-typed region inputs, its body reads and mutates them in place through the ordinary
 //! reference operations and views, and the kernel publishes updated arrays at its outer, array-typed boundary. This
-//! module owns the static validation of such a body. It runs the array view overlay
-//! ([`ArrayReferenceAnalysis`](ryft_core::ArrayReferenceAnalysis)) over the body region and checks the body against
+//! module owns the static validation of such a body. It consumes the array view overlay
+//! ([`ArrayReferenceAnalysis`](ryft_core::ArrayReferenceAnalysis)) retained on the body region through
+//! [`RegionRef::reference_view_analysis`](ryft_core::RegionRef::reference_view_analysis) and checks the body against
 //! a [`KernelBoundaryContract`](crate::experimental::reference_kernels::KernelBoundaryContract) declaring one
 //! [`KernelParameterAccess`](crate::experimental::reference_kernels::KernelParameterAccess) per reference-typed input.
 //! Both analyses are kernel-owned validation infrastructure invoked here explicitly; neither is a standing lint on
@@ -32,6 +33,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
+use std::sync::Arc;
 
 use ryft_core::{
     ArrayReferenceAnalysis, ArrayReferenceAnalysisError, ArrayReferenceView, ArrayType, AtomId, InstructionId,
@@ -236,8 +238,8 @@ impl KernelParameterSummary {
 /// the lowering of every swap in the body.
 #[derive(Clone, Debug)]
 pub struct KernelReferenceSummary {
-    /// Array view overlay of the body.
-    analysis: ArrayReferenceAnalysis,
+    /// Array view overlay of the body, shared with the region's transform cache.
+    analysis: Arc<ArrayReferenceAnalysis>,
 
     /// Summary per body input, with [`None`] for non-reference inputs.
     parameters: Vec<Option<KernelParameterSummary>>,
@@ -284,10 +286,11 @@ impl KernelReferenceSummary {
 
 /// Validates the kernel body `region` against `contract` and returns its [`KernelReferenceSummary`].
 ///
-/// The body is analyzed with [`ArrayReferenceAnalysis`] under an empty capture scope, so every reference-typed
-/// constant is rejected. The contract must declare exactly one entry per body input, [`Some`] for every
-/// reference-typed input and [`None`] for every other input. The body may publish no reference and may not consume an
-/// operand. Every access observed on an operand, directly or inside nested regions, must be admitted by its declared
+/// The body's [`ArrayReferenceAnalysis`] is obtained through the cached [`RegionRef::reference_view_analysis`]
+/// accessor under an empty capture scope, so every reference-typed constant is rejected and a body validated twice is
+/// analyzed once. The contract must declare exactly one entry per body input, [`Some`] for every reference-typed input
+/// and [`None`] for every other input. The body may publish no reference and may not consume an operand. Every access
+/// observed on an operand, directly or inside nested regions, must be admitted by its declared
 /// access: a read-only operand admits reads only; a write-only operand admits writes and swaps whose old-value result
 /// is provably dead (not used by any instruction of its region and not a region output), which lower as
 /// [`KernelSwapLowering::Store`]; a read-write operand admits every non-consuming access. Every swap in the body is
@@ -303,8 +306,8 @@ pub fn validate_kernel_body(
     contract: &KernelBoundaryContract,
 ) -> Result<KernelReferenceSummary, KernelValidationError> {
     // Kernel bodies capture no references, so no constant names a capture and every reference-typed constant is
-    // rejected by the generic analysis.
-    let analysis = ArrayReferenceAnalysis::new(region, 0)?;
+    // rejected by the generic analysis. The overlay is the retained one on the region, keyed by the capture count.
+    let analysis = region.reference_view_analysis(0)?;
     let generic = analysis.analysis();
     let entry = region.id();
     let inputs = region.input_ids();
@@ -422,6 +425,7 @@ fn entry_roots(
             }
         }
         ReferenceRoot::Allocation { .. } => {}
+        ReferenceRoot::Constant { .. } => unreachable!("kernel reference analysis requires lifted captures"),
     }
 }
 
@@ -432,7 +436,7 @@ mod tests {
         ArrayIrType, ArrayReferenceViewTransform, ArraySliceAxis, CaptureReference, ConditionOperation, DataType,
         Placeholder, ReferenceAddUpdateOperation, ReferenceAnalysisError, ReferenceFreezeOperation,
         ReferenceIndexOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSliceOperation,
-        ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation,
+        ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, ViewIndex,
     };
 
     use crate::experimental::lowering::{LoweringError, lower_mlir_module_for_program};
@@ -471,54 +475,27 @@ mod tests {
         let scalar = builder.add_input(array_type([]));
         let prefix = builder
             .add_instruction(
-                XlaOperation::ReferenceSlice(ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 1, 1)])),
+                ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 1, 1)]),
                 Vec::new(),
                 vec![read_only],
                 None,
             )
             .unwrap()[0];
-        let snapshot = builder
-            .add_instruction(XlaOperation::ReferenceRead(ReferenceReadOperation::new()), Vec::new(), vec![prefix], None)
-            .unwrap()[0];
+        let snapshot =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![prefix], None).unwrap()[0];
         let element = builder
-            .add_instruction(
-                XlaOperation::ReferenceIndex(ReferenceIndexOperation::new(0, 0)),
-                Vec::new(),
-                vec![write_only],
-                None,
-            )
+            .add_instruction(ReferenceIndexOperation::new(0, 0), Vec::new(), vec![write_only], None)
             .unwrap()[0];
         builder
-            .add_instruction(
-                XlaOperation::ReferenceWrite(ReferenceWriteOperation::new()),
-                Vec::new(),
-                vec![element, scalar],
-                None,
-            )
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![element, scalar], None)
             .unwrap();
-        let current = builder
-            .add_instruction(
-                XlaOperation::ReferenceRead(ReferenceReadOperation::new()),
-                Vec::new(),
-                vec![read_write],
-                None,
-            )
-            .unwrap()[0];
+        let current =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![read_write], None).unwrap()[0];
         builder
-            .add_instruction(
-                XlaOperation::ReferenceAddUpdate(ReferenceAddUpdateOperation::new()),
-                Vec::new(),
-                vec![read_write, current],
-                None,
-            )
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![read_write, current], None)
             .unwrap();
         builder
-            .add_instruction(
-                XlaOperation::ReferenceSwap(ReferenceSwapOperation::new()),
-                Vec::new(),
-                vec![read_write, current],
-                None,
-            )
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![read_write, current], None)
             .unwrap();
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![snapshot], vec![Placeholder; 4], vec![Placeholder])
@@ -539,23 +516,13 @@ mod tests {
         let reference = builder.add_input(reference_type([]));
         let scalar = builder.add_input(array_type([]));
         let old_value = builder
-            .add_instruction(
-                XlaOperation::ReferenceSwap(ReferenceSwapOperation::new()),
-                Vec::new(),
-                vec![reference, scalar],
-                None,
-            )
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, scalar], None)
             .unwrap()[0];
         let outputs = match use_old_value {
             None => Vec::new(),
             Some(false) => {
                 builder
-                    .add_instruction(
-                        XlaOperation::ReferenceWrite(ReferenceWriteOperation::new()),
-                        Vec::new(),
-                        vec![reference, old_value],
-                        None,
-                    )
+                    .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, old_value], None)
                     .unwrap();
                 Vec::new()
             }
@@ -731,12 +698,12 @@ mod tests {
         let summary = validate_kernel_body(program.entry_region_ref(), &contract).unwrap();
         assert_eq!(summary.view(value(0, 0)), Some(&ArrayReferenceView::root()));
         assert_eq!(
-            summary.view(value(0, 4)).map(ArrayReferenceView::transforms),
-            Some(&[ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(0, 1, 1)] }][..]),
+            summary.view(value(0, 4)).map(|view| view.transforms().cloned().collect::<Vec<_>>()),
+            Some(vec![ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(0, 1, 1)] }]),
         );
         assert_eq!(
-            summary.view(value(0, 6)).map(ArrayReferenceView::transforms),
-            Some(&[ArrayReferenceViewTransform::Index { axis: 0, index: 0 }][..]),
+            summary.view(value(0, 6)).map(|view| view.transforms().cloned().collect::<Vec<_>>()),
+            Some(vec![ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(0) }]),
         );
         assert_eq!(summary.view(value(0, 3)), None);
         assert_eq!(summary.view(value(0, 5)), None);
@@ -852,9 +819,7 @@ mod tests {
         let mut builder = XlaProgramBuilder::new();
         let reference = builder.add_input(reference_type([]));
         let scalar = builder.add_input(array_type([]));
-        let local = builder
-            .add_instruction(XlaOperation::ReferenceNew(ReferenceNewOperation::new()), Vec::new(), vec![scalar], None)
-            .unwrap()[0];
+        let local = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![scalar], None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![scalar, local, reference],
@@ -874,14 +839,8 @@ mod tests {
         // Consuming an operand violates the generic lifetime rule for external roots before any kernel rule applies.
         let mut builder = XlaProgramBuilder::new();
         let reference = builder.add_input(reference_type([]));
-        let frozen = builder
-            .add_instruction(
-                XlaOperation::ReferenceFreeze(ReferenceFreezeOperation::new()),
-                Vec::new(),
-                vec![reference],
-                None,
-            )
-            .unwrap()[0];
+        let frozen =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![frozen], vec![Placeholder], vec![Placeholder])
             .unwrap();
@@ -905,14 +864,8 @@ mod tests {
         // capture scope.
         let mut builder = XlaProgramBuilder::new();
         let captured = builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, reference_type([]))));
-        let snapshot = builder
-            .add_instruction(
-                XlaOperation::ReferenceRead(ReferenceReadOperation::new()),
-                Vec::new(),
-                vec![captured],
-                None,
-            )
-            .unwrap()[0];
+        let snapshot =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![captured], None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![snapshot], Vec::new(), vec![Placeholder])
             .unwrap();
@@ -937,21 +890,10 @@ mod tests {
         let reference = builder.add_input(reference_type([]));
         let scalar = builder.add_input(array_type([]));
         builder
-            .add_instruction(
-                XlaOperation::ReferenceWrite(ReferenceWriteOperation::new()),
-                Vec::new(),
-                vec![reference, scalar],
-                None,
-            )
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, scalar], None)
             .unwrap();
-        let snapshot = builder
-            .add_instruction(
-                XlaOperation::ReferenceRead(ReferenceReadOperation::new()),
-                Vec::new(),
-                vec![reference],
-                None,
-            )
-            .unwrap()[0];
+        let snapshot =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
@@ -1049,14 +991,8 @@ mod tests {
         // after discharge.
         let mut builder = XlaProgramBuilder::new();
         let reference = builder.add_input(reference_type([]));
-        let snapshot = builder
-            .add_instruction(
-                XlaOperation::ReferenceRead(ReferenceReadOperation::new()),
-                Vec::new(),
-                vec![reference],
-                None,
-            )
-            .unwrap()[0];
+        let snapshot =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
             .unwrap();

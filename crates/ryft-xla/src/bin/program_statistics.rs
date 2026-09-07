@@ -198,7 +198,7 @@ fn emit_scalar_bilinear_sin_vjp_pullback() -> Result<ProgramStatistics, Statisti
         (Array::scalar(2.0), Array::scalar(3.0)),
         (),
     )?;
-    let (pullback, _residuals) = pullback.into_parts();
+    let (pullback, _residuals) = pullback.into_transposed_parts()?;
     Ok(pullback.statistics())
 }
 
@@ -248,7 +248,7 @@ fn emit_scalar_quartic_plus_sin_linearize_pushforward() -> Result<ProgramStatist
         Array::scalar(2.0),
         (),
     )?;
-    let (pushforward, residuals) = pushforward.into_parts();
+    let (_, pushforward, residuals, _, _, _) = pushforward.into_parts();
     let (_, closed_pushforward) = context.interpret_and_trace(
         move |tangent| {
             let tracing_context = tangent.context().clone();

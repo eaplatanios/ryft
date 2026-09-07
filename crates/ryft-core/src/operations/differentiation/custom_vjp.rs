@@ -1352,7 +1352,7 @@ mod tests {
         assert!(forward.entry_region_ref().contains_effect_in_closure(EffectClass::OrderedState));
         let driver = ReferenceRuleDifferentiationDriver { programs: vec![primal, forward, backward] };
         assert!(matches!(
-            CustomVjpOperation::<ArrayIrType>::new().jvp(&DifferentiationContext::new(context.clone()), &driver, std::slice::from_ref(&input)),
+            CustomVjpOperation::<ArrayIrType>::new().jvp(&DifferentiationContext::fused(context.clone()), &driver, std::slice::from_ref(&input)),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "cannot apply forward-mode differentiation to a custom_vjp call; it supports only \
                                reverse-mode differentiation (e.g., `vjp`, `value_and_gradient`, or \

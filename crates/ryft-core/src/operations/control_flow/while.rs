@@ -16,8 +16,8 @@ use std::sync::Arc;
 
 use crate::arrays::batching::align_array_batch;
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, DataType,
-    DimensionValue,
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
+    ArrayType, DataType, DimensionValue,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -520,7 +520,7 @@ where
 //      lowering reduces the predicate with `or` and masks carry updates with a broadcast select. The iteration
 //      bound is preserved (batch items share masked iterations, so capping the loop matches per-item truncation
 //      exactly).
-impl<C, O, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for WhileOperation<ArrayType>
+impl<C, O, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>> for WhileOperation<ArrayType>
 where
     C: Context<Type = ArrayType, Operation = O>,
     <C as Domain>::Value: Broadcast + Transpose,
@@ -532,12 +532,12 @@ where
         + From<AndOperation<ArrayType>>
         + From<WhileOperation<ArrayType>>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         // The rule requests all nested-computation work through its region access (region 0 is the condition and
         // region 1 the body), which keeps its bounds free of the operation family's own semantic traits.
         let state_count = inputs.len();
@@ -679,7 +679,7 @@ where
 // loop-invariant state that per-item masking never touches (the relaxed [`WhileTypeSemantics`] contract documents that
 // invariance requirement), while *mapped* dimension inputs and dimension outputs that would widen into per-item
 // extents remain rejected.
-impl<C> BatchableOperation<C, ArrayIrBatching> for WhileOperation<ArrayIrType>
+impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for WhileOperation<ArrayIrType>
 where
     C: Context<
             Type = ArrayIrType,
@@ -693,12 +693,12 @@ where
     C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: From<TransposeOperation>,
 {
-    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
+    fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C, ArrayIrBatching>,
+        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         let condition_region = driver.region(0)?;
         let body_region = driver.region(1)?;
         let state_count = inputs.len();
@@ -2334,7 +2334,7 @@ where
         let input_known = (0..fused_state_count).map(|index| index < state_count).collect::<Vec<_>>();
         let required_outputs = (0..state_count).collect::<Vec<_>>();
         let partition = driver.partition_jvp_program(program.entry_region_ref(), &input_known, &required_outputs)?;
-        context.interpret_partitioned_jvp_program(&partition, &operands, state_count)?
+        partition.interpret_in_context(context, &operands, state_count)?
     };
     check_count!("output", outputs, fused_state_count, ProgramError);
     let (primal_outputs, tangent_outputs) = outputs.split_at(state_count);
@@ -2434,7 +2434,8 @@ where
                     .iter()
                     .map(|region| body_region.with_id(*region).map(RegionRef::to_program))
                     .collect::<Result<Vec<_>, ProgramError>>()?;
-                let output_duals = driver.bind_jvp_operation(context, instruction.operation(), programs, input_duals)?;
+                let output_duals =
+                    driver.bind_jvp_operation(context, instruction.operation(), programs, input_duals)?;
                 check_count!("output", output_duals, instruction.outputs().len(), ProgramError);
                 Ok(output_duals)
             },
@@ -2761,7 +2762,7 @@ impl<C: Context> WhilePredicate for Tracer<C> {}
 
 impl WhilePredicate for CaptureReference<ArrayType> {}
 
-impl<C: Context<Type = ArrayType>> WhilePredicate for BatchingTracer<C, ArrayBatching> where
+impl<C: Context<Type = ArrayType>> WhilePredicate for BatchingTracer<C, ArrayBatchingPolicy> where
     C::Value: Concretizable<bool>
 {
 }
@@ -4807,7 +4808,7 @@ mod tests {
         // Batching batch items [3, 1, 2] under an eager parent performs exactly one structural pass per region (the
         // fixed-point discovery body and the natural condition) and interprets the loop with its masked per-item
         // semantics: every batch item counts down to 0 even though the items terminate after different trip counts.
-        let context = BatchingContext::<_, ArrayIrBatching>::new(
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             EagerParent::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap()),
         );
@@ -4926,7 +4927,7 @@ mod tests {
         let state =
             trace.input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(batch.clone())])).into());
         let input_ids = [batch_extent.clone(), state.clone()].map(|input| input.atom_id().unwrap());
-        let context = BatchingContext::<_, ArrayIrBatching>::new(trace.clone(), batch_extent);
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), batch_extent);
         let outputs = context
             .bind(
                 ArrayIrOperation::While(WhileOperation::new()),
@@ -5208,20 +5209,20 @@ mod tests {
         where
             V: Value<Type = ArrayType> + crate::operations::manipulation::Transpose,
             V::DispatchDomain: Context<Type = ArrayType, Value = V, Constant = Array, Operation = TestDomainOperation>,
-            TestDomainOperation: BatchableOperation<V::DispatchDomain, ArrayBatching>
+            TestDomainOperation: BatchableOperation<V::DispatchDomain, ArrayBatchingPolicy>
                 + crate::batching::BatchableOperation<
                     crate::TracingContext<
                         <V::DispatchDomain as crate::Domain>::Constant,
                         <V::DispatchDomain as crate::Domain>::Operation,
                     >,
-                    ArrayBatching,
+                    ArrayBatchingPolicy,
                 > + From<crate::operations::manipulation::TransposeOperation>
                 + From<crate::operations::manipulation::BroadcastOperation>,
         {
             let context = x.dispatch_domain();
             let mapped = Batch::batch(
                 &context,
-                |item: BatchingTracer<V::DispatchDomain, ArrayBatching>| {
+                |item: BatchingTracer<V::DispatchDomain, ArrayBatchingPolicy>| {
                     let batching_context = item.context().clone();
                     let (while_operation, while_regions) = bounded_doubling_while_operation(8.0, 5);
                     let mut outputs = batching_context.bind(while_operation, while_regions, &[item])?;

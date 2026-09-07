@@ -2,8 +2,8 @@ use std::collections::BTreeSet;
 use std::fmt::Display;
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrType, ArrayType, DataType, Dimension, LogicalMesh, Sharding,
-    materialize_array_tangent,
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayType, DataType, Dimension,
+    LogicalMesh, Sharding, materialize_array_tangent,
 };
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
@@ -384,18 +384,18 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for ScatterO
 /// leading batch axis. This stages `O(axis_size)` scatters but is correct for every combiner and dimension-number
 /// configuration; dimension-number lifting is a performance optimization left as a follow-up. When no input is mapped
 /// the scatter applies once, unbatched.
-impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for ScatterOperation
+impl<C, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>> for ScatterOperation
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
     C::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
     ScatterOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         check_count!("input", inputs, 3, ProgramError);
         let Some(axis_size) = ArrayBatch::common_batch_size(inputs)? else {
             return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());

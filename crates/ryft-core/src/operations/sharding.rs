@@ -31,7 +31,9 @@
 
 use std::fmt::Display;
 
-use crate::arrays::{ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayType, Sharding, ShardingDimension};
+use crate::arrays::{
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType, Sharding, ShardingDimension,
+};
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
@@ -175,17 +177,17 @@ impl<C: Context> PartiallyEvaluatableOperation<C> for ReshardOperation where C::
 
 // Batching rule for [`ReshardOperation`]. The lifted reshard's target sharding gains the mapped axis's sharding
 // (derived from the batched inputs via [`ArrayBatch::sharding_for_inputs`]) at the new batch dimension.
-impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
     for ReshardOperation
 where
     ReshardOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         // Validates that a mapped batch axis has a static size before lifting.
         ArrayBatch::common_batch_size(inputs)?;
@@ -403,17 +405,17 @@ impl<C: Context> PartiallyEvaluatableOperation<C> for ShardingConstraintOperatio
 // entry at the new batch dimension: the hint governs only the compiler-propagated auto axes, so the new dimension
 // is left open for the backend to fill rather than pinned to a derived or replicated entry (matching JAX's
 // `with_sharding_constraint` batcher, which inserts `PartitionSpec.UNCONSTRAINED`).
-impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
     for ShardingConstraintOperation
 where
     ShardingConstraintOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         // Validates that a mapped batch axis has a static size before lifting.
         ArrayBatch::common_batch_size(inputs)?;

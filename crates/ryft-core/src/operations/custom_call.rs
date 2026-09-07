@@ -7,8 +7,9 @@ use std::marker::PhantomData;
 // TODO(eaplatanios): Why this import?
 use crate::arrays::batching::align_array_batch;
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, Dimension,
-    DimensionType, DimensionValue, DimensionVariable, Layout, RaggedAxis, ShardingDimension, TiledLayout,
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
+    ArrayType, Dimension, DimensionType, DimensionValue, DimensionVariable, Layout, RaggedAxis, ShardingDimension,
+    TiledLayout,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -1261,12 +1262,12 @@ impl<T: Type> CustomCallOperation<T> {
     }
 
     /// Attaches declared ragged metadata to batch-prefixed homogeneous outputs and records consumed input dimensions.
-    fn array_ragged_outputs<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>>(
+    fn array_ragged_outputs<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>>(
         &self,
         values: Vec<C::Value>,
         inputs: &[ArrayBatch<C::Value>],
         active: &[(String, RaggedAxis<C::Value>)],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         let contract = self.ragged_contract.as_ref().unwrap();
         let extent_axes = (0..=contract.batch_prefix_count).collect::<Vec<_>>();
         let mut outputs = Vec::with_capacity(values.len());
@@ -1336,7 +1337,7 @@ impl<T: Type> CustomCallOperation<T> {
         values: Vec<C::Value>,
         inputs: &[ArrayIrBatch<C::Value>],
         active: &[(String, RaggedAxis<C::Value>)],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         let contract = self.ragged_contract.as_ref().unwrap();
         let extent_axes = (0..=contract.batch_prefix_count).collect::<Vec<_>>();
         let mut outputs = Vec::with_capacity(values.len());
@@ -1538,18 +1539,18 @@ where
 // [`Sequential`](CustomCallBatching::Sequential) requires a statically known mapped extent: the scan trip count is a
 // host `usize` in this universe. The mixed [`ArrayIrType`] rule below owns the dynamic-extent case, where the trip
 // count is a first-class dimension operand.
-impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
     for CustomCallOperation<ArrayType>
 where
     C::Value: PartialEq,
     C::Operation: From<CustomCallOperation<ArrayType>> + From<ScanOperation<C::Constant>>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         let active_ragged_bindings = if let Some(contract) = &self.ragged_contract {
             let ragged_inputs = inputs
                 .iter()
@@ -1692,7 +1693,7 @@ where
 // [`BroadcastAll`](CustomCallBatching::BroadcastAll) instead rebinds one call whose declared outputs gain the mapped
 // batch dimension, prepending the transform's extent value to each output's trailing extent group when that batch
 // dimension is itself dynamic.
-impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatching> for CustomCallOperation<ArrayIrType>
+impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy> for CustomCallOperation<ArrayIrType>
 where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: PartialEq + ValueProjection<ArrayType, Projected: PartialEq + Transpose + Value<Type = ArrayType>>,
@@ -1706,12 +1707,12 @@ where
         + From<ScanOperation<<C::Constant as ValueProjection<ArrayType>>::Projected>>
         + From<TransposeOperation>,
 {
-    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
+    fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C, ArrayIrBatching>,
+        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         let extent_count = self.dynamic_output_dimension_count();
         let Some(array_input_count) = inputs.len().checked_sub(extent_count) else {
             return Err(ProgramError::InvalidInputCount { expected: extent_count, actual: inputs.len() }.into());
@@ -1957,7 +1958,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayBatch, ArrayBatching, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrValue,
+        Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue,
         ArrayOperation, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
         RaggedAxis, Shape, ShardingDimension, StridedLayout,
     };
@@ -2712,7 +2713,7 @@ mod tests {
         let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
         let packed = trace.input(ArrayType::new_static(DataType::F32, [2, 3, 4]));
         let extents = trace.input(ArrayType::new_static(DataType::I32, [3, 2]));
-        let context = BatchingContext::<_, ArrayBatching>::new(trace.clone(), 2);
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 2);
         let data = ArrayBatch::new(packed, BatchAxis::new(0))
             .unwrap()
             .with_ragged_axes(vec![RaggedAxis::new(2, extents.clone(), length.clone(), vec![1, 0])])
@@ -2754,7 +2755,7 @@ mod tests {
         let packed = trace.input(ArrayType::new_static(DataType::F32, [2, 3, 4]).into());
         let extents = trace.input(ArrayType::new_static(DataType::I32, [3, 2]).into());
         let axis_extent = trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
-        let context = BatchingContext::<_, ArrayIrBatching>::new(trace, axis_extent);
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace, axis_extent);
         let data = ArrayIrBatch::new(packed, BatchAxis::new(0))
             .unwrap()
             .with_ragged_axes(vec![RaggedAxis::new(2, extents.clone(), length.clone(), vec![1, 0])])
@@ -2783,7 +2784,7 @@ mod tests {
         let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
         let packed = trace.input(ArrayType::new_static(DataType::F32, [2, 4]));
         let extents = trace.input(ArrayType::new_static(DataType::I32, [2]));
-        let context = BatchingContext::<_, ArrayBatching>::new(trace, 2);
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace, 2);
         let data = ArrayBatch::new(packed, BatchAxis::new(0))?.with_ragged_axes(vec![RaggedAxis::new(
             1,
             extents.clone(),
@@ -2822,7 +2823,7 @@ mod tests {
         let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
         let input = trace.input(ArrayType::new_static(DataType::F32, [2, 4]));
         let replicated_input = trace.input(ArrayType::new_static(DataType::F32, [4]));
-        let context = BatchingContext::<_, ArrayBatching>::new(trace, 2);
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace, 2);
         let operation = CustomCallOperation::new(
             "ryft.test.fresh_ragged",
             vec![ArrayType::new_static(DataType::F32, [4]), ArrayType::scalar(DataType::I32)],
@@ -2935,7 +2936,8 @@ mod tests {
         let operation = CustomCallOperation::new("ryft.test.side_effect", vec![vector_type()])
             .with_batching(CustomCallBatching::BroadcastAll)
             .with_side_effect();
-        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
+        let context =
+            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
         assert!(matches!(
             operation.batch(&context, &EmptyRegionDriver, &[input]),
             Err(BatchingError::UnsupportedOperation { message })
@@ -2955,7 +2957,7 @@ mod tests {
         type_read_count.set(0);
 
         let operation = CustomCallOperation::new("ryft.test.dense", vec![vector_type()]);
-        let context = BatchingContext::<_, ArrayBatching>::new(TypeReadCountingContext, 2);
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(TypeReadCountingContext, 2);
         assert!(matches!(
             operation.batch(&context, &EmptyRegionDriver, &[input]),
             Err(BatchingError::UnsupportedOperation { message })
@@ -2977,7 +2979,7 @@ mod tests {
             let trace = TracingContext::<Array, ArrayOperation<Array>>::new();
             let packed = trace.input(ArrayType::new_static(DataType::F32, [2, 4]));
             let extents = trace.input(ArrayType::new_static(DataType::I32, [2]));
-            let context = BatchingContext::<_, ArrayBatching>::new(trace.clone(), 2);
+            let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace.clone(), 2);
             let data = ArrayBatch::new(packed, BatchAxis::new(0))?.with_ragged_axes(vec![RaggedAxis::new(
                 1,
                 extents.clone(),
@@ -3060,7 +3062,7 @@ mod tests {
         let packed = trace.input(ArrayType::new_static(DataType::F32, [2, 4]));
         let extents = trace.input(ArrayType::new_static(DataType::I32, [2]));
         let other_extents = trace.input(ArrayType::new_static(DataType::I32, [2]));
-        let context = BatchingContext::<_, ArrayBatching>::new(trace, 2);
+        let context = BatchingContext::<_, ArrayBatchingPolicy>::new(trace, 2);
         let data = ArrayBatch::new(packed, BatchAxis::new(0))
             .unwrap()
             .with_ragged_axes(vec![RaggedAxis::new(1, extents, length.clone(), vec![0])])
@@ -3474,7 +3476,7 @@ mod tests {
         let packed = trace.input(ArrayType::new_static(DataType::F32, [2, 4]).into());
         let extents = trace.input(ArrayType::new_static(DataType::I32, [2]).into());
         let axis_extent = trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()));
-        let context = BatchingContext::<_, ArrayIrBatching>::new(trace, axis_extent);
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace, axis_extent);
         let data = ArrayIrBatch::new(packed, BatchAxis::new(0))?.with_ragged_axes(vec![RaggedAxis::new(
             1,
             extents.clone(),
@@ -3521,7 +3523,7 @@ mod tests {
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = trace.input(ArrayType::new_static(DataType::F32, [4]).into());
         let axis_extent = trace.input(DimensionType::new(batch_size).into());
-        let context = BatchingContext::<_, ArrayIrBatching>::new(trace, axis_extent);
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace, axis_extent);
         let (outputs, evidence) =
             operation.batch(&context, &EmptyRegionDriver, &[ArrayIrBatch::replicated(input)])?.into_parts();
         assert!(evidence.is_empty());
@@ -3539,7 +3541,7 @@ mod tests {
         let output_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(rows)]));
         let operation =
             CustomCallOperation::<ArrayIrType>::from(CustomCallOperation::new("ryft.test.dynamic", vec![output_type]));
-        let context = BatchingContext::<_, ArrayIrBatching>::new(
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
         );
@@ -3572,7 +3574,7 @@ mod tests {
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)])).into(),
         );
         let extent = trace.input(DimensionType::new(rows).into());
-        let context = BatchingContext::<_, ArrayIrBatching>::new(trace.clone(), batch_extent);
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), batch_extent);
         let inputs = [
             BatchingTracer::new(context.clone(), ArrayIrBatch::new(mapped, BatchAxis::new(0))?),
             BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(extent)),
@@ -3640,7 +3642,7 @@ mod tests {
             )
             .into(),
         );
-        let context = BatchingContext::<_, ArrayIrBatching>::new(trace.clone(), axis_extent);
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), axis_extent);
         let (outputs, evidence) = operation
             .batch(&context, &EmptyRegionDriver, &[ArrayIrBatch::new(input, BatchAxis::new(0))?])?
             .into_parts();
@@ -3689,7 +3691,7 @@ mod tests {
         let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = trace.input(vector_type().into());
         let extent = trace.input(DimensionType::new(rows).into());
-        let context = BatchingContext::<_, ArrayIrBatching>::new(
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             trace.clone(),
             trace.constant(ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap())),
         );
@@ -3739,7 +3741,7 @@ mod tests {
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)])).into(),
         );
         let extent = trace.input(DimensionType::new(rows).into());
-        let context = BatchingContext::<_, ArrayIrBatching>::new(trace.clone(), batch_extent);
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), batch_extent);
         let inputs = [
             BatchingTracer::new(context.clone(), ArrayIrBatch::new(mapped, BatchAxis::new(0))?),
             BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(extent)),
@@ -3780,7 +3782,7 @@ mod tests {
         let packed = trace.input(ArrayType::new_static(DataType::F32, [2, 4]).into());
         let extents = trace.input(ArrayType::new_static(DataType::I32, [2]).into());
         let axis_extent = trace.input(DimensionType::new(batch_size).into());
-        let context = BatchingContext::<_, ArrayIrBatching>::new(trace.clone(), axis_extent);
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), axis_extent);
         let data = ArrayIrBatch::new(packed, BatchAxis::new(0))?.with_ragged_axes(vec![RaggedAxis::new(
             1,
             extents.clone(),
@@ -3842,7 +3844,7 @@ mod tests {
                         `custom_vjp` to provide one",
         ));
 
-        let batching_context = BatchingContext::<_, ArrayIrBatching>::new(
+        let batching_context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
         );

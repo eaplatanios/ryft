@@ -1,4 +1,4 @@
-use crate::arrays::{Array, ArrayBatch, ArrayBatching, ArrayElement, ArrayType};
+use crate::arrays::{Array, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayType};
 use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext};
 use crate::differentiation::{
@@ -66,11 +66,11 @@ where
     }
 }
 
-impl<L, C: Context<Type = ArrayType> + Fill<L, C::Value>> Fill<L, BatchingTracer<C, ArrayBatching>>
-    for BatchingContext<C, ArrayBatching>
+impl<L, C: Context<Type = ArrayType> + Fill<L, C::Value>> Fill<L, BatchingTracer<C, ArrayBatchingPolicy>>
+    for BatchingContext<C, ArrayBatchingPolicy>
 {
     #[inline]
-    fn fill(&self, r#type: &ArrayType, value: L) -> Result<BatchingTracer<C, ArrayBatching>, ProgramError> {
+    fn fill(&self, r#type: &ArrayType, value: L) -> Result<BatchingTracer<C, ArrayBatchingPolicy>, ProgramError> {
         let batch = ArrayBatch::new(self.parent().fill(r#type, value)?, BatchAxis::replicated())?;
         Ok(BatchingTracer::new(self.clone(), batch))
     }
@@ -81,7 +81,7 @@ impl<L, C: Context<Type: DifferentiableType> + Fill<L, C::Value>, P: Differentia
 {
     #[inline]
     fn fill(&self, r#type: &C::Type, value: L) -> Result<DifferentiationTracer<C, P>, ProgramError> {
-        let dual = DifferentiationDual::new_with_zero_tangent(self.parent().fill(r#type, value)?)?;
+        let dual = DifferentiationDual::new_with_zero_tangent(self.primal().fill(r#type, value)?)?;
         Ok(DifferentiationTracer::new(dual, self.clone()))
     }
 }
@@ -114,7 +114,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayBatching, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
+        Array, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
         DimensionBounds, DimensionVariable, Memory, Shape, f6e2m3fn, u4,
     };
     use crate::parameters::Placeholder;
@@ -180,7 +180,8 @@ mod tests {
 
     #[test]
     fn test_fill_batching() {
-        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
+        let context =
+            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
         let output_type = ArrayType::new_static(DataType::F32, [2]);
         let output = context.fill(&output_type, 4.5f32).unwrap();
         assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
@@ -189,7 +190,7 @@ mod tests {
 
     #[test]
     fn test_fill_differentiation() {
-        let context = DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let context = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new());
         let output_type = ArrayType::new_static(DataType::F32, [2]);
         let output = context.fill(&output_type, 5.5f32).unwrap();
         assert_eq!(output.primal(), &Array::from_elements(output_type.clone(), &[5.5f32; 2]).unwrap());

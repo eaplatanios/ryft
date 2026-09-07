@@ -1,8 +1,8 @@
 use std::fmt::Display;
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, Dimension,
-    DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, ShardingDimension,
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
+    ArrayType, Dimension, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, ShardingDimension,
 };
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
@@ -209,17 +209,17 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DynamicReshapeOperation>>> P
 /// Batching rule for [`DynamicReshapeOperation`]. Explicit output extents remain replicated shape values. A mapped
 /// input is canonicalized to a leading batch axis, and that axis is inserted into both the reshape geometry and the
 /// output sharding before the mixed operation is replayed.
-impl<C> BatchableOperation<C, ArrayIrBatching> for DynamicReshapeOperation
+impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for DynamicReshapeOperation
 where
     C: Context<Type = ArrayIrType, Operation: From<DynamicReshapeOperation>>,
     C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
 {
-    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
+    fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C, ArrayIrBatching>,
+        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         let Some((input, output_extents)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
@@ -660,18 +660,18 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for ReshapeO
 {
 }
 
-impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
     for ReshapeOperation
 where
     C::Value: Transpose,
     ReshapeOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         let Some(_) = inputs[0].batch_axis_position() else {
             // Replicated input: there is no batch axis to thread through the reshape, so interpret it as given and

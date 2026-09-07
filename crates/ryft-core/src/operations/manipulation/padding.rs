@@ -3,9 +3,9 @@ use std::marker::PhantomData;
 
 use crate::arrays::batching::{align_array_batch, array_dimension};
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, DataType,
-    Dimension, DimensionBounds, DimensionOperation, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding,
-    materialize_array_tangent,
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
+    ArrayType, DataType, Dimension, DimensionBounds, DimensionOperation, DimensionType, DimensionValue,
+    LinearResiduals, Shape, Sharding, materialize_array_tangent,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -382,18 +382,18 @@ where
 /// padding value is vectorized with a constant-size mask construction: pad the operand with zero, pad an all-true
 /// input mask with false, broadcast the per-item padding values over the padded result, and select those values at
 /// padding positions.
-impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for PadOperation<ArrayType>
+impl<C, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>> for PadOperation<ArrayType>
 where
     C: Context<Type = ArrayType> + One<C::Value> + Zero<C::Value>,
     C::Value: Broadcast + Pad + Select + Transpose,
     PadOperation<ArrayType>: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         check_count!("input", inputs, 2, ProgramError);
         if inputs[1].batch_axis_position().is_none() {
             let Some(batch_axis) = inputs[0].batch_axis_position() else {
@@ -446,7 +446,7 @@ where
 /// Batching rule for mixed [`PadOperation<ArrayIrType>`] instructions. Explicit result extents remain
 /// replicated. When the scalar padding value varies across the batch, the rule pads with zero and uses a padded mask
 /// to select the broadcast per-item padding value without changing `pad`'s scalar operand contract.
-impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatching> for PadOperation<ArrayIrType>
+impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy> for PadOperation<ArrayIrType>
 where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
@@ -458,12 +458,12 @@ where
         + From<PadOperation<ArrayType>>
         + OperationProjection<ArrayType, Projected: From<SelectOperation<ArrayType>> + From<ZeroOperation<ArrayType>>>,
 {
-    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
+    fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C, ArrayIrBatching>,
+        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         if inputs.len() < 2 {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
         }

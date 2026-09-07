@@ -12,7 +12,6 @@ pub mod operations;
 pub mod ops;
 /// Experimental preserved-reference kernel boundary for externally stateful XLA kernels.
 pub mod reference_kernels;
-/// Tracing-backed `shard_map` surface and the supporting manual-computation metadata model.
 pub mod shard_map;
 
 pub use lowering::RaggedDotLoweringStrategy;

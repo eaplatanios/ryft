@@ -117,7 +117,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayBatch, ArrayBatching, ArrayOperation, ArrayType, DataType, f8e8m0fnu};
+    use crate::arrays::{Array, ArrayBatch, ArrayBatchingPolicy, ArrayOperation, ArrayType, DataType, f8e8m0fnu};
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::differentiate_at;
@@ -235,7 +235,8 @@ mod tests {
 
     #[test]
     fn test_one_like_batching() {
-        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
+        let context =
+            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
         let input = BatchingTracer::new(
             context,
             ArrayBatch::new(Array::vector(vec![1.5f32, -2.5]), BatchAxis::replicated()).unwrap(),

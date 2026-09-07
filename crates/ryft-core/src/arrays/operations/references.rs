@@ -953,7 +953,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::arrays::Array;
-    use crate::arrays::batching::{ArrayIrBatch, ArrayIrBatching};
+    use crate::arrays::batching::{ArrayIrBatch, ArrayIrBatchingPolicy};
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
     use crate::arrays::reference_discharge::ArrayReferenceDischarge;
@@ -1146,7 +1146,7 @@ mod tests {
 
     #[test]
     fn test_array_reference_view_operations_jvp() {
-        let context = DifferentiationContext::new(TestDestination::new());
+        let context = DifferentiationContext::fused(TestDestination::new());
         let allocation_type = ArrayType::new_static(DataType::F32, [2, 3]);
         let reference = TestValue::Array(Array::from_f64s(allocation_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))
             .reference_new()
@@ -1224,7 +1224,7 @@ mod tests {
             DimensionValue::new(DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())), 2)
                 .unwrap(),
         );
-        let context = BatchingContext::<_, ArrayIrBatching>::new(TestDestination::new(), extent);
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(TestDestination::new(), extent);
         let packed_type = ArrayType::new_static(DataType::F32, [2, 3, 4]);
         let reference = TestValue::Array(Array::from_f64s(packed_type, (0..24).map(f64::from).collect()))
             .reference_new()
@@ -1321,7 +1321,7 @@ mod tests {
         let dynamic_type =
             ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(3)]));
         let reference = trace.input(ReferenceType::new(dynamic_type.clone()).into());
-        let context = BatchingContext::<_, ArrayIrBatching>::new(trace, extent);
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace, extent);
         let batched = BatchingTracer::new(context.clone(), ArrayIrBatch::new(reference, BatchAxis::new(0)).unwrap());
         let error = context
             .bind(ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 3, 1)]), Vec::new(), &[batched])

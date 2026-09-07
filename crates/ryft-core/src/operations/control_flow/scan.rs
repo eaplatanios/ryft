@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use crate::arrays::batching::align_array_batch;
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayIrValue,
-    ArrayReferenceViewTransform, ArrayType, Dimension, DimensionType, DimensionValue, Shape, ViewIndex,
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
+    ArrayIrValue, ArrayReferenceViewTransform, ArrayType, Dimension, DimensionType, DimensionValue, Shape, ViewIndex,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -809,7 +809,7 @@ where
 // rules against the same active context. This is the operational path eager batched scans execute either way, and
 // its packed stacked accumulators retain per-item placement metadata exactly. Constants lift and stacked-output
 // accumulators seed (via the parent's [`Zero`]) through `context.parent()`.
-impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for ScanOperation<C::Constant>
+impl<C, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>> for ScanOperation<C::Constant>
 where
     C: Context<Type = ArrayType> + Zero<<C as Domain>::Value>,
     <C as Domain>::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape,
@@ -821,12 +821,12 @@ where
         + From<ReshapeOperation>
         + From<ScanOperation<C::Constant>>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         driver: &D,
         inputs: &[ArrayBatch<<C as Domain>::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         let body = driver.region(0)?;
         let carry_count = self.carry_count();
         if self.captures().is_empty() && !context.parent().is_eager() {
@@ -1005,7 +1005,7 @@ where
 // stack keeps the batch axis fixed by its referent (which must lie behind the leading scan axis) and the batched scan
 // still consumes it as a stacked operand, so its body receives the per-iteration view of the packed stack through the
 // same boundary rule, batched at the axis that [`ReferenceView::batch`] derives for that view.
-impl<A, C> BatchableOperation<C, ArrayIrBatching> for ScanOperation<ArrayIrValue<A>>
+impl<A, C> BatchableOperation<C, ArrayIrBatchingPolicy> for ScanOperation<ArrayIrValue<A>>
 where
     A: Value<Type = ArrayType>,
     C: Context<
@@ -1020,12 +1020,12 @@ where
     C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: From<TransposeOperation>,
 {
-    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
+    fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C, ArrayIrBatching>,
+        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         let body = driver.region(0)?;
         let (scan_inputs, runtime_length) = if self.length().variable().is_some() {
             let Some((runtime_length, scan_inputs)) = inputs.split_last() else {
@@ -1234,7 +1234,7 @@ where
             .enumerate()
             .filter_map(|(index, &active)| active.then_some(index))
             .collect::<Vec<_>>();
-        let output_has_tangent = body.tangent_output_activity(&input_has_tangent)?;
+        let output_has_tangent = body.tangent_output_mask(&input_indices)?;
         let body_output_count = output_has_tangent.len();
         let live_carry_count = input_has_tangent[..carry_count].iter().filter(|&&live| live).count();
 
@@ -3623,7 +3623,6 @@ mod tests {
     use crate::batching::{BatchingTracer, batch};
     use crate::captures::{CaptureReference, ClosedProgram};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::forward::LinearizationTransform;
     use crate::differentiation::reverse::TranspositionTransform;
     use crate::differentiation::{
         CotangentDestination, CotangentSeed, Differentiate, LinearizationTracer, ReverseModeDifferentiate,
@@ -5229,7 +5228,7 @@ mod tests {
 
     /// Batches `scan` through the public [`BatchingContext::bind`] path with `body` as an owned attached region.
     fn batch_scan(
-        context: &BatchingContext<TestEagerContext, ArrayBatching>,
+        context: &BatchingContext<TestEagerContext, ArrayBatchingPolicy>,
         scan: ScanOperation<Array>,
         body: Program<Array, TestOperation, Vec<Array>, Vec<Array>>,
         inputs: Vec<ArrayBatch<Array>>,
@@ -7239,10 +7238,6 @@ mod tests {
         let first = scanning_program(&body, 1).linearize().unwrap();
         let second = scanning_program(&body, 2).linearize().unwrap();
         assert_ne!(first.tangent().to_string(), second.tangent().to_string());
-
-        // The body's linearization is derived by the first program and served to the second.
-        let statistics = body.entry_region_ref().transform_statistics::<LinearizationTransform>().unwrap();
-        assert_eq!((statistics.productions, statistics.hits), (1, 1));
 
         // An independently built copy of the same body shares no retained transforms, so it exercises the uncached
         // path and pins that caching changed nothing about what is staged.

@@ -6,7 +6,7 @@
 
 use std::fmt::Display;
 
-use crate::arrays::{ArrayBatch, ArrayBatching, ArrayType, RaggedArrayBatchingPolicy, RaggedMaskIdentity};
+use crate::arrays::{ArrayBatch, ArrayBatchingPolicy, ArrayType, RaggedArrayExtentBatchingPolicy, RaggedMaskIdentity};
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError,
     InterpretableBatchableOperation,
@@ -90,7 +90,7 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::batching::DynamicArrayBatchingPolicy;
+    use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable,
         LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension,
@@ -333,7 +333,7 @@ mod tests {
                 .into(),
         );
         let extents = trace.input(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(items)])).into());
-        let context = BatchingContext::<_, ArrayBatching<DynamicArrayBatchingPolicy>>::with_policy(
+        let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
             ProjectedContext::new(trace.clone()),
             batch_extent,
         );

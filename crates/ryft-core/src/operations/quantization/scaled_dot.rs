@@ -236,17 +236,17 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for ScaledDo
 // Batching rule for [`ScaledDotOperation`]. Every input is aligned to one leading mapped axis. The rule then shifts
 // every existing dimension number past that new axis and records axis zero as an additional batching dimension on
 // both element operands. Repeating the transform applies the same lift again, so batching has no rank ceiling.
-impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
     for ScaledDotOperation
 where
     ScaledDotOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         if inputs.len() != self.input_count() {
             return Err(ProgramError::InvalidInputCount { expected: self.input_count(), actual: inputs.len() }.into());
         }

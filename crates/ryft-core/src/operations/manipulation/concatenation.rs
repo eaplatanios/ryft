@@ -5,8 +5,9 @@ use std::marker::PhantomData;
 
 use crate::arrays::batching::align_array_batch;
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, Dimension,
-    DimensionOperation, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, materialize_array_tangent,
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
+    ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding,
+    materialize_array_tangent,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -297,17 +298,17 @@ where
 {
 }
 
-impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>, P: ArrayBatchingPolicy<C>>
-    BatchableOperation<C, ArrayBatching<P>> for ConcatenateOperation<ArrayType>
+impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>, P: ArrayExtentBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatchingPolicy<P>> for ConcatenateOperation<ArrayType>
 where
     ConcatenateOperation<ArrayType>: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         // Align all operands on one physical batch axis (replicated operands are broadcast to gain it via
         // `ArrayBatch::match_axis`, so each batch item concatenates its own operands), and shift the concatenated
         // axis past the inserted batch axis when the batch axis sits at or before it. When no operand is batched,
@@ -334,7 +335,7 @@ where
 
 // Batching rule for mixed [`ConcatenateOperation<ArrayIrType>`] instructions. The trailing result extent stays
 // replicated, while array operands are aligned on one physical mapped axis before concatenation.
-impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatching> for ConcatenateOperation<ArrayIrType>
+impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy> for ConcatenateOperation<ArrayIrType>
 where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Broadcast + Transpose + Value<Type = ArrayType>>,
@@ -344,12 +345,12 @@ where
         + From<DimensionSizeOperation>
         + OperationProjection<ArrayType>,
 {
-    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
+    fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C, ArrayIrBatching>,
+        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         let Some((result_extent, inputs)) = inputs.split_last() else {
             return Err(TypeError::invalid(format!(
                 "`{CONCATENATE_OPERATION_NAME}` expects at least one array followed by its result extent",
@@ -2030,7 +2031,7 @@ mod tests {
             DifferentiationDual::new_with_zero_tangent(result_extent).unwrap(),
         ];
         let outputs = ConcatenateOperation::<ArrayIrType>::from(ConcatenateOperation::new(0, 1).unwrap())
-            .jvp(&DifferentiationContext::new(context.clone()), &EmptyRegionDriver, inputs.as_slice())
+            .jvp(&DifferentiationContext::fused(context.clone()), &EmptyRegionDriver, inputs.as_slice())
             .unwrap();
         assert_eq!(outputs.len(), 1);
         assert_eq!(outputs[0].tangent().r#type().as_ref(), &ArrayIrType::Array(widened_type));

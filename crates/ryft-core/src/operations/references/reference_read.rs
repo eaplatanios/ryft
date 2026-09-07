@@ -215,7 +215,7 @@ where
 #[cfg(test)]
 mod tests {
     use crate::arrays::{
-        Array, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType,
+        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayType, DataType,
         DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
     };
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
@@ -287,7 +287,7 @@ mod tests {
 
     #[test]
     fn test_reference_read_operation_jvp() {
-        let context = DifferentiationContext::new(EagerContext::<TestIrValue, ArrayIrOperation<Array>>::new());
+        let context = DifferentiationContext::fused(EagerContext::<TestIrValue, ArrayIrOperation<Array>>::new());
         let reference = TestIrValue::Array(Array::vector(vec![1.0_f32, 2.0])).reference_new().unwrap();
         let tangent_reference = TestIrValue::Array(Array::vector(vec![3.0_f32, 4.0])).reference_new().unwrap();
 
@@ -318,7 +318,7 @@ mod tests {
             DimensionValue::new(DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())), 2)
                 .unwrap(),
         );
-        let context = BatchingContext::<_, ArrayIrBatching>::new(
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             EagerContext::<TestIrValue, ArrayIrOperation<Array>>::new(),
             extent,
         );

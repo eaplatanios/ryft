@@ -1,7 +1,7 @@
 use std::ops::{Add, Mul};
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayIrType, ArrayType, DataType, Dimension, Shape, Sharding, ShardingDimension,
+    ArrayBatch, ArrayBatchingPolicy, ArrayIrType, ArrayType, DataType, Dimension, Shape, Sharding, ShardingDimension,
 };
 use crate::batching::{BatchableOperation, BatchingContext, RecursiveBatchingPolicy};
 use crate::contexts::Context;
@@ -389,8 +389,8 @@ where
         + Reshape
         + Slice
         + Transpose,
-    C::Operation: BatchableOperation<C, ArrayBatching>
-        + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayBatching>
+    C::Operation: BatchableOperation<C, ArrayBatchingPolicy>
+        + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayBatchingPolicy>
         + From<TransposeOperation>
         + From<BroadcastOperation>,
 {
@@ -612,7 +612,7 @@ where
         inputs: Vec<Self::PackedValue>,
     ) -> Result<Vec<Self::PackedValue>, DifferentiationError> {
         let context = BatchingContext::new(context.clone(), packed_direction_count);
-        Ok(ArrayBatching::batch_region(&context, region, inputs).map_err(ProgramError::from)?)
+        Ok(ArrayBatchingPolicy::batch_region(&context, region, inputs).map_err(ProgramError::from)?)
     }
 
     fn validate_hessian_block_type(

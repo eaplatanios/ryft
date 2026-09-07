@@ -8,8 +8,8 @@ use std::fmt::Display;
 use ryft_macros::Parameter;
 
 use crate::arrays::{
-    ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, Dimension, DimensionError, DimensionType, DimensionVariable,
-    MAX_DIMENSION_EXTENT,
+    ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, Dimension, DimensionError, DimensionType,
+    DimensionVariable, MAX_DIMENSION_EXTENT,
 };
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -197,15 +197,15 @@ impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>> Pa
 // or dynamic axis produces shared shape metadata and remains replicated. A bounded ragged axis instead returns its
 // per-item extent array as the mapped dimension carrier, preserving the logical dimension identity rather than
 // exposing its packed storage bound.
-impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>> BatchableOperation<C, ArrayIrBatching>
-    for DimensionSizeOperation
+impl<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>>
+    BatchableOperation<C, ArrayIrBatchingPolicy> for DimensionSizeOperation
 {
-    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
+    fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C, ArrayIrBatching>,
+        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         let [input] = inputs else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: inputs.len() }.into());
         };

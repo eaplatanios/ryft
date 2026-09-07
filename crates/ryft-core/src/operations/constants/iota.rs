@@ -1,7 +1,7 @@
 use std::fmt::Display;
 
 use crate::arrays::{
-    Array, ArrayBatch, ArrayBatching, ArrayElement, ArrayIrBatching, ArrayIrType, ArrayType,
+    Array, ArrayBatch, ArrayBatchingPolicy, ArrayElement, ArrayIrBatchingPolicy, ArrayIrType, ArrayType,
     dispatch_on_array_element_type,
 };
 use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
@@ -140,7 +140,7 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for IotaOper
 }
 
 impl_nullary_batchable_operation!(@replicated IotaOperation<ArrayType>);
-impl_nullary_batchable_operation!(@member<ArrayIrType, ArrayIrBatching> IotaOperation<ArrayType>);
+impl_nullary_batchable_operation!(@member<ArrayIrType, ArrayIrBatchingPolicy> IotaOperation<ArrayType>);
 impl_non_differentiable_operation!(IotaOperation<ArrayType>);
 impl_nullary_transposable_operation!(IotaOperation<ArrayType>);
 
@@ -249,11 +249,15 @@ where
     }
 }
 
-impl<C: Context<Type = ArrayType> + Iota<C::Value>> Iota<BatchingTracer<C, ArrayBatching>>
-    for BatchingContext<C, ArrayBatching>
+impl<C: Context<Type = ArrayType> + Iota<C::Value>> Iota<BatchingTracer<C, ArrayBatchingPolicy>>
+    for BatchingContext<C, ArrayBatchingPolicy>
 {
     #[inline]
-    fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<BatchingTracer<C, ArrayBatching>, ProgramError> {
+    fn iota(
+        &self,
+        r#type: &ArrayType,
+        dimension: usize,
+    ) -> Result<BatchingTracer<C, ArrayBatchingPolicy>, ProgramError> {
         let batch = ArrayBatch::new(self.parent().iota(r#type, dimension)?, BatchAxis::replicated())?;
         Ok(BatchingTracer::new(self.clone(), batch))
     }
@@ -264,7 +268,7 @@ impl<C: Context<Type = ArrayType> + Iota<C::Value>, P: DifferentiationPolicy<C>>
 {
     #[inline]
     fn iota(&self, r#type: &ArrayType, dimension: usize) -> Result<DifferentiationTracer<C, P>, ProgramError> {
-        let dual = DifferentiationDual::new_with_zero_tangent(self.parent().iota(r#type, dimension)?)?;
+        let dual = DifferentiationDual::new_with_zero_tangent(self.primal().iota(r#type, dimension)?)?;
         Ok(DifferentiationTracer::new(dual, self.clone()))
     }
 }
@@ -275,7 +279,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayBatching, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
+        Array, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension,
         DimensionBounds, DimensionVariable, Shape, u4,
     };
     use crate::batching::{BatchAxis, BatchingContext};
@@ -421,7 +425,8 @@ mod tests {
 
     #[test]
     fn test_iota_batching() {
-        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
+        let context =
+            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
         let output_type = ArrayType::new_static(DataType::I32, [2, 3]);
         let output = context.iota(&output_type, 1).unwrap();
         assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
@@ -430,7 +435,7 @@ mod tests {
 
     #[test]
     fn test_iota_differentiation() {
-        let context = DifferentiationContext::new(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let context = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new());
         let output_type = ArrayType::new_static(DataType::F32, [2, 3]);
         let output = context.iota(&output_type, 1).unwrap();
         assert_eq!(

@@ -16,14 +16,14 @@ use ryft_core::{
     BindingRegionDriver, CallRequest, CompilationCacheDomain, CompilationContext, CompilationDomain, CompileRequest,
     Constant, ConstantOperation, Context, DataType, Device, DeviceId, DeviceMesh, DifferentiationError, Dimension,
     DimensionBounds, DimensionFromScalar, DimensionOperation, DimensionSize, DimensionType, DimensionValue,
-    DimensionVariable, DiskCache, Domain, DomainTracer, EagerContext, Effect, ExternalReferenceBinding,
+    DimensionVariable, DiskCache, Domain, DomainTracer, EagerContext, EffectClass, ExternalReferenceBinding,
     InterpretableOperation, InterpretationDriver, Layout, LogicalMesh, LoweringRequest, Memory, MeshAxis, MeshAxisType,
-    ONE_OPERATION_NAME, Operation, Parameterized, Placeholder, ProgramError, Provenance, ProvenanceScope,
-    ReadyOrPendingReferenceGuard, ReductionKind, ReferenceCompletion, ReferenceCompletionBackend,
+    ONE_OPERATION_NAME, Operation, OperationProvider, Parameterized, Placeholder, ProgramError, Provenance,
+    ProvenanceScope, ReadyOrPendingReferenceGuard, ReductionKind, ReferenceCompletion, ReferenceCompletionBackend,
     ReferenceDischargeResult, ReferenceExecution, ReferenceId, ReferenceReplacementPreparation, ReferenceSource,
     ScatterReductionKind, Shape, Sharding, ShardingDimension, StageRequest, StagedFunction, StatefulCompilationDomain,
     StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, Type, TypeError, TypeRefinements, Typed,
-    ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperationProvider, validate_reference_boundary,
+    ValueProjection, ZERO_OPERATION_NAME, Zero, ZeroOperation, validate_reference_boundary,
 };
 #[cfg(test)]
 use ryft_core::{Array as CpuArray, ProjectedContext};
@@ -549,41 +549,42 @@ impl<'c> Context for XlaDomain<'c> {
     }
 }
 
-/// Context capability that materializes additive-identity [`Array`]s. Transform machinery over this domain (e.g.,
-/// the batching rules of nullary constant operations and the accumulator seeding of recursive higher-order rules)
-/// synthesizes constants through the active context's type-driven [`Zero`], [`One`](ryft_core::One),
-/// [`Fill`](ryft_core::Fill), and [`Iota`](ryft_core::Iota) leaves.
-/// The binds below take the constant-materialization fast path on domains constructed with a concrete mesh and the
-/// compiled eager dispatch path (over a derived default mesh) otherwise. Dynamic array zeros are intentionally not
-/// available through this type-only capability because they require explicit first-class extent operands.
+// Context capability that materializes additive-identity [`Array`]s. Transform machinery over this domain (e.g.,
+// the batching rules of nullary constant operations and the accumulator seeding of recursive higher-order rules)
+// synthesizes constants through the active context's type-driven [`Zero`], [`One`](ryft_core::One),
+// [`Fill`](ryft_core::Fill), and [`Iota`](ryft_core::Iota) leaves.
+// The binds below take the constant-materialization fast path on domains constructed with a concrete mesh and the
+// compiled eager dispatch path (over a derived default mesh) otherwise. Dynamic array zeros are intentionally not
+// available through this type-only capability because they require explicit first-class extent operands.
 impl<'c> Zero<ArrayIrValue<Array<'c>>> for XlaDomain<'c> {
     fn zero(&self, r#type: &ArrayIrType) -> Result<ArrayIrValue<Array<'c>>, ProgramError> {
-        let mut outputs = self.bind(XlaOperation::zero_operation(r#type.clone())?, Vec::new(), &[])?;
+        let mut outputs =
+            self.bind(XlaOperation::provide(ZeroOperation::new(r#type.clone()), &[])?, Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
 }
 
-/// Materialization delegates to [`Context::lift`] and therefore shares its semantics: an immediate
-/// [`XlaConstant::Dimension`] extent materializes directly as a host-side dimension value, while a
-/// [`XlaConstant::Captured`] payload carries only a type and no data and is always rejected outside a surrounding
-/// capture table. The implementation exists because interpretation- and batching-capable operation families require a
-/// [`Constant`] leaf on their contexts; programs whose constants were compiled into capture tables never take the
-/// captured path.
+// Materialization delegates to [`Context::lift`] and therefore shares its semantics: an immediate
+// [`XlaConstant::Dimension`] extent materializes directly as a host-side dimension value, while a
+// [`XlaConstant::Captured`] payload carries only a type and no data and is always rejected outside a surrounding
+// capture table. The implementation exists because interpretation- and batching-capable operation families require a
+// [`Constant`] leaf on their contexts; programs whose constants were compiled into capture tables never take the
+// captured path.
 impl<'c> Constant<ArrayIrValue<Array<'c>>, XlaConstant> for XlaDomain<'c> {
     fn constant(&self, value: XlaConstant) -> Result<ArrayIrValue<Array<'c>>, ProgramError> {
         self.lift(value)
     }
 }
 
-/// Eager interpretation of a staged jitted call over concrete [`Array`]s. Top-level flat programs containing
-/// `jit_call` instructions (for example the pullbacks produced by eager `vjp`/`grad`) replay through
-/// [`Program::interpret_in_context`](ryft_core::Program::interpret_in_context), whose bind channel hands the callee
-/// region to [`Context::bind`] so the call is compiled whole through this domain's dispatch cache and executed on its
-/// PJRT client — mirroring JAX dispatching a jitted function called from eager code straight to the compiled
-/// executable. This rule covers the remaining path — a `jit_call` nested inside another region being interpreted —
-/// by re-entering the active interpreter on the callee region, which dispatches the callee's operations one by one
-/// through this same domain.
+// Eager interpretation of a staged jitted call over concrete [`Array`]s. Top-level flat programs containing
+// `jit_call` instructions (for example the pullbacks produced by eager `vjp`/`grad`) replay through
+// [`Program::interpret_in_context`](ryft_core::Program::interpret_in_context), whose bind channel hands the callee
+// region to [`Context::bind`] so the call is compiled whole through this domain's dispatch cache and executed on its
+// PJRT client — mirroring JAX dispatching a jitted function called from eager code straight to the compiled
+// executable. This rule covers the remaining path — a `jit_call` nested inside another region being interpreted —
+// by re-entering the active interpreter on the callee region, which dispatches the callee's operations one by one
+// through this same domain.
 impl<'c> InterpretableOperation<XlaDomain<'c>> for JitCallOperation<ArrayIrType> {
     fn interpret<D: InterpretationDriver<XlaDomain<'c>>>(
         &self,
@@ -670,7 +671,9 @@ impl<'c> XlaDomain<'c> {
     ) -> Result<Vec<ArrayIrValue<Array<'c>>>, ProgramError> {
         if inputs.iter().any(|input| matches!(input, ArrayIrValue::Reference(_))) {
             return Err(ProgramError::UnsupportedOperation {
-                message: "references must be discharged before XLA eager execution".to_string(),
+                message: "XLA eager execution lowers each operation and cannot bind a reference operand; discharge \
+                          references before lowering"
+                    .to_string(),
             });
         }
         // The intrinsic operation effects alone would miss region-carried state, while effect scans alone would miss
@@ -678,14 +681,18 @@ impl<'c> XlaDomain<'c> {
         // without cloning their program graphs. Although those rules do not execute in this eager bind, ordinary XLA
         // rejects unresolved references artifact-wide, so accepting one here would only defer failure to compilation
         // with a less targeted diagnostic.
-        if operation.effects().contains(Effect::OrderedState)
+        if operation.effects().classes().contains(EffectClass::OrderedState)
             || driver.regions().any(|region| {
-                region.contains_effect_in_closure(Effect::OrderedState)
+                region.contains_effect_in_closure(EffectClass::OrderedState)
                     || region.contains_atom_type_in_closure(Type::is_reference)
             })
         {
             return Err(ProgramError::UnsupportedOperation {
-                message: format!("`{}` must be discharged before XLA eager execution", operation.name()),
+                message: format!(
+                    "`{}` carries reference state that XLA eager execution cannot lower; discharge references before \
+                     lowering",
+                    operation.name(),
+                ),
             });
         }
         if let XlaOperation::Dimension(operation) = &operation {
@@ -2667,18 +2674,40 @@ impl<'c> CompilationDomain for XlaDomain<'c> {
             )?;
             request.replace_input_types(input_types)?;
         }
-        request.trace(|options, output_types| {
-            if let Some(reference) = output_types.iter().find(|r#type| r#type.is_reference()) {
-                return Err(ProgramError::UnsupportedOperation {
-                    message: format!(
-                        "references must be discharged before XLA compilation, but staged output has type \
-                        `{reference}`",
-                    ),
-                }
-                .into());
+        let staged = request.trace(|options, output_types| {
+            // A reference-typed output is rejected below with a diagnostic derived from the traced program, which the
+            // signature normalization cannot see, so it passes through here unsharded instead of failing the array
+            // projection that the sharding override performs.
+            if output_types.iter().any(|r#type| r#type.is_reference()) {
+                return Ok(output_types);
             }
             apply_signature_shardings(output_types, options.out_shardings.as_deref(), "out")
-        })
+        })?;
+        // The stateful XLA ABI opens and commits external input references and has no protocol for turning a
+        // backend-created array into a host reference with persistent identity, nor for handing an entering reference
+        // back through an output, so every reference-typed output is rejected. The retained reference analysis of the
+        // capture-lifted program distinguishes the escaping local allocation from the forwarded external reference.
+        if let Some(output_index) = staged.output_types().iter().position(|r#type| r#type.is_reference()) {
+            let capture_count = staged.source_program().captures().len();
+            let analysis = staged.lifted_program()?.reference_analysis(capture_count).map_err(ProgramError::from)?;
+            let root = analysis.output_roots().get(output_index).copied().flatten();
+            let reason = match root.map(|root| analysis.external_source(root)) {
+                Some(Some(source)) => format!(
+                    "output {output_index} forwards the external reference bound at {source}, and the stateful XLA \
+                     ABI does not return forwarded references; read the reference after the call instead",
+                ),
+                Some(None) => format!(
+                    "output {output_index} is a reference allocated inside the program and cannot be returned \
+                     through the stateful XLA ABI, which has no protocol to turn a backend array into a host reference",
+                ),
+                None => format!(
+                    "output {output_index} is a reference whose root the reference analysis attributes to neither an \
+                     input nor an allocation, and the stateful XLA ABI cannot return it",
+                ),
+            };
+            return Err(XlaDomainError::UnsupportedReferenceAbi { reason });
+        }
+        Ok(staged)
     }
 
     fn lower<Request>(
@@ -2857,7 +2886,7 @@ impl<'c> XlaDomain<'c> {
                 .collect::<Result<Vec<_>, _>>()?;
             let mut bindings =
                 Vec::<(ReferenceId, ArrayReference<Array<'c>>)>::with_capacity(program.reference_states.len());
-            for (_, &logical_input_index) in program.reference_states.iter().zip(&reference_state_input_indices) {
+            for &logical_input_index in &reference_state_input_indices {
                 let reference = match arguments.get(logical_input_index) {
                     Some(ArrayIrValue::Reference(reference)) => reference,
                     Some(value) => {
@@ -2908,26 +2937,20 @@ impl<'c> XlaDomain<'c> {
             let guard_indices =
                 bindings.iter().enumerate().map(|(index, (id, _))| (*id, index)).collect::<BTreeMap<_, _>>();
 
-            let mut mutated_slots = Vec::new();
+            let mut mutated_outputs = BTreeMap::new();
             for (state, &logical_input_index) in program.reference_states.iter().zip(&reference_state_input_indices) {
                 let ArrayIrValue::Reference(reference) = &arguments[logical_input_index] else {
                     unreachable!("reference bindings were validated before holder acquisition")
                 };
                 let guard_index = guard_indices[&reference.id()];
                 if let Some(logical_output_index) = state.output_index() {
-                    mutated_slots.push((guard_index, logical_output_index));
+                    mutated_outputs.insert(guard_index, logical_output_index);
                 }
             }
-            mutated_slots.sort_by_key(|(guard_index, _)| *guard_index);
-            let mutated_outputs = mutated_slots.iter().copied().collect::<BTreeMap<_, _>>();
             let mut arguments = Some(arguments);
 
-            let donation_overrides = program
-                .reference_states
-                .iter()
-                .zip(&reference_state_input_indices)
-                .map(|(_, &logical_input_index)| (logical_input_index, false))
-                .collect::<Vec<_>>();
+            let donation_overrides =
+                reference_state_input_indices.iter().map(|&index| (index, false)).collect::<Vec<_>>();
             let (
                 execution,
                 input_refinements,
@@ -2944,7 +2967,7 @@ impl<'c> XlaDomain<'c> {
                     guards.iter().map(ReadyOrPendingReferenceGuard::observe).collect::<Result<Vec<_>, _>>()?;
                 let logical_arguments = arguments.as_ref().unwrap();
                 let mut execution_arguments = logical_arguments.clone();
-                for (_, &logical_input_index) in program.reference_states.iter().zip(&reference_state_input_indices) {
+                for &logical_input_index in &reference_state_input_indices {
                     let ArrayIrValue::Reference(reference) = &logical_arguments[logical_input_index] else {
                         unreachable!("reference bindings were validated before holder acquisition")
                     };
@@ -2976,8 +2999,8 @@ impl<'c> XlaDomain<'c> {
                 if !guards.iter().zip(&observations).all(|(guard, observation)| observation.is_current(guard)) {
                     continue;
                 }
-                let mut read_only_guards = Vec::with_capacity(bindings.len() - mutated_slots.len());
-                let mut prepared_replacements = Vec::with_capacity(mutated_slots.len());
+                let mut read_only_guards = Vec::with_capacity(bindings.len() - mutated_outputs.len());
+                let mut prepared_replacements = Vec::with_capacity(mutated_outputs.len());
                 let mut read_leases = Vec::new();
                 for (guard_index, guard) in guards.into_iter().enumerate() {
                     if let Some(&logical_output_index) = mutated_outputs.get(&guard_index) {
@@ -3018,7 +3041,7 @@ impl<'c> XlaDomain<'c> {
                 let read_only_guard_storage = RefCell::new(read_only_guards);
                 let prepared_replacement_storage = RefCell::new(prepared_replacements);
                 let publication: RefCell<Option<ReferenceCompletion>> = RefCell::new(None);
-                let replacement_transactions = RefCell::new(Vec::with_capacity(mutated_slots.len()));
+                let replacement_transactions = RefCell::new(Vec::with_capacity(mutated_outputs.len()));
                 let execution =
                     execute_pjrt_buffers(&program.executable, execution_arguments, physical_output_count, |fence| {
                         let mut completions = dependencies.clone();
@@ -3086,7 +3109,7 @@ impl<'c> XlaDomain<'c> {
                 )?;
                 let mut hidden_outputs =
                     (program.output_count..program.output_types.len()).zip(hidden_outputs).collect::<BTreeMap<_, _>>();
-                if replacement_transactions.len() != mutated_slots.len() {
+                if replacement_transactions.len() != mutated_outputs.len() {
                     return Err(ProgramError::MalformedProgram(
                         "submitted reference replacement count does not match mutated reference count".to_string(),
                     )
@@ -3120,7 +3143,7 @@ impl<'c> XlaDomain<'c> {
                 }
             };
             let mut submitted_replacements = replacement_transactions.into_iter().zip(replacements);
-            let mut validated_replacements = Vec::with_capacity(mutated_slots.len());
+            let mut validated_replacements = Vec::with_capacity(mutated_outputs.len());
             while let Some(((_, transaction), replacement)) = submitted_replacements.next() {
                 match transaction.validate(replacement) {
                     Ok(replacement) => validated_replacements.push(replacement),
@@ -3244,7 +3267,8 @@ impl<'c> XlaDomain<'c> {
         // containing both a reference and ordered state receives the more precise reference diagnostic.
         if contains_unresolved_references(discharged.program()) {
             return Err(ProgramError::UnsupportedOperation {
-                message: "references must be discharged before XLA compilation".to_string(),
+                message: "discharged program still contains references, which XLA lowering cannot represent"
+                    .to_string(),
             }
             .into());
         }
@@ -3268,7 +3292,8 @@ impl<'c> XlaDomain<'c> {
     ) -> Result<XlaLoweredProgram, XlaDomainError> {
         if contains_unresolved_state(program) {
             return Err(ProgramError::UnsupportedOperation {
-                message: "state must be discharged before XLA compilation".to_string(),
+                message: "discharged program still contains ordered state, which XLA lowering cannot represent"
+                    .to_string(),
             }
             .into());
         }
@@ -3321,7 +3346,6 @@ impl<'c> XlaDomain<'c> {
             .cloned()
             .chain(effective_public_input_types.iter().cloned())
             .collect::<Vec<_>>();
-        let reference_states = reference_states.to_vec();
         let reference_state_input_indices = reference_states
             .iter()
             .map(|state| state.source().flat_input_index(capture_count))
@@ -3332,15 +3356,17 @@ impl<'c> XlaDomain<'c> {
             )
             .into());
         }
-        let hidden_output_indices =
-            reference_states.iter().filter_map(ExternalReferenceBinding::output_index).collect::<Vec<_>>();
-        if hidden_output_indices != (output_count..program.output_count()).collect::<Vec<_>>() {
+        if !reference_states
+            .iter()
+            .filter_map(ExternalReferenceBinding::output_index)
+            .eq(output_count..program.output_count())
+        {
             return Err(ProgramError::MalformedProgram(
                 "hidden discharged outputs must be covered exactly once by mutated external state".to_string(),
             )
             .into());
         }
-        for (_, &logical_input_index) in reference_states.iter().zip(&reference_state_input_indices) {
+        for &logical_input_index in &reference_state_input_indices {
             let input_type = effective_input_types.get(logical_input_index).ok_or_else(|| {
                 ProgramError::MalformedProgram(format!(
                     "external state logical input {logical_input_index} is out of range",
@@ -3421,37 +3447,26 @@ impl<'c> XlaDomain<'c> {
             .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
             .collect::<Result<Vec<_>, _>>()
             .map_err(ProgramError::from)?;
-        for logical_output_index in output_count..program.output_count() {
-            let (_, &logical_input_index) = reference_states
-                .iter()
-                .zip(&reference_state_input_indices)
-                .find(|(state, _)| state.output_index() == Some(logical_output_index))
-                .unwrap();
-            output_types.push(effective_input_types[logical_input_index].clone());
-        }
         let result_shardings = if reference_states.is_empty() {
             output_types.iter().map(|array_type| array_type.sharding().cloned()).collect::<Option<Vec<_>>>()
         } else {
-            Some(
-                output_types
-                    .iter()
-                    .enumerate()
-                    .map(|(logical_output_index, array_type)| {
-                        if logical_output_index < output_count {
-                            array_type.sharding().cloned().unwrap_or_else(|| {
-                                Sharding::replicated(options.mesh.logical_mesh().clone(), array_type.shape().rank())
-                            })
-                        } else {
-                            let (_, &logical_input_index) = reference_states
-                                .iter()
-                                .zip(&reference_state_input_indices)
-                                .find(|(state, _)| state.output_index() == Some(logical_output_index))
-                                .unwrap();
-                            logical_argument_shardings[logical_input_index].clone()
-                        }
+            let mut shardings = output_types
+                .iter()
+                .map(|array_type| {
+                    array_type.sharding().cloned().unwrap_or_else(|| {
+                        Sharding::replicated(options.mesh.logical_mesh().clone(), array_type.shape().rank())
                     })
-                    .collect(),
-            )
+                })
+                .collect::<Vec<_>>();
+            // Mutated bindings cover the hidden output suffix in order, as validated above. Derive both the hidden
+            // state type and its placement from the same input binding in one pass.
+            for (state, &logical_input_index) in reference_states.iter().zip(&reference_state_input_indices) {
+                if state.is_mutated() {
+                    output_types.push(effective_input_types[logical_input_index].clone());
+                    shardings.push(logical_argument_shardings[logical_input_index].clone());
+                }
+            }
+            Some(shardings)
         };
         // Shardy rejects bounded-dynamic tensors anywhere in the module, not only at the computation boundary, so a
         // program whose boundary is static but whose interior derives a dynamic extent through a gateway operation
@@ -3504,7 +3519,7 @@ impl<'c> XlaDomain<'c> {
             lowered_argument_shardings,
             lowered_result_shardings,
             target_platform.as_deref(),
-            reference_states.as_slice(),
+            reference_states,
             options.ragged_dot_lowering_strategy,
         )
         .map_err(|error| XlaDomainError::Lowering(error.into()))?;
@@ -3757,9 +3772,11 @@ impl<'c> XlaDomain<'c> {
         if reference_state_input_indices.windows(2).any(|indices| indices[0] >= indices[1]) {
             return Err(persistent_error("reference states are not in canonical logical input order"));
         }
-        let hidden_output_indices =
-            reference_states.iter().filter_map(ExternalReferenceBinding::output_index).collect::<Vec<_>>();
-        if hidden_output_indices != (output_count..output_types.len()).collect::<Vec<_>>() {
+        if !reference_states
+            .iter()
+            .filter_map(ExternalReferenceBinding::output_index)
+            .eq(output_count..output_types.len())
+        {
             return Err(persistent_error("reference-state metadata does not cover the hidden output suffix"));
         }
         for (state, &expected_input_index) in reference_states.iter().zip(&reference_state_input_indices) {
@@ -5311,19 +5328,20 @@ mod tests {
     use ryft_core::operations::sort::{SortDirection, SortOperation};
     use ryft_core::{
         AddOperation, AndOperation, ArrayOperation, ArraySliceAxis, Atan2Operation, CalleeRegionDriver,
-        CaptureReference, CompareOperation, ComparisonDirection, CompilationTracer, CompiledFunctionDispatcher,
-        ConditionOperation, ConstantOperation, ConvertElementTypeOperation, CumulativeLogSumExpOperation,
-        CumulativeMaxOperation, CumulativeMinOperation, CumulativeProductOperation, CumulativeSumOperation,
-        CustomJvpOperation, Dimension, DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalarOperation,
-        DimensionRemOperation, DimensionRequirementOperation, DimensionSizeOperation, DimensionSubOperation,
-        DimensionToScalarOperation, DivOperation, DotDimensionNumbers, DotOperation, DynamicBroadcastOperation,
-        DynamicReshapeOperation, DynamicShapeSliceOperation, Fill, IotaOperation, LogSumExpOperation, MulOperation,
-        NegOperation, OneOperation, PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation, ReduceOperation,
-        ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
-        ReferenceIndexOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-        ReferenceSliceOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation,
-        ScaledDotOperation, ScanOperation, ScatterDimensionNumbers, ScatterOperation, SelectOperation, Sharding,
-        ShardingDimension, StaticShape, SubOperation, WhileOperation, ZeroOperation, try_jit_with_options,
+        CaptureReference, CompareOperation, ComparisonDirection, CompilationStagingRequest, CompilationTracer,
+        CompiledFunctionDispatcher, ConditionOperation, ConstantOperation, ConvertElementTypeOperation,
+        CotangentDestinationKind, CumulativeLogSumExpOperation, CumulativeMaxOperation, CumulativeMinOperation,
+        CumulativeProductOperation, CumulativeSumOperation, CustomJvpOperation, Dimension, DimensionAddOperation,
+        DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionRemOperation, DimensionRequirementOperation,
+        DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation, DotDimensionNumbers,
+        DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation, DynamicShapeSliceOperation, Fill,
+        IotaOperation, LogSumExpOperation, MulOperation, NegOperation, OneOperation, PrintOperation,
+        RaggedDotDimensionNumbers, RaggedDotOperation, ReduceOperation, ReductionKind, ReferenceAddUpdate,
+        ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceIndexOperation, ReferenceNew,
+        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation,
+        ReferenceType, ReferenceWrite, ReferenceWriteOperation, ScaledDotOperation, ScanOperation,
+        ScatterDimensionNumbers, ScatterOperation, SelectOperation, Sharding, ShardingDimension, SliceOperation,
+        StaticShape, SubOperation, WhileOperation, ZeroOperation, try_jit_with_options,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -6016,7 +6034,7 @@ mod tests {
         let domain = XlaDomain::with_mesh(&client, mesh);
         let array_type = ArrayType::scalar(DataType::F32);
         let operations = [
-            XlaOperation::zero_operation(ArrayIrType::Array(array_type.clone())).unwrap(),
+            XlaOperation::provide(ZeroOperation::new(ArrayIrType::Array(array_type.clone())), &[]).unwrap(),
             OneOperation::new(array_type).into(),
         ];
 
@@ -8849,14 +8867,12 @@ mod tests {
             Ok(ValueProjection::<ArrayType>::from_projected(capture + input))
         }
         let staged: StagedFunction<XlaDomain<'_>, ArrayIrType, ArrayIrType> = domain
-            .stage(
-                ryft_core::compilation::CompilationStagingRequest::<XlaDomain<'_>, _, ArrayIrType, ArrayIrType>::new(
-                    add_capture,
-                    vec![ArrayIrValue::Array(capture.clone())],
-                    ArrayIrType::Array(input_type.clone()),
-                    XlaOptions::new(mesh.clone()).with_donate(true),
-                ),
-            )
+            .stage(CompilationStagingRequest::<XlaDomain<'_>, _, ArrayIrType, ArrayIrType>::new(
+                add_capture,
+                vec![ArrayIrValue::Array(capture.clone())],
+                ArrayIrType::Array(input_type.clone()),
+                XlaOptions::new(mesh.clone()).with_donate(true),
+            ))
             .unwrap();
         let compiled = domain.compile(domain.lower(staged).unwrap()).unwrap();
         let compiled_analysis = domain.analyze(compiled.executable_function()).unwrap();
@@ -9156,7 +9172,9 @@ mod tests {
         assert_eq!(
             XlaDomain::token().bind(XlaOperation::ReferenceNew(ReferenceNewOperation::new()), Vec::new(), &[]),
             Err(ProgramError::UnsupportedOperation {
-                message: "`reference_new` must be discharged before XLA eager execution".to_string(),
+                message: "`reference_new` carries reference state that XLA eager execution cannot lower; discharge \
+                          references before lowering"
+                    .to_string(),
             }),
         );
 
@@ -9168,7 +9186,9 @@ mod tests {
         assert_eq!(
             domain.bind(AddOperation::new(), Vec::new(), &[reference]),
             Err(ProgramError::UnsupportedOperation {
-                message: "references must be discharged before XLA eager execution".to_string(),
+                message: "XLA eager execution lowers each operation and cannot bind a reference operand; discharge \
+                          references before lowering"
+                    .to_string(),
             }),
         );
 
@@ -9196,7 +9216,9 @@ mod tests {
         assert_eq!(
             XlaDomain::token().bind(XlaOperation::While(WhileOperation::new()), vec![condition, body], &[]),
             Err(ProgramError::UnsupportedOperation {
-                message: "`while` must be discharged before XLA eager execution".to_string(),
+                message: "`while` carries reference state that XLA eager execution cannot lower; discharge \
+                          references before lowering"
+                    .to_string(),
             }),
         );
 
@@ -9233,7 +9255,9 @@ mod tests {
                 &[],
             ),
             Err(ProgramError::UnsupportedOperation {
-                message: "`custom_jvp` must be discharged before XLA eager execution".to_string(),
+                message: "`custom_jvp` carries reference state that XLA eager execution cannot lower; discharge \
+                          references before lowering"
+                    .to_string(),
             }),
         );
 
@@ -9262,7 +9286,9 @@ mod tests {
                 &[],
             ),
             Err(ProgramError::UnsupportedOperation {
-                message: "`custom_jvp` must be discharged before XLA eager execution".to_string(),
+                message: "`custom_jvp` carries reference state that XLA eager execution cannot lower; discharge \
+                          references before lowering"
+                    .to_string(),
             }),
         );
     }
@@ -9288,7 +9314,7 @@ mod tests {
         assert!(matches!(
             domain
                 .stage(
-                    ryft_core::compilation::CompilationStagingRequest::<XlaDomain<'_>, _, ArrayIrType, ArrayIrType>::new(
+                    CompilationStagingRequest::<XlaDomain<'_>, _, ArrayIrType, ArrayIrType>::new(
                         forward,
                         Vec::new(),
                         reference_type.clone(),
@@ -9300,7 +9326,8 @@ mod tests {
                 if reason == "external reference inputs do not support explicit input shardings",
         ));
 
-        // A reference output with `out_shardings` is likewise rejected before the output override runs.
+        // A reference output with `out_shardings` is likewise rejected, by the reference-output contract rather than
+        // by the output override, which never runs on a reference type.
         fn allocate<'c>(
             _: Vec<XlaConstant>,
             _: Vec<CompilationTracer<XlaDomain<'c>>>,
@@ -9311,7 +9338,7 @@ mod tests {
         assert!(matches!(
             domain
                 .stage(
-                    ryft_core::compilation::CompilationStagingRequest::<XlaDomain<'_>, _, ArrayIrType, ArrayIrType>::new(
+                    CompilationStagingRequest::<XlaDomain<'_>, _, ArrayIrType, ArrayIrType>::new(
                         allocate,
                         Vec::new(),
                         ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
@@ -9319,11 +9346,28 @@ mod tests {
                     ),
                 )
                 .map(|_| ()),
-            Err(XlaDomainError::Tracing(ProgramError::UnsupportedOperation { message }))
-                if message == format!(
-                    "references must be discharged before XLA compilation, but staged output has type \
-                    `{reference_type}`",
-                ),
+            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+                if reason == "output 0 is a reference allocated inside the program and cannot be returned through \
+                              the stateful XLA ABI, which has no protocol to turn a backend array into a host \
+                              reference",
+        ));
+
+        // Forwarding an external reference through an output is rejected by the same contract, because the ABI has no
+        // protocol for handing an entering reference back through an output either.
+        assert!(matches!(
+            domain
+                .stage(
+                    CompilationStagingRequest::<XlaDomain<'_>, _, ArrayIrType, ArrayIrType>::new(
+                        forward,
+                        Vec::new(),
+                        reference_type,
+                        XlaOptions::new(mesh.clone()),
+                    ),
+                )
+                .map(|_| ()),
+            Err(XlaDomainError::UnsupportedReferenceAbi { reason })
+                if reason == "output 0 forwards the external reference bound at input 0, and the stateful XLA ABI \
+                              does not return forwarded references; read the reference after the call instead",
         ));
     }
 
@@ -9511,6 +9555,38 @@ mod tests {
         let eager_final = eager_reference.freeze().unwrap();
         assert_eq!(eager_snapshot, ArrayIrValue::Array(CpuArray::scalar(5.0f32)));
         assert_eq!(eager_final, ArrayIrValue::Array(CpuArray::scalar(8.0f32)));
+    }
+
+    #[test]
+    fn test_xla_lowering_accumulates_slice_cotangents_into_existing_state() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::new(&client);
+        let mut builder = XlaProgramBuilder::new();
+        let input = builder.add_input(replicated_vector_type(&mesh, 4).into());
+        let output = builder
+            .add_instruction(SliceOperation::new(vec![1], vec![3]), Vec::new(), vec![input], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
+        assert_eq!(
+            pullback.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec!["reference_slice", "reference_add_update"],
+        );
+
+        // Discharge reads only the selected buffer entries, adds the seed, and writes that slice back. The lowered
+        // graph contains no full-size zero gradient or dense addition before the indexed update.
+        let lowered = domain.lower_xla_program(&pullback, 0, &XlaOptions::new(mesh)).unwrap();
+        let operations = lowered
+            .stable_hlo()
+            .lines()
+            .filter_map(|line| line.split_once(" = stablehlo."))
+            .map(|(_, operation)| operation.split_whitespace().next().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(operations, vec!["slice", "add", "constant", "dynamic_update_slice"]);
     }
 
     #[test]

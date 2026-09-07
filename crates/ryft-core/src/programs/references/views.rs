@@ -954,7 +954,7 @@ mod tests {
 
     use crate::arrays::addressing::ArraySliceAxis;
     use crate::arrays::arrays::Array;
-    use crate::arrays::batching::{ArrayIrBatch, ArrayIrBatching};
+    use crate::arrays::batching::{ArrayIrBatch, ArrayIrBatchingPolicy};
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{
@@ -1385,7 +1385,7 @@ mod tests {
                 .unwrap(),
         );
         let context =
-            BatchingContext::<_, ArrayIrBatching>::new(EagerContext::<TestValue, TestOperation>::new(), extent);
+            BatchingContext::<_, ArrayIrBatchingPolicy>::new(EagerContext::<TestValue, TestOperation>::new(), extent);
         let packed_type = ArrayType::new_static(DataType::F32, [2, 3]);
         let reference = TestValue::Array(Array::from_f64s(packed_type, (0..6).map(f64::from).collect()))
             .reference_new()

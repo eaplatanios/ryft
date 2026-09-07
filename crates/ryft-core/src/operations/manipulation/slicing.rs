@@ -2,8 +2,8 @@ use std::borrow::Cow;
 use std::fmt::Display;
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArraySliceAxis,
-    ArrayType, Dimension, DimensionType, DimensionValue, LinearResiduals, Memory, MeshAxisType,
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
+    ArraySliceAxis, ArrayType, Dimension, DimensionType, DimensionValue, LinearResiduals, Memory, MeshAxisType,
     ReferenceSliceOperation, Shape, Sharding, ShardingDimension,
 };
 use crate::axes::Axis;
@@ -215,16 +215,17 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for SliceOpe
 
 // Batching rule for [`SliceOperation`]: a batched operand keeps its batch axis by slicing it fully, so the lifted
 // operation inserts start index `0`, limit `axis_size`, and stride `1` at the batch axis position.
-impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for SliceOperation
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
+    for SliceOperation
 where
     SliceOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         check_count!("input", inputs, 1, ProgramError);
         match inputs[0].batch_axis_position() {
             None => Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into()),
@@ -767,19 +768,19 @@ impl<C: Context<Type = ArrayIrType>> PartiallyEvaluatableOperation<C> for Dynami
 // Batching rule for [`DynamicShapeSliceOperation`]. First-class starts and sizes must remain replicated because
 // per-item slice geometry requires a ragged representation. A mapped array axis is inserted into the slice geometry
 // with start zero, the transform's exact extent, and unit stride.
-impl<C> BatchableOperation<C, ArrayIrBatching> for DynamicShapeSliceOperation
+impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for DynamicShapeSliceOperation
 where
     C: Context<
             Type = ArrayIrType,
             Operation: From<DynamicShapeSliceOperation> + From<ConstantOperation<DimensionValue>>,
         >,
 {
-    fn batch<D: BatchingDriver<C, ArrayIrBatching>>(
+    fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
-        context: &BatchingContext<C, ArrayIrBatching>,
+        context: &BatchingContext<C, ArrayIrBatchingPolicy>,
         _driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayIrBatching>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         let Some((input, bounds)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
@@ -1195,18 +1196,18 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for UpdateSl
 // Batching rule for [`UpdateSliceOperation`]: the input and update operands are aligned on one physical batch axis
 // (replicated operands are broadcast to gain it), and the lifted operation inserts start index `0` at that axis
 // so each batch item updates its own block.
-impl<C: Context<Type = ArrayType>, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>>
+impl<C: Context<Type = ArrayType>, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>>
     for UpdateSliceOperation
 where
     C::Value: Broadcast + Transpose,
     UpdateSliceOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         check_count!("input", inputs, 2, ProgramError);
         let Some(batch_axis) = inputs.iter().find_map(ArrayBatch::batch_axis_position) else {
             return Ok(self.interpret_with_batch_axes(context, inputs, &[BatchAxis::replicated()])?.into());
@@ -1571,18 +1572,18 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DynamicS
 // type. Rank-0 operands have no index operands to donate a zero index, but a rank-0 dynamic slice is the identity
 // map, so the batched operand passes through unchanged.
 //
-impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for DynamicSliceOperation
+impl<C, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>> for DynamicSliceOperation
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
     C::Value: ZeroLike + Broadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
     DynamicSliceOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         if inputs.is_empty() {
             return Err(ProgramError::InvalidInputCount { expected: 1 + self.sizes().len(), actual: 0 }.into());
         }
@@ -2088,18 +2089,18 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DynamicU
 // even when the operands carried their batch axes elsewhere). The expansion stages `O(batch_size)` operations — a
 // scatter-based rule is an explicit non-goal — and behaves identically in eager and tracing contexts because it
 // only goes through the value capability traits.
-impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for DynamicUpdateSliceOperation
+impl<C, P: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<P>> for DynamicUpdateSliceOperation
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
     C::Value: ZeroLike + Broadcast + Transpose + Slice + UpdateSlice + Reshape + Reshard,
     DynamicUpdateSliceOperation: InterpretableOperation<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<P>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<P>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<P>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
         _driver: &D,
         inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<P>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<P>>, BatchingError> {
         if inputs.len() < 2 {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
         }
@@ -2751,8 +2752,8 @@ where
 /// item. Nonempty explicitly sharded mapped inputs are resharded to replicated placement before item extraction, and
 /// the completed replicated accumulator is resharded once to the context's mapped placement. This avoids assigning a
 /// nontrivial sharding to the extent-one slices used internally by the expansion.
-pub(crate) fn batch_by_item_expansion<C, O, P: ArrayBatchingPolicy<C>>(
-    context: &BatchingContext<C, ArrayBatching<P>>,
+pub(crate) fn batch_by_item_expansion<C, O, P: ArrayExtentBatchingPolicy<C>>(
+    context: &BatchingContext<C, ArrayBatchingPolicy<P>>,
     operation_name: &'static str,
     operation: &O,
     inputs: &[ArrayBatch<C::Value>],
@@ -2812,7 +2813,7 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType,
+        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType,
         DimensionBounds, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
         Sharding, ShardingDimension, StridedLayout,
     };
@@ -2868,7 +2869,7 @@ mod tests {
 
     #[test]
     fn test_dynamic_shape_slice_batching_inserts_the_mapped_axis_geometry() {
-        let context = BatchingContext::<_, ArrayIrBatching>::new(
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
             EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
         );

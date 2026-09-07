@@ -667,7 +667,7 @@ struct DifferentiationContext<C: Context, P: DifferentiationPolicy<C> = FusedDif
 
 impl<C: Context> DifferentiationContext<C> {
     /// Creates the fused context used by these dispatcher tests.
-    fn new(primal: C) -> Self {
+    fn fused(primal: C) -> Self {
         Self { primal, policy: PhantomData }
     }
 }
@@ -1986,7 +1986,7 @@ mod mixed_members {
             dimension_type: dimension_type.clone(),
         });
         let context = TracingContext::<ArrayIrValue<Array>, Operation>::new();
-        let duals = operation.jvp(&DifferentiationContext::new(context.clone()), &EmptyRegionDriver, &[]).unwrap();
+        let duals = operation.jvp(&DifferentiationContext::fused(context.clone()), &EmptyRegionDriver, &[]).unwrap();
 
         assert_eq!(duals.len(), 2);
         assert_eq!(duals[0].primal().r#type().as_ref(), &ArrayIrType::from(array_type.clone()));
@@ -2183,7 +2183,7 @@ fn test_operation_propagates_differentiation_payload_bounds() {
 
     let context = TestContext::<Factor, Operation> { marker: PhantomData };
     let operation = Operation::from(SpecialOperation);
-    let outputs = operation.jvp(&DifferentiationContext::new(context), &EmptyRegionDriver, &[]).unwrap();
+    let outputs = operation.jvp(&DifferentiationContext::fused(context), &EmptyRegionDriver, &[]).unwrap();
 
     assert_eq!(outputs.len(), 1);
     assert_eq!(outputs[0].label, "special");
@@ -2648,7 +2648,7 @@ trait BatchableOperation<C: Context, P: BatchingPolicy<C>>: Operation<Type = C::
 }
 
 /// Stand-in for `ryft_core::EagerContext`. Mirrors the real context's `Context` membership so that a top-level
-/// eager batch can be represented as `BatchingContext<EagerContext<...>, ArrayBatching>`.
+/// eager batch can be represented as `BatchingContext<EagerContext<...>, ArrayBatchingPolicy>`.
 struct EagerContext<V: Value, O: Operation<Type = V::Type>> {
     marker: PhantomData<(V, O)>,
 }
@@ -2705,20 +2705,20 @@ trait BatchingPolicy<C: Context> {
     type Batch;
 }
 
+/// Stand-in for `ryft_core::ArrayExtentBatchingPolicy`.
+trait ArrayExtentBatchingPolicy<C: Context<Type = ArrayType>> {}
+
+/// Stand-in for `ryft_core::StaticArrayExtentBatchingPolicy`.
+#[derive(Copy, Clone, Debug)]
+struct StaticArrayExtentBatchingPolicy;
+
+impl<C: Context<Type = ArrayType>> ArrayExtentBatchingPolicy<C> for StaticArrayExtentBatchingPolicy {}
+
 /// Stand-in for `ryft_core::ArrayBatchingPolicy`.
-trait ArrayBatchingPolicy<C: Context<Type = ArrayType>> {}
-
-/// Stand-in for `ryft_core::StaticArrayBatchingPolicy`.
 #[derive(Copy, Clone, Debug)]
-struct StaticArrayBatchingPolicy;
+struct ArrayBatchingPolicy<M = StaticArrayExtentBatchingPolicy>(PhantomData<fn() -> M>);
 
-impl<C: Context<Type = ArrayType>> ArrayBatchingPolicy<C> for StaticArrayBatchingPolicy {}
-
-/// Stand-in for `ryft_core::ArrayBatching`.
-#[derive(Copy, Clone, Debug)]
-struct ArrayBatching<M = StaticArrayBatchingPolicy>(PhantomData<fn() -> M>);
-
-impl<C: Context<Type = ArrayType>, M: ArrayBatchingPolicy<C>> BatchingPolicy<C> for ArrayBatching<M> {
+impl<C: Context<Type = ArrayType>, M: ArrayExtentBatchingPolicy<C>> BatchingPolicy<C> for ArrayBatchingPolicy<M> {
     type Batch = ArrayBatch<C::Value>;
 }
 
@@ -2757,46 +2757,47 @@ impl<C, Meta> SpecialBatchValue for Tracer<C, Meta> {}
 
 /// Ordinary leaf rule: it neither needs the active frame nor any value capability, and its physical work runs
 /// through the parent context (observed here through the parent-lifted constant in its output label).
-impl<C: Context<Type = ArrayType>, M: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<M>>
+impl<C: Context<Type = ArrayType>, M: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<M>>
     for ZeroOperation<ArrayType>
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<M>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<M>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<M>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<M>>,
         _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<M>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<M>>, BatchingError> {
         // Ordinary rules execute their lifted work through the parent context.
         let _ = context.parent();
         Ok(vec![ArrayBatch::labeled("zero")].into())
     }
 }
 
-impl<Constant: Clone, C: Context<Type = ArrayType>, M: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<M>>
-    for ConstantOperation<ArrayType, Constant>
+impl<Constant: Clone, C: Context<Type = ArrayType>, M: ArrayExtentBatchingPolicy<C>>
+    BatchableOperation<C, ArrayBatchingPolicy<M>> for ConstantOperation<ArrayType, Constant>
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<M>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<M>>>(
         &self,
-        _context: &BatchingContext<C, ArrayBatching<M>>,
+        _context: &BatchingContext<C, ArrayBatchingPolicy<M>>,
         _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<M>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<M>>, BatchingError> {
         Ok(vec![ArrayBatch::labeled("constant")].into())
     }
 }
 
 /// Batching rule requiring a value capability that the generated per-variant predicate transports to the owning
 /// enum's use sites without the enum spelling it.
-impl<C: Context<Type = ArrayType>, M: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<M>> for DotOperation
+impl<C: Context<Type = ArrayType>, M: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<M>>
+    for DotOperation
 where
     C::Value: SpecialBatchValue,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<M>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<M>>>(
         &self,
-        _context: &BatchingContext<C, ArrayBatching<M>>,
+        _context: &BatchingContext<C, ArrayBatchingPolicy<M>>,
         _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<M>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<M>>, BatchingError> {
         Ok(vec![ArrayBatch::labeled("dot")].into())
     }
 }
@@ -2838,15 +2839,15 @@ impl<C: Context<Type = ArrayType>> partial::PartiallyEvaluatableOperation<C> for
 {
 }
 
-impl<C: Context<Type = ArrayType>, M: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<M>>
+impl<C: Context<Type = ArrayType>, M: ArrayExtentBatchingPolicy<C>> BatchableOperation<C, ArrayBatchingPolicy<M>>
     for CollectiveLikeOperation
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<M>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<M>>>(
         &self,
-        context: &BatchingContext<C, ArrayBatching<M>>,
+        context: &BatchingContext<C, ArrayBatchingPolicy<M>>,
         _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<M>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<M>>, BatchingError> {
         // The rule observes the active frame's axis metadata directly.
         Ok(vec![ArrayBatch::labeled(if context.axis_name().is_some() {
             "collective_like_named"
@@ -2899,19 +2900,19 @@ where
 {
 }
 
-impl<C, M> BatchableOperation<C, ArrayBatching<M>> for BatchRecursiveOperation<C::Constant, C::Operation>
+impl<C, M> BatchableOperation<C, ArrayBatchingPolicy<M>> for BatchRecursiveOperation<C::Constant, C::Operation>
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
     C::Value: Concretizable<bool> + SpecialBatchValue,
     C::Operation: From<ZeroOperation<ArrayType>>,
-    M: ArrayBatchingPolicy<C>,
+    M: ArrayExtentBatchingPolicy<C>,
 {
-    fn batch<D: BatchingDriver<C, ArrayBatching<M>>>(
+    fn batch<D: BatchingDriver<C, ArrayBatchingPolicy<M>>>(
         &self,
-        _context: &BatchingContext<C, ArrayBatching<M>>,
+        _context: &BatchingContext<C, ArrayBatchingPolicy<M>>,
         _driver: &D,
         _inputs: &[ArrayBatch<C::Value>],
-    ) -> Result<BatchedOutputs<C, ArrayBatching<M>>, BatchingError> {
+    ) -> Result<BatchedOutputs<C, ArrayBatchingPolicy<M>>, BatchingError> {
         Ok(vec![ArrayBatch::labeled("batch_recursive")].into())
     }
 }
@@ -2933,7 +2934,7 @@ fn test_batchable_operation_dispatches_batching_to_payloads() {
 
     // Every arm receives the active batching context and flows the parent context's own value (`<Staging as
     // Domain>::Value`, here `Factor`).
-    let context = BatchingContext::<Staging, ArrayBatching> {
+    let context = BatchingContext::<Staging, ArrayBatchingPolicy> {
         parent: TestContext { marker: PhantomData },
         axis_name: Some("batch"),
         policy: PhantomData,
@@ -2970,7 +2971,7 @@ fn test_batchable_operation_dispatches_batching_over_eager_parents() {
 
     // A top-level eager batch is represented by a `BatchingContext` over an eager parent, not by a separate eager
     // dispatch mechanism, and unnamed frames are observable to rules that inspect the axis metadata.
-    let context = BatchingContext::<EagerContext<Factor, Operation>, ArrayBatching> {
+    let context = BatchingContext::<EagerContext<Factor, Operation>, ArrayBatchingPolicy> {
         parent: EagerContext { marker: PhantomData },
         axis_name: None,
         policy: PhantomData,
@@ -3281,7 +3282,7 @@ fn test_operation_generates_all_selected_dispatchers() {
 
     let operation = Operation::from(ZeroOperation { r#type: ArrayType });
     let context = Context { marker: PhantomData };
-    let batching_context = BatchingContext::<_, ArrayBatching> {
+    let batching_context = BatchingContext::<_, ArrayBatchingPolicy> {
         parent: Context { marker: PhantomData },
         axis_name: None,
         policy: PhantomData,
@@ -3300,7 +3301,7 @@ fn test_operation_generates_all_selected_dispatchers() {
         vec![ReferenceDischargeValue::labeled("zero_rule")],
     );
 
-    let differentiated = operation.jvp(&DifferentiationContext::new(context), &EmptyRegionDriver, &[]).unwrap();
+    let differentiated = operation.jvp(&DifferentiationContext::fused(context), &EmptyRegionDriver, &[]).unwrap();
     assert_eq!(differentiated.len(), 1);
     assert_eq!(differentiated[0].label, "zero");
 

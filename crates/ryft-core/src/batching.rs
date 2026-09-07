@@ -627,7 +627,7 @@ pub trait BatchingPolicy<C: Context>: Copy + Clone + Debug {
     ///
     ///   - Homogeneous array policies return no values (the default), because their mapped-axis extent
     ///     is static transform metadata and their batched programs carry exactly the source boundary.
-    ///   - [`ArrayIrBatching`](crate::ArrayIrBatching) returns its first-class mapped-extent dimension value,
+    ///   - [`ArrayIrBatching`](crate::ArrayIrBatchingPolicy) returns its first-class mapped-extent dimension value,
     ///     because every dynamic batch dimension inserted into one of its batched programs references the
     ///     [`DimensionVariable`](crate::DimensionVariable) defined by that program's leading extent input.
     ///
@@ -1157,11 +1157,12 @@ impl<C: Context, P: BatchingPolicy<C>> From<Vec<P::Batch>> for BatchedOutputs<C,
 /// `#[ryft(dispatch(batching))]`. It follows the operation derivation's enum-shape and type-inference rules
 /// and generates:
 ///
-///   - A dispatcher at `BatchableOperation<C, ArrayBatching>`, where [`ArrayBatching`](crate::ArrayBatching) is the
-///     array-domain policy and `C` is the parent [`Context`], that forwards the active [`BatchingContext`] to every
-///     variant's own rule. One dispatcher covers eager and staging parents alike, because the parent/active distinction
-///     lives in each rule's body rather than in dispatch.
-///   - Per-variant `Payload: BatchableOperation<C, ArrayBatching>` predicates that transport each rule's own
+///   - A dispatcher at `BatchableOperation<C, ArrayBatchingPolicy>`, where
+///     [`ArrayBatchingPolicy`](crate::ArrayBatchingPolicy) is the array-domain policy and `C` is the parent
+///     [`Context`], that forwards the active [`BatchingContext`] to every variant's own rule. One dispatcher covers
+///     eager and staging parents alike, because the parent/active distinction lives in each rule's body rather than
+///     in dispatch.
+///   - Per-variant `Payload: BatchableOperation<C, ArrayBatchingPolicy>` predicates that transport each rule's own
 ///     capability requirements to the use site. Nested programs batch structurally through [`Program::batched`],
 ///     requested by higher-order rules through their active [`BatchingDriver`], whose concrete implementation
 ///     establishes the finite program-level bounds at its construction site.
@@ -1985,9 +1986,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayBatch, ArrayBatching, ArrayIrBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
-        ArrayReference, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape,
-        ShardingDimension, StaticArrayBatchingPolicy,
+        Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
+        ArrayOperation, ArrayReference, ArrayType, DataType, Dimension, DimensionBounds, DimensionType,
+        DimensionVariable, Shape, ShardingDimension, StaticArrayExtentBatchingPolicy,
     };
     use crate::contexts::EagerContext;
     use crate::contexts::tests::{
@@ -2392,7 +2393,7 @@ mod tests {
     fn test_batching_driver_align_batch_axis() -> Result<(), BatchingError> {
         type Parent = EagerContext<Array, ArrayOperation<Array>>;
 
-        let context = BatchingContext::<Parent, ArrayBatching>::new(Parent::new(), 2);
+        let context = BatchingContext::<Parent, ArrayBatchingPolicy>::new(Parent::new(), 2);
         let mapped = ArrayBatch::new(Array::matrix(2, 3, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]), Some(0))?;
         let replicated = ArrayBatch::replicated(Array::vector(vec![1.0, 2.0, 3.0]));
 
@@ -2432,7 +2433,8 @@ mod tests {
         let vector_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
         let left = ArrayBatch::new(Array::vector(vec![1.0, 2.0, 3.0]), Some(0)).unwrap();
         let right = ArrayBatch::new(Array::vector(vec![10.0, 20.0, 30.0]), Some(0)).unwrap();
-        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3);
+        let context =
+            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 3);
         let outputs = AddOperation::new()
             .interpret_with_batch_axes(&context, &[left, right], &[BatchAxis::new(0)])
             .unwrap();
@@ -2452,7 +2454,8 @@ mod tests {
 
     #[test]
     fn test_batching_context() {
-        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
+        let context =
+            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 4);
         assert!(context.parent().is_eager());
         assert_eq!(context.axis_extent(), &4);
         assert_eq!(context.axis_name(), None);
@@ -2470,7 +2473,8 @@ mod tests {
             EagerContext::<Array, ArrayOperation<Array>>::trace(|inputs: Vec<_>| Ok(inputs), vec![vector_type])
                 .unwrap();
         let input_axes = [BatchAxis::new(1)];
-        let context = BatchingContext::<_, ArrayBatching>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
+        let context =
+            BatchingContext::<_, ArrayBatchingPolicy>::new(EagerContext::<Array, ArrayOperation<Array>>::new(), 2);
 
         // A program whose natural output axes already match the required axes is returned without asking the driver
         // to replay it. Using the empty driver pins that fast path because any replay through it would fail.
@@ -2540,9 +2544,9 @@ mod tests {
         let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(8)).unwrap());
         let extent_type = DimensionType::new(batch.clone());
         let extent = trace.input(extent_type.clone().into());
-        let context = BatchingContext::<_, ArrayIrBatching>::new(trace, extent);
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace, extent);
         let input_axes = [BatchAxis::new(0)];
-        let batched_program = <ArrayIrBatching as RecursiveBatchingPolicy<TraceContext>>::batch_program(
+        let batched_program = <ArrayIrBatchingPolicy as RecursiveBatchingPolicy<TraceContext>>::batch_program(
             &context,
             source_program.entry_region_ref(),
             input_axes.as_slice(),
@@ -2576,7 +2580,7 @@ mod tests {
     fn test_batching_context_prepare_inputs() -> Result<(), BatchingError> {
         let parent = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let reference = ArrayIrValue::Reference(ArrayReference::new(Array::vector(vec![1.0_f32, 2.0])));
-        let (context, inputs) = BatchingContext::<_, ArrayIrBatching>::prepare_inputs(
+        let (context, inputs) = BatchingContext::<_, ArrayIrBatchingPolicy>::prepare_inputs(
             &parent,
             vec![reference.clone()],
             vec![BatchAxis::new(0)],
@@ -2595,7 +2599,7 @@ mod tests {
             assert_eq!(context.lift(distinct.clone())?.batch().batch_axis(), BatchAxis::replicated());
         }
         assert_eq!(
-            BatchingContext::<_, ArrayIrBatching>::prepare_inputs(
+            BatchingContext::<_, ArrayIrBatchingPolicy>::prepare_inputs(
                 &parent,
                 vec![reference.clone(), reference],
                 vec![BatchAxis::new(0); 2],
@@ -2626,11 +2630,11 @@ mod tests {
             type BatchedProgram = BoundaryPreservingBatchedProgram<C::Constant, C::Operation>;
 
             fn batch(value: C::Value, batch_axis: BatchAxis) -> Result<Self::Batch, BatchingError> {
-                <StaticArrayBatchingPolicy as BatchingPolicy<C>>::batch(value, batch_axis)
+                <StaticArrayExtentBatchingPolicy as BatchingPolicy<C>>::batch(value, batch_axis)
             }
 
             fn replicated(value: C::Value) -> Self::Batch {
-                <StaticArrayBatchingPolicy as BatchingPolicy<C>>::replicated(value)
+                <StaticArrayExtentBatchingPolicy as BatchingPolicy<C>>::replicated(value)
             }
 
             fn value(batch: &Self::Batch) -> &C::Value {
@@ -2671,7 +2675,7 @@ mod tests {
                 required_output_axes: Option<&[BatchAxis]>,
                 collapse_fn: CollapseFn,
             ) -> Result<BoundaryPreservingBatchedProgram<C::Constant, C::Operation>, BatchingError> {
-                <StaticArrayBatchingPolicy as BatchingPolicy<C>>::adapt_batched_program(
+                <StaticArrayExtentBatchingPolicy as BatchingPolicy<C>>::adapt_batched_program(
                     program,
                     required_output_axes,
                     collapse_fn,
