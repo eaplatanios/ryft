@@ -99,8 +99,7 @@
 //! Scalar gradient functions return ordinary values at every active input position. An input of type `T` returns
 //! `cotangent(T)`; an input of type `ref<T>` returns `cotangent(T)`, the derivative with respect to its initial
 //! contents. The original parameter structure is preserved, so the value family must represent both references and
-//! their referents. [`ReferenceNewOperationProvider`] and [`ReferenceFreezeOperationProvider`] supply the allocation
-//! and freeze operations for families supporting references.
+//! their referents. [`OperationProvider`] selects the allocation and freeze operations for families supporting references.
 //!
 //! The primal runs exactly once and retains its mutations. For example, starting with `r = 3`, the function
 //! `r <- 2*r; return r*r` returns value `36` and gradient `24`, leaving `r = 6`. Each call uses fresh internal zero
@@ -158,12 +157,11 @@ use crate::differentiation::jacobian::{jacobian_forward_in_context, jacobian_rev
 use crate::differentiation::reverse::{value_and_gradient_auxiliary_in_context, value_and_gradient_in_context};
 use crate::errors::MaybeFallible;
 use crate::operations::{
-    AddOperation, OneOperationProvider, ReferenceFreezeOperationProvider, ReferenceNewOperationProvider, Zero,
-    ZeroLikeOperation,
+    AddOperation, OneOperation, ReferenceFreezeOperation, ReferenceNewOperation, Zero, ZeroLikeOperation,
 };
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
-use crate::programs::{ProgramError, ReferenceBoundary, ReferenceBoundaryError, TypeError, Value};
+use crate::programs::{OperationProvider, ProgramError, ReferenceBoundary, ReferenceBoundaryError, TypeError, Value};
 use crate::tracing::TracingContext;
 
 pub mod batching;
@@ -967,9 +965,19 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Output,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate<
-                Operation: ReferenceNewOperationProvider<V::Type>
-                               + ReferenceFreezeOperationProvider<V::Type>
-                               + OneOperationProvider<V::Type>,
+                Operation: OperationProvider<
+                    V::Type,
+                    ReferenceNewOperation<V::Type, V::Type>,
+                    Operation = <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    ReferenceFreezeOperation<V::Type, V::Type>,
+                    Operation = <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    OneOperation<V::Type>,
+                    Operation = <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
+                >,
             > + Zero<V>,
     {
         DifferentiationBuilder {
@@ -1012,9 +1020,19 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Output,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate<
-                Operation: ReferenceNewOperationProvider<V::Type>
-                               + ReferenceFreezeOperationProvider<V::Type>
-                               + OneOperationProvider<V::Type>,
+                Operation: OperationProvider<
+                    V::Type,
+                    ReferenceNewOperation<V::Type, V::Type>,
+                    Operation = <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    ReferenceFreezeOperation<V::Type, V::Type>,
+                    Operation = <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    OneOperation<V::Type>,
+                    Operation = <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
+                >,
             > + Zero<V>,
     {
         self.value_and_gradient(function).map(|(_, gradient)| gradient)
@@ -1350,10 +1368,19 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Output,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate<
-                Operation: ReferenceNewOperationProvider<V::Type>
-                               + ReferenceFreezeOperationProvider<V::Type>
-                               + OneOperationProvider<V::Type>
-                               + From<ZeroLikeOperation<V::Type>>,
+                Operation: OperationProvider<
+                    V::Type,
+                    ReferenceNewOperation<V::Type, V::Type>,
+                    Operation = <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    ReferenceFreezeOperation<V::Type, V::Type>,
+                    Operation = <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    OneOperation<V::Type>,
+                    Operation = <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
+                > + From<ZeroLikeOperation<V::Type>>,
             > + Zero<V>,
     {
         DifferentiationBuilder {
@@ -1421,10 +1448,19 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Output,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate<
-                Operation: ReferenceNewOperationProvider<V::Type>
-                               + ReferenceFreezeOperationProvider<V::Type>
-                               + OneOperationProvider<V::Type>
-                               + From<ZeroLikeOperation<V::Type>>,
+                Operation: OperationProvider<
+                    V::Type,
+                    ReferenceNewOperation<V::Type, V::Type>,
+                    Operation = <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    ReferenceFreezeOperation<V::Type, V::Type>,
+                    Operation = <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    OneOperation<V::Type>,
+                    Operation = <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
+                > + From<ZeroLikeOperation<V::Type>>,
             > + Zero<V>,
     {
         self.value_and_gradient(function).map(|((_, auxiliary), gradient)| (gradient, auxiliary))
@@ -1899,9 +1935,19 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Output,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate<
-                Operation: ReferenceNewOperationProvider<V::Type>
-                               + ReferenceFreezeOperationProvider<V::Type>
-                               + OneOperationProvider<V::Type>,
+                Operation: OperationProvider<
+                    V::Type,
+                    ReferenceNewOperation<V::Type, V::Type>,
+                    Operation = <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    ReferenceFreezeOperation<V::Type, V::Type>,
+                    Operation = <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    OneOperation<V::Type>,
+                    Operation = <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
+                >,
             > + Zero<V>,
     {
         value_and_gradient_in_context(
@@ -1950,9 +1996,19 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Output,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate<
-                Operation: ReferenceNewOperationProvider<V::Type>
-                               + ReferenceFreezeOperationProvider<V::Type>
-                               + OneOperationProvider<V::Type>,
+                Operation: OperationProvider<
+                    V::Type,
+                    ReferenceNewOperation<V::Type, V::Type>,
+                    Operation = <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    ReferenceFreezeOperation<V::Type, V::Type>,
+                    Operation = <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    OneOperation<V::Type>,
+                    Operation = <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
+                >,
             > + Zero<V>,
     {
         self.value_and_gradient(function).map(|(_, gradient)| gradient)
@@ -2303,10 +2359,19 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Output,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate<
-                Operation: ReferenceNewOperationProvider<V::Type>
-                               + ReferenceFreezeOperationProvider<V::Type>
-                               + OneOperationProvider<V::Type>
-                               + From<ZeroLikeOperation<V::Type>>,
+                Operation: OperationProvider<
+                    V::Type,
+                    ReferenceNewOperation<V::Type, V::Type>,
+                    Operation = <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    ReferenceFreezeOperation<V::Type, V::Type>,
+                    Operation = <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    OneOperation<V::Type>,
+                    Operation = <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
+                > + From<ZeroLikeOperation<V::Type>>,
             > + Zero<V>,
     {
         value_and_gradient_auxiliary_in_context(
@@ -2382,10 +2447,19 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Output,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate<
-                Operation: ReferenceNewOperationProvider<V::Type>
-                               + ReferenceFreezeOperationProvider<V::Type>
-                               + OneOperationProvider<V::Type>
-                               + From<ZeroLikeOperation<V::Type>>,
+                Operation: OperationProvider<
+                    V::Type,
+                    ReferenceNewOperation<V::Type, V::Type>,
+                    Operation = <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    ReferenceFreezeOperation<V::Type, V::Type>,
+                    Operation = <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
+                > + OperationProvider<
+                    V::Type,
+                    OneOperation<V::Type>,
+                    Operation = <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation,
+                > + From<ZeroLikeOperation<V::Type>>,
             > + Zero<V>,
     {
         self.value_and_gradient(function).map(|((_, auxiliary), gradient)| (gradient, auxiliary))

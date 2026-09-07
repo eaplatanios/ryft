@@ -5,8 +5,10 @@ use crate::contexts::Context;
 use crate::differentiation::DifferentiationError;
 use crate::differentiation::types::DifferentiableType;
 use crate::macros::check_count;
-use crate::operations::{Zero, ZeroOperation, ZeroOperationProvider};
-use crate::programs::{AtomId, MaybeZero, Operation, ProgramBuilder, ProgramError, Type, Typed, Value};
+use crate::operations::{Zero, ZeroOperation};
+use crate::programs::{
+    AtomId, MaybeZero, Operation, OperationProvider, ProgramBuilder, ProgramError, Type, Typed, Value,
+};
 
 /// Differentiation-owned protocol through which an operation family materializes zeros whose runtime geometry must
 /// be supplied by explicitly captured _residual_ values, because it is not derivable from the zero's [`Type`] alone.
@@ -16,7 +18,7 @@ use crate::programs::{AtomId, MaybeZero, Operation, ProgramBuilder, ProgramError
 /// Differentiation is the one transform that must synthesize values with no data edge to derive them from. For example,
 /// transposition is *defined* to return a cotangent for every differentiated input, including inputs that are
 /// disconnected from every output, and the mathematically determined value for such an input is a zero of its cotangent
-/// type. For a static type this is easy as [`ZeroOperationProvider::zero_operation`] constructs the zero from the type,
+/// type. For a static type this is easy as [`OperationProvider::provide`] constructs the zero from the type,
 /// with no operands. For a type with dynamic axes it is impossible as a [`Type`] carries only dimension _identities_
 /// and bounds, never defining values, and so the zero operation needs one explicit dimension operand per dynamic axis.
 /// Also, the value that could supply those operands (i.e., the primal input the cotangent corresponds to) is _not an
@@ -71,7 +73,7 @@ use crate::programs::{AtomId, MaybeZero, Operation, ProgramBuilder, ProgramError
 /// to. Both exist for the same reason (i.e., reverse mode needs geometry at a moment when its defining values would
 /// otherwise be out of scope) and both keep residual selection and threading owned by the differentiation transform
 /// rather than leaking into primal operation payloads.
-pub trait ResidualZeroProvider<T: Type>: ZeroOperationProvider<T> {
+pub trait ResidualZeroProvider<T: Type>: Operation + OperationProvider<T, ZeroOperation<T>, Operation = Self> {
     /// Returns the types of the residual values that a zero of `r#type` needs, in the exact order in which
     /// [`Self::capture_zero_residuals`] captures them and [`Self::zero_operation_with_residuals`] consumes them.
     /// Input-free [`Operation`] families use the empty default. The array-dimension composite family returns one
@@ -153,7 +155,7 @@ pub trait ResidualZeroProvider<T: Type>: ZeroOperationProvider<T> {
                 message: format!("input-free zero expected 0 residuals but got {}", residuals.len()),
             });
         }
-        Ok((Self::zero_operation(r#type)?, Vec::new()))
+        Ok((Self::provide(ZeroOperation::new(r#type), &[])?, Vec::new()))
     }
 
     /// Returns the value inside `zero`, materializing a structural [`MaybeZero::Zero`] whose [`Type`] cannot construct
