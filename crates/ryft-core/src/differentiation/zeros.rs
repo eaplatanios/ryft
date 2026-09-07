@@ -294,8 +294,7 @@ pub(crate) fn capture_and_validate_zero_residual_values<C: Context<Operation: Re
     Ok(residuals)
 }
 
-/// Role of differential boundary whose [`ZeroSpaceBoundaryLeaf`]s are reconstructed
-/// from [`ZeroSpaceBoundaryReconstruction`].
+/// Role of a differential boundary whose zero-space leaves are reconstructed by [`ZeroSpaceBoundaryReconstruction`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ZeroSpaceBoundaryRole {
     /// Cotangents of the primal input boundary, returned by a _pullback_ function.
@@ -460,28 +459,64 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
         live_values: I,
     ) -> Result<Vec<C::Value>, ProgramError> {
         let mut live_values = live_values.into_iter();
+        let values = self.rebuild_with(context, |_, zero| match zero {
+            Some(zero) => Ok(zero),
+            None => live_values.next().ok_or_else(|| {
+                ProgramError::MalformedProgram(format!("{} omitted a nonzero differential value", self.role))
+            }),
+        })?;
+        if live_values.next().is_some() {
+            return Err(ProgramError::MalformedProgram(format!(
+                "{} produced too many nonzero differential values",
+                self.role,
+            )));
+        }
+        Ok(values)
+    }
+
+    /// Rebuilds the complete differential boundary described by this instance using `reconstruct` to handle each leaf
+    /// in boundary order. The callback receives the leaf index and a materialized zero for a zero-space leaf, or
+    /// [`None`] for a nonzero-space leaf. Zero types and runtime geometry come from [`Self::capture`], and so
+    /// reconstruction does not read the primal values.
+    ///
+    /// Unlike [`Self::rebuild`], the `reconstruct` callback decides whether a non-zero-space leaf consumes a program
+    /// output and what value to return for it. For example, a pullback can consume an output for an ordinary input but
+    /// return [`None`] without consuming an output for an ignored reference input. The returned vector contains one
+    /// callback result per boundary leaf. Any check for unused program outputs remains the caller's responsibility.
+    ///
+    /// # Parameters
+    ///
+    ///   - `context`: Context in which residual-backed zero operations are bound.
+    ///   - `reconstruct`: Function called once per leaf, in increasing index order, after materializing its zero if
+    ///     needed. Its result becomes the corresponding element of the returned vector.
+    ///
+    /// # Errors
+    ///
+    /// Propagates zero-materialization and callback errors unchanged, stopping before processing subsequent leaves.
+    pub fn rebuild_with<
+        C: Context<Value = V, Type = V::Type, Operation: ResidualZeroProvider<C::Type>>,
+        R,
+        F: FnMut(usize, Option<V>) -> Result<R, ProgramError>,
+    >(
+        &self,
+        context: &C,
+        mut reconstruct: F,
+    ) -> Result<Vec<R>, ProgramError> {
         let mut zero_leaves = self.zero_leaves.iter().peekable();
         let mut values = Vec::with_capacity(self.boundary_size);
         for index in 0..self.boundary_size {
-            if zero_leaves.peek().is_some_and(|leaf| leaf.index == index) {
+            let zero = if zero_leaves.peek().is_some_and(|leaf| leaf.index == index) {
                 let zero_leaf = zero_leaves.next().unwrap();
                 let residuals = self.residuals.get(zero_leaf.residual_range.clone()).unwrap();
                 let (operation, operands) =
                     C::Operation::zero_operation_with_residuals(zero_leaf.r#type.clone(), residuals)?;
                 let mut outputs = context.bind(operation, Vec::new(), operands.as_slice())?;
                 check_count!("output", outputs, 1, ProgramError);
-                values.push(outputs.remove(0));
+                Some(outputs.remove(0))
             } else {
-                values.push(live_values.next().ok_or_else(|| {
-                    ProgramError::MalformedProgram(format!("{} omitted a nonzero differential value", self.role))
-                })?);
-            }
-        }
-        if live_values.next().is_some() {
-            return Err(ProgramError::MalformedProgram(format!(
-                "{} produced too many nonzero differential values",
-                self.role,
-            )));
+                None
+            };
+            values.push(reconstruct(index, zero)?);
         }
         Ok(values)
     }
@@ -502,6 +537,9 @@ mod tests {
     use crate::tracing::TracingContext;
 
     use super::*;
+
+    type TestOperation = ArrayIrOperation<Array>;
+    type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
     #[test]
     fn test_residual_zero_provider_input_free_defaults() {
@@ -544,9 +582,6 @@ mod tests {
 
     #[test]
     fn test_residual_zero_provider_captures_zero_residual_values() {
-        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-        type TestOperation = ArrayIrOperation<Array>;
-
         let first = DimensionVariable::new("first", DimensionBounds::positive(Some(8)).unwrap());
         let second = DimensionVariable::new("second", DimensionBounds::positive(Some(8)).unwrap());
         let primal_type = ArrayType::new(
@@ -585,10 +620,6 @@ mod tests {
         // one named quantity at a time. This is what makes it type-general where exemplar matching was not: a widened
         // differential representation has no live value of its own type anywhere, and a scan's stacked cotangent
         // geometry is split across a first-class dimension operand and a per-iteration peer.
-
-        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
-        type TestOperation = ArrayIrOperation<Array>;
-
         let length = DimensionVariable::new("length", DimensionBounds::positive(Some(8)).unwrap());
         let k = DimensionVariable::new("k", DimensionBounds::positive(Some(8)).unwrap());
         let context = TestContext::new();
@@ -713,6 +744,55 @@ mod tests {
         assert!(matches!(builder.instructions()[0].operation(), ArrayIrOperation::DimensionSize(_)));
         assert!(matches!(builder.instructions()[1].operation(), ArrayIrOperation::Zero(_)));
         assert_eq!(builder.instructions()[1].inputs(), builder.instructions()[0].outputs());
+    }
+
+    #[test]
+    fn test_zero_space_boundary_reconstruction_rebuild_with() {
+        // The boundary interleaves live leaves (`f64`) with zero-space leaves (`bool` and `i32`).
+        let context = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let primal_types = vec![
+            ArrayType::scalar(DataType::F64),
+            ArrayType::scalar(DataType::Boolean),
+            ArrayType::scalar(DataType::F64),
+            ArrayType::scalar(DataType::I32),
+        ];
+        let primal_values = primal_types.iter().map(|r#type| context.input(r#type.clone())).collect::<Vec<_>>();
+        let reconstruction = ZeroSpaceBoundaryReconstruction::capture(
+            &context,
+            primal_values.as_slice(),
+            primal_types.as_slice(),
+            ZeroSpaceBoundaryRole::InputCotangent,
+        )
+        .unwrap();
+
+        // Each callback receives its original boundary index and only zero-space leaves carry a materialized value.
+        let leaves = reconstruction
+            .rebuild_with(&context, |index, zero| Ok((index, zero.map(|zero| zero.r#type().into_owned()))))
+            .unwrap();
+        assert_eq!(
+            leaves,
+            vec![
+                (0, None),
+                (1, Some(ArrayType::scalar(DataType::Boolean).cotangent().unwrap())),
+                (2, None),
+                (3, Some(ArrayType::scalar(DataType::I32).cotangent().unwrap())),
+            ],
+        );
+        assert_eq!(context.builder().borrow().instructions().len(), 2);
+
+        // A callback error stops traversal immediately and retains the caller's diagnostic.
+        let mut visited = Vec::new();
+        assert!(matches!(
+            reconstruction.rebuild_with(&context, |index, _| {
+                visited.push(index);
+                if index == 1 {
+                    return Err(ProgramError::InvalidArgument { message: "invalid reconstruction leaf".to_string() });
+                }
+                Ok(())
+            }),
+            Err(ProgramError::InvalidArgument { message }) if message == "invalid reconstruction leaf",
+        ));
+        assert_eq!(visited, vec![0, 1]);
     }
 
     #[test]
