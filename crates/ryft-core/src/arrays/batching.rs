@@ -2104,26 +2104,25 @@ pub struct ArrayIrBatch<V: Value<Type = ArrayIrType>> {
 // TODO(eaplatanios): Review from here onwards.
 
 impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
-    /// Creates a batch view, rejecting mapped first-class dimensions. A reference is batched by batching its referent:
-    /// the batch axis is normalized against the referent's packed type, and the per-item type is a reference over the
-    /// per-item referent.
-    pub fn new(value: V, batch_axis: BatchAxis) -> Result<Self, BatchingError> {
-        let (batch_axis, member) = {
-            let value_type = value.r#type();
-            match value_type.as_ref() {
-                // Validating the complete per-item derivation once here, including the sharding projection of the
-                // removed batch dimension, is what lets `Self::unbatched_type` be infallible.
-                ArrayIrType::Array(packed_type) => (
-                    packed_type.unbatched_type_and_axis::<V>(batch_axis, &[])?.1,
-                    ArrayIrBatchMember::Array { ragged_axes: Vec::new() },
-                ),
-                ArrayIrType::Reference(r#type) => {
-                    (r#type.referent().unbatched_type_and_axis::<V>(batch_axis, &[])?.1, ArrayIrBatchMember::Reference)
-                }
-                ArrayIrType::Dimension(_) if batch_axis.is_replicated() => (batch_axis, ArrayIrBatchMember::Dimension),
-                ArrayIrType::Dimension(r#type) => {
-                    return Err(BatchingError::MappedDimension { r#type: Box::new(r#type.clone()), axis: batch_axis });
-                }
+    /// Creates a new dense [`ArrayIrBatch`], rejecting mapped [`ArrayIrType::Dimension`]s. [`ArrayIrType::Reference`]s
+    /// are batched by batching their referents (i.e., the batch axis is normalized against the referent's packed type,
+    /// and the per-item type is a reference over the per-item referent).
+    pub fn new<A: Into<BatchAxis>>(value: V, batch_axis: A) -> Result<Self, BatchingError> {
+        let batch_axis = batch_axis.into();
+        let value_type = value.r#type();
+        let (batch_axis, member) = match value_type.as_ref() {
+            ArrayIrType::Array(packed_type) => (
+                // Validating the complete per-item derivation once here, including the sharding projection
+                // of the removed batch dimension, is what lets `Self::unbatched_type` be infallible.
+                packed_type.unbatched_type_and_axis::<V>(batch_axis, &[])?.1,
+                ArrayIrBatchMember::Array { ragged_axes: Vec::new() },
+            ),
+            ArrayIrType::Reference(r#type) => {
+                (r#type.referent().unbatched_type_and_axis::<V>(batch_axis, &[])?.1, ArrayIrBatchMember::Reference)
+            }
+            ArrayIrType::Dimension(_) if batch_axis.is_replicated() => (batch_axis, ArrayIrBatchMember::Dimension),
+            ArrayIrType::Dimension(r#type) => {
+                return Err(BatchingError::MappedDimension { r#type: Box::new(r#type.clone()), axis: batch_axis });
             }
         };
         Ok(Self { value, batch_axis, member })
