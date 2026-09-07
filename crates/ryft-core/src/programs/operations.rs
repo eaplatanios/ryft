@@ -237,8 +237,8 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     structural arms described under [Variant Classes](#variant-classes) directly.
 ///   - `transposition` delegates native variants to the payload's own rule, mixed variants in either role to
 ///     [`transpose_mixed_operation`](crate::transpose_mixed_operation), and computational projected variants to
-///     [`transpose_projected_operation`](crate::transpose_projected_operation), while a structural projected variant
-///     returns zero cotangents directly.
+///     [`MemberTransposableOperation`](crate::MemberTransposableOperation). A structural projected variant contributes
+///     no cotangents.
 ///
 /// ## Variant Classes
 ///
@@ -266,18 +266,20 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 ///     [`MemberInterpretableOperation`](crate::MemberInterpretableOperation).
 ///     Several mixed variants may share one member type.
 ///   - A **computational** role means that transforms recurse into the payload's own rules. A projected payload uses
-///     the member family's ordinary rules, while a computational mixed payload states its parent-universe derivative
-///     through [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation) and its parent-universe batching
-///     rule through [`MemberBatchableOperation`](crate::MemberBatchableOperation). Transposition never needs a mixed
-///     rule because [`transpose_mixed_operation`](crate::transpose_mixed_operation) delegates the instruction's
-///     `U`-typed data operands, in operand order, to the payload's ordinary homogeneous
-///     [`TransposableOperation`](crate::TransposableOperation) rule and gives every other
-///     operand a structural zero cotangent.
+///     the member family's ordinary batching rules, and both projected and mixed payloads state their parent-universe
+///     derivative through [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation). A projected payload
+///     also supplies [`MemberTransposableOperation`](crate::MemberTransposableOperation), so its transpose rule can use
+///     cotangent buffers in the enclosing family. A mixed payload supplies its parent-universe batching rule through
+///     [`MemberBatchableOperation`](crate::MemberBatchableOperation). Transposition never needs a mixed rule because
+///     [`transpose_mixed_operation`](crate::transpose_mixed_operation) delegates the instruction's `U`-typed data
+///     operands, in operand order, to the payload's ordinary homogeneous
+///     [`TransposableOperation`](crate::TransposableOperation) rule and gives every other operand a structural zero
+///     cotangent.
 ///   - A **structural** role declares that the payload is bookkeeping. There is nothing to differentiate (i.e., the
 ///     type has a zero differential space) and nothing to batch per item, so batched inputs must be replicated. A
 ///     structural projected member reaches that behavior through its member family's rules and its projected batching
-///     policy, and its generated forward-mode and transposition arms stage a zero tangent and return zero cotangents
-///     directly. A structural mixed member instead has its forward-mode rule generated as the payload's primal plus
+///     policy, and its generated forward-mode and transposition arms stage a zero tangent and contribute no cotangents
+///     respectively. A structural mixed member instead has its forward-mode rule generated as the payload's primal plus
 ///     one zero tangent per declared parent output, staged over the same operands so that the runtime geometry those
 ///     operands carry stays available to both. Each output's tangent is constructed in the computational member
 ///     universe that output belongs to, discovered by projecting the declared output type across the family's
@@ -297,6 +299,15 @@ impl<'f, 'a> OperationFormatter<'f, 'a> {
 /// case has a unique default; both ask for the explicit `mixed(U)` form. A named member type that the family does not
 /// declare is also an error. The `projected` class always names its member type, so `#[ryft(projected)]` does not
 /// parse.
+///
+/// ### Member Transposition
+///
+/// A computational projected payload implements [`MemberTransposableOperation`](crate::MemberTransposableOperation).
+/// Its generated transposition arm calls `transpose_in_parent` with the enclosing context, driver, and original
+/// accumulator handles. This lets an array member update a reference cotangent buffer even when its homogeneous
+/// type cannot represent references. The member rule can delegate to
+/// [`transpose_projected_operation`](crate::transpose_projected_operation) when it only needs homogeneous values.
+/// That adapter projects the operands and forwards cotangent contributions to the original accumulators.
 ///
 /// ### Suppressing The Owned Conversion
 ///

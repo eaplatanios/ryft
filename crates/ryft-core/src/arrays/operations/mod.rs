@@ -20,9 +20,10 @@ use crate::arrays::types::ir::ArrayIrType;
 use crate::axes::AxisIndexOperation;
 use crate::contexts::{Context, ProjectedContext};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, ResidualZeroProvider,
-    jvp_projected_operation,
+    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation,
+    MemberTransposableOperation, ResidualZeroProvider, TransposableOperation, TranspositionContext,
+    TranspositionDriver, jvp_projected_operation, transpose_projected_operation,
 };
 use crate::operations::attention::{
     DotProductAttention, DotProductAttentionBackwardOperation, DotProductAttentionOperation,
@@ -64,11 +65,12 @@ use crate::operations::{
     TanhOperation, TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
     WhileOperation, Xor, XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
+use crate::partial::PartialValue;
 use crate::programs::{
     MaybeZero, Operation, OperationProjection, ProgramError, ReferenceViewOperation, ReferenceViewValidationError,
     Type, TypeError, TypeIdentityPosition, Typed, Value, ValueProjection, ViewSymbol,
 };
-use crate::tracing::TracingContext;
+use crate::tracing::{Tracer, TracingContext};
 use crate::tracing_v2::RematerializeOperation;
 
 mod attention;
@@ -1051,6 +1053,38 @@ where
                 DifferentiationDual::new(primal, MaybeZero::Value(tangent))
             })
             .collect()
+    }
+}
+
+impl<A, V, O> MemberTransposableOperation<V, O> for ArrayOperation<A>
+where
+    A: Value<Type = ArrayType>,
+    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    ArrayOperation<A>: TransposableOperation<<V as ValueProjection<ArrayType>>::Projected, ArrayOperation<A>>,
+    O: Operation<Type = ArrayIrType>
+        + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
+        + From<ReferenceSliceOperation>
+        + From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType>>
+        + From<ReferenceReadOperation<ArrayType, ArrayIrType>>
+        + From<ReferenceWriteOperation<ArrayType, ArrayIrType>>,
+{
+    fn transpose_in_parent<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TranspositionContext<'_, V, O>,
+        driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        // Slice rules can update an enclosing reference accumulator, which the array family cannot represent.
+        // Other rules retain the homogeneous projected context and contribute ordinary cotangent values.
+        match self {
+            Self::Slice(operation) => operation.transpose_in_parent(context, driver, inputs, outputs, accumulators),
+            Self::DynamicSlice(operation) => {
+                operation.transpose_in_parent(context, driver, inputs, outputs, accumulators)
+            }
+            operation => transpose_projected_operation(context, operation, inputs, outputs, accumulators),
+        }
     }
 }
 

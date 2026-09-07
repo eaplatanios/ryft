@@ -931,16 +931,12 @@ mod tests {
             ArrayIrOperation::<Array>::from(OneOperation::new(output_type.clone())),
             ArrayIrOperation::<Array>::from(IotaOperation::new(output_type.clone(), 0).unwrap()),
         ] {
-            let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let mut context = TranspositionContext::new(TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
             let output_cotangent = context.input(output_type.clone().into());
-            let cotangents = operation
-                .transpose(
-                    &mut TranspositionContext::new(context.clone()),
-                    &EmptyRegionDriver,
-                    &[PartialValue::Unknown(extent_type.clone().into())],
-                    &[MaybeZero::Value(output_cotangent)],
-                )
-                .unwrap();
+            let inputs = [PartialValue::Unknown(extent_type.clone().into())];
+            let accumulators = context.input_accumulators(&inputs, &[]).unwrap();
+            operation.transpose(&mut context, &EmptyRegionDriver, &inputs, &[MaybeZero::Value(output_cotangent)], &accumulators).unwrap();
+            let cotangents = context.take_cotangents(&accumulators).unwrap();
             let [cotangent] = cotangents.as_slice() else {
                 panic!("expected one cotangent per operation input");
             };

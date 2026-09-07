@@ -415,12 +415,21 @@ macro_rules! impl_default_reference_view_transposition {
         {
             fn transpose<D: TranspositionDriver<V, O>>(
                 &self,
-                _context: &mut TranspositionContext<'_, V, O>,
+                context: &mut TranspositionContext<'_, V, O>,
                 _driver: &D,
                 inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
                 _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-            ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-                inputs.iter().map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?))).collect()
+                accumulators: &[crate::differentiation::CotangentAccumulator],
+            ) -> Result<(), DifferentiationError> {
+                let contributions =
+                    (|| -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+                        inputs.iter().map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?))).collect()
+                    })()?;
+                check_count!("input", contributions, accumulators.len(), ProgramError);
+                for (accumulator, contribution) in accumulators.iter().zip(contributions) {
+                    accumulator.accumulate(context, contribution)?;
+                }
+                Ok(())
             }
         }
     };
@@ -1756,12 +1765,15 @@ mod tests {
         let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
         let value_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let inputs = [PartialValue::Unknown(reference_type), PartialValue::Unknown(value_type.clone())];
+        let mut context = TranspositionContext::new(TracingContext::<TestValue, TestOperation>::new());
+        let accumulators = context.input_accumulators(&inputs, &[]).unwrap();
         assert!(matches!(
             TestWrite::new().transpose(
-                &mut TranspositionContext::new(TracingContext::<TestValue, TestOperation>::new()),
+                &mut context,
                 &EmptyRegionDriver,
                 &inputs,
                 &[],
+                &accumulators,
             ),
             Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
                 if message == "operand 0 has no reference root in a transposition context that is not scoped to a \
@@ -1769,12 +1781,15 @@ mod tests {
         ));
         let context = TracingContext::<TestValue, TestOperation>::new();
         let cotangent = context.input(value_type);
+        let mut context = TranspositionContext::new(context);
+        let accumulators = context.input_accumulators(&inputs, &[]).unwrap();
         assert!(matches!(
             TestSwap::new().transpose(
-                &mut TranspositionContext::new(context.clone()),
+                &mut context,
                 &EmptyRegionDriver,
                 &inputs,
                 &[MaybeZero::Value(cotangent)],
+                &accumulators,
             ),
             Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
                 if message == "operand 0 has no reference root in a transposition context that is not scoped to a \
