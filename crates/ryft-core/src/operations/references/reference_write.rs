@@ -410,8 +410,12 @@ mod tests {
         );
         let error = context.bind(ReferenceWriteOperation::new(), Vec::new(), &[plumbing, replacement]).unwrap_err();
         assert_eq!(
-            error.downcast_custom::<DifferentiationError>(),
-            Some(&DifferentiationError::PlumbingReferenceTangent { operation: REFERENCE_WRITE_OPERATION_NAME }),
+            error,
+            ProgramError::InvalidArgument {
+                message: "`reference_write` writes a live tangent into a reference that carries no tangent; pass the \
+                          reference as a differentiated input instead of capturing it"
+                    .to_string(),
+            },
         );
         assert_eq!(reference.read(), Ok(TestIrValue::Array(Array::vector(vec![11.0_f32, 12.0]))));
     }

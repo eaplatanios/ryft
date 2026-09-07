@@ -68,6 +68,19 @@ pub trait ReferenceFreeze<Output = Self>: Sized {
     fn freeze(self) -> Result<Output, ProgramError>;
 }
 
+/// Supplies the operation that consumes a reference and returns its final contents. Transforms bind this operation
+/// through their context so that execution and staging use the operation family's reference semantics.
+pub trait ReferenceFreezeOperationProvider<T: Type>: Operation {
+    /// Returns the operation that freezes one reference, invalidating its aliases and returning its referent.
+    /// The default reports unsupported freezing, allowing value-only families to use transforms that only
+    /// request this operation when reference state is present.
+    fn reference_freeze_operation() -> Result<Self, ProgramError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: "this operation family does not support reference freezing".to_string(),
+        })
+    }
+}
+
 static REFERENCE_FREEZE_OPERATION_EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
     Effects::new(
         EffectClasses::NONE,

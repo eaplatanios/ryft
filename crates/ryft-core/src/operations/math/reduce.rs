@@ -13,7 +13,7 @@ use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
     DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment, MemberDifferentiableOperation,
-    TransposableOperation, TranspositionContext, TranspositionDriver, jvp_projected_operation, primal_to_tangent_duals,
+    TransposableOperation, TranspositionContext, TranspositionDriver, jvp_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -482,7 +482,7 @@ where
         let primal = context.bind(operation, Vec::new(), std::slice::from_ref(operand.primal()))?.remove(0);
         let output_primal = primal;
         let primal = destinations.primal_to_tangent(output_primal.clone())?;
-        let tangent_inputs = primal_to_tangent_duals(destinations, inputs)?;
+        let tangent_inputs = destinations.dual_primal_to_tangent(inputs)?;
         let operand = &tangent_inputs[0];
         let context = destinations.tangent();
         let tangent = match operand.tangent() {

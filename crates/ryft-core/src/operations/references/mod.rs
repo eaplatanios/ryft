@@ -169,8 +169,9 @@ fn align_stored_batch<C: Context, P: BatchingPolicy<C>, D: BatchingDriver<C, P>>
 ///
 /// # Errors
 ///
-/// Returns [`DifferentiationError::PlumbingReferenceTangent`] when `reference` is a plumbing reference and `value`
-/// carries a live tangent.
+/// Returns [`ProgramError::InvalidArgument`] through [`DifferentiationError::Program`] when `reference` has no
+/// tangent reference but `value` carries a live tangent. Silently discarding that tangent would lose a derivative
+/// contribution; the reference must be passed as a differentiated input so its tangent state can receive the store.
 fn stored_tangents<'r, V: Value>(
     operation_name: &'static str,
     reference: &'r DifferentiationDual<V>,
@@ -179,9 +180,13 @@ fn stored_tangents<'r, V: Value>(
     match (reference.tangent(), value.tangent()) {
         (MaybeZero::Value(tangent_reference), tangent) => Ok(Some((tangent_reference, tangent.clone()))),
         (MaybeZero::Zero(_), MaybeZero::Zero(_)) => Ok(None),
-        (MaybeZero::Zero(_), MaybeZero::Value(_)) => {
-            Err(DifferentiationError::PlumbingReferenceTangent { operation: operation_name })
+        (MaybeZero::Zero(_), MaybeZero::Value(_)) => Err(ProgramError::InvalidArgument {
+            message: format!(
+                "`{operation_name}` writes a live tangent into a reference that carries no tangent; pass the \
+                 reference as a differentiated input instead of capturing it",
+            ),
         }
+        .into()),
     }
 }
 
@@ -221,7 +226,9 @@ pub use reference_add_update::{
     REFERENCE_ADD_UPDATE_OPERATION_NAME, ReferenceAddUpdate, ReferenceAddUpdateOperation,
     ReferenceAddUpdateOperationProvider,
 };
-pub use reference_freeze::{REFERENCE_FREEZE_OPERATION_NAME, ReferenceFreeze, ReferenceFreezeOperation};
+pub use reference_freeze::{
+    REFERENCE_FREEZE_OPERATION_NAME, ReferenceFreeze, ReferenceFreezeOperation, ReferenceFreezeOperationProvider,
+};
 pub use reference_new::{
     REFERENCE_NEW_OPERATION_NAME, ReferenceNew, ReferenceNewOperation, ReferenceNewOperationProvider,
 };

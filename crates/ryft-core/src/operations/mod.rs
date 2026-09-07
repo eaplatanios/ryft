@@ -64,8 +64,9 @@ pub use references::{
     REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME,
     REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME, ReferenceAddUpdate,
     ReferenceAddUpdateOperation, ReferenceAddUpdateOperationProvider, ReferenceFreeze, ReferenceFreezeOperation,
-    ReferenceNew, ReferenceNewOperation, ReferenceNewOperationProvider, ReferenceRead, ReferenceReadOperation,
-    ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation,
+    ReferenceFreezeOperationProvider, ReferenceNew, ReferenceNewOperation, ReferenceNewOperationProvider,
+    ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
+    ReferenceWriteOperation,
 };
 pub use sharding::*;
 pub use tag::{TAG_OPERATION_NAME, Tag, TagOperation};

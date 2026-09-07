@@ -67,7 +67,7 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::{
     CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationContext,
     DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, ResidualZeroProvider,
-    TransposableOperation, interpret_partitioned_jvp,
+    TransposableOperation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types, impl_reference_dischargeable_operation};
@@ -527,7 +527,7 @@ where
             known.resize(tangent_operands.len(), false);
             tangent_operands[..residual_count].clone_from_slice(&primal_residuals);
             let partition = driver.partition_jvp_program(tangent_region, &known, &[])?;
-            interpret_partitioned_jvp(context, &partition, &tangent_operands, 0)?
+            context.interpret_partitioned_jvp_program(&partition, &tangent_operands, 0)?
         } else {
             context.tangent().bind(
                 LinearCallOperation::new(residual_count),

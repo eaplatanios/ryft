@@ -37,9 +37,15 @@ pub trait ReferenceNew<Output = Self>: Sized {
 
 /// Supplies the allocation operation of a reference-capable operation family. Transforms use this family-owned
 /// capability to allocate state without requiring downstream implementations for core-owned tracer types.
-pub trait ReferenceNewOperationProvider<T: Type>: Operation<Type = T> {
+pub trait ReferenceNewOperationProvider<T: Type>: Operation {
     /// Returns the operation that allocates a reference from one initial referent value.
-    fn reference_new_operation() -> Self;
+    /// The default reports unsupported allocation, allowing value-only families to use transforms that only
+    /// request this operation when reference state is present.
+    fn reference_new_operation() -> Result<Self, ProgramError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: "this operation family does not support reference allocation".to_string(),
+        })
+    }
 }
 
 static REFERENCE_NEW_OPERATION_EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
