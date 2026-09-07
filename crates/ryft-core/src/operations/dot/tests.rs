@@ -1419,7 +1419,7 @@ fn test_ragged_dot_jvp_and_noncontracting_transpose() {
         .unwrap();
     assert_abs_diff_eq!(outputs[1], (plus - minus) * (0.5 / step), epsilon = 1e-3);
 
-    let transpose = program.transpose_with_respect_to(&[0]).unwrap();
+    let transpose = program.transpose_with_respect_to(&[0], &[]).unwrap();
     assert_eq!(
         transpose.to_string(),
         indoc! {"
@@ -1539,7 +1539,7 @@ fn test_ragged_dot_transpose_rejects_contracting_and_batch_modes() {
             .build::<Vec<Array>, Vec<Array>>(outputs, vec![crate::Placeholder; 3], vec![crate::Placeholder])
             .unwrap();
         assert_eq!(
-            program.transpose_with_respect_to(&[0]).unwrap_err(),
+            program.transpose_with_respect_to(&[0], &[]).unwrap_err(),
             crate::differentiation::DifferentiationError::Program(crate::ProgramError::UnsupportedOperation {
                 message: format!("`{RAGGED_DOT_OPERATION_NAME}` transposition is unsupported in `{mode}` mode"),
             }),

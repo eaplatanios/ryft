@@ -222,16 +222,9 @@ mod reference_read;
 mod reference_swap;
 mod reference_write;
 
-pub use reference_add_update::{
-    REFERENCE_ADD_UPDATE_OPERATION_NAME, ReferenceAddUpdate, ReferenceAddUpdateOperation,
-    ReferenceAddUpdateOperationProvider,
-};
-pub use reference_freeze::{
-    REFERENCE_FREEZE_OPERATION_NAME, ReferenceFreeze, ReferenceFreezeOperation, ReferenceFreezeOperationProvider,
-};
-pub use reference_new::{
-    REFERENCE_NEW_OPERATION_NAME, ReferenceNew, ReferenceNewOperation, ReferenceNewOperationProvider,
-};
+pub use reference_add_update::{REFERENCE_ADD_UPDATE_OPERATION_NAME, ReferenceAddUpdate, ReferenceAddUpdateOperation};
+pub use reference_freeze::{REFERENCE_FREEZE_OPERATION_NAME, ReferenceFreeze, ReferenceFreezeOperation};
+pub use reference_new::{REFERENCE_NEW_OPERATION_NAME, ReferenceNew, ReferenceNewOperation};
 pub use reference_read::{REFERENCE_READ_OPERATION_NAME, ReferenceRead, ReferenceReadOperation};
 pub use reference_swap::{REFERENCE_SWAP_OPERATION_NAME, ReferenceSwap, ReferenceSwapOperation};
 pub use reference_write::{REFERENCE_WRITE_OPERATION_NAME, ReferenceWrite, ReferenceWriteOperation};

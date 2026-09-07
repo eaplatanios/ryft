@@ -14,7 +14,6 @@ use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
     DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment, MemberDifferentiableOperation,
     ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver, jvp_projected_operation,
-    primal_to_tangent_duals,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -603,7 +602,7 @@ where
         let primal = context.bind(operation.clone(), Vec::new(), primal_inputs.as_slice())?.remove(0);
         let output_primal = primal;
         let primal = destinations.primal_to_tangent(output_primal.clone())?;
-        let tangent_inputs = primal_to_tangent_duals(destinations, inputs)?;
+        let tangent_inputs = destinations.dual_primal_to_tangent(inputs)?;
         let inputs = tangent_inputs.as_slice();
         let operand = &inputs[0];
         let indices = &inputs[1];

@@ -41,12 +41,12 @@ use crate::differentiation::{
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
 };
 use crate::macros::check_count;
-use crate::operations::constants::zero::{Zero, ZeroOperationProvider};
+use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::manipulation::concatenation::{Concatenate, ConcatenateOperation};
 use crate::operations::manipulation::padding::{Pad, PadOperation, dependency_scalar_type};
 use crate::operations::manipulation::slicing::{Slice, SliceOperation};
 use crate::operations::math::add::{Add, AddOperation};
-use crate::programs::{MaybeZero, ProgramError, ProvenanceScope, TypeError, Typed, Value};
+use crate::programs::{MaybeZero, OperationProvider, ProgramError, ProvenanceScope, TypeError, Typed, Value};
 use crate::tracing::{Tracer, TracingContext};
 
 pub mod cumulative_log_sum_exp;
@@ -362,7 +362,7 @@ where
         + From<ConcatenateOperation<ArrayType>>
         + From<PadOperation<ArrayType>>
         + From<SliceOperation>
-        + ZeroOperationProvider<ArrayType>,
+        + OperationProvider<ArrayType, ZeroOperation<ArrayType>, Operation = C::Operation>,
     F: Fn(&DecompositionTracer<C>, &DecompositionTracer<C>) -> Result<DecompositionTracer<C>, ProgramError>,
 {
     let (_, decomposition) = TracingContext::<C::Constant, C::Operation>::trace::<_, ArrayType, _>(
@@ -652,7 +652,7 @@ macro_rules! define_cumulative_operation {
                 + From<$operation>
                 + From<PadOperation<ArrayType>>
                 + From<SliceOperation>
-                + ZeroOperationProvider<ArrayType>,
+                + OperationProvider<ArrayType, ZeroOperation<ArrayType>, Operation = C::Operation>,
             C::Value: $capability,
         {
             fn jvp<D: DifferentiationDriver<C>, P: $crate::DifferentiationPolicy<C>>(

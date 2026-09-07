@@ -14,12 +14,14 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::constants::zero::Zero;
-use crate::operations::references::reference_new::ReferenceNewOperationProvider;
+use crate::operations::references::reference_new::ReferenceNewOperation;
+
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    EffectClasses, Effects, MaybeZero, Operation, ProgramError, ReferenceAccessMode, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceEffect, ReferenceType, ReferenceViewOperation, RegionInterface, Type, TypeError, Typed, Value,
+    EffectClasses, Effects, MaybeZero, Operation, OperationProvider, ProgramError, ReferenceAccessMode,
+    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, ReferenceEffect, ReferenceType, ReferenceViewOperation, RegionInterface, Type,
+    TypeError, Typed, Value,
 };
 use crate::tracing::{Tracer, TracingContext};
 use std::borrow::Cow;
@@ -224,7 +226,7 @@ where
     V: Value<Type = U>,
     O: ReferenceViewOperation<Type = U>
         + ResidualZeroProvider<U>
-        + ReferenceNewOperationProvider<U>
+        + OperationProvider<U, ReferenceNewOperation<U, U>, Operation = O>
         + From<ReferenceSwapOperation<T, U>>,
 {
     // A swap maps `(state, x) ↦ (x, state)`, so its transpose swaps the output cotangent into the cotangent reference

@@ -112,7 +112,7 @@ pub const REMATERIALIZE_OPERATION_NAME: &str = "rematerialize";
 /// output. The backward region maps `(non_differentiated..., forward_tail..., lead...)` to one cotangent per
 /// differentiated operand, where `lead` is one cotangent per non-reference primal output followed by one cotangent
 /// destination reference per differentiated reference-typed operand, in operand order: exactly the boundary that
-/// [`Program::transpose_with_destinations`] gives the transposed tangent program under the default destination kinds. A
+/// [`Program::transpose_with_respect_to`] gives the transposed tangent program under the default destination kinds. A
 /// reference-typed primal output forwards an input root and therefore has no cotangent slot, and a differentiated
 /// reference-typed operand's cotangent output is its destination reference returned by identity. The operands are
 /// forwarded positionally into the primal and forward regions and, for the leading non-differentiated operands, into
@@ -200,7 +200,7 @@ impl<T: DifferentiableType> RematerializeOperation<T> {
     /// destination reference per differentiated reference-typed operand; and the tangent region receives the
     /// non-differentiated operands, the residuals, and one tangent per differentiated operand. Derivative positions
     /// carry the [`DifferentiableType::tangent`] and [`DifferentiableType::cotangent`] representations of their primal
-    /// types, which is what [`Program::transpose_with_destinations`] and the linearization tangent program expose
+    /// types, which is what [`Program::transpose_with_respect_to`] and the linearization tangent program expose
     /// (e.g., `ref<cotangent(T)>` for the destination of a `ref<T>` operand). Refer to the documentation of
     /// [`RematerializeOperation`] for the complete contract.
     fn region_input_types(

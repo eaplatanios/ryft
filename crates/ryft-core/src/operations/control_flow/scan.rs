@@ -30,7 +30,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::constant::ConstantOperation;
-use crate::operations::constants::zero::{Zero, ZeroOperationProvider};
+use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::control_flow::{TemporalResidualOperation, TemporalResidualType};
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation, DynamicBroadcastOperation};
@@ -45,12 +45,12 @@ use crate::partial::{
 };
 use crate::programs::{
     AtomId, CalleeRegionDriver, InputRegionProvenance, MaybeZero, Operation, OperationFormatter, OperationProjection,
-    OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion,
-    ReferenceDischargeRegionInput, ReferenceDischargeRegionOutput, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceType, ReferenceView, ReferenceViewOperation, ReferenceViewPath,
-    RegionInterface, RegionRef, RegionSlot, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value,
-    ValueProjection, ViewOverlap, ViewSymbol, ViewSymbolBinding,
+    OperationProvider, OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary,
+    ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeRegionInput, ReferenceDischargeRegionOutput,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceType, ReferenceView, ReferenceViewOperation,
+    ReferenceViewPath, RegionInterface, RegionRef, RegionSlot, Type, TypeError, TypeIdentityPosition,
+    TypeIdentityRenaming, Typed, Value, ValueProjection, ViewOverlap, ViewSymbol, ViewSymbolBinding,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -813,7 +813,7 @@ impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for S
 where
     C: Context<Type = ArrayType> + Zero<<C as Domain>::Value>,
     <C as Domain>::Value: Broadcast + Transpose + Slice + UpdateSlice + Reshape,
-    C::Operation: ZeroOperationProvider<ArrayType>
+    C::Operation: OperationProvider<ArrayType, ZeroOperation<ArrayType>, Operation = C::Operation>
         + From<BroadcastOperation>
         + From<TransposeOperation>
         + From<SliceOperation>
@@ -1226,7 +1226,7 @@ where
             .iter()
             .enumerate()
             .map(|(index, input)| {
-                input.is_active() && (shared_destinations || index < carry_count || !input.tangent().is_zero())
+                input.is_tangent_active() && (shared_destinations || index < carry_count || !input.tangent().is_zero())
             })
             .collect::<Vec<_>>();
         let output_has_tangent = body.tangent_output_activity(&input_has_tangent)?;
@@ -4466,7 +4466,7 @@ mod tests {
         // Transposing with respect to the carry initializer and the stacked operand reaches the dead stacked
         // cotangent. The pullback reads the inner extent off the live carry cotangent, reuses the runtime length
         // operand, and stages the mixed dynamic zero over both.
-        let pullback = program.transpose_with_respect_to(&[1, 2]).unwrap();
+        let pullback = program.transpose_with_respect_to(&[1, 2], &[]).unwrap();
         assert_eq!(
             pullback.to_string(),
             indoc! {"
@@ -4769,7 +4769,7 @@ mod tests {
             .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![final_carry], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         assert!(matches!(
-            program.transpose_with_respect_to(&[0]),
+            program.transpose_with_respect_to(&[0], &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "scan transpose received a known reference-typed scanned operand at position 1; \
                                reference stacks are linear or absent",

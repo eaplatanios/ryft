@@ -892,11 +892,22 @@ pub trait OperationProjection<T: Type>: From<Self::Projected> {
 /// a different concrete operation depending on the operands' type family (e.g., multiplying arrays stages the
 /// stateless [`MulOperation`](crate::MulOperation) itself, while multiplying first-class dimensions must stage a
 /// [`DimensionMulOperation`](crate::DimensionMulOperation) whose payload is computed from the operand types).
-/// This trait is that selection point. The generated capability implementation calls
-/// `<Marker as OperationProvider<V::Type>>::provide(&[..input types..])` and binds the returned operation
-/// with the declared operation marker acting as its own family's provider.
+/// This trait is that selection point. The generated capability implementation calls `<OperationMarker as
+/// OperationProvider<V::Type>>::provide((), &[..input types..])` and binds the returned operation with the declared
+/// operation marker acting as its own family's provider.
 ///
-/// Two implementation levels cover every case:
+/// The default `Request = ()` needs no construction arguments beyond operand types, as used by elementwise
+/// capabilities. A caller can instead pass an operation payload as a request to its context's operation family.
+/// For example, `ZeroOperation::new(output_type)` requests a zero with no operands, while a reference allocation
+/// request takes the initial value's type in `input_types`. The selected operation may differ from the request:
+/// composite families select their member operations, and unsupported families return an error.
+///
+/// Explicit requests use the same payload types as ordinary operation construction. Reference requests repeat the
+/// enclosing type family in both payload parameters to identify the capability; the selected operation uses the
+/// actual referent family. The default unit request keeps self-provision separate from family selection, including
+/// when a family is a single operation.
+///
+/// The default request supports two implementation levels:
 ///
 ///   - **Self-Provision (Blanket):** A stateless operation that implements [`Operation<Type = T>`](Operation) and
 ///     [`Default`] provides itself for `T`, so ordinary homogeneous operation families need no code at all.
@@ -908,22 +919,24 @@ pub trait OperationProjection<T: Type>: From<Self::Projected> {
 ///
 /// The contract is deliberately narrow. `input_types` contains exactly the operation's input type descriptors in
 /// operand order, callers (i.e., the generated capability implementations) always pass borrowed stack arrays, and
-/// provider implementations validate the arity they support. Selection is based strictly on types, never on runtime
-/// values. This is *not* a universal operation factory: mixed operations whose signatures cross member kinds,
-/// region-carrying operations, and operations requiring explicit user parameters keep their ordinary constructors.
-pub trait OperationProvider<T: Type> {
+/// provider implementations validate the arity they support. Selection receives construction metadata and operand
+/// types, never runtime values. Region-carrying operations and operations requiring explicit user parameters keep
+/// their ordinary constructors unless their request explicitly carries those arguments.
+pub trait OperationProvider<T: Type, Request = ()> {
     /// Concrete [`Operation`] type provided for program [`Type`] `T`.
     type Operation: Operation<Type = T>;
 
-    /// Selects and constructs the [`Operation`] from its ordered input [`Type`]s.
-    fn provide(input_types: &[&T]) -> Result<Self::Operation, ProgramError>;
+    /// Selects and constructs the [`Operation`] for `request` and its ordered operand types. Constructor arguments
+    /// belong in `request`. `input_types` contains only operands and is empty for nullary operations. A family may
+    /// reject requests for operations that it does not support.
+    fn provide(request: Request, input_types: &[&T]) -> Result<Self::Operation, ProgramError>;
 }
 
 impl<O: Default + Operation> OperationProvider<O::Type> for O {
     type Operation = O;
 
     #[inline]
-    fn provide(_input_types: &[&O::Type]) -> Result<Self::Operation, ProgramError> {
+    fn provide(_request: (), _input_types: &[&O::Type]) -> Result<Self::Operation, ProgramError> {
         Ok(Self::default())
     }
 }

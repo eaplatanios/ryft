@@ -10,7 +10,7 @@ use crate::batching::{
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, ResidualZeroProvider, interpret_partitioned_jvp,
+    DifferentiationError, DifferentiationPolicy, ResidualZeroProvider,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{
@@ -435,7 +435,7 @@ where
             let mut known = vec![true; inputs.len()];
             known.resize(jvp_inputs.len(), false);
             let partition = driver.partition_jvp_program(jvp_region, &known, &(0..output_count).collect::<Vec<_>>())?;
-            interpret_partitioned_jvp(context, &partition, &jvp_inputs, output_count)?
+            context.interpret_partitioned_jvp_program(&partition, &jvp_inputs, output_count)?
         };
         check_count!("output", outputs, 2 * output_count, ProgramError);
         let tangents = outputs.split_off(output_count);
@@ -1495,7 +1495,7 @@ mod tests {
                     vec![Placeholder],
                 )
                 .unwrap();
-            let linearization = program.entry_region_ref().linearize_with_activity(&[false, true]).unwrap();
+            let linearization = program.entry_region_ref().linearize_with_respect_to(&[1]).unwrap();
             let reference = ArrayReference::new(initial.clone());
             let mut primals = linearization
                 .primal()

@@ -16,9 +16,10 @@ use crate::operations::math::add::AddOperation;
 use crate::operations::references::reference_read::ReferenceReadOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    EffectClasses, Effects, MaybeZero, Operation, ProgramError, ReferenceAccessMode, ReferenceAccumulationPolicy,
-    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceEffect, ReferenceType, ReferenceViewOperation, RegionInterface, Type, TypeError, Typed, Value,
+    EffectClasses, Effects, MaybeZero, Operation, OperationProvider, ProgramError, ReferenceAccessMode,
+    ReferenceAccumulationPolicy, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, ReferenceEffect, ReferenceType, ReferenceViewOperation, RegionInterface, Type,
+    TypeError, Typed, Value,
 };
 use crate::tracing::{Tracer, TracingContext};
 use std::borrow::Cow;
@@ -30,20 +31,40 @@ use super::{align_stored_batch, stored_tangents, validate_operand_types};
 pub const REFERENCE_ADD_UPDATE_OPERATION_NAME: &str = "reference_add_update";
 
 /// Adds an update into the value stored by a reference in program order.
+///
+/// Concrete values implement their runtime update semantics directly. Values whose dispatch domain is a
+/// [`Context`] use its operation family to select and bind the update operation through
+/// [`OperationProvider<Type, ReferenceAddUpdateOperation<Type, Type>>`](OperationProvider). Here both request
+/// parameters name the enclosing value type family; the selected operation may use a different referent type or
+/// a downstream payload. The provider returns its enclosing operation family, receives the reference and update
+/// types in that order, and may report unsupported construction for families without references.
 pub trait ReferenceAddUpdate<Update = Self>: Sized {
     /// Adds `update` to the stored value in program order.
     fn add_update(&self, update: &Update) -> Result<(), ProgramError>;
 }
 
-/// Supplies the additive reference-update operation of a reference-capable operation family. Its addition semantics
-/// belong to the family, so a downstream universe can provide accumulation without implementing a core operation
-/// trait for the core-owned [`AddOperation`] payload.
-pub trait ReferenceAddUpdateOperationProvider<T: Type>: Operation<Type = T> {
-    /// Returns the operation that adds its second operand into the reference state named by its first operand.
-    ///
-    /// Returns [`ProgramError::UnsupportedOperation`] when this family has no reference-valued operations. Such
-    /// families can still use destination APIs with ordinary returned or ignored cotangents.
-    fn reference_add_update_operation() -> Result<Self, ProgramError>;
+// Staged values delegate selection to their operation family. The request uses the enclosing type in both slots:
+// it identifies the capability, while the selected operation can use the family's actual referent type or payload.
+impl<V: Value> ReferenceAddUpdate for V
+where
+    V::DispatchDomain: Context<
+        Operation: OperationProvider<
+            V::Type,
+            ReferenceAddUpdateOperation<V::Type, V::Type>,
+            Operation = <V::DispatchDomain as Domain>::Operation,
+        >,
+    >,
+{
+    fn add_update(&self, update: &Self) -> Result<(), ProgramError> {
+        let reference_type = self.r#type();
+        let update_type = update.r#type();
+        let operation = <V::DispatchDomain as Domain>::Operation::provide(
+            ReferenceAddUpdateOperation::<V::Type, V::Type>::new(),
+            &[reference_type.as_ref(), update_type.as_ref()],
+        )?;
+        self.dispatch_domain().bind(operation, Vec::new(), &[self.clone(), update.clone()])?;
+        Ok(())
+    }
 }
 
 static REFERENCE_ADD_UPDATE_OPERATION_EFFECTS: LazyLock<Effects> = LazyLock::new(|| {

@@ -26,7 +26,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::constant::ConstantOperation;
-use crate::operations::constants::zero::{Zero, ZeroOperationProvider};
+use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::control_flow::select::{Select, SelectOperation};
 use crate::operations::dimensions::dimension_requirement::DimensionRequirementOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
@@ -40,9 +40,9 @@ use crate::partial::{
 };
 use crate::programs::{
     CalleeRegionDriver, Concretizable, InputRegionProvenance, MaybeZero, Operation, OperationProjection,
-    OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceRoot,
-    ReferenceViewOperation, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueProjection,
+    OperationProvider, OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    ReferenceRoot, ReferenceViewOperation, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueProjection,
     discharge_positional_region_operation,
 };
 use crate::tracing::{Tracer, TracingContext};
@@ -253,7 +253,9 @@ impl<V, O, C> PartiallyEvaluatableOperation<C> for ConditionOperation<V>
 where
     V: Value + Concretizable<bool>,
     C: Context<Type = V::Type, Constant = V, Operation = O>,
-    O: Operation<Type = V::Type> + From<ConditionOperation<V>> + ZeroOperationProvider<V::Type>,
+    O: Operation<Type = V::Type>
+        + From<ConditionOperation<V>>
+        + OperationProvider<V::Type, ZeroOperation<V::Type>, Operation = O>,
 {
     fn partially_evaluate<D: PartialEvaluationDriver<C>>(
         &self,
@@ -690,7 +692,7 @@ where
         // activity: a numeric operand is active (a symbolic zero is materialized below), while a plumbing reference
         // operand (a captured or inactive reference reaching the branch at any input position) and a zero-space operand
         // are inactive and receive no tangent input.
-        let activity = operands.iter().map(DifferentiationDual::is_active).collect::<Vec<_>>();
+        let activity = operands.iter().map(DifferentiationDual::is_tangent_active).collect::<Vec<_>>();
         let output_activity = true_branch.tangent_output_activity(&activity)?;
         let tangent_output_count = output_activity.iter().filter(|&&active| active).count();
 
@@ -886,7 +888,9 @@ fn split_condition_by_knownness<V, O, C, D: PartialEvaluationDriver<C>>(
 where
     V: Value,
     C: Context<Type = V::Type, Constant = V, Operation = O>,
-    O: Operation<Type = V::Type> + From<ConditionOperation<V>> + ZeroOperationProvider<V::Type>,
+    O: Operation<Type = V::Type>
+        + From<ConditionOperation<V>>
+        + OperationProvider<V::Type, ZeroOperation<V::Type>, Operation = O>,
 {
     let true_branch = driver.region(0)?;
     let false_branch = driver.region(1)?;
@@ -934,7 +938,9 @@ fn reconstruct_partitioned_condition<V, O, Input, KnownBind, ResidualBind>(
 ) -> Result<Option<Vec<Input>>, ProgramError>
 where
     V: Value,
-    O: Operation<Type = V::Type> + From<ConditionOperation<V>> + ZeroOperationProvider<V::Type>,
+    O: Operation<Type = V::Type>
+        + From<ConditionOperation<V>>
+        + OperationProvider<V::Type, ZeroOperation<V::Type>, Operation = O>,
     Input: Clone,
     KnownBind: FnMut(O, Vec<Program<V, O, Vec<V>, Vec<V>>>, &[Input]) -> Result<Vec<Input>, ProgramError>,
     ResidualBind: FnMut(O, Vec<Program<V, O, Vec<V>, Vec<V>>>, &[Input]) -> Result<Vec<Input>, ProgramError>,
@@ -1095,7 +1101,12 @@ where
         }
         let mut zero_atoms = Vec::with_capacity(other.edge_types.len());
         for edge_type in other.edge_types.iter() {
-            let zeros = builder.add_instruction(O::zero_operation(edge_type.clone())?, Vec::new(), Vec::new(), None)?;
+            let zeros = builder.add_instruction(
+                O::provide(ZeroOperation::new(edge_type.clone()), &[])?,
+                Vec::new(),
+                Vec::new(),
+                None,
+            )?;
             check_count!("output", zeros, 1, ProgramError);
             zero_atoms.push(zeros[0]);
         }

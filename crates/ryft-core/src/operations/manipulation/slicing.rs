@@ -14,7 +14,7 @@ use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
     DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment, MemberDifferentiableOperation,
-    TransposableOperation, TranspositionContext, TranspositionDriver, jvp_projected_operation, primal_to_tangent_duals,
+    TransposableOperation, TranspositionContext, TranspositionDriver, jvp_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_reference_dischargeable_operation};
@@ -400,7 +400,7 @@ where
         let primal = context.bind(operation, Vec::new(), std::slice::from_ref(operand.primal()))?.remove(0);
         let output_primal = primal;
         let primal = destinations.primal_to_tangent(output_primal.clone())?;
-        let tangent_inputs = primal_to_tangent_duals(destinations, inputs)?;
+        let tangent_inputs = destinations.dual_primal_to_tangent(inputs)?;
         let inputs = tangent_inputs.as_slice();
         let operand = &inputs[0];
         let context = destinations.tangent();
@@ -1646,7 +1646,7 @@ where
         let primal = context.bind(operation, Vec::new(), primal_inputs.as_slice())?.remove(0);
         let output_primal = primal;
         let primal = destinations.primal_to_tangent(output_primal.clone())?;
-        let tangent_inputs = primal_to_tangent_duals(destinations, inputs)?;
+        let tangent_inputs = destinations.dual_primal_to_tangent(inputs)?;
         let inputs = tangent_inputs.as_slice();
         let (operand, start_indices) = inputs.split_first().unwrap();
         let context = destinations.tangent();
@@ -2118,7 +2118,7 @@ where
         let primal = context.bind(operation, Vec::new(), primal_inputs.as_slice())?.remove(0);
         let output_primal = primal;
         let primal = destinations.primal_to_tangent(output_primal.clone())?;
-        let tangent_inputs = primal_to_tangent_duals(destinations, inputs)?;
+        let tangent_inputs = destinations.dual_primal_to_tangent(inputs)?;
         let inputs = tangent_inputs.as_slice();
         let operand = &inputs[0];
         let update = &inputs[1];
@@ -3998,7 +3998,7 @@ mod tests {
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(
-            program.transpose_with_respect_to(&[0]).unwrap_err(),
+            program.transpose_with_respect_to(&[0], &[]).unwrap_err(),
             TypeError::invalid("`slice` transpose requires a static input shape but got f64[elements]").into(),
         );
 
@@ -4012,7 +4012,7 @@ mod tests {
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         assert_eq!(
-            program.transpose_with_respect_to(&[0]).unwrap_err(),
+            program.transpose_with_respect_to(&[0], &[]).unwrap_err(),
             TypeError::invalid("`dynamic_slice` transpose requires a statically shaped operand but got f64[elements]")
                 .into(),
         );

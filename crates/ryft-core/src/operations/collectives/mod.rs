@@ -27,7 +27,6 @@ use crate::batching::{BatchAxis, BatchingContext, BatchingError};
 use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::{
     DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    primal_to_tangent_duals,
 };
 use crate::macros::check_count;
 use crate::operations::constants::constant::ConstantOperation;
@@ -1047,7 +1046,7 @@ where
     let tangent = match array.tangent() {
         MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
         MaybeZero::Value(array_tangent) => {
-            let tangent_inputs = primal_to_tangent_duals(context, inputs)?;
+            let tangent_inputs = context.dual_primal_to_tangent(inputs)?;
             let (array, output_extents) = tangent_inputs.split_first().unwrap();
             let context = context.tangent();
             let mut residuals = LinearResiduals::new();
@@ -1542,7 +1541,7 @@ mod tests {
             .unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         let transposed_twice =
-            program.transpose_with_respect_to(&[0]).unwrap().transpose_with_respect_to(&[0]).unwrap();
+            program.transpose_with_respect_to(&[0], &[]).unwrap().transpose_with_respect_to(&[0], &[]).unwrap();
         assert!(matches!(transposed_twice.instructions()[0].operation(), ArrayOperation::ParallelSumScatter(_)));
         assert_eq!(transposed_twice.input_types(), program.input_types());
         assert_eq!(transposed_twice.output_types(), program.output_types());
@@ -1560,7 +1559,7 @@ mod tests {
             .unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
         let transposed_twice =
-            program.transpose_with_respect_to(&[0]).unwrap().transpose_with_respect_to(&[0]).unwrap();
+            program.transpose_with_respect_to(&[0], &[]).unwrap().transpose_with_respect_to(&[0], &[]).unwrap();
         assert!(matches!(transposed_twice.instructions()[0].operation(), ArrayOperation::AllToAll(_)));
         assert_eq!(transposed_twice.input_types(), program.input_types());
         assert_eq!(transposed_twice.output_types(), program.output_types());

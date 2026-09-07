@@ -941,9 +941,10 @@ macro_rules! define_elementwise_operation {
 ///   - `$argument`: Required name for the binary capability's non-receiver argument (e.g., `x` in `atan2(x)`).
 ///   - `$operation`: Stateless operation marker (e.g., `SinOperation`) whose
 ///     [`OperationProvider`](crate::OperationProvider) implementation selects and constructs the concrete operation
-///     staged for each value type family. Stateless operations provide themselves through the blanket implementation,
-///     while type families whose operations carry type-derived metadata (e.g., checked dimension arithmetic) override
-///     the provider for the marker.
+///     staged for each value type family. The provider receives `()` because this capability has no operation-specific
+///     configuration. Stateless operations provide themselves through the blanket implementation, while type families
+///     whose operations carry type-derived metadata (e.g., checked dimension arithmetic) override the provider for the
+///     marker.
 #[macro_export]
 macro_rules! define_elementwise_capability {
     // This branch defines a receiver capability whose unary operation is provided by the value type family.
@@ -975,8 +976,10 @@ macro_rules! define_elementwise_capability {
             #[inline]
             fn $method(&self) -> Result<Self, $crate::ProgramError> {
                 let input_type = $crate::Typed::r#type(self);
-                let operation =
-                    <$operation<__V::Type> as $crate::OperationProvider<__V::Type>>::provide(&[input_type.as_ref()])?;
+                let operation = <$operation<__V::Type> as $crate::OperationProvider<__V::Type>>::provide(
+                    (),
+                    &[input_type.as_ref()],
+                )?;
                 Ok($crate::Context::bind(
                     &$crate::Value::dispatch_domain(self),
                     operation,
@@ -1019,10 +1022,10 @@ macro_rules! define_elementwise_capability {
             fn $method(&self, $argument: &Self) -> Result<Self, $crate::ProgramError> {
                 let left_type = $crate::Typed::r#type(self);
                 let right_type = $crate::Typed::r#type($argument);
-                let operation = <$operation<__V::Type> as $crate::OperationProvider<__V::Type>>::provide(&[
-                    left_type.as_ref(),
-                    right_type.as_ref(),
-                ])?;
+                let operation = <$operation<__V::Type> as $crate::OperationProvider<__V::Type>>::provide(
+                    (),
+                    &[left_type.as_ref(), right_type.as_ref()],
+                )?;
                 Ok($crate::Context::bind(
                     &$crate::Value::dispatch_domain(self),
                     operation,
@@ -4346,7 +4349,7 @@ macro_rules! check_operation_transposition {
                     vec![$crate::parameters::Placeholder; output_count],
                 )
                 .unwrap();
-            let pullback = program.transpose_with_respect_to(linear_indices.as_slice()).unwrap();
+            let pullback = program.transpose_with_respect_to(linear_indices.as_slice(), &[]).unwrap();
             $(assert_eq!(pullback.to_string(), $pullback.trim_end());)?
 
             let output_cotangents: Vec<$value> =
@@ -4411,7 +4414,7 @@ macro_rules! check_operation_transposition {
             .unwrap();
         let input_indices = (0..input_count).collect::<Vec<_>>();
         assert!(matches!(
-            program.transpose_with_respect_to(input_indices.as_slice()),
+            program.transpose_with_respect_to(input_indices.as_slice(), &[]),
             Err($crate::differentiation::DifferentiationError::Program(
                 $crate::programs::ProgramError::UnsupportedOperation { message },
             )) if message == format!("operation `{descriptor}` is not transposable"),
@@ -4991,7 +4994,7 @@ mod tests {
     impl OperationProvider<DimensionType> for TestBinaryOperation<DimensionType> {
         type Operation = TestArithmeticDimensionOperation;
 
-        fn provide(input_types: &[&DimensionType]) -> Result<Self::Operation, ProgramError> {
+        fn provide(_request: (), input_types: &[&DimensionType]) -> Result<Self::Operation, ProgramError> {
             check_count!("input", input_types, 2, ProgramError);
             Ok(TestArithmeticDimensionOperation::new(input_types[0], input_types[1])?)
         }

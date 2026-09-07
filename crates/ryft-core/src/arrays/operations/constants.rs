@@ -9,9 +9,8 @@ use crate::contexts::Context;
 use crate::differentiation::ResidualZeroProvider;
 use crate::operations::{
     DimensionSizeOperation, IotaOperation, OneOperation, ReferenceReadOperation, ZeroLikeOperation, ZeroOperation,
-    ZeroOperationProvider,
 };
-use crate::programs::{AtomId, Operation, ProgramBuilder, ProgramError, Typed, Value};
+use crate::programs::{AtomId, Operation, OperationProvider, ProgramBuilder, ProgramError, Typed, Value};
 
 // TODO(eaplatanios): Review this module.
 
@@ -190,7 +189,7 @@ impl<A: Value<Type = ArrayType>> ArrayIrOperation<A> {
             });
         }
         if first_axes.is_empty() {
-            return Ok((Self::zero_operation(r#type.into())?, Vec::new()));
+            return Ok((Self::provide(ZeroOperation::new(r#type.into()), &[])?, Vec::new()));
         }
         let operands = shape.dynamic_dimensions(residuals);
         Ok((Self::Zero(ZeroOperation::new(r#type)), operands))

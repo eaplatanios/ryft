@@ -469,7 +469,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
-        let pullback = program.transpose_with_respect_to(&[0]).unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
         assert_eq!(
             pullback.to_string(),
             indoc::indoc! {r#"

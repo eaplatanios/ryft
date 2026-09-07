@@ -13,13 +13,15 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
-use crate::operations::references::reference_add_update::ReferenceAddUpdateOperationProvider;
-use crate::operations::references::reference_new::ReferenceNewOperationProvider;
+use crate::operations::references::reference_add_update::ReferenceAddUpdate;
+use crate::operations::references::reference_new::ReferenceNewOperation;
+
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    EffectClasses, Effects, MaybeZero, Operation, ProgramError, ReferenceAccessMode, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceEffect, ReferenceType, ReferenceViewOperation, RegionInterface, Type, TypeError, Typed, Value,
+    EffectClasses, Effects, MaybeZero, Operation, OperationProvider, ProgramError, ReferenceAccessMode,
+    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, ReferenceEffect, ReferenceType, ReferenceViewOperation, RegionInterface, Type,
+    TypeError, Typed, Value,
 };
 use crate::tracing::{Tracer, TracingContext};
 use std::borrow::Cow;
@@ -185,8 +187,8 @@ where
     V: Value<Type = U>,
     O: ReferenceViewOperation<Type = U>
         + ResidualZeroProvider<U>
-        + ReferenceNewOperationProvider<U>
-        + ReferenceAddUpdateOperationProvider<U>,
+        + OperationProvider<U, ReferenceNewOperation<U, U>, Operation = O>,
+    Tracer<TracingContext<V, O>>: ReferenceAddUpdate,
 {
     // A read is the identity map from the referenced state to its result, so its transpose accumulates the result's
     // cotangent into the cotangent reference of the read root, viewed exactly as the operand views it. The reference
@@ -202,7 +204,7 @@ where
         check_count!("output", outputs, 1, ProgramError);
         if let MaybeZero::Value(cotangent) = &outputs[0] {
             let reference = context.cotangent_reference(0)?;
-            context.bind(O::reference_add_update_operation()?, Vec::new(), &[reference, cotangent.clone()])?;
+            reference.add_update(cotangent)?;
         }
         Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)])
     }

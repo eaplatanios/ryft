@@ -1844,7 +1844,9 @@ dependencies = [
 name = "ryft-cuda"
 version = "0.0.3"
 dependencies = [
+ "indoc",
  "libloading 0.9.0",
+ "pretty_assertions",
  "sha2",
  "thiserror 2.0.18",
 ]
@@ -1906,6 +1908,7 @@ dependencies = [
  "indoc",
  "libloading 0.9.0",
  "paste",
+ "pretty_assertions",
  "prost",
  "ryft-cuda",
  "ryft-xla-sys",

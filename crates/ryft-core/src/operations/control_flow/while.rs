@@ -29,13 +29,13 @@ use crate::contexts::{Context, Domain};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
     DifferentiationError, DifferentiationPolicy, DifferentiationTracer, ResidualZeroProvider, TransposableOperation,
-    TranspositionContext, TranspositionDriver, interpret_partitioned_jvp, primal_to_tangent_duals,
+    TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::one::OneOperation;
-use crate::operations::constants::zero::{Zero, ZeroOperation, ZeroOperationProvider};
+use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::control_flow::condition::ConditionOperation;
 use crate::operations::control_flow::scan::{ScanOperation, stacked_scan_type, validate_reference_carry_axis};
 use crate::operations::control_flow::select::SelectOperation;
@@ -54,11 +54,11 @@ use crate::partial::{
 };
 use crate::programs::{
     AtomId, CalleeRegionDriver, Concretizable, InputRegionProvenance, MaybeZero, Operation, OperationFormatter,
-    OperationProjection, OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceAccessMode,
-    ReferenceDischargeAllocationId, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, RegionInterface, RegionRef, RegionSlot, Type, TypeError, Typed, Value,
-    ValueProjection,
+    OperationProjection, OperationProvider, OutputRegionProvenance, Program, ProgramBuilder, ProgramError,
+    ReferenceAccessMode, ReferenceDischargeAllocationId, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, RegionInterface, RegionRef, RegionSlot, Type, TypeError,
+    Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -876,7 +876,7 @@ where
     C: Context + Zero<C::Value>,
     C::Type: WhileJvp<C>,
     C::Value: Concretizable<bool>,
-    C::Operation: ZeroOperationProvider<C::Type>,
+    C::Operation: OperationProvider<C::Type, ZeroOperation<C::Type>, Operation = C::Operation>,
     for<'operation> &'operation WhileOperation<C::Type>: TryFrom<&'operation C::Operation>,
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
@@ -1934,7 +1934,7 @@ where
     // body's mask is the operand mask). The nonlinear half returns the next state followed by ordinary residuals, and
     // the linear half consumes the live state tangents followed by those residuals.
     check_count!("input", inputs, state_count, ProgramError);
-    let element_has_tangent = inputs.iter().map(DifferentiationDual::is_active).collect::<Vec<_>>();
+    let element_has_tangent = inputs.iter().map(DifferentiationDual::is_tangent_active).collect::<Vec<_>>();
     let (primal_program, tangent_program, residual_count) =
         driver.linearize_program(driver.region(1)?, &element_has_tangent)?.into_parts();
     let residual_types = primal_program.output_types().split_off(state_count);
@@ -2160,7 +2160,7 @@ where
 
     // The tangent scan consumes invariant dimension residuals, live tangent carries, stored residual stacks, and one
     // scalar validity stack.
-    let tangent_inputs = primal_to_tangent_duals(context, inputs)?;
+    let tangent_inputs = context.dual_primal_to_tangent(inputs)?;
     let mut tangent_operands = invariant_residual_sources
         .iter()
         .flatten()
@@ -2265,7 +2265,7 @@ where
     // tangent can only come from its input, so it cannot become active through iteration.
     let body = driver.region(1)?;
     check_count!("input", inputs, body.input_types().len(), ProgramError);
-    let element_has_tangent = inputs.iter().map(DifferentiationDual::is_active).collect::<Vec<_>>();
+    let element_has_tangent = inputs.iter().map(DifferentiationDual::is_tangent_active).collect::<Vec<_>>();
     let tangent_state_count = element_has_tangent.iter().filter(|&&has_tangent| has_tangent).count();
     let fused_state_count = state_count + tangent_state_count;
     // The body is differentiated through its region's retained transform cache, so a body shared by several programs
@@ -2323,7 +2323,7 @@ where
         let input_known = (0..fused_state_count).map(|index| index < state_count).collect::<Vec<_>>();
         let required_outputs = (0..state_count).collect::<Vec<_>>();
         let partition = driver.partition_jvp_program(program.entry_region_ref(), &input_known, &required_outputs)?;
-        interpret_partitioned_jvp(context, &partition, &operands, state_count)?
+        context.interpret_partitioned_jvp_program(&partition, &operands, state_count)?
     };
     check_count!("output", outputs, fused_state_count, ProgramError);
     let (primal_outputs, tangent_outputs) = outputs.split_at(state_count);
@@ -2370,7 +2370,7 @@ where
     C: Context + Zero<C::Value>,
     C::Type: DifferentiableType + WhileTypeSemantics,
     C::Value: Concretizable<bool>,
-    C::Operation: ZeroOperationProvider<C::Type>,
+    C::Operation: OperationProvider<C::Type, ZeroOperation<C::Type>, Operation = C::Operation>,
     for<'operation> &'operation WhileOperation<C::Type>: TryFrom<&'operation C::Operation>,
 {
     let state_count = inputs.len();

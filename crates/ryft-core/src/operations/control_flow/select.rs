@@ -7,11 +7,12 @@ use crate::differentiation::{DifferentiableType, DifferentiationDual, Elementwis
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::ElementwiseOperation;
-use crate::operations::constants::zero::{Zero, ZeroOperationProvider};
+use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::constants::zero_like::ZeroLikeOperation;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, Type, TypeError, Typed, Value,
+    MaybeZero, Operation, OperationFormatter, OperationProvider, ProgramError, RegionInterface, Type, TypeError, Typed,
+    Value,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -227,7 +228,7 @@ impl_select_differentiation! {
     transpose<V, O>
     where
         V::Type: DifferentiableType,
-        O: From<ZeroLikeOperation<V::Type>> + ZeroOperationProvider<V::Type> + From<SelectOperation<V::Type>>,
+        O: From<ZeroLikeOperation<V::Type>> + OperationProvider<V::Type, ZeroOperation<V::Type>, Operation = O> + From<SelectOperation<V::Type>>,
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
     {
         |_operation, context, _driver, inputs, outputs| {

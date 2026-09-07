@@ -26,15 +26,17 @@
 //! rule. Eagerly, a bit view is a [`RegisterValue::BitReference`] handle over the root reference; a bit of a bit has no
 //! eager handle, so nested bit views are reachable only through staged programs and their discharge.
 //!
-//! The transform legs are reached through the public entry points ([`differentiate_at`] for `jvp` and `vjp`, and
-//! [`batch`]) over a live register reference. The generic reference primitives ([`ReferenceNewOperation`] and its
-//! siblings) are wrapped by the family and interpret eagerly through the value-level capabilities implemented on
-//! [`RegisterValue`], and their generic differentiation, transposition, and batching rules apply at the eager context
-//! and at the staged contexts that transforms instantiate. The family supplies its allocation and accumulation
-//! operations through [`ReferenceNewOperationProvider`] and [`ReferenceAddUpdateOperationProvider`], so generic
-//! transposition can allocate cotangent references without any downstream implementation for a core-owned tracer.
-//! `register.add_update` retains family-owned addition semantics; the other reference primitives reuse their generic
-//! transform rules.
+//! The transform legs are reached through the public entry points ([`differentiate_at`] for `jvp`, `vjp`, and
+//! `value_and_gradient`, and [`batch`]) over a live register reference. The generic reference primitives
+//! ([`ReferenceNewOperation`] and its siblings) are wrapped by the family and interpret eagerly through the value-level
+//! capabilities implemented on [`RegisterValue`], and their generic differentiation, transposition, and batching rules
+//! apply at the eager context and at the staged contexts that transforms instantiate. The family selects allocation,
+//! accumulation, and freezing operations through [`OperationProvider`], using the requested operation as a marker.
+//! Generic transposition can therefore allocate cotangent references and use [`ReferenceAddUpdate`] on core-owned
+//! tracers without a downstream tracer implementation. `register.add_update` retains family-owned addition semantics;
+//! the other reference primitives reuse their generic transform rules. The gradient convenience boundary also uses
+//! allocation and freezing to manage internal cotangent references, returning ordinary register values in the original
+//! parameter structure.
 
 // TODO(eaplatanios): Review this module.
 
@@ -47,27 +49,26 @@ use pretty_assertions::assert_eq;
 
 use ryft_core::macros::check_count;
 use ryft_core::{
-    AddOperation, AtomId, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableType, BatchedOutputs,
-    BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError, BatchingPolicy,
+    AddOperation, ArrayIrType, AtomId, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableType,
+    BatchedOutputs, BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError, BatchingPolicy,
     BoundaryPreservingBatchedProgram, Context, CotangentDestination, CotangentDestinationKind, CotangentSeed,
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
     DifferentiationError, DifferentiationPolicy, Domain, EagerContext, EffectClass, EffectClasses, Effects,
     ExternalReferenceBinding, InputRegionProvenance, InstructionId, InterpretableOperation, InterpretationDriver,
-    MaybeZero, NoIdentity, Operation, OutputRegionProvenance, Parameter, PartialValue, PartiallyEvaluatableOperation,
-    Placeholder, Program, ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, RecursiveBatchingPolicy,
-    RecursiveReferenceDischargeDriver, Reference, ReferenceAccessMode, ReferenceAddUpdate,
-    ReferenceAddUpdateOperationProvider, ReferenceAlias, ReferenceAliasEdge, ReferenceAliasKind, ReferenceAliasOrigin,
+    MaybeZero, NoIdentity, OneOperation, Operation, OperationProvider, OutputRegionProvenance, Parameter, PartialValue,
+    PartiallyEvaluatableOperation, Placeholder, Program, ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError,
+    RecursiveBatchingPolicy, RecursiveReferenceDischargeDriver, Reference, ReferenceAccessMode, ReferenceAddUpdate,
+    ReferenceAddUpdateOperation, ReferenceAlias, ReferenceAliasEdge, ReferenceAliasKind, ReferenceAliasOrigin,
     ReferenceBoundary, ReferenceBoundaryError, ReferenceDischargeContext, ReferenceDischargeDriver,
     ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion,
     ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation,
     ReferenceDischargeableType, ReferenceEffect, ReferenceFreeze, ReferenceFreezeOperation, ReferenceId, ReferenceNew,
-    ReferenceNewOperation, ReferenceNewOperationProvider, ReferenceRead, ReferenceReadOperation, ReferenceSource,
-    ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceView, ReferenceViewOperation, ReferenceViewPath,
-    ReferenceViewStep, ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation, RegionId,
-    RegionInterface, RegionRef, RegionSlot, Trace, Tracer, TracingContext, TransposableOperation, TranspositionContext,
-    TranspositionDriver, Type, TypeError, Typed, Value, ValueId, ViewOverlap, ViewSymbol, ViewSymbolBinding, Zero,
-    ZeroOperation, batch, batch_reference_view_operation, differentiate_at, discharge_reference_free_operation,
-    validate_reference_boundary,
+    ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSource, ReferenceSwap,
+    ReferenceSwapOperation, ReferenceType, ReferenceView, ReferenceViewOperation, ReferenceViewPath, ReferenceViewStep,
+    ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation, RegionId, RegionInterface, RegionRef,
+    RegionSlot, Trace, Tracer, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, Type,
+    TypeError, Typed, Value, ValueId, ViewOverlap, ViewSymbol, ViewSymbolBinding, Zero, ZeroOperation, batch,
+    batch_reference_view_operation, differentiate_at, discharge_reference_free_operation, validate_reference_boundary,
 };
 
 /// Destination universe of the downstream programs: the eager context over the register family, which is what a
@@ -377,13 +378,6 @@ impl ReferenceSwap for RegisterValue {
     }
 }
 
-impl ReferenceAddUpdate for RegisterValue {
-    fn add_update(&self, update: &Self) -> Result<(), ProgramError> {
-        let current = self.read()?.register()?;
-        self.write(&Self::Register(current + update.register()?))
-    }
-}
-
 impl ReferenceFreeze for RegisterValue {
     fn freeze(self) -> Result<Self, ProgramError> {
         self.reference()?.freeze().map_err(ProgramError::custom)
@@ -499,6 +493,7 @@ enum RegisterOperation {
     Negate,
     Add(AddOperation<RegisterIrType>),
     Zero(ZeroOperation<RegisterIrType>),
+    One,
     ReferenceNew(ReferenceNewOperation<RegisterType, RegisterIrType>),
     Read(ReferenceReadOperation<RegisterType, RegisterIrType>),
     Write(ReferenceWriteOperation<RegisterType, RegisterIrType>),
@@ -521,6 +516,16 @@ impl From<AddOperation<RegisterIrType>> for RegisterOperation {
 impl From<ZeroOperation<RegisterIrType>> for RegisterOperation {
     fn from(operation: ZeroOperation<RegisterIrType>) -> Self {
         Self::Zero(operation)
+    }
+}
+
+impl OperationProvider<RegisterIrType, OneOperation<RegisterIrType>> for RegisterOperation {
+    type Operation = Self;
+
+    fn provide(request: OneOperation<RegisterIrType>, input_types: &[&RegisterIrType]) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 0, ProgramError);
+        <&RegisterType>::try_from(request.r#type())?;
+        Ok(Self::One)
     }
 }
 
@@ -560,14 +565,40 @@ impl From<ReferenceFreezeOperation<RegisterType, RegisterIrType>> for RegisterOp
     }
 }
 
-impl ReferenceNewOperationProvider<RegisterIrType> for RegisterOperation {
-    fn reference_new_operation() -> Self {
-        Self::ReferenceNew(ReferenceNewOperation::new())
+impl OperationProvider<RegisterIrType, ReferenceNewOperation<RegisterIrType, RegisterIrType>> for RegisterOperation {
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceNewOperation<RegisterIrType, RegisterIrType>,
+        input_types: &[&RegisterIrType],
+    ) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 1, ProgramError);
+        Ok(Self::ReferenceNew(ReferenceNewOperation::new()))
     }
 }
 
-impl ReferenceAddUpdateOperationProvider<RegisterIrType> for RegisterOperation {
-    fn reference_add_update_operation() -> Result<Self, ProgramError> {
+impl OperationProvider<RegisterIrType, ReferenceFreezeOperation<RegisterIrType, RegisterIrType>> for RegisterOperation {
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceFreezeOperation<RegisterIrType, RegisterIrType>,
+        input_types: &[&RegisterIrType],
+    ) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 1, ProgramError);
+        Ok(Self::Freeze(ReferenceFreezeOperation::new()))
+    }
+}
+
+impl OperationProvider<RegisterIrType, ReferenceAddUpdateOperation<RegisterIrType, RegisterIrType>>
+    for RegisterOperation
+{
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceAddUpdateOperation<RegisterIrType, RegisterIrType>,
+        input_types: &[&RegisterIrType],
+    ) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 2, ProgramError);
         Ok(Self::AddUpdate)
     }
 }
@@ -580,6 +611,7 @@ impl Operation for RegisterOperation {
             Self::Negate => "register.negate",
             Self::Add(_) => "register.add",
             Self::Zero(_) => "register.zero",
+            Self::One => "register.one",
             Self::ReferenceNew(operation) => operation.name(),
             Self::Read(operation) => operation.name(),
             Self::Write(operation) => operation.name(),
@@ -638,6 +670,11 @@ impl Operation for RegisterOperation {
                 Ok(vec![RegisterIrType::Register(RegisterType)])
             }
             Self::Zero(operation) => operation.infer_output_types(input_types, region_interfaces),
+            Self::One => {
+                check_count!("input", input_types, 0, TypeError);
+                check_count!("region", region_interfaces, 0, TypeError);
+                Ok(vec![RegisterIrType::Register(RegisterType)])
+            }
             Self::ReferenceNew(operation) => operation.infer_output_types(input_types, region_interfaces),
             Self::Read(operation) => operation.infer_output_types(input_types, region_interfaces),
             Self::Write(operation) => operation.infer_output_types(input_types, region_interfaces),
@@ -677,7 +714,7 @@ impl Operation for RegisterOperation {
 
     fn effects(&self) -> Cow<'_, Effects> {
         match self {
-            Self::Negate | Self::Add(_) | Self::Zero(_) | Self::BitExtract | Self::BitInsert => {
+            Self::Negate | Self::Add(_) | Self::Zero(_) | Self::One | Self::BitExtract | Self::BitInsert => {
                 Cow::Borrowed(Effects::empty())
             }
             Self::ReferenceNew(operation) => operation.effects(),
@@ -734,7 +771,7 @@ where
         // Access arms see only discharged references: the dispatch path replays accesses to preserved references verbatim
         // before any rule runs, so only the allocation arm still distinguishes selected from preserved.
         match self {
-            Self::Negate | Self::Add(_) | Self::Zero(_) | Self::BitExtract | Self::BitInsert => {
+            Self::Negate | Self::Add(_) | Self::Zero(_) | Self::One | Self::BitExtract | Self::BitInsert => {
                 discharge_reference_free_operation(self, context, driver, inputs)
             }
             Self::ReferenceNew(_) => {
@@ -995,6 +1032,10 @@ impl<C: Domain<Type = RegisterIrType, Value = RegisterValue>> InterpretableOpera
                     }
                 }
             }
+            Self::One => {
+                check_count!("input", inputs, 0, ProgramError);
+                Ok(vec![RegisterValue::Register(1)])
+            }
             // The wrapped primitives interpret through the eager capabilities of `RegisterValue`.
             Self::ReferenceNew(operation) => operation.interpret(context, driver, inputs),
             Self::Read(operation) => operation.interpret(context, driver, inputs),
@@ -1003,7 +1044,10 @@ impl<C: Domain<Type = RegisterIrType, Value = RegisterValue>> InterpretableOpera
             Self::Freeze(operation) => operation.interpret(context, driver, inputs),
             Self::AddUpdate => {
                 check_count!("input", inputs, 2, ProgramError);
-                inputs[0].add_update(&inputs[1])?;
+                // The capability dispatches to this operation for both eager values and tracers. Execute the
+                // primitive here instead of calling the capability again, which would recursively bind itself.
+                let current = inputs[0].read()?.register()?;
+                inputs[0].write(&RegisterValue::Register(current + inputs[1].register()?))?;
                 Ok(Vec::new())
             }
             Self::Call => driver.interpret_region(context, 0, inputs.to_vec()),
@@ -1089,7 +1133,7 @@ impl<C: Context<Type = RegisterIrType, Operation = RegisterOperation> + Zero<C::
                 };
                 Ok(vec![DifferentiationDual::new(primal, tangent)?])
             }
-            Self::Zero(_) => {
+            Self::Zero(_) | Self::One => {
                 check_count!("input", inputs, 0, ProgramError);
                 Ok(vec![DifferentiationDual::new_with_zero_tangent(bind_register_output(
                     context.primal(),
@@ -1105,7 +1149,14 @@ impl<C: Context<Type = RegisterIrType, Operation = RegisterOperation> + Zero<C::
             Self::AddUpdate => {
                 check_count!("input", inputs, 2, ProgramError);
                 if inputs[0].tangent().is_zero() && !inputs[1].tangent().is_zero() {
-                    return Err(DifferentiationError::PlumbingReferenceTangent { operation: self.name() });
+                    return Err(ProgramError::InvalidArgument {
+                        message: format!(
+                            "`{}` writes a live tangent into a reference that carries no tangent; pass the reference \
+                             as a differentiated input instead of capturing it",
+                            self.name(),
+                        ),
+                    }
+                    .into());
                 }
                 context.primal().bind(self.clone(), Vec::new(), &primals)?;
                 if let (MaybeZero::Value(reference), MaybeZero::Value(tangent)) =
@@ -1168,7 +1219,7 @@ impl TransposableOperation<RegisterValue, RegisterOperation> for RegisterOperati
                 check_count!("output", outputs, 1, ProgramError);
                 Ok(vec![outputs[0].clone(), outputs[0].clone()])
             }
-            Self::Zero(_) => {
+            Self::Zero(_) | Self::One => {
                 check_count!("input", inputs, 0, ProgramError);
                 Ok(Vec::new())
             }
@@ -2176,6 +2227,33 @@ fn test_downstream_dynamic_view_discharges_through_a_value_bound_alias() {
 }
 
 #[test]
+fn test_downstream_reference_add_update_stages_the_family_operation() {
+    // The generic value capability selects the downstream operation for a core-owned tracer, while eager replay
+    // executes the register operation's own addition. Neither path requires a canonical array accumulation operation.
+    let (_, program): (_, Program<_, _, (RegisterValue, RegisterValue), RegisterValue>) = RegisterDestination::trace(
+        |(reference, update): (RegisterTracer, RegisterTracer)| {
+            reference.add_update(&update)?;
+            Ok(update)
+        },
+        (RegisterIrType::Reference(ReferenceType::new(RegisterType)), RegisterIrType::Register(RegisterType)),
+    )
+    .unwrap();
+    assert_eq!(
+        program.to_string(),
+        indoc! {"
+            lambda %0:ref<register>, %1:register .
+            let register.add_update %0 %1
+            in (%1)"},
+    );
+    let reference = Reference::new(RegisterValue::Register(4)).unwrap();
+    assert_eq!(
+        program.interpret((RegisterValue::Reference(reference.clone()), RegisterValue::Register(3))),
+        Ok(RegisterValue::Register(3)),
+    );
+    assert_eq!(reference.read(), Ok(RegisterValue::Register(7)));
+}
+
+#[test]
 fn test_downstream_reference_universe_jvp_through_the_public_boundary() {
     // Forward mode pairs the live register reference with the caller's tangent reference and mutates both in program
     // order: `r = 1 + 3` and `ṫ = 5 + 2`, with the read returning the updated contents of each.
@@ -2251,6 +2329,84 @@ fn test_downstream_reference_universe_vjp_with_a_local_allocation() {
         .unwrap();
     assert_eq!(value, RegisterValue::Register(3));
     assert_eq!(pullback.apply(RegisterValue::Register(7)), Ok(RegisterValue::Register(7)));
+}
+
+#[test]
+fn test_downstream_reference_operation_providers_support_value_only_composite_families() {
+    // A downstream family can use the core composite type without supporting reference operations. Owning the
+    // providers on the operation family lets it opt into ordinary gradients without an orphan-rule conflict.
+    /// A downstream operation family whose only operation has no operands or results.
+    #[derive(Clone)]
+    struct ValueOnlyOperation;
+
+    impl Operation for ValueOnlyOperation {
+        type Type = ArrayIrType;
+
+        fn name(&self) -> &'static str {
+            "value_only"
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[ArrayIrType],
+            region_interfaces: &[RegionInterface<ArrayIrType>],
+        ) -> Result<Vec<ArrayIrType>, TypeError> {
+            check_count!("input", input_types, 0, TypeError);
+            check_count!("region", region_interfaces, 0, TypeError);
+            Ok(Vec::new())
+        }
+    }
+
+    impl OperationProvider<ArrayIrType, ReferenceNewOperation<ArrayIrType, ArrayIrType>> for ValueOnlyOperation {
+        type Operation = Self;
+
+        fn provide(
+            _request: ReferenceNewOperation<ArrayIrType, ArrayIrType>,
+            _input_types: &[&ArrayIrType],
+        ) -> Result<Self, ProgramError> {
+            Err(ProgramError::UnsupportedOperation {
+                message: "this operation family does not support reference allocation".to_string(),
+            })
+        }
+    }
+
+    impl OperationProvider<ArrayIrType, ReferenceFreezeOperation<ArrayIrType, ArrayIrType>> for ValueOnlyOperation {
+        type Operation = Self;
+
+        fn provide(
+            _request: ReferenceFreezeOperation<ArrayIrType, ArrayIrType>,
+            _input_types: &[&ArrayIrType],
+        ) -> Result<Self, ProgramError> {
+            Err(ProgramError::UnsupportedOperation {
+                message: "this operation family does not support reference freezing".to_string(),
+            })
+        }
+    }
+
+    // Unsupported constructors are fallible; ordinary gradients do not call them for value-only inputs.
+    assert!(matches!(
+        ValueOnlyOperation::provide(ReferenceNewOperation::new(), &[]),
+        Err(ProgramError::UnsupportedOperation { message, .. })
+            if message == "this operation family does not support reference allocation",
+    ));
+    assert!(matches!(
+        ValueOnlyOperation::provide(ReferenceFreezeOperation::new(), &[]),
+        Err(ProgramError::UnsupportedOperation { message, .. })
+            if message == "this operation family does not support reference freezing",
+    ));
+}
+
+#[test]
+fn test_downstream_reference_universe_value_and_gradient() {
+    // The composite parameter is one leaf regardless of its member variant. A reference input therefore reconstructs
+    // as an ordinary register cotangent, beside the ordinary input's cotangent, while primal mutation remains visible.
+    let reference = Reference::new(RegisterValue::Register(1)).unwrap();
+    assert_eq!(
+        differentiate_at((RegisterValue::Reference(reference.clone()), RegisterValue::Register(3)))
+            .value_and_gradient(read_modify_write),
+        Ok((RegisterValue::Register(4), (RegisterValue::Register(1), RegisterValue::Register(1)))),
+    );
+    assert_eq!(reference.read(), Ok(RegisterValue::Register(4)));
 }
 
 #[test]
@@ -2333,7 +2489,7 @@ fn test_downstream_dynamic_view_vjp_resolves_the_index_of_the_viewed_cotangent_r
     // before the read's accumulation and the write's swap act on that view, and it is returned by identity.
     let transposed = pullback
         .linear_program()
-        .transpose_with_destinations(
+        .transpose_with_respect_to(
             &[0, 1, 2],
             &[CotangentDestinationKind::Reference, CotangentDestinationKind::Return, CotangentDestinationKind::Return],
         )

@@ -813,7 +813,7 @@ mod tests {
             ]),
         );
 
-        let pullback = program.transpose_with_respect_to(&[0]).unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
         assert_eq!(
             pullback.interpret(vec![ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0],))]),
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0,]))]),
@@ -1271,7 +1271,7 @@ in (%4)
 
         assert_eq!(
             program
-                .transpose_with_respect_to(&[0, 1])
+                .transpose_with_respect_to(&[0, 1], &[])
                 .unwrap()
                 .interpret(vec![ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,]))]),
             Ok(vec![
@@ -2126,7 +2126,7 @@ in (%4)
                 vec![expected_output, ArrayIrValue::Array(Array::matrix(3, 2, vec![3.0_f64, 4.0, 3.0, 4.0, 3.0, 4.0])),]
             ),
         );
-        let pullback = program.transpose_with_respect_to(&[0]).unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
         assert_eq!(
             pullback.interpret(vec![ArrayIrValue::Array(Array::matrix(3, 2, vec![1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0],))]),
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![9.0_f64, 12.0]))]),
@@ -2251,7 +2251,7 @@ in (%4)
             ]),
         );
         assert!(matches!(
-            program.transpose_with_respect_to(&[0]),
+            program.transpose_with_respect_to(&[0], &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "operation `dynamic_shape_slice` does not yet support reverse-mode differentiation",
         ));
@@ -2413,7 +2413,7 @@ in (%4)
             ]),
             Ok(vec![ArrayIrValue::Array(Array::vector(vec![2.5_f64, 2.5, 2.5]))]),
         );
-        let pullback = program.transpose_with_respect_to(&[0]).unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
         assert_eq!(
             pullback.interpret(vec![
                 ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0])),
@@ -2745,7 +2745,7 @@ in (%4)
         );
         assert_eq!(
             program
-                .transpose_with_respect_to(&[0, 1])
+                .transpose_with_respect_to(&[0, 1], &[])
                 .unwrap()
                 .interpret(vec![ArrayIrValue::Array(Array::vector(vec![7.0_f64, 8.0, 9.0]))]),
             Ok(vec![
@@ -2791,7 +2791,7 @@ in (%4)
         // Forward mode is unaffected: only the cotangent slicing needs the non-concatenated extent.
         assert!(program.jvp().is_ok());
 
-        let pullback = program.transpose_with_respect_to(&[0, 1]).unwrap();
+        let pullback = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
         assert_eq!(
             pullback.to_string(),
             indoc! {"
@@ -2856,7 +2856,7 @@ in (%4)
             .unwrap();
 
         assert!(matches!(
-            program.transpose_with_respect_to(&[0, 1]),
+            program.transpose_with_respect_to(&[0, 1], &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "direct transposition of a dynamic `concatenate` requires linearization so its input \
                                extents can be retained as residuals",

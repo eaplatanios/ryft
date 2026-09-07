@@ -3,8 +3,8 @@ use std::sync::{LazyLock, Mutex};
 use std::{env, fs};
 
 use ryft_cuda::{
-    CudaArtifactFormat, CudaError, CudaKernelAbi, CudaKernelArgument, CudaKernelArtifact, CudaKernelLaunchDimensions,
-    CudaKernelLauncher, CudaKernelParameterType, CudaScalarType, CudaScalarValue,
+    CudaArtifactFormat, CudaKernelAbi, CudaKernelArgument, CudaKernelArtifact, CudaKernelLaunchDimensions,
+    CudaKernelLauncher, CudaKernelParameterType, CudaScalarType, CudaScalarValue, Error,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -229,18 +229,18 @@ fn launch_cutile(call_frame: &FfiCallFrame<'_>) -> Result<(), FfiError> {
 
     // `cutile_python_v2` flattens each rank-one ArrayConstraint into its device pointer, shape, and stride.
     // The ConstantConstraint for the tile size is intentionally omitted from the launch ABI.
-    let launch = (|| -> Result<_, CudaError> {
+    let launch = (|| -> Result<_, Error> {
         unsafe {
             context.cuda_kernel_launch(vec![
                 lhs_buffer.cuda_kernel_argument()?,
-                CudaKernelArgument::scalar(CudaScalarValue::I32(1)),
-                CudaKernelArgument::scalar(CudaScalarValue::I32(1)),
+                CudaKernelArgument::Scalar(CudaScalarValue::I32(1)),
+                CudaKernelArgument::Scalar(CudaScalarValue::I32(1)),
                 rhs_buffer.cuda_kernel_argument()?,
-                CudaKernelArgument::scalar(CudaScalarValue::I32(1)),
-                CudaKernelArgument::scalar(CudaScalarValue::I32(1)),
+                CudaKernelArgument::Scalar(CudaScalarValue::I32(1)),
+                CudaKernelArgument::Scalar(CudaScalarValue::I32(1)),
                 out_buffer.cuda_kernel_argument()?,
-                CudaKernelArgument::scalar(CudaScalarValue::I32(1)),
-                CudaKernelArgument::scalar(CudaScalarValue::I32(1)),
+                CudaKernelArgument::Scalar(CudaScalarValue::I32(1)),
+                CudaKernelArgument::Scalar(CudaScalarValue::I32(1)),
             ])
         }
     })()

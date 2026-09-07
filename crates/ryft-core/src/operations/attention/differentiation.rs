@@ -11,10 +11,10 @@ use crate::operations::attention::{
     DOT_PRODUCT_ATTENTION_OPERATION_NAME, DotProductAttention, DotProductAttentionBackwardOperation,
     DotProductAttentionOperation,
 };
-use crate::operations::constants::zero::{Zero, ZeroOperationProvider};
+use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::differentiation::custom_vjp::{CustomVjp, custom_vjp};
 use crate::parameters::Parameter;
-use crate::programs::{ProgramError, Typed, Value};
+use crate::programs::{OperationProvider, ProgramError, Typed, Value};
 use crate::tracing::DomainTracer;
 
 /// Residuals retained by the fused attention reverse rule.
@@ -84,7 +84,8 @@ fn bind_attention_backward<D: Domain<Type = ArrayType>>(
     configuration: AttentionConfiguration,
 ) -> Result<AttentionInputs<DomainTracer<D>>, ProgramError>
 where
-    D::Operation: From<DotProductAttentionBackwardOperation> + ZeroOperationProvider<ArrayType>,
+    D::Operation: From<DotProductAttentionBackwardOperation>
+        + OperationProvider<ArrayType, ZeroOperation<ArrayType>, Operation = D::Operation>,
 {
     let signature = inputs.signature();
     let context = inputs.query.dispatch_domain();
@@ -139,7 +140,8 @@ pub fn differentiable_dot_product_attention<D>(
 >
 where
     D: Domain<Type = ArrayType>,
-    D::Operation: From<DotProductAttentionBackwardOperation> + ZeroOperationProvider<ArrayType>,
+    D::Operation: From<DotProductAttentionBackwardOperation>
+        + OperationProvider<ArrayType, ZeroOperation<ArrayType>, Operation = D::Operation>,
     DomainTracer<D>: DotProductAttention,
 {
     custom_vjp(

@@ -13,13 +13,15 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
-use crate::operations::references::reference_add_update::ReferenceAddUpdateOperationProvider;
-use crate::operations::references::reference_new::ReferenceNewOperationProvider;
+use crate::operations::references::reference_add_update::ReferenceAddUpdate;
+use crate::operations::references::reference_new::ReferenceNewOperation;
+
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    EffectClasses, Effects, MaybeZero, Operation, ProgramError, ReferenceAccessMode, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceEffect, ReferenceType, ReferenceViewOperation, RegionInterface, Type, TypeError, Typed, Value,
+    EffectClasses, Effects, MaybeZero, Operation, OperationProvider, ProgramError, ReferenceAccessMode,
+    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, ReferenceEffect, ReferenceType, ReferenceViewOperation, RegionInterface, Type,
+    TypeError, Typed, Value,
 };
 use crate::tracing::{Tracer, TracingContext};
 use std::borrow::Cow;
@@ -66,19 +68,6 @@ pub trait ReferenceFreeze<Output = Self>: Sized {
     /// # Ok::<(), ryft_core::ProgramError>(())
     /// ```
     fn freeze(self) -> Result<Output, ProgramError>;
-}
-
-/// Supplies the operation that consumes a reference and returns its final contents. Transforms bind this operation
-/// through their context so that execution and staging use the operation family's reference semantics.
-pub trait ReferenceFreezeOperationProvider<T: Type>: Operation {
-    /// Returns the operation that freezes one reference, invalidating its aliases and returning its referent.
-    /// The default reports unsupported freezing, allowing value-only families to use transforms that only
-    /// request this operation when reference state is present.
-    fn reference_freeze_operation() -> Result<Self, ProgramError> {
-        Err(ProgramError::UnsupportedOperation {
-            message: "this operation family does not support reference freezing".to_string(),
-        })
-    }
 }
 
 static REFERENCE_FREEZE_OPERATION_EFFECTS: LazyLock<Effects> = LazyLock::new(|| {
@@ -239,8 +228,8 @@ where
     V: Value<Type = U>,
     O: ReferenceViewOperation<Type = U>
         + ResidualZeroProvider<U>
-        + ReferenceNewOperationProvider<U>
-        + ReferenceAddUpdateOperationProvider<U>,
+        + OperationProvider<U, ReferenceNewOperation<U, U>, Operation = O>,
+    Tracer<TracingContext<V, O>>: ReferenceAddUpdate,
 {
     // A freeze reads the final state and consumes the allocation, so its transpose accumulates the frozen value's
     // cotangent into the root's cotangent reference exactly like a read. The cotangent reference stays live for the
@@ -256,7 +245,7 @@ where
         check_count!("output", outputs, 1, ProgramError);
         if let MaybeZero::Value(cotangent) = &outputs[0] {
             let reference = context.cotangent_reference(0)?;
-            context.bind(O::reference_add_update_operation()?, Vec::new(), &[reference, cotangent.clone()])?;
+            reference.add_update(cotangent)?;
         }
         Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)])
     }

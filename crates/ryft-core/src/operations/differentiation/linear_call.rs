@@ -1067,7 +1067,7 @@ mod tests {
         let inputs = vec![ArrayIrValue::Array(Array::scalar(3.0_f32)), ArrayIrValue::Array(Array::scalar(4.0_f32))];
         let expected = vec![ArrayIrValue::Array(Array::scalar(12.0_f32))];
         assert_eq!(discharged.interpret(inputs.clone()), Ok(expected.clone()));
-        assert_eq!(discharged.transpose_with_respect_to(&[1]).unwrap().interpret(inputs), Ok(expected));
+        assert_eq!(discharged.transpose_with_respect_to(&[1], &[]).unwrap().interpret(inputs), Ok(expected));
 
         // A targeted rewrite discharges only the selected region's allocation and retains the other lifecycle.
         let targets = program.reference_discharge_targets(0).unwrap();

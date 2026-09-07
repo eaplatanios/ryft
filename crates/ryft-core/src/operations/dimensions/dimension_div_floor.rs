@@ -24,7 +24,7 @@ define_arithmetic_dimension_operation!(
 impl OperationProvider<DimensionType> for DivOperation<DimensionType> {
     type Operation = DimensionDivFloorOperation;
 
-    fn provide(input_types: &[&DimensionType]) -> Result<Self::Operation, ProgramError> {
+    fn provide(_request: (), input_types: &[&DimensionType]) -> Result<Self::Operation, ProgramError> {
         check_count!("input", input_types, 2, ProgramError);
         Ok(DimensionDivFloorOperation::new(input_types[0], input_types[1])?)
     }

@@ -20,7 +20,7 @@ use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
     DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, TransposableOperation,
-    TranspositionContext, TranspositionDriver, primal_to_tangent_duals,
+    TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
@@ -834,7 +834,7 @@ where
     let tangent = match array.tangent() {
         MaybeZero::Zero(_) => MaybeZero::Zero(primal.r#type().tangent()?),
         MaybeZero::Value(array_tangent) => {
-            let tangent_inputs = primal_to_tangent_duals(context, inputs)?;
+            let tangent_inputs = context.dual_primal_to_tangent(inputs)?;
             let (array, output_extents) = tangent_inputs.split_first().unwrap();
             let context = context.tangent();
             let mut residuals = LinearResiduals::new();
@@ -1355,7 +1355,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
-        let pullback = program.transpose_with_respect_to(&[0]).unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
         assert_eq!(
             pullback.to_string(),
             indoc::indoc! {r#"
@@ -1384,7 +1384,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
-        let pullback = program.transpose_with_respect_to(&[0]).unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
         let ArrayOperation::ParallelSumScatter(adjoint) = pullback.instructions()[0].operation() else {
             panic!("expected grouped all-gather transpose to stage parallel-sum-scatter");
         };
@@ -1413,7 +1413,7 @@ mod tests {
             )
             .unwrap()[0];
         let program = builder.build::<Array, Array>(vec![output], Placeholder, Placeholder).unwrap();
-        let pullback = program.transpose_with_respect_to(&[0]).unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
         assert!(matches!(pullback.instructions()[0].operation(), ArrayOperation::ParallelSumScatter(_)));
         assert_eq!(pullback.output_types(), vec![input_type.cotangent().unwrap()]);
     }

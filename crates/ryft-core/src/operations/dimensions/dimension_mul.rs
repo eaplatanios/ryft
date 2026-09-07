@@ -24,7 +24,7 @@ define_arithmetic_dimension_operation!(
 impl OperationProvider<DimensionType> for MulOperation<DimensionType> {
     type Operation = DimensionMulOperation;
 
-    fn provide(input_types: &[&DimensionType]) -> Result<Self::Operation, ProgramError> {
+    fn provide(_request: (), input_types: &[&DimensionType]) -> Result<Self::Operation, ProgramError> {
         check_count!("input", input_types, 2, ProgramError);
         Ok(DimensionMulOperation::new(input_types[0], input_types[1])?)
     }

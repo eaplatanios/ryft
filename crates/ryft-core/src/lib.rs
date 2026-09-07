@@ -63,16 +63,16 @@ pub use differentiation::{
     BinaryElementwiseJvpOperands, BroadcastDerivativeAlignment, CotangentBatchingPolicy, CotangentDestination,
     CotangentDestinationKind, CotangentReferenceAccumulator, CotangentSeed, DenseDifferentiableType,
     DerivativeTransform, DifferentiableOperation, DifferentiableType, Differentiate, DifferentiationBoundaryPosition,
-    DifferentiationBuilder, DifferentiationBuilderContext, DifferentiationBuilderExecutionContext,
-    DifferentiationBuilderLinearityMode, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationParameterRole, DifferentiationPolicy, DifferentiationTracer,
-    ElementwiseDerivativeAlignment, ForwardModeDifferentiate, FusedDifferentiationPolicy, Hessian, HessianBlock,
-    HolomorphicLinearity, Jacobian, JacobianBlock, Linearization, LinearizationTracer, MemberDifferentiableOperation,
-    PartitionedDifferentiationPolicy, Pullback, Pushforward, RealLinearity, ReferenceOperandCotangents,
-    ResidualZeroProvider, ReverseModeDifferentiate, TransposableOperation, TranspositionContext, TranspositionDriver,
-    UnaryElementwiseJvpOperands, WithAuxiliaryOutput, WithCapture, WithContext, WithoutAuxiliaryOutput, WithoutCapture,
-    WithoutContext, binary_elementwise_jvp, differentiate_at, jvp_projected_operation, reference_operand_cotangents,
-    transpose_mixed_operation, transpose_projected_operation, unary_elementwise_jvp,
+    DifferentiationBuilder, DifferentiationBuilderContext, DifferentiationBuilderLinearityMode, DifferentiationContext,
+    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationParameterRole,
+    DifferentiationPolicy, DifferentiationTracer, ElementwiseDerivativeAlignment, ForwardModeDifferentiate,
+    FusedDifferentiationPolicy, Hessian, HessianBlock, HolomorphicLinearity, Jacobian, JacobianBlock, Linearization,
+    LinearizationContext, LinearizationTracer, MemberDifferentiableOperation, PartitionedDifferentiationPolicy,
+    Pullback, Pushforward, RealLinearity, ReferenceOperandCotangents, ResidualZeroProvider, ReverseModeDifferentiate,
+    TransposableOperation, TranspositionContext, TranspositionDriver, UnaryElementwiseJvpOperands, WithAuxiliaryOutput,
+    WithCapture, WithContext, WithoutAuxiliaryOutput, WithoutCapture, WithoutContext, binary_elementwise_jvp,
+    differentiate_at, jvp_projected_operation, reference_operand_cotangents, transpose_mixed_operation,
+    transpose_projected_operation, unary_elementwise_jvp,
 };
 pub use errors::{CustomError, Error, MaybeFallible};
 pub use interpretation::{
@@ -82,9 +82,8 @@ pub use interpretation::{
 pub use operations::compare::{COMPARE_OPERATION_NAME, Compare, CompareOperation, ComparisonDirection};
 pub use operations::constants::{
     CONSTANT_OPERATION_NAME, Constant, ConstantOperation, Fill, IOTA_OPERATION_NAME, Iota, IotaOperation,
-    ONE_LIKE_OPERATION_NAME, ONE_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation, OneOperationProvider,
+    ONE_LIKE_OPERATION_NAME, ONE_OPERATION_NAME, One, OneLike, OneLikeOperation, OneOperation,
     ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
-    ZeroOperationProvider,
 };
 pub use operations::control_flow::{
     CONDITION_OPERATION_NAME, ConditionOperation, SCAN_OPERATION_NAME, SELECT_OPERATION_NAME, ScanOperation, Select,
@@ -140,8 +139,7 @@ pub use operations::quantization::{BlockQuantize, SCALED_DOT_OPERATION_NAME, Sca
 pub use operations::references::{
     REFERENCE_ADD_UPDATE_OPERATION_NAME, REFERENCE_FREEZE_OPERATION_NAME, REFERENCE_NEW_OPERATION_NAME,
     REFERENCE_READ_OPERATION_NAME, REFERENCE_SWAP_OPERATION_NAME, REFERENCE_WRITE_OPERATION_NAME, ReferenceAddUpdate,
-    ReferenceAddUpdateOperation, ReferenceAddUpdateOperationProvider, ReferenceFreeze, ReferenceFreezeOperation,
-    ReferenceFreezeOperationProvider, ReferenceNew, ReferenceNewOperation, ReferenceNewOperationProvider,
+    ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
     ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
     ReferenceWriteOperation,
 };

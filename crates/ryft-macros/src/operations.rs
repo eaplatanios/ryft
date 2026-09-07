@@ -1513,7 +1513,7 @@ impl OperationEnum {
         // `Program::jvp`/`Program::linearize` bounds at their construction sites, so the dispatcher itself only
         // supplies the zero provider those rules use to materialize structural zeros.
         where_clause.predicates.push(syn::parse_quote! {
-            #differentiation_self_type: #ryft::ZeroOperationProvider<#primary_type>
+            #differentiation_self_type: #ryft::OperationProvider<#primary_type, #ryft::ZeroOperation<#primary_type>, Operation = #differentiation_self_type>
         });
 
         let jvp_arms = variants.iter().map(|variant| {

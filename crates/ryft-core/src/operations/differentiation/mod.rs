@@ -6,13 +6,15 @@
 
 // TODO(eaplatanios): Review this module.
 
+use crate::contexts::Context;
+use crate::differentiation::{DifferentiableType, DifferentiationDual};
+use crate::programs::{ProgramError, ReferenceBoundary, Type, TypeError, Typed};
+
 pub mod custom_jvp;
 pub mod custom_vjp;
 pub mod linear_call;
 pub mod stop_gradient;
-use crate::contexts::Context;
-use crate::differentiation::{DifferentiableType, DifferentiationDual, validate_differentiation_boundary};
-use crate::programs::{ProgramError, Type, TypeError, Typed};
+
 pub use custom_jvp::{CUSTOM_JVP_OPERATION_NAME, CustomJvp, CustomJvpOperation, custom_jvp};
 pub use custom_vjp::{CUSTOM_VJP_OPERATION_NAME, CustomVjp, CustomVjpOperation, custom_vjp};
 pub use linear_call::LinearCallOperation;
@@ -114,7 +116,7 @@ pub(crate) fn validate_custom_derivative_replay<C: Context<Type: DifferentiableT
         primal_types.as_slice(),
         output_types,
     )?;
-    validate_differentiation_boundary(context, inputs.iter().map(DifferentiationDual::primal), [], [])?;
+    ReferenceBoundary::new_for_differentiation(context, inputs.iter().map(DifferentiationDual::primal), [], [])?;
     if let Some(input) = inputs.iter().take(non_differentiated_count).find(|input| {
         !input.primal().r#type().is_reference()
             && !input.tangent().is_zero()

@@ -19,9 +19,9 @@ use ryft_macros::Parameter;
 
 use crate::arrays::addressing::ArraySliceAxis;
 use crate::arrays::ir::ArrayIrValue;
-use crate::arrays::operations::ArrayOperation;
 use crate::arrays::reference_views::{ArrayReference, ArrayReferenceView, ArrayReferenceViewTransform, ViewIndex};
 use crate::arrays::types::arrays::ArrayType;
+use crate::arrays::types::data::DataType;
 use crate::arrays::types::ir::ArrayIrType;
 use crate::batching::{
     BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingPolicy,
@@ -35,16 +35,15 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::references::forwarded_tangent;
 use crate::operations::{
-    Add, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAddUpdateOperationProvider, ReferenceFreeze,
-    ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceNewOperationProvider, ReferenceRead,
-    ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, Reshape,
-    Slice, UpdateSlice,
+    Add, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
+    ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation,
+    ReferenceWrite, ReferenceWriteOperation, Reshape, Slice, UpdateSlice,
 };
 use crate::parameters::Parameter;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, ProgramError, ProjectedValue, ReferenceAlias,
-    ReferenceAliasKind, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
+    EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, OperationProvider, ProgramError, ProjectedValue,
+    ReferenceAlias, ReferenceAliasKind, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
     ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceType, ReferenceView, ReferenceViewOperation,
     ReferenceViewValidationError, RegionInterface, TypeError, Typed, Value, ValueProjection, ViewSymbol,
     batch_reference_view_operation,
@@ -580,26 +579,113 @@ where
     Ok(outputs.remove(0))
 }
 
-// Array operation families share their canonical allocation and accumulation payloads with generic transforms.
+// Composite families select canonical operations; homogeneous families reject requests for reference state.
 impl<O: Operation<Type = ArrayIrType> + From<ReferenceNewOperation<ArrayType, ArrayIrType>>>
-    ReferenceNewOperationProvider<ArrayIrType> for O
+    OperationProvider<ArrayIrType, ReferenceNewOperation<ArrayIrType, ArrayIrType>> for O
 {
-    fn reference_new_operation() -> Self {
-        ReferenceNewOperation::new().into()
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceNewOperation<ArrayIrType, ArrayIrType>,
+        input_types: &[&ArrayIrType],
+    ) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 1, ProgramError);
+        Ok(ReferenceNewOperation::new().into())
+    }
+}
+
+impl<O: Operation<Type = ArrayIrType> + From<ReferenceFreezeOperation<ArrayType, ArrayIrType>>>
+    OperationProvider<ArrayIrType, ReferenceFreezeOperation<ArrayIrType, ArrayIrType>> for O
+{
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceFreezeOperation<ArrayIrType, ArrayIrType>,
+        input_types: &[&ArrayIrType],
+    ) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 1, ProgramError);
+        Ok(ReferenceFreezeOperation::new().into())
+    }
+}
+
+impl<O: Operation<Type = DataType>> OperationProvider<DataType, ReferenceNewOperation<DataType, DataType>> for O {
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceNewOperation<DataType, DataType>,
+        _input_types: &[&DataType],
+    ) -> Result<Self, ProgramError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: "this operation family does not support reference allocation".to_string(),
+        })
+    }
+}
+
+impl<O: Operation<Type = ArrayType>> OperationProvider<ArrayType, ReferenceNewOperation<ArrayType, ArrayType>> for O {
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceNewOperation<ArrayType, ArrayType>,
+        _input_types: &[&ArrayType],
+    ) -> Result<Self, ProgramError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: "this operation family does not support reference allocation".to_string(),
+        })
+    }
+}
+
+impl<O: Operation<Type = DataType>> OperationProvider<DataType, ReferenceFreezeOperation<DataType, DataType>> for O {
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceFreezeOperation<DataType, DataType>,
+        _input_types: &[&DataType],
+    ) -> Result<Self, ProgramError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: "this operation family does not support reference freezing".to_string(),
+        })
+    }
+}
+
+impl<O: Operation<Type = ArrayType>> OperationProvider<ArrayType, ReferenceFreezeOperation<ArrayType, ArrayType>>
+    for O
+{
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceFreezeOperation<ArrayType, ArrayType>,
+        _input_types: &[&ArrayType],
+    ) -> Result<Self, ProgramError> {
+        Err(ProgramError::UnsupportedOperation {
+            message: "this operation family does not support reference freezing".to_string(),
+        })
     }
 }
 
 impl<O: Operation<Type = ArrayIrType> + From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType>>>
-    ReferenceAddUpdateOperationProvider<ArrayIrType> for O
+    OperationProvider<ArrayIrType, ReferenceAddUpdateOperation<ArrayIrType, ArrayIrType>> for O
 {
-    fn reference_add_update_operation() -> Result<Self, ProgramError> {
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceAddUpdateOperation<ArrayIrType, ArrayIrType>,
+        input_types: &[&ArrayIrType],
+    ) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 2, ProgramError);
         Ok(ReferenceAddUpdateOperation::new().into())
     }
 }
 
 // Homogeneous array families can return or ignore cotangents, but their type universe contains no references.
-impl<V: Value<Type = ArrayType>> ReferenceAddUpdateOperationProvider<ArrayType> for ArrayOperation<V> {
-    fn reference_add_update_operation() -> Result<Self, ProgramError> {
+impl<O: Operation<Type = ArrayType>> OperationProvider<ArrayType, ReferenceAddUpdateOperation<ArrayType, ArrayType>>
+    for O
+{
+    type Operation = Self;
+
+    fn provide(
+        _request: ReferenceAddUpdateOperation<ArrayType, ArrayType>,
+        _input_types: &[&ArrayType],
+    ) -> Result<Self, ProgramError> {
         Err(ProgramError::UnsupportedOperation {
             message: "the homogeneous array operation family cannot accumulate into a reference destination"
                 .to_string(),
@@ -726,18 +812,6 @@ where
             .remove(0)
             .into_projected()
             .map_err(Into::into)
-    }
-}
-
-impl<V: Value<Type = ArrayIrType>> ReferenceAddUpdate<V> for V
-where
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType>>,
-{
-    fn add_update(&self, update: &V) -> Result<(), ProgramError> {
-        self.dispatch_domain()
-            .bind(ReferenceAddUpdateOperation::new(), Vec::new(), &[self.clone(), update.clone()])?;
-        Ok(())
     }
 }
 
@@ -870,7 +944,7 @@ mod tests {
     use crate::arrays::arrays::Array;
     use crate::arrays::batching::{ArrayIrBatch, ArrayIrBatching};
     use crate::arrays::dimensions::DimensionValue;
-    use crate::arrays::operations::ArrayIrOperation;
+    use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
     use crate::arrays::reference_discharge::ArrayReferenceDischarge;
     use crate::arrays::reference_views::ArrayReferenceViewError;
     use crate::arrays::types::data::DataType;
@@ -885,7 +959,7 @@ mod tests {
     use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::control_flow::scan::ScanOperation;
     use crate::operations::control_flow::r#while::WhileOperation;
-    use crate::operations::{REFERENCE_NEW_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME};
+    use crate::operations::{AddOperation, REFERENCE_NEW_OPERATION_NAME, REFERENCE_READ_OPERATION_NAME};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, ReferencePlacement};
     use crate::programs::{
@@ -1280,6 +1354,54 @@ mod tests {
         assert!(matches!(
             ArrayIrOperation::<Array>::from(ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 1, 1)])),
             ArrayIrOperation::ReferenceSlice(_),
+        ));
+    }
+
+    #[test]
+    fn test_operation_provider_reference_new() {
+        // Composite array families construct the canonical reference allocation operation.
+        assert!(matches!(
+            TestOperation::provide(
+                ReferenceNewOperation::<ArrayIrType, ArrayIrType>::new(),
+                &[&ArrayIrType::Array(ArrayType::scalar(DataType::F32))]
+            ),
+            Ok(ArrayIrOperation::ReferenceNew(_))
+        ));
+
+        // Homogeneous array and scalar families satisfy the provider contract without supporting references.
+        assert!(matches!(
+            ArrayOperation::<Array>::provide(ReferenceNewOperation::<ArrayType, ArrayType>::new(), &[]),
+            Err(ProgramError::UnsupportedOperation { message, .. })
+                if message == "this operation family does not support reference allocation",
+        ));
+        assert!(matches!(
+            AddOperation::<DataType>::provide(ReferenceNewOperation::<DataType, DataType>::new(), &[]),
+            Err(ProgramError::UnsupportedOperation { message, .. })
+                if message == "this operation family does not support reference allocation",
+        ));
+    }
+
+    #[test]
+    fn test_operation_provider_reference_freeze() {
+        // Extraction uses the canonical consuming operation, keeping alias invalidation in the reference machinery.
+        assert!(matches!(
+            TestOperation::provide(
+                ReferenceFreezeOperation::<ArrayIrType, ArrayIrType>::new(),
+                &[&ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)))]
+            ),
+            Ok(ArrayIrOperation::ReferenceFreeze(_))
+        ));
+
+        // Value-only families report unsupported construction instead of requiring reference conversions.
+        assert!(matches!(
+            ArrayOperation::<Array>::provide(ReferenceFreezeOperation::<ArrayType, ArrayType>::new(), &[]),
+            Err(ProgramError::UnsupportedOperation { message, .. })
+                if message == "this operation family does not support reference freezing",
+        ));
+        assert!(matches!(
+            AddOperation::<DataType>::provide(ReferenceFreezeOperation::<DataType, DataType>::new(), &[]),
+            Err(ProgramError::UnsupportedOperation { message, .. })
+                if message == "this operation family does not support reference freezing",
         ));
     }
 
@@ -2009,7 +2131,7 @@ mod tests {
         let tangent_reference = TestValue::Array(Array::vector(vec![0.5_f32, 0.25])).reference_new().unwrap();
         let (primal, tangent) =
             differentiate_at((reference.clone(), TestValue::Array(Array::vector(vec![3.0_f32, 4.0]))))
-                .jvp::<TestValue, _, _>(
+                .jvp::<_, TestValue, _, _>(
                     (tangent_reference.clone(), TestValue::Array(Array::vector(vec![5.0_f32, 6.0]))),
                     |(reference, value)| {
                         reference.add_update(&value)?;

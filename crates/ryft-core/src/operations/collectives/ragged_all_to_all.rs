@@ -20,7 +20,7 @@ use crate::contexts::{Context, Domain, ProjectedContext, ValueResolution};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
     DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, TransposableOperation,
-    TranspositionContext, TranspositionDriver, jvp_projected_operation, primal_to_tangent_duals,
+    TranspositionContext, TranspositionDriver, jvp_projected_operation,
 };
 use crate::interpretation::{
     InterpretableOperation, InterpretationDriver, MemberInterpretableOperation, interpret_projected_operation,
@@ -704,7 +704,7 @@ where
         let tangent = if operand.tangent().is_zero() && output.tangent().is_zero() {
             MaybeZero::Zero(primal.r#type().tangent()?)
         } else {
-            let tangent_inputs = primal_to_tangent_duals(context, inputs)?;
+            let tangent_inputs = context.dual_primal_to_tangent(inputs)?;
             let [operand, output, input_offsets, send_sizes, output_offsets, receive_sizes] = tangent_inputs.as_slice()
             else {
                 unreachable!();
@@ -1583,7 +1583,7 @@ mod tests {
         let program = builder
             .build::<Vec<Array>, Array>(vec![result], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
-        let pullback = program.transpose_with_respect_to(&[0, 1]).unwrap();
+        let pullback = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
 
         let all_to_all_groups = pullback
             .instructions()
@@ -1679,7 +1679,7 @@ mod tests {
             .trim_end(),
         );
 
-        let transposed_twice = pullback.transpose_with_respect_to(&[0]).unwrap();
+        let transposed_twice = pullback.transpose_with_respect_to(&[0], &[]).unwrap();
         assert_eq!(transposed_twice.input_types(), program.input_types());
         assert_eq!(transposed_twice.output_types(), program.output_types());
     }
@@ -1705,7 +1705,7 @@ mod tests {
             .build::<Vec<Array>, Array>(vec![result], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
 
-        let pullback = program.transpose_with_respect_to(&[1]).unwrap();
+        let pullback = program.transpose_with_respect_to(&[1], &[]).unwrap();
 
         assert_eq!(
             pullback
@@ -1739,7 +1739,7 @@ mod tests {
             )
             .unwrap();
         assert!(matches!(
-            program.transpose_with_respect_to(&[0, 1, 2]),
+            program.transpose_with_respect_to(&[0, 1, 2], &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "`ragged_all_to_all` transpose requires `input_offsets` to be a known primal residual"
         ));
@@ -1765,7 +1765,7 @@ mod tests {
             .build::<Vec<Array>, Array>(vec![result], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
         assert!(matches!(
-            program.transpose_with_respect_to(&[0, 1]),
+            program.transpose_with_respect_to(&[0, 1], &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "`ragged_all_to_all` transpose requires a static output leading dimension"
         ));
@@ -1789,7 +1789,7 @@ mod tests {
             .build::<Vec<Array>, Array>(vec![result], vec![Placeholder, Placeholder], Placeholder)
             .unwrap();
         assert!(matches!(
-            program.transpose_with_respect_to(&[0, 1]),
+            program.transpose_with_respect_to(&[0, 1], &[]),
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
                 if message == "`ragged_all_to_all` transpose marker extent does not fit in `usize`"
         ));
@@ -1823,7 +1823,7 @@ mod tests {
             let program = builder
                 .build::<Vec<Array>, Array>(vec![result], vec![Placeholder, Placeholder], Placeholder)
                 .unwrap();
-            let pullback = program.transpose_with_respect_to(&[0, 1]).unwrap();
+            let pullback = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
             assert_eq!(pullback.input_types(), &[output_type]);
             assert_eq!(pullback.output_types(), &[operand_type, program.input_types()[1].clone()]);
         }

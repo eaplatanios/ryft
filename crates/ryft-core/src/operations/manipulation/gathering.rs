@@ -13,7 +13,7 @@ use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
     DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, TransposableOperation,
-    TranspositionContext, TranspositionDriver, jvp_projected_operation, primal_to_tangent_duals,
+    TranspositionContext, TranspositionDriver, jvp_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -528,7 +528,7 @@ where
             .remove(0);
         let output_primal = primal;
         let primal = destinations.primal_to_tangent(output_primal.clone())?;
-        let tangent_inputs = primal_to_tangent_duals(destinations, inputs)?;
+        let tangent_inputs = destinations.dual_primal_to_tangent(inputs)?;
         let inputs = tangent_inputs.as_slice();
         let operand = &inputs[0];
         let indices = &inputs[1];
@@ -1366,7 +1366,7 @@ mod tests {
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
         assert_eq!(
-            program.transpose_with_respect_to(&[0]).unwrap_err(),
+            program.transpose_with_respect_to(&[0], &[]).unwrap_err(),
             TypeError::invalid("`gather` transpose requires a statically shaped operand but got f32[rows, 2]").into(),
         );
     }

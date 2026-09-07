@@ -2384,7 +2384,7 @@ mod tests {
         // Transposing the raw, un-linearized call directly is still rejected, but now by the composite payload's own
         // non-transposable rule instead of by a projected adapter that never received its regions.
         assert_eq!(
-            composite_custom_jvp_program().transpose_with_respect_to(&[0]).unwrap_err(),
+            composite_custom_jvp_program().transpose_with_respect_to(&[0], &[]).unwrap_err(),
             DifferentiationError::Program(ProgramError::UnsupportedOperation {
                 message: "operation `custom_jvp` is not transposable".to_string(),
             }),
@@ -2458,7 +2458,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             program
-                .transpose_with_respect_to(&[0])
+                .transpose_with_respect_to(&[0], &[])
                 .unwrap()
                 .interpret(vec![ArrayIrValue::Array(Array::scalar(5.0_f64))]),
             Ok(vec![ArrayIrValue::Array(Array::scalar(15.0_f64))]),

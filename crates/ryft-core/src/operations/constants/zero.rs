@@ -1,8 +1,8 @@
 use std::fmt::Display;
 
 use crate::arrays::{
-    Array, ArrayBatch, ArrayBatching, ArrayElement, ArrayIrBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue,
-    ArrayOperation, ArrayType, DataType, dispatch_on_array_element_type,
+    Array, ArrayBatch, ArrayBatching, ArrayElement, ArrayIrBatch, ArrayIrBatching, ArrayIrOperation, ArrayIrType,
+    ArrayIrValue, ArrayOperation, ArrayType, DataType, dispatch_on_array_element_type,
 };
 use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
 use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext};
@@ -17,8 +17,8 @@ use crate::macros::{
 use crate::operations::constants::check_constructor_type_has_no_identity_references;
 use crate::partial::{PartialEvaluationContext, PartialTracer, PartiallyEvaluatableOperation};
 use crate::programs::{
-    Operation, OperationFormatter, OperationProjection, ProgramError, RegionInterface, Type, TypeError,
-    TypeIdentityRenaming, Typed, Value, ValueProjection,
+    Operation, OperationFormatter, OperationProjection, OperationProvider, ProgramError, RegionInterface, Type,
+    TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -28,6 +28,13 @@ pub const ZERO_OPERATION_NAME: &str = "zero";
 /// [`Operation`] that has no inputs and that produces a single output that corresponds to the _zero_ value for the
 /// [`Type`] that it holds (i.e., for its `r#type` field). For arrays, this would typically correspond to an array of
 /// the right type and shape filled with zeros.
+///
+/// This operation also serves as an [`OperationProvider`] request: it carries the requested output type while the
+/// provider receives no input types. Composite operation families select the appropriate member operation from this
+/// type; homogeneous families use their ordinary `From<ZeroOperation<T>>` conversion.
+/// This constructs zeros whose geometry is fully described by their type. Differentiation's separate
+/// [`ResidualZeroProvider`](crate::ResidualZeroProvider) protocol handles zeros that require runtime geometry from
+/// residual values, such as disconnected cotangents with dynamic axes.
 #[derive(Clone, Debug)]
 pub struct ZeroOperation<T: Type> {
     /// [`Type`] of the value produced when this operation is interpreted.
@@ -124,35 +131,22 @@ impl_member_interpretable_operation_for_array_ir_constant_operation!(
 // TODO(eaplatanios): Restore the strict `Operation<Type = T>` super-trait bound once the next-generation trait solver
 //  stabilizes. The current solver cannot discharge this projection equality at implementation heads whose context type
 //  is built from `Self` (E0284). The equality is enforced per method through a `where` clause instead.
-/// Supplies the canonical zero [`Operation`] of a program type's operation family. [`Self::zero_operation`] covers
-/// zeros that can be constructed from a type without operands, which is all that staging and eager materialization
-/// need. Differentiation additionally must materialize zeros whose runtime geometry is unavailable from the type alone
-/// (e.g., disconnected cotangents with dynamic axes). That residual protocol is transform-owned and lives on
-/// [`ResidualZeroProvider`](crate::ResidualZeroProvider).
-///
-/// The super-trait is plain [`Operation`] rather than `Operation<Type = T>` because the current trait solver cannot
-/// discharge that projection equality where this provider is requested through a context's operation family, which is
-/// how every transform requests it. The equality is instead required by [`zero_operation`](Self::zero_operation)
-/// itself, so a provider whose [`Operation::Type`] disagrees with `T` cannot construct anything: the requirement is
-/// restated by the residual-zero protocol and by transform call sites, and any mismatched implementation is rejected
-/// with a type-mismatch error there.
-pub trait ZeroOperationProvider<T: Type>: Operation {
-    /// Constructs an [`Operation`] that materializes a zero of `r#type` without operands.
-    fn zero_operation(r#type: T) -> Result<Self, ProgramError>
-    where
-        Self: Operation<Type = T>;
-}
+impl<T: Type, O: Operation<Type = T> + From<ZeroOperation<T>>> OperationProvider<T, ZeroOperation<T>> for O {
+    type Operation = Self;
 
-impl<T: Type, O: Operation<Type = T> + From<ZeroOperation<T>>> ZeroOperationProvider<T> for O {
     #[inline]
-    fn zero_operation(r#type: T) -> Result<Self, ProgramError> {
-        Ok(Self::from(ZeroOperation::new(r#type)))
+    fn provide(request: ZeroOperation<T>, input_types: &[&T]) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 0, ProgramError);
+        Ok(Self::from(request))
     }
 }
 
-impl<A: Value<Type = ArrayType>> ZeroOperationProvider<ArrayIrType> for ArrayIrOperation<A> {
-    fn zero_operation(r#type: ArrayIrType) -> Result<Self, ProgramError> {
-        let r#type = match r#type {
+impl<A: Value<Type = ArrayType>> OperationProvider<ArrayIrType, ZeroOperation<ArrayIrType>> for ArrayIrOperation<A> {
+    type Operation = Self;
+
+    fn provide(request: ZeroOperation<ArrayIrType>, input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
+        check_count!("input", input_types, 0, ProgramError);
+        let r#type = match request.r#type {
             ArrayIrType::Array(r#type) => r#type,
             ArrayIrType::Dimension(_) => {
                 // A first-class dimension is a symbolic runtime extent rather than an algebraic value. A zero dimension
@@ -223,10 +217,14 @@ where
     }
 }
 
-impl<C: StagingContext<Operation: ZeroOperationProvider<C::Type>>> Zero<Tracer<C>> for C {
+impl<C: StagingContext> Zero<Tracer<C>> for C
+where
+    C::Operation: OperationProvider<C::Type, ZeroOperation<C::Type>, Operation = C::Operation>,
+{
     #[inline]
     fn zero(&self, r#type: &C::Type) -> Result<Tracer<C>, ProgramError> {
-        let mut outputs = self.stage_nullary_operation(C::Operation::zero_operation(r#type.clone())?)?;
+        let mut outputs =
+            self.stage_nullary_operation(C::Operation::provide(ZeroOperation::new(r#type.clone()), &[])?)?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -236,11 +234,12 @@ impl<C: Context> Zero<PartialTracer<C>> for PartialEvaluationContext<C>
 where
     C::Operation: PartiallyEvaluatableOperation<C>
         + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-        + ZeroOperationProvider<C::Type>,
+        + OperationProvider<C::Type, ZeroOperation<C::Type>, Operation = C::Operation>,
 {
     #[inline]
     fn zero(&self, r#type: &C::Type) -> Result<PartialTracer<C>, ProgramError> {
-        let mut outputs = self.bind(C::Operation::zero_operation(r#type.clone())?, Vec::new(), &[])?;
+        let mut outputs =
+            self.bind(C::Operation::provide(ZeroOperation::new(r#type.clone()), &[])?, Vec::new(), &[])?;
         check_count!("output", outputs, 1, ProgramError);
         Ok(outputs.remove(0))
     }
@@ -252,6 +251,16 @@ impl<C: Context<Type = ArrayType> + Zero<C::Value>> Zero<BatchingTracer<C, Array
     #[inline]
     fn zero(&self, r#type: &ArrayType) -> Result<BatchingTracer<C, ArrayBatching>, ProgramError> {
         let batch = ArrayBatch::new(self.parent().zero(r#type)?, BatchAxis::replicated())?;
+        Ok(BatchingTracer::new(self.clone(), batch))
+    }
+}
+
+impl<C: Context<Type = ArrayIrType> + Zero<C::Value>> Zero<BatchingTracer<C, ArrayIrBatching>>
+    for BatchingContext<C, ArrayIrBatching>
+{
+    #[inline]
+    fn zero(&self, r#type: &ArrayIrType) -> Result<BatchingTracer<C, ArrayIrBatching>, ProgramError> {
+        let batch = ArrayIrBatch::new(self.parent().zero(r#type)?, BatchAxis::replicated())?;
         Ok(BatchingTracer::new(self.clone(), batch))
     }
 }
@@ -274,7 +283,7 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayBatch, ArrayBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, DataType,
-        Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape,
+        Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Shape,
     };
     use crate::batching::{BatchAxis, BatchableOperation, BatchingContext};
     use crate::contexts::EagerContext;
@@ -438,6 +447,14 @@ mod tests {
         let output = context.zero(&output_type).unwrap();
         assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
         assert_eq!(output.batch().value(), &Array::from_elements(output_type, &[0.0f32; 2]).unwrap());
+
+        let context = BatchingContext::<_, ArrayIrBatching>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(4).unwrap()),
+        );
+        let output = context.zero(&ArrayIrType::Array(ArrayType::scalar(DataType::F32))).unwrap();
+        assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
+        assert_eq!(output.batch().value(), &ArrayIrValue::Array(Array::scalar(0.0_f32)));
     }
 
     #[test]
@@ -465,19 +482,33 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_operation_provider() {
-        // Homogeneous operation families receive the infallible provider implementation through their ordinary
+    fn test_operation_provider_zero() {
+        // Homogeneous operation families construct nullary operations through their ordinary
         // `From<ZeroOperation<T>>` conversion.
         let static_type = ArrayType::new_static(DataType::F32, [2]);
-        let ArrayOperation::<Array>::Zero(operation) = ArrayOperation::zero_operation(static_type.clone()).unwrap()
+        let ArrayOperation::<Array>::Zero(operation) =
+            ArrayOperation::<Array>::provide(ZeroOperation::new(static_type.clone()), &[]).unwrap()
         else {
             panic!("expected a homogeneous zero operation");
         };
         assert_eq!(operation.r#type(), &static_type);
 
+        // Output types belong to the request; nullary construction rejects any operand types.
+        assert_eq!(
+            ArrayOperation::<Array>::provide(ZeroOperation::new(static_type.clone()), &[&static_type]).unwrap_err(),
+            ProgramError::InvalidInputCount { expected: 0, actual: 1 },
+        );
+        let composite_type = ArrayIrType::Array(static_type.clone());
+        assert_eq!(
+            ArrayIrOperation::<Array>::provide(ZeroOperation::new(composite_type.clone()), &[&composite_type])
+                .unwrap_err(),
+            ProgramError::InvalidInputCount { expected: 0, actual: 1 },
+        );
+
         // The composite provider projects a valid operand-free array zero into the homogeneous member family.
         let ArrayIrOperation::<Array>::Array(ArrayOperation::Zero(operation)) =
-            ArrayIrOperation::zero_operation(ArrayIrType::Array(static_type.clone())).unwrap()
+            ArrayIrOperation::<Array>::provide(ZeroOperation::new(ArrayIrType::Array(static_type.clone())), &[])
+                .unwrap()
         else {
             panic!("expected a composite homogeneous zero operation");
         };
@@ -488,7 +519,7 @@ mod tests {
         let size = DimensionVariable::new("size", DimensionBounds::unbounded());
         let dynamic_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(size.clone())]));
         assert_eq!(
-            ArrayIrOperation::<Array>::zero_operation(ArrayIrType::Array(dynamic_type)).unwrap_err(),
+            ArrayIrOperation::<Array>::provide(ZeroOperation::new(ArrayIrType::Array(dynamic_type)), &[]).unwrap_err(),
             ProgramError::Type(TypeError::invalid(
                 "`zero` cannot construct type f32[size] without operands because it references identity size",
             )),
@@ -498,12 +529,17 @@ mod tests {
         // by a zero of its referent type. The differentiation rules allocate tangent and cotangent references instead
         // of ever materializing a zero reference.
         assert_eq!(
-            ArrayIrOperation::<Array>::zero_operation(ArrayIrType::Dimension(DimensionType::new(size))).unwrap_err(),
+            ArrayIrOperation::<Array>::provide(
+                ZeroOperation::new(ArrayIrType::Dimension(DimensionType::new(size))),
+                &[],
+            )
+            .unwrap_err(),
             ProgramError::Type(TypeError::invalid("cannot materialize a zero for a first-class dimension type")),
         );
         let reference_type = ReferenceType::new(static_type);
         assert_eq!(
-            ArrayIrOperation::<Array>::zero_operation(ArrayIrType::Reference(reference_type.clone())).unwrap_err(),
+            ArrayIrOperation::<Array>::provide(ZeroOperation::new(ArrayIrType::Reference(reference_type.clone())), &[])
+                .unwrap_err(),
             ProgramError::Type(TypeError::invalid(format!(
                 "cannot materialize a zero for reference type `{reference_type}`; a reference denotes an allocation \
                  and has no zero value, so tangent and cotangent references are allocated by the differentiation rules",

@@ -342,10 +342,16 @@ trait OperationProjection<T: Type>: Operation + From<Self::Projected> {
     type Projected: Operation<Type = T>;
 }
 
-/// Stand-in for the operation-family capability used to construct typed structural zeros.
-trait ZeroOperationProvider<T: Type>: Operation<Type = T> {}
+/// Stand-in for the associated operation contract emitted by the derive. These fixtures test generated bounds;
+/// operation construction is covered separately using the real provider in `mixed_members`.
+trait OperationProvider<T: Type, Request = ()> {
+    /// Operation selected for the request and type universe.
+    type Operation: Operation<Type = T>;
+}
 
-impl<T: Type, O: Operation<Type = T>> ZeroOperationProvider<T> for O {}
+impl<T: Type, O: Operation<Type = T>, Request> OperationProvider<T, Request> for O {
+    type Operation = Self;
+}
 
 /// Infers projected region input types using the same contract as `ryft_core`'s derive support helper.
 fn infer_projected_operation_region_input_types<T: Type, U: Type, O: Operation<Type = T>>(
@@ -632,12 +638,12 @@ trait DifferentiationPolicy<C: Context>: Copy + Clone + std::fmt::Debug {}
 
 /// Stand-in for the default fused policy.
 #[derive(Copy, Clone, Debug)]
-struct FusedDifferentiation;
+struct FusedDifferentiationPolicy;
 
-impl<C: Context> DifferentiationPolicy<C> for FusedDifferentiation {}
+impl<C: Context> DifferentiationPolicy<C> for FusedDifferentiationPolicy {}
 
 /// Stand-in for the concrete rule construction context.
-struct DifferentiationContext<C: Context, P: DifferentiationPolicy<C> = FusedDifferentiation> {
+struct DifferentiationContext<C: Context, P: DifferentiationPolicy<C> = FusedDifferentiationPolicy> {
     primal: C,
     policy: PhantomData<P>,
 }
@@ -1523,9 +1529,9 @@ mod mixed_members {
         DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationPolicy, Dimension,
         DimensionBounds, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, EmptyRegionDriver,
         MaybeZero, MemberDifferentiableOperation, MemberInterpretableOperation, MemberOperation, Operation,
-        PartialValue, ProgramError, RegionInterface, Shape, StagingContext, Tracer, TracingContext,
+        OperationProvider, PartialValue, ProgramError, RegionInterface, Shape, StagingContext, Tracer, TracingContext,
         TransposableOperation, TranspositionContext, TranspositionDriver, TypeError, TypeIdentityRenaming, Typed,
-        Value, ZeroOperation, ZeroOperationProvider,
+        Value, ZeroOperation,
     };
 
     /// Member payload whose parent instruction interleaves its two array data operands with two first-class dimension
@@ -1791,9 +1797,13 @@ mod mixed_members {
         }
     }
 
-    impl<A: Value<Type = ArrayType>> ZeroOperationProvider<ArrayIrType> for MixedProgramOperation<A> {
-        fn zero_operation(r#type: ArrayIrType) -> Result<Self, ProgramError> {
-            Ok(Self::from(ZeroOperation::new(<&ArrayType>::try_from(&r#type)?.clone())))
+    impl<A: Value<Type = ArrayType>> OperationProvider<ArrayIrType, ZeroOperation<ArrayIrType>>
+        for MixedProgramOperation<A>
+    {
+        type Operation = Self;
+
+        fn provide(request: ZeroOperation<ArrayIrType>, _input_types: &[&ArrayIrType]) -> Result<Self, ProgramError> {
+            Ok(Self::from(ZeroOperation::new(<&ArrayType>::try_from(request.r#type())?.clone())))
         }
     }
 

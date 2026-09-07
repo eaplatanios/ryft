@@ -722,7 +722,7 @@ mod tests {
         pullback_inputs.extend(residuals);
         assert_eq!(linearization.pullback().unwrap().interpret(pullback_inputs), Ok(vec![zero_cotangent]));
         assert!(matches!(
-            program.transpose_with_respect_to(&[0]),
+            program.transpose_with_respect_to(&[0], &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "direct `all_gather` transposition with runtime-dependent type metadata requires \
                     linearization so that the relevant primal information can be retained as residuals",
@@ -806,7 +806,7 @@ mod tests {
         // The mixed boundary delegates its array contribution to the homogeneous all-gather rule, so the invariant
         // guard that rule owns is what rejects direct transposition here.
         assert!(matches!(
-            program.transpose_with_respect_to(&[0]),
+            program.transpose_with_respect_to(&[0], &[]),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "direct transposition of invariant `all_gather` cannot represent the participant-indexed \
                     slice; linearize so that the current participant can select its gathered chunk",
