@@ -2052,8 +2052,22 @@ enum ArrayIrBatchMember<V> {
 
     /// Mapped first-class dimension whose per-item extents are packed into the value as an integer array, batched along
     /// an axis of that array, and whose per-item type is the recorded [`DimensionType`]. Refer to the documentation of
-    /// [`ArrayIrBatch::mapped_dimension`] for more information.
+    /// [`ArrayIrBatch::mapped_dimension_type`] for more information.
     MappedDimension(DimensionType),
+}
+
+impl<V> ArrayIrBatchMember<V> {
+    /// Returns the [`ArrayIrBatchMember`] that a packed value's [`ArrayIrType`] determines. Note that, a
+    /// [`ArrayIrBatchMember::MappedDimension`] is never derived from a type, because its packed value is an
+    /// ordinary integer array; only [`ArrayIrBatch::mapped_dimension`] can produce it.
+    #[inline]
+    fn from_type(r#type: &ArrayIrType) -> Self {
+        match r#type {
+            ArrayIrType::Array(_) => Self::Array { ragged_axes: Vec::new() },
+            ArrayIrType::Reference(_) => Self::Reference,
+            ArrayIrType::Dimension(_) => Self::Dimension,
+        }
+    }
 }
 
 /// Value with [`ArrayIrType`] type that represents a _packed_ batch of array IR values. [`ArrayIrBatch`] is the
@@ -2073,7 +2087,7 @@ enum ArrayIrBatchMember<V> {
 ///   - A **dimension** member is shape data. A replicated dimension is one [`DimensionType`] value shared by every
 ///     batch item. A _mapped_ dimension is the one carrier kind whose per-item type cannot be derived from its packed
 ///     value: the per-item extents are packed into [`value`](Self::value) as an ordinary integer array whose only
-///     mapped axis is the batch axis, and [`mapped_dimension`](Self::mapped_dimension) records the per-item
+///     mapped axis is the batch axis, and [`mapped_dimension_type`](Self::mapped_dimension_type) records the per-item
 ///     [`DimensionType`] that [`unbatched_type`](Self::unbatched_type) reports in place of that integer array type.
 ///
 /// For example, consider batching a program over three items when one of its inputs is a first-class dimension value
@@ -2086,8 +2100,12 @@ enum ArrayIrBatchMember<V> {
 /// ragged axis. The `dimension_size` rule produces such a batch when asked for the size of a ragged axis, and the
 /// `dimension_from_scalar` rule produces one from a batch of scalars.
 ///
-/// The constructors normalize the batch axis against the rank that the member kind batches over and validate the
-/// complete per-item derivation once, which is what lets [`unbatched_type`](Self::unbatched_type) be infallible.
+/// Each member kind has one constructor: [`new`](Self::new) derives the array, reference, or replicated-dimension
+/// kind from the value's type, [`replicated`](Self::replicated) is its infallible replicated form,
+/// [`mapped_dimension`](Self::mapped_dimension) builds the one kind the type cannot reveal, and
+/// [`with_ragged_axes`](Self::with_ragged_axes) attaches bounded ragged axes to an array member. All of them normalize
+/// the batch axis against the rank that the member kind batches over and validate the complete per-item derivation
+/// once, which is what lets [`unbatched_type`](Self::unbatched_type) be infallible.
 #[derive(Clone, Debug, PartialEq, Parameter)]
 pub struct ArrayIrBatch<V: Value<Type = ArrayIrType>> {
     /// Refer to the documentation of [`value`](Self::value) for more information.
@@ -2104,119 +2122,147 @@ pub struct ArrayIrBatch<V: Value<Type = ArrayIrType>> {
 // TODO(eaplatanios): Review from here onwards.
 
 impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
-    /// Creates a new dense [`ArrayIrBatch`], rejecting mapped [`ArrayIrType::Dimension`]s. [`ArrayIrType::Reference`]s
-    /// are batched by batching their referents (i.e., the batch axis is normalized against the referent's packed type,
-    /// and the per-item type is a reference over the per-item referent).
-    pub fn new<A: Into<BatchAxis>>(value: V, batch_axis: A) -> Result<Self, BatchingError> {
-        let batch_axis = batch_axis.into();
-        let value_type = value.r#type();
-        let (batch_axis, member) = match value_type.as_ref() {
-            ArrayIrType::Array(packed_type) => (
-                // Validating the complete per-item derivation once here, including the sharding projection
-                // of the removed batch dimension, is what lets `Self::unbatched_type` be infallible.
-                packed_type.unbatched_type_and_axis::<V>(batch_axis, &[])?.1,
-                ArrayIrBatchMember::Array { ragged_axes: Vec::new() },
-            ),
-            ArrayIrType::Reference(r#type) => {
-                (r#type.referent().unbatched_type_and_axis::<V>(batch_axis, &[])?.1, ArrayIrBatchMember::Reference)
-            }
-            ArrayIrType::Dimension(_) if batch_axis.is_replicated() => (batch_axis, ArrayIrBatchMember::Dimension),
-            ArrayIrType::Dimension(r#type) => {
-                return Err(BatchingError::MappedDimension { r#type: Box::new(r#type.clone()), axis: batch_axis });
-            }
-        };
-        Ok(Self { value, batch_axis, member })
-    }
-
-    /// Creates a mapped first-class dimension whose per-item extents are packed as ordinary integer array data. This is
-    /// the one carrier kind whose per-item type cannot be derived from its packed value, because the value is an
-    /// integer extent array while the per-item type is a [`DimensionType`]. Refer to the documentation of
-    /// [`mapped_dimension`](Self::mapped_dimension) for more information.
+    /// Creates a new [`ArrayIrBatch`] over the provided packed value, deriving the member kind from the value's type.
+    /// An array is batched along an axis of the array itself, a reference along an axis of its packed referent (so
+    /// the per-item type is a reference over the per-item referent), and a first-class dimension value must be
+    /// replicated because its per-item type would otherwise be underivable. Use [`Self::mapped_dimension`] for a
+    /// dimension whose per-item extents are packed as an integer array. This constructor interprets an existing
+    /// dimension of an already packed value as the batch dimension; it moves no data and adds no axis. Use
+    /// [`Self::replicated`] for a value shared unchanged across the batch and [`Self::with_ragged_axes`] to attach
+    /// bounded ragged axes to an array member.
     ///
     /// # Parameters
     ///
-    ///   - `value`: Packed integer extent array holding one per-item extent along `batch_axis`.
-    ///   - `batch_axis`: Possibly-negative mapped [`BatchAxis`] of `value`, normalized against its rank before it is
-    ///     stored. A replicated axis is rejected because a replicated dimension is an ordinary dimension value.
-    ///   - `r#type`: Per-item [`DimensionType`] that the batch reports as its per-item type.
-    pub(crate) fn new_mapped_dimension(
-        value: V,
-        batch_axis: BatchAxis,
-        r#type: DimensionType,
-    ) -> Result<Self, BatchingError> {
-        let batch_axis = {
-            let value_type = value.r#type();
-            let array_type = <&ArrayType>::try_from(value_type.as_ref())?;
-            if !array_type.data_type().is_integer() {
-                return Err(TypeError::invalid(format!(
-                    "ragged dimension extents must use an integer array type but got {array_type}",
-                ))
-                .into());
-            }
-            let (batch_axis, _) = array_type.normalize_batch_axis(batch_axis)?;
-            if batch_axis.is_replicated() {
-                return Err(BatchingError::InvalidBatchMetadata {
-                    message: "a mapped dimension requires a mapped batch axis".to_string(),
-                });
-            }
-            batch_axis
-        };
-        Ok(Self { value, batch_axis, member: ArrayIrBatchMember::MappedDimension(r#type) })
+    ///   - `value`: Packed value, whose own [`ArrayIrType`] determines the member kind.
+    ///   - `batch_axis`: Possibly-negative [`BatchAxis`], normalized against the rank the member kind batches over
+    ///     before it is stored.
+    #[inline]
+    pub fn new(value: V, batch_axis: BatchAxis) -> Result<Self, BatchingError> {
+        let member = ArrayIrBatchMember::from_type(value.r#type().as_ref());
+        Self::from_member(value, batch_axis, member)
     }
 
-    /// Replaces this array batch's ragged-axis metadata. Each ragged axis must be an ordinary packed axis of the
-    /// carried value and cannot be its mapped batch axis. Only an array member carries ragged axes: a reference or
-    /// first-class dimension member is rejected, and so is a mapped first-class dimension, which carries its per-item
-    /// extents directly and has no ragged array axes. The per-item type follows the new metadata,
-    /// because [`Self::unbatched_type`] derives it from the packed value and the ragged axes together. Refer to the
-    /// documentation of [`ArrayBatch::with_ragged_axes`] for the semantic invariants each [`RaggedAxis`] claim
-    /// carries; this method validates the same structural requirements and trusts the same claims.
-    pub fn with_ragged_axes(mut self, ragged_axes: Vec<RaggedAxis<V>>) -> Result<Self, BatchingError> {
-        let value_type = self.value.r#type();
-        let packed_type = match &self.member {
-            // The constructor derived the array member kind from the value's type, so the projection cannot fail.
-            ArrayIrBatchMember::Array { .. } => <&ArrayType>::try_from(value_type.as_ref()).unwrap(),
-            ArrayIrBatchMember::MappedDimension(r#type) => {
-                return Err(BatchingError::MappedDimension { r#type: Box::new(r#type.clone()), axis: self.batch_axis });
-            }
-            ArrayIrBatchMember::Reference | ArrayIrBatchMember::Dimension => {
-                return Err(BatchingError::InvalidBatchMetadata {
-                    message: format!("ragged axes require an array member but the batched value has type {value_type}"),
-                });
-            }
-        };
-        let position = self.batch_axis_position();
-        for (index, ragged_axis) in ragged_axes.iter().enumerate() {
-            if ragged_axes[..index].iter().any(|existing| existing.axis() == ragged_axis.axis()) {
-                return Err(BatchingError::InvalidBatchMetadata {
-                    message: format!(
-                        "packed array type {} has more than one ragged axis {}",
-                        packed_type,
-                        ragged_axis.axis(),
-                    ),
-                });
-            }
-            ragged_axis.validate_axis_mapping(packed_type, self.batch_axis, position)?;
-        }
-        self.member = ArrayIrBatchMember::Array { ragged_axes };
-        Ok(self)
-    }
-
-    /// Creates a replicated batch view.
-    ///
-    /// This infallible constructor implements [`BatchingPolicy::replicated`] and may temporarily wrap any composite
-    /// constant kind, so it must never be the boundary through which values _enter_ batching: entry boundaries
-    /// (batching entry points, constant lifting, and structural constant replay) use the checked [`Self::new`], which
-    /// validates the per-item derivation of every carrier kind, including a reference whose batch axis is normalized
-    /// against its referent.
+    /// Creates a new [`ArrayIrBatch`] that replicates the provided value across the batch, deriving the member kind
+    /// from the value's type exactly like [`Self::new`] does. A replicated axis cannot fail any member kind's
+    /// validation, so this constructor is infallible and implements [`BatchingPolicy::replicated`].
     #[inline]
     pub fn replicated(value: V) -> Self {
-        let member = match value.r#type().as_ref() {
-            ArrayIrType::Array(_) => ArrayIrBatchMember::Array { ragged_axes: Vec::new() },
-            ArrayIrType::Reference(_) => ArrayIrBatchMember::Reference,
-            ArrayIrType::Dimension(_) => ArrayIrBatchMember::Dimension,
-        };
+        let member = ArrayIrBatchMember::from_type(value.r#type().as_ref());
         Self { value, batch_axis: BatchAxis::replicated(), member }
+    }
+
+    /// Creates a new [`ArrayIrBatch`] holding a _mapped_ first-class dimension: a dimension whose per-item extents are
+    /// packed into `extents` as ordinary integer array data along `batch_axis`, and whose per-item type is `r#type`.
+    /// This is the one member kind whose per-item type cannot be derived from its packed value, because the value is
+    /// an integer extent array while the per-item type is a [`DimensionType`]. Refer to the documentation of
+    /// [`mapped_dimension_type`](Self::mapped_dimension_type) for more information.
+    ///
+    /// The following structural requirements are validated here: `extents` must be an integer array and `batch_axis`
+    /// must name one of its axes, because a replicated dimension is an ordinary dimension value rather than a mapped
+    /// one. The semantic content is a claim that this constructor cannot verify and that downstream rules treat as
+    /// truth, exactly like the extents of a [`RaggedAxis`]: each element of `extents` must be the true per-item extent
+    /// of the dimension, within the declared bounds of its [`DimensionVariable`], and the extent array must hold
+    /// exactly one element per batch item along `batch_axis`. Rules such as `dimension_size` over a bounded ragged axis
+    /// and `dimension_from_scalar` over a batch of scalars produce such batches from extents they computed themselves.
+    ///
+    /// # Parameters
+    ///
+    ///   - `extents`: Packed integer extent array holding one per-item extent along `batch_axis`.
+    ///   - `batch_axis`: Possibly-negative mapped [`BatchAxis`] of `extents`, normalized against its rank
+    ///     before it is stored.
+    ///   - `r#type`: Per-item [`DimensionType`] that the batch reports as its per-item type.
+    #[inline]
+    pub fn mapped_dimension(extents: V, batch_axis: BatchAxis, r#type: DimensionType) -> Result<Self, BatchingError> {
+        Self::from_member(extents, batch_axis, ArrayIrBatchMember::MappedDimension(r#type))
+    }
+
+    /// Returns this [`ArrayIrBatch`] carrying the provided bounded ragged axes in place of any it already carried, so
+    /// that its logical per-item type keeps a dynamic [`Dimension`] wherever the packed array stores a finite physical
+    /// bound. Only an array member carries ragged axes: a reference or first-class dimension member is rejected, and so
+    /// is a mapped first-class dimension, which stores its per-item extents directly and has no ragged array axes.
+    ///
+    /// Structural requirements are validated exactly as by [`ArrayBatch::with_ragged_axes`]: every ragged axis must
+    /// uniquely name an ordinary packed axis of the value other than the mapped batch axis, every recorded extent-axis
+    /// mapping must name a distinct packed axis, and the per-item type must derive cleanly. Refer to that function's
+    /// documentation for the semantic claims each [`RaggedAxis`] carries; this function trusts the same claims.
+    pub fn with_ragged_axes(self, ragged_axes: Vec<RaggedAxis<V>>) -> Result<Self, BatchingError> {
+        match self.member {
+            ArrayIrBatchMember::Array { .. } => {
+                Self::from_member(self.value, self.batch_axis, ArrayIrBatchMember::Array { ragged_axes })
+            }
+            ArrayIrBatchMember::MappedDimension(r#type) => {
+                Err(BatchingError::MappedDimension { r#type: Box::new(r#type), axis: self.batch_axis })
+            }
+            ArrayIrBatchMember::Reference | ArrayIrBatchMember::Dimension => Err(BatchingError::InvalidBatchMetadata {
+                message: format!(
+                    "ragged axes require an array member but the batched value has type {}",
+                    self.value.r#type(),
+                ),
+            }),
+        }
+    }
+
+    /// Validates `member` against `value`'s type, normalizes `batch_axis` against the rank that the member kind batches
+    /// over, and derives the complete per-item type once, including the sharding projection of the removed batch
+    /// dimension and the restored dynamic dimensions of every ragged axis. This is the single validation boundary
+    /// behind every fallible constructor: the value, axis, and member are immutable afterwards, which is what lets
+    /// [`Self::unbatched_type`] be infallible.
+    fn from_member(value: V, batch_axis: BatchAxis, member: ArrayIrBatchMember<V>) -> Result<Self, BatchingError> {
+        let batch_axis = {
+            let value_type = value.r#type();
+            match &member {
+                // The three derived kinds come from `ArrayIrBatchMember::from_type` over this same type, so their
+                // projections cannot fail. A mapped dimension is requested by the caller instead and must be checked.
+                ArrayIrBatchMember::Array { ragged_axes } => {
+                    let packed_type = <&ArrayType>::try_from(value_type.as_ref()).unwrap();
+                    let (batch_axis, position) = packed_type.normalize_batch_axis(batch_axis)?;
+                    for (index, ragged_axis) in ragged_axes.iter().enumerate() {
+                        if ragged_axes[..index].iter().any(|existing| existing.axis() == ragged_axis.axis()) {
+                            return Err(BatchingError::InvalidBatchMetadata {
+                                message: format!(
+                                    "packed array type {} has more than one ragged axis {}",
+                                    packed_type,
+                                    ragged_axis.axis(),
+                                ),
+                            });
+                        }
+                        ragged_axis.validate_axis_mapping(packed_type, batch_axis, position)?;
+                    }
+                    packed_type.unbatched_type_and_axis(batch_axis, ragged_axes.as_slice())?.1
+                }
+                ArrayIrBatchMember::Reference => {
+                    let referent = <&ReferenceType<ArrayType>>::try_from(value_type.as_ref()).unwrap().referent();
+                    referent.unbatched_type_and_axis::<V>(batch_axis, &[])?.1
+                }
+                ArrayIrBatchMember::Dimension => {
+                    if !batch_axis.is_replicated() {
+                        let r#type = <&DimensionType>::try_from(value_type.as_ref()).unwrap();
+                        return Err(BatchingError::MappedDimension {
+                            r#type: Box::new(r#type.clone()),
+                            axis: batch_axis,
+                        });
+                    }
+                    batch_axis
+                }
+                ArrayIrBatchMember::MappedDimension(_) => {
+                    let array_type = <&ArrayType>::try_from(value_type.as_ref())?;
+                    if !array_type.data_type().is_integer() {
+                        return Err(TypeError::invalid(format!(
+                            "ragged dimension extents must use an integer array type but got {array_type}",
+                        ))
+                        .into());
+                    }
+                    let (batch_axis, _) = array_type.normalize_batch_axis(batch_axis)?;
+                    if batch_axis.is_replicated() {
+                        return Err(BatchingError::InvalidBatchMetadata {
+                            message: "a mapped dimension requires a mapped batch axis".to_string(),
+                        });
+                    }
+                    batch_axis
+                }
+            }
+        };
+        Ok(Self { value, batch_axis, member })
     }
 
     /// Returns the [`BatchAxis`] marking which dimension of [`value`](Self::value) indexes the batch items, or a
@@ -2232,10 +2278,10 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
 
     /// Returns the canonical nonnegative position of this [`ArrayIrBatch`]'s mapped [`BatchAxis`] for an array member
     /// or, for a reference member, within its packed referent. The constructors normalize signed declarations before
-    /// storing them, and so internal batching rules can use this index directly. A mapped first-class dimension
-    /// reports the position within its packed integer extent array. Returns `None` for a replicated member, including
-    /// a replicated first-class dimension.
-    pub(crate) fn batch_axis_position(&self) -> Option<usize> {
+    /// storing them, and so batching rules can use this index directly. A mapped first-class dimension reports the
+    /// position within its packed integer extent array. Returns `None` for a replicated member, including a replicated
+    /// first-class dimension.
+    pub fn batch_axis_position(&self) -> Option<usize> {
         // The constructors derive the member kind from the value's type, so the projections below cannot fail.
         let value_type = self.value.r#type();
         let rank = match &self.member {
@@ -2256,13 +2302,21 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
     /// an integer array holding one extent per batch item along [`batch_axis`](Self::batch_axis), while the per-item
     /// type is the recorded [`DimensionType`], which [`unbatched_type`](Self::unbatched_type) reports in its place.
     /// Every other member kind derives its per-item type from the packed value instead. The packed extents themselves
-    /// are the [`value`](Self::value).
+    /// are returned by [`mapped_dimension_extents`](Self::mapped_dimension_extents).
     #[inline]
-    pub fn mapped_dimension(&self) -> Option<&DimensionType> {
+    pub fn mapped_dimension_type(&self) -> Option<&DimensionType> {
         match &self.member {
             ArrayIrBatchMember::MappedDimension(r#type) => Some(r#type),
             ArrayIrBatchMember::Array { .. } | ArrayIrBatchMember::Reference | ArrayIrBatchMember::Dimension => None,
         }
+    }
+
+    /// Returns the packed integer extent array of a mapped first-class dimension (i.e., its [`value`](Self::value)), or
+    /// `None` for every other member kind. Rules that build an array shaped by the mapped dimension read the per-item
+    /// extents from this array.
+    #[inline]
+    pub fn mapped_dimension_extents(&self) -> Option<&V> {
+        self.mapped_dimension_type().map(|_| &self.value)
     }
 
     /// Returns the bounded ragged axes of an array member, each restoring a dynamic [`Dimension`] in the per-item type
@@ -2332,14 +2386,11 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
         }
     }
 
-    /// Returns the mapped per-item dimension's packed extent array, or `None` for every other carrier kind.
-    #[inline]
-    pub(crate) fn mapped_dimension_extents(&self) -> Option<&V> {
-        self.mapped_dimension().map(|_| &self.value)
-    }
-
-    /// Validates that this batch contains a replicated first-class dimension.
-    pub(crate) fn validate_replicated_dimension(&self) -> Result<(), BatchingError> {
+    /// Validates that this [`ArrayIrBatch`] holds a replicated first-class dimension, which is what a rule requires of
+    /// a dimension operand that must be shared by every batch item (e.g., a shape operand). A mapped first-class
+    /// dimension and a dimension value carrying a mapped axis are rejected with [`BatchingError::MappedDimension`], and
+    /// an array or reference member fails the dimension type projection.
+    pub fn validate_replicated_dimension(&self) -> Result<(), BatchingError> {
         let value_type = self.value.r#type();
         let r#type = match &self.member {
             ArrayIrBatchMember::Dimension if self.batch_axis.is_replicated() => return Ok(()),
@@ -6434,13 +6485,13 @@ mod tests {
         let array = ArrayIrBatch::replicated(ArrayIrValue::<Array>::Array(Array::vector(vec![1.0_f32, 2.0])));
         assert_eq!(array.batch_axis(), BatchAxis::replicated());
         assert_eq!(array.batch_axis_position(), None);
-        assert_eq!(array.mapped_dimension(), None);
+        assert_eq!(array.mapped_dimension_type(), None);
         assert_eq!(array.ragged_axes(), &[]);
         assert_eq!(array.unbatched_type(), ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2])));
 
         let reference = ArrayIrBatch::replicated(ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32))));
         assert_eq!(reference.batch_axis_position(), None);
-        assert_eq!(reference.mapped_dimension(), None);
+        assert_eq!(reference.mapped_dimension_type(), None);
         assert_eq!(reference.ragged_axes(), &[]);
         assert_eq!(
             reference.unbatched_type(),
@@ -6450,7 +6501,7 @@ mod tests {
         let dimension =
             ArrayIrBatch::replicated(ArrayIrValue::<Array>::Dimension(DimensionValue::constant(3).unwrap()));
         assert_eq!(dimension.batch_axis_position(), None);
-        assert_eq!(dimension.mapped_dimension(), None);
+        assert_eq!(dimension.mapped_dimension_type(), None);
         assert_eq!(dimension.ragged_axes(), &[]);
         assert_eq!(dimension.validate_replicated_dimension(), Ok(()));
         assert_eq!(dimension.unbatched_type(), dimension.value().r#type().into_owned());
@@ -6482,13 +6533,10 @@ mod tests {
 
         // A mapped first-class dimension stores its per-item extents directly and reports the dedicated error, while
         // still exposing its recorded per-item type and the mapped axis of its extent array.
-        let mapped = ArrayIrBatch::new_mapped_dimension(
-            extents.clone(),
-            BatchAxis::new(0),
-            DimensionType::new(variable.clone()),
-        )
-        .unwrap();
-        assert_eq!(mapped.mapped_dimension(), Some(&DimensionType::new(variable.clone())));
+        let mapped =
+            ArrayIrBatch::mapped_dimension(extents.clone(), BatchAxis::new(0), DimensionType::new(variable.clone()))
+                .unwrap();
+        assert_eq!(mapped.mapped_dimension_type(), Some(&DimensionType::new(variable.clone())));
         assert_eq!(mapped.mapped_dimension_extents(), Some(&extents));
         assert_eq!(mapped.batch_axis_position(), Some(0));
         assert_eq!(mapped.ragged_axes(), &[]);
@@ -8495,7 +8543,7 @@ mod tests {
         assert_eq!(
             gateway_operation.batch(&context, &EmptyRegionDriver, &[mapped_gateway_input]),
             Ok(vec![
-                ArrayIrBatch::new_mapped_dimension(
+                ArrayIrBatch::mapped_dimension(
                     ArrayIrValue::Array(Array::vector(vec![4_i64, 5_i64])),
                     BatchAxis::new(0),
                     DimensionType::new(gateway_variable.clone()),
