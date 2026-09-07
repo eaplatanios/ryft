@@ -1694,7 +1694,7 @@ mod tests {
     };
     use crate::parameters::Placeholder;
     use crate::programs::{EffectClasses, ProgramBuilder, ReferenceType};
-    use crate::tests::CountingBatchingDriver;
+    use crate::tests::{CountingBatchingDriver, test_condition_program};
     use crate::tracing::{DomainTracingContext, Trace};
 
     use super::*;
@@ -3067,6 +3067,253 @@ mod tests {
             assert_eq!(value, Array::scalar(expected_value));
             assert_eq!(pushforward.apply(Array::scalar(1.5)), Ok(Array::scalar(expected_tangent)));
         }
+    }
+
+    #[test]
+    fn test_condition_differentiation_passes_plumbing_references_into_branches() {
+        // Both branches read the reference they receive at input position 1, after a numeric input, and add it to
+        // that numeric input: `f(p, x, r) = x + read(r)`.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let reference_type = ReferenceType::new(scalar_type.clone());
+        let branch = || {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let value = builder.add_input(scalar_type.clone().into());
+            let reference = builder.add_input(reference_type.clone().into());
+            let current =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            let output = builder
+                .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![value, current], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let true_branch = builder.import_region(branch().entry_region_ref());
+        let false_branch = builder.import_region(branch().entry_region_ref());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let value = builder.add_input(scalar_type.clone().into());
+        let reference = builder.add_input(reference_type.into());
+        let output = builder
+            .add_instruction(
+                ConditionOperation::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, value, reference],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+
+        // With the reference inactive it reaches the branches as plumbing at a non-prefix position: the branches
+        // receive no tangent input for it (`[x, r, ẋ]`), the read's tangent is zero, and the program still
+        // differentiates with `ẏ = ẋ`. The fused program is spliced behind local allocations of the reference operands
+        // so that the interpreted program owns the state it mutates.
+        let jvp = program.entry_region_ref().jvp(&[1]).unwrap();
+        assert_eq!(jvp.input_types().len(), 4);
+        assert_eq!(jvp.output_types().len(), 2);
+        let condition =
+            jvp.instructions().iter().find(|instruction| instruction.operation().name() == "condition").unwrap();
+        assert_eq!(jvp.region_ref(condition.regions()[0]).unwrap().input_types().len(), 3);
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let value = builder.add_input(scalar_type.clone().into());
+        let state = builder.add_input(scalar_type.clone().into());
+        let tangent = builder.add_input(scalar_type.clone().into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
+        let outputs = builder.splice_program(&jvp, &[predicate, value, reference, tangent]).unwrap();
+        let runnable = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 4], vec![Placeholder; 2])
+            .unwrap();
+        assert_eq!(
+            runnable.interpret(vec![
+                TestValue::Array(Array::scalar(true)),
+                TestValue::Array(Array::scalar(2.0_f32)),
+                TestValue::Array(Array::scalar(5.0_f32)),
+                TestValue::Array(Array::scalar(3.0_f32)),
+            ]),
+            Ok(vec![TestValue::Array(Array::scalar(7.0_f32)), TestValue::Array(Array::scalar(3.0_f32))]),
+        );
+
+        // With the reference active the branches receive its tangent reference too (`[x, r, ẋ, ṛ]`) and the read's
+        // tangent is the referenced tangent: `ẏ = ẋ + read(ṛ)`.
+        let jvp = program.jvp().unwrap();
+        let condition =
+            jvp.instructions().iter().find(|instruction| instruction.operation().name() == "condition").unwrap();
+        assert_eq!(jvp.region_ref(condition.regions()[0]).unwrap().input_types().len(), 4);
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let value = builder.add_input(scalar_type.clone().into());
+        let state = builder.add_input(scalar_type.clone().into());
+        let tangent = builder.add_input(scalar_type.clone().into());
+        let state_tangent = builder.add_input(scalar_type.into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
+        let reference_tangent = builder
+            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![state_tangent], None)
+            .unwrap()[0];
+        let outputs = builder.splice_program(&jvp, &[predicate, value, reference, tangent, reference_tangent]).unwrap();
+        let runnable = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 5], vec![Placeholder; 2])
+            .unwrap();
+        assert_eq!(
+            runnable.interpret(vec![
+                TestValue::Array(Array::scalar(false)),
+                TestValue::Array(Array::scalar(2.0_f32)),
+                TestValue::Array(Array::scalar(5.0_f32)),
+                TestValue::Array(Array::scalar(3.0_f32)),
+                TestValue::Array(Array::scalar(0.5_f32)),
+            ]),
+            Ok(vec![TestValue::Array(Array::scalar(7.0_f32)), TestValue::Array(Array::scalar(3.5_f32))]),
+        );
+    }
+
+    #[test]
+    fn test_condition_differentiation_forwards_inactive_reference_outputs() {
+        // Both branches forward the reference they receive, and the program reads through the conditional's result,
+        // so the public output is numeric while the branch outputs are references.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let reference_type = ReferenceType::new(scalar_type.clone());
+        let branch = || {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let reference = builder.add_input(reference_type.clone().into());
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let true_branch = builder.import_region(branch().entry_region_ref());
+        let false_branch = builder.import_region(branch().entry_region_ref());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let reference = builder.add_input(reference_type.into());
+        let forwarded = builder
+            .add_instruction(
+                ConditionOperation::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, reference],
+                None,
+            )
+            .unwrap()[0];
+        let output =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![forwarded], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        // An inactive reference is forwarded through the branch without a tangent slot. Reading it produces a
+        // numeric structural zero, which is materialized at the outer output boundary.
+        let inactive_jvp = program.entry_region_ref().jvp(&[]).unwrap();
+        assert_eq!(inactive_jvp.input_ids().len(), 2);
+        assert_eq!(inactive_jvp.output_ids().len(), 2);
+        assert_eq!(
+            inactive_jvp.interpret(vec![
+                TestValue::Array(Array::scalar(true)),
+                TestValue::Reference(ArrayReference::new(Array::scalar(5.0_f32))),
+            ]),
+            Ok(vec![TestValue::Array(Array::scalar(5.0_f32)), TestValue::Array(Array::scalar(0.0_f32))]),
+        );
+
+        // An active reference is forwarded together with its tangent reference, and the read pairs them back up. The
+        // fused program is spliced behind local allocations of the reference operands so that the interpreted program
+        // owns the state it mutates.
+        let jvp = program.jvp().unwrap();
+        assert_eq!(jvp.input_types().len(), 3);
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let state = builder.add_input(scalar_type.clone().into());
+        let state_tangent = builder.add_input(scalar_type.into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
+        let reference_tangent = builder
+            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![state_tangent], None)
+            .unwrap()[0];
+        let outputs = builder.splice_program(&jvp, &[predicate, reference, reference_tangent]).unwrap();
+        let runnable = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 3], vec![Placeholder; 2])
+            .unwrap();
+        assert_eq!(
+            runnable.interpret(vec![
+                TestValue::Array(Array::scalar(true)),
+                TestValue::Array(Array::scalar(5.0_f32)),
+                TestValue::Array(Array::scalar(0.5_f32)),
+            ]),
+            Ok(vec![TestValue::Array(Array::scalar(5.0_f32)), TestValue::Array(Array::scalar(0.5_f32))]),
+        );
+    }
+
+    #[test]
+    fn test_condition_differentiation_after_local_reference_discharge() {
+        let source = test_condition_program();
+
+        // Forward mode, linearization, and transposition all consume the discharged program, so every derived
+        // program must be pure and reference-free even though the source threads state through both branches.
+        let jvp = source
+            .clone()
+            .discharge_references(0)
+            .unwrap()
+            .into_program_without_external_references()
+            .unwrap()
+            .jvp()
+            .unwrap();
+        let linearization = source
+            .discharge_references(0)
+            .unwrap()
+            .into_program_without_external_references()
+            .unwrap()
+            .linearize()
+            .unwrap();
+        let pullback = linearization.pullback().unwrap();
+        for program in [&jvp, linearization.primal(), linearization.tangent(), &pullback] {
+            assert!(!program.entry_region_ref().contains_atom_type_in_closure(Type::is_reference));
+            assert!(program.effects().classes().is_empty());
+        }
+
+        // The true branch accumulates the input, so both public outputs remain differentiable.
+        let predicate = ArrayIrValue::Array(Array::scalar(true));
+        let initial = ArrayIrValue::Array(Array::scalar(4.0_f32));
+        assert_eq!(
+            jvp.interpret(vec![predicate.clone(), initial.clone(), ArrayIrValue::Array(Array::scalar(2.0_f32))]),
+            Ok(vec![
+                ArrayIrValue::Array(Array::scalar(5.0_f32)),
+                ArrayIrValue::Array(Array::scalar(5.0_f32)),
+                ArrayIrValue::Array(Array::scalar(2.0_f32)),
+                ArrayIrValue::Array(Array::scalar(2.0_f32)),
+            ]),
+        );
+        let primal_outputs = linearization.primal().interpret(vec![predicate, initial]).unwrap();
+        assert_eq!(
+            primal_outputs[..2],
+            [ArrayIrValue::Array(Array::scalar(5.0_f32)), ArrayIrValue::Array(Array::scalar(5.0_f32))],
+        );
+        let mut pullback_inputs =
+            vec![ArrayIrValue::Array(Array::scalar(2.0_f32)), ArrayIrValue::Array(Array::scalar(3.0_f32))];
+        pullback_inputs.extend_from_slice(&primal_outputs[2..]);
+        assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![ArrayIrValue::Array(Array::scalar(5.0_f32))]));
+
+        // The false branch replaces the state with a constant, so the frozen output has zero tangent and contributes
+        // no cotangent to the input.
+        let predicate = ArrayIrValue::Array(Array::scalar(false));
+        let initial = ArrayIrValue::Array(Array::scalar(4.0_f32));
+        assert_eq!(
+            jvp.interpret(vec![predicate.clone(), initial.clone(), ArrayIrValue::Array(Array::scalar(2.0_f32))]),
+            Ok(vec![
+                ArrayIrValue::Array(Array::scalar(4.0_f32)),
+                ArrayIrValue::Array(Array::scalar(9.0_f32)),
+                ArrayIrValue::Array(Array::scalar(2.0_f32)),
+                ArrayIrValue::Array(Array::scalar(0.0_f32)),
+            ]),
+        );
+        let primal_outputs = linearization.primal().interpret(vec![predicate, initial]).unwrap();
+        assert_eq!(
+            primal_outputs[..2],
+            [ArrayIrValue::Array(Array::scalar(4.0_f32)), ArrayIrValue::Array(Array::scalar(9.0_f32))],
+        );
+        let mut pullback_inputs =
+            vec![ArrayIrValue::Array(Array::scalar(2.0_f32)), ArrayIrValue::Array(Array::scalar(3.0_f32))];
+        pullback_inputs.extend_from_slice(&primal_outputs[2..]);
+        assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![ArrayIrValue::Array(Array::scalar(2.0_f32))]));
     }
 
     #[test]

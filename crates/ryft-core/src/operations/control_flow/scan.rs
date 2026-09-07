@@ -6817,6 +6817,152 @@ mod tests {
     /// A reference stack keeps the batch axis fixed by its referent and stays a stacked operand of the batched scan,
     /// whose body receives the per-iteration view of the packed stack at the axis the boundary view derives for it.
     #[test]
+    fn test_scan_differentiation_threads_reference_carries() {
+        // The body accumulates each scanned element into a reference carry and reports the running state, while an
+        // ordinary carry sums the elements: `f(x, s, xs) = (x + Σxs, [s + xs₁, s + xs₁ + xs₂, ...], s + Σxs)`.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let reference_type = ReferenceType::new(scalar_type.clone());
+        let mut body_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let carry = body_builder.add_input(scalar_type.clone().into());
+        let reference = body_builder.add_input(reference_type.into());
+        let element = body_builder.add_input(scalar_type.clone().into());
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, element], None)
+            .unwrap();
+        let current = body_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        let next_carry = body_builder
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, element], None)
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![next_carry, reference, current],
+                vec![Placeholder; 3],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let initial_carry = builder.add_input(scalar_type.clone().into());
+        let initial_state = builder.add_input(scalar_type.into());
+        let elements = builder.add_input(ArrayType::new_static(DataType::F32, [3]).into());
+        let reference = builder
+            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial_state], None)
+            .unwrap()[0];
+        let outputs = builder
+            .add_instruction(
+                ScanOperation::<ArrayIrValue<Array>>::new(2, 3),
+                vec![body],
+                vec![initial_carry, reference, elements],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let frozen = builder
+            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![outputs[1]], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![outputs[0], outputs[2], frozen],
+                vec![Placeholder; 3],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+
+        // The reference carry keeps its position and gains a tangent reference carry beside it, so the fused scan
+        // carries `[carry, ref, ċarry, ṙef]` over a body with one tangent input per (active) body input.
+        let jvp = program.jvp().unwrap();
+        let scan = jvp.instructions().iter().find(|instruction| instruction.operation().name() == "scan").unwrap();
+        assert!(matches!(scan.operation(), ArrayIrOperation::Scan(operation) if operation.carry_count() == 4));
+        assert_eq!(jvp.region_ref(scan.regions()[0]).unwrap().input_types().len(), 6);
+        assert_eq!(jvp.input_types().len(), 6);
+        assert_eq!(jvp.output_types().len(), 6);
+
+        let inputs = vec![
+            ArrayIrValue::Array(Array::scalar(0.0_f32)),
+            ArrayIrValue::Array(Array::scalar(10.0_f32)),
+            ArrayIrValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0])),
+            ArrayIrValue::Array(Array::scalar(1.0_f32)),
+            ArrayIrValue::Array(Array::scalar(1.0_f32)),
+            ArrayIrValue::Array(Array::vector(vec![0.0_f32, 0.0, 1.0])),
+        ];
+        let expected = program
+            .discharge_references(0)
+            .unwrap()
+            .into_program_without_external_references()
+            .unwrap()
+            .jvp()
+            .unwrap()
+            .interpret(inputs.clone())
+            .unwrap();
+        assert_eq!(
+            expected,
+            vec![
+                ArrayIrValue::Array(Array::scalar(6.0_f32)),
+                ArrayIrValue::Array(Array::vector(vec![11.0_f32, 13.0, 16.0])),
+                ArrayIrValue::Array(Array::scalar(16.0_f32)),
+                ArrayIrValue::Array(Array::scalar(2.0_f32)),
+                ArrayIrValue::Array(Array::vector(vec![1.0_f32, 1.0, 2.0])),
+                ArrayIrValue::Array(Array::scalar(2.0_f32)),
+            ],
+        );
+        assert_eq!(jvp.interpret(inputs), Ok(expected));
+    }
+
+    #[test]
+    fn test_scan_differentiation_preserves_inactive_reference_carries() {
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let reference_type = ReferenceType::new(scalar_type.clone());
+        let mut body_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let reference = body_builder.add_input(reference_type.clone().into());
+        let carry = body_builder.add_input(scalar_type.clone().into());
+        let doubled = body_builder
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, carry], None)
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![reference, doubled],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let reference = builder.add_input(reference_type.into());
+        let carry = builder.add_input(scalar_type.into());
+        let body = builder.import_region(body.entry_region_ref());
+        let outputs = builder
+            .add_instruction(ScanOperation::<ArrayIrValue<Array>>::new(2, 3), vec![body], vec![reference, carry], None)
+            .unwrap()
+            .to_vec();
+        let state =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![outputs[0]], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![outputs[1], state],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let jvp = program.entry_region_ref().jvp(&[1]).unwrap();
+        assert_eq!(jvp.input_ids().len(), 3);
+        assert_eq!(
+            jvp.interpret(vec![
+                ArrayIrValue::Reference(ArrayReference::new(Array::scalar(5.0_f32))),
+                ArrayIrValue::Array(Array::scalar(3.0_f32)),
+                ArrayIrValue::Array(Array::scalar(2.0_f32)),
+            ]),
+            Ok(vec![
+                ArrayIrValue::Array(Array::scalar(24.0_f32)),
+                ArrayIrValue::Array(Array::scalar(5.0_f32)),
+                ArrayIrValue::Array(Array::scalar(16.0_f32)),
+                ArrayIrValue::Array(Array::scalar(0.0_f32)),
+            ])
+        );
+    }
+
+    #[test]
     fn test_scan_differentiation_flows_through_reverse_scans() {
         type TestContext = EagerContext<Array, ArrayOperation<Array>>;
         type TestTracer = LinearizationTracer<TestContext>;

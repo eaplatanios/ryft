@@ -3289,15 +3289,13 @@ mod tests {
     use crate::differentiation::differentiate_at;
     use crate::operations::differentiation::tests::custom_jvp_regions_with_reference_state;
     use crate::operations::{
-        CompareOperation, ComparisonDirection, ConditionOperation, CosOperation, CustomJvpOperation, Dot,
-        DotDimensionNumbers, MulOperation, ParallelReduceOperation, ParallelReductionKind, ReferenceAddUpdate,
-        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
-        ReferenceReadOperation, ReferenceWriteOperation, ScanOperation, Sin, SinOperation, StopGradient,
-        StopGradientOperation, WhileOperation, ZeroOperation,
+        ConditionOperation, CosOperation, CustomJvpOperation, Dot, DotDimensionNumbers, MulOperation,
+        ParallelReduceOperation, ParallelReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
+        ReferenceWriteOperation, Sin, SinOperation, StopGradient, StopGradientOperation, ZeroOperation,
     };
     use crate::parameters::{ParameterError, Placeholder};
     use crate::programs::{Concretizable, Operation, OperationProvider, ProgramBuilder, ReferenceType, RegionId};
-    use crate::tests::test_condition_program;
     use crate::tracing::{NestedTracingContext, Trace};
 
     #[cfg(debug_assertions)]
@@ -3364,6 +3362,125 @@ mod tests {
             .unwrap()
     }
 
+    /// Builds a program whose entry applies `operation` to its single scalar input.
+    fn unary_program(
+        operation: ArrayOperation<Array>,
+    ) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
+        builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
+    /// Builds a single-instruction region tagging its input with `key`.
+    #[cfg(debug_assertions)]
+    fn tagged_program(key: &str) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(TagOperation::new(key), Vec::new(), vec![input], None).unwrap()[0];
+        builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
+    /// Builds a single-instruction region scaling its input by the constant `factor`.
+    #[cfg(debug_assertions)]
+    fn scaled_program(factor: f64) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let constant = builder.add_constant(Array::scalar(factor));
+        let output = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, constant], None).unwrap()[0];
+        builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
+    }
+
+    /// Adds the numeric input to a reference and returns its updated contents.
+    fn add_to_reference<V: ReferenceAddUpdate + ReferenceRead>((reference, x): (V, V)) -> Result<V, ProgramError> {
+        reference.add_update(&x)?;
+        reference.read()
+    }
+
+    /// Adds one reference's contents to another and returns the updated contents.
+    fn add_reference_contents<V: ReferenceAddUpdate + ReferenceRead>(
+        (reference, other): (V, V),
+    ) -> Result<V, ProgramError> {
+        reference.add_update(&other.read()?)?;
+        reference.read()
+    }
+
+    /// Builds a valid flat program with the requested input types and constant outputs. Constructor tests vary
+    /// the relationship between two valid programs rather than corrupting either program's own structure.
+    fn boundary_program(
+        inputs: &[DataType],
+        outputs: &[Array],
+    ) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
+        let mut builder = ProgramBuilder::new();
+        for &data_type in inputs {
+            builder.add_input(ArrayType::scalar(data_type));
+        }
+        let output_ids = outputs.iter().cloned().map(|value| builder.add_constant(value)).collect();
+        builder
+            .build(output_ids, vec![Placeholder; inputs.len()], vec![Placeholder; outputs.len()])
+            .unwrap()
+    }
+
+    /// Constructs a pushforward with a reference-free public boundary and its matching reconstruction plan.
+    /// Tests independently vary the compact program and residual values to exercise constructor validation.
+    fn pushforward_with_boundary(
+        program: Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>,
+        residuals: Vec<Array>,
+        inputs: &[Array],
+        outputs: &[Array],
+    ) -> Result<Pushforward<EagerContext<Array, ArrayOperation<Array>>, Vec<Array>, Vec<Array>>, ProgramError> {
+        let context = EagerContext::new();
+        let input_types = inputs.iter().map(|value| value.r#type().into_owned()).collect();
+        let output_types = outputs.iter().map(|value| value.r#type().into_owned()).collect::<Vec<_>>();
+        let reconstruction = ZeroSpaceBoundaryReconstruction::capture(
+            &context,
+            outputs,
+            &output_types,
+            ZeroSpaceBoundaryRole::OutputTangent,
+        )?;
+        let references = ReferenceBoundary::new_for_differentiation(&context, inputs, &[], &[])?;
+        Pushforward::new(
+            context,
+            program,
+            residuals,
+            reconstruction,
+            input_types,
+            output_types,
+            references,
+            vec![Placeholder; outputs.len()],
+        )
+    }
+
+    /// Renders the complete cache nondeterminism diagnostic expected from a deliberately corrupted artifact.
+    #[cfg(debug_assertions)]
+    fn transform_mismatch_message<T>(
+        cached: &[&Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>],
+        derived: &[&Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>],
+        cached_metadata: &str,
+        derived_metadata: &str,
+    ) -> String {
+        let mut programs = String::new();
+        for index in 0..cached.len().max(derived.len()) {
+            for (label, entries) in [("cached", cached), ("fresh", derived)] {
+                let rendering = entries.get(index).map(|program| program.to_string());
+                programs.push_str(&format!(
+                    "--- {label} program {index} ---\n{}\n",
+                    rendering.as_deref().unwrap_or("<absent>")
+                ));
+            }
+        }
+        format!(
+            "nondeterministic transform rule detected for `{}` with arguments DifferentiationTransformArguments {{ \
+                input_indices: [0] }}: re-derivation produced a different artifact than the region cache retained, \
+                but region transforms must be deterministic structural functions of their complete reachable \
+                contents and arguments\n\ncached metadata: {}\nderived metadata: {}\n\n{}",
+            cached_metadata,
+            derived_metadata,
+            programs,
+            std::any::type_name::<T>(),
+        )
+    }
+
     #[test]
     fn test_differentiation_dual_new() {
         let differentiable = DifferentiationDual::new(Array::scalar(2.0), Array::scalar(3.0)).unwrap();
@@ -3395,6 +3512,17 @@ mod tests {
     }
 
     #[test]
+    fn test_differentiation_dual_new_with_zero_tangent() {
+        let dual = DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0_f64)).unwrap();
+        assert_eq!(dual.primal(), &Array::scalar(2.0_f64));
+        assert!(matches!(dual.tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::F64)));
+        let zero_space = DifferentiationDual::new_with_zero_tangent(Array::scalar(true)).unwrap();
+        assert!(
+            matches!(zero_space.tangent(), MaybeZero::Zero(r#type) if r#type == &ArrayType::scalar(DataType::Zero))
+        );
+    }
+
+    #[test]
     fn test_differentiation_dual_is_tangent_active() {
         // A live tangent is always active. A structural zero is active only when it can be materialized from its type
         // alone: a numeric zero is, while a zero-space value, a plumbing reference, and a zero whose type carries a
@@ -3417,6 +3545,75 @@ mod tests {
     }
 
     #[test]
+    fn test_linearization_new() {
+        let primal = boundary_program(&[DataType::F64], &[Array::scalar(2.0_f64)]);
+        let tangent = boundary_program(&[DataType::F64], &[Array::scalar(0.0_f64)]);
+        let linearization = Linearization::new(primal.clone(), tangent.clone(), 0).unwrap();
+        assert_eq!(linearization.primal().to_string(), primal.to_string());
+        assert_eq!(linearization.tangent().to_string(), tangent.to_string());
+        assert_eq!(linearization.residual_count(), 0);
+        assert_eq!(linearization.pushforward().to_string(), tangent.to_string());
+        let (actual_primal, actual_tangent, residual_count) = linearization.into_parts();
+        assert_eq!(actual_primal.to_string(), primal.to_string());
+        assert_eq!(actual_tangent.to_string(), tangent.to_string());
+        assert_eq!(residual_count, 0);
+    }
+
+    #[test]
+    fn test_linearization_new_rejects_residual_counts() {
+        assert!(matches!(
+            Linearization::new(boundary_program(&[], &[]), boundary_program(&[], &[]), 1),
+            Err(ProgramError::MalformedProgram(message)) if message == "linearization primal program produces 0 \
+                outputs which is fewer than its 1 residuals",
+        ));
+    }
+
+    #[test]
+    fn test_linearization_new_rejects_tangent_residual_count() {
+        assert!(matches!(
+            Linearization::new(boundary_program(&[], &[Array::scalar(1.0_f64)]), boundary_program(&[], &[]), 1),
+            Err(ProgramError::MalformedProgram(message)) if message == "linearization tangent program consumes 0 \
+                inputs which is fewer than its 1 residuals",
+        ));
+    }
+
+    #[test]
+    fn test_linearization_new_rejects_input_count() {
+        assert!(matches!(
+            Linearization::new(boundary_program(&[DataType::F64], &[]), boundary_program(&[], &[]), 0),
+            Err(ProgramError::MalformedProgram(message)) if message == "linearization tangent program consumes 0 \
+                tangent inputs while the primal program has 1 active inputs",
+        ));
+    }
+
+    #[test]
+    fn test_linearization_new_rejects_output_count() {
+        assert!(matches!(
+            Linearization::new(boundary_program(&[], &[Array::scalar(1.0_f64)]), boundary_program(&[], &[]), 0),
+            Err(ProgramError::MalformedProgram(message)) if message == "linearization tangent program produces 0 \
+                outputs while the primal program has 1 nonzero differential outputs",
+        ));
+    }
+
+    #[test]
+    fn test_linearization_new_rejects_output_type() {
+        assert!(matches!(
+            Linearization::new(boundary_program(&[], &[Array::scalar(1.0_f64)]), boundary_program(&[], &[Array::scalar(1.0_f32)]), 0),
+            Err(ProgramError::MalformedProgram(message)) if message == "linearization tangent output 0 has type f32[] \
+                but primal output type f64[] requires tangent type f64[]",
+        ));
+    }
+
+    #[test]
+    fn test_linearization_new_rejects_residual_type() {
+        assert!(matches!(
+            Linearization::new(boundary_program(&[], &[Array::scalar(1.0_f64)]), boundary_program(&[DataType::F32], &[]), 1),
+            Err(ProgramError::MalformedProgram(message)) if message == "linearization residual 0 has type f64[] in \
+                the primal program but type f32[] in the tangent program",
+        ));
+    }
+
+    #[test]
     fn test_linearization_new_with_respect_to() {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let first = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -3428,12 +3625,15 @@ mod tests {
         let linearization = program.entry_region_ref().linearize(&[2, 0]).unwrap();
         let (primal, tangent, residual_count) = linearization.into_parts();
         // Constructor validation uses selected order and omits zero spaces just like the transform.
-        assert!(
-            Linearization::new_with_respect_to(primal.clone(), tangent.clone(), residual_count, &[2, 1, 0]).is_ok()
-        );
+        let reconstructed =
+            Linearization::new_with_respect_to(primal.clone(), tangent.clone(), residual_count, &[2, 1, 0]).unwrap();
+        assert_eq!(reconstructed.primal().to_string(), primal.to_string());
+        assert_eq!(reconstructed.tangent().to_string(), tangent.to_string());
+        assert_eq!(reconstructed.residual_count(), residual_count);
         assert!(matches!(Linearization::new_with_respect_to(primal.clone(), tangent.clone(), residual_count, &[0, 2]),
             Err(ProgramError::MalformedProgram(message))
-                if message == "linearization tangent input 0 has type f32[] but primal input type f64[] requires tangent type f64[]",
+                if message == "linearization tangent input 0 has type f32[] but primal input type f64[] requires \
+                    tangent type f64[]",
         ));
         assert!(matches!(Linearization::new_with_respect_to(primal.clone(), tangent.clone(), residual_count, &[1, 1]),
             Err(ProgramError::InvalidArgument { message })
@@ -3443,6 +3643,148 @@ mod tests {
             Err(ProgramError::InvalidArgument { message })
                 if message == "differentiation input index 3 is out of range for a region with 3 inputs",
         ));
+    }
+
+    #[test]
+    fn test_pushforward_new() {
+        let program = boundary_program(&[DataType::F64, DataType::F32], &[Array::scalar(0.0_f64)]);
+        let pushforward = pushforward_with_boundary(
+            program.clone(),
+            vec![Array::scalar(7.0_f32)],
+            &[Array::scalar(1.0_f64)],
+            &[Array::scalar(2.0_f64)],
+        )
+        .unwrap();
+        assert_eq!(pushforward.program().to_string(), program.to_string());
+        assert_eq!(pushforward.residuals(), &[Array::scalar(7.0_f32)]);
+        assert_eq!(pushforward.apply(vec![Array::scalar(5.0_f64)]), Ok(vec![Array::scalar(0.0_f64)]));
+        let (_, actual_program, residuals, input_types, output_types, _) = pushforward.into_parts();
+        assert_eq!(input_types, vec![ArrayType::scalar(DataType::F64)]);
+        assert_eq!(output_types, vec![ArrayType::scalar(DataType::F64)]);
+        assert_eq!(actual_program.to_string(), program.to_string());
+        assert_eq!(residuals, vec![Array::scalar(7.0_f32)]);
+    }
+
+    #[test]
+    fn test_pushforward_new_rejects_residual_count() {
+        assert!(matches!(
+            pushforward_with_boundary(boundary_program(&[], &[]), vec![Array::scalar(1.0_f64)], &[], &[]),
+            Err(ProgramError::MalformedProgram(message)) if message == "pushforward program consumes 0 inputs which \
+                is fewer than its 1 residuals",
+        ));
+    }
+
+    #[test]
+    fn test_pushforward_new_rejects_residual_type() {
+        assert!(matches!(
+            pushforward_with_boundary(boundary_program(&[DataType::F32], &[]), vec![Array::scalar(1.0_f64)], &[], &[]),
+            Err(ProgramError::MalformedProgram(message)) if message == "pushforward residual 0 has type f32[] in the \
+                pushforward program but carries a value of type f64[]",
+        ));
+    }
+
+    #[test]
+    fn test_pushforward_new_rejects_input_count() {
+        assert!(matches!(
+            pushforward_with_boundary(boundary_program(&[], &[]), vec![], &[Array::scalar(1.0_f64)], &[]),
+            Err(ProgramError::MalformedProgram(message)) if message == "pushforward program consumes 0 tangent inputs \
+                but its public boundary has 1 nonzero differential inputs",
+        ));
+    }
+
+    #[test]
+    fn test_pushforward_new_rejects_input_type() {
+        assert!(matches!(
+            pushforward_with_boundary(boundary_program(&[DataType::F32], &[]), vec![], &[Array::scalar(1.0_f64)], &[]),
+            Err(ProgramError::MalformedProgram(message)) if message == "pushforward program tangent input 0 has type \
+                f32[] but its public boundary requires tangent type f64[]",
+        ));
+    }
+
+    #[test]
+    fn test_pushforward_new_rejects_output_count() {
+        assert!(matches!(
+            pushforward_with_boundary(boundary_program(&[], &[]), vec![], &[], &[Array::scalar(1.0_f64)]),
+            Err(ProgramError::MalformedProgram(message)) if message == "pushforward program produces 0 tangent \
+                outputs but its public boundary has 1 nonzero differential outputs",
+        ));
+    }
+
+    #[test]
+    fn test_pushforward_new_rejects_output_type() {
+        assert!(matches!(
+            pushforward_with_boundary(boundary_program(&[], &[Array::scalar(1.0_f32)]), vec![], &[], &[Array::scalar(1.0_f64)]),
+            Err(ProgramError::MalformedProgram(message)) if message == "pushforward program tangent output 0 has type \
+                f32[] but its public boundary requires tangenttype f64[]",
+        ));
+    }
+
+    #[test]
+    fn test_pushforward_apply() {
+        // Structured inputs preserve their leaf order through a reusable multi-input pushforward.
+        let function = |(a, b): (
+            LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>,
+            LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>,
+        )| Ok(a.clone() * b + a.sin()?);
+        let (_, pushforward) = differentiate_at((Array::scalar(0.5), Array::scalar(1.3))).linearize(function).unwrap();
+        assert_abs_diff_eq!(
+            pushforward.apply((Array::scalar(1.0), Array::scalar(0.0))).unwrap().to_f64s()[0],
+            1.3 + 0.5f64.cos(),
+            epsilon = 1e-9,
+        );
+        assert_abs_diff_eq!(
+            pushforward.apply((Array::scalar(0.0), Array::scalar(1.0))).unwrap().to_f64s()[0],
+            0.5,
+            epsilon = 1e-9,
+        );
+    }
+
+    #[test]
+    fn test_pushforward_apply_rejects_aliased_tangent_references() {
+        // `f(r, s) = { add_update(r, read(s)); read(r) }` over two live references.
+
+        let reference = ArrayReference::new(Array::scalar(1.0_f32));
+        let other = ArrayReference::new(Array::scalar(3.0_f32));
+        let (value, pushforward) =
+            differentiate_at((ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Reference(other.clone())))
+                .linearize(add_reference_contents)
+                .unwrap();
+        assert_eq!(value, ArrayIrValue::Array(Array::scalar(4.0_f32)));
+
+        // A tangent reference aliasing a reference bound at the primal boundary is rejected by identity even though
+        // that reference advanced generations after linearization, and two tangents aliasing each other are rejected
+        // as well. The rejections precede any interpretation, so the primal state is untouched.
+        let tangent_reference = ArrayReference::new(Array::scalar(0.5_f32));
+        assert!(matches!(
+            pushforward.apply((
+                ArrayIrValue::Reference(tangent_reference.clone()),
+                ArrayIrValue::Reference(reference.clone()),
+            )),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "tangent 1 aliases a reference bound at the primal boundary of the differentiated \
+                    function",
+        ));
+        assert!(matches!(
+            pushforward.apply((
+                ArrayIrValue::Reference(tangent_reference.clone()),
+                ArrayIrValue::Reference(tangent_reference.clone()),
+            )),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "tangent 1 and tangent 0 bind the same reference allocation",
+        ));
+        assert_eq!(reference.read(), Ok(Array::scalar(4.0_f32)));
+        assert_eq!(other.read(), Ok(Array::scalar(3.0_f32)));
+
+        // Distinct tangent references push the tangent through: `ṫ = ṟ + ṡ = 0.5 + 2`.
+        let other_tangent_reference = ArrayReference::new(Array::scalar(2.0_f32));
+        assert_eq!(
+            pushforward.apply((
+                ArrayIrValue::Reference(tangent_reference.clone()),
+                ArrayIrValue::Reference(other_tangent_reference),
+            )),
+            Ok(ArrayIrValue::Array(Array::scalar(2.5_f32))),
+        );
+        assert_eq!(tangent_reference.read(), Ok(Array::scalar(2.5_f32)));
     }
 
     #[test]
@@ -3506,6 +3848,67 @@ mod tests {
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
                 if message == "differentiation input index 2 is out of range for a region with 2 inputs",
         ));
+    }
+
+    #[test]
+    fn test_differentiation_tracer_new() {
+        let context = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let primal = Array::scalar(2.0_f64);
+        let tangent = Array::scalar(3.0_f64);
+        let dual = DifferentiationDual::new(primal.clone(), tangent.clone()).unwrap();
+        let tracer = DifferentiationTracer::new(dual, context);
+        assert_eq!(tracer.primal(), &primal);
+        assert_eq!(tracer.tangent().as_value(), Some(&tangent));
+        assert_eq!(tracer.dual().primal(), &primal);
+        assert!(tracer.context().is_eager());
+        assert_eq!(tracer.r#type().as_ref(), primal.r#type().as_ref());
+        assert_eq!(format!("{tracer}"), format!("{primal} + {tangent}ε"));
+        assert_eq!(format!("{tracer:?}"), format!("DifferentiationTracer {{ dual: {:?} }}", tracer.dual()));
+        let (actual_primal, actual_tangent) = tracer.into_dual().into_parts();
+        assert_eq!(actual_primal, primal);
+        assert_eq!(actual_tangent.as_value(), Some(&tangent));
+    }
+
+    #[test]
+    fn test_differentiation_tracer_equality() {
+        let context = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let first = DifferentiationTracer::new(
+            DifferentiationDual::new(Array::scalar(2.0), Array::scalar(3.0)).unwrap(),
+            context.clone(),
+        );
+        assert_eq!(first, first);
+        assert_eq!(first, first.clone());
+        // Context stamping does not change value equality; either half of the dual does.
+        let other_context = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new());
+        assert_eq!(first, DifferentiationTracer::new(first.dual().clone(), other_context));
+        assert_ne!(
+            first,
+            DifferentiationTracer::new(
+                DifferentiationDual::new(Array::scalar(4.0), Array::scalar(3.0)).unwrap(),
+                context.clone()
+            )
+        );
+        assert_ne!(
+            first,
+            DifferentiationTracer::new(
+                DifferentiationDual::new(Array::scalar(2.0), Array::scalar(4.0)).unwrap(),
+                context.clone()
+            )
+        );
+        let zero = DifferentiationTracer::new(
+            DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0)).unwrap(),
+            context.clone(),
+        );
+        assert_eq!(zero, zero.clone());
+        assert_ne!(first, zero);
+        assert_ne!(
+            zero,
+            DifferentiationTracer::new(
+                DifferentiationDual::new(Array::scalar(2.0), Array::scalar(0.0)).unwrap(),
+                context
+            )
+        );
+        assert_eq!(format!("{zero}"), format!("{} + 0ε", Array::scalar(2.0)));
     }
 
     #[test]
@@ -3599,33 +4002,20 @@ mod tests {
     }
 
     #[test]
-    fn test_differentiation_context_resolves_only_structural_zero_duals() {
+    fn test_differentiation_context_bind() {
         let context = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new());
-        let constant = context.lift(Array::scalar(2.0)).unwrap();
-        assert!(matches!(
-            context.resolve(&constant),
-            ValueResolution::Constant(value) if value == Array::scalar(2.0)
-        ));
-
-        let live = DifferentiationTracer::new(
-            DifferentiationDual::new(Array::scalar(2.0), Array::scalar(1.0)).unwrap(),
+        let input = DifferentiationTracer::new(
+            DifferentiationDual::new(Array::scalar(0.0_f64), Array::scalar(3.0_f64)).unwrap(),
             context.clone(),
         );
-        assert!(matches!(context.resolve(&live), ValueResolution::Opaque));
-
-        let parent = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let foreign = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let primal = foreign.input(ArrayType::scalar(DataType::F64));
-        let context = DifferentiationContext::fused(parent);
-        let opaque = DifferentiationTracer::new(
-            DifferentiationDual::new(primal, MaybeZero::Zero(ArrayType::scalar(DataType::F64))).unwrap(),
-            context.clone(),
-        );
-        assert!(matches!(context.resolve(&opaque), ValueResolution::Opaque));
+        let outputs = context.bind(SinOperation::new(), Vec::new(), &[input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].primal(), &Array::scalar(0.0_f64));
+        assert_eq!(outputs[0].tangent().as_value(), Some(&Array::scalar(3.0_f64)));
     }
 
     #[test]
-    fn test_differentiation_context_runs_reference_rules_before_symbolic_zero_fast_path() {
+    fn test_differentiation_context_bind_reference_outputs() {
         let context =
             DifferentiationContext::fused(EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
         let input = DifferentiationTracer::new(
@@ -3644,7 +4034,7 @@ mod tests {
     }
 
     #[test]
-    fn test_differentiation_context_runs_region_rules_for_reference_results_under_symbolic_zero_tangents() {
+    fn test_differentiation_context_bind_region_reference_outputs() {
         // Both branches allocate a local reference from the numeric operand and return it: `f(p, x) = new(x)`.
         let scalar_type = ArrayType::scalar(DataType::F32);
         let branch = || {
@@ -3678,7 +4068,7 @@ mod tests {
     }
 
     #[test]
-    fn test_differentiation_context_skips_ruleless_operations_for_symbolic_zero_tangents() {
+    fn test_differentiation_context_bind_symbolic_zero_tangents() {
         // `stop_gradient` severs the collective's tangent input. The differentiation context must therefore bind the
         // primal collective without consulting its absent JVP rule, while preserving the live tangent of the other
         // addition operand.
@@ -3698,7 +4088,7 @@ mod tests {
     }
 
     #[test]
-    fn test_differentiation_context_replays_custom_derivative_regions_with_local_reference_state() {
+    fn test_differentiation_context_bind_custom_derivative_reference_state() {
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let regions = custom_jvp_regions_with_reference_state(&scalar_type);
 
@@ -3721,9 +4111,8 @@ mod tests {
             Ok((ArrayIrValue::Array(Array::scalar(1.0_f32)), ArrayIrValue::Array(Array::scalar(1.0_f32)))),
         );
 
-        // Replacing the active input with a lifted value leaves the rule dormant: the all-zero fast path binds only the
-        // pure primal region, so the stateful rule region is never entered and the boundary materializes a zero
-        // tangent for the primal result.
+        // A lifted input has a structural zero tangent. The attached rule contains references, so binding still
+        // invokes it; its identity tangent evaluates to zero. This case checks the result, not whether replay is skipped.
         let result = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new().jvp(
             move |input: DifferentiationTracer<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>, ()| {
                 let lifted = input.context().lift(ArrayIrValue::Array(Array::scalar(1.0_f32)))?;
@@ -3738,6 +4127,833 @@ mod tests {
             result,
             Ok((ArrayIrValue::Array(Array::scalar(1.0_f32)), ArrayIrValue::Array(Array::scalar(0.0_f32)))),
         );
+    }
+
+    #[test]
+    fn test_differentiation_context_resolve() {
+        let context = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new());
+        let constant = context.lift(Array::scalar(2.0)).unwrap();
+        assert!(matches!(
+            context.resolve(&constant),
+            ValueResolution::Constant(value) if value == Array::scalar(2.0)
+        ));
+
+        let live = DifferentiationTracer::new(
+            DifferentiationDual::new(Array::scalar(2.0), Array::scalar(1.0)).unwrap(),
+            context.clone(),
+        );
+        assert!(matches!(context.resolve(&live), ValueResolution::Opaque));
+
+        let parent = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let foreign = TracingContext::<Array, ArrayOperation<Array>>::new();
+        let primal = foreign.input(ArrayType::scalar(DataType::F64));
+        let context = DifferentiationContext::fused(parent);
+        let opaque = DifferentiationTracer::new(
+            DifferentiationDual::new(primal, MaybeZero::Zero(ArrayType::scalar(DataType::F64))).unwrap(),
+            context.clone(),
+        );
+        assert!(matches!(context.resolve(&opaque), ValueResolution::Opaque));
+    }
+
+    #[test]
+    fn test_region_tangent_output_mask() {
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let value = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let reference = builder.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
+        let count = builder.add_input(ArrayType::scalar(DataType::I64).into());
+        let local = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![value], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(
+                vec![value, reference, local, count],
+                vec![Placeholder; 3],
+                vec![Placeholder; 4],
+            )
+            .unwrap();
+        let region = program.entry_region_ref();
+        assert_eq!(region.tangent_output_mask(&[]), Ok(vec![true, false, true, false]));
+
+        // Selection order changes tangent inputs, but the output mask always follows the primal outputs.
+        assert_eq!(region.tangent_output_mask(&[1, 0]), Ok(vec![true, true, true, false]));
+        assert_eq!(region.tangent_output_mask(&[0, 1]), Ok(vec![true, true, true, false]));
+        assert_eq!(region.tangent_output_mask(&[2]), Ok(vec![true, false, true, false]));
+
+        // Validate all selected positions, including duplicate inputs whose differential space is zero.
+        assert!(matches!(region.tangent_output_mask(&[1, 1]),
+            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
+                if message == "differentiation input index 1 is selected more than once",
+        ));
+        assert!(matches!(region.tangent_output_mask(&[2, 2]),
+            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
+                if message == "differentiation input index 2 is selected more than once",
+        ));
+        assert!(matches!(region.tangent_output_mask(&[3]),
+            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
+                if message == "differentiation input index 3 is out of range for a region with 3 inputs",
+        ));
+    }
+
+    #[test]
+    fn test_region_jvp() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let first = builder.add_input(ArrayType::scalar(DataType::F64));
+        builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let last = builder.add_input(ArrayType::scalar(DataType::F32));
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![first, last], vec![Placeholder; 3], vec![Placeholder; 2])
+            .unwrap();
+        let region = program.entry_region_ref();
+
+        // Primals and outputs retain source order, while tangent inputs follow the selection and omit metadata.
+        let jvp = region.jvp(&[2, 1, 0]).unwrap();
+        assert_eq!(
+            jvp.input_types(),
+            vec![
+                ArrayType::scalar(DataType::F64),
+                ArrayType::scalar(DataType::Boolean),
+                ArrayType::scalar(DataType::F32),
+                ArrayType::scalar(DataType::F32),
+                ArrayType::scalar(DataType::F64),
+            ]
+        );
+        assert_eq!(
+            jvp.interpret(vec![
+                Array::scalar(2.0_f64),
+                Array::scalar(true),
+                Array::scalar(3.0_f32),
+                Array::scalar(5.0_f32),
+                Array::scalar(7.0_f64),
+            ]),
+            Ok(vec![Array::scalar(2.0_f64), Array::scalar(3.0_f32), Array::scalar(7.0_f64), Array::scalar(5.0_f32)])
+        );
+
+        // Selecting no inputs supplies zero output tangents and retains all primal inputs.
+        assert_eq!(
+            region.jvp(&[]).unwrap().interpret(vec![
+                Array::scalar(2.0_f64),
+                Array::scalar(true),
+                Array::scalar(3.0_f32),
+            ]),
+            Ok(vec![Array::scalar(2.0_f64), Array::scalar(3.0_f32), Array::scalar(0.0_f64), Array::scalar(0.0_f32)])
+        );
+        assert!(matches!(region.jvp(&[0, 0]),
+            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
+                if message == "differentiation input index 0 is selected more than once",
+        ));
+        assert!(matches!(region.jvp(&[1, 1]),
+            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
+                if message == "differentiation input index 1 is selected more than once",
+        ));
+        assert!(matches!(region.jvp(&[3]),
+            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
+                if message == "differentiation input index 3 is out of range for a region with 3 inputs",
+        ));
+    }
+
+    #[test]
+    fn test_region_jvp_reference_input_order() {
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let scalar = ArrayType::scalar(DataType::F32);
+        let reference = builder.add_input(ReferenceType::new(scalar.clone()).into());
+        let value = builder.add_input(scalar.into());
+        let contents =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let product = builder
+            .add_instruction(
+                ArrayOperation::<Array>::from(MulOperation::new()),
+                Vec::new(),
+                vec![contents, value],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![product],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(4.0_f32)));
+        let tangent_reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(6.0_f32)));
+        let primals = vec![reference, Array::scalar(2.0_f32).into()];
+        let tangents = vec![Array::scalar(5.0_f32).into(), tangent_reference];
+
+        // The selected boundary puts the ordinary tangent before the reference tangent, despite primal order.
+        let region = program.entry_region_ref();
+        let jvp = region.jvp(&[1, 0]).unwrap();
+        let mut inputs = primals.clone();
+        inputs.extend(tangents.clone());
+        assert_eq!(jvp.interpret(inputs), Ok(vec![Array::scalar(8.0_f32).into(), Array::scalar(32.0_f32).into()]));
+    }
+
+    #[test]
+    fn test_region_jvp_omits_inactive_reference_output_tangents() {
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = builder.add_input(reference_type.into());
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // The compact region boundary retains the inactive primal reference and omits its tangent.
+        let inactive_jvp = program.entry_region_ref().jvp(&[]).unwrap();
+        assert!(inactive_jvp.instructions().is_empty());
+        assert_eq!(inactive_jvp.input_ids().len(), 1);
+        assert_eq!(inactive_jvp.output_ids(), inactive_jvp.input_ids());
+
+        // A forwarded active reference has its tangent reference forwarded by identity, with no allocation: the fused
+        // program stages nothing and returns its two inputs as its two outputs.
+        let jvp = program.entry_region_ref().jvp(&[0]).unwrap();
+        assert!(jvp.instructions().is_empty());
+        assert_eq!(jvp.input_types().len(), 2);
+        assert_eq!(jvp.output_ids(), jvp.input_ids());
+    }
+
+    #[test]
+    fn test_region_jvp_rejects_reference_view_outputs() {
+        let reference_type = ReferenceType::new(ArrayType::new_static(DataType::F32, [4]));
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = builder.add_input(reference_type.into());
+        let view = builder
+            .add_instruction(
+                ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 2, 1)]),
+                Vec::new(),
+                vec![reference],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![view], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // A derived view output would need the same view applied to the tangent root, which is not supported.
+        assert!(matches!(
+            program.entry_region_ref().jvp(&[0]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "output 0 is a derived view of a reference and cannot be differentiated; return the \
+                    viewed reference and apply the view outside the differentiated program",
+        ));
+    }
+
+    #[test]
+    fn test_region_jvp_shared() {
+        // A shared region is differentiated once and reused by every copy of it, which is what removes the repeated
+        // re-transformation that programs attaching one shared `condition` branch or `scan` body would otherwise pay.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let callee = Arc::new(
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
+        );
+        let retained = callee.entry_region_ref().jvp_shared(&[0]).unwrap();
+        assert_eq!(retained.to_string(), callee.jvp().unwrap().to_string());
+        assert!(Arc::ptr_eq(&callee.entry_region_ref().jvp_shared(&[0]).unwrap(), &retained));
+
+        // Two independently built programs that intern the same callee share its retained program, because importing
+        // a region copies its complete reachable contents and therefore carries its transforms along.
+        let mut first_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let first_region = first_builder.intern_callee(&callee, None).unwrap();
+        let mut second_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let second_region = second_builder.intern_callee(&callee, None).unwrap();
+        assert!(Arc::ptr_eq(
+            &RegionRef::new(&first_builder.regions, first_region).unwrap().jvp_shared(&[0]).unwrap(),
+            &retained,
+        ));
+        assert!(Arc::ptr_eq(
+            &RegionRef::new(&second_builder.regions, second_region).unwrap().jvp_shared(&[0]).unwrap(),
+            &retained,
+        ));
+
+        // The initial request produces the artifact; direct and interned-region requests reuse it three times.
+        let statistics = callee.entry_region_ref().transform_statistics::<JvpTransform>().unwrap();
+        assert_eq!((statistics.productions, statistics.hits), (1, 3));
+
+        // A region whose contents are genuinely rewritten starts over with a freshly derived program.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        builder.add_instruction(SinOperation::new(), Vec::new(), vec![output], None).unwrap();
+        let with_dead_work =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let before = with_dead_work.entry_region_ref().jvp_shared(&[0]).unwrap();
+        let simplified = with_dead_work.simplified().unwrap();
+        let after = simplified.entry_region_ref().jvp_shared(&[0]).unwrap();
+        assert!(!Arc::ptr_eq(&after, &before));
+        assert_eq!(after.to_string(), retained.to_string());
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_region_jvp_shared_debug_recheck_detects_corrupted_cached_program() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+
+        // Publish an artifact that disagrees with what differentiating this region produces, which is exactly the
+        // state a nondeterministic `jvp` rule would leave behind: a retained derivative of a program the region does
+        // not compute.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(CosOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let unrelated = Arc::new(
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
+        );
+        program.entry_region_ref().insert_transform_artifact_for_testing::<JvpTransform, _>(
+            DifferentiationTransformArguments { input_indices: vec![0] },
+            TransformArtifact::new(vec![unrelated.clone()], ()),
+        );
+
+        // The recheck runs on the hit and reports the contract violation rather than serving the wrong derivative.
+        let panicked =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| program.entry_region_ref().jvp_shared(&[0])))
+                .unwrap_err();
+        let message = panicked.downcast_ref::<String>().unwrap();
+        assert_eq!(
+            message,
+            &transform_mismatch_message::<JvpTransform>(&[&unrelated], &[&program.jvp().unwrap()], "()", "()")
+        );
+    }
+
+    #[test]
+    fn test_region_jvp_shared_keys_artifacts_by_effective_selection() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let left = builder.add_input(ArrayType::scalar(DataType::F64));
+        let right = builder.add_input(ArrayType::scalar(DataType::F64));
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![product], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let region = program.entry_region_ref();
+
+        // Distinct effective selections derive distinct programs, while repeated selections share an artifact.
+        // Selecting every input in source order retains the complete tangent boundary.
+        let partial = region.jvp_shared(&[0]).unwrap();
+        let full = region.jvp_shared(&[0, 1]).unwrap();
+        assert_eq!(partial.input_types().len(), 3);
+        assert_eq!(full.input_types().len(), 4);
+        assert!(!Arc::ptr_eq(&partial, &full));
+        assert!(Arc::ptr_eq(&region.jvp_shared(&[0]).unwrap(), &partial));
+        assert!(Arc::ptr_eq(&region.jvp_shared(&[0, 1]).unwrap(), &full));
+        let reversed = region.jvp_shared(&[1, 0]).unwrap();
+        assert!(!Arc::ptr_eq(&reversed, &full));
+        assert!(Arc::ptr_eq(&region.jvp_shared(&[1, 0]).unwrap(), &reversed));
+        assert_eq!(
+            reversed.interpret(vec![
+                Array::scalar(2.0_f64),
+                Array::scalar(3.0_f64),
+                Array::scalar(5.0_f64),
+                Array::scalar(7.0_f64),
+            ]),
+            Ok(vec![Array::scalar(6.0_f64), Array::scalar(31.0_f64)])
+        );
+        assert_eq!(
+            partial.interpret(vec![Array::scalar(2.0), Array::scalar(3.0), Array::scalar(1.0)]),
+            Ok(vec![Array::scalar(6.0), Array::scalar(3.0)]),
+        );
+        assert!(matches!(
+            region.jvp_shared(&[2]),
+            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
+                if message == "differentiation input index 2 is out of range for a region with 2 inputs",
+        ));
+
+        // Selecting a zero-space input adds no tangent slot and does not change the cached artifact.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let value = builder.add_input(ArrayType::scalar(DataType::F64));
+        builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![value], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let region = program.entry_region_ref();
+        let requested = region.jvp_shared(&[0, 1]).unwrap();
+        assert_eq!(requested.input_types().len(), 3);
+        assert!(Arc::ptr_eq(&region.jvp_shared(&[0]).unwrap(), &requested));
+    }
+
+    #[test]
+    fn test_region_linearize() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let left = builder.add_input(ArrayType::scalar(DataType::F64));
+        builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let right = builder.add_input(ArrayType::scalar(DataType::F64));
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![product], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let region = program.entry_region_ref();
+        let linearization = region.linearize(&[2, 1, 0]).unwrap();
+        let primal_outputs = linearization
+            .primal()
+            .interpret(vec![Array::scalar(2.0_f64), Array::scalar(true), Array::scalar(3.0_f64)])
+            .unwrap();
+        assert_eq!(primal_outputs[0], Array::scalar(6.0_f64));
+        let mut tangent_inputs = vec![Array::scalar(5.0_f64), Array::scalar(7.0_f64)];
+        tangent_inputs.extend_from_slice(&primal_outputs[1..]);
+        // Tangents are [dright, dleft], so dproduct = 2 * 5 + 3 * 7, not 2 * 7 + 3 * 5.
+        assert_eq!(linearization.tangent().interpret(tangent_inputs), Ok(vec![Array::scalar(31.0_f64)]));
+        let mut pullback_inputs = vec![Array::scalar(1.0_f64)];
+        pullback_inputs.extend_from_slice(&primal_outputs[1..]);
+        assert_eq!(
+            linearization.pullback().unwrap().interpret(pullback_inputs),
+            Ok(vec![Array::scalar(2.0_f64), Array::scalar(3.0_f64)])
+        );
+
+        let empty = region.linearize(&[]).unwrap();
+        let outputs = empty
+            .primal()
+            .interpret(vec![Array::scalar(2.0_f64), Array::scalar(true), Array::scalar(3.0_f64)])
+            .unwrap();
+        assert_eq!(empty.tangent().interpret(outputs[1..].to_vec()), Ok(vec![Array::scalar(0.0_f64)]));
+        assert!(matches!(region.linearize(&[2, 2]),
+            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
+                if message == "differentiation input index 2 is selected more than once",
+        ));
+        assert!(matches!(region.linearize(&[1, 1]),
+            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
+                if message == "differentiation input index 1 is selected more than once",
+        ));
+        assert!(matches!(region.linearize(&[3]),
+            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
+                if message == "differentiation input index 3 is out of range for a region with 3 inputs",
+        ));
+    }
+
+    #[test]
+    fn test_region_linearize_omits_inactive_reference_output_tangents() {
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = builder.add_input(reference_type.into());
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // The primal carries the inactive reference while the tangent program has no inputs or outputs.
+        let inactive = program.entry_region_ref().linearize(&[]).unwrap();
+        assert_eq!(inactive.residual_count(), 0);
+        assert_eq!(inactive.primal().output_ids(), inactive.primal().input_ids());
+        assert!(inactive.tangent().input_ids().is_empty());
+        assert!(inactive.tangent().output_ids().is_empty());
+
+        // A forwarded active reference has its tangent reference forwarded by identity through the tangent program.
+        let linearization = program.entry_region_ref().linearize(&[0]).unwrap();
+        assert_eq!(linearization.residual_count(), 0);
+        assert!(linearization.tangent().instructions().is_empty());
+        assert_eq!(linearization.tangent().output_ids(), linearization.tangent().input_ids());
+    }
+
+    #[test]
+    fn test_region_linearize_rejects_reference_view_outputs() {
+        let reference_type = ReferenceType::new(ArrayType::new_static(DataType::F32, [4]));
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = builder.add_input(reference_type.into());
+        let view = builder
+            .add_instruction(
+                ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 2, 1)]),
+                Vec::new(),
+                vec![reference],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![view], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // The derived-view rejection applies to linearization exactly as it applies to the fused program.
+        assert!(matches!(
+            program.entry_region_ref().linearize(&[0]),
+            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
+                if message == "output 0 is a derived view of a reference and cannot be differentiated; return the \
+                    viewed reference and apply the view outside the differentiated program",
+        ));
+    }
+
+    #[test]
+    fn test_region_linearize_retains_no_zero_residuals_for_write_only_tangent_references() {
+        // `f(r, x) = { write(r, x); x }` stores into the reference without reading it back, so the tangent reference is
+        // reached by no tangent output even though its state is live. A reference has no value cotangent to construct,
+        // so the dead-tangent-input residual pass skips it and nothing crosses as a residual.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = builder.add_input(ReferenceType::new(scalar_type.clone()).into());
+        let value = builder.add_input(scalar_type.into());
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, value], None)
+            .unwrap();
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![value], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let linearization = program.entry_region_ref().linearize(&[0, 1]).unwrap();
+        assert_eq!(linearization.residual_count(), 0);
+        assert_eq!(
+            linearization.tangent().to_string(),
+            indoc! {"
+                lambda %0:ref<f32[]>, %1:f32[] .
+                let reference_write %0 %1
+                in (%1)
+            "}
+            .trim_end(),
+        );
+    }
+
+    #[test]
+    fn test_region_linearize_omits_inactive_tangent_inputs() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let left = builder.add_input(ArrayType::scalar(DataType::F64));
+        let right = builder.add_input(ArrayType::scalar(DataType::F64));
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![product], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let region = program.entry_region_ref();
+
+        // The tangent half consumes one tangent input for the active input only, followed by the residuals, and
+        // computes `ẏ = ẋ · right` without a term for the inactive input.
+        let linearization = region.linearize(&[0]).unwrap();
+        assert_eq!(linearization.tangent().input_ids().len(), 1 + linearization.residual_count());
+        assert_eq!(linearization.tangent().output_ids().len(), 1);
+        let primal_outputs = linearization.primal().interpret(vec![Array::scalar(2.0), Array::scalar(3.0)]).unwrap();
+        assert_eq!(primal_outputs[0], Array::scalar(6.0));
+        let mut tangent_inputs = vec![Array::scalar(1.0)];
+        tangent_inputs.extend_from_slice(&primal_outputs[1..]);
+        assert_eq!(linearization.tangent().interpret(tangent_inputs), Ok(vec![Array::scalar(3.0)]));
+    }
+
+    #[test]
+    fn test_region_linearize_reference_input_order() {
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let scalar = ArrayType::scalar(DataType::F32);
+        let reference = builder.add_input(ReferenceType::new(scalar.clone()).into());
+        let value = builder.add_input(scalar.into());
+        let contents =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let product = builder
+            .add_instruction(
+                ArrayOperation::<Array>::from(MulOperation::new()),
+                Vec::new(),
+                vec![contents, value],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![product],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(4.0_f32)));
+        let tangent_reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(6.0_f32)));
+        let primals = vec![reference, Array::scalar(2.0_f32).into()];
+        let tangents = vec![Array::scalar(5.0_f32).into(), tangent_reference];
+
+        // The selected boundary puts the ordinary tangent before the reference tangent, despite primal order.
+        let region = program.entry_region_ref();
+        let linearization = region.linearize(&[1, 0]).unwrap();
+        let outputs = linearization.primal().interpret(primals).unwrap();
+        assert_eq!(outputs[0], Array::scalar(8.0_f32).into());
+        let mut inputs = tangents;
+        inputs.extend_from_slice(&outputs[1..]);
+        assert_eq!(linearization.tangent().interpret(inputs), Ok(vec![Array::scalar(32.0_f32).into()]));
+    }
+
+    #[test]
+    fn test_region_linearize_shared() {
+        // A shared callee is linearized once and reused by every copy of its sealed region, which is what removes the
+        // repeated re-transformation that outer programs interning one callee would otherwise pay.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let callee = Arc::new(
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
+        );
+        let (primal, tangent, residual_count) = callee.entry_region_ref().linearize_shared(&[0]).unwrap();
+        assert_eq!(residual_count, 1);
+        assert_eq!(primal.to_string(), callee.linearize().unwrap().primal().to_string());
+        assert_eq!(tangent.to_string(), callee.linearize().unwrap().tangent().to_string());
+
+        // Two independently built programs that intern the same callee share its retained linearization, because
+        // importing a region copies its complete reachable contents and therefore carries its transforms along.
+        let mut first_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let first_region = first_builder.intern_callee(&callee, None).unwrap();
+        let mut second_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let second_region = second_builder.intern_callee(&callee, None).unwrap();
+        let first = RegionRef::new(&first_builder.regions, first_region).unwrap().linearize_shared(&[0]).unwrap();
+        let second = RegionRef::new(&second_builder.regions, second_region).unwrap().linearize_shared(&[0]).unwrap();
+        assert!(Arc::ptr_eq(&first.0, &primal));
+        assert!(Arc::ptr_eq(&first.1, &tangent));
+        assert!(Arc::ptr_eq(&second.0, &primal));
+        assert!(Arc::ptr_eq(&second.1, &tangent));
+
+        // The original region produces the artifact, and both independently interned copies reuse it.
+        let statistics = callee.entry_region_ref().transform_statistics::<LinearizationTransform>().unwrap();
+        assert_eq!((statistics.productions, statistics.hits), (1, 2));
+
+        // Simplification rebuilds every region, so it keeps the retained linearization only when the rebuild left the
+        // region's contents untouched. A program carrying dead work is genuinely rewritten and must not reuse it.
+        let simplified = callee.simplified().unwrap();
+        assert!(Arc::ptr_eq(&simplified.entry_region_ref().linearize_shared(&[0]).unwrap().0, &primal));
+
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        builder.add_instruction(SinOperation::new(), Vec::new(), vec![output], None).unwrap();
+        let with_dead_work =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let before = with_dead_work.entry_region_ref().linearize_shared(&[0]).unwrap();
+        let after = with_dead_work.simplified().unwrap();
+        let after = after.entry_region_ref().linearize_shared(&[0]).unwrap();
+        assert!(!Arc::ptr_eq(&after.0, &before.0));
+        assert_eq!(after.0.to_string(), primal.to_string());
+
+        // Instantiating a program's type identities rewrites its types, so the rebuilt program starts over with no
+        // retained transforms even though the source program keeps its own.
+        let bounds = DimensionBounds::non_negative(Some(16)).unwrap();
+        let dynamic_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("formal", bounds))]),
+        );
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(dynamic_type);
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let dynamic_callee =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let formal = dynamic_callee.entry_region_ref().linearize_shared(&[0]).unwrap();
+        let actual_type = ArrayType::new(
+            DataType::F64,
+            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("actual", bounds))]),
+        );
+        let instantiated = dynamic_callee.with_instantiated_type_identities(&[actual_type]).unwrap().into_owned();
+        let instantiated = instantiated.entry_region_ref().linearize_shared(&[0]).unwrap();
+        assert!(!Arc::ptr_eq(&instantiated.0, &formal.0));
+        assert!(Arc::ptr_eq(&dynamic_callee.entry_region_ref().linearize_shared(&[0]).unwrap().0, &formal.0));
+    }
+
+    #[test]
+    fn test_region_linearize_shared_invalidates_rebased_attached_regions() {
+        // A region's retained transforms cover its complete reachable contents, but the identifiers it attaches its
+        // descendants by are relative to the arena it is sealed in. Program `first` attaches the sine branch as both
+        // branches of a condition, so its entry's linearization is the derivative of sine.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let sine = builder.import_region(unary_program(ArrayOperation::Sin(SinOperation::new())).entry_region_ref());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder
+            .add_instruction(ConditionOperation::new(), vec![sine, sine], vec![predicate, input], None)
+            .unwrap()[0];
+        let first = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let retained = first.entry_region_ref().linearize_shared(&[0, 1]).unwrap();
+
+        // Re-sealing a copy of that entry into an arena whose region 0 is the cosine branch changes what the copy
+        // computes, so it must not be served the transforms derived from the sine branch.
+        let rebased = Program::<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>::new(
+            vec![Placeholder; 2],
+            vec![Placeholder],
+            vec![
+                unary_program(ArrayOperation::Cos(CosOperation::new())).entry_region().clone(),
+                first.entry_region().clone(),
+            ],
+            RegionId::new(1),
+        )
+        .unwrap();
+        let derived = rebased.entry_region_ref().linearize_shared(&[0, 1]).unwrap();
+        assert!(!Arc::ptr_eq(&derived.0, &retained.0));
+        assert!(!Arc::ptr_eq(&derived.1, &retained.1));
+
+        // The freshly derived tangent program differentiates the cosine branch the rebased arena actually attaches,
+        // which is the wrong-derivative failure that serving the retained artifact would produce.
+        assert_eq!(derived.1.to_string(), rebased.linearize().unwrap().tangent().to_string());
+        assert_ne!(derived.1.to_string(), retained.1.to_string());
+
+        // The source program keeps its own retained artifact, because only the re-sealed copy was rebased.
+        assert!(Arc::ptr_eq(&first.entry_region_ref().linearize_shared(&[0, 1]).unwrap().0, &retained.0));
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_region_linearize_shared_debug_recheck_detects_corrupted_cached_linearization() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+
+        // Publish an artifact that disagrees with what linearizing this region produces, which is exactly the state a
+        // nondeterministic `jvp` rule would leave behind: a retained derivative of a program the region does not
+        // compute.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(CosOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let unrelated = Arc::new(
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
+        );
+        program.entry_region_ref().insert_transform_artifact_for_testing::<LinearizationTransform, _>(
+            DifferentiationTransformArguments { input_indices: vec![0] },
+            TransformArtifact::new(vec![unrelated.clone(), unrelated.clone()], 0),
+        );
+
+        // The recheck runs on the hit and reports the contract violation rather than serving the wrong derivative.
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            program.entry_region_ref().linearize_shared(&[0])
+        }))
+        .unwrap_err();
+        let message = panicked.downcast_ref::<String>().unwrap();
+        let fresh = program.linearize().unwrap();
+        assert_eq!(
+            message,
+            &transform_mismatch_message::<LinearizationTransform>(
+                &[&unrelated, &unrelated],
+                &[fresh.primal(), fresh.tangent()],
+                "0",
+                &format!("{:?}", fresh.residual_count())
+            )
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_region_linearize_shared_debug_recheck_detects_operation_metadata_changes() {
+        // This test pins the metadata-fingerprint contract of `Operation::render`. The transform cache debugging
+        // diagnostic compares programs purely by rendering, so an operation that fails to render its semantics-bearing
+        // payload is an operation whose corruption the diagnostic cannot see. `tag` is the canonical example: its key
+        // is invisible to types and structure, yet rematerialization policies classify residuals by it. The two regions
+        // below differ only in that key, so this test panics exactly when `TagOperation::render` renders it; a
+        // name-only rendering would make the corrupted artifact compare equal and serve silently.
+
+        let program = tagged_program("saved");
+        let other = tagged_program("recomputed");
+
+        // The two programs differ only in operation metadata, so the corruption below is invisible to everything
+        // except rendering that carries the key.
+        assert_ne!(program.to_string(), other.to_string());
+
+        // Publish the *other* region's genuine linearization against this region, which is the state a `jvp` rule that
+        // is not a structural function of its operation would leave behind.
+        let (primal, tangent, residual_count) = other.entry_region_ref().linearize_shared(&[0]).unwrap();
+        program.entry_region_ref().insert_transform_artifact_for_testing::<LinearizationTransform, _>(
+            DifferentiationTransformArguments { input_indices: vec![0] },
+            TransformArtifact::new(vec![primal.clone(), tangent.clone()], residual_count),
+        );
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            program.entry_region_ref().linearize_shared(&[0])
+        }))
+        .unwrap_err();
+        let message = panicked.downcast_ref::<String>().unwrap();
+        let fresh = program.linearize().unwrap();
+        assert_eq!(
+            message,
+            &transform_mismatch_message::<LinearizationTransform>(
+                &[&primal, &tangent],
+                &[fresh.primal(), fresh.tangent()],
+                &format!("{residual_count:?}"),
+                &format!("{:?}", fresh.residual_count())
+            )
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn test_region_linearize_shared_debug_recheck_detects_constant_payload_changes() {
+        // This test pins the constant-payload part of the rendering contract at a cache hit. The two regions below
+        // differ only in one `Atom::Constant` literal, so this test panics exactly when `Program::render` carries that
+        // payload into the rendering compared by the recheck.
+
+        let program = scaled_program(2.0);
+        let other = scaled_program(3.0);
+
+        // The ordinary rendering is semantically complete enough to distinguish the embedded literal.
+        assert_ne!(program.to_string(), other.to_string());
+
+        // Publish the *other* region's genuine linearization against this region, which is the state a `jvp` rule
+        // that is not a structural function of the constants it embeds would leave behind.
+        let (primal, tangent, residual_count) = other.entry_region_ref().linearize_shared(&[0]).unwrap();
+        program.entry_region_ref().insert_transform_artifact_for_testing::<LinearizationTransform, _>(
+            DifferentiationTransformArguments { input_indices: vec![0] },
+            TransformArtifact::new(vec![primal.clone(), tangent.clone()], residual_count),
+        );
+
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            program.entry_region_ref().linearize_shared(&[0])
+        }))
+        .unwrap_err();
+        let message = panicked.downcast_ref::<String>().unwrap();
+        let fresh = program.linearize().unwrap();
+        assert_eq!(
+            message,
+            &transform_mismatch_message::<LinearizationTransform>(
+                &[&primal, &tangent],
+                &[fresh.primal(), fresh.tangent()],
+                &format!("{residual_count:?}"),
+                &format!("{:?}", fresh.residual_count())
+            )
+        );
+    }
+
+    #[test]
+    fn test_region_linearize_shared_does_not_retain_its_source_cache() {
+        // `to_program` deliberately preserves the source entry region's cache. Linearizing that materialized copy is
+        // therefore the strongest ownership-cycle attempt available through today's built-in transform API.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let program =
+            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
+        let source_cache = program.entry_region().transform_cache.downgrade();
+        let materialized = program.entry_region_ref().to_program();
+        assert!(program.entry_region().transform_cache.ptr_eq(&materialized.entry_region().transform_cache));
+        let (primal, tangent, _) = materialized.entry_region_ref().linearize_shared(&[0]).unwrap();
+
+        drop(program);
+        drop(materialized);
+        assert!(!source_cache.is_alive());
+
+        // The returned programs can outlive the source cache because built-in linearization constructs a fresh entry
+        // and imports only strict descendants from the acyclic source arena; neither artifact embeds the source root.
+        drop(primal);
+        drop(tangent);
+    }
+
+    #[test]
+    fn test_region_linearize_shared_normalizes_zero_spaces() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let left = builder.add_input(ArrayType::scalar(DataType::F64));
+        builder.add_input(ArrayType::scalar(DataType::Boolean));
+        let right = builder.add_input(ArrayType::scalar(DataType::F64));
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![product], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let region = program.entry_region_ref();
+        // Cache identity depends on live tangent order, but not on where zero-space indices appear.
+        let reversed = region.linearize_shared(&[2, 1, 0]).unwrap();
+        let equivalent = region.linearize_shared(&[1, 2, 0]).unwrap();
+        let source_order = region.linearize_shared(&[0, 2]).unwrap();
+        assert!(Arc::ptr_eq(&reversed.0, &equivalent.0));
+        assert!(Arc::ptr_eq(&reversed.1, &equivalent.1));
+        assert!(!Arc::ptr_eq(&reversed.0, &source_order.0));
+        assert!(!Arc::ptr_eq(&reversed.1, &source_order.1));
+    }
+
+    #[test]
+    fn test_region_linearize_shared_keys_artifacts_by_effective_selection() {
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let left = builder.add_input(ArrayType::scalar(DataType::F64));
+        let right = builder.add_input(ArrayType::scalar(DataType::F64));
+        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![product], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let region = program.entry_region_ref();
+
+        // The tangent half consumes one tangent input for the active input only, followed by the residuals, and
+        // computes `ẏ = ẋ · right` without a term for the inactive input.
+        // The retained linearization is keyed by the effective selection as well.
+        let (partial_primal, ..) = region.linearize_shared(&[0]).unwrap();
+        let (full_primal, ..) = region.linearize_shared(&[0, 1]).unwrap();
+        assert!(!Arc::ptr_eq(&partial_primal, &full_primal));
+        assert!(Arc::ptr_eq(&region.linearize_shared(&[0]).unwrap().0, &partial_primal));
     }
 
     #[test]
@@ -3766,39 +4982,6 @@ mod tests {
         );
         let outputs = fused.interpret(vec![Array::scalar(3.0), Array::scalar(1.0)]).unwrap();
         assert_eq!(outputs, vec![Array::scalar(3.0f64.sin()), Array::scalar(3.0f64.cos())]);
-
-        // Test that structural zero tangents are materialized as typed `zero` instructions only at the output boundary,
-        // preserving the `(primal_outputs ++ tangent_outputs)` contract. Both zero producers are covered: the
-        // constant-valued output's tangent is a *derived* zero (a constant is connected to no input tangent) and the
-        // `stop_gradient` output's tangent is a *rule-returned* zero, and exactly one `zero` instruction is staged per
-        // zero tangent output with none staged mid-program.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let constant = builder.add_constant(Array::scalar(2.0));
-        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, constant], None).unwrap()[0];
-        let severed = builder.add_instruction(StopGradientOperation::new(), Vec::new(), vec![scaled], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![scaled, constant, severed], vec![Placeholder], vec![Placeholder; 3])
-            .unwrap();
-        let fused = program.jvp().unwrap();
-        assert_eq!(fused.input_ids().len(), 2);
-        assert_eq!(fused.output_ids().len(), 6);
-        let zero_count =
-            fused.instructions().iter().filter(|instruction| instruction.operation().name() == "zero").count();
-        assert_eq!(zero_count, 2, "expected exactly one boundary zero per zero tangent output, but got:\n{fused}");
-        let outputs = fused.interpret(vec![Array::scalar(3.0), Array::scalar(1.0)]).unwrap();
-        assert_eq!(
-            outputs,
-            vec![
-                Array::scalar(6.0),
-                Array::scalar(2.0),
-                Array::scalar(6.0),
-                Array::scalar(2.0),
-                Array::scalar(0.0),
-                Array::scalar(0.0),
-            ],
-            "the fused outputs must be the primal outputs [3 * 2, 2, 3 * 2] followed by the tangents [2 * 1, 0, 0]",
-        );
     }
 
     #[test]
@@ -3940,945 +5123,58 @@ mod tests {
     }
 
     #[test]
-    fn test_region_tangent_output_mask() {
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let value = builder.add_input(ArrayType::scalar(DataType::F32).into());
-        let reference = builder.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
-        let count = builder.add_input(ArrayType::scalar(DataType::I64).into());
-        let local = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![value], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(
-                vec![value, reference, local, count],
-                vec![Placeholder; 3],
-                vec![Placeholder; 4],
-            )
-            .unwrap();
-        let region = program.entry_region_ref();
-        assert_eq!(region.tangent_output_mask(&[]), Ok(vec![true, false, true, false]));
-
-        // Selection order changes tangent inputs, but the output mask always follows the primal outputs.
-        assert_eq!(region.tangent_output_mask(&[1, 0]), Ok(vec![true, true, true, false]));
-        assert_eq!(region.tangent_output_mask(&[0, 1]), Ok(vec![true, true, true, false]));
-        assert_eq!(region.tangent_output_mask(&[2]), Ok(vec![true, false, true, false]));
-
-        // Validate all selected positions, including duplicate inputs whose differential space is zero.
-        assert!(matches!(region.tangent_output_mask(&[1, 1]),
-            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
-                if message == "differentiation input index 1 is selected more than once",
-        ));
-        assert!(matches!(region.tangent_output_mask(&[2, 2]),
-            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
-                if message == "differentiation input index 2 is selected more than once",
-        ));
-        assert!(matches!(region.tangent_output_mask(&[3]),
-            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
-                if message == "differentiation input index 3 is out of range for a region with 3 inputs",
-        ));
-    }
-
-    #[test]
-    fn test_region_jvp() {
+    fn test_program_jvp_materializes_boundary_zeros() {
+        // Test that structural zero tangents are materialized as typed `zero` instructions only at the output boundary,
+        // preserving the `(primal_outputs ++ tangent_outputs)` contract. Both zero producers are covered: the
+        // constant-valued output's tangent is a *derived* zero (a constant is connected to no input tangent) and the
+        // `stop_gradient` output's tangent is a *rule-returned* zero, and exactly one `zero` instruction is staged per
+        // zero tangent output with none staged mid-program.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let first = builder.add_input(ArrayType::scalar(DataType::F64));
-        builder.add_input(ArrayType::scalar(DataType::Boolean));
-        let last = builder.add_input(ArrayType::scalar(DataType::F32));
+        let input = builder.add_input(ArrayType::scalar(DataType::F64));
+        let constant = builder.add_constant(Array::scalar(2.0));
+        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, constant], None).unwrap()[0];
+        let severed = builder.add_instruction(StopGradientOperation::new(), Vec::new(), vec![scaled], None).unwrap()[0];
         let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![first, last], vec![Placeholder; 3], vec![Placeholder; 2])
+            .build::<Vec<Array>, Vec<Array>>(vec![scaled, constant, severed], vec![Placeholder], vec![Placeholder; 3])
             .unwrap();
-        let region = program.entry_region_ref();
-
-        // Primals and outputs retain source order, while tangent inputs follow the selection and omit metadata.
-        let jvp = region.jvp(&[2, 1, 0]).unwrap();
+        let fused = program.jvp().unwrap();
+        assert_eq!(fused.input_ids().len(), 2);
+        assert_eq!(fused.output_ids().len(), 6);
+        let zero_count =
+            fused.instructions().iter().filter(|instruction| instruction.operation().name() == "zero").count();
+        assert_eq!(zero_count, 2);
         assert_eq!(
-            jvp.input_types(),
+            fused
+                .instructions()
+                .iter()
+                .filter(|instruction| instruction.operation().name() == "zero")
+                .flat_map(|instruction| instruction.outputs().iter().copied())
+                .collect::<Vec<_>>(),
+            fused.output_ids()[4..],
+        );
+        assert_eq!(
+            fused
+                .instructions()
+                .iter()
+                .rev()
+                .take(2)
+                .map(|instruction| instruction.operation().name())
+                .collect::<Vec<_>>(),
+            vec!["zero", "zero"],
+        );
+        let outputs = fused.interpret(vec![Array::scalar(3.0), Array::scalar(1.0)]).unwrap();
+        assert_eq!(
+            outputs,
             vec![
-                ArrayType::scalar(DataType::F64),
-                ArrayType::scalar(DataType::Boolean),
-                ArrayType::scalar(DataType::F32),
-                ArrayType::scalar(DataType::F32),
-                ArrayType::scalar(DataType::F64),
-            ]
-        );
-        assert_eq!(
-            jvp.interpret(vec![
-                Array::scalar(2.0_f64),
-                Array::scalar(true),
-                Array::scalar(3.0_f32),
-                Array::scalar(5.0_f32),
-                Array::scalar(7.0_f64),
-            ]),
-            Ok(vec![Array::scalar(2.0_f64), Array::scalar(3.0_f32), Array::scalar(7.0_f64), Array::scalar(5.0_f32)])
-        );
-
-        // Selecting no inputs supplies zero output tangents and retains all primal inputs.
-        assert_eq!(
-            region.jvp(&[]).unwrap().interpret(vec![
-                Array::scalar(2.0_f64),
-                Array::scalar(true),
-                Array::scalar(3.0_f32),
-            ]),
-            Ok(vec![Array::scalar(2.0_f64), Array::scalar(3.0_f32), Array::scalar(0.0_f64), Array::scalar(0.0_f32)])
-        );
-        assert!(matches!(region.jvp(&[0, 0]),
-            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
-                if message == "differentiation input index 0 is selected more than once",
-        ));
-        assert!(matches!(region.jvp(&[1, 1]),
-            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
-                if message == "differentiation input index 1 is selected more than once",
-        ));
-        assert!(matches!(region.jvp(&[3]),
-            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
-                if message == "differentiation input index 3 is out of range for a region with 3 inputs",
-        ));
-    }
-
-    #[test]
-    fn test_region_jvp_reference_input_order() {
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let scalar = ArrayType::scalar(DataType::F32);
-        let reference = builder.add_input(ReferenceType::new(scalar.clone()).into());
-        let value = builder.add_input(scalar.into());
-        let contents =
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-        let product = builder
-            .add_instruction(
-                ArrayOperation::<Array>::from(MulOperation::new()),
-                Vec::new(),
-                vec![contents, value],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![product],
-                vec![Placeholder; 2],
-                vec![Placeholder],
-            )
-            .unwrap();
-        let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(4.0_f32)));
-        let tangent_reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(6.0_f32)));
-        let primals = vec![reference, Array::scalar(2.0_f32).into()];
-        let tangents = vec![Array::scalar(5.0_f32).into(), tangent_reference];
-
-        // Both execution forms receive the ordinary tangent before the reference tangent, despite primal order.
-        let region = program.entry_region_ref();
-        let jvp = region.jvp(&[1, 0]).unwrap();
-        let mut inputs = primals.clone();
-        inputs.extend(tangents.clone());
-        assert_eq!(jvp.interpret(inputs), Ok(vec![Array::scalar(8.0_f32).into(), Array::scalar(32.0_f32).into()]));
-        let linearization = region.linearize(&[1, 0]).unwrap();
-        let outputs = linearization.primal().interpret(primals).unwrap();
-        assert_eq!(outputs[0], Array::scalar(8.0_f32).into());
-        let mut inputs = tangents;
-        inputs.extend_from_slice(&outputs[1..]);
-        assert_eq!(linearization.tangent().interpret(inputs), Ok(vec![Array::scalar(32.0_f32).into()]));
-    }
-
-    #[test]
-    fn test_region_jvp_threads_reference_carries_through_scan() {
-        // The body accumulates each scanned element into a reference carry and reports the running state, while an
-        // ordinary carry sums the elements: `f(x, s, xs) = (x + Σxs, [s + xs₁, s + xs₁ + xs₂, ...], s + Σxs)`.
-        let scalar_type = ArrayType::scalar(DataType::F32);
-        let reference_type = ReferenceType::new(scalar_type.clone());
-        let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let carry = body_builder.add_input(scalar_type.clone().into());
-        let reference = body_builder.add_input(reference_type.into());
-        let element = body_builder.add_input(scalar_type.clone().into());
-        body_builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, element], None)
-            .unwrap();
-        let current = body_builder
-            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
-            .unwrap()[0];
-        let next_carry = body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, element], None)
-            .unwrap()[0];
-        let body = body_builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(
-                vec![next_carry, reference, current],
-                vec![Placeholder; 3],
-                vec![Placeholder; 3],
-            )
-            .unwrap();
-
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let body = builder.import_region(body.entry_region_ref());
-        let initial_carry = builder.add_input(scalar_type.clone().into());
-        let initial_state = builder.add_input(scalar_type.into());
-        let elements = builder.add_input(ArrayType::new_static(DataType::F32, [3]).into());
-        let reference = builder
-            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial_state], None)
-            .unwrap()[0];
-        let outputs = builder
-            .add_instruction(
-                ScanOperation::<TestValue>::new(2, 3),
-                vec![body],
-                vec![initial_carry, reference, elements],
-                None,
-            )
-            .unwrap()
-            .to_vec();
-        let frozen = builder
-            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![outputs[1]], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(
-                vec![outputs[0], outputs[2], frozen],
-                vec![Placeholder; 3],
-                vec![Placeholder; 3],
-            )
-            .unwrap();
-
-        // The reference carry keeps its position and gains a tangent reference carry beside it, so the fused scan
-        // carries `[carry, ref, ċarry, ṙef]` over a body with one tangent input per (active) body input.
-        let jvp = program.jvp().unwrap();
-        let scan = jvp.instructions().iter().find(|instruction| instruction.operation().name() == "scan").unwrap();
-        assert!(matches!(scan.operation(), TestOperation::Scan(operation) if operation.carry_count() == 4));
-        assert_eq!(jvp.region_ref(scan.regions()[0]).unwrap().input_types().len(), 6);
-        assert_eq!(jvp.input_types().len(), 6);
-        assert_eq!(jvp.output_types().len(), 6);
-
-        let inputs = vec![
-            TestValue::Array(Array::scalar(0.0_f32)),
-            TestValue::Array(Array::scalar(10.0_f32)),
-            TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0])),
-            TestValue::Array(Array::scalar(1.0_f32)),
-            TestValue::Array(Array::scalar(1.0_f32)),
-            TestValue::Array(Array::vector(vec![0.0_f32, 0.0, 1.0])),
-        ];
-        let expected = program
-            .discharge_references(0)
-            .unwrap()
-            .into_program_without_external_references()
-            .unwrap()
-            .jvp()
-            .unwrap()
-            .interpret(inputs.clone())
-            .unwrap();
-        assert_eq!(
-            expected,
-            vec![
-                TestValue::Array(Array::scalar(6.0_f32)),
-                TestValue::Array(Array::vector(vec![11.0_f32, 13.0, 16.0])),
-                TestValue::Array(Array::scalar(16.0_f32)),
-                TestValue::Array(Array::scalar(2.0_f32)),
-                TestValue::Array(Array::vector(vec![1.0_f32, 1.0, 2.0])),
-                TestValue::Array(Array::scalar(2.0_f32)),
+                Array::scalar(6.0),
+                Array::scalar(2.0),
+                Array::scalar(6.0),
+                Array::scalar(2.0),
+                Array::scalar(0.0),
+                Array::scalar(0.0),
             ],
+            "the fused outputs must be the primal outputs [3 * 2, 2, 3 * 2] followed by the tangents [2 * 1, 0, 0]",
         );
-        assert_eq!(jvp.interpret(inputs), Ok(expected));
-    }
-
-    #[test]
-    fn test_region_jvp_preserves_inactive_reference_carries_through_scan() {
-        let scalar_type = ArrayType::scalar(DataType::F32);
-        let reference_type = ReferenceType::new(scalar_type.clone());
-        let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let reference = body_builder.add_input(reference_type.clone().into());
-        let carry = body_builder.add_input(scalar_type.clone().into());
-        let doubled = body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, carry], None)
-            .unwrap()[0];
-        let body = body_builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(
-                vec![reference, doubled],
-                vec![Placeholder; 2],
-                vec![Placeholder; 2],
-            )
-            .unwrap();
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let reference = builder.add_input(reference_type.into());
-        let carry = builder.add_input(scalar_type.into());
-        let body = builder.import_region(body.entry_region_ref());
-        let outputs = builder
-            .add_instruction(ScanOperation::<TestValue>::new(2, 3), vec![body], vec![reference, carry], None)
-            .unwrap()
-            .to_vec();
-        let state =
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![outputs[0]], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(
-                vec![outputs[1], state],
-                vec![Placeholder; 2],
-                vec![Placeholder; 2],
-            )
-            .unwrap();
-        let jvp = program.entry_region_ref().jvp(&[1]).unwrap();
-        assert_eq!(jvp.input_ids().len(), 3);
-        assert_eq!(
-            jvp.interpret(vec![
-                TestValue::Reference(ArrayReference::new(Array::scalar(5.0_f32))),
-                TestValue::Array(Array::scalar(3.0_f32)),
-                TestValue::Array(Array::scalar(2.0_f32)),
-            ]),
-            Ok(vec![
-                TestValue::Array(Array::scalar(24.0_f32)),
-                TestValue::Array(Array::scalar(5.0_f32)),
-                TestValue::Array(Array::scalar(16.0_f32)),
-                TestValue::Array(Array::scalar(0.0_f32)),
-            ])
-        );
-    }
-
-    #[test]
-    fn test_region_jvp_threads_reference_state_through_while() {
-        // `f(s) = while (i < 2) { state += state; i += 1 }` doubles the referenced state twice, so `f(s) = 4s` with
-        // tangent `4ṡ`. The counter is an integer, so its zero differential space contributes no tangent state.
-        let scalar_type = ArrayType::scalar(DataType::F32);
-        let counter_type = ArrayType::scalar(DataType::I64);
-        let reference_type = ReferenceType::new(scalar_type.clone());
-        let condition = {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            builder.add_input(reference_type.clone().into());
-            let counter = builder.add_input(counter_type.clone().into());
-            let bound = builder.add_constant(TestValue::Array(Array::scalar(2_i64)));
-            let predicate = builder
-                .add_instruction(
-                    ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::LessThan)),
-                    Vec::new(),
-                    vec![counter, bound],
-                    None,
-                )
-                .unwrap()[0];
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
-                .unwrap()
-        };
-        let body = {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let reference = builder.add_input(reference_type.into());
-            let counter = builder.add_input(counter_type.clone().into());
-            let current =
-                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-            builder
-                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, current], None)
-                .unwrap();
-            let one = builder.add_constant(TestValue::Array(Array::scalar(1_i64)));
-            let incremented = builder
-                .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![counter, one], None)
-                .unwrap()[0];
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(
-                    vec![reference, incremented],
-                    vec![Placeholder; 2],
-                    vec![Placeholder; 2],
-                )
-                .unwrap()
-        };
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let condition = builder.import_region(condition.entry_region_ref());
-        let body = builder.import_region(body.entry_region_ref());
-        let initial = builder.add_input(scalar_type.into());
-        let reference =
-            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
-        let counter = builder.add_constant(TestValue::Array(Array::scalar(0_i64)));
-        let outputs = builder
-            .add_instruction(
-                WhileOperation::<ArrayIrType>::new(),
-                vec![condition, body],
-                vec![reference, counter],
-                None,
-            )
-            .unwrap()
-            .to_vec();
-        let frozen = builder
-            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![outputs[0]], None)
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
-        // The fused loop state is `[ref, i, ṙef]`: the reference state keeps its position with its tangent reference
-        // appended, and the zero-space counter contributes no tangent state.
-        let jvp = program.jvp().unwrap();
-        let r#while = jvp.instructions().iter().find(|instruction| instruction.operation().name() == "while").unwrap();
-        assert_eq!(jvp.region_ref(r#while.regions()[1]).unwrap().input_types().len(), 3);
-        assert_eq!(jvp.input_types().len(), 2);
-        assert_eq!(jvp.output_types().len(), 2);
-
-        let inputs = vec![TestValue::Array(Array::scalar(1.5_f32)), TestValue::Array(Array::scalar(1.0_f32))];
-        let expected = program
-            .discharge_references(0)
-            .unwrap()
-            .into_program_without_external_references()
-            .unwrap()
-            .jvp()
-            .unwrap()
-            .interpret(inputs.clone())
-            .unwrap();
-        assert_eq!(expected, vec![TestValue::Array(Array::scalar(6.0_f32)), TestValue::Array(Array::scalar(4.0_f32))]);
-        // Eager replay cannot run a loop whose state carries references, so the fused program is discharged first.
-        assert_eq!(
-            jvp.discharge_references(0)
-                .unwrap()
-                .into_program_without_external_references()
-                .unwrap()
-                .interpret(inputs),
-            Ok(expected),
-        );
-    }
-
-    #[test]
-    fn test_region_jvp_preserves_inactive_reference_state_through_while() {
-        let scalar_type = ArrayType::scalar(DataType::F32);
-        let reference_type = ReferenceType::new(scalar_type.clone());
-        let counter_type = ArrayType::scalar(DataType::I64);
-        let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        condition_builder.add_input(reference_type.clone().into());
-        let counter = condition_builder.add_input(counter_type.clone().into());
-        condition_builder.add_input(scalar_type.clone().into());
-        let bound = condition_builder.add_constant(TestValue::Array(Array::scalar(2_i64)));
-        let predicate = condition_builder
-            .add_instruction(
-                ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::LessThan)),
-                Vec::new(),
-                vec![counter, bound],
-                None,
-            )
-            .unwrap()[0];
-        let condition = condition_builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![predicate], vec![Placeholder; 3], vec![Placeholder])
-            .unwrap();
-        let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let reference = body_builder.add_input(reference_type.clone().into());
-        let counter = body_builder.add_input(counter_type.into());
-        let value = body_builder.add_input(scalar_type.clone().into());
-        let state = body_builder
-            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
-            .unwrap()[0];
-        let next_value = body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![value, state], None)
-            .unwrap()[0];
-        let one = body_builder.add_constant(TestValue::Array(Array::scalar(1_i64)));
-        let next_counter = body_builder
-            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![counter, one], None)
-            .unwrap()[0];
-        let body = body_builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(
-                vec![reference, next_counter, next_value],
-                vec![Placeholder; 3],
-                vec![Placeholder; 3],
-            )
-            .unwrap();
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let reference = builder.add_input(reference_type.into());
-        let value = builder.add_input(scalar_type.into());
-        let counter = builder.add_constant(TestValue::Array(Array::scalar(0_i64)));
-        let condition = builder.import_region(condition.entry_region_ref());
-        let body = builder.import_region(body.entry_region_ref());
-        let outputs = builder
-            .add_instruction(
-                WhileOperation::<ArrayIrType>::new(),
-                vec![condition, body],
-                vec![reference, counter, value],
-                None,
-            )
-            .unwrap()
-            .to_vec();
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![outputs[2]], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let jvp = program.entry_region_ref().jvp(&[1]).unwrap();
-        assert_eq!(
-            jvp.interpret(vec![
-                TestValue::Reference(ArrayReference::new(Array::scalar(5.0_f32))),
-                TestValue::Array(Array::scalar(3.0_f32)),
-                TestValue::Array(Array::scalar(2.0_f32)),
-            ]),
-            Ok(vec![TestValue::Array(Array::scalar(13.0_f32)), TestValue::Array(Array::scalar(2.0_f32))])
-        );
-    }
-
-    #[test]
-    fn test_region_jvp_passes_plumbing_references_into_condition_branches() {
-        // Both branches read the reference they receive at input position 1, after a numeric input, and add it to
-        // that numeric input: `f(p, x, r) = x + read(r)`.
-        let scalar_type = ArrayType::scalar(DataType::F32);
-        let reference_type = ReferenceType::new(scalar_type.clone());
-        let branch = || {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let value = builder.add_input(scalar_type.clone().into());
-            let reference = builder.add_input(reference_type.clone().into());
-            let current =
-                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-            let output = builder
-                .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![value, current], None)
-                .unwrap()[0];
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-                .unwrap()
-        };
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let true_branch = builder.import_region(branch().entry_region_ref());
-        let false_branch = builder.import_region(branch().entry_region_ref());
-        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
-        let value = builder.add_input(scalar_type.clone().into());
-        let reference = builder.add_input(reference_type.into());
-        let output = builder
-            .add_instruction(
-                ConditionOperation::new(),
-                vec![true_branch, false_branch],
-                vec![predicate, value, reference],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
-            .unwrap();
-
-        // With the reference inactive it reaches the branches as plumbing at a non-prefix position: the branches
-        // receive no tangent input for it (`[x, r, ẋ]`), the read's tangent is zero, and the program still
-        // differentiates with `ẏ = ẋ`. The fused program is spliced behind local allocations of the reference operands
-        // so that the interpreted program owns the state it mutates.
-        let jvp = program.entry_region_ref().jvp(&[1]).unwrap();
-        assert_eq!(jvp.input_types().len(), 4);
-        assert_eq!(jvp.output_types().len(), 2);
-        let condition =
-            jvp.instructions().iter().find(|instruction| instruction.operation().name() == "condition").unwrap();
-        assert_eq!(jvp.region_ref(condition.regions()[0]).unwrap().input_types().len(), 3);
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
-        let value = builder.add_input(scalar_type.clone().into());
-        let state = builder.add_input(scalar_type.clone().into());
-        let tangent = builder.add_input(scalar_type.clone().into());
-        let reference =
-            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
-        let outputs = builder.splice_program(&jvp, &[predicate, value, reference, tangent]).unwrap();
-        let runnable = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 4], vec![Placeholder; 2])
-            .unwrap();
-        assert_eq!(
-            runnable.interpret(vec![
-                TestValue::Array(Array::scalar(true)),
-                TestValue::Array(Array::scalar(2.0_f32)),
-                TestValue::Array(Array::scalar(5.0_f32)),
-                TestValue::Array(Array::scalar(3.0_f32)),
-            ]),
-            Ok(vec![TestValue::Array(Array::scalar(7.0_f32)), TestValue::Array(Array::scalar(3.0_f32))]),
-        );
-
-        // With the reference active the branches receive its tangent reference too (`[x, r, ẋ, ṛ]`) and the read's
-        // tangent is the referenced tangent: `ẏ = ẋ + read(ṛ)`.
-        let jvp = program.jvp().unwrap();
-        let condition =
-            jvp.instructions().iter().find(|instruction| instruction.operation().name() == "condition").unwrap();
-        assert_eq!(jvp.region_ref(condition.regions()[0]).unwrap().input_types().len(), 4);
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
-        let value = builder.add_input(scalar_type.clone().into());
-        let state = builder.add_input(scalar_type.clone().into());
-        let tangent = builder.add_input(scalar_type.clone().into());
-        let state_tangent = builder.add_input(scalar_type.into());
-        let reference =
-            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
-        let reference_tangent = builder
-            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![state_tangent], None)
-            .unwrap()[0];
-        let outputs = builder.splice_program(&jvp, &[predicate, value, reference, tangent, reference_tangent]).unwrap();
-        let runnable = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 5], vec![Placeholder; 2])
-            .unwrap();
-        assert_eq!(
-            runnable.interpret(vec![
-                TestValue::Array(Array::scalar(false)),
-                TestValue::Array(Array::scalar(2.0_f32)),
-                TestValue::Array(Array::scalar(5.0_f32)),
-                TestValue::Array(Array::scalar(3.0_f32)),
-                TestValue::Array(Array::scalar(0.5_f32)),
-            ]),
-            Ok(vec![TestValue::Array(Array::scalar(7.0_f32)), TestValue::Array(Array::scalar(3.5_f32))]),
-        );
-    }
-
-    #[test]
-    fn test_region_jvp_forwards_inactive_reference_outputs_through_condition() {
-        // Both branches forward the reference they receive, and the program reads through the conditional's result,
-        // so the public output is numeric while the branch outputs are references.
-        let scalar_type = ArrayType::scalar(DataType::F32);
-        let reference_type = ReferenceType::new(scalar_type.clone());
-        let branch = || {
-            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-            let reference = builder.add_input(reference_type.clone().into());
-            builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
-                .unwrap()
-        };
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let true_branch = builder.import_region(branch().entry_region_ref());
-        let false_branch = builder.import_region(branch().entry_region_ref());
-        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
-        let reference = builder.add_input(reference_type.into());
-        let forwarded = builder
-            .add_instruction(
-                ConditionOperation::new(),
-                vec![true_branch, false_branch],
-                vec![predicate, reference],
-                None,
-            )
-            .unwrap()[0];
-        let output =
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![forwarded], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-
-        // An inactive reference is forwarded through the branch without a tangent slot. Reading it produces a
-        // numeric structural zero, which is materialized at the outer output boundary.
-        let inactive_jvp = program.entry_region_ref().jvp(&[]).unwrap();
-        assert_eq!(inactive_jvp.input_ids().len(), 2);
-        assert_eq!(inactive_jvp.output_ids().len(), 2);
-        assert_eq!(
-            inactive_jvp.interpret(vec![
-                TestValue::Array(Array::scalar(true)),
-                TestValue::Reference(ArrayReference::new(Array::scalar(5.0_f32))),
-            ]),
-            Ok(vec![TestValue::Array(Array::scalar(5.0_f32)), TestValue::Array(Array::scalar(0.0_f32))]),
-        );
-
-        // An active reference is forwarded together with its tangent reference, and the read pairs them back up. The
-        // fused program is spliced behind local allocations of the reference operands so that the interpreted program
-        // owns the state it mutates.
-        let jvp = program.jvp().unwrap();
-        assert_eq!(jvp.input_types().len(), 3);
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
-        let state = builder.add_input(scalar_type.clone().into());
-        let state_tangent = builder.add_input(scalar_type.into());
-        let reference =
-            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![state], None).unwrap()[0];
-        let reference_tangent = builder
-            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![state_tangent], None)
-            .unwrap()[0];
-        let outputs = builder.splice_program(&jvp, &[predicate, reference, reference_tangent]).unwrap();
-        let runnable = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 3], vec![Placeholder; 2])
-            .unwrap();
-        assert_eq!(
-            runnable.interpret(vec![
-                TestValue::Array(Array::scalar(true)),
-                TestValue::Array(Array::scalar(5.0_f32)),
-                TestValue::Array(Array::scalar(0.5_f32)),
-            ]),
-            Ok(vec![TestValue::Array(Array::scalar(5.0_f32)), TestValue::Array(Array::scalar(0.5_f32))]),
-        );
-    }
-
-    #[test]
-    fn test_region_jvp_omits_inactive_reference_output_tangents() {
-        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let reference = builder.add_input(reference_type.into());
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
-        // The compact region boundary retains the inactive primal reference and omits its tangent.
-        let inactive_jvp = program.entry_region_ref().jvp(&[]).unwrap();
-        assert!(inactive_jvp.instructions().is_empty());
-        assert_eq!(inactive_jvp.input_ids().len(), 1);
-        assert_eq!(inactive_jvp.output_ids(), inactive_jvp.input_ids());
-
-        // A forwarded active reference has its tangent reference forwarded by identity, with no allocation: the fused
-        // program stages nothing and returns its two inputs as its two outputs.
-        let jvp = program.jvp().unwrap();
-        assert!(jvp.instructions().is_empty());
-        assert_eq!(jvp.input_types().len(), 2);
-        assert_eq!(jvp.output_ids(), jvp.input_ids());
-    }
-
-    #[test]
-    fn test_region_jvp_rejects_reference_view_outputs() {
-        let reference_type = ReferenceType::new(ArrayType::new_static(DataType::F32, [4]));
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let reference = builder.add_input(reference_type.into());
-        let view = builder
-            .add_instruction(
-                ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 2, 1)]),
-                Vec::new(),
-                vec![reference],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![view], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
-        // A derived view output would need the same view applied to the tangent root, which is not supported.
-        assert!(matches!(
-            program.jvp(),
-            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "output 0 is a derived view of a reference and cannot be differentiated; return the \
-                    viewed reference and apply the view outside the differentiated program",
-        ));
-    }
-
-    #[test]
-    fn test_region_linearize() {
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let left = builder.add_input(ArrayType::scalar(DataType::F64));
-        builder.add_input(ArrayType::scalar(DataType::Boolean));
-        let right = builder.add_input(ArrayType::scalar(DataType::F64));
-        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![product], vec![Placeholder; 3], vec![Placeholder])
-            .unwrap();
-        let region = program.entry_region_ref();
-        let linearization = region.linearize(&[2, 1, 0]).unwrap();
-        let primal_outputs = linearization
-            .primal()
-            .interpret(vec![Array::scalar(2.0_f64), Array::scalar(true), Array::scalar(3.0_f64)])
-            .unwrap();
-        assert_eq!(primal_outputs[0], Array::scalar(6.0_f64));
-        let mut tangent_inputs = vec![Array::scalar(5.0_f64), Array::scalar(7.0_f64)];
-        tangent_inputs.extend_from_slice(&primal_outputs[1..]);
-        // Tangents are [dright, dleft], so dproduct = 2 * 5 + 3 * 7, not 2 * 7 + 3 * 5.
-        assert_eq!(linearization.tangent().interpret(tangent_inputs), Ok(vec![Array::scalar(31.0_f64)]));
-        let mut pullback_inputs = vec![Array::scalar(1.0_f64)];
-        pullback_inputs.extend_from_slice(&primal_outputs[1..]);
-        assert_eq!(
-            linearization.pullback().unwrap().interpret(pullback_inputs),
-            Ok(vec![Array::scalar(2.0_f64), Array::scalar(3.0_f64)])
-        );
-
-        let empty = region.linearize(&[]).unwrap();
-        let outputs = empty
-            .primal()
-            .interpret(vec![Array::scalar(2.0_f64), Array::scalar(true), Array::scalar(3.0_f64)])
-            .unwrap();
-        assert_eq!(empty.tangent().interpret(outputs[1..].to_vec()), Ok(vec![Array::scalar(0.0_f64)]));
-        assert!(matches!(region.linearize(&[2, 2]),
-            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
-                if message == "differentiation input index 2 is selected more than once",
-        ));
-        assert!(matches!(region.linearize(&[1, 1]),
-            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
-                if message == "differentiation input index 1 is selected more than once",
-        ));
-        assert!(matches!(region.linearize(&[3]),
-            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
-                if message == "differentiation input index 3 is out of range for a region with 3 inputs",
-        ));
-
-        // Cache identity depends on live tangent order, but not on where zero-space indices appear.
-        let reversed = region.linearize_shared(&[2, 1, 0]).unwrap();
-        let equivalent = region.linearize_shared(&[1, 2, 0]).unwrap();
-        let source_order = region.linearize_shared(&[0, 2]).unwrap();
-        assert!(Arc::ptr_eq(&reversed.0, &equivalent.0));
-        assert!(Arc::ptr_eq(&reversed.1, &equivalent.1));
-        assert!(!Arc::ptr_eq(&reversed.0, &source_order.0));
-        assert!(!Arc::ptr_eq(&reversed.1, &source_order.1));
-    }
-
-    #[test]
-    fn test_region_linearize_omits_inactive_reference_output_tangents() {
-        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let reference = builder.add_input(reference_type.into());
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
-        // The primal carries the inactive reference while the tangent program has no inputs or outputs.
-        let inactive = program.entry_region_ref().linearize(&[]).unwrap();
-        assert_eq!(inactive.residual_count(), 0);
-        assert_eq!(inactive.primal().output_ids(), inactive.primal().input_ids());
-        assert!(inactive.tangent().input_ids().is_empty());
-        assert!(inactive.tangent().output_ids().is_empty());
-
-        // A forwarded active reference has its tangent reference forwarded by identity through the tangent program.
-        let linearization = program.linearize().unwrap();
-        assert_eq!(linearization.residual_count(), 0);
-        assert!(linearization.tangent().instructions().is_empty());
-        assert_eq!(linearization.tangent().output_ids(), linearization.tangent().input_ids());
-    }
-
-    #[test]
-    fn test_region_linearize_rejects_reference_view_outputs() {
-        let reference_type = ReferenceType::new(ArrayType::new_static(DataType::F32, [4]));
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let reference = builder.add_input(reference_type.into());
-        let view = builder
-            .add_instruction(
-                ReferenceSliceOperation::new(vec![ArraySliceAxis::new(0, 2, 1)]),
-                Vec::new(),
-                vec![reference],
-                None,
-            )
-            .unwrap()[0];
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![view], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
-        // The derived-view rejection applies to linearization exactly as it applies to the fused program.
-        assert!(matches!(
-            program.linearize(),
-            Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
-                if message == "output 0 is a derived view of a reference and cannot be differentiated; return the \
-                    viewed reference and apply the view outside the differentiated program",
-        ));
-    }
-
-    #[test]
-    fn test_region_linearize_retains_no_zero_residuals_for_write_only_tangent_references() {
-        // `f(r, x) = { write(r, x); x }` stores into the reference without reading it back, so the tangent reference is
-        // reached by no tangent output even though its state is live. A reference has no value cotangent to construct,
-        // so the dead-tangent-input residual pass skips it and nothing crosses as a residual.
-        let scalar_type = ArrayType::scalar(DataType::F32);
-        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
-        let reference = builder.add_input(ReferenceType::new(scalar_type.clone()).into());
-        let value = builder.add_input(scalar_type.into());
-        builder
-            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, value], None)
-            .unwrap();
-        let program = builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![value], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let linearization = program.linearize().unwrap();
-        assert_eq!(linearization.residual_count(), 0);
-        assert_eq!(
-            linearization.tangent().to_string(),
-            indoc! {"
-                lambda %0:ref<f32[]>, %1:f32[] .
-                let reference_write %0 %1
-                in (%1)
-            "}
-            .trim_end(),
-        );
-    }
-
-    #[test]
-    fn test_region_jvp_shared() {
-        // A shared region is differentiated once and reused by every copy of it, which is what removes the repeated
-        // re-transformation that programs attaching one shared `condition` branch or `scan` body would otherwise pay.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
-        let callee = Arc::new(
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
-        );
-        let retained = callee.entry_region_ref().jvp_shared(&[0]).unwrap();
-        assert_eq!(retained.to_string(), callee.jvp().unwrap().to_string());
-        assert!(Arc::ptr_eq(&callee.entry_region_ref().jvp_shared(&[0]).unwrap(), &retained));
-
-        // Two independently built programs that intern the same callee share its retained program, because importing
-        // a region copies its complete reachable contents and therefore carries its transforms along.
-        let mut first_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let first_region = first_builder.intern_callee(&callee, None).unwrap();
-        let mut second_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let second_region = second_builder.intern_callee(&callee, None).unwrap();
-        assert!(Arc::ptr_eq(
-            &RegionRef::new(&first_builder.regions, first_region).unwrap().jvp_shared(&[0]).unwrap(),
-            &retained,
-        ));
-        assert!(Arc::ptr_eq(
-            &RegionRef::new(&second_builder.regions, second_region).unwrap().jvp_shared(&[0]).unwrap(),
-            &retained,
-        ));
-
-        // The initial request produces the artifact; direct and interned-region requests reuse it three times.
-        let statistics = callee.entry_region_ref().transform_statistics::<JvpTransform>().unwrap();
-        assert_eq!((statistics.productions, statistics.hits), (1, 3));
-
-        // A region whose contents are genuinely rewritten starts over with a freshly derived program.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
-        builder.add_instruction(SinOperation::new(), Vec::new(), vec![output], None).unwrap();
-        let with_dead_work =
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-        let before = with_dead_work.entry_region_ref().jvp_shared(&[0]).unwrap();
-        let simplified = with_dead_work.simplified().unwrap();
-        let after = simplified.entry_region_ref().jvp_shared(&[0]).unwrap();
-        assert!(!Arc::ptr_eq(&after, &before));
-        assert_eq!(after.to_string(), retained.to_string());
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn test_region_jvp_shared_debug_recheck_detects_corrupted_cached_program() {
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
-        let program =
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-
-        // Publish an artifact that disagrees with what differentiating this region produces, which is exactly the
-        // state a nondeterministic `jvp` rule would leave behind: a retained derivative of a program the region does
-        // not compute.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(CosOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
-        let unrelated = Arc::new(
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
-        );
-        program.entry_region_ref().insert_transform_artifact_for_testing::<JvpTransform, _>(
-            DifferentiationTransformArguments { input_indices: vec![0] },
-            TransformArtifact::new(vec![unrelated], ()),
-        );
-
-        // The recheck runs on the hit and reports the contract violation rather than serving the wrong derivative.
-        let panicked =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| program.entry_region_ref().jvp_shared(&[0])))
-                .unwrap_err();
-        let message = panicked.downcast_ref::<String>().unwrap();
-        assert!(message.starts_with("nondeterministic transform rule detected for `"), "{message}",);
-        assert!(message.contains("JvpTransform"), "{message}");
-    }
-
-    #[test]
-    fn test_region_jvp_shared_keys_artifacts_by_effective_selection() {
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let left = builder.add_input(ArrayType::scalar(DataType::F64));
-        let right = builder.add_input(ArrayType::scalar(DataType::F64));
-        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![product], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let region = program.entry_region_ref();
-
-        // Distinct effective selections derive distinct programs, while repeated selections share an artifact.
-        // Selecting every input in source order retains the complete tangent boundary.
-        let partial = region.jvp_shared(&[0]).unwrap();
-        let full = region.jvp_shared(&[0, 1]).unwrap();
-        assert_eq!(partial.input_types().len(), 3);
-        assert_eq!(full.input_types().len(), 4);
-        assert!(!Arc::ptr_eq(&partial, &full));
-        assert!(Arc::ptr_eq(&region.jvp_shared(&[0]).unwrap(), &partial));
-        assert!(Arc::ptr_eq(&region.jvp_shared(&[0, 1]).unwrap(), &full));
-        let reversed = region.jvp_shared(&[1, 0]).unwrap();
-        assert!(!Arc::ptr_eq(&reversed, &full));
-        assert!(Arc::ptr_eq(&region.jvp_shared(&[1, 0]).unwrap(), &reversed));
-        assert_eq!(
-            reversed.interpret(vec![
-                Array::scalar(2.0_f64),
-                Array::scalar(3.0_f64),
-                Array::scalar(5.0_f64),
-                Array::scalar(7.0_f64),
-            ]),
-            Ok(vec![Array::scalar(6.0_f64), Array::scalar(31.0_f64)])
-        );
-        assert_eq!(
-            partial.interpret(vec![Array::scalar(2.0), Array::scalar(3.0), Array::scalar(1.0)]),
-            Ok(vec![Array::scalar(6.0), Array::scalar(3.0)]),
-        );
-        assert!(matches!(
-            region.jvp_shared(&[2]),
-            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
-                if message == "differentiation input index 2 is out of range for a region with 2 inputs",
-        ));
-
-        // Selecting a zero-space input adds no tangent slot and does not change the cached artifact.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let value = builder.add_input(ArrayType::scalar(DataType::F64));
-        builder.add_input(ArrayType::scalar(DataType::Boolean));
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![value], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let region = program.entry_region_ref();
-        let requested = region.jvp_shared(&[0, 1]).unwrap();
-        assert_eq!(requested.input_types().len(), 3);
-        assert!(Arc::ptr_eq(&region.jvp_shared(&[0]).unwrap(), &requested));
     }
 
     #[test]
@@ -4891,18 +5187,6 @@ mod tests {
             program.jvp_with_respect_to(&[]).unwrap().interpret(vec![Array::scalar(2.0_f64)]),
             Ok(vec![Array::scalar(2.0_f64), Array::scalar(0.0_f64)])
         );
-    }
-
-    #[test]
-    fn test_program_linearize_with_respect_to() {
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let program =
-            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
-        let linearization = program.linearize_with_respect_to(&[]).unwrap();
-        let outputs = linearization.primal().interpret(vec![Array::scalar(2.0_f64)]).unwrap();
-        assert_eq!(outputs[0], Array::scalar(2.0_f64));
-        assert_eq!(linearization.tangent().interpret(outputs[1..].to_vec()), Ok(vec![Array::scalar(0.0_f64)]));
     }
 
     #[test]
@@ -4953,82 +5237,6 @@ mod tests {
             pullback.interpret(vec![Array::scalar(1.0), Array::scalar(3.0f64.cos())]).unwrap(),
             vec![Array::scalar(3.0f64.cos())],
         );
-
-        // Test that a structurally zero tangent output (here, the tangent of a constant-valued program output) folds to
-        // the known side during the split and is restored in the tangent sub-program as a staged `zero` instruction, so
-        // the tangent sub-program keeps one tangent output per primal output.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let constant = builder.add_constant(Array::scalar(2.0));
-        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, constant], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![scaled, constant], vec![Placeholder], vec![Placeholder; 2])
-            .unwrap();
-        let linearization = program.linearize().unwrap();
-        assert_eq!(linearization.primal().output_ids().len(), 2 + linearization.residual_count());
-        assert_eq!(linearization.tangent().output_ids().len(), 2);
-        let tangent_inputs =
-            [vec![Array::scalar(1.0)], vec![Array::scalar(2.0); linearization.residual_count()]].concat();
-        let tangent_outputs = linearization.tangent().interpret(tangent_inputs).unwrap();
-        assert_eq!(
-            tangent_outputs,
-            vec![Array::scalar(2.0), Array::scalar(0.0)],
-            "the tangent outputs must be [2 * ẋ] for the scaled output and a restored zero for the constant output",
-        );
-
-        // Boundary-degenerate programs retain their canonical signatures. A zero-input constant program has one
-        // primal output and one zero tangent output, while a zero-output program still retains the dead tangent
-        // input corresponding to its primal input.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let constant = builder.add_constant(Array::scalar(5.0));
-        let program = builder.build::<Vec<Array>, Vec<Array>>(vec![constant], Vec::new(), vec![Placeholder]).unwrap();
-        let linearization = program.linearize().unwrap();
-        assert_eq!(linearization.residual_count(), 0);
-        assert_eq!(linearization.primal().interpret(Vec::new()).unwrap(), vec![Array::scalar(5.0)]);
-        assert_eq!(linearization.tangent().interpret(Vec::new()).unwrap(), vec![Array::scalar(0.0)]);
-
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        builder.add_input(ArrayType::scalar(DataType::F64));
-        let program = builder.build::<Vec<Array>, Vec<Array>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
-        let linearization = program.linearize().unwrap();
-        assert_eq!(linearization.primal().input_ids().len(), 1);
-        assert!(linearization.primal().output_ids().is_empty());
-        assert_eq!(linearization.tangent().input_ids().len(), 1);
-        assert!(linearization.tangent().output_ids().is_empty());
-    }
-
-    #[test]
-    fn test_region_linearize_omits_inactive_tangent_inputs() {
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let left = builder.add_input(ArrayType::scalar(DataType::F64));
-        let right = builder.add_input(ArrayType::scalar(DataType::F64));
-        let product = builder.add_instruction(MulOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![product], vec![Placeholder; 2], vec![Placeholder])
-            .unwrap();
-        let region = program.entry_region_ref();
-
-        // The tangent half consumes one tangent input for the active input only, followed by the residuals, and
-        // computes `ẏ = ẋ · right` without a term for the inactive input.
-        let linearization = region.linearize(&[0]).unwrap();
-        assert_eq!(linearization.tangent().input_ids().len(), 1 + linearization.residual_count());
-        assert_eq!(linearization.tangent().output_ids().len(), 1);
-        let primal_outputs = linearization.primal().interpret(vec![Array::scalar(2.0), Array::scalar(3.0)]).unwrap();
-        assert_eq!(primal_outputs[0], Array::scalar(6.0));
-        let mut tangent_inputs = vec![Array::scalar(1.0)];
-        tangent_inputs.extend_from_slice(&primal_outputs[1..]);
-        assert_eq!(linearization.tangent().interpret(tangent_inputs), Ok(vec![Array::scalar(3.0)]));
-
-        // The retained linearization is keyed by the effective selection as well.
-        let (partial_primal, ..) = region.linearize_shared(&[0]).unwrap();
-        let (full_primal, ..) = region.linearize_shared(&[0, 1]).unwrap();
-        assert!(!Arc::ptr_eq(&partial_primal, &full_primal));
-        assert!(Arc::ptr_eq(&region.linearize_shared(&[0]).unwrap().0, &partial_primal));
-        assert!(matches!(
-            region.linearize(&[0, 2]),
-            Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
-                if message == "differentiation input index 2 is out of range for a region with 2 inputs",
-        ));
     }
 
     #[test]
@@ -5140,169 +5348,6 @@ mod tests {
     }
 
     #[test]
-    fn test_program_jvp_and_linearize_after_local_reference_discharge_across_condition() {
-        let source = test_condition_program();
-
-        // Forward mode, linearization, and transposition all consume the discharged program, so every derived
-        // program must be pure and reference-free even though the source threads state through both branches.
-        let jvp = source
-            .clone()
-            .discharge_references(0)
-            .unwrap()
-            .into_program_without_external_references()
-            .unwrap()
-            .jvp()
-            .unwrap();
-        let linearization = source
-            .discharge_references(0)
-            .unwrap()
-            .into_program_without_external_references()
-            .unwrap()
-            .linearize()
-            .unwrap();
-        let pullback = linearization.pullback().unwrap();
-        for program in [&jvp, linearization.primal(), linearization.tangent(), &pullback] {
-            assert!(!program.entry_region_ref().contains_atom_type_in_closure(Type::is_reference));
-            assert!(program.effects().classes().is_empty());
-        }
-
-        // The true branch accumulates the input, so both public outputs remain differentiable.
-        let predicate = ArrayIrValue::Array(Array::scalar(true));
-        let initial = ArrayIrValue::Array(Array::scalar(4.0_f32));
-        assert_eq!(
-            jvp.interpret(vec![predicate.clone(), initial.clone(), ArrayIrValue::Array(Array::scalar(2.0_f32))]),
-            Ok(vec![
-                ArrayIrValue::Array(Array::scalar(5.0_f32)),
-                ArrayIrValue::Array(Array::scalar(5.0_f32)),
-                ArrayIrValue::Array(Array::scalar(2.0_f32)),
-                ArrayIrValue::Array(Array::scalar(2.0_f32)),
-            ]),
-        );
-        let primal_outputs = linearization.primal().interpret(vec![predicate, initial]).unwrap();
-        assert_eq!(
-            primal_outputs[..2],
-            [ArrayIrValue::Array(Array::scalar(5.0_f32)), ArrayIrValue::Array(Array::scalar(5.0_f32))],
-        );
-        let mut pullback_inputs =
-            vec![ArrayIrValue::Array(Array::scalar(2.0_f32)), ArrayIrValue::Array(Array::scalar(3.0_f32))];
-        pullback_inputs.extend_from_slice(&primal_outputs[2..]);
-        assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![ArrayIrValue::Array(Array::scalar(5.0_f32))]));
-
-        // The false branch replaces the state with a constant, so the frozen output has zero tangent and contributes
-        // no cotangent to the input.
-        let predicate = ArrayIrValue::Array(Array::scalar(false));
-        let initial = ArrayIrValue::Array(Array::scalar(4.0_f32));
-        assert_eq!(
-            jvp.interpret(vec![predicate.clone(), initial.clone(), ArrayIrValue::Array(Array::scalar(2.0_f32))]),
-            Ok(vec![
-                ArrayIrValue::Array(Array::scalar(4.0_f32)),
-                ArrayIrValue::Array(Array::scalar(9.0_f32)),
-                ArrayIrValue::Array(Array::scalar(2.0_f32)),
-                ArrayIrValue::Array(Array::scalar(0.0_f32)),
-            ]),
-        );
-        let primal_outputs = linearization.primal().interpret(vec![predicate, initial]).unwrap();
-        assert_eq!(
-            primal_outputs[..2],
-            [ArrayIrValue::Array(Array::scalar(4.0_f32)), ArrayIrValue::Array(Array::scalar(9.0_f32))],
-        );
-        let mut pullback_inputs =
-            vec![ArrayIrValue::Array(Array::scalar(2.0_f32)), ArrayIrValue::Array(Array::scalar(3.0_f32))];
-        pullback_inputs.extend_from_slice(&primal_outputs[2..]);
-        assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![ArrayIrValue::Array(Array::scalar(2.0_f32))]));
-    }
-
-    #[test]
-    fn test_program_jvp_and_linearize_after_local_reference_discharge_across_bounded_while() {
-        let scalar_type = ArrayType::scalar(DataType::F32);
-        let reference_type = ReferenceType::new(scalar_type.clone());
-        let mut condition_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let reference = condition_builder.add_input(reference_type.clone().into());
-        condition_builder
-            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
-            .unwrap();
-        let predicate = condition_builder.add_constant(ArrayIrValue::Array(Array::scalar(true)));
-        let condition = condition_builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![predicate],
-                vec![Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-
-        let mut body_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let reference = body_builder.add_input(reference_type.into());
-        let update = body_builder.add_constant(ArrayIrValue::Array(Array::scalar(1.0_f32)));
-        body_builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
-            .unwrap();
-        let body = body_builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![reference],
-                vec![Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-
-        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-        let condition = builder.import_region(condition.entry_region_ref());
-        let body = builder.import_region(body.entry_region_ref());
-        let initial = builder.add_input(ArrayIrType::Array(scalar_type));
-        let reference =
-            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
-        let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(2).unwrap();
-        let reference = builder.add_instruction(operation, vec![condition, body], vec![reference], None).unwrap()[0];
-        let output =
-            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-        let source = builder
-            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
-                vec![output],
-                vec![Placeholder],
-                vec![Placeholder],
-            )
-            .unwrap();
-
-        // The loop's mutated state becomes an ordinary carry, so the derived programs are pure and reference-free
-        // and reverse mode remains available through the bounded loop.
-        let jvp = source
-            .clone()
-            .discharge_references(0)
-            .unwrap()
-            .into_program_without_external_references()
-            .unwrap()
-            .jvp()
-            .unwrap();
-        let linearization = source
-            .discharge_references(0)
-            .unwrap()
-            .into_program_without_external_references()
-            .unwrap()
-            .linearize()
-            .unwrap();
-        let pullback = linearization.pullback().unwrap();
-        for program in [&jvp, linearization.primal(), linearization.tangent(), &pullback] {
-            assert!(!program.entry_region_ref().contains_atom_type_in_closure(Type::is_reference));
-            assert!(program.effects().classes().is_empty());
-        }
-
-        // Two iterations accumulate the constant `1.0` into the state, so `f(x) = x + 2` and the tangent passes
-        // through unscaled in both directions.
-        assert_eq!(
-            jvp.interpret(vec![
-                ArrayIrValue::Array(Array::scalar(3.0_f32)),
-                ArrayIrValue::Array(Array::scalar(2.0_f32)),
-            ]),
-            Ok(vec![ArrayIrValue::Array(Array::scalar(5.0_f32)), ArrayIrValue::Array(Array::scalar(2.0_f32))]),
-        );
-        let primal_outputs =
-            linearization.primal().interpret(vec![ArrayIrValue::Array(Array::scalar(3.0_f32))]).unwrap();
-        assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::scalar(5.0_f32)));
-        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::scalar(4.0_f32))];
-        pullback_inputs.extend_from_slice(&primal_outputs[1..]);
-        assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![ArrayIrValue::Array(Array::scalar(4.0_f32))]));
-    }
-
-    #[test]
     fn test_program_linearize_restores_pruned_tangent_inputs() {
         // `stop_gradient` disconnects `dy` from the tangent output while `y` remains live in the primal program.
         // The split must restore the canonical `dy` boundary slot after partial-evaluation liveness pruning.
@@ -5331,261 +5376,62 @@ mod tests {
     }
 
     #[test]
-    fn test_region_linearize_shared() {
-        // A shared callee is linearized once and reused by every copy of its sealed region, which is what removes the
-        // repeated re-transformation that outer programs interning one callee would otherwise pay.
+    fn test_program_linearize_constant_output_tangent() {
+        // A constant-valued output still has an ordinary tangent output whose value is zero. Preserve this output
+        // alongside the live derivative, regardless of how its zero is represented internally.
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
-        let callee = Arc::new(
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
-        );
-        let (primal, tangent, residual_count) = callee.entry_region_ref().linearize_shared(&[0]).unwrap();
-        assert_eq!(residual_count, 1);
-        assert_eq!(primal.to_string(), callee.linearize().unwrap().primal().to_string());
-        assert_eq!(tangent.to_string(), callee.linearize().unwrap().tangent().to_string());
-
-        // Two independently built programs that intern the same callee share its retained linearization, because
-        // importing a region copies its complete reachable contents and therefore carries its transforms along.
-        let mut first_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let first_region = first_builder.intern_callee(&callee, None).unwrap();
-        let mut second_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let second_region = second_builder.intern_callee(&callee, None).unwrap();
-        let first = RegionRef::new(&first_builder.regions, first_region).unwrap().linearize_shared(&[0]).unwrap();
-        let second = RegionRef::new(&second_builder.regions, second_region).unwrap().linearize_shared(&[0]).unwrap();
-        assert!(Arc::ptr_eq(&first.0, &primal));
-        assert!(Arc::ptr_eq(&first.1, &tangent));
-        assert!(Arc::ptr_eq(&second.0, &primal));
-        assert!(Arc::ptr_eq(&second.1, &tangent));
-
-        // The original region produces the artifact, and both independently interned copies reuse it.
-        let statistics = callee.entry_region_ref().transform_statistics::<LinearizationTransform>().unwrap();
-        assert_eq!((statistics.productions, statistics.hits), (1, 2));
-
-        // Simplification rebuilds every region, so it keeps the retained linearization only when the rebuild left the
-        // region's contents untouched. A program carrying dead work is genuinely rewritten and must not reuse it.
-        let simplified = callee.simplified().unwrap();
-        assert!(Arc::ptr_eq(&simplified.entry_region_ref().linearize_shared(&[0]).unwrap().0, &primal));
-
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
-        builder.add_instruction(SinOperation::new(), Vec::new(), vec![output], None).unwrap();
-        let with_dead_work =
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-        let before = with_dead_work.entry_region_ref().linearize_shared(&[0]).unwrap();
-        let after = with_dead_work.simplified().unwrap();
-        let after = after.entry_region_ref().linearize_shared(&[0]).unwrap();
-        assert!(!Arc::ptr_eq(&after.0, &before.0));
-        assert_eq!(after.0.to_string(), primal.to_string());
-
-        // Instantiating a program's type identities rewrites its types, so the rebuilt program starts over with no
-        // retained transforms even though the source program keeps its own.
-        let bounds = DimensionBounds::non_negative(Some(16)).unwrap();
-        let dynamic_type = ArrayType::new(
-            DataType::F64,
-            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("formal", bounds))]),
-        );
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(dynamic_type);
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
-        let dynamic_callee =
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-        let formal = dynamic_callee.entry_region_ref().linearize_shared(&[0]).unwrap();
-        let actual_type = ArrayType::new(
-            DataType::F64,
-            Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("actual", bounds))]),
-        );
-        let instantiated = dynamic_callee.with_instantiated_type_identities(&[actual_type]).unwrap().into_owned();
-        let instantiated = instantiated.entry_region_ref().linearize_shared(&[0]).unwrap();
-        assert!(!Arc::ptr_eq(&instantiated.0, &formal.0));
-        assert!(Arc::ptr_eq(&dynamic_callee.entry_region_ref().linearize_shared(&[0]).unwrap().0, &formal.0));
-    }
-
-    #[test]
-    fn test_region_linearize_shared_invalidates_rebased_attached_regions() {
-        /// Builds a program whose entry applies `operation` to its single scalar input.
-        fn branch(operation: ArrayOperation<Array>) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
-            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-            let input = builder.add_input(ArrayType::scalar(DataType::F64));
-            let output = builder.add_instruction(operation, Vec::new(), vec![input], None).unwrap()[0];
-            builder.build(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
-        }
-
-        // A region's retained transforms cover its complete reachable contents, but the identifiers it attaches its
-        // descendants by are relative to the arena it is sealed in. Program `first` attaches the sine branch as both
-        // branches of a condition, so its entry's linearization is the derivative of sine.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let sine = builder.import_region(branch(ArrayOperation::Sin(SinOperation::new())).entry_region_ref());
-        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean));
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder
-            .add_instruction(ConditionOperation::new(), vec![sine, sine], vec![predicate, input], None)
-            .unwrap()[0];
-        let first = builder
-            .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+        let constant = builder.add_constant(Array::scalar(2.0));
+        let scaled = builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, constant], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<Array>, Vec<Array>>(vec![scaled, constant], vec![Placeholder], vec![Placeholder; 2])
             .unwrap();
-        let retained = first.entry_region_ref().linearize_shared(&[0, 1]).unwrap();
-
-        // Re-sealing a copy of that entry into an arena whose region 0 is the cosine branch changes what the copy
-        // computes, so it must not be served the transforms derived from the sine branch.
-        let rebased = Program::<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>::new(
-            vec![Placeholder; 2],
-            vec![Placeholder],
-            vec![branch(ArrayOperation::Cos(CosOperation::new())).entry_region().clone(), first.entry_region().clone()],
-            RegionId::new(1),
-        )
-        .unwrap();
-        let derived = rebased.entry_region_ref().linearize_shared(&[0, 1]).unwrap();
-        assert!(!Arc::ptr_eq(&derived.0, &retained.0));
-        assert!(!Arc::ptr_eq(&derived.1, &retained.1));
-
-        // The freshly derived tangent program differentiates the cosine branch the rebased arena actually attaches,
-        // which is the wrong-derivative failure that serving the retained artifact would produce.
-        assert_eq!(derived.1.to_string(), rebased.linearize().unwrap().tangent().to_string());
-        assert_ne!(derived.1.to_string(), retained.1.to_string());
-
-        // The source program keeps its own retained artifact, because only the re-sealed copy was rebased.
-        assert!(Arc::ptr_eq(&first.entry_region_ref().linearize_shared(&[0, 1]).unwrap().0, &retained.0));
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.primal().output_ids().len(), 2 + linearization.residual_count());
+        assert_eq!(linearization.tangent().output_ids().len(), 2);
+        let tangent_inputs =
+            [vec![Array::scalar(1.0)], vec![Array::scalar(2.0); linearization.residual_count()]].concat();
+        let tangent_outputs = linearization.tangent().interpret(tangent_inputs).unwrap();
+        assert_eq!(
+            tangent_outputs,
+            vec![Array::scalar(2.0), Array::scalar(0.0)],
+            "the tangent outputs must be [2 * ẋ] for the scaled output and a restored zero for the constant output",
+        );
     }
 
     #[test]
-    fn test_region_linearization_does_not_retain_its_source_cache() {
-        // `to_program` deliberately preserves the source entry region's cache. Linearizing that materialized copy is
-        // therefore the strongest ownership-cycle attempt available through today's built-in transform API.
+    fn test_program_linearize_empty_boundaries() {
+        // Boundary-degenerate programs retain their canonical signatures. A zero-input constant program has one
+        // primal output and one zero tangent output, while a zero-output program still retains the dead tangent
+        // input corresponding to its primal input.
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        let constant = builder.add_constant(Array::scalar(5.0));
+        let program = builder.build::<Vec<Array>, Vec<Array>>(vec![constant], Vec::new(), vec![Placeholder]).unwrap();
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.residual_count(), 0);
+        assert_eq!(linearization.primal().interpret(Vec::new()).unwrap(), vec![Array::scalar(5.0)]);
+        assert_eq!(linearization.tangent().interpret(Vec::new()).unwrap(), vec![Array::scalar(0.0)]);
+
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        builder.add_input(ArrayType::scalar(DataType::F64));
+        let program = builder.build::<Vec<Array>, Vec<Array>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
+        let linearization = program.linearize().unwrap();
+        assert_eq!(linearization.primal().input_ids().len(), 1);
+        assert!(linearization.primal().output_ids().is_empty());
+        assert_eq!(linearization.tangent().input_ids().len(), 1);
+        assert!(linearization.tangent().output_ids().is_empty());
+    }
+
+    #[test]
+    fn test_program_linearize_with_respect_to() {
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
         let program =
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-        let source_cache = program.entry_region().transform_cache.downgrade();
-        let materialized = program.entry_region_ref().to_program();
-        assert!(program.entry_region().transform_cache.ptr_eq(&materialized.entry_region().transform_cache));
-        let (primal, tangent, _) = materialized.entry_region_ref().linearize_shared(&[0]).unwrap();
-
-        drop(program);
-        drop(materialized);
-        assert!(!source_cache.is_alive());
-
-        // The returned programs can outlive the source cache because built-in linearization constructs a fresh entry
-        // and imports only strict descendants from the acyclic source arena; neither artifact embeds the source root.
-        drop(primal);
-        drop(tangent);
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn test_region_linearize_shared_debug_recheck_detects_corrupted_cached_linearization() {
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(SinOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
-        let program =
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
-
-        // Publish an artifact that disagrees with what linearizing this region produces, which is exactly the state a
-        // nondeterministic `jvp` rule would leave behind: a retained derivative of a program the region does not
-        // compute.
-        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-        let input = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(CosOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
-        let unrelated = Arc::new(
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
-        );
-        program.entry_region_ref().insert_transform_artifact_for_testing::<LinearizationTransform, _>(
-            DifferentiationTransformArguments { input_indices: vec![0] },
-            TransformArtifact::new(vec![unrelated.clone(), unrelated], 0),
-        );
-
-        // The recheck runs on the hit and reports the contract violation rather than serving the wrong derivative.
-        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            program.entry_region_ref().linearize_shared(&[0])
-        }))
-        .unwrap_err();
-        let message = panicked.downcast_ref::<String>().unwrap();
-        assert!(message.starts_with("nondeterministic transform rule detected for `"), "{message}",);
-        assert!(message.contains("LinearizationTransform"), "{message}");
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn test_region_linearize_shared_debug_recheck_detects_operation_metadata_changes() {
-        // This test pins the metadata-fingerprint contract of `Operation::render`. The transform cache debugging
-        // diagnostic compares programs purely by rendering, so an operation that fails to render its semantics-bearing
-        // payload is an operation whose corruption the diagnostic cannot see. `tag` is the canonical example: its key
-        // is invisible to types and structure, yet rematerialization policies classify residuals by it. The two regions
-        // below differ only in that key, so this test panics exactly when `TagOperation::render` renders it; a
-        // name-only rendering would make the corrupted artifact compare equal and serve silently.
-
-        // Builds a single-instruction region tagging its input with `key`.
-        fn tagged_program(key: &str) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
-            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-            let input = builder.add_input(ArrayType::scalar(DataType::F64));
-            let output = builder.add_instruction(TagOperation::new(key), Vec::new(), vec![input], None).unwrap()[0];
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
-        }
-
-        let program = tagged_program("saved");
-        let other = tagged_program("recomputed");
-
-        // The two programs differ only in operation metadata, so the corruption below is invisible to everything
-        // except rendering that carries the key.
-        assert_ne!(program.to_string(), other.to_string());
-
-        // Publish the *other* region's genuine linearization against this region, which is the state a `jvp` rule that
-        // is not a structural function of its operation would leave behind.
-        let (primal, tangent, residual_count) = other.entry_region_ref().linearize_shared(&[0]).unwrap();
-        program.entry_region_ref().insert_transform_artifact_for_testing::<LinearizationTransform, _>(
-            DifferentiationTransformArguments { input_indices: vec![0] },
-            TransformArtifact::new(vec![primal, tangent], residual_count),
-        );
-
-        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            program.entry_region_ref().linearize_shared(&[0])
-        }))
-        .unwrap_err();
-        let message = panicked.downcast_ref::<String>().unwrap();
-        assert!(message.starts_with("nondeterministic transform rule detected for `"), "{message}",);
-        assert!(message.contains("LinearizationTransform"), "{message}");
-    }
-
-    #[cfg(debug_assertions)]
-    #[test]
-    fn test_region_linearize_shared_debug_recheck_detects_constant_payload_changes() {
-        // This test pins the constant-payload part of the rendering contract at a cache hit. The two regions below
-        // differ only in one `Atom::Constant` literal, so this test panics exactly when `Program::render` carries that
-        // payload into the rendering compared by the recheck.
-
-        // Builds a single-instruction region scaling its input by the constant `factor`.
-        fn scaled_program(factor: f64) -> Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>> {
-            let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
-            let input = builder.add_input(ArrayType::scalar(DataType::F64));
-            let constant = builder.add_constant(Array::scalar(factor));
-            let output =
-                builder.add_instruction(MulOperation::new(), Vec::new(), vec![input, constant], None).unwrap()[0];
-            builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap()
-        }
-
-        let program = scaled_program(2.0);
-        let other = scaled_program(3.0);
-
-        // The ordinary rendering is semantically complete enough to distinguish the embedded literal.
-        assert_ne!(program.to_string(), other.to_string());
-
-        // Publish the *other* region's genuine linearization against this region, which is the state a `jvp` rule
-        // that is not a structural function of the constants it embeds would leave behind.
-        let (primal, tangent, residual_count) = other.entry_region_ref().linearize_shared(&[0]).unwrap();
-        program.entry_region_ref().insert_transform_artifact_for_testing::<LinearizationTransform, _>(
-            DifferentiationTransformArguments { input_indices: vec![0] },
-            TransformArtifact::new(vec![primal, tangent], residual_count),
-        );
-
-        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            program.entry_region_ref().linearize_shared(&[0])
-        }))
-        .unwrap_err();
-        let message = panicked.downcast_ref::<String>().unwrap();
-        assert!(message.starts_with("nondeterministic transform rule detected for `"), "{message}",);
-        assert!(message.contains("LinearizationTransform"), "{message}");
+            builder.build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder]).unwrap();
+        let linearization = program.linearize_with_respect_to(&[]).unwrap();
+        let outputs = linearization.primal().interpret(vec![Array::scalar(2.0_f64)]).unwrap();
+        assert_eq!(outputs[0], Array::scalar(2.0_f64));
+        assert_eq!(linearization.tangent().interpret(outputs[1..].to_vec()), Ok(vec![Array::scalar(0.0_f64)]));
     }
 
     #[test]
@@ -5711,7 +5557,7 @@ mod tests {
     }
 
     #[test]
-    fn test_jvp() {
+    fn test_forward_mode_differentiate_jvp() {
         // `ForwardModeDifferentiate::jvp` on an explicit context runs the closure directly on duals. For
         // `f(x) = sin(x)` at `x = 2` along the tangent `ẋ = 3`, the primal output is `sin(2)` and the tangent
         // output is `3 · cos(2)`.
@@ -5726,119 +5572,6 @@ mod tests {
             .unwrap();
         assert_eq!(value.to_f64s(), vec![6.0]);
         assert_eq!(tangent.to_f64s(), vec![3.0]);
-
-        // The builder's `jvp` terminal serves top-level concrete values through their `Value::ExecutionDomain`
-        // declarations. A concrete array input recovers the eager array domain, so both dual halves are concrete.
-        let (value, tangent) = differentiate_at(Array::scalar(2.0)).jvp(Array::scalar(3.0), |x| x.sin()).unwrap();
-        assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(tangent.to_f64s()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
-
-        // Complex duals flow through the same rules. The jvp of z² pushes the tangent ż to `2z · ż`
-        // at a genuinely complex point.
-        let z = num_complex::Complex::new(0.7f64, -0.3f64);
-        let tangent_seed = num_complex::Complex::new(1.0f64, 0.5f64);
-        let (value, tangent) =
-            differentiate_at(Array::scalar(z)).jvp(Array::scalar(tangent_seed), |x| Ok(x.clone() * x)).unwrap();
-        assert_eq!(value.elements::<num_complex::Complex<f64>>().unwrap(), vec![z * z]);
-        assert_eq!(tangent.elements::<num_complex::Complex<f64>>().unwrap(), vec![(z + z) * tangent_seed],);
-
-        // Eager JVP duals carry concrete primal halves, so ordinary host control flow can branch on a Boolean primal
-        // without tracing the untaken branch. The Boolean has no tangent space and therefore receives a structural-zero
-        // tangent alongside the live tangent of `x`.
-        let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
-        let (value, tangent) = differentiate_at((Array::scalar(true), Array::scalar(0.7)))
-            .jvp((zero.clone(), Array::scalar(1.0)), |(predicate, x)| {
-                Ok(if predicate.concretize()? { x.clone() * x.sin()? } else { -x })
-            })
-            .unwrap();
-        assert_abs_diff_eq!(value.to_f64s()[0], 0.7 * 0.7f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(tangent.to_f64s()[0], 0.7f64.sin() + 0.7 * 0.7f64.cos(), epsilon = 1e-9);
-
-        // Inputs without tangent spaces retain first-class zero-space boundary leaves. Their only valid tangent value
-        // is a rank-zero structural-zero array, and output structural zeros materialize with the same type.
-        let (value, tangent): ((Array, Array), (Array, Array)) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jvp(
-                |inputs, ()| Ok(inputs),
-                (Array::scalar(2.0f64), Array::scalar(3i32)),
-                (Array::scalar(1.0f64), zero.clone()),
-                (),
-            )
-            .unwrap();
-        assert_eq!(value, (Array::scalar(2.0f64), Array::scalar(3i32)));
-        assert_eq!(tangent, (Array::scalar(1.0f64), zero.clone()));
-
-        let token = Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap();
-        let (value, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .jvp(|token, ()| Ok(token), token.clone(), zero.clone(), ())
-            .unwrap();
-        assert_eq!(value, token.clone());
-        assert_eq!(tangent, zero.clone());
-        assert!(matches!(
-            EagerContext::<Array, ArrayOperation<Array>>::new().jvp(
-                |token, ()| Ok(token),
-                token.clone(),
-                token.clone(),
-                (),
-            ),
-            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
-                if message == "tangent type token[] does not match type zero[] required by primal type token[]",
-        ));
-
-        // Under an active trace, the builder's `jvp` terminal recovers the staging context from its tracer inputs, so
-        // it composes inside traced code without threading a context. The closure stages the fused primal and tangent
-        // operations into the enclosing trace.
-        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |inputs: Vec<_>| {
-                let (value, tangent) = differentiate_at(inputs[0].clone()).jvp(inputs[1].clone(), |x| x.sin())?;
-                Ok(vec![value, tangent])
-            },
-            vec![ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
-        )
-        .unwrap();
-        let outputs = program.interpret(vec![Array::scalar(2.0), Array::scalar(3.0)]).unwrap();
-        assert_eq!(outputs.len(), 2);
-        assert_abs_diff_eq!(outputs[0].to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(outputs[1].to_f64s()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
-
-        // The same composition preserves zero-space leaves for tokens instead of attempting to stage token
-        // arithmetic while constructing the enclosing program.
-        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |inputs: Vec<_>| {
-                let (value, tangent) = differentiate_at(inputs[0].clone()).jvp(inputs[1].clone(), |token| Ok(token))?;
-                Ok(vec![value, tangent])
-            },
-            vec![ArrayType::scalar(DataType::Token), ArrayType::scalar(DataType::Zero)],
-        )
-        .unwrap();
-        assert_eq!(program.interpret(vec![token.clone(), zero.clone()]), Ok(vec![token.clone(), zero.clone()]));
-
-        // Tangents pair with primals leaf-for-leaf and so a tangent structure that does not match the primal
-        // structure is rejected.
-        assert!(matches!(
-            differentiate_at(vec![Array::scalar(1.0)])
-                .jvp(vec![Array::scalar(1.0), Array::scalar(2.0)], |x| Ok(x))
-                .unwrap_err(),
-            DifferentiationError::Program(ProgramError::Parameter(
-                ParameterError::MismatchedParameterStructures { .. },
-            )),
-        ));
-
-        // With no leaf value to recover a context from, the builder's `jvp` terminal reports that differentiation
-        // requires at least one input leaf.
-        assert_eq!(
-            differentiate_at(Vec::<Array>::new()).jvp(Vec::new(), |x| Ok(x)).unwrap_err(),
-            DifferentiationError::EmptyInput,
-        );
-
-        // Rank-zero arrays support both half-precision variants through the ordinary array operations.
-        assert_eq!(
-            differentiate_at(Array::scalar(bf16::from_f32(3.0))).jvp(Array::scalar(bf16::ONE), |x| Ok(x.clone() + x)),
-            Ok((Array::scalar(bf16::from_f32(6.0)), Array::scalar(bf16::from_f32(2.0)))),
-        );
-        assert_eq!(
-            differentiate_at(Array::scalar(f16::from_f32(3.0))).jvp(Array::scalar(f16::ONE), |x| Ok(x.clone() + x)),
-            Ok((Array::scalar(f16::from_f32(6.0)), Array::scalar(f16::from_f32(2.0)))),
-        );
     }
 
     #[test]
@@ -5861,181 +5594,6 @@ mod tests {
             Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
                 if message == "jvp output tangent captured 0 zero residuals but declared 1",
         ));
-    }
-
-    #[test]
-    fn test_linearize() {
-        // `ForwardModeDifferentiate::linearize` on an explicit context runs the closure once at the primal point and
-        // returns the primal output together with a reusable pushforward: applying it pushes any number of tangents
-        // through the Jacobian at that point without re-tracing or re-differentiating.
-        let (value, pushforward) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .linearize(|x, ()| x.sin(), Array::scalar(2.0), ())
-            .unwrap();
-        assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(pushforward.apply(Array::scalar(1.0)).unwrap().to_f64s()[0], 2.0f64.cos(), epsilon = 1e-9);
-        assert_abs_diff_eq!(
-            pushforward.apply(Array::scalar(3.0)).unwrap().to_f64s()[0],
-            3.0 * 2.0f64.cos(),
-            epsilon = 1e-9,
-        );
-
-        // The builder's `linearize` terminal serves top-level concrete values through their `Value::ExecutionDomain`
-        // declarations. Primal work executes eagerly at the concrete linearization point while the pushforward program
-        // accumulates.
-        let (value, pushforward) = differentiate_at(Array::scalar(2.0)).linearize(|x| x.sin()).unwrap();
-        assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(pushforward.apply(Array::scalar(1.0)).unwrap().to_f64s()[0], 2.0f64.cos(), epsilon = 1e-9);
-
-        let token = Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap();
-        let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
-        let (value, pushforward) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .linearize(|token, ()| Ok(token), token.clone(), ())
-            .unwrap();
-        assert_eq!(value, token.clone());
-        assert_eq!(pushforward.apply(zero.clone()), Ok(zero.clone()));
-        assert!(matches!(
-            pushforward.apply(token.clone()),
-            Err(ProgramError::MalformedProgram(message))
-                if message == "pushforward tangent 0 has type token[] but its primal boundary requires tangent type zero[]",
-        ));
-
-        // Under an active trace, the builder's `linearize` terminal recovers the staging context from its tracer input,
-        // so primal work stages into the enclosing trace and the pushforward replays there when applied.
-        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |inputs: Vec<_>| {
-                let (value, pushforward) = differentiate_at(inputs[0].clone()).linearize(|x| x.sin())?;
-                let tangent = pushforward.apply(inputs[1].clone())?;
-                Ok(vec![value, tangent])
-            },
-            vec![ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
-        )
-        .unwrap();
-        let outputs = program.interpret(vec![Array::scalar(2.0), Array::scalar(3.0)]).unwrap();
-        assert_eq!(outputs.len(), 2);
-        assert_abs_diff_eq!(outputs[0].to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
-        assert_abs_diff_eq!(outputs[1].to_f64s()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
-
-        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
-            |inputs: Vec<_>| {
-                let (value, pushforward) = differentiate_at(inputs[0].clone()).linearize(|token| Ok(token))?;
-                let tangent = pushforward.apply(inputs[1].clone())?;
-                Ok(vec![value, tangent])
-            },
-            vec![ArrayType::scalar(DataType::Token), ArrayType::scalar(DataType::Zero)],
-        )
-        .unwrap();
-        assert_eq!(program.interpret(vec![token.clone(), zero.clone()]), Ok(vec![token.clone(), zero]));
-
-        // The closure can branch on a Boolean *primal* with host control flow, because the duals' primal halves carry
-        // concrete known values under an eager context. For a true predicate and `x = 3`, `f(x) = x * x` linearizes to
-        // the pushforward `ẋ ↦ 2x · ẋ = 6ẋ`, and the untaken `sin(x)` branch is never traced at all. Neither `sin` nor
-        // its `cos` derivative can appear in the pushforward program.
-        let (value, pushforward) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .linearize(
-                |(predicate, x), ()| Ok(if predicate.concretize().unwrap() { x.clone() * x } else { x.sin().unwrap() }),
-                (Array::scalar(true), Array::scalar(3.0)),
-                (),
-            )
-            .unwrap();
-        assert_abs_diff_eq!(value.to_f64s()[0], 9.0, epsilon = 1e-9);
-        let program = pushforward.program().to_string();
-        assert!(program.contains("mul"), "{program}");
-        assert!(
-            !program.contains("sin") && !program.contains("cos"),
-            "the untaken branch must never be traced: {program}",
-        );
-        let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
-        assert_abs_diff_eq!(pushforward.apply((zero, Array::scalar(1.0))).unwrap().to_f64s()[0], 6.0, epsilon = 1e-9,);
-
-        // Structured inputs preserve their leaf order through a reusable multi-input pushforward.
-        let function = |(a, b): (
-            LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>,
-            LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>,
-        )| Ok(a.clone() * b + a.sin()?);
-        let (_, pushforward) = differentiate_at((Array::scalar(0.5), Array::scalar(1.3))).linearize(function).unwrap();
-        assert_abs_diff_eq!(
-            pushforward.apply((Array::scalar(1.0), Array::scalar(0.0))).unwrap().to_f64s()[0],
-            1.3 + 0.5f64.cos(),
-            epsilon = 1e-9,
-        );
-        assert_abs_diff_eq!(
-            pushforward.apply((Array::scalar(0.0), Array::scalar(1.0))).unwrap().to_f64s()[0],
-            0.5,
-            epsilon = 1e-9,
-        );
-
-        // With no leaf value to recover a context from, the builder's `linearize` terminal reports that differentiation
-        // requires at least one input leaf.
-        assert_eq!(
-            differentiate_at(Vec::<Array>::new()).linearize(|x| Ok(x)).map(|(outputs, _)| outputs).unwrap_err(),
-            DifferentiationError::EmptyInput
-        );
-    }
-
-    #[test]
-    fn test_jvp_projected_operation() {
-        // The third fixture member is intentionally unrelated to arrays. Its identity JVP proves that the adapter
-        // projects both halves of a live dual and lifts the resulting member values back into the composite family.
-        let context =
-            DifferentiationContext::fused(EagerContext::<ProjectedProgramValue, ProjectedProgramOperation>::new());
-        let input = DifferentiationDual::new(
-            ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)),
-            ProjectedProgramValue::Third(ProjectedMemberValue::<2>(3)),
-        )
-        .unwrap();
-        let output = jvp_projected_operation(&context, &ProjectedMemberOperation::<2>, &[input]).unwrap().remove(0);
-        let (primal, tangent) = output.into_parts();
-        assert_eq!(primal, ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)));
-        assert!(matches!(tangent, MaybeZero::Value(ProjectedProgramValue::Third(ProjectedMemberValue::<2>(3))),));
-
-        // Structural zeros cross the same adapter as types and therefore do not stage or materialize member values.
-        let input = DifferentiationDual::new(
-            ProjectedProgramValue::Third(ProjectedMemberValue::<2>(11)),
-            MaybeZero::Zero(ProjectedProgramType::Third(ProjectedMemberType::<2>)),
-        )
-        .unwrap();
-        let output = jvp_projected_operation(&context, &ProjectedMemberOperation::<2>, &[input]).unwrap().remove(0);
-        let (primal, tangent) = output.into_parts();
-        assert_eq!(primal, ProjectedProgramValue::Third(ProjectedMemberValue::<2>(11)));
-        assert!(matches!(tangent, MaybeZero::Zero(ProjectedProgramType::Third(ProjectedMemberType::<2>)),));
-    }
-
-    #[test]
-    fn test_forward_mode_differentiate_staged_reference_boundaries() {
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
-        let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
-            |inputs: Vec<_>| {
-                let (primal, tangent) =
-                    differentiate_at(inputs[0].clone()).jvp(inputs[1].clone(), |reference| reference.read())?;
-                let (_, pushforward) = differentiate_at(inputs[0].clone()).linearize(|reference| reference.read())?;
-                let delayed = pushforward.apply(inputs[1].clone())?;
-                assert!(matches!(
-                    pushforward.apply(inputs[0].clone()),
-                    Err(ProgramError::InvalidArgument { message })
-                        if message == "tangent 0 aliases a reference bound at the primal boundary of the \
-                            differentiated function",
-                ));
-                assert!(matches!(
-                    differentiate_at(inputs[0].clone()).jvp(inputs[0].clone(), |reference| reference.read()),
-                    Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
-                        if message == "tangent 0 and input 0 bind the same reference allocation",
-                ));
-                Ok(vec![primal, tangent, delayed])
-            },
-            vec![reference_type.clone(), reference_type],
-        )
-        .unwrap();
-        assert_eq!(
-            program.interpret(vec![
-                ArrayIrValue::Reference(ArrayReference::new(Array::scalar(3.0_f32))),
-                ArrayIrValue::Reference(ArrayReference::new(Array::scalar(2.0_f32))),
-            ]),
-            Ok(vec![
-                ArrayIrValue::Array(Array::scalar(3.0_f32)),
-                ArrayIrValue::Array(Array::scalar(2.0_f32)),
-                ArrayIrValue::Array(Array::scalar(2.0_f32)),
-            ])
-        );
     }
 
     #[test]
@@ -6132,6 +5690,204 @@ mod tests {
     }
 
     #[test]
+    fn test_forward_mode_differentiate_jvp_staged_reference_boundaries() {
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
+            |inputs: Vec<_>| {
+                let (primal, tangent) =
+                    differentiate_at(inputs[0].clone()).jvp(inputs[1].clone(), |reference| reference.read())?;
+                let (_, pushforward) = differentiate_at(inputs[0].clone()).linearize(|reference| reference.read())?;
+                let delayed = pushforward.apply(inputs[1].clone())?;
+                assert!(matches!(
+                    pushforward.apply(inputs[0].clone()),
+                    Err(ProgramError::InvalidArgument { message })
+                        if message == "tangent 0 aliases a reference bound at the primal boundary of the \
+                            differentiated function",
+                ));
+                assert!(matches!(
+                    differentiate_at(inputs[0].clone()).jvp(inputs[0].clone(), |reference| reference.read()),
+                    Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
+                        if message == "tangent 0 and input 0 bind the same reference allocation",
+                ));
+                Ok(vec![primal, tangent, delayed])
+            },
+            vec![reference_type.clone(), reference_type],
+        )
+        .unwrap();
+        assert_eq!(
+            program.interpret(vec![
+                ArrayIrValue::Reference(ArrayReference::new(Array::scalar(3.0_f32))),
+                ArrayIrValue::Reference(ArrayReference::new(Array::scalar(2.0_f32))),
+            ]),
+            Ok(vec![
+                ArrayIrValue::Array(Array::scalar(3.0_f32)),
+                ArrayIrValue::Array(Array::scalar(2.0_f32)),
+                ArrayIrValue::Array(Array::scalar(2.0_f32)),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_forward_mode_differentiate_jvp_in_execution_domain() {
+        // The builder's `jvp` terminal serves top-level concrete values through their `Value::ExecutionDomain`
+        // declarations. A concrete array input recovers the eager array domain, so both dual halves are concrete.
+        let (value, tangent) = differentiate_at(Array::scalar(2.0)).jvp(Array::scalar(3.0), |x| x.sin()).unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(tangent.to_f64s()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_forward_mode_differentiate_jvp_complex() {
+        // Complex duals flow through the same rules. The jvp of z² pushes the tangent ż to `2z · ż`
+        // at a genuinely complex point.
+        let z = num_complex::Complex::new(0.7f64, -0.3f64);
+        let tangent_seed = num_complex::Complex::new(1.0f64, 0.5f64);
+        let (value, tangent) =
+            differentiate_at(Array::scalar(z)).jvp(Array::scalar(tangent_seed), |x| Ok(x.clone() * x)).unwrap();
+        assert_eq!(value.elements::<num_complex::Complex<f64>>().unwrap(), vec![z * z]);
+        assert_eq!(tangent.elements::<num_complex::Complex<f64>>().unwrap(), vec![(z + z) * tangent_seed],);
+    }
+
+    #[test]
+    fn test_forward_mode_differentiate_jvp_host_control_flow() {
+        // Eager JVP duals carry concrete primal halves, so ordinary host control flow can branch on a Boolean primal
+        // without tracing the untaken branch. The Boolean has no tangent space and therefore receives a structural-zero
+        // tangent alongside the live tangent of `x`.
+        let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
+        let (value, tangent) = differentiate_at((Array::scalar(true), Array::scalar(0.7)))
+            .jvp((zero.clone(), Array::scalar(1.0)), |(predicate, x)| {
+                Ok(if predicate.concretize()? { x.clone() * x.sin()? } else { -x })
+            })
+            .unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], 0.7 * 0.7f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(tangent.to_f64s()[0], 0.7f64.sin() + 0.7 * 0.7f64.cos(), epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_forward_mode_differentiate_jvp_zero_spaces() {
+        let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
+        // Inputs without tangent spaces retain first-class zero-space boundary leaves. Their only valid tangent value
+        // is a rank-zero structural-zero array, and output structural zeros materialize with the same type.
+        let (value, tangent): ((Array, Array), (Array, Array)) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jvp(
+                |inputs, ()| Ok(inputs),
+                (Array::scalar(2.0f64), Array::scalar(3i32)),
+                (Array::scalar(1.0f64), zero.clone()),
+                (),
+            )
+            .unwrap();
+        assert_eq!(value, (Array::scalar(2.0f64), Array::scalar(3i32)));
+        assert_eq!(tangent, (Array::scalar(1.0f64), zero.clone()));
+
+        let token = Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap();
+        let (value, tangent) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .jvp(|token, ()| Ok(token), token.clone(), zero.clone(), ())
+            .unwrap();
+        assert_eq!(value, token.clone());
+        assert_eq!(tangent, zero.clone());
+        assert!(matches!(
+            EagerContext::<Array, ArrayOperation<Array>>::new().jvp(
+                |token, ()| Ok(token),
+                token.clone(),
+                token.clone(),
+                (),
+            ),
+            Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
+                if message == "tangent type token[] does not match type zero[] required by primal type token[]",
+        ));
+    }
+
+    #[test]
+    fn test_forward_mode_differentiate_jvp_staged() {
+        // Under an active trace, the builder's `jvp` terminal recovers the staging context from its tracer inputs, so
+        // it composes inside traced code without threading a context. The closure stages the fused primal and tangent
+        // operations into the enclosing trace.
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<_>| {
+                let (value, tangent) = differentiate_at(inputs[0].clone()).jvp(inputs[1].clone(), |x| x.sin())?;
+                Ok(vec![value, tangent])
+            },
+            vec![ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        )
+        .unwrap();
+        let outputs = program.interpret(vec![Array::scalar(2.0), Array::scalar(3.0)]).unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert_abs_diff_eq!(outputs[0].to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(outputs[1].to_f64s()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_forward_mode_differentiate_jvp_staged_zero_spaces() {
+        let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
+        let token = Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap();
+        // The same composition preserves zero-space leaves for tokens instead of attempting to stage token
+        // arithmetic while constructing the enclosing program.
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<_>| {
+                let (value, tangent) = differentiate_at(inputs[0].clone()).jvp(inputs[1].clone(), |token| Ok(token))?;
+                Ok(vec![value, tangent])
+            },
+            vec![ArrayType::scalar(DataType::Token), ArrayType::scalar(DataType::Zero)],
+        )
+        .unwrap();
+        assert_eq!(program.interpret(vec![token.clone(), zero.clone()]), Ok(vec![token.clone(), zero.clone()]));
+    }
+
+    #[test]
+    fn test_forward_mode_differentiate_jvp_invalid_structure() {
+        // Tangents pair with primals leaf-for-leaf and so a tangent structure that does not match the primal
+        // structure is rejected.
+        assert!(matches!(
+            differentiate_at(vec![Array::scalar(1.0)])
+                .jvp(vec![Array::scalar(1.0), Array::scalar(2.0)], |x| Ok(x))
+                .unwrap_err(),
+            DifferentiationError::Program(ProgramError::Parameter(
+                ParameterError::MismatchedParameterStructures { .. },
+            )),
+        ));
+    }
+
+    #[test]
+    fn test_forward_mode_differentiate_jvp_empty_input() {
+        // With no leaf value to recover a context from, the builder's `jvp` terminal reports that differentiation
+        // requires at least one input leaf.
+        assert_eq!(
+            differentiate_at(Vec::<Array>::new()).jvp(Vec::new(), |x| Ok(x)).unwrap_err(),
+            DifferentiationError::EmptyInput,
+        );
+    }
+
+    #[test]
+    fn test_forward_mode_differentiate_jvp_low_precision() {
+        // Rank-zero arrays support both half-precision variants through the ordinary array operations.
+        assert_eq!(
+            differentiate_at(Array::scalar(bf16::from_f32(3.0))).jvp(Array::scalar(bf16::ONE), |x| Ok(x.clone() + x)),
+            Ok((Array::scalar(bf16::from_f32(6.0)), Array::scalar(bf16::from_f32(2.0)))),
+        );
+        assert_eq!(
+            differentiate_at(Array::scalar(f16::from_f32(3.0))).jvp(Array::scalar(f16::ONE), |x| Ok(x.clone() + x)),
+            Ok((Array::scalar(f16::from_f32(6.0)), Array::scalar(f16::from_f32(2.0)))),
+        );
+    }
+
+    #[test]
+    fn test_forward_mode_differentiate_linearize() {
+        // `ForwardModeDifferentiate::linearize` on an explicit context runs the closure once at the primal point and
+        // returns the primal output together with a reusable pushforward: applying it pushes any number of tangents
+        // through the Jacobian at that point without re-tracing or re-differentiating.
+        let (value, pushforward) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .linearize(|x, ()| x.sin(), Array::scalar(2.0), ())
+            .unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(pushforward.apply(Array::scalar(1.0)).unwrap().to_f64s()[0], 2.0f64.cos(), epsilon = 1e-9);
+        assert_abs_diff_eq!(
+            pushforward.apply(Array::scalar(3.0)).unwrap().to_f64s()[0],
+            3.0 * 2.0f64.cos(),
+            epsilon = 1e-9,
+        );
+    }
+
+    #[test]
     fn test_forward_mode_differentiate_linearize_rejects_aliased_reference_inputs() {
         let reference = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
         let error = differentiate_at((reference.clone(), reference))
@@ -6168,14 +5924,11 @@ mod tests {
         // `f(r, x) = { add_update(r, x); read(r) }` over a live reference. The eager known side of the linearization
         // is the forward pass: the primal update mutates `r` at linearization time, exactly as forward mode does, while
         // the tangent accesses stage over the tangent reference the pushforward is later applied to.
-        fn function<V: ReferenceAddUpdate + ReferenceRead>((reference, x): (V, V)) -> Result<V, ProgramError> {
-            reference.add_update(&x)?;
-            reference.read()
-        }
+
         let reference = ArrayReference::new(Array::scalar(1.0_f32));
         let (value, pushforward) =
             differentiate_at((ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(Array::scalar(3.0_f32))))
-                .linearize(function)
+                .linearize(add_to_reference)
                 .unwrap();
         assert_eq!(value, ArrayIrValue::Array(Array::scalar(4.0_f32)));
         assert_eq!(reference.read(), Ok(Array::scalar(4.0_f32)));
@@ -6212,7 +5965,7 @@ mod tests {
             differentiate_at((ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Array(Array::scalar(3.0_f32))))
                 .jvp(
                     (ArrayIrValue::Reference(tangent_reference.clone()), ArrayIrValue::Array(Array::scalar(2.0_f32))),
-                    function,
+                    add_to_reference,
                 ),
             Ok((ArrayIrValue::Array(Array::scalar(4.0_f32)), ArrayIrValue::Array(Array::scalar(2.5_f32)))),
         );
@@ -6241,53 +5994,147 @@ mod tests {
     }
 
     #[test]
-    fn test_pushforward_apply_rejects_aliased_tangent_references() {
-        // `f(r, s) = { add_update(r, read(s)); read(r) }` over two live references.
-        fn function<V: ReferenceAddUpdate + ReferenceRead>((reference, other): (V, V)) -> Result<V, ProgramError> {
-            reference.add_update(&other.read()?)?;
-            reference.read()
-        }
-        let reference = ArrayReference::new(Array::scalar(1.0_f32));
-        let other = ArrayReference::new(Array::scalar(3.0_f32));
-        let (value, pushforward) =
-            differentiate_at((ArrayIrValue::Reference(reference.clone()), ArrayIrValue::Reference(other.clone())))
-                .linearize(function)
-                .unwrap();
-        assert_eq!(value, ArrayIrValue::Array(Array::scalar(4.0_f32)));
+    fn test_forward_mode_differentiate_linearize_in_execution_domain() {
+        // The builder's `linearize` terminal serves top-level concrete values through their `Value::ExecutionDomain`
+        // declarations. Primal work executes eagerly at the concrete linearization point while the pushforward program
+        // accumulates.
+        let (value, pushforward) = differentiate_at(Array::scalar(2.0)).linearize(|x| x.sin()).unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(pushforward.apply(Array::scalar(1.0)).unwrap().to_f64s()[0], 2.0f64.cos(), epsilon = 1e-9);
 
-        // A tangent reference aliasing a reference bound at the primal boundary is rejected by identity even though
-        // that reference advanced generations after linearization, and two tangents aliasing each other are rejected
-        // as well. The rejections precede any interpretation, so the primal state is untouched.
-        let tangent_reference = ArrayReference::new(Array::scalar(0.5_f32));
+        let token = Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap();
+        let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
+        let (value, pushforward) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .linearize(|token, ()| Ok(token), token.clone(), ())
+            .unwrap();
+        assert_eq!(value, token.clone());
+        assert_eq!(pushforward.apply(zero.clone()), Ok(zero.clone()));
         assert!(matches!(
-            pushforward.apply((
-                ArrayIrValue::Reference(tangent_reference.clone()),
-                ArrayIrValue::Reference(reference.clone()),
-            )),
-            Err(ProgramError::InvalidArgument { message })
-                if message == "tangent 1 aliases a reference bound at the primal boundary of the differentiated \
-                    function",
+            pushforward.apply(token.clone()),
+            Err(ProgramError::MalformedProgram(message))
+                if message == "pushforward tangent 0 has type token[] but its primal boundary requires tangent type \
+                    zero[]",
         ));
-        assert!(matches!(
-            pushforward.apply((
-                ArrayIrValue::Reference(tangent_reference.clone()),
-                ArrayIrValue::Reference(tangent_reference.clone()),
-            )),
-            Err(ProgramError::InvalidArgument { message })
-                if message == "tangent 1 and tangent 0 bind the same reference allocation",
-        ));
-        assert_eq!(reference.read(), Ok(Array::scalar(4.0_f32)));
-        assert_eq!(other.read(), Ok(Array::scalar(3.0_f32)));
+    }
 
-        // Distinct tangent references push the tangent through: `ṫ = ṟ + ṡ = 0.5 + 2`.
-        let other_tangent_reference = ArrayReference::new(Array::scalar(2.0_f32));
+    #[test]
+    fn test_forward_mode_differentiate_linearize_staged() {
+        let token = Array::from_logical_bytes(ArrayType::scalar(DataType::Token), &[]).unwrap();
+        let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
+        // Under an active trace, the builder's `linearize` terminal recovers the staging context from its tracer input,
+        // so primal work stages into the enclosing trace and the pushforward replays there when applied.
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<_>| {
+                let (value, pushforward) = differentiate_at(inputs[0].clone()).linearize(|x| x.sin())?;
+                let tangent = pushforward.apply(inputs[1].clone())?;
+                Ok(vec![value, tangent])
+            },
+            vec![ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        )
+        .unwrap();
+        let outputs = program.interpret(vec![Array::scalar(2.0), Array::scalar(3.0)]).unwrap();
+        assert_eq!(outputs.len(), 2);
+        assert_abs_diff_eq!(outputs[0].to_f64s()[0], 2.0f64.sin(), epsilon = 1e-9);
+        assert_abs_diff_eq!(outputs[1].to_f64s()[0], 3.0 * 2.0f64.cos(), epsilon = 1e-9);
+
+        let (_, program) = EagerContext::<Array, ArrayOperation<Array>>::trace(
+            |inputs: Vec<_>| {
+                let (value, pushforward) = differentiate_at(inputs[0].clone()).linearize(|token| Ok(token))?;
+                let tangent = pushforward.apply(inputs[1].clone())?;
+                Ok(vec![value, tangent])
+            },
+            vec![ArrayType::scalar(DataType::Token), ArrayType::scalar(DataType::Zero)],
+        )
+        .unwrap();
+        assert_eq!(program.interpret(vec![token.clone(), zero.clone()]), Ok(vec![token.clone(), zero]));
+    }
+
+    #[test]
+    fn test_forward_mode_differentiate_linearize_host_control_flow() {
+        // The closure can branch on a Boolean *primal* with host control flow, because the duals' primal halves carry
+        // concrete known values under an eager context. For a true predicate and `x = 3`, `f(x) = x * x` linearizes to
+        // the pushforward `ẋ ↦ 2x · ẋ = 6ẋ`, and the untaken `sin(x)` branch is never traced at all. Neither `sin` nor
+        // its `cos` derivative can appear in the pushforward program.
+        let (value, pushforward) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .linearize(
+                |(predicate, x), ()| Ok(if predicate.concretize().unwrap() { x.clone() * x } else { x.sin().unwrap() }),
+                (Array::scalar(true), Array::scalar(3.0)),
+                (),
+            )
+            .unwrap();
+        assert_abs_diff_eq!(value.to_f64s()[0], 9.0, epsilon = 1e-9);
         assert_eq!(
-            pushforward.apply((
-                ArrayIrValue::Reference(tangent_reference.clone()),
-                ArrayIrValue::Reference(other_tangent_reference),
-            )),
-            Ok(ArrayIrValue::Array(Array::scalar(2.5_f32))),
+            pushforward
+                .program()
+                .instructions()
+                .iter()
+                .map(|instruction| instruction.operation().name())
+                .collect::<Vec<_>>(),
+            vec!["mul", "mul", "add"],
         );
-        assert_eq!(tangent_reference.read(), Ok(Array::scalar(2.5_f32)));
+        let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
+        assert_abs_diff_eq!(pushforward.apply((zero, Array::scalar(1.0))).unwrap().to_f64s()[0], 6.0, epsilon = 1e-9,);
+    }
+
+    #[test]
+    fn test_forward_mode_differentiate_linearize_empty_input() {
+        // With no leaf value to recover a context from, the builder's `linearize` terminal reports that differentiation
+        // requires at least one input leaf.
+        assert_eq!(
+            differentiate_at(Vec::<Array>::new()).linearize(|x| Ok(x)).map(|(outputs, _)| outputs).unwrap_err(),
+            DifferentiationError::EmptyInput
+        );
+    }
+
+    #[test]
+    fn test_jvp_projected_operation() {
+        // The third fixture member is intentionally unrelated to arrays. Its identity JVP proves that the adapter
+        // projects both halves of a live dual and lifts the resulting member values back into the composite family.
+        let context =
+            DifferentiationContext::fused(EagerContext::<ProjectedProgramValue, ProjectedProgramOperation>::new());
+        let input = DifferentiationDual::new(
+            ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)),
+            ProjectedProgramValue::Third(ProjectedMemberValue::<2>(3)),
+        )
+        .unwrap();
+        let output = jvp_projected_operation(&context, &ProjectedMemberOperation::<2>, &[input]).unwrap().remove(0);
+        let (primal, tangent) = output.into_parts();
+        assert_eq!(primal, ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)));
+        assert!(matches!(tangent, MaybeZero::Value(ProjectedProgramValue::Third(ProjectedMemberValue::<2>(3))),));
+
+        // Structural zeros cross the same adapter as types and therefore do not stage or materialize member values.
+        let input = DifferentiationDual::new(
+            ProjectedProgramValue::Third(ProjectedMemberValue::<2>(11)),
+            MaybeZero::Zero(ProjectedProgramType::Third(ProjectedMemberType::<2>)),
+        )
+        .unwrap();
+        let output = jvp_projected_operation(&context, &ProjectedMemberOperation::<2>, &[input]).unwrap().remove(0);
+        let (primal, tangent) = output.into_parts();
+        assert_eq!(primal, ProjectedProgramValue::Third(ProjectedMemberValue::<2>(11)));
+        assert!(matches!(tangent, MaybeZero::Zero(ProjectedProgramType::Third(ProjectedMemberType::<2>)),));
+    }
+
+    #[test]
+    fn test_jvp_projected_operation_partitioned() {
+        let context = DifferentiationContext::partitioned(PartialEvaluationContext::new(EagerContext::<
+            TestValue,
+            TestOperation,
+        >::new()));
+        let primal = context.primal().lift(Array::scalar(0.0_f64).into()).unwrap();
+        let tangent = PartialTracer::new(
+            context.tangent().clone(),
+            context.tangent().unknown_input(ArrayType::scalar(DataType::F64).into(), 0),
+        );
+        let input = DifferentiationDual::new(primal, tangent.clone()).unwrap();
+        let outputs =
+            jvp_projected_operation(&context, &ArrayOperation::<Array>::Sin(SinOperation::new()), &[input]).unwrap();
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].primal().value().unwrap().as_known(), Some(&Array::scalar(0.0_f64).into()));
+        let tangent_output = outputs[0].tangent().as_value().unwrap();
+        assert_eq!(tangent_output.context().import_known(&tangent), Ok(tangent.clone()));
+        assert!(matches!(outputs[0].primal().context().import_known(&tangent),
+            Err(ProgramError::MalformedProgram(message)) if message == "cannot import an unknown value from another \
+                partial-evaluation context",
+        ));
     }
 }

@@ -3495,6 +3495,269 @@ mod tests {
     }
 
     #[test]
+    fn test_while_differentiation_threads_reference_state() {
+        // `f(s) = while (i < 2) { state += state; i += 1 }` doubles the referenced state twice, so `f(s) = 4s` with
+        // tangent `4ṡ`. The counter is an integer, so its zero differential space contributes no tangent state.
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let counter_type = ArrayType::scalar(DataType::I64);
+        let reference_type = ReferenceType::new(scalar_type.clone());
+        let condition = {
+            let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+            builder.add_input(reference_type.clone().into());
+            let counter = builder.add_input(counter_type.clone().into());
+            let bound = builder.add_constant(TestIrValue::Array(Array::scalar(2_i64)));
+            let predicate = builder
+                .add_instruction(
+                    ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::LessThan)),
+                    Vec::new(),
+                    vec![counter, bound],
+                    None,
+                )
+                .unwrap()[0];
+            builder
+                .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let body = {
+            let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+            let reference = builder.add_input(reference_type.into());
+            let counter = builder.add_input(counter_type.clone().into());
+            let current =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, current], None)
+                .unwrap();
+            let one = builder.add_constant(TestIrValue::Array(Array::scalar(1_i64)));
+            let incremented = builder
+                .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![counter, one], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                    vec![reference, incremented],
+                    vec![Placeholder; 2],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let condition = builder.import_region(condition.entry_region_ref());
+        let body = builder.import_region(body.entry_region_ref());
+        let initial = builder.add_input(scalar_type.into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let counter = builder.add_constant(TestIrValue::Array(Array::scalar(0_i64)));
+        let outputs = builder
+            .add_instruction(
+                WhileOperation::<ArrayIrType>::new(),
+                vec![condition, body],
+                vec![reference, counter],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let frozen = builder
+            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![outputs[0]], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // The fused loop state is `[ref, i, ṙef]`: the reference state keeps its position with its tangent reference
+        // appended, and the zero-space counter contributes no tangent state.
+        let jvp = program.jvp().unwrap();
+        let r#while = jvp.instructions().iter().find(|instruction| instruction.operation().name() == "while").unwrap();
+        assert_eq!(jvp.region_ref(r#while.regions()[1]).unwrap().input_types().len(), 3);
+        assert_eq!(jvp.input_types().len(), 2);
+        assert_eq!(jvp.output_types().len(), 2);
+
+        let inputs = vec![TestIrValue::Array(Array::scalar(1.5_f32)), TestIrValue::Array(Array::scalar(1.0_f32))];
+        let expected = program
+            .discharge_references(0)
+            .unwrap()
+            .into_program_without_external_references()
+            .unwrap()
+            .jvp()
+            .unwrap()
+            .interpret(inputs.clone())
+            .unwrap();
+        assert_eq!(
+            expected,
+            vec![TestIrValue::Array(Array::scalar(6.0_f32)), TestIrValue::Array(Array::scalar(4.0_f32))]
+        );
+        // Direct reference execution and reference discharge must produce the same derivative.
+        assert_eq!(jvp.interpret(inputs.clone()), Ok(expected.clone()));
+        assert_eq!(
+            jvp.discharge_references(0)
+                .unwrap()
+                .into_program_without_external_references()
+                .unwrap()
+                .interpret(inputs),
+            Ok(expected),
+        );
+    }
+
+    #[test]
+    fn test_while_differentiation_preserves_inactive_reference_state() {
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let reference_type = ReferenceType::new(scalar_type.clone());
+        let counter_type = ArrayType::scalar(DataType::I64);
+        let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        condition_builder.add_input(reference_type.clone().into());
+        let counter = condition_builder.add_input(counter_type.clone().into());
+        condition_builder.add_input(scalar_type.clone().into());
+        let bound = condition_builder.add_constant(TestIrValue::Array(Array::scalar(2_i64)));
+        let predicate = condition_builder
+            .add_instruction(
+                ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::LessThan)),
+                Vec::new(),
+                vec![counter, bound],
+                None,
+            )
+            .unwrap()[0];
+        let condition = condition_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let reference = body_builder.add_input(reference_type.clone().into());
+        let counter = body_builder.add_input(counter_type.into());
+        let value = body_builder.add_input(scalar_type.clone().into());
+        let state = body_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        let next_value = body_builder
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![value, state], None)
+            .unwrap()[0];
+        let one = body_builder.add_constant(TestIrValue::Array(Array::scalar(1_i64)));
+        let next_counter = body_builder
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![counter, one], None)
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![reference, next_counter, next_value],
+                vec![Placeholder; 3],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let reference = builder.add_input(reference_type.into());
+        let value = builder.add_input(scalar_type.into());
+        let counter = builder.add_constant(TestIrValue::Array(Array::scalar(0_i64)));
+        let condition = builder.import_region(condition.entry_region_ref());
+        let body = builder.import_region(body.entry_region_ref());
+        let outputs = builder
+            .add_instruction(
+                WhileOperation::<ArrayIrType>::new(),
+                vec![condition, body],
+                vec![reference, counter, value],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let program = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![outputs[2]], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let jvp = program.entry_region_ref().jvp(&[1]).unwrap();
+        assert_eq!(
+            jvp.interpret(vec![
+                TestIrValue::Reference(ArrayReference::new(Array::scalar(5.0_f32))),
+                TestIrValue::Array(Array::scalar(3.0_f32)),
+                TestIrValue::Array(Array::scalar(2.0_f32)),
+            ]),
+            Ok(vec![TestIrValue::Array(Array::scalar(13.0_f32)), TestIrValue::Array(Array::scalar(2.0_f32))])
+        );
+    }
+
+    #[test]
+    fn test_while_differentiation_after_local_reference_discharge() {
+        let scalar_type = ArrayType::scalar(DataType::F32);
+        let reference_type = ReferenceType::new(scalar_type.clone());
+        let mut condition_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let reference = condition_builder.add_input(reference_type.clone().into());
+        condition_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap();
+        let predicate = condition_builder.add_constant(ArrayIrValue::Array(Array::scalar(true)));
+        let condition = condition_builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![predicate],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let mut body_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let reference = body_builder.add_input(reference_type.into());
+        let update = body_builder.add_constant(ArrayIrValue::Array(Array::scalar(1.0_f32)));
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let body = body_builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![reference],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let condition = builder.import_region(condition.entry_region_ref());
+        let body = builder.import_region(body.entry_region_ref());
+        let initial = builder.add_input(ArrayIrType::Array(scalar_type));
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(2).unwrap();
+        let reference = builder.add_instruction(operation, vec![condition, body], vec![reference], None).unwrap()[0];
+        let output =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        // The loop's mutated state becomes an ordinary carry, so the derived programs are pure and reference-free
+        // and reverse mode remains available through the bounded loop.
+        let jvp = source
+            .clone()
+            .discharge_references(0)
+            .unwrap()
+            .into_program_without_external_references()
+            .unwrap()
+            .jvp()
+            .unwrap();
+        let linearization = source
+            .discharge_references(0)
+            .unwrap()
+            .into_program_without_external_references()
+            .unwrap()
+            .linearize()
+            .unwrap();
+        let pullback = linearization.pullback().unwrap();
+        for program in [&jvp, linearization.primal(), linearization.tangent(), &pullback] {
+            assert!(!program.entry_region_ref().contains_atom_type_in_closure(Type::is_reference));
+            assert!(program.effects().classes().is_empty());
+        }
+
+        // Two iterations accumulate the constant `1.0` into the state, so `f(x) = x + 2` and the tangent passes
+        // through unscaled in both directions.
+        assert_eq!(
+            jvp.interpret(vec![
+                ArrayIrValue::Array(Array::scalar(3.0_f32)),
+                ArrayIrValue::Array(Array::scalar(2.0_f32)),
+            ]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(5.0_f32)), ArrayIrValue::Array(Array::scalar(2.0_f32))]),
+        );
+        let primal_outputs =
+            linearization.primal().interpret(vec![ArrayIrValue::Array(Array::scalar(3.0_f32))]).unwrap();
+        assert_eq!(primal_outputs[0], ArrayIrValue::Array(Array::scalar(5.0_f32)));
+        let mut pullback_inputs = vec![ArrayIrValue::Array(Array::scalar(4.0_f32))];
+        pullback_inputs.extend_from_slice(&primal_outputs[1..]);
+        assert_eq!(pullback.interpret(pullback_inputs), Ok(vec![ArrayIrValue::Array(Array::scalar(4.0_f32))]));
+    }
+
+    #[test]
     fn test_unbounded_while_eager_jvp_executes_body_effects_once_per_iteration() {
         let context = CountingPrintContext::new();
         let observed_context = context.clone();
