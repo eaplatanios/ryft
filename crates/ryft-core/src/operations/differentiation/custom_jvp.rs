@@ -13,15 +13,15 @@ use crate::differentiation::{
     DifferentiationError, DifferentiationPolicy, ResidualZeroProvider, interpret_partitioned_jvp,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, check_types, impl_non_transposable_operation};
+use crate::macros::{
+    check_count, check_types, impl_non_transposable_operation, impl_reference_dischargeable_operation,
+};
 use crate::operations::constants::zero::Zero;
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
     InputRegionProvenance, Operation, OperationFormatter, OutputRegionProvenance, Program, ProgramError,
-    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, RegionInterface, RegionSlot, TypeError, Value,
-    discharge_local_reference_operation,
+    RegionInterface, RegionSlot, TypeError, Value,
 };
 use crate::tracing::{DomainTracer, Trace};
 
@@ -249,6 +249,10 @@ impl<T: DifferentiableType> Operation for CustomJvpOperation<T> {
     }
 }
 
+// Local reference lifecycles discharge inside each region while all user-declared numeric boundaries stay intact.
+// External reference operands still require explicit state threading that these derivative interfaces do not supply.
+impl_reference_dischargeable_operation!(@local_reference <T> CustomJvpOperation<T> where T: DifferentiableType);
+
 impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for CustomJvpOperation<C::Type> {
     fn interpret<D: InterpretationDriver<C>>(
         &self,
@@ -270,23 +274,6 @@ where
     // The default partial-evaluation rule is the desired one: interpret the primal region when every operand is known;
     // otherwise residualize the complete custom-JVP call so its attached derivative rule remains available to later
     // differentiation.
-}
-
-// Local reference lifecycles discharge inside each region while all user-declared numeric boundaries stay intact.
-// External reference operands still require explicit state threading that these derivative interfaces do not supply.
-impl<C: Context<Type: DifferentiableType>, P: ReferenceDischargePolicy<C>> ReferenceDischargeableOperation<C, P>
-    for CustomJvpOperation<C::Type>
-where
-    C::Operation: From<CustomJvpOperation<C::Type>>,
-{
-    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
-        &self,
-        context: &ReferenceDischargeContext<C, P>,
-        driver: &D,
-        inputs: &[ReferenceDischargeValue<C, P>],
-    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
-        discharge_local_reference_operation(self, context, driver, inputs)
-    }
 }
 
 impl<T: DifferentiableType, C: Context<Type = T>, P: BatchingPolicy<C>> BatchableOperation<C, P>

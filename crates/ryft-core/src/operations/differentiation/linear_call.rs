@@ -7,11 +7,12 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
+    CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationContext,
+    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, ResidualZeroProvider,
+    TransposableOperation, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-use crate::macros::{check_count, check_types, impl_reference_free_dischargeable_operation};
+use crate::macros::{check_count, check_types, impl_reference_dischargeable_operation};
 use crate::operations::constants::zero::Zero;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
@@ -524,6 +525,8 @@ impl<T: DifferentiableType> Operation for LinearCallOperation<T> {
     }
 }
 
+impl_reference_dischargeable_operation!(@local_reference <T> LinearCallOperation<T> where T: DifferentiableType);
+
 impl<C: Domain<Type: DifferentiableType>> InterpretableOperation<C> for LinearCallOperation<C::Type> {
     #[inline]
     fn interpret<D: InterpretationDriver<C>>(
@@ -548,11 +551,6 @@ impl<C: Context<Type: DifferentiableType, Operation: From<LinearCallOperation<C:
 {
 }
 
-// A linear call's regions carry no reference state, and its transpose region is a dormant derivative rule for which
-// mutation has no defined meaning, so it replays verbatim: the shared reference-free rule copies its regions across
-// unchanged and rejects the application by name if a reference ever reaches its closure.
-impl_reference_free_dischargeable_operation!(<T> LinearCallOperation<T> where T: DifferentiableType);
-
 impl<
     T: DifferentiableType,
     C: Context<Type = T, Operation: Clone + From<LinearCallOperation<T>>>,
@@ -573,9 +571,9 @@ impl<
 impl<C: Context<Type: DifferentiableType, Operation: ResidualZeroProvider<C::Type>> + Zero<C::Value>>
     DifferentiableOperation<C> for LinearCallOperation<C::Type>
 {
-    fn jvp<D: DifferentiationDriver<C>>(
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
-        context: &C,
+        context: &DifferentiationContext<C, P>,
         driver: &D,
         inputs: &[DifferentiationDual<C::Value>],
     ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
@@ -599,32 +597,30 @@ impl<C: Context<Type: DifferentiableType, Operation: ResidualZeroProvider<C::Typ
         let forward = driver.region(0)?;
         let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
         if inputs.iter().all(|input| input.tangent().is_zero()) {
-            let primal_outputs = forward.interpret_in_context(context, primals)?;
+            let primal_outputs = forward.interpret_in_context(context.primal(), primals)?;
             return primal_outputs.into_iter().map(DifferentiationDual::new_with_zero_tangent).collect();
         }
 
-        // Higher-order differentiation must include the dependence of the linear map on its residual parameters.
-        // Replay the ordinary fused JVP of the attached forward region instead of assuming residual tangents are zero.
-        // The derived program is only interpreted here, never re-attached, so the shared handle is simply dereferenced.
-        // Every forward input is active; a linear call over references is not supported yet.
-        let jvp = driver.jvp_program(forward, &vec![true; forward.input_ids().len()])?;
-        let mut jvp_inputs = primals;
+        // Differentiate the dependence on residual parameters as well as the map's linear arguments.
+        let linearization = driver.linearize_program(forward, &vec![true; forward.input_ids().len()])?;
+        let output_types = forward.output_types();
+        let mut outputs = linearization.primal().interpret_in_context(context.primal(), primals)?;
+        let residuals = outputs.split_off(output_types.len());
+        let mut tangent_inputs = Vec::new();
         for input in inputs {
             if !input.tangent().r#type().is_zero_space() {
-                // The operand primal names every runtime quantity a reference-bearing tangent type omits, because the
-                // tangent type derivation preserves geometry exactly; statically shaped operands keep the nullary
-                // zero and stage the same instruction sequence as before.
-                jvp_inputs.push(C::Operation::materialize_zero_from_residual_sources(
-                    context,
+                let source = context.primal_to_tangent(input.primal().clone())?;
+                tangent_inputs.push(C::Operation::materialize_zero_from_residual_sources(
+                    context.tangent(),
                     input.tangent().clone(),
-                    std::iter::once(input.primal()),
+                    std::iter::once(&source),
                 )?);
             }
         }
-
-        let mut outputs = jvp.interpret_in_context(context, jvp_inputs)?;
-        let output_types = forward.output_types();
-        let tangent_outputs = outputs.split_off(output_types.len());
+        tangent_inputs.extend(
+            residuals.into_iter().map(|value| context.primal_to_tangent(value)).collect::<Result<Vec<_>, _>>()?,
+        );
+        let tangent_outputs = linearization.tangent().interpret_in_context(context.tangent(), tangent_inputs)?;
         let mut tangent_outputs = tangent_outputs.into_iter();
         outputs
             .into_iter()
@@ -637,7 +633,6 @@ impl<C: Context<Type: DifferentiableType, Operation: ResidualZeroProvider<C::Typ
                 }
             })
             .collect::<Result<Vec<_>, _>>()
-            .map_err(Into::into)
     }
 }
 
@@ -772,9 +767,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayBatch, ArrayBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType,
-        DataType, Dimension, DimensionBounds, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType,
-        Shape, Sharding, ShardingDimension,
+        Array, ArrayBatch, ArrayBatching, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
+        ArrayReferenceDischarge, ArrayType, DataType, Dimension, DimensionBounds, DimensionValue, DimensionVariable,
+        LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
     use crate::axes::AxisIndexOperation;
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, batch};
@@ -794,6 +789,7 @@ mod tests {
     use crate::operations::math::add::AddOperation;
     use crate::operations::math::mul::MulOperation;
     use crate::operations::math::reduce::{Reduce, ReductionKind};
+    use crate::operations::references::{ReferenceFreezeOperation, ReferenceNewOperation};
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationOutput, PartialValue};
     use crate::programs::{
@@ -1013,6 +1009,66 @@ mod tests {
             Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
                 if message == "linear call residual operand 0 is not known during transposition",
         ));
+    }
+
+    #[test]
+    fn test_linear_call_operation_discharges_local_references_in_both_regions() {
+        // Each region computes `coefficient * linear input` through a private reference lifecycle. Discharge must
+        // retain both regions so transposition still uses the declared rule after backend preparation.
+        let region = || {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let coefficient = builder.add_input(ArrayType::scalar(DataType::F32).into());
+            let linear = builder.add_input(ArrayType::scalar(DataType::F32).into());
+            let reference =
+                builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![coefficient], None).unwrap()[0];
+            let coefficient =
+                builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            let output = builder
+                .add_instruction(ArrayOperation::from(MulOperation::new()), Vec::new(), vec![coefficient, linear], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![output],
+                    vec![Placeholder; 2],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let coefficient = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let linear = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let regions = vec![
+            builder.import_region(region().entry_region_ref()),
+            builder.import_region(region().entry_region_ref()),
+        ];
+        let output = builder
+            .add_instruction(LinearCallOperation::new(1), regions, vec![coefficient, linear], None)
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let discharged = program
+            .clone()
+            .discharge_references::<ArrayReferenceDischarge>(0)
+            .unwrap()
+            .into_program_without_external_references()
+            .unwrap();
+        assert_eq!(discharged.instructions()[0].regions().len(), 2);
+        assert!(!discharged.entry_region_ref().contains_references_in_closure());
+        let inputs = vec![ArrayIrValue::Array(Array::scalar(3.0_f32)), ArrayIrValue::Array(Array::scalar(4.0_f32))];
+        let expected = vec![ArrayIrValue::Array(Array::scalar(12.0_f32))];
+        assert_eq!(discharged.interpret(inputs.clone()), Ok(expected.clone()));
+        assert_eq!(discharged.transpose_with_respect_to(&[1]).unwrap().interpret(inputs), Ok(expected));
+
+        // A targeted rewrite discharges only the selected region's allocation and retains the other lifecycle.
+        let targets = program.reference_discharge_targets(0).unwrap();
+        assert_eq!(targets.len(), 2);
+        let partial = program.partially_discharge_references::<ArrayReferenceDischarge>(0, &targets[..1]).unwrap();
+        assert!(partial.program().entry_region_ref().contains_references_in_closure());
     }
 
     #[test]
