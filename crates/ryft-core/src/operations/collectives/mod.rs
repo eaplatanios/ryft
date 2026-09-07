@@ -1277,16 +1277,21 @@ mod tests {
 
         // Direct mixed transposition delegates the array contribution through the homogeneous projection and gives
         // the explicit extent operand a structural-zero cotangent.
-        let mut context = Context::new();
+        let context = Context::new();
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));
         let output_cotangent = context.input(array_type.clone().into());
         let extent_type = DimensionValue::constant(3)?.r#type().into_owned();
-        let cotangents = transpose_mixed_operation(
+        let mut context = crate::differentiation::TranspositionContext::new(context);
+        let inputs = [PartialValue::Unknown(array_type.into()), PartialValue::Unknown(extent_type.into())];
+        let accumulators = context.input_accumulators(&inputs, &[])?;
+        transpose_mixed_operation(
             &mut context,
             &ParallelSumScatterOperation::new("x".to_string(), 1, 0, CollectiveOptions::tiled()),
-            &[PartialValue::Unknown(array_type.into()), PartialValue::Unknown(extent_type.into())],
+            &inputs,
             &[MaybeZero::Value(output_cotangent)],
+            &accumulators,
         )?;
+        let cotangents = context.take_cotangents(&accumulators)?;
         assert!(matches!(cotangents.as_slice(), [MaybeZero::Value(_), MaybeZero::Zero(_)]));
         assert!(matches!(
             context.builder().borrow().instructions()[0].operation(),

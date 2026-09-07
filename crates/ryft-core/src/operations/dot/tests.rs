@@ -8,9 +8,9 @@ use crate::arrays::{
 };
 use crate::batching::{BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, batch};
 use crate::contexts::EagerContext;
-use crate::differentiation::differentiate_at;
+use crate::differentiation::{TranspositionContext, differentiate_at};
 use crate::macros::{check_operation_transposition, check_operation_type_inference};
-use crate::programs::{Operation, TypeError};
+use crate::programs::{EmptyRegionDriver, Operation, TypeError};
 
 use super::*;
 
@@ -956,6 +956,37 @@ fn test_dot_transposition() {
             },
         ],
     );
+}
+
+#[test]
+fn test_dot_transposition_omits_unrequested_cotangent() {
+    let mut context = TranspositionContext::new(TracingContext::<Array, ArrayOperation<Array>>::new());
+    let right = context.input(ArrayType::new_static(DataType::F64, [3, 2]));
+    let seed = context.input(ArrayType::new_static(DataType::F64, [2, 2]));
+    let inputs = [PartialValue::Unknown(ArrayType::new_static(DataType::F64, [2, 3])), PartialValue::Known(right)];
+    let accumulators = context.input_accumulators(&inputs, &[false, false]).unwrap();
+    DotOperation::matmul()
+        .transpose(&mut context, &EmptyRegionDriver, &inputs, &[MaybeZero::Value(seed.clone())], &accumulators)
+        .unwrap();
+    assert!(context.builder().borrow().instructions().is_empty());
+    assert!(context.take_cotangents(&accumulators).unwrap().iter().all(MaybeZero::is_zero));
+
+    // Requesting the same unknown input constructs its adjoint matrix multiplication; knownness is unchanged.
+    let accumulators = context.input_accumulators(&inputs, &[true, false]).unwrap();
+    DotOperation::matmul()
+        .transpose(&mut context, &EmptyRegionDriver, &inputs, &[MaybeZero::Value(seed)], &accumulators)
+        .unwrap();
+    assert_eq!(
+        context
+            .builder()
+            .borrow()
+            .instructions()
+            .iter()
+            .map(|instruction| instruction.operation().name())
+            .collect::<Vec<_>>(),
+        vec!["dot"]
+    );
+    assert!(!context.take_cotangents(&accumulators).unwrap()[0].is_zero());
 }
 
 #[test]

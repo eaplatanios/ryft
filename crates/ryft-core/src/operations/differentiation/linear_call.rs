@@ -7,7 +7,7 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationContext,
+    CotangentAccumulator, CotangentBatchingPolicy, DifferentiableOperation, DifferentiableType, DifferentiationContext,
     DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, ResidualZeroProvider,
     TransposableOperation, TranspositionContext, TranspositionDriver,
 };
@@ -602,7 +602,8 @@ impl<C: Context<Type: DifferentiableType, Operation: ResidualZeroProvider<C::Typ
         }
 
         // Differentiate the dependence on residual parameters as well as the map's linear arguments.
-        let linearization = driver.linearize_program(forward, &vec![true; forward.input_ids().len()])?;
+        let input_indices = (0..forward.input_ids().len()).collect::<Vec<_>>();
+        let linearization = driver.linearize_program(forward, &input_indices)?;
         let output_types = forward.output_types();
         let mut outputs = linearization.primal().interpret_in_context(context.primal(), primals)?;
         let residuals = outputs.split_off(output_types.len());
@@ -652,7 +653,8 @@ impl<
         driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
         if self.residual_count > inputs.len() {
             return Err(ProgramError::MalformedProgram(format!(
                 "linear call residual count {} exceeds input count {}",
@@ -661,8 +663,12 @@ impl<
             ))
             .into());
         }
-        // The rule stages into the tracing context only, so the transposition context is narrowed once up front.
-        let context: &TracingContext<V, O> = context;
+        let output_count = match &self.interface {
+            LinearCallInterface::ForwardAndTranspose => driver.region(0)?.output_types().len(),
+            LinearCallInterface::TransposeOnly { output_types, .. } => output_types.len(),
+        };
+        check_count!("output", outputs, output_count, ProgramError);
+        check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
         let (residual_inputs, linear_inputs) = inputs.split_at(self.residual_count);
         let residuals = residual_inputs
             .iter()
@@ -676,8 +682,14 @@ impl<
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        if outputs.iter().all(MaybeZero::is_zero) {
-            return inputs.iter().map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?))).collect();
+        let transpose = driver.region(if self.is_transpose_only() { 0 } else { 1 })?;
+
+        // Unrequested gradients can omit a pure backward program, but its observable effects must still execute
+        // even when all seeds are structural zeros or none of the linear inputs requests a cotangent.
+        if (outputs.iter().all(MaybeZero::is_zero) || !accumulators.iter().any(CotangentAccumulator::is_needed))
+            && !transpose.effects().has_observable_effects_when_unused()
+        {
+            return Ok(());
         }
 
         // Classify each transpose-region output as structurally zero by inspecting its producing instruction in the
@@ -685,7 +697,6 @@ impl<
         // instruction (forwarded region inputs and constants) conservatively classify as nonzero. The transpose
         // region follows the forward-and-transpose form's leading forward region (index 1) and is the transpose-only
         // form's only region (index 0).
-        let transpose = driver.region(if self.is_transpose_only() { 0 } else { 1 })?;
         let output_is_zero = transpose
             .output_ids()
             .iter()
@@ -714,7 +725,7 @@ impl<
             .cloned()
             .map(|output| {
                 O::materialize_zero_from_residual_sources(
-                    context,
+                    &**context,
                     output,
                     outputs.iter().filter_map(MaybeZero::as_value).chain(&residuals),
                 )
@@ -725,7 +736,7 @@ impl<
         let input_cotangents = if self.is_transpose_only() {
             // The transpose-only form's region is a user-supplied backward program with no linearity contract of its
             // own, so it cannot be re-transposed and is replayed inline into the pullback.
-            transpose.interpret_in_context(context, transpose_inputs)?
+            transpose.interpret_in_context(&**context, transpose_inputs)?
         } else {
             // The forward-and-transpose form transposes by *swapping* its regions: the pullback stages the same
             // operation with the transpose region leading, over the same residuals followed by the output
@@ -738,28 +749,18 @@ impl<
         };
         check_count!("output", input_cotangents, linear_inputs.len(), ProgramError);
 
-        let mut cotangents = residual_inputs
+        // Residual operands are known and contribute nothing. Preserve symbolic zeros reported by the stored
+        // backward program instead of adding materialized zero outputs to an accumulator.
+        linear_inputs
             .iter()
-            .map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?)))
-            .collect::<Result<Vec<_>, DifferentiationError>>()?;
-        cotangents.extend(
-            linear_inputs
-                .iter()
-                .zip(input_cotangents.into_iter().zip(output_is_zero))
-                .map(|(input, (cotangent, is_zero))| -> Result<_, DifferentiationError> {
-                    if input.is_unknown() {
-                        Ok(if is_zero {
-                            MaybeZero::Zero(cotangent.r#type().into_owned())
-                        } else {
-                            MaybeZero::Value(cotangent)
-                        })
-                    } else {
-                        Ok(MaybeZero::Zero(input.r#type().cotangent()?))
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        );
-        Ok(cotangents)
+            .zip(input_cotangents)
+            .zip(output_is_zero)
+            .zip(&accumulators[self.residual_count..])
+            .filter(|(((input, _), is_zero), _)| input.is_unknown() && !is_zero)
+            .try_for_each(|(((_, cotangent), _), accumulator)| {
+                accumulator.accumulate(context, MaybeZero::Value(cotangent))
+            })?;
+        Ok(())
     }
 }
 
@@ -788,7 +789,7 @@ mod tests {
     };
     use crate::operations::constants::zero::ZeroOperation;
     use crate::operations::constants::zero_like::ZeroLikeOperation;
-    use crate::operations::dimensions::dimension_from_scalar::DimensionFromScalar;
+    use crate::operations::dimensions::dimension_from_scalar::{DimensionFromScalar, DimensionFromScalarOperation};
     use crate::operations::manipulation::broadcasting::DynamicBroadcast;
     use crate::operations::manipulation::conversion::ConvertElementTypeOperation;
     use crate::operations::math::add::AddOperation;
@@ -996,6 +997,7 @@ mod tests {
                 &driver,
                 &[],
                 &[],
+                &[],
             ),
             Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
                 if message == "linear call residual count 3 exceeds input count 0",
@@ -1004,12 +1006,16 @@ mod tests {
         // Every residual must be known during transposition, because the replayed transpose region consumes the
         // residual values themselves rather than cotangents for them.
         let output_cotangent = context.input(r#type.clone());
+        let inputs = [PartialValue::Unknown(r#type.clone()), PartialValue::Unknown(r#type.clone())];
+        let mut context = TranspositionContext::new(context);
+        let accumulators = context.input_accumulators(&inputs, &[]).unwrap();
         assert!(matches!(
             LinearCallOperation::transpose_only(1, vec![r#type.clone()], vec![r#type.clone()]).transpose(
-                &mut TranspositionContext::new(context.clone()),
+                &mut context,
                 &driver,
-                &[PartialValue::Unknown(r#type.clone()), PartialValue::Unknown(r#type)],
+                &inputs,
                 &[MaybeZero::Value(output_cotangent)],
+                &accumulators,
             ),
             Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
                 if message == "linear call residual operand 0 is not known during transposition",
@@ -1533,6 +1539,53 @@ mod tests {
     }
 
     #[test]
+    fn test_linear_call_operation_transposition_preserves_unrequested_backward_effects() {
+        // The backward rule asserts a dimension bound even though its contribution is unused. Its forward call has
+        // no computation region, so ordinary forward-effect summaries cannot keep this assertion alive.
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let mut backward = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let seed = backward.add_input(scalar_type.clone());
+        let invalid_extent = backward.add_constant(Array::scalar(-1_i32).into());
+        backward
+            .add_instruction(
+                DimensionFromScalarOperation::new(DimensionVariable::new(
+                    "extent",
+                    DimensionBounds::new(0, None).unwrap(),
+                )),
+                Vec::new(),
+                vec![invalid_extent],
+                None,
+            )
+            .unwrap();
+        let backward = backward
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![seed],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(scalar_type.clone());
+        let backward = builder.import_program(backward);
+        builder
+            .add_instruction(
+                LinearCallOperation::transpose_only(0, vec![scalar_type.clone()], vec![scalar_type]),
+                vec![backward],
+                vec![input],
+                None,
+            )
+            .unwrap();
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(Vec::new(), vec![Placeholder], Vec::new())
+            .unwrap();
+        let transposed = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Ignore]).unwrap();
+        assert!(transposed.input_ids().is_empty());
+        assert!(transposed.output_ids().is_empty());
+        assert!(matches!(transposed.interpret(Vec::new()), Err(ProgramError::InvalidArgument { message })
+            if message == "`dimension_from_scalar` scalar input must be a nonnegative host-representable extent but is -1"));
+    }
+
+    #[test]
     fn test_linear_call_operation_transposition_swaps_the_attached_regions() {
         /// Exposes an executable linear call's two regions directly to its transposition rule.
         struct TwoRegionDriver<'r> {
@@ -1583,14 +1636,15 @@ mod tests {
         // without replaying either region or staging a materialized array zero.
         let zero_context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let residual = zero_context.input(r#type.clone());
-        let zero_cotangents = LinearCallOperation::new(1)
-            .transpose(
-                &mut TranspositionContext::new(zero_context.clone()),
-                &driver,
-                &[PartialValue::Known(residual), PartialValue::Unknown(r#type.clone())],
-                &[MaybeZero::Zero(r#type.clone())],
-            )
-            .unwrap();
+        let zero_cotangents = {
+            let mut rule_context = TranspositionContext::new(zero_context.clone());
+            let rule_inputs = &[PartialValue::Known(residual), PartialValue::Unknown(r#type.clone())];
+            let accumulators = rule_context.input_accumulators(rule_inputs, &[]).unwrap();
+            LinearCallOperation::new(1)
+                .transpose(&mut rule_context, &driver, rule_inputs, &[MaybeZero::Zero(r#type.clone())], &accumulators)
+                .unwrap();
+            rule_context.take_cotangents(&accumulators).unwrap()
+        };
         assert_eq!(zero_cotangents.len(), 2);
         assert!(zero_cotangents.iter().all(MaybeZero::is_zero));
         assert!(zero_context.builder().borrow().instructions().is_empty());
@@ -1601,14 +1655,21 @@ mod tests {
 
         // Transposition must assign a structural zero to the known residual and stage one swapped linear call for the
         // unknown linear input's cotangent.
-        let cotangents = LinearCallOperation::new(1)
-            .transpose(
-                &mut TranspositionContext::new(context.clone()),
-                &driver,
-                &[PartialValue::Known(residual), PartialValue::Unknown(r#type)],
-                &[MaybeZero::Value(output_cotangent)],
-            )
-            .unwrap();
+        let cotangents = {
+            let mut rule_context = TranspositionContext::new(context.clone());
+            let rule_inputs = &[PartialValue::Known(residual), PartialValue::Unknown(r#type)];
+            let accumulators = rule_context.input_accumulators(rule_inputs, &[]).unwrap();
+            LinearCallOperation::new(1)
+                .transpose(
+                    &mut rule_context,
+                    &driver,
+                    rule_inputs,
+                    &[MaybeZero::Value(output_cotangent)],
+                    &accumulators,
+                )
+                .unwrap();
+            rule_context.take_cotangents(&accumulators).unwrap()
+        };
         assert_eq!(cotangents.len(), 2);
         assert!(cotangents[0].is_zero());
         let output = match &cotangents[1] {
@@ -1673,14 +1734,25 @@ mod tests {
         let output_cotangent = context.input(r#type.clone());
 
         let linear_types = vec![r#type.clone(), r#type.clone()];
-        let cotangents = LinearCallOperation::transpose_only(1, linear_types, vec![r#type.clone()])
-            .transpose(
-                &mut TranspositionContext::new(context.clone()),
-                &driver,
-                &[PartialValue::Known(residual), PartialValue::Unknown(r#type), PartialValue::Known(known_linear)],
-                &[MaybeZero::Value(output_cotangent)],
-            )
-            .unwrap();
+        let cotangents = {
+            let mut rule_context = TranspositionContext::new(context.clone());
+            let rule_inputs = &[
+                PartialValue::Known(residual),
+                PartialValue::Unknown(r#type.clone()),
+                PartialValue::Known(known_linear),
+            ];
+            let accumulators = rule_context.input_accumulators(rule_inputs, &[]).unwrap();
+            LinearCallOperation::transpose_only(1, linear_types, vec![r#type.clone()])
+                .transpose(
+                    &mut rule_context,
+                    &driver,
+                    rule_inputs,
+                    &[MaybeZero::Value(output_cotangent)],
+                    &accumulators,
+                )
+                .unwrap();
+            rule_context.take_cotangents(&accumulators).unwrap()
+        };
 
         assert_eq!(cotangents.len(), 3);
         assert!(cotangents[0].is_zero());
@@ -1711,14 +1783,21 @@ mod tests {
         let driver = TestTranspositionDriver { region: transpose.entry_region_ref() };
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = context.input(cotangent_type.clone());
-        let cotangents = LinearCallOperation::transpose_only(0, vec![tangent_type.clone()], vec![tangent_type.clone()])
-            .transpose(
-                &mut TranspositionContext::new(context.clone()),
-                &driver,
-                &[PartialValue::Unknown(tangent_type.clone())],
-                &[MaybeZero::Value(output_cotangent)],
-            )
-            .unwrap();
+        let cotangents = {
+            let mut rule_context = TranspositionContext::new(context.clone());
+            let rule_inputs = &[PartialValue::Unknown(tangent_type.clone())];
+            let accumulators = rule_context.input_accumulators(rule_inputs, &[]).unwrap();
+            LinearCallOperation::transpose_only(0, vec![tangent_type.clone()], vec![tangent_type.clone()])
+                .transpose(
+                    &mut rule_context,
+                    &driver,
+                    rule_inputs,
+                    &[MaybeZero::Value(output_cotangent)],
+                    &accumulators,
+                )
+                .unwrap();
+            rule_context.take_cotangents(&accumulators).unwrap()
+        };
         assert!(matches!(&cotangents[0], MaybeZero::Zero(r#type) if r#type == &cotangent_type));
 
         // `zero_like` is equally structural even though it consumes an exemplar input. Opaque region replay must
@@ -1734,14 +1813,21 @@ mod tests {
         let driver = TestTranspositionDriver { region: transpose.entry_region_ref() };
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = context.input(cotangent_type.clone());
-        let cotangents = LinearCallOperation::transpose_only(0, vec![tangent_type.clone()], vec![tangent_type])
-            .transpose(
-                &mut TranspositionContext::new(context.clone()),
-                &driver,
-                &[PartialValue::Unknown(primal_type.tangent().unwrap())],
-                &[MaybeZero::Value(output_cotangent)],
-            )
-            .unwrap();
+        let cotangents = {
+            let mut rule_context = TranspositionContext::new(context.clone());
+            let rule_inputs = &[PartialValue::Unknown(primal_type.tangent().unwrap())];
+            let accumulators = rule_context.input_accumulators(rule_inputs, &[]).unwrap();
+            LinearCallOperation::transpose_only(0, vec![tangent_type.clone()], vec![tangent_type])
+                .transpose(
+                    &mut rule_context,
+                    &driver,
+                    rule_inputs,
+                    &[MaybeZero::Value(output_cotangent)],
+                    &accumulators,
+                )
+                .unwrap();
+            rule_context.take_cotangents(&accumulators).unwrap()
+        };
         assert!(matches!(&cotangents[0], MaybeZero::Zero(r#type) if r#type == &cotangent_type));
     }
 }

@@ -47,28 +47,28 @@ use std::fmt::Display;
 use indoc::indoc;
 use pretty_assertions::assert_eq;
 
-use ryft_core::macros::check_count;
 use ryft_core::{
     AddOperation, ArrayIrType, AtomId, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableType,
     BatchedOutputs, BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError, BatchingPolicy,
-    BoundaryPreservingBatchedProgram, Context, CotangentDestination, CotangentDestinationKind, CotangentSeed,
-    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, Domain, EagerContext, EffectClass, EffectClasses, Effects,
-    ExternalReferenceBinding, InputRegionProvenance, InstructionId, InterpretableOperation, InterpretationDriver,
-    MaybeZero, NoIdentity, OneOperation, Operation, OperationProvider, OutputRegionProvenance, Parameter, PartialValue,
-    PartiallyEvaluatableOperation, Placeholder, Program, ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError,
-    RecursiveBatchingPolicy, RecursiveReferenceDischargeDriver, Reference, ReferenceAccessMode, ReferenceAddUpdate,
-    ReferenceAddUpdateOperation, ReferenceAlias, ReferenceAliasEdge, ReferenceAliasKind, ReferenceAliasOrigin,
-    ReferenceBoundary, ReferenceBoundaryError, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion,
-    ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceDischargeableType, ReferenceEffect, ReferenceFreeze, ReferenceFreezeOperation, ReferenceId, ReferenceNew,
-    ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSource, ReferenceSwap,
-    ReferenceSwapOperation, ReferenceType, ReferenceView, ReferenceViewOperation, ReferenceViewPath, ReferenceViewStep,
-    ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation, RegionId, RegionInterface, RegionRef,
-    RegionSlot, Trace, Tracer, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, Type,
-    TypeError, Typed, Value, ValueId, ViewOverlap, ViewSymbol, ViewSymbolBinding, Zero, ZeroOperation, batch,
-    batch_reference_view_operation, differentiate_at, discharge_reference_free_operation, validate_reference_boundary,
+    BoundaryPreservingBatchedProgram, Context, CotangentAccumulator, CotangentDestination, CotangentDestinationKind,
+    CotangentSeed, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, DifferentiationPolicy, Domain, EagerContext, EffectClass, EffectClasses,
+    Effects, ExternalReferenceBinding, InputRegionProvenance, InstructionId, InterpretableOperation,
+    InterpretationDriver, MaybeZero, NoIdentity, OneOperation, Operation, OperationProvider, OutputRegionProvenance,
+    Parameter, PartialValue, PartiallyEvaluatableOperation, Placeholder, Program, ProgramBatchingOutputAxesPolicy,
+    ProgramBuilder, ProgramError, RecursiveBatchingPolicy, RecursiveReferenceDischargeDriver, Reference,
+    ReferenceAccessMode, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAlias, ReferenceAliasEdge,
+    ReferenceAliasKind, ReferenceAliasOrigin, ReferenceBoundary, ReferenceBoundaryError, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary,
+    ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeResult, ReferenceDischargeTarget,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceEffect,
+    ReferenceFreeze, ReferenceFreezeOperation, ReferenceId, ReferenceNew, ReferenceNewOperation, ReferenceRead,
+    ReferenceReadOperation, ReferenceSource, ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceView,
+    ReferenceViewOperation, ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError, ReferenceWrite,
+    ReferenceWriteOperation, RegionId, RegionInterface, RegionRef, RegionSlot, Trace, Tracer, TracingContext,
+    TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError, Typed, Value, ValueId,
+    ViewOverlap, ViewSymbol, ViewSymbolBinding, Zero, ZeroOperation, batch, batch_reference_view_operation,
+    check_count, differentiate_at, discharge_reference_free_operation, validate_reference_boundary,
 };
 
 /// Destination universe of the downstream programs: the eager context over the register family, which is what a
@@ -1200,36 +1200,45 @@ impl TransposableOperation<RegisterValue, RegisterOperation> for RegisterOperati
         driver: &D,
         inputs: &[PartialValue<RegisterTracer>],
         outputs: &[MaybeZero<RegisterTracer>],
-    ) -> Result<Vec<MaybeZero<RegisterTracer>>, DifferentiationError> {
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
         match self {
             Self::Negate => {
                 check_count!("input", inputs, 1, ProgramError);
                 check_count!("output", outputs, 1, ProgramError);
-                Ok(vec![match &outputs[0] {
+                check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+                let contribution = match &outputs[0] {
                     MaybeZero::Value(cotangent) => MaybeZero::Value(bind_register_output(
                         &**context,
                         self.clone(),
                         std::slice::from_ref(cotangent),
                     )?),
                     MaybeZero::Zero(r#type) => MaybeZero::Zero(r#type.clone()),
-                }])
+                };
+                accumulators[0].accumulate(context, contribution)
             }
             Self::Add(_) => {
                 check_count!("input", inputs, 2, ProgramError);
                 check_count!("output", outputs, 1, ProgramError);
-                Ok(vec![outputs[0].clone(), outputs[0].clone()])
+                check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+                accumulators[0].accumulate(context, outputs[0].clone())?;
+                accumulators[1].accumulate(context, outputs[0].clone())
             }
             Self::Zero(_) | Self::One => {
                 check_count!("input", inputs, 0, ProgramError);
-                Ok(Vec::new())
+                check_count!("output", outputs, 1, ProgramError);
+                check_count!("accumulator", accumulators, 0, DifferentiationError);
+                Ok(())
             }
-            Self::ReferenceNew(operation) => operation.transpose(context, driver, inputs, outputs),
-            Self::Read(operation) => operation.transpose(context, driver, inputs, outputs),
-            Self::Freeze(operation) => operation.transpose(context, driver, inputs, outputs),
-            Self::Write(operation) => operation.transpose(context, driver, inputs, outputs),
-            Self::Swap(operation) => operation.transpose(context, driver, inputs, outputs),
+            Self::ReferenceNew(operation) => operation.transpose(context, driver, inputs, outputs, accumulators),
+            Self::Read(operation) => operation.transpose(context, driver, inputs, outputs, accumulators),
+            Self::Freeze(operation) => operation.transpose(context, driver, inputs, outputs, accumulators),
+            Self::Write(operation) => operation.transpose(context, driver, inputs, outputs, accumulators),
+            Self::Swap(operation) => operation.transpose(context, driver, inputs, outputs, accumulators),
             Self::AddUpdate => {
                 check_count!("input", inputs, 2, ProgramError);
+                check_count!("output", outputs, 0, ProgramError);
+                check_count!("accumulator", accumulators, 2, DifferentiationError);
                 let update_cotangent = match context.cotangent_reference_if_allocated(0)? {
                     Some(accumulator) => MaybeZero::Value(bind_register_output(
                         &**context,
@@ -1238,7 +1247,7 @@ impl TransposableOperation<RegisterValue, RegisterOperation> for RegisterOperati
                     )?),
                     None => MaybeZero::Zero(inputs[1].r#type().cotangent()?),
                 };
-                Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?), update_cotangent])
+                accumulators[1].accumulate(context, update_cotangent)
             }
             // A view has no cotangent of its own: the accesses through it reach the same bit of the root's cotangent
             // reference through the transposition context, which reapplies the view over the root's accumulator with
@@ -1246,10 +1255,8 @@ impl TransposableOperation<RegisterValue, RegisterOperation> for RegisterOperati
             Self::Bit => {
                 check_count!("input", inputs, 2, ProgramError);
                 check_count!("output", outputs, 1, ProgramError);
-                Ok(vec![
-                    MaybeZero::Zero(inputs[0].r#type().cotangent()?),
-                    MaybeZero::Zero(inputs[1].r#type().cotangent()?),
-                ])
+                check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+                Ok(())
             }
             Self::Call | Self::Halves | Self::BitExtract | Self::BitInsert => Err(ProgramError::UnsupportedOperation {
                 message: format!("`{}` has no transposition rule in the register universe", self.name()),

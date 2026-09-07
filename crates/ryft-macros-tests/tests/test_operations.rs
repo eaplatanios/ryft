@@ -481,6 +481,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Value for Tracer<TracingContext<V, 
 /// Stand-in for `ryft_core::TranspositionContext`. Mirrors the real context's region lifetime and its dereferencing to
 /// the wrapped tracing context, which is what generated transposition dispatchers pass through to payload rules.
 struct TranspositionContext<'r, V: Value, O: Operation<Type = V::Type>> {
+    contributions: Vec<MaybeZero<Tracer<TracingContext<V, O>>>>,
     context: TracingContext<V, O>,
     marker: PhantomData<&'r ()>,
 }
@@ -496,6 +497,21 @@ impl<V: Value, O: Operation<Type = V::Type>> std::ops::Deref for TranspositionCo
 impl<V: Value, O: Operation<Type = V::Type>> std::ops::DerefMut for TranspositionContext<'_, V, O> {
     fn deref_mut(&mut self) -> &mut TracingContext<V, O> {
         &mut self.context
+    }
+}
+
+/// Stand-in handle that records the label submitted by a generated transpose dispatcher.
+struct CotangentAccumulator;
+
+impl CotangentAccumulator {
+    /// Records a contribution in the fixture context.
+    fn accumulate<V: Value, O: Operation<Type = V::Type>>(
+        &self,
+        context: &mut TranspositionContext<'_, V, O>,
+        contribution: MaybeZero<Tracer<TracingContext<V, O>>>,
+    ) -> Result<(), DifferentiationError> {
+        context.contributions.push(contribution);
+        Ok(())
     }
 }
 
@@ -534,7 +550,8 @@ trait TransposableOperation<V: Value, O: Operation<Type = V::Type>>: Operation<T
         driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError>;
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError>;
 }
 
 /// Stand-in for `ryft_core::Program`.
@@ -985,12 +1002,14 @@ impl<T: Type, C: Context<Type = T>> DifferentiableOperation<C> for ZeroOperation
 impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>> TransposableOperation<V, O> for ZeroOperation<T> {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        _context: &mut TranspositionContext<'_, V, O>,
+        context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        Ok(vec![transposed("zero")])
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        accumulators[0].accumulate(context, transposed("zero"))?;
+        Ok(())
     }
 }
 
@@ -1032,12 +1051,14 @@ impl<C: Context<Type = DataType>> partial::PartiallyEvaluatableOperation<C> for 
 impl<V: Value<Type = DataType>, O: Operation<Type = DataType>> TransposableOperation<V, O> for AddOperation {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        _context: &mut TranspositionContext<'_, V, O>,
+        context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        Ok(vec![transposed("add")])
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        accumulators[0].accumulate(context, transposed("add"))?;
+        Ok(())
     }
 }
 
@@ -1176,12 +1197,14 @@ impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>, F: Clone> Transposable
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        _context: &mut TranspositionContext<'_, V, O>,
+        context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        Ok(vec![transposed("factor")])
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        accumulators[0].accumulate(context, transposed("factor"))?;
+        Ok(())
     }
 }
 
@@ -1344,12 +1367,14 @@ impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>, F: Clone> Transposable
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        _context: &mut TranspositionContext<'_, V, O>,
+        context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        Ok(vec![transposed("constant")])
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        accumulators[0].accumulate(context, transposed("constant"))?;
+        Ok(())
     }
 }
 
@@ -1525,13 +1550,14 @@ fn test_operation_default_crate_path_is_ryft() {
 mod mixed_members {
     use ryft::arrays::Array;
     use ryft::{
-        ArrayIrType, ArrayIrValue, ArrayType, Context, DataType, DifferentiableOperation, DifferentiableType,
-        DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationPolicy, Dimension,
-        DimensionBounds, DimensionOperation, DimensionType, DimensionValue, DimensionVariable, EmptyRegionDriver,
-        MaybeZero, MemberDifferentiableOperation, MemberInterpretableOperation, MemberOperation, Operation,
-        OperationProvider, PartialValue, ProgramError, RegionInterface, Shape, StagingContext, Tracer, TracingContext,
+        AddOperation, ArrayIrType, ArrayIrValue, ArrayType, Context, CotangentAccumulator, DataType,
+        DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+        DifferentiationDual, DifferentiationPolicy, Dimension, DimensionBounds, DimensionOperation, DimensionType,
+        DimensionValue, DimensionVariable, EmptyRegionDriver, MaybeZero, MemberDifferentiableOperation,
+        MemberInterpretableOperation, MemberOperation, MemberTransposableOperation, Operation, OperationProvider,
+        PartialValue, ProgramError, RegionInterface, Shape, StagingContext, Tracer, TracingContext,
         TransposableOperation, TranspositionContext, TranspositionDriver, TypeError, TypeIdentityRenaming, Typed,
-        Value, ZeroOperation,
+        Value, ZeroOperation, check_count,
     };
 
     /// Member payload whose parent instruction interleaves its two array data operands with two first-class dimension
@@ -1623,26 +1649,22 @@ mod mixed_members {
     impl<V: Value<Type = ArrayType>, O: Operation<Type = ArrayType>> TransposableOperation<V, O> for InterleavedOperation {
         fn transpose<D: TranspositionDriver<V, O>>(
             &self,
-            _context: &mut TranspositionContext<'_, V, O>,
+            context: &mut TranspositionContext<'_, V, O>,
             _driver: &D,
             inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
             outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ryft::DifferentiationError> {
-            // The homogeneous rule sees exactly the two array data operands and forwards the output cotangent to each
-            // one that is linear in the transposed program.
-            if inputs.len() != 2 || outputs.len() != 1 {
-                return Err(ProgramError::InvalidArgument {
-                    message: "interleaved transposition expects two operands and one output".to_string(),
+            accumulators: &[CotangentAccumulator],
+        ) -> Result<(), ryft::DifferentiationError> {
+            check_count!("input", inputs, 2, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, 2, DifferentiationError);
+            // The homogeneous rule sees only array operands and submits each requested linear contribution.
+            for (input, accumulator) in inputs.iter().zip(accumulators) {
+                if matches!(input, PartialValue::Unknown(_)) {
+                    accumulator.accumulate(context, outputs[0].clone())?;
                 }
-                .into());
             }
-            Ok(inputs
-                .iter()
-                .map(|input| match input {
-                    PartialValue::Unknown(_) => Ok(outputs[0].clone()),
-                    PartialValue::Known(_) => input.r#type().cotangent().map(MaybeZero::Zero),
-                })
-                .collect::<Result<Vec<_>, _>>()?)
+            Ok(())
         }
     }
 
@@ -1720,19 +1742,24 @@ mod mixed_members {
             _context: &mut TranspositionContext<'_, V, O>,
             _driver: &D,
             inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-            _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-        ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ryft::DifferentiationError> {
-            inputs.iter().map(|input| input.r#type().cotangent().map(MaybeZero::Zero)).collect()
+            outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+            accumulators: &[CotangentAccumulator],
+        ) -> Result<(), ryft::DifferentiationError> {
+            check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+            Ok(())
         }
     }
 
     /// Homogeneous array member family of [`MixedProgramOperation`], which is the family every projected boundary and
     /// every delegated mixed transpose rule runs in.
     #[derive(Clone, Debug, ryft::Operation)]
-    #[ryft(dispatch(transposition))]
     enum MixedMemberOperation<V: Value<Type = ArrayType>> {
         /// Member zero constructor, which is also the tangent constructor the family's structural mixed arm stages.
         Zero(ZeroOperation<ArrayType>),
+
+        /// Addition used when extracting accumulated cotangents.
+        Add(AddOperation<ArrayType>),
 
         /// Member view of the interleaved mixed payload, which owns its homogeneous transpose rule.
         Interleaved(InterleavedOperation),
@@ -1742,6 +1769,28 @@ mod mixed_members {
 
         /// Member constant, which is what ties this family to its flowing value type.
         Constant(ryft::ConstantOperation<V>),
+    }
+
+    impl<V: Value<Type = ArrayType>> TransposableOperation<V, Self> for MixedMemberOperation<V> {
+        fn transpose<D: TranspositionDriver<V, Self>>(
+            &self,
+            context: &mut TranspositionContext<'_, V, Self>,
+            driver: &D,
+            inputs: &[PartialValue<Tracer<TracingContext<V, Self>>>],
+            outputs: &[MaybeZero<Tracer<TracingContext<V, Self>>>],
+            accumulators: &[CotangentAccumulator],
+        ) -> Result<(), ryft::DifferentiationError> {
+            // The fixture only transposes its interleaved payload. Addition is a real instruction used to extract
+            // contributions, but transposing that instruction would require unrelated array alignment capabilities.
+            match self {
+                Self::Interleaved(operation) => operation.transpose(context, driver, inputs, outputs, accumulators),
+                Self::Zero(_) | Self::MixedUniverseConstructor(_) | Self::Constant(_) => Ok(()),
+                Self::Add(_) => Err(ProgramError::UnsupportedOperation {
+                    message: "the mixed member fixture does not transpose accumulated additions".to_string(),
+                }
+                .into()),
+            }
+        }
     }
 
     /// Operation family with two declared member universes: computational arrays and structural first-class
@@ -1791,9 +1840,34 @@ mod mixed_members {
         }
     }
 
+    impl<A: Value<Type = ArrayType>, V: Value<Type = ArrayIrType>>
+        MemberTransposableOperation<V, MixedProgramOperation<A>> for MixedMemberOperation<A>
+    {
+        fn transpose_in_parent<D: TranspositionDriver<V, MixedProgramOperation<A>>>(
+            &self,
+            _context: &mut TranspositionContext<'_, V, MixedProgramOperation<A>>,
+            _driver: &D,
+            inputs: &[PartialValue<Tracer<TracingContext<V, MixedProgramOperation<A>>>>],
+            outputs: &[MaybeZero<Tracer<TracingContext<V, MixedProgramOperation<A>>>>],
+            accumulators: &[CotangentAccumulator],
+        ) -> Result<(), ryft::DifferentiationError> {
+            check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+            // The homogeneous rule contributes to both inputs. Leaving these accumulators unchanged distinguishes
+            // the member rule from projection and proves that derived dispatch preserves the enclosing context.
+            Ok(())
+        }
+    }
+
     impl<A: Value<Type = ArrayType>> From<ZeroOperation<ArrayType>> for MixedProgramOperation<A> {
         fn from(operation: ZeroOperation<ArrayType>) -> Self {
             Self::Array(MixedMemberOperation::Zero(operation))
+        }
+    }
+
+    impl<A: Value<Type = ArrayType>> From<AddOperation<ArrayIrType>> for MixedProgramOperation<A> {
+        fn from(_operation: AddOperation<ArrayIrType>) -> Self {
+            Self::Array(MixedMemberOperation::Add(AddOperation::new()))
         }
     }
 
@@ -1842,19 +1916,24 @@ mod mixed_members {
         // homogeneous rule and gives each interleaved dimension operand a structural zero cotangent.
         let context = TracingContext::<ArrayIrValue<Array>, Operation>::new();
         let output_cotangent = context.input(array_type.clone().into());
-        let cotangents = operation
+        let inputs = [
+            PartialValue::Unknown(array_type.clone().into()),
+            PartialValue::Unknown(dimension_type.clone().into()),
+            PartialValue::Unknown(array_type.clone().into()),
+            PartialValue::Unknown(dimension_type.clone().into()),
+        ];
+        let mut transposition = TranspositionContext::new(context.clone());
+        let accumulators = transposition.input_accumulators(&inputs, &[]).unwrap();
+        operation
             .transpose(
-                &mut TranspositionContext::new(context.clone()),
+                &mut transposition,
                 &EmptyRegionDriver,
-                &[
-                    PartialValue::Unknown(array_type.clone().into()),
-                    PartialValue::Unknown(dimension_type.clone().into()),
-                    PartialValue::Unknown(array_type.clone().into()),
-                    PartialValue::Unknown(dimension_type.clone().into()),
-                ],
+                &inputs,
                 &[MaybeZero::Value(output_cotangent.clone())],
+                &accumulators,
             )
             .unwrap();
+        let cotangents = transposition.take_cotangents(&accumulators).unwrap();
         let [
             MaybeZero::Value(first_cotangent),
             MaybeZero::Zero(second_cotangent_type),
@@ -1869,6 +1948,29 @@ mod mixed_members {
         let dimension_cotangent_type = ArrayIrType::from(dimension_type).cotangent().unwrap();
         assert_eq!(second_cotangent_type, &dimension_cotangent_type);
         assert_eq!(fourth_cotangent_type, &dimension_cotangent_type);
+    }
+
+    #[test]
+    fn test_operation_generates_member_transposition_dispatch() {
+        type Operation = MixedProgramOperation<Array>;
+
+        // The homogeneous interleaved rule returns output contributions, while the member rule submits no contributions.
+        // Receiving zeros here proves that transposition kept the composite boundary and selected the member rule.
+        let (array_type, _) = fixture_types();
+        let context = TracingContext::<ArrayIrValue<Array>, Operation>::new();
+        let output = context.input(array_type.clone().into());
+        let operation = Operation::Array(MixedMemberOperation::Interleaved(InterleavedOperation));
+        let inputs =
+            [PartialValue::Unknown(array_type.clone().into()), PartialValue::Unknown(array_type.clone().into())];
+        let mut transposition = TranspositionContext::new(context);
+        let accumulators = transposition.input_accumulators(&inputs, &[]).unwrap();
+        operation
+            .transpose(&mut transposition, &EmptyRegionDriver, &inputs, &[MaybeZero::Value(output)], &accumulators)
+            .unwrap();
+        let cotangents = transposition.take_cotangents(&accumulators).unwrap();
+        assert_eq!(cotangents.len(), 2);
+        assert!(matches!(&cotangents[0], MaybeZero::Zero(r#type) if r#type == &ArrayIrType::from(array_type.clone())));
+        assert!(matches!(&cotangents[1], MaybeZero::Zero(r#type) if r#type == &ArrayIrType::from(array_type)));
     }
 
     #[test]
@@ -1984,7 +2086,8 @@ impl<V: Value<Type = ArrayType>, O: Operation<Type = ArrayType>> TransposableOpe
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        _accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
         match *self {}
     }
 }
@@ -2046,12 +2149,14 @@ where
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        _context: &mut TranspositionContext<'_, V, O>,
+        context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        Ok(vec![transposed("special")])
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        accumulators[0].accumulate(context, transposed("special"))?;
+        Ok(())
     }
 }
 
@@ -2163,12 +2268,14 @@ impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>, W: Clone, P: Clone> Tr
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        _context: &mut TranspositionContext<'_, V, O>,
+        context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        Ok(vec![transposed("while")])
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        accumulators[0].accumulate(context, transposed("while"))?;
+        Ok(())
     }
 }
 
@@ -2216,12 +2323,14 @@ impl<V: Value<Type = ArrayType>, O: Operation<Type = ArrayType>, P: Operation<Ty
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        _context: &mut TranspositionContext<'_, V, O>,
+        context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        Ok(vec![transposed("recompute")])
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        accumulators[0].accumulate(context, transposed("recompute"))?;
+        Ok(())
     }
 }
 
@@ -2271,12 +2380,14 @@ impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>, C: Clone, P: Clone, F:
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        _context: &mut TranspositionContext<'_, V, O>,
+        context: &mut TranspositionContext<'_, V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        Ok(vec![transposed("custom_vjp_call")])
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        accumulators[0].accumulate(context, transposed("custom_vjp_call"))?;
+        Ok(())
     }
 }
 
@@ -2372,11 +2483,13 @@ fn test_transposable_operation_dispatches_to_payloads() {
 
     let operation = Operation::from(ZeroOperation { r#type: DataType });
     let mut context = TranspositionContext::<ScalarFactor, Operation> {
+        contributions: Vec::new(),
         context: TracingContext { marker: PhantomData },
         marker: PhantomData,
     };
 
-    assert_eq!(operation.transpose(&mut context, &EmptyRegionDriver, &[], &[]).unwrap(), vec![transposed("zero")],);
+    operation.transpose(&mut context, &EmptyRegionDriver, &[], &[], &[CotangentAccumulator]).unwrap();
+    assert_eq!(context.contributions, vec![transposed("zero")]);
 }
 
 #[test]
@@ -3192,13 +3305,14 @@ fn test_operation_generates_all_selected_dispatchers() {
     assert_eq!(differentiated[0].label, "zero");
 
     let mut transposition_context = TranspositionContext {
+        contributions: Vec::new(),
         context: TracingContext::<Factor, Operation> { marker: PhantomData },
         marker: PhantomData,
     };
-    assert_eq!(
-        operation.transpose(&mut transposition_context, &EmptyRegionDriver, &[], &[]).unwrap(),
-        vec![transposed("zero")],
-    );
+    operation
+        .transpose(&mut transposition_context, &EmptyRegionDriver, &[], &[], &[CotangentAccumulator])
+        .unwrap();
+    assert_eq!(transposition_context.contributions, vec![transposed("zero")]);
 }
 
 #[test]

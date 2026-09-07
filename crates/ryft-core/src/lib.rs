@@ -60,19 +60,20 @@ pub use compilation::{
 };
 pub use contexts::{Context, Domain, EagerContext, ProjectedContext, StagingContext, ValueResolution};
 pub use differentiation::{
-    BinaryElementwiseJvpOperands, BroadcastDerivativeAlignment, CotangentBatchingPolicy, CotangentDestination,
-    CotangentDestinationKind, CotangentReferenceAccumulator, CotangentSeed, DenseDifferentiableType,
-    DerivativeTransform, DifferentiableOperation, DifferentiableType, Differentiate, DifferentiationBoundaryPosition,
-    DifferentiationBuilder, DifferentiationBuilderContext, DifferentiationBuilderLinearityMode, DifferentiationContext,
-    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationParameterRole,
-    DifferentiationPolicy, DifferentiationTracer, ElementwiseDerivativeAlignment, ForwardModeDifferentiate,
-    FusedDifferentiationPolicy, Hessian, HessianBlock, HolomorphicLinearity, Jacobian, JacobianBlock, Linearization,
-    LinearizationContext, LinearizationTracer, MemberDifferentiableOperation, PartitionedDifferentiationPolicy,
-    Pullback, Pushforward, RealLinearity, ReferenceOperandCotangents, ResidualZeroProvider, ReverseModeDifferentiate,
-    TransposableOperation, TranspositionContext, TranspositionDriver, UnaryElementwiseJvpOperands, WithAuxiliaryOutput,
-    WithCapture, WithContext, WithoutAuxiliaryOutput, WithoutCapture, WithoutContext, binary_elementwise_jvp,
-    differentiate_at, jvp_projected_operation, reference_operand_cotangents, transpose_mixed_operation,
-    transpose_projected_operation, unary_elementwise_jvp,
+    BinaryElementwiseJvpOperands, BroadcastDerivativeAlignment, CotangentAccumulator, CotangentBatchingPolicy,
+    CotangentDestination, CotangentDestinationKind, CotangentReferenceAccumulator, CotangentSeed,
+    DenseDifferentiableType, DerivativeTransform, DifferentiableOperation, DifferentiableType, Differentiate,
+    DifferentiationBoundaryPosition, DifferentiationBuilder, DifferentiationBuilderContext,
+    DifferentiationBuilderLinearityMode, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationParameterRole, DifferentiationPolicy, DifferentiationTracer,
+    ElementwiseDerivativeAlignment, ForwardModeDifferentiate, FusedDifferentiationPolicy, Hessian, HessianBlock,
+    HolomorphicLinearity, Jacobian, JacobianBlock, Linearization, LinearizationContext, LinearizationTracer,
+    MemberDifferentiableOperation, MemberTransposableOperation, OperandCotangents, PartitionedDifferentiationPolicy,
+    Pullback, Pushforward, RealLinearity, ResidualZeroProvider, ReverseModeDifferentiate, TransposableOperation,
+    TranspositionContext, TranspositionDriver, UnaryElementwiseJvpOperands, WithAuxiliaryOutput, WithCapture,
+    WithContext, WithoutAuxiliaryOutput, WithoutCapture, WithoutContext, binary_elementwise_jvp, differentiate_at,
+    jvp_projected_operation, operand_cotangents, transpose_mixed_operation, transpose_projected_operation,
+    unary_elementwise_jvp,
 };
 pub use errors::{CustomError, Error, MaybeFallible};
 pub use interpretation::{

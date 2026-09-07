@@ -370,13 +370,13 @@ where
         primal.r#type().into_owned(),
     )?;
     if std::ptr::eq(context.primal(), context.tangent()) {
-        let fused = driver.jvp_program(decomposition.entry_region_ref(), &[true])?;
+        let fused = driver.jvp_program(decomposition.entry_region_ref(), &[0])?;
         let mut outputs = fused.interpret_in_context(context.primal(), vec![primal.clone(), tangent.clone()])?;
         check_count!("output", outputs, 2, ProgramError);
         let output_tangent = outputs.remove(1);
         return DifferentiationDual::new(outputs.remove(0), MaybeZero::Value(output_tangent));
     }
-    let linearization = driver.linearize_program(decomposition.entry_region_ref(), &[true])?;
+    let linearization = driver.linearize_program(decomposition.entry_region_ref(), &[0])?;
     let mut primal_outputs = linearization.primal().interpret_in_context(context.primal(), vec![primal.clone()])?;
     check_count!("output", primal_outputs, 1 + linearization.residual_count(), ProgramError);
     let residuals = primal_outputs.split_off(1);

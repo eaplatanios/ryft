@@ -27,9 +27,9 @@ use crate::batching::{
 use crate::captures::CaptureReference;
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, DifferentiationTracer, ResidualZeroProvider, TransposableOperation,
-    TranspositionContext, TranspositionDriver,
+    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, DifferentiationPolicy, DifferentiationTracer, ResidualZeroProvider,
+    TransposableOperation, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
@@ -916,13 +916,14 @@ where
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        _accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
         Err(ProgramError::UnsupportedOperation {
-            message: format!("{WHILE_OPERATION_NAME} does not support transposition (reverse-mode differentiation through staged unbounded \
-                      {WHILE_OPERATION_NAME} loops is not supported; eager differentiation executes concrete duals, and loops built \
-                      with `with_iteration_bound` stage a transposable masked scan)"),
-        }
-        .into())
+                message: format!("{WHILE_OPERATION_NAME} does not support transposition (reverse-mode differentiation through staged unbounded \
+                          {WHILE_OPERATION_NAME} loops is not supported; eager differentiation executes concrete duals, and loops built \
+                          with `with_iteration_bound` stage a transposable masked scan)"),
+            }
+            .into())
     }
 }
 
@@ -1876,10 +1877,10 @@ where
         extended_inputs.push(DifferentiationDual::new_with_zero_tangent(initial_mask.remove(0))?);
         // The masked loop's condition and body are freshly built region programs, so the recursive `jvp` is
         // requested through the instruction-scoped driver over them.
-        let mut outputs = driver.jvp_operation(
+        let mut outputs = driver.bind_jvp_operation(
+            context,
             &C::Operation::from(masked_while),
             vec![masked_condition, masked_body],
-            context,
             extended_inputs.as_slice(),
         )?;
         check_count!("output", outputs, state_count + 1, ProgramError);
@@ -1935,8 +1936,13 @@ where
     // the linear half consumes the live state tangents followed by those residuals.
     check_count!("input", inputs, state_count, ProgramError);
     let element_has_tangent = inputs.iter().map(DifferentiationDual::is_tangent_active).collect::<Vec<_>>();
+    let input_indices = element_has_tangent
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &active)| active.then_some(index))
+        .collect::<Vec<_>>();
     let (primal_program, tangent_program, residual_count) =
-        driver.linearize_program(driver.region(1)?, &element_has_tangent)?.into_parts();
+        driver.linearize_program(driver.region(1)?, &input_indices)?.into_parts();
     let residual_types = primal_program.output_types().split_off(state_count);
     check_count!("output", residual_types, residual_count, ProgramError);
 
@@ -2012,7 +2018,7 @@ where
     while_outputs.truncate(state_count);
     let primal_outputs = while_outputs;
 
-    let tangent_state_count = element_has_tangent.iter().filter(|&&has_tangent| has_tangent).count();
+    let tangent_state_count = input_indices.len();
     if tangent_state_count == 0 {
         return primal_outputs.into_iter().map(DifferentiationDual::new_with_zero_tangent).collect();
     }
@@ -2266,11 +2272,16 @@ where
     let body = driver.region(1)?;
     check_count!("input", inputs, body.input_types().len(), ProgramError);
     let element_has_tangent = inputs.iter().map(DifferentiationDual::is_tangent_active).collect::<Vec<_>>();
-    let tangent_state_count = element_has_tangent.iter().filter(|&&has_tangent| has_tangent).count();
+    let input_indices = element_has_tangent
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &active)| active.then_some(index))
+        .collect::<Vec<_>>();
+    let tangent_state_count = input_indices.len();
     let fused_state_count = state_count + tangent_state_count;
     // The body is differentiated through its region's retained transform cache, so a body shared by several programs
     // is differentiated once and repeated attachments of the result intern by `Arc` identity.
-    let fused_body = driver.jvp_program(body, &element_has_tangent)?;
+    let fused_body = driver.jvp_program(body, &input_indices)?;
     let fused_state_types = fused_body.input_types();
     check_count!("input", fused_state_types, fused_state_count, ProgramError);
 
@@ -2423,18 +2434,7 @@ where
                     .iter()
                     .map(|region| body_region.with_id(*region).map(RegionRef::to_program))
                     .collect::<Result<Vec<_>, ProgramError>>()?;
-                let output_duals = if !input_duals.is_empty() && input_duals.iter().all(|dual| dual.tangent().is_zero())
-                {
-                    let primal_inputs = input_duals.iter().map(|dual| dual.primal().clone()).collect::<Vec<_>>();
-                    context
-                        .primal()
-                        .bind(instruction.operation().clone(), programs, primal_inputs.as_slice())?
-                        .into_iter()
-                        .map(DifferentiationDual::new_with_zero_tangent)
-                        .collect::<Result<Vec<_>, _>>()?
-                } else {
-                    driver.jvp_operation(instruction.operation(), programs, context, input_duals)?
-                };
+                let output_duals = driver.bind_jvp_operation(context, instruction.operation(), programs, input_duals)?;
                 check_count!("output", output_duals, instruction.outputs().len(), ProgramError);
                 Ok(output_duals)
             },
@@ -3517,6 +3517,62 @@ mod tests {
         assert_eq!(primal.to_f64s(), vec![8.0]);
         assert_eq!(tangent.to_f64s(), vec![8.0]);
         assert_eq!(observed_context.print_count(), 3);
+    }
+
+    #[test]
+    fn test_unbounded_while_eager_jvp_allocates_zero_initialized_tangent_references() {
+        let scalar = ArrayType::scalar(DataType::F64);
+        let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let input = condition_builder.add_input(scalar.clone().into());
+        let limit = condition_builder.add_constant(TestIrValue::Array(Array::scalar(4.0_f64)));
+        let predicate = condition_builder
+            .add_instruction(
+                ArrayOperation::<Array>::from(CompareOperation::new(ComparisonDirection::LessThan)),
+                Vec::new(),
+                vec![input, limit],
+                None,
+            )
+            .unwrap()[0];
+        let condition = condition_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // The initializer has a structural-zero tangent, but the reference must still get its own tangent allocation:
+        // subsequent updates add the live input tangent into it twice on each iteration.
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let input = body_builder.add_input(scalar.into());
+        let zero = body_builder.add_constant(TestIrValue::Array(Array::scalar(0.0_f64)));
+        let reference =
+            body_builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![zero], None).unwrap()[0];
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, input], None)
+            .unwrap();
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, input], None)
+            .unwrap();
+        let output = body_builder
+            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![output], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let context = EagerContext::<TestIrValue, TestIrOperation>::new();
+        let (primal, tangent) = context
+            .jvp(
+                move |input, ()| {
+                    Ok(input
+                        .context()
+                        .bind(WhileOperation::new(), vec![condition.clone(), body.clone()], &[input.clone()])?
+                        .remove(0))
+                },
+                TestIrValue::Array(Array::scalar(1.0_f64)),
+                TestIrValue::Array(Array::scalar(3.0_f64)),
+                (),
+            )
+            .unwrap();
+        assert_eq!(primal, TestIrValue::Array(Array::scalar(4.0_f64)));
+        assert_eq!(tangent, TestIrValue::Array(Array::scalar(12.0_f64)));
     }
 
     #[derive(Clone, Debug, Parameter, PartialEq)]

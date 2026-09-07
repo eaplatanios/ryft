@@ -7,9 +7,9 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, ResidualZeroProvider, TransposableOperation, TranspositionContext,
-    TranspositionDriver,
+    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, DifferentiationPolicy, ResidualZeroProvider, TransposableOperation,
+    TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -21,7 +21,7 @@ use crate::programs::{
     EffectClasses, Effects, MaybeZero, Operation, OperationProvider, ProgramError, ReferenceAccessMode,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceEffect, ReferenceType, ReferenceViewOperation, RegionInterface, Type,
-    TypeError, Typed, Value,
+    TypeError, Value,
 };
 use crate::tracing::{Tracer, TracingContext};
 use std::borrow::Cow;
@@ -239,15 +239,16 @@ where
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
-        let reference_cotangent = MaybeZero::Zero(inputs[0].r#type().cotangent()?);
+        check_count!("accumulator", accumulators, 2, DifferentiationError);
         let accumulator = match &outputs[0] {
             MaybeZero::Value(_) => context.cotangent_reference(0)?,
             MaybeZero::Zero(_) => match context.cotangent_reference_if_allocated(0)? {
                 Some(accumulator) => accumulator,
-                None => return Ok(vec![reference_cotangent, MaybeZero::Zero(inputs[1].r#type().cotangent()?)]),
+                None => return Ok(()),
             },
         };
         let cotangent = O::materialize_zero_from_residual_sources(
@@ -259,7 +260,7 @@ where
                 .chain(std::iter::once(&accumulator)),
         )?;
         let previous = context.bind(*self, Vec::new(), &[accumulator, cotangent])?.remove(0);
-        Ok(vec![reference_cotangent, MaybeZero::Value(previous)])
+        accumulators[1].accumulate(context, MaybeZero::Value(previous))
     }
 }
 

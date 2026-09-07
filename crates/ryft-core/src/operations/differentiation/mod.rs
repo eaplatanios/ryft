@@ -241,7 +241,7 @@ pub(crate) mod tests {
         fn jvp_program(
             &self,
             _region: RegionRef<'_, ArrayIrValue<Array>, ArrayIrOperation<Array>>,
-            _activity: &[bool],
+            _input_indices: &[usize],
         ) -> Result<Arc<FlatProgram<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>, DifferentiationError>
         {
             unreachable!("custom derivative rules replay their rule regions instead of differentiating them")
@@ -250,7 +250,7 @@ pub(crate) mod tests {
         fn linearize_program(
             &self,
             _region: RegionRef<'_, ArrayIrValue<Array>, ArrayIrOperation<Array>>,
-            _activity: &[bool],
+            _input_indices: &[usize],
         ) -> Result<Linearization<ArrayIrValue<Array>, ArrayIrOperation<Array>>, DifferentiationError> {
             unreachable!("custom derivative rules replay their rule regions instead of linearizing them")
         }
@@ -264,11 +264,11 @@ pub(crate) mod tests {
             Ok(region.partition_with_configuration(input_known, true, true, Some(required_known_outputs))?.0)
         }
 
-        fn jvp_operation<P: DifferentiationPolicy<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>(
+        fn bind_jvp_operation<P: DifferentiationPolicy<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>(
             &self,
+            _context: &DifferentiationContext<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>, P>,
             _operation: &ArrayIrOperation<Array>,
             _programs: Vec<FlatProgram<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>>>,
-            _context: &DifferentiationContext<EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>, P>,
             _inputs: &[DifferentiationDual<ArrayIrValue<Array>>],
         ) -> Result<Vec<DifferentiationDual<ArrayIrValue<Array>>>, DifferentiationError> {
             unreachable!("custom derivative rules replay their rule regions instead of differentiating them")

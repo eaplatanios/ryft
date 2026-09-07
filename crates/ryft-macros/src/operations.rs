@@ -574,7 +574,8 @@ impl OperationParser {
                 })
                 .unwrap_or_else(|error| self.errors.push(error));
         }
-        (class.unwrap_or(OperationVariantClass::CompositeNative), generate_from)
+        let class = class.unwrap_or(OperationVariantClass::CompositeNative);
+        (class, generate_from)
     }
 }
 
@@ -1651,7 +1652,9 @@ impl OperationEnum {
     /// Enums with two or more inferred value parameters pin the transposition value to the first (tangent/cotangent)
     /// value parameter. Higher-order rules request nested-program transposition through their instruction-scoped
     /// driver, whose concrete implementation establishes the corresponding `Program::transpose_with_respect_to`
-    /// bounds.
+    /// bounds. Computational projected members use `MemberTransposableOperation::transpose_in_parent`, preserving
+    /// access to accumulator buffers that the member's own value family may not represent. Mixed members keep their
+    /// geometry-aware projection adapter, and structural projected members contribute no cotangents.
     fn generate_transposable_operation(&self) -> TokenStream {
         let variants = &self.variants;
         let ryft = &self.ryft_crate;
@@ -1724,23 +1727,12 @@ impl OperationEnum {
                             ::std::convert::TryFrom<&'__t #primary_type, Error = #ryft::TypeError>
                     });
                 }
-                OperationVariantClass::ProjectedMember { member_type, structural: false } => {
+                OperationVariantClass::ProjectedMember { structural: false, .. } => {
+                    // The member rule owns any projection it needs and retains access to the original accumulators.
                     where_clause.predicates.push(syn::parse_quote! {
-                        #transposed_value_type: #ryft::ValueProjection<
-                            #member_type,
-                            Projected: #ryft::Value<Type = #member_type>,
-                        >
-                    });
-                    where_clause.predicates.push(syn::parse_quote! {
-                        #operation_self_type: #ryft::OperationProjection<
-                            #member_type,
-                            Projected = #operation_type,
-                        >
-                    });
-                    where_clause.predicates.push(syn::parse_quote! {
-                        #operation_type: #ryft::TransposableOperation<
-                            <#transposed_value_type as #ryft::ValueProjection<#member_type>>::Projected,
-                            #operation_type,
+                        #operation_type: #ryft::MemberTransposableOperation<
+                            #transposed_value_type,
+                            #operation_self_type,
                         >
                     });
                 }
@@ -1759,27 +1751,25 @@ impl OperationEnum {
                         <#operation_type as #ryft::TransposableOperation<
                             #transposed_value_type,
                             #operation_self_type,
-                        >>::transpose(#receiver, context, driver, inputs, outputs)
+                        >>::transpose(#receiver, context, driver, inputs, outputs, accumulators)
                     },
                 },
                 OperationVariantClass::MixedMember { .. } => quote! {
                     Self::#variant_ident(operation) => {
-                        #ryft::transpose_mixed_operation(context, #receiver, inputs, outputs)
+                        #ryft::transpose_mixed_operation(context, #receiver, inputs, outputs, accumulators)
                     },
                 },
                 OperationVariantClass::ProjectedMember { structural: false, .. } => quote! {
                     Self::#variant_ident(operation) => {
-                        #ryft::transpose_projected_operation(context, #receiver, inputs, outputs)
+                        <#operation_type as #ryft::MemberTransposableOperation<
+                            #transposed_value_type,
+                            #operation_self_type,
+                        >>::transpose_in_parent(#receiver, context, driver, inputs, outputs, accumulators)
                     },
                 },
                 OperationVariantClass::ProjectedMember { structural: true, .. } => quote! {
                     Self::#variant_ident(_) => {
-                        inputs
-                            .iter()
-                            .map(|input| {
-                                ::std::result::Result::Ok(#ryft::MaybeZero::Zero(input.r#type().cotangent()?))
-                            })
-                            .collect()
+                        ::std::result::Result::Ok(())
                     },
                 },
             }
@@ -1815,15 +1805,8 @@ impl OperationEnum {
                             #operation_self_type,
                         >>,
                     >],
-                ) -> ::std::result::Result<
-                    ::std::vec::Vec<#ryft::MaybeZero<
-                        #ryft::Tracer<#ryft::TracingContext<
-                            #transposed_value_type,
-                            #operation_self_type,
-                        >>,
-                    >>,
-                    #ryft::DifferentiationError,
-                > {
+                    accumulators: &[#ryft::CotangentAccumulator],
+                ) -> ::std::result::Result<(), #ryft::DifferentiationError> {
                     match self {
                         #(#transpose_arms)*
                     }
@@ -2740,6 +2723,11 @@ mod tests {
                 "the 'structural' operation variant class was replaced by the 'projected(U, structural)' role form",
             ),
             (
+                quote!(#[ryft(projected(ArrayType), transpose = custom_transpose)]),
+                "invalid operation variant '#[ryft(...)]' attribute: 'transpose'; only 'projected', 'mixed', \
+                 and 'skip_from' are supported here",
+            ),
+            (
                 quote!(#[ryft(composite_member(ArrayType))]),
                 "invalid operation variant '#[ryft(...)]' attribute: 'composite_member'; only 'projected', 'mixed', \
                  and 'skip_from' are supported here",
@@ -2968,15 +2956,18 @@ mod tests {
         assert!(generated.contains("OperationProjection<DimensionType>forCompositeOperation<A>"));
         assert!(generated.contains("jvp_in_parent(operation,context,driver,inputs)"));
         assert!(generated.contains("DifferentiationDual::new_with_zero_tangent"));
-        assert!(generated.contains("transpose_projected_operation(context,operation,inputs,outputs)"));
-        assert!(generated.contains("MaybeZero::Zero(input.r#type().cotangent()?)"));
+        assert!(generated.contains(
+            "MemberTransposableOperation<__TranspositionValue,CompositeOperation<A>,>>::transpose_in_parent\
+             (operation,context,driver,inputs,outputs,accumulators)",
+        ));
+        assert!(generated.contains("Self::Dimension(_)=>{::std::result::Result::Ok(())}"));
 
         // Mixed payloads use their parent-universe contracts, while native payloads continue to delegate directly.
         assert!(generated.contains("MemberOperation<ArrayIrType>>::infer_parent_output_types"));
         assert!(generated.contains("MemberInterpretableOperation<__Context>>::interpret_in_parent"));
         assert!(generated.contains("MemberBatchableOperation<__ParentContext,__BatchingPolicy,>>::batch_in_parent"));
         assert!(generated.contains("MemberDifferentiableOperation<__DifferentiationContext>>::jvp_in_parent"));
-        assert!(generated.contains("transpose_mixed_operation(context,operation,inputs,outputs)"));
+        assert!(generated.contains("transpose_mixed_operation(context,operation,inputs,outputs,accumulators)"));
         assert!(generated.contains("NativeOperation<ArrayIrType>asryft::Operation>::infer_output_types"));
 
         // Reference discharge delegates only native payloads. Every member payload, computational or structural,
@@ -3006,6 +2997,78 @@ mod tests {
         assert!(generated.contains("typeError=ryft::TypeError;"));
         assert!(generated_tokens.contains(r#""cannot project operation '{}' into a '{}' payload""#));
         assert!(generated_tokens.contains(r#""ArrayOperation<A>""#));
+    }
+
+    #[test]
+    fn test_operation_generate_transposable_operation_member_dispatch() {
+        let mut input: syn::DeriveInput = syn::parse_quote! {
+            #[ryft(type = ArrayIrType, constant = ArrayIrValue<A>)]
+            enum CompositeOperation<A: Value<Type = ArrayType>> {
+                #[ryft(projected(ArrayType))]
+                Array(Box<ArrayOperation<A>>),
+                #[ryft(projected(DimensionType, structural))]
+                Dimension(DimensionOperation),
+            }
+        };
+        replace_self_type(&mut input);
+        let mut parser = OperationParser::new();
+        parser.extract_attributes(&input);
+        let operation = parser.normalize_input(&input).unwrap();
+        assert!(parser.errors.is_empty());
+
+        // Inspect only the transpose implementation, so another transform's projection bounds cannot mask a regression.
+        let generated: syn::ItemConst = syn::parse2(operation.generate_transposable_operation()).unwrap();
+        let syn::Expr::Block(block) = *generated.expr else { panic!("expected a generated const block") };
+        let syn::Stmt::Item(syn::Item::Impl(implementation)) = &block.block.stmts[0] else {
+            panic!("expected a generated transpose implementation")
+        };
+        assert!(implementation.generics.where_clause.as_ref().unwrap().predicates.iter().all(|predicate| {
+            let predicate = predicate.to_token_stream().to_string();
+            !predicate.contains("ValueProjection") && !predicate.contains("OperationProjection")
+        }));
+        let member_bounds = implementation
+            .generics
+            .where_clause
+            .as_ref()
+            .unwrap()
+            .predicates
+            .iter()
+            .filter(|predicate| predicate.to_token_stream().to_string().contains("TransposableOperation"))
+            .map(|predicate| predicate.to_token_stream().to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            member_bounds,
+            vec![
+                quote! {
+                    ArrayOperation<A>: ryft::MemberTransposableOperation<
+                        __TranspositionValue,
+                        CompositeOperation<A>,
+                    >
+                }
+                .to_string()
+            ]
+        );
+
+        // A boxed computational member receives the original driver and accumulators; structural members do no work.
+        let syn::ImplItem::Fn(function) = &implementation.items[0] else {
+            panic!("expected a generated transpose function")
+        };
+        let expected: syn::Block = syn::parse_quote! {
+            {
+                match self {
+                    Self::Array(operation) => {
+                        <ArrayOperation<A> as ryft::MemberTransposableOperation<
+                            __TranspositionValue,
+                            CompositeOperation<A>,
+                        >>::transpose_in_parent(&**operation, context, driver, inputs, outputs, accumulators)
+                    },
+                    Self::Dimension(_) => {
+                        ::std::result::Result::Ok(())
+                    },
+                }
+            }
+        };
+        assert_eq!(function.block.to_token_stream().to_string(), expected.to_token_stream().to_string());
     }
 
     #[test]

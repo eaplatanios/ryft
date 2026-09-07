@@ -15,7 +15,7 @@ use crate::arrays::{
 use crate::axes::{AxisError, NamedAxes};
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{DifferentiableType, DifferentiationDual};
+use crate::differentiation::DifferentiationDual;
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::constants::fill::Fill;
@@ -315,7 +315,7 @@ impl_differentiable_operation! {
         V: Value<Type = ArrayType>,
         O: Operation<Type = ArrayType> + From<ParallelReduceOperation>,
     {
-        |operation, context, _driver, inputs, outputs| {
+        |operation, context, _driver, inputs, outputs, accumulators| {
             // Transpose rule for [`ParallelReduceOperation`]. `parallel_sum`/`parallel_mean` are self-adjoint, so the
             // operand cotangent is the same collective applied to the output cotangent. The single operand is linear
             // (its [`PartialValue`] is [`Unknown`](PartialValue::Unknown)); a known operand contributes no cotangent
@@ -323,6 +323,7 @@ impl_differentiable_operation! {
             // [`UnsupportedOperation`](ProgramError::UnsupportedOperation) error.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, 1, DifferentiationError);
             if matches!(operation.kind, ParallelReductionKind::Max) {
                 return Err(ProgramError::UnsupportedOperation {
                     message: "`parallel_max` transpose is not yet supported".to_string(),
@@ -331,14 +332,18 @@ impl_differentiable_operation! {
             }
             // A known (non-linear) operand contributes no cotangent.
             if inputs[0].is_known() {
-                return Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)]);
+                return Ok(());
             }
             match &outputs[0] {
                 MaybeZero::Value(cotangent) => {
-                    let contribution = stage_collective(context, operation, cotangent)?;
-                    Ok(vec![MaybeZero::Value(contribution)])
+                    let contribution = stage_collective(&**context, operation, cotangent)?;
+                    {
+                        let contribution = MaybeZero::Value(contribution);
+                        accumulators[0].accumulate(context, contribution)?;
+                        Ok(())
+                    }
                 }
-                MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)]),
+                MaybeZero::Zero(_) => Ok(()),
             }
         }
     },

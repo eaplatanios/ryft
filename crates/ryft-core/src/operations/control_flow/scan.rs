@@ -22,10 +22,10 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
-    CotangentDestinationKind, DifferentiableOperation, DifferentiableType, DifferentiationContext,
-    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    ReferenceOperandCotangents, ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
-    reference_operand_cotangents,
+    CotangentAccumulator, CotangentDestinationKind, DifferentiableOperation, DifferentiableType,
+    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
+    OperandCotangents, ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
+    operand_cotangents,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
@@ -1229,11 +1229,16 @@ where
                 input.is_tangent_active() && (shared_destinations || index < carry_count || !input.tangent().is_zero())
             })
             .collect::<Vec<_>>();
+        let input_indices = input_has_tangent
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &active)| active.then_some(index))
+            .collect::<Vec<_>>();
         let output_has_tangent = body.tangent_output_activity(&input_has_tangent)?;
         let body_output_count = output_has_tangent.len();
         let live_carry_count = input_has_tangent[..carry_count].iter().filter(|&&live| live).count();
 
-        let live_input_count = input_has_tangent.iter().filter(|&&live| live).count();
+        let live_input_count = input_indices.len();
         let live_output_count = output_has_tangent.iter().filter(|&&live| live).count();
         let input_order = live_scan_signature_permutation(&input_has_tangent, carry_count)?;
         let output_order = live_scan_signature_permutation(&output_has_tangent, carry_count)?;
@@ -1255,7 +1260,7 @@ where
             .with_reverse(reverse)
             .with_unroll(unroll)?;
         let outputs = if shared_destinations {
-            let fused_body = driver.jvp_program(body, &input_has_tangent)?;
+            let fused_body = driver.jvp_program(body, &input_indices)?;
             let fused_body = reorder_program_boundary(&fused_body, &input_order, &output_order)?;
             let operands = scan_inputs.iter().map(|(value, _)| value.clone()).collect::<Vec<_>>();
             context
@@ -1266,7 +1271,7 @@ where
                 .collect::<Vec<_>>()
         } else {
             let (primal_program, tangent_program, residual_count) =
-                driver.linearize_program(body, &input_has_tangent)?.into_parts();
+                driver.linearize_program(body, &input_indices)?.into_parts();
             let mut fused_input_types = body.input_types();
             fused_input_types.extend(tangent_program.input_types().into_iter().take(live_input_count));
             let reordered_input_types =
@@ -1375,8 +1380,21 @@ where
         driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, Target>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, Target>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, DifferentiationError> {
-        <V::Type>::transpose_scan(self, context, driver, inputs, outputs)
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        let body = driver.region(0)?;
+        let runtime_length_count = usize::from(self.length().variable().is_some());
+        check_count!("input", inputs, body.input_types().len() + runtime_length_count, ProgramError);
+        check_count!("output", outputs, body.output_types().len(), ProgramError);
+        check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+        let contributions: Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, DifferentiationError> =
+            { <V::Type>::transpose_scan(self, context, driver, inputs, outputs) };
+        let contributions = contributions?;
+        check_count!("input", contributions, accumulators.len(), ProgramError);
+        for (accumulator, contribution) in accumulators.iter().zip(contributions) {
+            accumulator.accumulate(context, contribution)?;
+        }
+        Ok(())
     }
 }
 
@@ -3023,7 +3041,7 @@ where
         inputs: &[PartialValue<Tracer<TracingContext<V, Target>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, Target>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, DifferentiationError> {
-        let cotangents = ReferenceOperandCotangents::without_references(inputs.len());
+        let cotangents = OperandCotangents::without_references(std::iter::repeat_n(true, inputs.len()));
         transpose_array_scan(operation, context, driver, inputs, outputs, &cotangents)
     }
 }
@@ -3047,7 +3065,9 @@ where
         inputs: &[PartialValue<Tracer<TracingContext<V, Target>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, Target>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, DifferentiationError> {
-        let cotangents = reference_operand_cotangents(context, inputs)?;
+        // A scan's ordinary carry gradients drive earlier iterations, and its scanned gradients have element
+        // geometry inside the body. Return those values before the outer rule applies demand or gradient buffers.
+        let cotangents = operand_cotangents(context, inputs, &[])?;
         transpose_array_scan(operation, context, driver, inputs, outputs, &cotangents)
     }
 }
@@ -3059,7 +3079,7 @@ fn transpose_array_scan<V, F, Target, D>(
     driver: &D,
     inputs: &[PartialValue<Tracer<TracingContext<V, Target>>>],
     outputs: &[MaybeZero<Tracer<TracingContext<V, Target>>>],
-    cotangents: &ReferenceOperandCotangents<Tracer<TracingContext<V, Target>>>,
+    cotangents: &OperandCotangents<Tracer<TracingContext<V, Target>>>,
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, DifferentiationError>
 where
     V: Value<Type: DifferentiableType + ScanTypeSemantics>,
@@ -3070,7 +3090,10 @@ where
     // A scan with only zero output cotangents and no live reference carry is a zero linear map. A live reference carry
     // keeps the rule live regardless, because the accumulated state cotangent flows through the reversed body even
     // when no ordinary output cotangent does.
-    if outputs.iter().all(MaybeZero::is_zero) && !cotangents.is_live() {
+    if outputs.iter().all(MaybeZero::is_zero)
+        && !cotangents.is_live()
+        && !driver.region(0)?.has_observable_transpose_effects()
+    {
         return inputs.iter().map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?))).collect();
     }
     if operation.captures().is_empty() {
@@ -3182,7 +3205,7 @@ where
 ///     [`Known`](PartialValue::Known) of the residual-stack tracer the pullback reads.
 ///   - `outputs`: Symbolic cotangents for the scan's outputs.
 ///   - `cotangents`: Cotangent destinations of the operands (refer to the documentation of
-///     [`reference_operand_cotangents`]). A live (`Reference`-kind) reference
+///     [`operand_cotangents`]). A live (`Reference`-kind) reference
 ///     carry is threaded through the reversed scan as a carry at its own position: the reversed body receives its
 ///     cotangent reference as that carry's input and passes it back out by identity as that carry's output, so every
 ///     reversed iteration accumulates into and reads from one shared cotangent reference. A live reference *stack*
@@ -3199,7 +3222,7 @@ pub fn transpose_primal_scan<V, O, F, D: TranspositionDriver<V, O>>(
     driver: &D,
     inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
     outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    cotangents: &ReferenceOperandCotangents<Tracer<TracingContext<V, O>>>,
+    cotangents: &OperandCotangents<Tracer<TracingContext<V, O>>>,
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError>
 where
     V: Value<Type: DifferentiableType + ScanTypeSemantics>,
@@ -3210,7 +3233,10 @@ where
     // cotangent is zero. A live reference carry keeps the rule live, because its accumulated state cotangent flows
     // through the reversed body even when no ordinary output cotangent does.
     check_count!("input", cotangents.destination_kinds(), inputs.len(), ProgramError);
-    if outputs.iter().all(MaybeZero::is_zero) && !cotangents.is_live() {
+    if outputs.iter().all(MaybeZero::is_zero)
+        && !cotangents.is_live()
+        && !driver.region(0)?.has_observable_transpose_effects()
+    {
         return inputs
             .iter()
             .map(|input| {

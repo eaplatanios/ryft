@@ -18,9 +18,9 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, TransposableOperation,
-    TranspositionContext, TranspositionDriver,
+    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation,
+    TransposableOperation, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
@@ -409,7 +409,11 @@ where
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        check_count!("input", inputs, 1, ProgramError);
+        check_count!("output", outputs, 1, ProgramError);
+        check_count!("accumulator", accumulators, 1, DifferentiationError);
         if self.output_variance == AllGatherOutputVariance::Invariant {
             return Err(ProgramError::UnsupportedOperation {
                 message: "direct transposition of invariant `all_gather` cannot represent the participant-indexed \
@@ -418,7 +422,7 @@ where
             }
             .into());
         }
-        transpose_shape_changing_collective(
+        let contributions = transpose_shape_changing_collective(
             context,
             inputs,
             outputs,
@@ -428,7 +432,11 @@ where
                 self.concat_axis,
                 self.options.clone(),
             ),
-        )
+        )?;
+        for (accumulator, contribution) in accumulators.iter().zip(contributions) {
+            accumulator.accumulate(context, contribution)?;
+        }
+        Ok(())
     }
 }
 
@@ -1227,9 +1235,12 @@ mod tests {
         .unwrap();
         let extent =
             |value| ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(value).unwrap()));
-        let ragged_extent =
-            ArrayIrBatch::mapped_dimension(extents.clone(), BatchAxis::new(0), DimensionType::new(variable.clone()))
-                .unwrap();
+        let ragged_extent = ArrayIrBatch::mapped_dimension(
+            extents.clone(),
+            BatchAxis::new(0),
+            DimensionType::new(variable.clone()),
+        )
+        .unwrap();
         let context = BatchingContext::new(
             EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
             ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),

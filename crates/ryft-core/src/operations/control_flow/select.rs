@@ -231,7 +231,7 @@ impl_select_differentiation! {
         O: From<ZeroLikeOperation<V::Type>> + OperationProvider<V::Type, ZeroOperation<V::Type>, Operation = O> + From<SelectOperation<V::Type>>,
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<V::Type>,
     {
-        |_operation, context, _driver, inputs, outputs| {
+        |_operation, context, _driver, inputs, outputs, accumulators| {
             // Partition-aware transposition rule for `SelectOperation`. The Boolean condition (i.e., operand 0) has no
             // tangent space, and so in a valid pushforward it is the known operand and the two branches (i.e., operands
             // 1 and 2) are the linear ones. The forward map `(on_true, on_false) ↦ select(condition, on_true,
@@ -244,11 +244,9 @@ impl_select_differentiation! {
             // shape-specific logic, so it applies uniformly to every operation family that contains `SelectOperation`.
             check_count!("input", inputs, 3, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, 3, DifferentiationError);
             match &outputs[0] {
-                MaybeZero::Zero(_) => inputs
-                    .iter()
-                    .map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?)))
-                    .collect(),
+                MaybeZero::Zero(_) => Ok(()),
                 MaybeZero::Value(cotangent) => {
                     // The condition is the known operand. The dispatch guarantees a `Known` operand
                     // carries its pullback value, so read the tracer directly.
@@ -269,7 +267,7 @@ impl_select_differentiation! {
                         check_count!("output", zero, 1, ProgramError);
                         zero.remove(0)
                     } else {
-                        MaybeZero::Zero(cotangent_type).materialize(context)?
+                        MaybeZero::Zero(cotangent_type).materialize(&**context)?
                     };
                     let on_true = context.stage_operation(
                         SelectOperation::new(),
@@ -285,11 +283,15 @@ impl_select_differentiation! {
                     check_count!("output", on_false, 1, ProgramError);
                     let on_true_type = inputs[1].r#type().cotangent()?;
                     let on_false_type = inputs[2].r#type().cotangent()?;
-                    Ok(vec![
-                        MaybeZero::Zero(inputs[0].r#type().cotangent()?),
-                        MaybeZero::Value(on_true.into_iter().next().unwrap().unalign_cotangent(&on_true_type)?),
-                        MaybeZero::Value(on_false.into_iter().next().unwrap().unalign_cotangent(&on_false_type)?),
-                    ])
+                    {
+                        let contribution =
+                            MaybeZero::Value(on_true.into_iter().next().unwrap().unalign_cotangent(&on_true_type)?);
+                        accumulators[1].accumulate(context, contribution)?;
+                        let contribution =
+                            MaybeZero::Value(on_false.into_iter().next().unwrap().unalign_cotangent(&on_false_type)?);
+                        accumulators[2].accumulate(context, contribution)?;
+                        Ok(())
+                    }
                 }
             }
         }

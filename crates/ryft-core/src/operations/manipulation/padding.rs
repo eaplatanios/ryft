@@ -14,9 +14,10 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment, ResidualZeroProvider,
-    TransposableOperation, TranspositionContext, TranspositionDriver, transpose_projected_operation,
+    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment,
+    ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
+    transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_reference_dischargeable_operation};
@@ -980,123 +981,133 @@ where
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        // The rule stages into the tracing context only, so the transposition context is narrowed once up front.
-        let context: &mut TracingContext<V, O> = context;
-        check_count!("input", inputs, 2, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(vec![
-                MaybeZero::Zero(inputs[0].r#type().cotangent()?),
-                MaybeZero::Zero(inputs[1].r#type().cotangent()?),
-            ]),
-            MaybeZero::Value(cotangent) => {
-                let input_cotangent = if inputs[0].is_unknown() {
-                    let inverse_edge_padding_low = self
-                        .edge_padding_low()
-                        .iter()
-                        .enumerate()
-                        .map(|(axis, padding)| {
-                            padding.checked_neg().ok_or_else(|| TypeError::invalid(format!(
-                                    "`{PAD_OPERATION_NAME}` transpose cannot negate edge_padding_low at axis {axis} with value {padding}",
-                                )))
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let inverse_edge_padding_high = self
-                        .edge_padding_high()
-                        .iter()
-                        .enumerate()
-                        .map(|(axis, padding)| {
-                            padding.checked_neg().ok_or_else(|| {
-                                TypeError::invalid(format!(
-                                    "`{PAD_OPERATION_NAME}` transpose cannot negate edge_padding_high at axis {axis} with value \
-                                     {padding}",
-                                ))
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        let contributions: Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> = {
+            // The rule stages into the tracing context only, so the transposition context is narrowed once up front.
+            let context: &mut TracingContext<V, O> = context;
+            check_count!("input", inputs, 2, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, 2, DifferentiationError);
+            match &outputs[0] {
+                MaybeZero::Zero(_) => Ok(vec![
+                    MaybeZero::Zero(inputs[0].r#type().cotangent()?),
+                    MaybeZero::Zero(inputs[1].r#type().cotangent()?),
+                ]),
+                MaybeZero::Value(cotangent) => {
+                    let input_cotangent = if inputs[0].is_unknown() {
+                        let inverse_edge_padding_low = self
+                            .edge_padding_low()
+                            .iter()
+                            .enumerate()
+                            .map(|(axis, padding)| {
+                                padding.checked_neg().ok_or_else(|| TypeError::invalid(format!(
+                                        "`{PAD_OPERATION_NAME}` transpose cannot negate edge_padding_low at axis {axis} with value {padding}",
+                                    )))
                             })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let zero_type = dependency_scalar_type(cotangent.r#type().as_ref())?;
-                    let zero = MaybeZero::Zero(zero_type).materialize(context)?;
-                    let mut unpadded = context.stage_operation(
-                        PadOperation::new(
-                            inverse_edge_padding_low,
-                            inverse_edge_padding_high,
-                            vec![0; self.interior_padding().len()],
-                        )?,
-                        Vec::new(),
-                        &[cotangent.clone(), zero],
-                    )?;
-                    check_count!("output", unpadded, 1, ProgramError);
-                    let unpadded = unpadded.remove(0);
-                    let strides = self
-                        .interior_padding()
-                        .iter()
-                        .enumerate()
-                        .map(|(axis, padding)| {
-                            padding.checked_add(1).ok_or_else(|| {
-                                TypeError::invalid(format!(
-                                    "`{PAD_OPERATION_NAME}` transpose stride overflows usize on axis {axis}"
-                                ))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let inverse_edge_padding_high = self
+                            .edge_padding_high()
+                            .iter()
+                            .enumerate()
+                            .map(|(axis, padding)| {
+                                padding.checked_neg().ok_or_else(|| {
+                                    TypeError::invalid(format!(
+                                        "`{PAD_OPERATION_NAME}` transpose cannot negate edge_padding_high at axis {axis} with value \
+                                         {padding}",
+                                    ))
+                                })
                             })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let rank = strides.len();
-                    let limit_indices = unpadded
-                        .r#type()
-                        .shape()
-                        .dimensions()
-                        .iter()
-                        .enumerate()
-                        .map(|(axis, dimension)| {
-                            dimension.value().ok_or_else(|| {
-                                TypeError::invalid(format!(
-                                    "`{PAD_OPERATION_NAME}` transpose requires a static unpadded extent on axis {axis} but has \
-                                     {dimension}",
-                                ))
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let zero_type = dependency_scalar_type(cotangent.r#type().as_ref())?;
+                        let zero = MaybeZero::Zero(zero_type).materialize(context)?;
+                        let mut unpadded = context.stage_operation(
+                            PadOperation::new(
+                                inverse_edge_padding_low,
+                                inverse_edge_padding_high,
+                                vec![0; self.interior_padding().len()],
+                            )?,
+                            Vec::new(),
+                            &[cotangent.clone(), zero],
+                        )?;
+                        check_count!("output", unpadded, 1, ProgramError);
+                        let unpadded = unpadded.remove(0);
+                        let strides = self
+                            .interior_padding()
+                            .iter()
+                            .enumerate()
+                            .map(|(axis, padding)| {
+                                padding.checked_add(1).ok_or_else(|| {
+                                    TypeError::invalid(format!(
+                                        "`{PAD_OPERATION_NAME}` transpose stride overflows usize on axis {axis}"
+                                    ))
+                                })
                             })
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let slice = SliceOperation::new(vec![0; rank], limit_indices).with_strides(strides)?;
-                    let mut sliced = context.stage_operation(slice, Vec::new(), std::slice::from_ref(&unpadded))?;
-                    check_count!("output", sliced, 1, ProgramError);
-                    MaybeZero::Value(sliced.remove(0).unalign_cotangent(&inputs[0].r#type().cotangent()?)?)
-                } else {
-                    MaybeZero::Zero(inputs[0].r#type().cotangent()?)
-                };
-                let padding_value_cotangent = if inputs[1].is_unknown() {
-                    let mask_input_type =
-                        inputs[0].r#type().cotangent()?.with_data_type(DataType::Boolean).with_layout(None);
-                    let mask_padding_type =
-                        inputs[1].r#type().cotangent()?.with_data_type(DataType::Boolean).with_layout(None);
-                    let mask_input = MaybeZero::Zero(mask_input_type).materialize(context)?;
-                    let no_inputs: [Tracer<TracingContext<V, O>>; 0] = [];
-                    let mut mask_padding =
-                        context.stage_operation(OneOperation::new(mask_padding_type), Vec::new(), &no_inputs)?;
-                    check_count!("output", mask_padding, 1, ProgramError);
-                    let mut mask =
-                        context.stage_operation(self.clone(), Vec::new(), &[mask_input, mask_padding.remove(0)])?;
-                    check_count!("output", mask, 1, ProgramError);
-                    let zero = MaybeZero::Zero(cotangent.r#type().into_owned()).materialize(context)?;
-                    let mut selected = context.stage_operation(
-                        SelectOperation::<ArrayType>::new(),
-                        Vec::new(),
-                        &[mask.remove(0), cotangent.clone(), zero],
-                    )?;
-                    check_count!("output", selected, 1, ProgramError);
-                    let all_axes = (0..cotangent.r#type().rank()).collect::<Vec<_>>();
-                    let mut reduced = context.stage_operation(
-                        ReduceOperation::new(all_axes, ReductionKind::Sum),
-                        Vec::new(),
-                        &[selected.remove(0)],
-                    )?;
-                    check_count!("output", reduced, 1, ProgramError);
-                    MaybeZero::Value(reduced.remove(0).unalign_cotangent(&inputs[1].r#type().cotangent()?)?)
-                } else {
-                    MaybeZero::Zero(inputs[1].r#type().cotangent()?)
-                };
-                Ok(vec![input_cotangent, padding_value_cotangent])
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let rank = strides.len();
+                        let limit_indices = unpadded
+                            .r#type()
+                            .shape()
+                            .dimensions()
+                            .iter()
+                            .enumerate()
+                            .map(|(axis, dimension)| {
+                                dimension.value().ok_or_else(|| {
+                                    TypeError::invalid(format!(
+                                        "`{PAD_OPERATION_NAME}` transpose requires a static unpadded extent on axis {axis} but has \
+                                         {dimension}",
+                                    ))
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        let slice = SliceOperation::new(vec![0; rank], limit_indices).with_strides(strides)?;
+                        let mut sliced = context.stage_operation(slice, Vec::new(), std::slice::from_ref(&unpadded))?;
+                        check_count!("output", sliced, 1, ProgramError);
+                        MaybeZero::Value(sliced.remove(0).unalign_cotangent(&inputs[0].r#type().cotangent()?)?)
+                    } else {
+                        MaybeZero::Zero(inputs[0].r#type().cotangent()?)
+                    };
+                    let padding_value_cotangent = if inputs[1].is_unknown() {
+                        let mask_input_type =
+                            inputs[0].r#type().cotangent()?.with_data_type(DataType::Boolean).with_layout(None);
+                        let mask_padding_type =
+                            inputs[1].r#type().cotangent()?.with_data_type(DataType::Boolean).with_layout(None);
+                        let mask_input = MaybeZero::Zero(mask_input_type).materialize(context)?;
+                        let no_inputs: [Tracer<TracingContext<V, O>>; 0] = [];
+                        let mut mask_padding =
+                            context.stage_operation(OneOperation::new(mask_padding_type), Vec::new(), &no_inputs)?;
+                        check_count!("output", mask_padding, 1, ProgramError);
+                        let mut mask =
+                            context.stage_operation(self.clone(), Vec::new(), &[mask_input, mask_padding.remove(0)])?;
+                        check_count!("output", mask, 1, ProgramError);
+                        let zero = MaybeZero::Zero(cotangent.r#type().into_owned()).materialize(context)?;
+                        let mut selected = context.stage_operation(
+                            SelectOperation::<ArrayType>::new(),
+                            Vec::new(),
+                            &[mask.remove(0), cotangent.clone(), zero],
+                        )?;
+                        check_count!("output", selected, 1, ProgramError);
+                        let all_axes = (0..cotangent.r#type().rank()).collect::<Vec<_>>();
+                        let mut reduced = context.stage_operation(
+                            ReduceOperation::new(all_axes, ReductionKind::Sum),
+                            Vec::new(),
+                            &[selected.remove(0)],
+                        )?;
+                        check_count!("output", reduced, 1, ProgramError);
+                        MaybeZero::Value(reduced.remove(0).unalign_cotangent(&inputs[1].r#type().cotangent()?)?)
+                    } else {
+                        MaybeZero::Zero(inputs[1].r#type().cotangent()?)
+                    };
+                    Ok(vec![input_cotangent, padding_value_cotangent])
+                }
             }
+        };
+        let contributions = contributions?;
+        check_count!("input", contributions, accumulators.len(), ProgramError);
+        for (accumulator, contribution) in accumulators.iter().zip(contributions) {
+            accumulator.accumulate(context, contribution)?;
         }
+        Ok(())
     }
 }
 
@@ -1119,9 +1130,11 @@ where
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        // The rule stages into the tracing context only, so the transposition context is narrowed once up front.
-        let context: &mut TracingContext<V, O> = context;
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        check_count!("output", outputs, 1, ProgramError);
+        check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+
         if inputs.len() < 2 {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
         }
@@ -1145,14 +1158,8 @@ where
 
         let operation =
             <O as OperationProjection<ArrayType>>::Projected::from(PadOperation::<ArrayType>::from(self.clone()));
-        let mut cotangents = transpose_projected_operation(context, &operation, array_inputs, outputs)?;
-        cotangents.extend(
-            output_extents
-                .iter()
-                .map(|extent| Ok(MaybeZero::Zero(extent.r#type().cotangent()?)))
-                .collect::<Result<Vec<_>, DifferentiationError>>()?,
-        );
-        Ok(cotangents)
+        // Dimension operands do not receive cotangents; forward only the array operands' handles.
+        transpose_projected_operation(context, &operation, array_inputs, outputs, &accumulators[..2])
     }
 }
 

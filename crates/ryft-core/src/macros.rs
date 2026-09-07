@@ -1481,7 +1481,6 @@ macro_rules! impl_differentiable_operation {
                 $outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<$value, $operations>>>],
                 $accumulators: &[$crate::CotangentAccumulator],
             ) -> Result<(), $crate::DifferentiationError> {
-                $crate::check_count!("accumulator", $accumulators, $inputs.len(), DifferentiationError);
                 let $self = self;
                 $body
             }
@@ -2321,6 +2320,7 @@ macro_rules! impl_differentiable_elementwise_operation {
             |operation, context, _driver, inputs, outputs, accumulators| {
                 $crate::check_count!("input", inputs, 2, ProgramError);
                 $crate::check_count!("output", outputs, 1, ProgramError);
+                $crate::check_count!("accumulator", accumulators, 2, DifferentiationError);
                 let (linear_index, contribution) = match (inputs[0].is_unknown(), inputs[1].is_unknown()) {
                     (true, false) => {
                         let target = $crate::DifferentiableType::cotangent(
@@ -2444,6 +2444,7 @@ macro_rules! impl_differentiable_elementwise_operation {
             |operation, context, _driver, inputs, outputs, accumulators| {
                 $crate::check_count!("input", inputs, 2, ProgramError);
                 $crate::check_count!("output", outputs, 1, ProgramError);
+                $crate::check_count!("accumulator", accumulators, 2, DifferentiationError);
                 let left_is_linear = inputs[0].is_unknown();
                 let right_is_linear = inputs[1].is_unknown();
                 if !left_is_linear || right_is_linear {
@@ -6076,6 +6077,23 @@ mod tests {
         ];
         let mut transpose_context = TranspositionContext::new(context.clone());
         let accumulators = transpose_context.input_accumulators(&inputs, &[]).unwrap();
+
+        // Boundary counts are checked before input-linearity diagnostics, with output validation first.
+        assert_eq!(
+            MulOperation::<ArrayType>::new().transpose(&mut transpose_context, &EmptyRegionDriver, &inputs, &[], &[],),
+            Err(DifferentiationError::Program(ProgramError::InvalidOutputCount { expected: 1, actual: 0 })),
+        );
+        assert_eq!(
+            MulOperation::<ArrayType>::new().transpose(
+                &mut transpose_context,
+                &EmptyRegionDriver,
+                &inputs,
+                &outputs,
+                &accumulators[..1],
+            ),
+            Err(DifferentiationError::InvalidAccumulatorCount { expected: 2, actual: 1 }),
+        );
+
         assert!(matches!(
             <MulOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &MulOperation::new(),

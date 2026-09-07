@@ -17,8 +17,9 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, TransposableOperation, TranspositionContext, TranspositionDriver,
+    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, DifferentiationPolicy, TransposableOperation, TranspositionContext,
+    TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -225,16 +226,26 @@ where
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        check_count!("input", inputs, 1, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)]),
-            MaybeZero::Value(cotangent) => Ok(vec![MaybeZero::Value(match self.reverse {
-                true => cotangent.cumulative_sum(self.axis)?,
-                false => cotangent.reverse_cumulative_sum(self.axis)?,
-            })]),
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        let contributions: Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> = {
+            check_count!("input", inputs, 1, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, 1, DifferentiationError);
+            match &outputs[0] {
+                MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)]),
+                MaybeZero::Value(cotangent) => Ok(vec![MaybeZero::Value(match self.reverse {
+                    true => cotangent.cumulative_sum(self.axis)?,
+                    false => cotangent.reverse_cumulative_sum(self.axis)?,
+                })]),
+            }
+        };
+        let contributions = contributions?;
+        check_count!("input", contributions, accumulators.len(), ProgramError);
+        for (accumulator, contribution) in accumulators.iter().zip(contributions) {
+            accumulator.accumulate(_context, contribution)?;
         }
+        Ok(())
     }
 }
 

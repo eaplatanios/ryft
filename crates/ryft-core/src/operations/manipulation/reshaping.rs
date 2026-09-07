@@ -10,9 +10,9 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment, TransposableOperation,
-    TranspositionContext, TranspositionDriver, transpose_projected_operation,
+    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment,
+    TransposableOperation, TranspositionContext, TranspositionDriver, transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
@@ -437,8 +437,12 @@ where
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        let Some((input, output_extents)) = inputs.split_first() else {
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        check_count!("output", outputs, 1, ProgramError);
+        check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+
+        let Some((input, _output_extents)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
         let input_cotangent_type = <&ArrayType>::try_from(input.r#type().as_ref())?.cotangent()?;
@@ -474,14 +478,8 @@ where
             parameters = parameters.with_output_sharding(output_sharding.clone());
         }
         let operation = <O as OperationProjection<ArrayType>>::Projected::from(ReshapeOperation::new(parameters));
-        let mut cotangents = transpose_projected_operation(context, &operation, std::slice::from_ref(input), outputs)?;
-        cotangents.extend(
-            output_extents
-                .iter()
-                .map(|extent| Ok(MaybeZero::Zero(extent.r#type().cotangent()?)))
-                .collect::<Result<Vec<_>, DifferentiationError>>()?,
-        );
-        Ok(cotangents)
+        // Dimension operands do not receive cotangents; forward only the array operands' handles.
+        transpose_projected_operation(context, &operation, std::slice::from_ref(input), outputs, &accumulators[..1])
     }
 }
 
@@ -732,9 +730,10 @@ impl_differentiable_operation! {
         O: Operation<Type = ArrayType> + From<ReshapeOperation> + From<TransposeOperation>,
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType> + Reshape + Transpose,
     {
-        |operation, _context, _driver, inputs, outputs| {
+        |operation, context, _driver, inputs, outputs, accumulators| {
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, 1, DifferentiationError);
             let input_cotangent_type = inputs[0].r#type().cotangent()?;
             let permuted_input_cotangent_type = match operation.parameters().dimensions() {
                 Some(dimensions) => input_cotangent_type.transpose(dimensions)?,
@@ -742,17 +741,15 @@ impl_differentiable_operation! {
             };
             match &outputs[0] {
                 MaybeZero::Value(cotangent) => {
-                    let bridge_sharding = match (
-                        permuted_input_cotangent_type.sharding(),
-                        cotangent.r#type().sharding(),
-                    ) {
-                        (Some(sharding), _) => Some(sharding.clone()),
-                        (None, Some(sharding)) => Some(Sharding::replicated(
-                            sharding.mesh().clone(),
-                            permuted_input_cotangent_type.rank(),
-                        )),
-                        (None, None) => None,
-                    };
+                    let bridge_sharding =
+                        match (permuted_input_cotangent_type.sharding(), cotangent.r#type().sharding()) {
+                            (Some(sharding), _) => Some(sharding.clone()),
+                            (None, Some(sharding)) => Some(Sharding::replicated(
+                                sharding.mesh().clone(),
+                                permuted_input_cotangent_type.rank(),
+                            )),
+                            (None, None) => None,
+                        };
                     let mut inverse_parameters = ReshapeParameters::new(permuted_input_cotangent_type.shape().clone());
                     if let Some(bridge_sharding) = bridge_sharding {
                         inverse_parameters = inverse_parameters.with_output_sharding(bridge_sharding);
@@ -761,11 +758,13 @@ impl_differentiable_operation! {
                     if let Some(dimensions) = operation.parameters().dimensions() {
                         cotangent = cotangent.transpose(dimensions.inverse()?)?;
                     }
-                    Ok(vec![MaybeZero::Value(
-                        cotangent.unalign_cotangent(&input_cotangent_type)?,
-                    )])
+                    {
+                        let contribution = MaybeZero::Value(cotangent.unalign_cotangent(&input_cotangent_type)?);
+                        accumulators[0].accumulate(context, contribution)?;
+                        Ok(())
+                    }
                 }
-                MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(input_cotangent_type)]),
+                MaybeZero::Zero(_) => Ok(()),
             }
         }
     },

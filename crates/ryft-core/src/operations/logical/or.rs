@@ -166,6 +166,7 @@ mod tests {
                     PartialValue::Unknown(ArrayType::scalar(DataType::Boolean)),
                 ],
                 &[MaybeZero::Zero(ArrayType::scalar(DataType::Zero))],
+                &[],
             ),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "operation `or` is not transposable",

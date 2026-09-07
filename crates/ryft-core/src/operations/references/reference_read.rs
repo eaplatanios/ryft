@@ -7,9 +7,9 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, ResidualZeroProvider, TransposableOperation, TranspositionContext,
-    TranspositionDriver,
+    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, DifferentiationPolicy, ResidualZeroProvider, TransposableOperation,
+    TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -21,7 +21,7 @@ use crate::programs::{
     EffectClasses, Effects, MaybeZero, Operation, OperationProvider, ProgramError, ReferenceAccessMode,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
     ReferenceDischargeableOperation, ReferenceEffect, ReferenceType, ReferenceViewOperation, RegionInterface, Type,
-    TypeError, Typed, Value,
+    TypeError, Value,
 };
 use crate::tracing::{Tracer, TracingContext};
 use std::borrow::Cow;
@@ -199,14 +199,16 @@ where
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
+        check_count!("accumulator", accumulators, 1, DifferentiationError);
         if let MaybeZero::Value(cotangent) = &outputs[0] {
             let reference = context.cotangent_reference(0)?;
             reference.add_update(cotangent)?;
         }
-        Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)])
+        Ok(())
     }
 }
 

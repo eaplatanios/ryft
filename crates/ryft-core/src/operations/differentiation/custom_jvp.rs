@@ -1495,7 +1495,7 @@ mod tests {
                     vec![Placeholder],
                 )
                 .unwrap();
-            let linearization = program.entry_region_ref().linearize_with_respect_to(&[1]).unwrap();
+            let linearization = program.entry_region_ref().linearize(&[1]).unwrap();
             let reference = ArrayReference::new(initial.clone());
             let mut primals = linearization
                 .primal()

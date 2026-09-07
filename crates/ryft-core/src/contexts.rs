@@ -1131,6 +1131,7 @@ pub(crate) mod tests {
         ) -> Result<(), DifferentiationError> {
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, 1, DifferentiationError);
             accumulators[0].accumulate(context, outputs[0].clone())
         }
     }

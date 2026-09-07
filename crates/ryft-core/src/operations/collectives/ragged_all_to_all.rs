@@ -18,9 +18,9 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, ProjectedContext, ValueResolution};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, TransposableOperation,
-    TranspositionContext, TranspositionDriver, jvp_projected_operation,
+    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation,
+    TransposableOperation, TranspositionContext, TranspositionDriver, jvp_projected_operation,
 };
 use crate::interpretation::{
     InterpretableOperation, InterpretationDriver, MemberInterpretableOperation, interpret_projected_operation,
@@ -758,7 +758,8 @@ where
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
         let provenance_context = context.clone();
         provenance_context.invoke_with_provenance_scope(ProvenanceScope::new("ryft"), || {
             provenance_context.invoke_with_provenance_scope(ProvenanceScope::new("differentiation"), || {
@@ -767,27 +768,22 @@ where
                     || {
                         check_count!("input", inputs, 6, ProgramError);
                         check_count!("output", outputs, 1, ProgramError);
+                        check_count!("accumulator", accumulators, 6, DifferentiationError);
                         let [operand, output, input_offsets, send_sizes, output_offsets, receive_sizes] = inputs else {
                             unreachable!()
                         };
-                        let zero_inputs = || {
-                            inputs
-                                .iter()
-                                .map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?)))
-                                .collect::<Result<Vec<_>, DifferentiationError>>()
-                        };
                         let MaybeZero::Value(cotangent) = &outputs[0] else {
-                            return zero_inputs();
+                            return Ok(());
                         };
-                        if operand.is_known() && output.is_known() {
-                            return zero_inputs();
+                        if !accumulators[0].is_needed() && !accumulators[1].is_needed() {
+                            return Ok(());
                         }
 
                         let input_offsets = known_transpose_input(input_offsets, "input_offsets")?;
                         let send_sizes = known_transpose_input(send_sizes, "send_sizes")?;
                         let output_offsets = known_transpose_input(output_offsets, "output_offsets")?;
                         let receive_sizes = known_transpose_input(receive_sizes, "receive_sizes")?;
-                        let (operand_cotangent, permuted_output_offsets) = if operand.is_known() {
+                        let (operand_cotangent, permuted_output_offsets) = if !accumulators[0].is_needed() {
                             (MaybeZero::Zero(operand.r#type().cotangent()?), None)
                         } else {
                             let permuted_output_offsets = transpose_offsets(self, context, &output_offsets)?;
@@ -806,7 +802,7 @@ where
                             check_count!("output", contributions, 1, ProgramError);
                             (MaybeZero::Value(contributions.remove(0)), Some(permuted_output_offsets))
                         };
-                        let output_cotangent = if output.is_known() {
+                        let output_cotangent = if !accumulators[1].is_needed() {
                             MaybeZero::Zero(output.r#type().cotangent()?)
                         } else if self.update_kind == RaggedAllToAllUpdateKind::Add {
                             MaybeZero::Value(cotangent.clone())
@@ -823,14 +819,8 @@ where
                                 self.is_physical(),
                             )?)
                         };
-                        Ok(vec![
-                            operand_cotangent,
-                            output_cotangent,
-                            MaybeZero::Zero(input_offsets.r#type().cotangent()?),
-                            MaybeZero::Zero(send_sizes.r#type().cotangent()?),
-                            MaybeZero::Zero(output_offsets.r#type().cotangent()?),
-                            MaybeZero::Zero(receive_sizes.r#type().cotangent()?),
-                        ])
+                        accumulators[0].accumulate(context, operand_cotangent)?;
+                        accumulators[1].accumulate(context, output_cotangent)
                     },
                 )
             })

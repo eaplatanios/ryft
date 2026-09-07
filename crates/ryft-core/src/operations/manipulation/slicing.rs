@@ -2,8 +2,9 @@ use std::borrow::Cow;
 use std::fmt::Display;
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArrayType, Dimension,
-    DimensionType, DimensionValue, LinearResiduals, Memory, MeshAxisType, Shape, Sharding, ShardingDimension,
+    ArrayBatch, ArrayBatching, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatching, ArrayIrType, ArraySliceAxis,
+    ArrayType, Dimension, DimensionType, DimensionValue, LinearResiduals, Memory, MeshAxisType,
+    ReferenceSliceOperation, Shape, Sharding, ShardingDimension,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -12,9 +13,10 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment, MemberDifferentiableOperation,
-    TransposableOperation, TranspositionContext, TranspositionDriver, jvp_projected_operation,
+    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment,
+    MemberDifferentiableOperation, MemberTransposableOperation, TransposableOperation, TranspositionContext,
+    TranspositionDriver, jvp_projected_operation, transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_reference_dischargeable_operation};
@@ -27,6 +29,8 @@ use crate::operations::manipulation::broadcasting::Broadcast;
 use crate::operations::manipulation::padding::PadOperation;
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::transposition::Transpose;
+use crate::operations::math::add::AddOperation;
+use crate::operations::references::{ReferenceAddUpdateOperation, ReferenceReadOperation, ReferenceWriteOperation};
 use crate::operations::sharding::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
@@ -80,6 +84,9 @@ pub const SLICE_OPERATION_NAME: &str = "slice";
 
 /// [`Operation`] that extracts a (possibly strided) sub-array from its input using static start, limit, and stride
 /// values. Refer to the documentation of [`Slice`] for more information.
+///
+/// Its [`MemberTransposableOperation`] rule can add the cotangent directly into a slice of an enclosing reference
+/// accumulator. Value accumulators use the ordinary projected transpose rule.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SliceOperation {
     /// Inclusive start index for each input axis.
@@ -265,9 +272,27 @@ where
 // of the input's cotangent type (or reconstructs its extents), and the homogeneous [`ArrayType`] operation family owns
 // no first-class dimension operations, so it has no constructor that can supply a runtime extent. A dynamically shaped
 // input is therefore rejected here with an exact diagnostic. Mixed [`ArrayIrType`](crate::ArrayIrType) programs are
-// unaffected: the [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation) rule above routes a
+// unaffected: the [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation) rule routes a
 // dynamically shaped slice into a residual-carrying [`LinearCallOperation`] whose transpose region rebuilds the same
 // zero from the retained exact extents.
+//
+// Transpose (vector-Jacobian product) for a [`SliceOperation`].
+//
+// The forward map extracts a (possibly strided) block, so its pullback scatters the output cotangent back into the
+// positions the forward map read, with the strategy split on the strides:
+//
+//   - **Unit strides** read a contiguous block, so the pullback writes the cotangent into a zero array of the input
+//     type at the same static offsets: `cotangent ↦ update_slice(zeros(input_type), cotangent, start_indices)`.
+//   - **Non-unit strides** read every `strides[d]`-th element, so the pullback pads the cotangent with a zero
+//     scalar at exactly the inverse geometry: `edge_padding_low[d] = start_indices[d]`,
+//     `interior_padding[d] = strides[d] - 1`, and `edge_padding_high[d]` covers the rest of the input extent
+//     (everything after the last element the forward slice covered). For example, slicing `[0..6)` with `start = 1`
+//     and `stride = 2` reads positions `1`, `3`, and `5`, and the pullback pads the cotangent of length `3` with
+//     `low = 1`, `interior = 1`, and `high = 0`, scattering its elements back to positions `1`, `3`, and `5` of a
+//     zero-filled length-`6` array.
+//
+// Symbolic-zero cotangents propagate unchanged.
+//
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for SliceOperation
 where
     O: Operation<Type = ArrayType>
@@ -282,13 +307,13 @@ where
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        // The rule stages into the tracing context only, so the transposition context is narrowed once up front.
-        let context: &mut TracingContext<V, O> = context;
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
+        check_count!("accumulator", accumulators, 1, DifferentiationError);
         match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)]),
+            MaybeZero::Zero(_) => Ok(()),
             MaybeZero::Value(cotangent) if self.strides().iter().all(|stride| *stride == 1) => {
                 // Only the nullary zero is available in the homogeneous family, so enforce this rule's static-shape
                 // contract explicitly, matching the strided strategy's own check below.
@@ -300,7 +325,10 @@ where
                     ))
                     .into());
                 }
-                let zeros = MaybeZero::Zero(input_cotangent_type).materialize(context)?;
+                if !accumulators[0].is_needed() {
+                    return Ok(());
+                }
+                let zeros = MaybeZero::Zero(input_cotangent_type).materialize(&**context)?;
                 let outputs = context.stage_operation(
                     UpdateSliceOperation::new(self.start_indices().to_vec()),
                     Vec::new(),
@@ -309,7 +337,7 @@ where
                 check_count!("output", outputs, 1, ProgramError);
                 let cotangent =
                     outputs.into_iter().next().unwrap().unalign_cotangent(&inputs[0].r#type().cotangent()?)?;
-                Ok(vec![MaybeZero::Value(cotangent)])
+                accumulators[0].accumulate(context, MaybeZero::Value(cotangent))
             }
             MaybeZero::Value(cotangent) => {
                 let input_type = inputs[0].r#type();
@@ -346,10 +374,13 @@ where
                     })?);
                     interior_padding.push(stride - 1);
                 }
+                if !accumulators[0].is_needed() {
+                    return Ok(());
+                }
                 let zero = MaybeZero::Zero(
                     ArrayType::scalar(input_type.data_type().cotangent()?).with_memory(input_type.memory()),
                 )
-                .materialize(context)?;
+                .materialize(&**context)?;
                 let outputs = context.stage_operation(
                     PadOperation::new(edge_padding_low, edge_padding_high, interior_padding)?,
                     Vec::new(),
@@ -358,7 +389,7 @@ where
                 check_count!("output", outputs, 1, ProgramError);
                 let cotangent =
                     outputs.into_iter().next().unwrap().unalign_cotangent(&inputs[0].r#type().cotangent()?)?;
-                Ok(vec![MaybeZero::Value(cotangent)])
+                accumulators[0].accumulate(context, MaybeZero::Value(cotangent))
             }
         }
     }
@@ -479,23 +510,59 @@ where
     }
 }
 
-// Transpose (vector-Jacobian product) for a [`SliceOperation`].
-//
-// The forward map extracts a (possibly strided) block, so its pullback scatters the output cotangent back into the
-// positions the forward map read, with the strategy split on the strides:
-//
-//   - **Unit strides** read a contiguous block, so the pullback writes the cotangent into a zero array of the input
-//     type at the same static offsets: `cotangent ↦ update_slice(zeros(input_type), cotangent, start_indices)`.
-//   - **Non-unit strides** read every `strides[d]`-th element, so the pullback pads the cotangent with a zero
-//     scalar at exactly the inverse geometry: `edge_padding_low[d] = start_indices[d]`,
-//     `interior_padding[d] = strides[d] - 1`, and `edge_padding_high[d]` covers the rest of the input extent
-//     (everything after the last element the forward slice covered). For example, slicing `[0..6)` with `start = 1`
-//     and `stride = 2` reads positions `1`, `3`, and `5`, and the pullback pads the cotangent of length `3` with
-//     `low = 1`, `interior = 1`, and `high = 0`, scattering its elements back to positions `1`, `3`, and `5` of a
-//     zero-filled length-`6` array.
-//
-// Symbolic-zero cotangents propagate unchanged.
-//
+impl<V, O> MemberTransposableOperation<V, O> for SliceOperation
+where
+    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    O: Operation<Type = ArrayIrType>
+        + OperationProjection<ArrayType>
+        + From<ReferenceSliceOperation>
+        + From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType>>,
+    <O as OperationProjection<ArrayType>>::Projected: TransposableOperation<
+            <V as ValueProjection<ArrayType>>::Projected,
+            <O as OperationProjection<ArrayType>>::Projected,
+        > + From<SliceOperation>,
+{
+    fn transpose_in_parent<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TranspositionContext<'_, V, O>,
+        _driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        check_count!("input", inputs, 1, ProgramError);
+        check_count!("output", outputs, 1, ProgramError);
+        check_count!("accumulator", accumulators, 1, DifferentiationError);
+
+        if let Some(reference) = accumulators[0].reference(context)? {
+            if let MaybeZero::Value(cotangent) = &outputs[0] {
+                // A reference slice describes the same coordinates as the array slice, including empty selections
+                // and non-unit strides. Updating its view adds only the selected entries, without padding a dense
+                // gradient with zeros or reading and replacing the caller's whole buffer.
+                let axes = self
+                    .start_indices()
+                    .iter()
+                    .zip(self.limit_indices())
+                    .zip(self.strides())
+                    .map(|((&start, &limit), &stride)| {
+                        ArraySliceAxis::new(start, (limit - start).div_ceil(stride), stride)
+                    })
+                    .collect();
+                let reference = context.bind(ReferenceSliceOperation::new(axes), Vec::new(), &[reference])?.remove(0);
+                context.bind(ReferenceAddUpdateOperation::new(), Vec::new(), &[reference, cotangent.clone()])?;
+            }
+            return Ok(());
+        }
+        transpose_projected_operation(
+            context,
+            &<O as OperationProjection<ArrayType>>::Projected::from(self.clone()),
+            inputs,
+            outputs,
+            accumulators,
+        )
+    }
+}
+
 /// Canonical operation name for [`DynamicShapeSliceOperation`].
 pub const DYNAMIC_SHAPE_SLICE_OPERATION_NAME: &str = "dynamic_shape_slice";
 
@@ -808,7 +875,8 @@ impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> Transposabl
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        _accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
         Err(ProgramError::UnsupportedOperation {
             message: format!(
                 "operation `{DYNAMIC_SHAPE_SLICE_OPERATION_NAME}` does not yet support reverse-mode differentiation",
@@ -1200,46 +1268,60 @@ where
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        // The rule stages into the tracing context only, so the transposition context is narrowed once up front.
-        let context: &mut TracingContext<V, O> = context;
-        check_count!("input", inputs, 2, ProgramError);
-        check_count!("output", outputs, 1, ProgramError);
-        match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(vec![
-                MaybeZero::Zero(inputs[0].r#type().cotangent()?),
-                MaybeZero::Zero(inputs[1].r#type().cotangent()?),
-            ]),
-            MaybeZero::Value(cotangent) => {
-                let update_type = inputs[1].r#type();
-                let update_sizes = static_update_sizes(UPDATE_SLICE_OPERATION_NAME, &update_type)?;
-                let zeros = MaybeZero::Zero(update_type.cotangent()?).materialize(context)?;
-                let input_cotangents = context.stage_operation(
-                    UpdateSliceOperation::new(self.start_indices().to_vec()),
-                    Vec::new(),
-                    &[cotangent.clone(), zeros],
-                )?;
-                check_count!("output", input_cotangents, 1, ProgramError);
-                let limit_indices: Vec<usize> =
-                    self.start_indices().iter().zip(update_sizes.iter()).map(|(start, size)| start + size).collect();
-                let update_cotangents = context.stage_operation(
-                    SliceOperation::new(self.start_indices().to_vec(), limit_indices)
-                        .with_strides(vec![1; self.start_indices().len()])?,
-                    Vec::new(),
-                    std::slice::from_ref(cotangent),
-                )?;
-                check_count!("output", update_cotangents, 1, ProgramError);
-                let update_cotangent = update_cotangents
-                    .into_iter()
-                    .next()
-                    .unwrap()
-                    .unalign_cotangent(&inputs[1].r#type().cotangent()?)?;
-                Ok(vec![
-                    MaybeZero::Value(input_cotangents.into_iter().next().unwrap()),
-                    MaybeZero::Value(update_cotangent),
-                ])
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        let contributions: Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> = {
+            // The rule stages into the tracing context only, so the transposition context is narrowed once up front.
+            let context: &mut TracingContext<V, O> = context;
+            check_count!("input", inputs, 2, ProgramError);
+            check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, 2, DifferentiationError);
+            match &outputs[0] {
+                MaybeZero::Zero(_) => Ok(vec![
+                    MaybeZero::Zero(inputs[0].r#type().cotangent()?),
+                    MaybeZero::Zero(inputs[1].r#type().cotangent()?),
+                ]),
+                MaybeZero::Value(cotangent) => {
+                    let update_type = inputs[1].r#type();
+                    let update_sizes = static_update_sizes(UPDATE_SLICE_OPERATION_NAME, &update_type)?;
+                    let zeros = MaybeZero::Zero(update_type.cotangent()?).materialize(context)?;
+                    let input_cotangents = context.stage_operation(
+                        UpdateSliceOperation::new(self.start_indices().to_vec()),
+                        Vec::new(),
+                        &[cotangent.clone(), zeros],
+                    )?;
+                    check_count!("output", input_cotangents, 1, ProgramError);
+                    let limit_indices: Vec<usize> = self
+                        .start_indices()
+                        .iter()
+                        .zip(update_sizes.iter())
+                        .map(|(start, size)| start + size)
+                        .collect();
+                    let update_cotangents = context.stage_operation(
+                        SliceOperation::new(self.start_indices().to_vec(), limit_indices)
+                            .with_strides(vec![1; self.start_indices().len()])?,
+                        Vec::new(),
+                        std::slice::from_ref(cotangent),
+                    )?;
+                    check_count!("output", update_cotangents, 1, ProgramError);
+                    let update_cotangent = update_cotangents
+                        .into_iter()
+                        .next()
+                        .unwrap()
+                        .unalign_cotangent(&inputs[1].r#type().cotangent()?)?;
+                    Ok(vec![
+                        MaybeZero::Value(input_cotangents.into_iter().next().unwrap()),
+                        MaybeZero::Value(update_cotangent),
+                    ])
+                }
             }
+        };
+        let contributions = contributions?;
+        check_count!("input", contributions, accumulators.len(), ProgramError);
+        for (accumulator, contribution) in accumulators.iter().zip(contributions) {
+            accumulator.accumulate(context, contribution)?;
         }
+        Ok(())
     }
 }
 
@@ -1391,6 +1473,10 @@ pub const DYNAMIC_SLICE_OPERATION_NAME: &str = "dynamic_slice";
 
 /// [`Operation`] that extracts a statically shaped sub-array from its input at start indices that are computed at
 /// run time. Refer to the documentation of [`DynamicSlice`] for more information.
+///
+/// Its [`MemberTransposableOperation`] rule adds to the selected block of an enclosing reference accumulator without
+/// constructing a dense zero gradient. It currently reads and replaces the complete referent, which may copy storage
+/// in eager execution. Value accumulators use the ordinary projected transpose rule.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DynamicSliceOperation {
     /// Dimension of the extracted slice along each input axis.
@@ -1477,6 +1563,14 @@ impl<C: Context<Type = ArrayType>> PartiallyEvaluatableOperation<C> for DynamicS
 // batch axis is `0` even when the operand carried its batch axis elsewhere). The expansion stages `O(batch_size)`
 // operations — a gather-based rule is an explicit non-goal — and behaves identically in eager and tracing contexts
 // because it only goes through the value capability traits.
+// Batching rule for [`DynamicSliceOperation`].
+//
+// Replicated start indices keep the structural fast path: a batched operand keeps its batch axis by slicing it
+// fully, so the lifted operation inserts size `axis_size` at the batch axis position and a zero start index for it,
+// derived from an existing index operand via [`ZeroLike`] so the inserted index carries the same scalar integer
+// type. Rank-0 operands have no index operands to donate a zero index, but a rank-0 dynamic slice is the identity
+// map, so the batched operand passes through unchanged.
+//
 impl<C, P: ArrayBatchingPolicy<C>> BatchableOperation<C, ArrayBatching<P>> for DynamicSliceOperation
 where
     C: Context<Type = ArrayType> + Zero<C::Value>,
@@ -1558,7 +1652,7 @@ where
 // operand's cotangent type, and the homogeneous [`ArrayType`] operation family owns no first-class dimension
 // operations, so it has no constructor that can supply a runtime extent for that zero. A dynamically shaped operand
 // is therefore rejected here with an exact diagnostic. Mixed [`ArrayIrType`](crate::ArrayIrType) programs are
-// unaffected: the [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation) rule above routes a
+// unaffected: the [`MemberDifferentiableOperation`](crate::MemberDifferentiableOperation) rule routes a
 // dynamically shaped dynamic slice into a residual-carrying [`LinearCallOperation`] whose transpose region rebuilds
 // the same zero from the retained exact extents.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for DynamicSliceOperation
@@ -1571,21 +1665,13 @@ where
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        // The rule stages into the tracing context only, so the transposition context is narrowed once up front.
-        let context: &mut TracingContext<V, O> = context;
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
         if inputs.is_empty() {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         }
         check_count!("output", outputs, 1, ProgramError);
-        // One structural zero per operand: a contribution for the linear operand and zeros for the known indices.
-        let mut contributions = inputs
-            .iter()
-            .map(|input| {
-                let input_type = input.r#type();
-                Ok(MaybeZero::Zero(input_type.cotangent()?))
-            })
-            .collect::<Result<Vec<_>, DifferentiationError>>()?;
+        check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
         if let MaybeZero::Value(cotangent) = &outputs[0] {
             let start_indices = read_known_start_indices(&inputs[1..]);
             // Only the nullary zero is available in the homogeneous family, so enforce this rule's static-shape
@@ -1598,16 +1684,19 @@ where
                 ))
                 .into());
             }
-            let zeros = MaybeZero::Zero(operand_cotangent_type).materialize(context)?;
+            if !accumulators[0].is_needed() {
+                return Ok(());
+            }
+            let zeros = MaybeZero::Zero(operand_cotangent_type).materialize(&**context)?;
             let mut operands = Vec::with_capacity(2 + start_indices.len());
             operands.push(zeros);
             operands.push(cotangent.clone());
             operands.extend(start_indices);
             let outputs = context.stage_operation(DynamicUpdateSliceOperation, Vec::new(), operands.as_slice())?;
             check_count!("output", outputs, 1, ProgramError);
-            contributions[0] = MaybeZero::Value(outputs.into_iter().next().unwrap());
+            accumulators[0].accumulate(context, MaybeZero::Value(outputs.into_iter().next().unwrap()))?;
         }
-        Ok(contributions)
+        Ok(())
     }
 }
 
@@ -1709,14 +1798,89 @@ where
     }
 }
 
-// Batching rule for [`DynamicSliceOperation`].
-//
-// Replicated start indices keep the structural fast path: a batched operand keeps its batch axis by slicing it
-// fully, so the lifted operation inserts size `axis_size` at the batch axis position and a zero start index for it,
-// derived from an existing index operand via [`ZeroLike`] so the inserted index carries the same scalar integer
-// type. Rank-0 operands have no index operands to donate a zero index, but a rank-0 dynamic slice is the identity
-// map, so the batched operand passes through unchanged.
-//
+impl<V, O> MemberTransposableOperation<V, O> for DynamicSliceOperation
+where
+    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    O: Operation<Type = ArrayIrType>
+        + OperationProjection<ArrayType>
+        + From<ReferenceReadOperation<ArrayType, ArrayIrType>>
+        + From<ReferenceWriteOperation<ArrayType, ArrayIrType>>,
+    <O as OperationProjection<ArrayType>>::Projected: TransposableOperation<
+            <V as ValueProjection<ArrayType>>::Projected,
+            <O as OperationProjection<ArrayType>>::Projected,
+        > + From<DynamicSliceOperation>
+        + From<DynamicUpdateSliceOperation>
+        + From<AddOperation<ArrayType>>,
+{
+    fn transpose_in_parent<D: TranspositionDriver<V, O>>(
+        &self,
+        context: &mut TranspositionContext<'_, V, O>,
+        _driver: &D,
+        inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
+        outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        check_count!("input", inputs, 1 + self.sizes().len(), ProgramError);
+        check_count!("output", outputs, 1, ProgramError);
+        check_count!("accumulator", accumulators, 1 + self.sizes().len(), DifferentiationError);
+
+        if let Some(reference) = accumulators[0].reference(context)? {
+            if let MaybeZero::Value(cotangent) = &outputs[0] {
+                // Runtime indices remain ordinary residual inputs, so this typed rule can choose buffer updates
+                // when transposition runs. Add to the selected block, then replace that block in the current referent. This preserves prior contributions and uses the same index clamping as
+                // the forward slice without constructing a full-size zero gradient. Until dynamic reference views
+                // are supported, the final write still describes an update to the complete reference and eager
+                // execution may copy its complete storage.
+                let start_indices = inputs[1..]
+                    .iter()
+                    .map(|input| {
+                        input.as_known().cloned().ok_or_else(|| ProgramError::InvalidArgument {
+                            message: "`dynamic_slice` transpose requires known start indices".to_string(),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let current = context
+                    .bind(ReferenceReadOperation::new(), Vec::new(), std::slice::from_ref(&reference))?
+                    .remove(0);
+                let mut slice_inputs = vec![current.clone()];
+                slice_inputs.extend(start_indices.iter().cloned());
+                let selected = context
+                    .bind(
+                        <O as OperationProjection<ArrayType>>::Projected::from(self.clone()),
+                        Vec::new(),
+                        &slice_inputs,
+                    )?
+                    .remove(0);
+                let updated = context
+                    .bind(
+                        <O as OperationProjection<ArrayType>>::Projected::from(AddOperation::new()),
+                        Vec::new(),
+                        &[selected, cotangent.clone()],
+                    )?
+                    .remove(0);
+                let mut update_inputs = vec![current, updated];
+                update_inputs.extend(start_indices);
+                let updated = context
+                    .bind(
+                        <O as OperationProjection<ArrayType>>::Projected::from(DynamicUpdateSliceOperation),
+                        Vec::new(),
+                        &update_inputs,
+                    )?
+                    .remove(0);
+                context.bind(ReferenceWriteOperation::new(), Vec::new(), &[reference, updated])?;
+            }
+            return Ok(());
+        }
+        transpose_projected_operation(
+            context,
+            &<O as OperationProjection<ArrayType>>::Projected::from(self.clone()),
+            inputs,
+            outputs,
+            accumulators,
+        )
+    }
+}
+
 /// Represents the ability to extract a statically shaped sub-array at start indices that are computed at run time,
 /// with the semantics of StableHLO's [`dynamic_slice`](https://openxla.org/stablehlo/spec#dynamic_slice) operation.
 ///
@@ -2033,50 +2197,52 @@ where
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        // The rule stages into the tracing context only, so the transposition context is narrowed once up front.
-        let context: &mut TracingContext<V, O> = context;
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
         if inputs.len() < 2 {
             return Err(ProgramError::InvalidInputCount { expected: 2, actual: inputs.len() }.into());
         }
         check_count!("output", outputs, 1, ProgramError);
-        // One structural zero per operand: contributions for the linear input and update, and zeros for the known
-        // start indices.
-        let mut contributions = inputs
-            .iter()
-            .map(|input| {
-                let input_type = input.r#type();
-                Ok(MaybeZero::Zero(input_type.cotangent()?))
-            })
-            .collect::<Result<Vec<_>, DifferentiationError>>()?;
+        check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
         if let MaybeZero::Value(cotangent) = &outputs[0] {
             let update_sizes = static_update_sizes(DYNAMIC_UPDATE_SLICE_OPERATION_NAME, &inputs[1].r#type())?;
             let start_indices = read_known_start_indices(&inputs[2..]);
-            let zeros = MaybeZero::Zero(inputs[1].r#type().cotangent()?).materialize(context)?;
-            // Input cotangent: the output cotangent with the update window overwritten by zeros.
-            let mut input_operands = Vec::with_capacity(2 + start_indices.len());
-            input_operands.push(cotangent.clone());
-            input_operands.push(zeros);
-            input_operands.extend(start_indices.iter().cloned());
-            let input_cotangents =
-                context.stage_operation(DynamicUpdateSliceOperation, Vec::new(), input_operands.as_slice())?;
-            check_count!("output", input_cotangents, 1, ProgramError);
-            // Update cotangent: the dynamic slice of the output cotangent at the update window.
-            let mut update_operands = Vec::with_capacity(1 + start_indices.len());
-            update_operands.push(cotangent.clone());
-            update_operands.extend(start_indices);
-            let update_cotangents = context.stage_operation(
-                DynamicSliceOperation::new(update_sizes),
-                Vec::new(),
-                update_operands.as_slice(),
-            )?;
-            check_count!("output", update_cotangents, 1, ProgramError);
-            contributions[0] = MaybeZero::Value(input_cotangents.into_iter().next().unwrap());
-            contributions[1] = MaybeZero::Value(
-                update_cotangents.into_iter().next().unwrap().unalign_cotangent(&inputs[1].r#type().cotangent()?)?,
-            );
+            if accumulators[0].is_needed() {
+                let zeros = MaybeZero::Zero(inputs[1].r#type().cotangent()?).materialize(&**context)?;
+                // Input cotangent: the output cotangent with the update window overwritten by zeros.
+                let mut input_operands = Vec::with_capacity(2 + start_indices.len());
+                input_operands.push(cotangent.clone());
+                input_operands.push(zeros);
+                input_operands.extend(start_indices.iter().cloned());
+                let input_cotangents =
+                    context.stage_operation(DynamicUpdateSliceOperation, Vec::new(), input_operands.as_slice())?;
+                check_count!("output", input_cotangents, 1, ProgramError);
+                accumulators[0].accumulate(context, MaybeZero::Value(input_cotangents.into_iter().next().unwrap()))?;
+            }
+            if accumulators[1].is_needed() {
+                // Update cotangent: the dynamic slice of the output cotangent at the update window.
+                let mut update_operands = Vec::with_capacity(1 + start_indices.len());
+                update_operands.push(cotangent.clone());
+                update_operands.extend(start_indices);
+                let update_cotangents = context.stage_operation(
+                    DynamicSliceOperation::new(update_sizes),
+                    Vec::new(),
+                    update_operands.as_slice(),
+                )?;
+                check_count!("output", update_cotangents, 1, ProgramError);
+                accumulators[1].accumulate(
+                    context,
+                    MaybeZero::Value(
+                        update_cotangents
+                            .into_iter()
+                            .next()
+                            .unwrap()
+                            .unalign_cotangent(&inputs[1].r#type().cotangent()?)?,
+                    ),
+                )?;
+            }
         }
-        Ok(contributions)
+        Ok(())
     }
 }
 
@@ -2652,12 +2818,13 @@ mod tests {
     };
     use crate::batching::{BatchAxis, BatchingContext, batch};
     use crate::contexts::EagerContext;
-    use crate::differentiation::differentiate_at;
+    use crate::differentiation::{CotangentDestinationKind, differentiate_at};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
     use crate::operations::math::reduce::{Reduce, ReductionKind};
+    use crate::operations::references::{ReferenceNew, ReferenceRead};
     use crate::parameters::Placeholder;
     use crate::programs::{EmptyRegionDriver, ProgramBuilder, ProgramError, Typed};
     use crate::tracing::Trace;
@@ -3427,6 +3594,65 @@ mod tests {
     }
 
     #[test]
+    fn test_dynamic_slice_transpose_in_parent() {
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::new_static(DataType::F64, [5]).into());
+        let start = builder.add_input(ArrayType::scalar(DataType::I32).into());
+        let output = builder
+            .add_instruction(
+                ArrayOperation::DynamicSlice(DynamicSliceOperation::new(vec![2])),
+                Vec::new(),
+                vec![input, start],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
+        assert!(pullback.output_ids().is_empty());
+        assert_eq!(
+            pullback.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec!["reference_read", "dynamic_slice", "add", "dynamic_update_slice", "reference_write"],
+        );
+
+        // Different runtime starts share one transformed program, including the forward operation's clamping at
+        // either end. Repeated calls add to the prepopulated buffer instead of resetting earlier contributions.
+        let buffer = ArrayIrValue::Array(Array::vector(vec![10.0_f64; 5])).reference_new().unwrap();
+        let seed = ArrayIrValue::Array(Array::vector(vec![2.0_f64, 3.0]));
+        assert_eq!(
+            pullback.interpret(vec![seed.clone(), buffer.clone(), ArrayIrValue::Array(Array::scalar(1_i32))]),
+            Ok(vec![]),
+        );
+        assert_eq!(buffer.read(), Ok(ArrayIrValue::Array(Array::vector(vec![10.0_f64, 12.0, 13.0, 10.0, 10.0]))));
+        assert_eq!(
+            pullback.interpret(vec![seed.clone(), buffer.clone(), ArrayIrValue::Array(Array::scalar(20_i32))]),
+            Ok(vec![]),
+        );
+        assert_eq!(buffer.read(), Ok(ArrayIrValue::Array(Array::vector(vec![10.0_f64, 12.0, 13.0, 12.0, 13.0]))));
+        assert_eq!(
+            pullback.interpret(vec![seed.clone(), buffer.clone(), ArrayIrValue::Array(Array::scalar(-1_i32))]),
+            Ok(vec![]),
+        );
+        assert_eq!(buffer.read(), Ok(ArrayIrValue::Array(Array::vector(vec![12.0_f64, 15.0, 13.0, 12.0, 13.0]))));
+
+        // The same retained rule returns a dense value when requested, while Ignore constructs no scratch buffer
+        // and emits no arithmetic at all.
+        let returned = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            returned.interpret(vec![seed, ArrayIrValue::Array(Array::scalar(1_i32))]),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f64, 2.0, 3.0, 0.0, 0.0]))]),
+        );
+        let ignored = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Ignore]).unwrap();
+        assert!(ignored.instructions().is_empty());
+        assert!(ignored.output_ids().is_empty());
+    }
+
+    #[test]
     fn test_update_slice() {
         let operation = UpdateSliceOperation::new(vec![0, 1]);
 
@@ -4015,6 +4241,83 @@ mod tests {
             program.transpose_with_respect_to(&[0], &[]).unwrap_err(),
             TypeError::invalid("`dynamic_slice` transpose requires a statically shaped operand but got f64[elements]")
                 .into(),
+        );
+    }
+
+    #[test]
+    fn test_slice_transposition_accumulator_count() {
+        let mut context = TranspositionContext::new(TracingContext::<Array, ArrayOperation<Array>>::new());
+        let inputs = [PartialValue::Unknown(ArrayType::new_static(DataType::F64, [5]))];
+        let outputs = [MaybeZero::Zero(ArrayType::new_static(DataType::F64, [2]))];
+        let accumulators = context.input_accumulators(&inputs, &[]).unwrap();
+        let operation = SliceOperation::new(vec![1], vec![3]);
+
+        // Even a structural-zero cotangent must validate its boundary before skipping the update.
+        assert_eq!(
+            operation.transpose(&mut context, &EmptyRegionDriver, &inputs, &outputs, &[]),
+            Err(DifferentiationError::InvalidAccumulatorCount { expected: 1, actual: 0 }),
+        );
+        assert_eq!(
+            operation.transpose(
+                &mut context,
+                &EmptyRegionDriver,
+                &inputs,
+                &outputs,
+                &[accumulators[0].clone(), accumulators[0].clone()],
+            ),
+            Err(DifferentiationError::InvalidAccumulatorCount { expected: 1, actual: 2 }),
+        );
+    }
+
+    #[test]
+    fn test_slice_transpose_in_parent() {
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::new_static(DataType::F64, [5]).into());
+        let first = builder
+            .add_instruction(
+                ArrayOperation::Slice(SliceOperation::new(vec![1], vec![4])),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let second = builder
+            .add_instruction(
+                ArrayOperation::Slice(SliceOperation::new(vec![2], vec![5])),
+                Vec::new(),
+                vec![input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![first, second],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let pullback = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Reference]).unwrap();
+        assert!(pullback.output_ids().is_empty());
+        // Both overlapping slices update the supplied buffer directly. There is no dense zero, pad, or full-gradient
+        // result, and the second invocation adds another contribution without resetting the existing buffer.
+        assert_eq!(
+            pullback.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
+            vec!["reference_slice", "reference_add_update", "reference_slice", "reference_add_update"],
+        );
+        let buffer = ArrayIrValue::Array(Array::vector(vec![10.0_f64; 5])).reference_new().unwrap();
+        let seeds = [
+            ArrayIrValue::Array(Array::vector(vec![1.0_f64, 2.0, 3.0])),
+            ArrayIrValue::Array(Array::vector(vec![4.0_f64, 5.0, 6.0])),
+        ];
+        assert_eq!(pullback.interpret(vec![seeds[0].clone(), seeds[1].clone(), buffer.clone()]), Ok(vec![]));
+        assert_eq!(buffer.read(), Ok(ArrayIrValue::Array(Array::vector(vec![10.0_f64, 11.0, 16.0, 18.0, 16.0]))));
+        assert_eq!(pullback.interpret(vec![seeds[0].clone(), seeds[1].clone(), buffer.clone()]), Ok(vec![]));
+        assert_eq!(buffer.read(), Ok(ArrayIrValue::Array(Array::vector(vec![10.0_f64, 12.0, 22.0, 26.0, 22.0]))));
+
+        let returned = program.transpose_with_respect_to(&[0], &[]).unwrap();
+        assert_eq!(
+            returned.interpret(seeds.to_vec()),
+            Ok(vec![ArrayIrValue::Array(Array::vector(vec![0.0_f64, 1.0, 6.0, 8.0, 6.0]))]),
         );
     }
 

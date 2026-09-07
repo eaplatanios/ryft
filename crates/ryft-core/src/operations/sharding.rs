@@ -37,7 +37,7 @@ use crate::batching::{
     InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationError};
+use crate::differentiation::{DifferentiableType, DifferentiationDual};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation};

@@ -418,9 +418,11 @@ macro_rules! impl_default_reference_view_transposition {
                 context: &mut TranspositionContext<'_, V, O>,
                 _driver: &D,
                 inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
-                _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+                outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
                 accumulators: &[crate::differentiation::CotangentAccumulator],
             ) -> Result<(), DifferentiationError> {
+                check_count!("output", outputs, 1, ProgramError);
+                check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
                 let contributions =
                     (|| -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
                         inputs.iter().map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?))).collect()

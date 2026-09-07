@@ -169,14 +169,15 @@ impl_differentiable_operation! {
         V: Value<Type = ArrayType>,
         O: Operation<Type = ArrayType> + From<TransferToMemoryOperation>,
     {
-        |_operation, context, _driver, inputs, outputs| {
+        |_operation, context, _driver, inputs, outputs, accumulators| {
             // Transpose rule for [`TransferToMemoryOperation`]. A memory transfer is the identity linear map between two
             // memories, so its transpose moves the output cotangent back to the operand's source memory by staging a
             // transfer to `input_types[0]`'s memory. Symbolic-zero cotangents propagate unchanged.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, 1, DifferentiationError);
             match &outputs[0] {
-                MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)]),
+                MaybeZero::Zero(_) => Ok(()),
                 MaybeZero::Value(cotangent) => {
                     let outputs = context.stage_operation(
                         TransferToMemoryOperation::new(inputs[0].r#type().memory()),
@@ -184,7 +185,11 @@ impl_differentiable_operation! {
                         std::slice::from_ref(cotangent),
                     )?;
                     check_count!("output", outputs, 1, ProgramError);
-                    Ok(vec![MaybeZero::Value(outputs.into_iter().next().unwrap())])
+                    {
+                        let contribution = MaybeZero::Value(outputs.into_iter().next().unwrap());
+                        accumulators[0].accumulate(context, contribution)?;
+                        Ok(())
+                    }
                 }
             }
         }

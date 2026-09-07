@@ -146,19 +146,26 @@ impl_differentiable_operation! {
         O: From<ConvertElementTypeOperation<T>>,
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<T>,
     {
-        |_operation, _context, _driver, inputs, outputs| {
+        |_operation, context, _driver, inputs, outputs, accumulators| {
             // Convert a live output cotangent back to the input's complete cotangent type. Structural zeros remain
             // structural, and an input with no cotangent space receives the structural zero of that space.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, 1, DifferentiationError);
             let input_cotangent_type = inputs[0].r#type().cotangent()?;
             if input_cotangent_type.is_zero_space() {
-                return Ok(vec![MaybeZero::Zero(input_cotangent_type)]);
+                return Ok(());
             }
-            Ok(vec![match &outputs[0] {
-                MaybeZero::Zero(_) => MaybeZero::Zero(input_cotangent_type),
-                MaybeZero::Value(cotangent) => MaybeZero::Value(cotangent.unalign_cotangent(&input_cotangent_type)?),
-            }])
+            {
+                let contribution = match &outputs[0] {
+                    MaybeZero::Zero(_) => MaybeZero::Zero(input_cotangent_type),
+                    MaybeZero::Value(cotangent) => {
+                        MaybeZero::Value(cotangent.unalign_cotangent(&input_cotangent_type)?)
+                    }
+                };
+                accumulators[0].accumulate(context, contribution)?;
+                Ok(())
+            }
         }
     },
 }

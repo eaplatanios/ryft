@@ -3867,6 +3867,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[],
                 &[],
+                &[],
             ),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "operation `custom_call` is not transposable",

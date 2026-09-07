@@ -9,9 +9,9 @@ use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    BroadcastDerivativeAlignment, DifferentiableOperation, DifferentiableType, DifferentiationContext,
-    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, TransposableOperation,
-    TranspositionContext, TranspositionDriver, transpose_projected_operation,
+    BroadcastDerivativeAlignment, CotangentAccumulator, DifferentiableOperation, DifferentiableType,
+    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
+    TransposableOperation, TranspositionContext, TranspositionDriver, transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
@@ -495,8 +495,12 @@ where
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        let Some((input, output_extents)) = inputs.split_first() else {
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        check_count!("output", outputs, 1, ProgramError);
+        check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+
+        let Some((input, _output_extents)) = inputs.split_first() else {
             return Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }.into());
         };
         let input_cotangent_type = <&ArrayType>::try_from(input.r#type().as_ref())?.cotangent()?;
@@ -524,14 +528,8 @@ where
             output_type,
             self.output_axes().to_vec(),
         ));
-        let mut cotangents = transpose_projected_operation(context, &operation, std::slice::from_ref(input), outputs)?;
-        cotangents.extend(
-            output_extents
-                .iter()
-                .map(|extent| Ok(MaybeZero::Zero(extent.r#type().cotangent()?)))
-                .collect::<Result<Vec<_>, DifferentiationError>>()?,
-        );
-        Ok(cotangents)
+        // Dimension operands do not receive cotangents; forward only the array operands' handles.
+        transpose_projected_operation(context, &operation, std::slice::from_ref(input), outputs, &accumulators[..1])
     }
 }
 
@@ -731,7 +729,7 @@ impl_differentiable_operation! {
             + From<ReshardOperation>
             + From<ZeroLikeOperation<ArrayType>>,
     {
-        |operation, _context, _driver, inputs, outputs| {
+        |operation, context, _driver, inputs, outputs, accumulators| {
             // Transposition rule for `BroadcastOperation`. The pullback of a broadcast is a sum-reduction over
             // output axis the input was replicated along (i.e., the axes of the target type that are not named in
             // `output_axes`, plus the mapped axes whose input extent is `1` stretched to a larger target extent).
@@ -741,16 +739,21 @@ impl_differentiable_operation! {
             // space receives the structural zero of that space.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, 1, DifferentiationError);
             let input_cotangent_type = inputs[0].r#type().cotangent()?;
             if input_cotangent_type.is_zero_space() {
-                return Ok(vec![MaybeZero::Zero(input_cotangent_type)]);
+                return Ok(());
             }
             let MaybeZero::Value(cotangent) = &outputs[0] else {
-                return Ok(vec![MaybeZero::Zero(input_cotangent_type)]);
+                return Ok(());
             };
-            Ok(vec![MaybeZero::Value(
-                cotangent.unalign_cotangent_along(&input_cotangent_type, operation.output_axes())?,
-            )])
+            {
+                let contribution = MaybeZero::Value(
+                    cotangent.unalign_cotangent_along(&input_cotangent_type, operation.output_axes())?,
+                );
+                accumulators[0].accumulate(context, contribution)?;
+                Ok(())
+            }
         }
     },
 }
@@ -1578,14 +1581,21 @@ mod tests {
         let output_cotangent_type = output_type.cotangent().unwrap();
 
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let contributions = operation
-            .transpose(
-                &mut TranspositionContext::new(context.clone()),
-                &EmptyRegionDriver,
-                &[PartialValue::Unknown(input_type)],
-                &[MaybeZero::Zero(output_cotangent_type)],
-            )
-            .unwrap();
+        let contributions = {
+            let mut rule_context = TranspositionContext::new(context.clone());
+            let rule_inputs = &[PartialValue::Unknown(input_type)];
+            let accumulators = rule_context.input_accumulators(rule_inputs, &[]).unwrap();
+            operation
+                .transpose(
+                    &mut rule_context,
+                    &EmptyRegionDriver,
+                    rule_inputs,
+                    &[MaybeZero::Zero(output_cotangent_type)],
+                    &accumulators,
+                )
+                .unwrap();
+            rule_context.take_cotangents(&accumulators).unwrap()
+        };
         assert_eq!(contributions.len(), 1);
         assert!(contributions[0].is_zero());
         assert_eq!(contributions[0].r#type().as_ref(), &input_cotangent_type);
@@ -1594,14 +1604,21 @@ mod tests {
         let input_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(3)]));
         let output_type = ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let operation = BroadcastOperation::new(output_type.clone(), vec![1]);
-        let contributions = operation
-            .transpose(
-                &mut TranspositionContext::new(context.clone()),
-                &EmptyRegionDriver,
-                &[PartialValue::Unknown(input_type.clone())],
-                &[MaybeZero::Zero(output_type.cotangent().unwrap())],
-            )
-            .unwrap();
+        let contributions = {
+            let mut rule_context = TranspositionContext::new(context.clone());
+            let rule_inputs = &[PartialValue::Unknown(input_type.clone())];
+            let accumulators = rule_context.input_accumulators(rule_inputs, &[]).unwrap();
+            operation
+                .transpose(
+                    &mut rule_context,
+                    &EmptyRegionDriver,
+                    rule_inputs,
+                    &[MaybeZero::Zero(output_type.cotangent().unwrap())],
+                    &accumulators,
+                )
+                .unwrap();
+            rule_context.take_cotangents(&accumulators).unwrap()
+        };
         assert_eq!(contributions.len(), 1);
         assert!(contributions[0].is_zero());
         assert_eq!(contributions[0].r#type().as_ref(), &input_type.cotangent().unwrap());

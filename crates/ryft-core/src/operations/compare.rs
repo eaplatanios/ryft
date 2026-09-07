@@ -522,6 +522,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[],
                 &[],
+                &[],
             ),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "operation `compare` is not transposable",

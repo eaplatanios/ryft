@@ -1,4 +1,5 @@
-use crate::differentiation::{DifferentiationContext, DifferentiationPolicy};
+use crate::differentiation::{CotangentAccumulator, DifferentiationContext, DifferentiationPolicy};
+use crate::macros::check_count;
 
 use super::*;
 
@@ -94,9 +95,11 @@ impl<
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
+        check_count!("accumulator", accumulators, 2, DifferentiationError);
         match (inputs[0].is_unknown(), inputs[1].is_unknown()) {
             // Both operands linear is a bilinear product, which is not a linear map in both operands jointly and so
             // never appears in a valid pushforward.
@@ -108,6 +111,11 @@ impl<
             // structural zero for the known operand. A zero output cotangent stays a structural zero.
             (left_is_linear, _) => {
                 let (linear_index, known_index) = if left_is_linear { (0, 1) } else { (1, 0) };
+                // Demand is independent of primal knowledge: an ignored linear operand stays unknown, but no
+                // matrix multiplication or element conversion is needed for its cotangent.
+                if !accumulators[linear_index].is_needed() {
+                    return Ok(());
+                }
                 let linear_cotangent_type = inputs[linear_index].r#type().cotangent()?;
                 let contribution = match &outputs[0] {
                     MaybeZero::Zero(_) => MaybeZero::Zero(linear_cotangent_type),
@@ -151,15 +159,7 @@ impl<
                         MaybeZero::Value(adjoint_value)
                     }
                 };
-                let mut contributions = inputs
-                    .iter()
-                    .map(|input| {
-                        let input_type = input.r#type();
-                        Ok(MaybeZero::Zero(input_type.cotangent()?))
-                    })
-                    .collect::<Result<Vec<_>, DifferentiationError>>()?;
-                contributions[linear_index] = contribution;
-                Ok(contributions)
+                accumulators[linear_index].accumulate(context, contribution)
             }
         }
     }
@@ -209,9 +209,11 @@ where
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
         check_count!("input", inputs, 3, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
+        check_count!("accumulator", accumulators, 3, DifferentiationError);
         let mode = self.dimensions().mode(inputs[0].r#type().rank())?;
         if mode != RaggedDotMode::NonContracting {
             return Err(ProgramError::UnsupportedOperation {
@@ -222,14 +224,8 @@ where
         let group_sizes = inputs[2].as_known().ok_or_else(|| ProgramError::UnsupportedOperation {
             message: format!("`{RAGGED_DOT_OPERATION_NAME}` group sizes must be known during transposition"),
         })?;
-        let zero_contributions = || {
-            inputs
-                .iter()
-                .map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?)))
-                .collect::<Result<Vec<_>, DifferentiationError>>()
-        };
         let MaybeZero::Value(cotangent) = &outputs[0] else {
-            return zero_contributions();
+            return Ok(());
         };
         if inputs[0].is_unknown() && inputs[1].is_unknown() {
             return Err(ProgramError::UnsupportedOperation {
@@ -239,7 +235,6 @@ where
             }
             .into());
         }
-        let mut contributions = zero_contributions()?;
         let (linear_index, dimensions, output_axes, mut operands) = if inputs[0].is_unknown() {
             let known_rhs = inputs[1].as_known().unwrap();
             let (dimensions, output_axes) = adjoint_ragged_dimensions_for_lhs(
@@ -257,8 +252,12 @@ where
             );
             (1, dimensions, output_axes, [known_lhs.clone(), cotangent.clone(), group_sizes.clone()])
         } else {
-            return Ok(contributions);
+            return Ok(());
         };
+        // Retain the known group metadata contract, but omit the adjoint kernel when its value is not requested.
+        if !accumulators[linear_index].is_needed() {
+            return Ok(());
+        }
         let linear_cotangent_type = inputs[linear_index].r#type().cotangent()?;
         for operand in &mut operands[..2] {
             if operand.r#type().data_type() != cotangent.r#type().data_type() {
@@ -278,7 +277,6 @@ where
         } else {
             adjoint.convert_element_type(linear_cotangent_type.data_type())?
         };
-        contributions[linear_index] = MaybeZero::Value(adjoint);
-        Ok(contributions)
+        accumulators[linear_index].accumulate(context, MaybeZero::Value(adjoint))
     }
 }

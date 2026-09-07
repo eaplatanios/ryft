@@ -15,9 +15,10 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment, ResidualZeroProvider,
-    TransposableOperation, TranspositionContext, TranspositionDriver, transpose_projected_operation,
+    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment,
+    ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
+    transpose_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
@@ -599,35 +600,33 @@ impl_differentiable_operation! {
         O: Operation<Type = ArrayType> + From<SliceOperation>,
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
     {
-        |operation, context, _driver, inputs, outputs| {
+        |operation, context, _driver, inputs, outputs, accumulators| {
             // Transposition rule for `ConcatenateOperation`. The forward map lays its inputs end to end, so its
             // pullback slices the output cotangent at cumulative input offsets. The concatenated input dimensions must
             // be static so those offsets are known. Symbolic-zero cotangents remain symbolic for every input.
             check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
             if inputs.is_empty() {
                 return Err(TypeError::invalid(format!(
                     "`{}` transpose expects at least one operand but got none",
                     CONCATENATE_OPERATION_NAME,
-                )).into());
+                ))
+                .into());
             }
             let axis = operation.axis();
             match &outputs[0] {
-                MaybeZero::Zero(_) => inputs
-                    .iter()
-                    .map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?)))
-                    .collect(),
+                MaybeZero::Zero(_) => Ok(()),
                 MaybeZero::Value(cotangent) => {
                     let rank = inputs[0].r#type().rank();
                     let mut offset = 0usize;
-                    let mut input_cotangents = Vec::with_capacity(inputs.len());
                     for (index, input) in inputs.iter().enumerate() {
                         let input_type = input.r#type();
                         let dimension = input_type.dimension(axis);
                         let Dimension::Static(input_axis_size) = dimension else {
                             return Err(TypeError::invalid(format!(
-                                    "`{CONCATENATE_OPERATION_NAME}` transpose requires a static size along the \
-                                    concatenated axis {axis} but operand {index} has size {dimension}",
-                                ))
+                                "`{CONCATENATE_OPERATION_NAME}` transpose requires a static size along the \
+                                            concatenated axis {axis} but operand {index} has size {dimension}",
+                            ))
                             .into());
                         };
                         let mut start_indices = vec![0usize; rank];
@@ -640,7 +639,7 @@ impl_differentiable_operation! {
                                 dimension.value().ok_or_else(|| {
                                     TypeError::invalid(format!(
                                         "`{CONCATENATE_OPERATION_NAME}` transpose requires a static size on axis \
-                                         {other_axis} but operand {index} has size {dimension}",
+                                                 {other_axis} but operand {index} has size {dimension}",
                                     ))
                                 })
                             })
@@ -652,10 +651,10 @@ impl_differentiable_operation! {
                         check_count!("output", outputs, 1, ProgramError);
                         let input_cotangent =
                             outputs.into_iter().next().unwrap().unalign_cotangent(&input_type.cotangent()?)?;
-                        input_cotangents.push(MaybeZero::Value(input_cotangent));
+                        accumulators[index].accumulate(context, MaybeZero::Value(input_cotangent))?;
                         offset += input_axis_size;
                     }
-                    Ok(input_cotangents)
+                    Ok(())
                 }
             }
         }
@@ -690,7 +689,11 @@ where
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        check_count!("output", outputs, 1, ProgramError);
+        check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+
         let Some((result_extent, array_inputs)) = inputs.split_last() else {
             return Err(TypeError::invalid(format!(
                 "`{CONCATENATE_OPERATION_NAME}` transpose expects at least one array followed by its result extent",
@@ -734,9 +737,13 @@ where
             let operation = <O as OperationProjection<ArrayType>>::Projected::from(
                 ConcatenateOperation::<ArrayType>::from(self.clone()),
             );
-            let mut cotangents = transpose_projected_operation(context, &operation, array_inputs, outputs)?;
-            cotangents.push(MaybeZero::Zero(result_extent.r#type().cotangent()?));
-            return Ok(cotangents);
+            return transpose_projected_operation(
+                context,
+                &operation,
+                array_inputs,
+                outputs,
+                &accumulators[..array_inputs.len()],
+            );
         }
 
         // A dynamic extent on a non-concatenated axis needs no residual, because the exact geometry the pullback
@@ -746,7 +753,7 @@ where
         // while keeping nothing alive that the pullback did not already hold. The homogeneous member rule cannot
         // express this because its [`SliceOperation`] bounds are static payload values, so the composite slice is
         // staged here directly.
-        check_count!("output", outputs, 1, ProgramError);
+
         let mut cotangents = Vec::with_capacity(inputs.len());
         match &outputs[0] {
             MaybeZero::Zero(_) => {
@@ -834,7 +841,10 @@ where
             }
         }
         cotangents.push(MaybeZero::Zero(result_extent.r#type().cotangent()?));
-        Ok(cotangents)
+        for (accumulator, contribution) in accumulators.iter().zip(cotangents) {
+            accumulator.accumulate(context, contribution)?;
+        }
+        Ok(())
     }
 }
 

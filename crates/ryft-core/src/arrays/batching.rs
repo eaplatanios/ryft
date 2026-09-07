@@ -2119,8 +2119,6 @@ pub struct ArrayIrBatch<V: Value<Type = ArrayIrType>> {
     member: ArrayIrBatchMember<V>,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
     /// Creates a new [`ArrayIrBatch`] over the provided packed value, deriving the member kind from the value's type.
     /// An array is batched along an axis of the array itself, a reference along an axis of its packed referent (so
@@ -2137,9 +2135,9 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
     ///   - `batch_axis`: Possibly-negative [`BatchAxis`], normalized against the rank the member kind batches over
     ///     before it is stored.
     #[inline]
-    pub fn new(value: V, batch_axis: BatchAxis) -> Result<Self, BatchingError> {
+    pub fn new<A: Into<BatchAxis>>(value: V, batch_axis: A) -> Result<Self, BatchingError> {
         let member = ArrayIrBatchMember::from_type(value.r#type().as_ref());
-        Self::from_member(value, batch_axis, member)
+        Self::from_member(value, batch_axis.into(), member)
     }
 
     /// Creates a new [`ArrayIrBatch`] that replicates the provided value across the batch, deriving the member kind
@@ -2172,26 +2170,28 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
     ///     before it is stored.
     ///   - `r#type`: Per-item [`DimensionType`] that the batch reports as its per-item type.
     #[inline]
-    pub fn mapped_dimension(extents: V, batch_axis: BatchAxis, r#type: DimensionType) -> Result<Self, BatchingError> {
-        Self::from_member(extents, batch_axis, ArrayIrBatchMember::MappedDimension(r#type))
+    pub fn mapped_dimension<A: Into<BatchAxis>>(
+        extents: V,
+        batch_axis: A,
+        r#type: DimensionType,
+    ) -> Result<Self, BatchingError> {
+        Self::from_member(extents, batch_axis.into(), ArrayIrBatchMember::MappedDimension(r#type))
     }
 
     /// Returns this [`ArrayIrBatch`] carrying the provided bounded ragged axes in place of any it already carried, so
     /// that its logical per-item type keeps a dynamic [`Dimension`] wherever the packed array stores a finite physical
-    /// bound. Only an array member carries ragged axes: a reference or first-class dimension member is rejected, and so
-    /// is a mapped first-class dimension, which stores its per-item extents directly and has no ragged array axes.
+    /// bound. Only [`ArrayIrBatchMember::Array`]s carry ragged axes. [`ArrayIrBatchMember::Reference`]s and
+    /// [`ArrayIrBatchMember::Dimension`]s are rejected, and so are [`ArrayIrBatchMember::MappedDimension`], which store
+    /// their per-item extents directly and have no ragged array axes.
     ///
-    /// Structural requirements are validated exactly as by [`ArrayBatch::with_ragged_axes`]: every ragged axis must
-    /// uniquely name an ordinary packed axis of the value other than the mapped batch axis, every recorded extent-axis
-    /// mapping must name a distinct packed axis, and the per-item type must derive cleanly. Refer to that function's
-    /// documentation for the semantic claims each [`RaggedAxis`] carries; this function trusts the same claims.
+    /// The following structural requirements are validated exactly in the same way as [`ArrayBatch::with_ragged_axes`]:
+    /// every ragged axis must uniquely name an ordinary packed axis of the value other than the mapped batch axis,
+    /// every recorded extent axis mapping must name a distinct packed axis, and the per-item type must derive cleanly.
+    /// Refer to that function's documentation for the semantic claims each [`RaggedAxis`] carries.
     pub fn with_ragged_axes(self, ragged_axes: Vec<RaggedAxis<V>>) -> Result<Self, BatchingError> {
         match self.member {
             ArrayIrBatchMember::Array { .. } => {
                 Self::from_member(self.value, self.batch_axis, ArrayIrBatchMember::Array { ragged_axes })
-            }
-            ArrayIrBatchMember::MappedDimension(r#type) => {
-                Err(BatchingError::MappedDimension { r#type: Box::new(r#type), axis: self.batch_axis })
             }
             ArrayIrBatchMember::Reference | ArrayIrBatchMember::Dimension => Err(BatchingError::InvalidBatchMetadata {
                 message: format!(
@@ -2199,14 +2199,17 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
                     self.value.r#type(),
                 ),
             }),
+            ArrayIrBatchMember::MappedDimension(r#type) => {
+                Err(BatchingError::MappedDimension { r#type: Box::new(r#type), axis: self.batch_axis })
+            }
         }
     }
 
     /// Validates `member` against `value`'s type, normalizes `batch_axis` against the rank that the member kind batches
     /// over, and derives the complete per-item type once, including the sharding projection of the removed batch
     /// dimension and the restored dynamic dimensions of every ragged axis. This is the single validation boundary
-    /// behind every fallible constructor: the value, axis, and member are immutable afterwards, which is what lets
-    /// [`Self::unbatched_type`] be infallible.
+    /// behind every fallible constructor (the value, axis, and member are immutable afterwards, which is what lets
+    /// [`Self::unbatched_type`] be infallible).
     fn from_member(value: V, batch_axis: BatchAxis, member: ArrayIrBatchMember<V>) -> Result<Self, BatchingError> {
         let batch_axis = {
             let value_type = value.r#type();
@@ -2265,11 +2268,13 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
         Ok(Self { value, batch_axis, member })
     }
 
+    // TODO(eaplatanios): Review from here onwards.
+
     /// Returns the [`BatchAxis`] marking which dimension of [`value`](Self::value) indexes the batch items, or a
     /// replicated axis for a value shared unchanged across the batch. The rank the axis is normalized against depends
-    /// on the member kind: for an array member it is an axis of the packed array, for a mapped first-class dimension
+    /// on the member kind (for an array member it is an axis of the packed array, for a mapped first-class dimension
     /// an axis of its packed integer extent array, and for a reference member an axis of the packed referent, fixed by
-    /// the input or allocation that produced the reference for the reference's whole lifetime. A replicated
+    /// the input or allocation that produced the reference for the reference's whole lifetime). A replicated
     /// first-class dimension always carries a replicated axis.
     #[inline]
     pub fn batch_axis(&self) -> BatchAxis {

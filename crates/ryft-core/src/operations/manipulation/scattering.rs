@@ -11,9 +11,10 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment, MemberDifferentiableOperation,
-    ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver, jvp_projected_operation,
+    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment,
+    MemberDifferentiableOperation, ResidualZeroProvider, TransposableOperation, TranspositionContext,
+    TranspositionDriver, jvp_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -471,9 +472,11 @@ where
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
         check_count!("input", inputs, 3, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
+        check_count!("accumulator", accumulators, 3, DifferentiationError);
         if self.kind() != ScatterReductionKind::Add {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
@@ -485,14 +488,13 @@ where
             .into());
         }
         match &outputs[0] {
-            MaybeZero::Zero(_) => inputs
-                .iter()
-                .map(|input| {
-                    let input_type = input.r#type();
-                    Ok(MaybeZero::Zero(input_type.cotangent()?))
-                })
-                .collect(),
+            MaybeZero::Zero(_) => Ok(()),
             MaybeZero::Value(cotangent) => {
+                accumulators[0].accumulate(context, MaybeZero::Value(cotangent.clone()))?;
+                // Only the update operand needs a gather; the base operand's cotangent is the seed itself.
+                if !accumulators[2].is_needed() {
+                    return Ok(());
+                }
                 // The indices are the known operand; the dispatch guarantees a `Known` operand carries its pullback
                 // value, so read the tracer directly.
                 let indices = inputs[1]
@@ -548,11 +550,7 @@ where
                     .next()
                     .unwrap()
                     .unalign_cotangent(&inputs[2].r#type().cotangent()?)?;
-                Ok(vec![
-                    MaybeZero::Value(cotangent.clone()),
-                    MaybeZero::Zero(inputs[1].r#type().cotangent()?),
-                    MaybeZero::Value(update_cotangent),
-                ])
+                accumulators[2].accumulate(context, MaybeZero::Value(update_cotangent))
             }
         }
     }

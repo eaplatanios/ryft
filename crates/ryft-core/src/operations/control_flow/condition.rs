@@ -18,10 +18,10 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    CotangentDestinationKind, DifferentiableOperation, DifferentiableType, DifferentiationContext,
-    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    ReferenceOperandCotangents, ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
-    reference_operand_cotangents,
+    CotangentAccumulator, CotangentDestinationKind, DifferentiableOperation, DifferentiableType,
+    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
+    OperandCotangents, ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
+    operand_cotangents,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
@@ -697,7 +697,12 @@ where
         let tangent_output_count = output_activity.iter().filter(|&&active| active).count();
 
         let primal_input_count = operands.len();
-        let live_input_count = activity.iter().filter(|&&active| active).count();
+        let input_indices = activity
+            .iter()
+            .enumerate()
+            .filter_map(|(index, &active)| active.then_some(index))
+            .collect::<Vec<_>>();
+        let live_input_count = input_indices.len();
         let mut condition_inputs = vec![predicate_primal];
         condition_inputs.extend(operands.iter().map(|operand| operand.primal().clone()));
         for (operand, &active) in operands.iter().zip(&activity) {
@@ -711,8 +716,10 @@ where
             }
         }
         let outputs = if std::ptr::eq(context.primal(), context.tangent()) {
-            let branches =
-                [driver.jvp_program(true_branch, &activity)?, driver.jvp_program(driver.region(1)?, &activity)?];
+            let branches = [
+                driver.jvp_program(true_branch, &input_indices)?,
+                driver.jvp_program(driver.region(1)?, &input_indices)?,
+            ];
             context
                 .primal()
                 .bind(ConditionOperation::new(), CalleeRegionDriver::new(&branches), &condition_inputs)?
@@ -720,7 +727,7 @@ where
             let mut partitions = Vec::with_capacity(2);
             let mut branch_input_types = true_branch.input_types();
             for branch in [true_branch, driver.region(1)?] {
-                let (primal, tangent, residual_count) = driver.linearize_program(branch, &activity)?.into_parts();
+                let (primal, tangent, residual_count) = driver.linearize_program(branch, &input_indices)?.into_parts();
                 if partitions.is_empty() {
                     branch_input_types.extend(tangent.input_types().into_iter().take(live_input_count));
                 }
@@ -805,8 +812,20 @@ where
         driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        <V::Type>::transpose_condition(context, driver, inputs, outputs)
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        let branch = driver.region(0)?;
+        check_count!("input", inputs, 1 + branch.input_types().len(), ProgramError);
+        check_count!("output", outputs, branch.output_types().len(), ProgramError);
+        check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+        let contributions: Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> =
+            { <V::Type>::transpose_condition(context, driver, inputs, outputs, accumulators) };
+        let contributions = contributions?;
+        check_count!("input", contributions, accumulators.len(), ProgramError);
+        for (accumulator, contribution) in accumulators.iter().zip(contributions) {
+            accumulator.accumulate(context, contribution)?;
+        }
+        Ok(())
     }
 }
 
@@ -1411,6 +1430,7 @@ where
         driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+        accumulators: &[CotangentAccumulator],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError>;
 }
 
@@ -1425,8 +1445,10 @@ where
         driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+        accumulators: &[CotangentAccumulator],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        let cotangents = ReferenceOperandCotangents::without_references(inputs.len());
+        let cotangents =
+            OperandCotangents::without_references(accumulators.iter().map(CotangentAccumulator::is_needed));
         transpose_primal_condition(context, driver, inputs, outputs, &cotangents).map_err(DifferentiationError::from)
     }
 }
@@ -1447,8 +1469,9 @@ where
         driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
+        accumulators: &[CotangentAccumulator],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        let cotangents = reference_operand_cotangents(context, inputs)?;
+        let cotangents = operand_cotangents(context, inputs, accumulators)?;
         transpose_primal_condition(context, driver, inputs, outputs, &cotangents).map_err(DifferentiationError::from)
     }
 }
@@ -1487,7 +1510,7 @@ where
 /// reads.
 ///   - `outputs`: Symbolic cotangents for the condition's outputs.
 ///   - `cotangents`: Cotangent destinations of the operands (refer to the documentation of
-///     [`reference_operand_cotangents`]). Both branches are transposed with the
+///     [`operand_cotangents`]). Both branches are transposed with the
 ///     destination kinds of the branch operands. The cotangent reference of a `Reference`-kind operand is passed into
 ///     both transposed branches at that operand's slot and the branch that runs accumulates into it in place, so the
 ///     transposed condition's output at that position is the reference itself and the operand receives a structural
@@ -1497,7 +1520,7 @@ pub fn transpose_primal_condition<V, O, D: TranspositionDriver<V, O>>(
     driver: &D,
     inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
     outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    cotangents: &ReferenceOperandCotangents<Tracer<TracingContext<V, O>>>,
+    cotangents: &OperandCotangents<Tracer<TracingContext<V, O>>>,
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError>
 where
     V: Value<Type: ConditionTypeSemantics + DifferentiableType>,
@@ -1507,7 +1530,11 @@ where
     // cotangent is zero. A live reference operand keeps the rule live, because its accumulated state cotangent flows
     // through the transposed branches even when no ordinary output cotangent does.
     check_count!("input", cotangents.destination_kinds(), inputs.len(), ProgramError);
-    if outputs.iter().all(MaybeZero::is_zero) && !cotangents.is_live() {
+    if outputs.iter().all(MaybeZero::is_zero)
+        && !cotangents.is_live()
+        && !driver.region(0)?.has_observable_transpose_effects()
+        && !driver.region(1)?.has_observable_transpose_effects()
+    {
         return inputs
             .iter()
             .map(|input| {
@@ -1606,9 +1633,8 @@ where
         CalleeRegionDriver::new(&transposed_branches),
         operands.as_slice(),
     )?;
-    let ignored_count =
-        branch_destination_kinds.iter().filter(|&&kind| kind == CotangentDestinationKind::Ignore).count();
-    check_count!("output", branch_cotangents, branch_tangent_count - ignored_count, ProgramError);
+    let output_count = (1..1 + branch_tangent_count).filter(|&index| cotangents.returns_cotangent(index)).count();
+    check_count!("output", branch_cotangents, output_count, ProgramError);
 
     // Reassemble one cotangent per operand: the predicate and residuals carry structural zeros, while the branch
     // tangents receive the transposed condition's outputs in order. A live reference tangent's output is its cotangent
@@ -1623,7 +1649,9 @@ where
             match cotangents.kind(index) {
                 CotangentDestinationKind::Return if linear => Ok(MaybeZero::Value(branch_cotangents.next().unwrap())),
                 CotangentDestinationKind::Reference => {
-                    branch_cotangents.next();
+                    if cotangents.is_reference(index) {
+                        branch_cotangents.next();
+                    }
                     Ok(MaybeZero::Zero(input.r#type().cotangent()?))
                 }
                 CotangentDestinationKind::Return | CotangentDestinationKind::Ignore => {
@@ -1973,6 +2001,64 @@ mod tests {
             "}
             .trim_end(),
         );
+    }
+
+    #[test]
+    fn test_condition_transposition_preserves_shared_gradient_buffers() {
+        type TestValue = ArrayIrValue<Array>;
+        type TestOperation = ArrayIrOperation<Array>;
+
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let mut branch = ProgramBuilder::<TestValue, TestOperation>::new();
+        let left = branch.add_input(scalar_type.clone());
+        let right = branch.add_input(scalar_type.clone());
+        let sum = branch.add_instruction(AddOperation::new(), Vec::new(), vec![left, right], None).unwrap()[0];
+        let branch = branch
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![sum], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let branch = builder.import_program(branch);
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let input = builder.add_input(scalar_type.clone());
+        let output = builder
+            .add_instruction(
+                ConditionOperation::<TestValue>::new(),
+                vec![branch, branch],
+                vec![predicate, input, input],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let transposed = program.transpose_with_respect_to(&[1], &[CotangentDestinationKind::Reference]).unwrap();
+        let condition = transposed
+            .instructions()
+            .iter()
+            .find(|instruction| instruction.operation().name() == CONDITION_OPERATION_NAME)
+            .unwrap();
+        assert_eq!(condition.inputs().len(), 4);
+        assert_eq!(condition.inputs()[2], condition.inputs()[3]);
+
+        // Both nested operand positions share one caller-owned buffer. Test through a local allocation so reference
+        // discharge must preserve that internal alias rather than treating the two branch inputs as independent state.
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let initial = builder.add_input(scalar_type.clone());
+        let seed = builder.add_input(scalar_type);
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        assert!(builder.splice_program(&transposed, &[seed, reference, predicate]).unwrap().is_empty());
+        let output =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let staged = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let inputs = vec![Array::scalar(5.0_f32).into(), Array::scalar(3.0_f32).into(), Array::scalar(true).into()];
+        let expected = vec![Array::scalar(11.0_f32).into()];
+        assert_eq!(staged.interpret(inputs.clone()).unwrap(), expected);
+        let discharged = staged.discharge_references(0).unwrap().into_program_without_external_references().unwrap();
+        assert_eq!(discharged.interpret(inputs).unwrap(), expected);
     }
 
     /// A known-symbolic predicate splits known branch results from residual branch work without dropping an

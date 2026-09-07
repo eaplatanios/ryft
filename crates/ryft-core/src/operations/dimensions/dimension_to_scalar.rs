@@ -338,6 +338,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[],
                 &[],
+                &[],
             ),
             Err(crate::DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "operation `dimension_to_scalar` is not transposable",

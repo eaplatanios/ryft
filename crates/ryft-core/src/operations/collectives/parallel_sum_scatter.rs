@@ -18,9 +18,9 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, TransposableOperation,
-    TranspositionContext, TranspositionDriver,
+    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation,
+    TransposableOperation, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
@@ -345,19 +345,31 @@ where
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        transpose_shape_changing_collective(
-            context,
-            inputs,
-            outputs,
-            AllGatherOperation::new(
-                self.axis_name.clone(),
-                self.axis_size,
-                self.scatter_axis,
-                self.options.clone(),
-                AllGatherOutputVariance::Varying,
-            ),
-        )
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        check_count!("input", inputs, 1, ProgramError);
+        check_count!("output", outputs, 1, ProgramError);
+        check_count!("accumulator", accumulators, 1, DifferentiationError);
+        let contributions: Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> = {
+            transpose_shape_changing_collective(
+                context,
+                inputs,
+                outputs,
+                AllGatherOperation::new(
+                    self.axis_name.clone(),
+                    self.axis_size,
+                    self.scatter_axis,
+                    self.options.clone(),
+                    AllGatherOutputVariance::Varying,
+                ),
+            )
+        };
+        let contributions = contributions?;
+        check_count!("input", contributions, accumulators.len(), ProgramError);
+        for (accumulator, contribution) in accumulators.iter().zip(contributions) {
+            accumulator.accumulate(context, contribution)?;
+        }
+        Ok(())
     }
 }
 

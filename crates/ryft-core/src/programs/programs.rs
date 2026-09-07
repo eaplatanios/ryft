@@ -3225,12 +3225,12 @@ mod tests {
             .build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
 
-        let before = program.entry_region_ref().linearize_shared().unwrap();
+        let before = program.entry_region_ref().linearize_shared(&[0, 1]).unwrap();
         let simplified = program.simplified().unwrap();
         assert_eq!(simplified.atoms().len(), program.atoms().len());
         assert_eq!(simplified.instructions().len(), program.instructions().len());
         assert_eq!(simplified.regions()[0].instructions().len(), 1);
-        let after = simplified.entry_region_ref().linearize_shared().unwrap();
+        let after = simplified.entry_region_ref().linearize_shared(&[0, 1]).unwrap();
         assert!(!Arc::ptr_eq(&after.0, &before.0));
         assert!(!Arc::ptr_eq(&after.1, &before.1));
     }
@@ -3266,11 +3266,11 @@ mod tests {
             RegionId::new(0),
         )
         .unwrap();
-        let before = program.entry_region_ref().linearize_shared().unwrap();
+        let before = program.entry_region_ref().linearize_shared(&[0]).unwrap();
         let simplified = program.simplified().unwrap();
         assert_eq!(simplified.instructions()[0].outputs(), [AtomId::new(1)]);
         assert_eq!(simplified.instructions()[1].outputs(), [AtomId::new(2)]);
-        let after = simplified.entry_region_ref().linearize_shared().unwrap();
+        let after = simplified.entry_region_ref().linearize_shared(&[0]).unwrap();
         assert!(!Arc::ptr_eq(&after.0, &before.0));
     }
 
@@ -3431,9 +3431,9 @@ mod tests {
         let program =
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap();
 
-        let before = program.entry_region_ref().linearize_shared().unwrap();
+        let before = program.entry_region_ref().linearize_shared(&[0]).unwrap();
         let simplified = program.into_simplified().unwrap();
-        let after = simplified.entry_region_ref().linearize_shared().unwrap();
+        let after = simplified.entry_region_ref().linearize_shared(&[0]).unwrap();
         assert!(Arc::ptr_eq(&after.0, &before.0));
         assert!(Arc::ptr_eq(&after.1, &before.1));
     }

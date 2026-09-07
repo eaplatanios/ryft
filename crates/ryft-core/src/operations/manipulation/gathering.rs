@@ -11,9 +11,9 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, ProjectedContext, StagingContext};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation, TransposableOperation,
-    TranspositionContext, TranspositionDriver, jvp_projected_operation,
+    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, DifferentiationPolicy, MemberDifferentiableOperation,
+    TransposableOperation, TranspositionContext, TranspositionDriver, jvp_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -438,16 +438,13 @@ where
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        // The rule stages into the tracing context only, so the transposition context is narrowed once up front.
-        let context: &mut TracingContext<V, O> = context;
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
         check_count!("input", inputs, 2, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
+        check_count!("accumulator", accumulators, 2, DifferentiationError);
         match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(vec![
-                MaybeZero::Zero(inputs[0].r#type().cotangent()?),
-                MaybeZero::Zero(inputs[1].r#type().cotangent()?),
-            ]),
+            MaybeZero::Zero(_) => Ok(()),
             MaybeZero::Value(cotangent) => {
                 // The indices are the known operand; the dispatch guarantees a `Known` operand carries its pullback
                 // value, so read the tracer directly.
@@ -465,7 +462,10 @@ where
                     ))
                     .into());
                 }
-                let zeros = MaybeZero::Zero(operand_cotangent_type).materialize(context)?;
+                if !accumulators[0].is_needed() {
+                    return Ok(());
+                }
+                let zeros = MaybeZero::Zero(operand_cotangent_type).materialize(&**context)?;
                 let scatter_dimensions = ScatterDimensionNumbers::new(
                     self.dimensions().offset_dimensions().to_vec(),
                     self.dimensions().collapsed_slice_dimensions().to_vec(),
@@ -482,10 +482,7 @@ where
                 let outputs =
                     context.stage_operation(scatter_operation, Vec::new(), &[zeros, indices, cotangent.clone()])?;
                 check_count!("output", outputs, 1, ProgramError);
-                Ok(vec![
-                    MaybeZero::Value(outputs.into_iter().next().unwrap()),
-                    MaybeZero::Zero(inputs[1].r#type().cotangent()?),
-                ])
+                accumulators[0].accumulate(context, MaybeZero::Value(outputs.into_iter().next().unwrap()))
             }
         }
     }
@@ -1292,9 +1289,10 @@ mod tests {
             driver: &D,
             inputs: &[PartialValue<Tracer<TracingContext<V, TestGatherOperation<V>>>>],
             outputs: &[MaybeZero<Tracer<TracingContext<V, TestGatherOperation<V>>>>],
-        ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, TestGatherOperation<V>>>>>, DifferentiationError> {
+            accumulators: &[CotangentAccumulator],
+        ) -> Result<(), DifferentiationError> {
             match self {
-                Self::Gather(operation) => operation.transpose(context, driver, inputs, outputs),
+                Self::Gather(operation) => operation.transpose(context, driver, inputs, outputs, accumulators),
                 _ => Err(ProgramError::UnsupportedOperation {
                     message: format!("{} is not transposed in this test enum", self.name()),
                 }

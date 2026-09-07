@@ -106,7 +106,7 @@ impl_differentiable_operation! {
         V::Type: DifferentiableType,
         O: From<NegOperation<V::Type>> + From<RealOperation<V::Type>> + From<ImaginaryOperation<V::Type>>,
     {
-        |_operation, _context, _driver, inputs, outputs| {
+        |_operation, context, _driver, inputs, outputs, accumulators| {
             // Transpose rule for the linear [`ComplexOperation`]. Under the bilinear (i.e., conjugation-free) pairing
             // that Ryft's transposition uses over complex types, the transpose of `(re, im) ↦ re + im·i` maps the output
             // cotangent `ȳ` to the part cotangents `(real(ȳ), imaginary(-ȳ))`: pairing `Re(ȳ · (re + im·i))` against
@@ -115,15 +115,17 @@ impl_differentiable_operation! {
             // at the pullback output boundary.
             check_count!("input", inputs, 2, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, 2, DifferentiationError);
             match &outputs[0] {
-                MaybeZero::Zero(_) => inputs
-                    .iter()
-                    .map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?)))
-                    .collect(),
-                MaybeZero::Value(output_cotangent) => Ok(vec![
-                    MaybeZero::Value(output_cotangent.unary(RealOperation::new())),
-                    MaybeZero::Value(output_cotangent.unary(NegOperation::new()).unary(ImaginaryOperation::new())),
-                ]),
+                MaybeZero::Zero(_) => Ok(()),
+                MaybeZero::Value(output_cotangent) => {
+                    let contribution = MaybeZero::Value(output_cotangent.unary(RealOperation::new()));
+                    accumulators[0].accumulate(context, contribution)?;
+                    let contribution =
+                        MaybeZero::Value(output_cotangent.unary(NegOperation::new()).unary(ImaginaryOperation::new()));
+                    accumulators[1].accumulate(context, contribution)?;
+                    Ok(())
+                }
             }
         }
     },
@@ -187,17 +189,21 @@ impl_differentiable_operation! {
         V::Type: DifferentiableType,
         O: From<ConjugateOperation<V::Type>>,
     {
-        |_operation, _context, _driver, inputs, outputs| {
+        |_operation, context, _driver, inputs, outputs, accumulators| {
             // Transpose rule for the ℝ-linear [`ConjugateOperation`]. Under the bilinear (i.e., conjugation-free)
             // pairing that Ryft's transposition uses over complex types, conjugation is self-adjoint: pairing
             // `Re(ȳ · z̄)` against `z` shows that the transpose of `z ↦ z̄` is `ȳ ↦ ȳ̄`.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
-            Ok(match &outputs[0] {
-                MaybeZero::Zero(_) => vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)],
-                MaybeZero::Value(output_cotangent) =>
-                    vec![MaybeZero::Value(output_cotangent.unary(ConjugateOperation::new()))],
-            })
+            check_count!("accumulator", accumulators, 1, DifferentiationError);
+            match &outputs[0] {
+                MaybeZero::Zero(_) => Ok(()),
+                MaybeZero::Value(output_cotangent) => {
+                    let contribution = MaybeZero::Value(output_cotangent.unary(ConjugateOperation::new()));
+                    accumulators[0].accumulate(context, contribution)?;
+                    Ok(())
+                }
+            }
         }
     },
 }
@@ -258,19 +264,24 @@ impl_differentiable_operation! {
         V::Type: DifferentiableType,
         O: From<ComplexOperation<V::Type>> + From<ZeroLikeOperation<V::Type>>,
     {
-        |_operation, _context, _driver, inputs, outputs| {
+        |_operation, context, _driver, inputs, outputs, accumulators| {
             // Transpose rule for the ℝ-linear [`RealOperation`]. Under the bilinear (i.e., conjugation-free) pairing
             // that Ryft's transposition uses over complex types, pairing `t · Re(z)` against `z` shows that the
             // transpose of `z ↦ Re(z)` is `t ↦ complex(t, 0)`, injecting the real cotangent with a zero imaginary part.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
-            Ok(match &outputs[0] {
-                MaybeZero::Zero(_) => vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)],
+            check_count!("accumulator", accumulators, 1, DifferentiationError);
+            match &outputs[0] {
+                MaybeZero::Zero(_) => Ok(()),
                 MaybeZero::Value(output_cotangent) => {
                     let zero = output_cotangent.unary(ZeroLikeOperation::new());
-                    vec![MaybeZero::Value(output_cotangent.binary(&zero, ComplexOperation::new()))]
+                    {
+                        let contribution = MaybeZero::Value(output_cotangent.binary(&zero, ComplexOperation::new()));
+                        accumulators[0].accumulate(context, contribution)?;
+                        Ok(())
+                    }
                 }
-            })
+            }
         }
     },
 }
@@ -331,21 +342,26 @@ impl_differentiable_operation! {
         V::Type: DifferentiableType,
         O: From<NegOperation<V::Type>> + From<ComplexOperation<V::Type>> + From<ZeroLikeOperation<V::Type>>,
     {
-        |_operation, _context, _driver, inputs, outputs| {
+        |_operation, context, _driver, inputs, outputs, accumulators| {
             // Transpose rule for the ℝ-linear [`ImaginaryOperation`]. Under the bilinear (i.e., conjugation-free)
             // pairing that Ryft's transposition uses over complex types, pairing `t · Im(z)` against `z` shows that the
             // transpose of `z ↦ Im(z)` is `t ↦ complex(0, -t)`, injecting the *negated* real cotangent as the imaginary
             // part.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
-            Ok(match &outputs[0] {
-                MaybeZero::Zero(_) => vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)],
+            check_count!("accumulator", accumulators, 1, DifferentiationError);
+            match &outputs[0] {
+                MaybeZero::Zero(_) => Ok(()),
                 MaybeZero::Value(output_cotangent) => {
                     let zero = output_cotangent.unary(ZeroLikeOperation::new());
                     let negated = output_cotangent.unary(NegOperation::new());
-                    vec![MaybeZero::Value(zero.binary(&negated, ComplexOperation::new()))]
+                    {
+                        let contribution = MaybeZero::Value(zero.binary(&negated, ComplexOperation::new()));
+                        accumulators[0].accumulate(context, contribution)?;
+                        Ok(())
+                    }
                 }
-            })
+            }
         }
     },
 }

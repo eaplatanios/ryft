@@ -291,18 +291,22 @@ impl_differentiable_operation! {
         O: Operation<Type = ArrayType> + From<TransposeOperation>,
         Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType> + Transpose,
     {
-        |operation, _context, _driver, inputs, outputs| {
+        |operation, context, _driver, inputs, outputs, accumulators| {
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, 1, DifferentiationError);
             let inverse = operation.permutation().inverse()?;
             match &outputs[0] {
                 MaybeZero::Value(cotangent) => {
                     let cotangent = cotangent.transpose(inverse)?;
-                    Ok(vec![MaybeZero::Value(
-                        cotangent.unalign_cotangent(&inputs[0].r#type().cotangent()?)?,
-                    )])
+                    {
+                        let contribution =
+                            MaybeZero::Value(cotangent.unalign_cotangent(&inputs[0].r#type().cotangent()?)?);
+                        accumulators[0].accumulate(context, contribution)?;
+                        Ok(())
+                    }
                 }
-                MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)]),
+                MaybeZero::Zero(_) => Ok(()),
             }
         }
     },
@@ -1244,14 +1248,21 @@ mod tests {
         assert_eq!(context.builder().borrow().instructions().len(), 1);
 
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
-        let contributions = TransposeOperation::new([2, 0, 1])
-            .transpose(
-                &mut TranspositionContext::new(context.clone()),
-                &EmptyRegionDriver,
-                &[PartialValue::Unknown(cycle_input_type.clone())],
-                &[MaybeZero::Zero(cycle_output_type.cotangent().unwrap())],
-            )
-            .unwrap();
+        let contributions = {
+            let mut rule_context = TranspositionContext::new(context.clone());
+            let rule_inputs = &[PartialValue::Unknown(cycle_input_type.clone())];
+            let accumulators = rule_context.input_accumulators(rule_inputs, &[]).unwrap();
+            TransposeOperation::new([2, 0, 1])
+                .transpose(
+                    &mut rule_context,
+                    &EmptyRegionDriver,
+                    rule_inputs,
+                    &[MaybeZero::Zero(cycle_output_type.cotangent().unwrap())],
+                    &accumulators,
+                )
+                .unwrap();
+            rule_context.take_cotangents(&accumulators).unwrap()
+        };
         assert!(contributions[0].is_zero());
         assert_eq!(contributions[0].r#type().as_ref(), &cycle_input_type.cotangent().unwrap());
         assert!(context.builder().borrow().instructions().is_empty());

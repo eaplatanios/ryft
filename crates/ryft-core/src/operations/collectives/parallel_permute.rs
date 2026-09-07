@@ -11,8 +11,8 @@ use crate::axes::NamedAxes;
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual, DifferentiationError,
-    TransposableOperation, TranspositionContext, TranspositionDriver,
+    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, TransposableOperation, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -180,15 +180,27 @@ where
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        let inverted_pairs =
-            self.source_target_pairs.iter().map(|(source, target)| (*target, *source)).collect::<Vec<_>>();
-        transpose_shape_changing_collective(
-            context,
-            inputs,
-            outputs,
-            ParallelPermuteOperation::new(self.axis_name.clone(), self.axis_size, inverted_pairs),
-        )
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
+        check_count!("input", inputs, 1, ProgramError);
+        check_count!("output", outputs, 1, ProgramError);
+        check_count!("accumulator", accumulators, 1, DifferentiationError);
+        let contributions: Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> = {
+            let inverted_pairs =
+                self.source_target_pairs.iter().map(|(source, target)| (*target, *source)).collect::<Vec<_>>();
+            transpose_shape_changing_collective(
+                context,
+                inputs,
+                outputs,
+                ParallelPermuteOperation::new(self.axis_name.clone(), self.axis_size, inverted_pairs),
+            )
+        };
+        let contributions = contributions?;
+        check_count!("input", contributions, accumulators.len(), ProgramError);
+        for (accumulator, contribution) in accumulators.iter().zip(contributions) {
+            accumulator.accumulate(context, contribution)?;
+        }
+        Ok(())
     }
 }
 

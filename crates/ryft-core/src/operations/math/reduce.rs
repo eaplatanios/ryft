@@ -11,9 +11,10 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, ProjectedContext};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment, MemberDifferentiableOperation,
-    TransposableOperation, TranspositionContext, TranspositionDriver, jvp_projected_operation,
+    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, DifferentiationPolicy, ElementwiseDerivativeAlignment,
+    MemberDifferentiableOperation, TransposableOperation, TranspositionContext, TranspositionDriver,
+    jvp_projected_operation,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -366,13 +367,15 @@ where
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
+        check_count!("accumulator", accumulators, 1, DifferentiationError);
         let input_type = inputs[0].r#type();
         let input_shape = input_type.shape();
         match &outputs[0] {
-            MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(input_type.cotangent()?)]),
+            MaybeZero::Zero(_) => Ok(()),
             MaybeZero::Value(cotangent) => match self.kind {
                 ReductionKind::Sum | ReductionKind::Mean => {
                     // Replicating the cotangent back over a reduced axis requires that axis's extent, which a
@@ -390,6 +393,9 @@ where
                         .into());
                     }
 
+                    if !accumulators[0].is_needed() {
+                        return Ok(());
+                    }
                     let output_type = input_type.cotangent()?;
                     let output_axes = output_to_input_axis_map(input_shape.rank(), &self.axes);
                     let broadcasted = cotangent.broadcast(output_type, output_axes.as_slice())?;
@@ -424,7 +430,7 @@ where
                         }
                         _ => unreachable!("outer match handled the only two supported kinds"),
                     };
-                    Ok(vec![MaybeZero::Value(cotangent_input)])
+                    accumulators[0].accumulate(context, MaybeZero::Value(cotangent_input))
                 }
                 other => Err(TypeError::invalid(format!(
                     "reduce transpose for {other} is not yet supported; only Sum and Mean are wired \
@@ -1279,12 +1285,16 @@ mod tests {
                     .add_input(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)])));
                 context.tracer(atom, None)
             };
+            let inputs = [PartialValue::Unknown(input_type.clone())];
+            let mut transposition = TranspositionContext::new(context.clone());
+            let accumulators = transposition.input_accumulators(&inputs, &[]).unwrap();
             assert!(matches!(
                 ReduceOperation::new(vec![0], kind).transpose(
-                    &mut TranspositionContext::new(context.clone()),
+                    &mut transposition,
                     &crate::programs::regions::EmptyRegionDriver,
-                    &[PartialValue::Unknown(input_type.clone())],
+                    &inputs,
                     &[MaybeZero::Value(output_cotangent)],
+                    &accumulators,
                 ),
                 Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                     if message == format!(
@@ -1358,17 +1368,21 @@ mod tests {
         let transpose_builder = context.builder().clone();
         let output_cotangent_atom = transpose_builder.borrow_mut().add_input(cotangent_type);
         let output_cotangent = context.tracer(output_cotangent_atom, None);
-        let contribution = ReduceOperation::new(vec![0], ReductionKind::Mean)
-            .transpose(
-                &mut TranspositionContext::new(context.clone()),
-                &crate::programs::regions::EmptyRegionDriver,
-                &[PartialValue::Unknown(input_type)],
-                &[MaybeZero::Value(output_cotangent)],
-            )
-            .unwrap()
-            .into_iter()
-            .next()
-            .expect("transpose should return one contribution");
+        let contribution = {
+            let mut context = TranspositionContext::new(context.clone());
+            let inputs = &[PartialValue::Unknown(input_type)];
+            let accumulators = context.input_accumulators(inputs, &[]).unwrap();
+            ReduceOperation::new(vec![0], ReductionKind::Mean)
+                .transpose(
+                    &mut context,
+                    &crate::programs::regions::EmptyRegionDriver,
+                    inputs,
+                    &[MaybeZero::Value(output_cotangent)],
+                    &accumulators,
+                )
+                .unwrap();
+            context.take_cotangents(&accumulators).unwrap().remove(0)
+        };
         let MaybeZero::Value(contribution) = contribution else {
             panic!("transpose should produce one cotangent contribution");
         };
@@ -1403,12 +1417,16 @@ mod tests {
             context.tracer(atom, None)
         };
 
+        let inputs = [PartialValue::Unknown(input_type.clone())];
+        let mut transposition = TranspositionContext::new(context.clone());
+        let accumulators = transposition.input_accumulators(&inputs, &[]).unwrap();
         assert!(matches!(
             ReduceOperation::new(vec![0, 1], ReductionKind::Mean).transpose(
-                &mut TranspositionContext::new(context.clone()),
+                &mut transposition,
                 &crate::programs::regions::EmptyRegionDriver,
-                &[PartialValue::Unknown(input_type)],
+                &inputs,
                 &[MaybeZero::Value(output_cotangent)],
+                &accumulators,
             ),
             Err(DifferentiationError::Program(ProgramError::Type(TypeError::Invalid { message })))
                 if message == format!(
@@ -1433,14 +1451,21 @@ mod tests {
             context.tracer(atom, None)
         };
 
-        let contributions = ReduceOperation::new(vec![0, 1, 2], ReductionKind::Mean)
-            .transpose(
-                &mut TranspositionContext::new(context.clone()),
-                &crate::programs::regions::EmptyRegionDriver,
-                &[PartialValue::Unknown(input_type.clone())],
-                &[MaybeZero::Value(output_cotangent)],
-            )
-            .unwrap();
+        let contributions = {
+            let mut context = TranspositionContext::new(context.clone());
+            let inputs = &[PartialValue::Unknown(input_type.clone())];
+            let accumulators = context.input_accumulators(inputs, &[]).unwrap();
+            ReduceOperation::new(vec![0, 1, 2], ReductionKind::Mean)
+                .transpose(
+                    &mut context,
+                    &crate::programs::regions::EmptyRegionDriver,
+                    inputs,
+                    &[MaybeZero::Value(output_cotangent)],
+                    &accumulators,
+                )
+                .unwrap();
+            context.take_cotangents(&accumulators).unwrap()
+        };
         assert_eq!(contributions.len(), 1);
         assert_eq!(contributions[0].r#type().as_ref(), &input_type);
     }

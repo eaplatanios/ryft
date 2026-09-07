@@ -8,9 +8,9 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
-    DifferentiationError, DifferentiationPolicy, ResidualZeroProvider, TransposableOperation, TranspositionContext,
-    TranspositionDriver,
+    CotangentAccumulator, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
+    DifferentiationDual, DifferentiationError, DifferentiationPolicy, ResidualZeroProvider, TransposableOperation,
+    TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
@@ -231,15 +231,18 @@ where
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
-        Ok(vec![match context.allocation_cotangent(0)? {
+        check_count!("accumulator", accumulators, 1, DifferentiationError);
+        let contribution = match context.allocation_cotangent(0)? {
             Some(accumulator) => {
                 MaybeZero::Value(context.bind(ReferenceFreezeOperation::new(), Vec::new(), &[accumulator])?.remove(0))
             }
             None => MaybeZero::Zero(inputs[0].r#type().cotangent()?),
-        }])
+        };
+        accumulators[0].accumulate(context, contribution)
     }
 }
 

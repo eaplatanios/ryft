@@ -476,9 +476,10 @@ mod tests {
                 &EmptyRegionDriver,
                 &[],
                 &[MaybeZero::Value(output_cotangent)],
+                &[],
             )
             .unwrap();
-        assert!(input_cotangents.is_empty());
+        assert_eq!(input_cotangents, ());
     }
 
     #[test]
