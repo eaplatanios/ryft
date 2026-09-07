@@ -1193,6 +1193,10 @@ impl<C: Context<Type = ArrayType, Value: Broadcast + Transpose>> RaggedArrayBatc
     }
 }
 
+impl BatchableType for ArrayType {
+    type Policy = ArrayBatching;
+}
+
 /// Homogeneous-array [`BatchingPolicy`] parameterized by its [`ArrayBatchingPolicy`]. The default
 /// [`StaticArrayBatchingPolicy`] preserves the ordinary public array batching API. Composite programs use a private
 /// dynamic policy whose extent is a parent-owned first-class dimension value. Keeping both policies under this
@@ -1449,10 +1453,6 @@ where
     ) -> Result<ArrayBatch<C::Value>, BatchingError> {
         batch.match_axis(axis, *context.axis_extent(), context.axis_sharding().clone())
     }
-}
-
-impl BatchableType for ArrayType {
-    type Policy = ArrayBatching;
 }
 
 /// [`Region`] [`Transform`] marker for retained homogeneous array batched [`Program`]s.
@@ -2507,6 +2507,10 @@ impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> BatchedProg
     }
 }
 
+impl BatchableType for ArrayIrType {
+    type Policy = ArrayIrBatchingPolicy;
+}
+
 /// [`BatchingPolicy`] for [`Program`]s over [`ArrayIrValue`](crate::ArrayIrValue)s.
 ///
 /// [`ArrayIrType::Array`] members may carry a mapped axis. [`ArrayIrType::Dimension`] members are shared shape values
@@ -2618,10 +2622,6 @@ impl<C: Context<Type = ArrayIrType>> BatchingPolicy<C> for ArrayIrBatchingPolicy
             collapse_fn,
         )
     }
-}
-
-impl BatchableType for ArrayIrType {
-    type Policy = ArrayIrBatchingPolicy;
 }
 
 // TODO(eaplatanios): Review from here onwards.
