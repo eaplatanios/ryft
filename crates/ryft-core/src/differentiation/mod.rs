@@ -56,12 +56,13 @@
 //!
 //! Differentiation captures are not static arguments and do not embed host values into a trace. They retain their
 //! runtime types, shapes, shardings, and placement, and changing capture values alone does not specialize the
-//! computation. They also differ from [`StopGradients::stop_gradients`], which blocks derivative flow but leaves the
-//! stopped value inside the active parameter structure and its derivative bookkeeping. Finally, they differ from
-//! [`ClosedProgram`](crate::ClosedProgram) and Just-In-Time (JIT) compilation captures as those hide lifted runtime
-//! values from a compiled function's public signature, whereas differentiation captures are explicit inputs to the
-//! binary closure. Auxiliary outputs are similarly runtime outputs rather than differentiation variables. They remain
-//! part of the closure result but are excluded from derivative seeding and pullback construction.
+//! computation. They also differ from [`StopGradients::stop_gradients`](crate::StopGradients::stop_gradients), which
+//! blocks derivative flow but leaves the stopped value inside the active parameter structure and its derivative
+//! bookkeeping. Finally, they differ from [`ClosedProgram`](crate::ClosedProgram) and Just-In-Time (JIT) compilation
+//! captures as those hide lifted runtime values from a compiled function's public signature, whereas differentiation
+//! captures are explicit inputs to the binary closure. Auxiliary outputs are similarly runtime outputs rather than
+//! differentiation variables. They remain part of the closure result but are excluded from derivative seeding and
+//! pullback construction.
 //!
 //! Context-generic code can use [`ForwardModeDifferentiate`] and [`ReverseModeDifferentiate`] directly, and already
 //! traced programs expose the corresponding program-level JVP, linearization, and transposition methods documented on
@@ -92,6 +93,25 @@
 //! and the result is a [`Pullback`] that accepts output cotangents, consumes saved residuals, and accumulates input
 //! cotangents. This architecture keeps primal execution, residualization, and linear algebra as separate, composable
 //! concerns.
+//!
+//! # Gradients of Reference Inputs
+//!
+//! Scalar gradient functions return ordinary values at every active input position. An input of type `T` returns
+//! `cotangent(T)`; an input of type `ref<T>` returns `cotangent(T)`, the derivative with respect to its initial
+//! contents. The original parameter structure is preserved, so the value family must represent both references and
+//! their referents. [`GradientOperationProvider`] supplies the allocation and extraction operations for families
+//! supporting references.
+//!
+//! The primal runs exactly once and retains its mutations. For example, starting with `r = 3`, the function
+//! `r <- 2*r; return r*r` returns value `36` and gradient `24`, leaving `r = 6`. Each call uses fresh internal zero
+//! cotangent references: the final primal state contributes no seed, and completed cotangent references are frozen
+//! into ordinary values before returning. Runtime geometry is captured before primal execution, including when the
+//! function consumes an input reference. Duplicate references, views, and aliases at the differentiation boundary
+//! remain subject to the usual boundary validation. Auxiliary gradient outputs must be ordinary values.
+//!
+//! Use [`Pullback::apply_with_destinations`] for explicit cotangent storage or nonzero final-state cotangent seeds.
+//! For reference inputs, those destinations hold final-state cotangents before replay and initial-state cotangents
+//! afterward; replay may replace their contents. For ordinary inputs, reference destinations accumulate by addition.
 //!
 //! # Zero Differential Spaces
 //!
@@ -140,7 +160,7 @@ use crate::errors::MaybeFallible;
 use crate::operations::{AddOperation, OneOperationProvider, Zero, ZeroLikeOperation};
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
-use crate::programs::{ProgramError, TypeError, Value};
+use crate::programs::{ProgramError, ReferenceBoundary, ReferenceBoundaryError, TypeError, Value};
 use crate::tracing::TracingContext;
 
 pub mod batching;
@@ -148,7 +168,6 @@ pub mod elementwise;
 pub mod forward;
 pub mod hessian;
 pub mod jacobian;
-pub mod operations;
 pub mod reverse;
 pub mod types;
 pub mod zeros;
@@ -159,18 +178,16 @@ pub use elementwise::{
     UnaryElementwiseJvpOperands, binary_elementwise_jvp, unary_elementwise_jvp,
 };
 pub use forward::{
-    DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationTracer,
-    ForwardModeDifferentiate, Linearization, LinearizationTracer, MemberDifferentiableOperation, Pushforward,
-    jvp_projected_operation,
+    DifferentiableOperation, DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationPolicy,
+    DifferentiationTracer, ForwardModeDifferentiate, FusedDifferentiation, Linearization, LinearizationTracer,
+    LinearizedDifferentiation, MemberDifferentiableOperation, Pushforward, jvp_projected_operation,
 };
 pub use hessian::{Hessian, HessianBlock};
 pub use jacobian::{Jacobian, JacobianBlock};
-pub use operations::{
-    CustomJvp, CustomJvpOperation, CustomVjp, CustomVjpOperation, LinearCallOperation, STOP_GRADIENT_OPERATION_NAME,
-    StopGradient, StopGradientOperation, StopGradients, custom_jvp, custom_vjp,
-};
 pub use reverse::{
-    Pullback, ReverseModeDifferentiate, TransposableOperation, TranspositionDriver, transpose_mixed_operation,
+    CotangentDestination, CotangentDestinationKind, CotangentReferenceAccumulator, CotangentSeed,
+    GradientOperationProvider, Pullback, ReferenceOperandCotangents, ReverseModeDifferentiate, TransposableOperation,
+    TranspositionContext, TranspositionDriver, reference_operand_cotangents, transpose_mixed_operation,
     transpose_projected_operation,
 };
 pub use types::{DenseDifferentiableType, DifferentiableType};
@@ -342,6 +359,99 @@ impl From<DifferentiationError> for ProgramError {
     }
 }
 
+/// Position of a value at a differentiation boundary, numbered within its flattened parameter group.
+/// This is used for diagnostic purposes.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum DifferentiationBoundaryPosition {
+    /// Active primal input at the specified index.
+    Input(usize),
+
+    /// Captured primal value at the specified index.
+    Capture(usize),
+
+    /// Tangent paired with the primal input at the provided index.
+    Tangent(usize),
+
+    /// Caller-provided cotangent destination for the primal input at the provided index.
+    Cotangent(usize),
+}
+
+impl Display for DifferentiationBoundaryPosition {
+    #[inline]
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Input(index) => write!(formatter, "input {index}"),
+            Self::Capture(index) => write!(formatter, "capture {index}"),
+            Self::Tangent(index) => write!(formatter, "tangent {index}"),
+            Self::Cotangent(index) => write!(formatter, "cotangent {index}"),
+        }
+    }
+}
+
+impl ReferenceBoundary<DifferentiationBoundaryPosition> {
+    /// Creates a differentiation [`ReferenceBoundary`], checking that inputs, captures, and tangents identify distinct
+    /// allocations, in that order. Non-reference values do not contribute allocation identities. The boundary retains
+    /// reference identities so that a reusable [`Pushforward`] or [`Pullback`] can reject later arguments that alias
+    /// the original primal state.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first identity or alias error in boundary order, preserving context-resolution errors unchanged.
+    pub(crate) fn new_for_differentiation<
+        'v,
+        C: Context<Value: 'v>,
+        II: IntoIterator<Item = &'v C::Value>,
+        TI: IntoIterator<Item = &'v C::Value>,
+        CI: IntoIterator<Item = &'v C::Value>,
+    >(
+        context: &C,
+        inputs: II,
+        tangents: TI,
+        captures: CI,
+    ) -> Result<Self, ProgramError> {
+        let inputs = inputs
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| (DifferentiationBoundaryPosition::Input(index), value));
+        let captures = captures
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| (DifferentiationBoundaryPosition::Capture(index), value));
+        let tangents = tangents
+            .into_iter()
+            .enumerate()
+            .map(|(index, value)| (DifferentiationBoundaryPosition::Tangent(index), value));
+        Ok(Self::new(context, inputs.chain(captures).chain(tangents))?)
+    }
+
+    /// Checks that the provided reference arguments to a reusable derivative function are distinct from one another
+    /// and from its original primal inputs and captures. For example, a pushforward must reject the original primal
+    /// reference as a tangent argument, since tangent updates would then mutate the primal state.
+    ///
+    /// # Errors
+    ///
+    /// Reports an alias of a retained allocation as a primal boundary conflict. Other identity, alias, and context
+    /// errors retain the core validator's diagnostics.
+    pub(crate) fn validate_differentiation_arguments<
+        'v,
+        C: Context<Value: 'v>,
+        V: IntoIterator<Item = (DifferentiationBoundaryPosition, &'v C::Value)>,
+    >(
+        &self,
+        context: &C,
+        values: V,
+    ) -> Result<(), ProgramError> {
+        match self.validate(context, values) {
+            Err(ReferenceBoundaryError::AliasedRetained { position, .. }) => Err(ProgramError::InvalidArgument {
+                message: format!(
+                    "{position} aliases a reference bound at the primal boundary of the differentiated function",
+                ),
+            }),
+            result => result.map_err(ProgramError::from),
+        }
+    }
+}
+
 /// Derivative transform family that was active when an error occurred. Holomorphic entry points use the same forward-
 /// or reverse-Jacobian family as their non-holomorphic counterparts. Holomorphy changes the admissible element types,
 /// not the mathematical derivative object being materialized.
@@ -496,15 +606,15 @@ pub type DifferentiationBuilderExecutionContext<ContextState, V, Input> =
 ///   - [`with_captures`](Self::with_captures) supplies dynamic runtime values that participate in the primal
 ///     computation but which are excluded from derivative bookkeeping. The active input and captures can have unrelated
 ///     [`Parameterized`] structures. For example, a derived model struct can be active while a tuple containing
-///     batches, targets, and optional runtime state is captured. The builder reparameterizes both structures from
-///     runtime leaves to the terminal function's tracer leaves before invoking the closure. Unlike
-///     [`StopGradients::stop_gradients`], captures do not allocate any gradient, Jacobian, or Hessian values.
-///     They are also distinct from compilation captures stored by [`ClosedProgram`](crate::ClosedProgram).
-///     Differentiation captures remain explicit runtime inputs to the function being differentiated, and changing their
-///     values does not make them static specialization arguments. Captures follow the same operational validity rules
-///     as ordinary values. If a capture is incompatible with the selected context, the operation or execution boundary
-///     that uses it returns its normal context- or backend-specific error. An unused capture is harmless and does not
-///     fail the builder's up-front signature validation.
+///     batches, targets, and optional runtime state is captured. The builder reparameterizes both structures
+///     from runtime leaves to the terminal function's tracer leaves before invoking the closure. Unlike
+///     [`StopGradients::stop_gradients`](crate::StopGradients::stop_gradients), captures do not allocate
+///     any gradient, Jacobian, or Hessian values. They are also distinct from compilation captures stored by
+///     [`ClosedProgram`](crate::ClosedProgram). Differentiation captures remain explicit runtime inputs to the function
+///     being differentiated, and changing their values does not make them static specialization arguments. Captures
+///     follow the same operational validity rules as ordinary values. If a capture is incompatible with the selected
+///     context, the operation or execution boundary that uses it returns its normal context- or backend-specific error.
+///     An unused capture is harmless and does not fail the builder's up-front signature validation.
 ///   - [`with_auxiliary_output`](Self::with_auxiliary_output) declares that the closure being differentiated returns
 ///     `(output, auxiliary)`. `auxiliary` may be any third, independently shaped [`Parameterized`] tree and is
 ///     reconstructed with runtime leaves without being differentiated.
@@ -824,6 +934,11 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     /// validates complex input and output types but cannot prove the
     /// [Cauchy-Riemann equations](https://en.wikipedia.org/wiki/Cauchy%E2%80%93Riemann_equations).
     ///
+    /// Reference inputs return ordinary gradients with respect to their initial contents. The primal runs once,
+    /// preserving mutations, and each invocation uses fresh zero cotangent references that are frozen before return.
+    /// Refer to the module's [reference gradient contract](self#gradients-of-reference-inputs) for an example and to
+    /// [`Pullback::apply_with_destinations`] for explicit final state seeds.
+    ///
     /// # Parameters
     ///
     ///   - `function`: Scalar-valued function to evaluate and differentiate at the builder's active primal.
@@ -848,8 +963,8 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         F: FnOnce(
             Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Output,
-        DifferentiationBuilderExecutionContext<ContextState, V, Input>:
-            ReverseModeDifferentiate<Operation: OneOperationProvider<V::Type>> + Zero<V>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate<Operation: GradientOperationProvider<V::Type> + OneOperationProvider<V::Type>>
+            + Zero<V>,
     {
         DifferentiationBuilder {
             primal: self.primal,
@@ -890,8 +1005,8 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         F: FnOnce(
             Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Output,
-        DifferentiationBuilderExecutionContext<ContextState, V, Input>:
-            ReverseModeDifferentiate<Operation: OneOperationProvider<V::Type>> + Zero<V>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate<Operation: GradientOperationProvider<V::Type> + OneOperationProvider<V::Type>>
+            + Zero<V>,
     {
         self.value_and_gradient(function).map(|(_, gradient)| gradient)
     }
@@ -1074,7 +1189,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     where
         V: Value<
                 Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextState, V, Input>>
-                          + DenseDifferentiableType<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                          + DenseDifferentiableType<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>,
             >,
         Input: Parameterized<
                 V,
@@ -1083,38 +1198,38 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
                 To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>: Parameterized<
                     LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                     To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>> = Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
-                    To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>> = Input::To<
-                        LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                    To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>> = Input::To<
+                        LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>,
                     >,
                     To<V::Type> = Input::To<V::Type>,
                 >,
                 Family: ParameterizedFamily<V::Type>
                             + ParameterizedFamily<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>
                             + ParameterizedFamily<
-                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>,
                 >,
             >,
         Output: Parameterized<
-                LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>,
                 To<V::Type>: Clone,
                 Family: ParameterizedFamily<V::Type> + ParameterizedFamily<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
             >,
         ContextState: DifferentiationBuilderContext<V, Input>,
         F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>>,
+            Input::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>>,
         ) -> Result<Output, ProgramError>,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
                 Type = V::Type,
                 Value = V,
                 Operation: PartiallyEvaluatableOperation<DifferentiationBuilderExecutionContext<ContextState, V, Input>>
-                               + PartiallyEvaluatableOperation<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>
+                               + PartiallyEvaluatableOperation<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>
                                + PartiallyEvaluatableOperation<TracingContext<<DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant, <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation>>
                                + DifferentiableOperation<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>
                                + DifferentiableOperation<TracingContext<<DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant, <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation>>
                                + DifferentiableOperation<
                     PartialEvaluationContext<TracingContext<<DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant, <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation>>,
                 > + DifferentiableOperation<
-                    PartialEvaluationContext<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                    PartialEvaluationContext<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>,
                 > + TransposableOperation<<DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant, <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation>
                                + ResidualZeroProvider<V::Type>
                                + From<AddOperation<V::Type>>,
@@ -1191,9 +1306,11 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         F: FnOnce(
             Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Output,
-        DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate + Zero<V>,
-        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation:
-            OneOperationProvider<V::Type> + From<ZeroLikeOperation<V::Type>>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate<
+                Operation: GradientOperationProvider<V::Type>
+                               + OneOperationProvider<V::Type>
+                               + From<ZeroLikeOperation<V::Type>>,
+            > + Zero<V>,
     {
         DifferentiationBuilder {
             primal: self.primal,
@@ -1259,9 +1376,11 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
         F: FnOnce(
             Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Output,
-        DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate + Zero<V>,
-        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation:
-            OneOperationProvider<V::Type> + From<ZeroLikeOperation<V::Type>>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate<
+                Operation: GradientOperationProvider<V::Type>
+                               + OneOperationProvider<V::Type>
+                               + From<ZeroLikeOperation<V::Type>>,
+            > + Zero<V>,
     {
         self.value_and_gradient(function).map(|((_, auxiliary), gradient)| (gradient, auxiliary))
     }
@@ -1416,7 +1535,7 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
     where
         V: Value<
                 Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextState, V, Input>>
-                          + DenseDifferentiableType<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                          + DenseDifferentiableType<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>,
             >,
         Input: Parameterized<
                 V,
@@ -1425,43 +1544,43 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
                 To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>: Parameterized<
                     LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                     To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>> = Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
-                    To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>> = Input::To<
-                        LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                    To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>> = Input::To<
+                        LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>,
                     >,
                     To<V::Type> = Input::To<V::Type>,
                 >,
                 Family: ParameterizedFamily<V::Type>
                             + ParameterizedFamily<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>
                             + ParameterizedFamily<
-                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>,
                 >,
             >,
         Output: Parameterized<
-                LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>,
                 To<V::Type>: Clone,
                 Family: ParameterizedFamily<V::Type> + ParameterizedFamily<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
             >,
         AuxiliaryOutput: Parameterized<
-                LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>,
                 To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>: Parameterized<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, To<V> = AuxiliaryOutput::To<V>>,
                 Family: ParameterizedFamily<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>> + ParameterizedFamily<V>,
             >,
         ContextState: DifferentiationBuilderContext<V, Input>,
         F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>>,
+            Input::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>>,
         ) -> Result<(Output, AuxiliaryOutput), ProgramError>,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
                 Type = V::Type,
                 Value = V,
                 Operation: PartiallyEvaluatableOperation<DifferentiationBuilderExecutionContext<ContextState, V, Input>>
-                               + PartiallyEvaluatableOperation<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>
+                               + PartiallyEvaluatableOperation<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>
                                + PartiallyEvaluatableOperation<TracingContext<<DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant, <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation>>
                                + DifferentiableOperation<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>
                                + DifferentiableOperation<TracingContext<<DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant, <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation>>
                                + DifferentiableOperation<
                     PartialEvaluationContext<TracingContext<<DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant, <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation>>,
                 > + DifferentiableOperation<
-                    PartialEvaluationContext<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                    PartialEvaluationContext<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>,
                 > + TransposableOperation<<DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant, <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation>
                                + ResidualZeroProvider<V::Type>
                                + From<AddOperation<V::Type>>,
@@ -1690,9 +1809,8 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
             Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Output,
-        DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate + Zero<V>,
-        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation:
-            OneOperationProvider<V::Type>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate<Operation: GradientOperationProvider<V::Type> + OneOperationProvider<V::Type>>
+            + Zero<V>,
     {
         value_and_gradient_in_context(
             &self.context.resolve(&self.primal)?,
@@ -1739,9 +1857,8 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
             Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Output,
-        DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate + Zero<V>,
-        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation:
-            OneOperationProvider<V::Type>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate<Operation: GradientOperationProvider<V::Type> + OneOperationProvider<V::Type>>
+            + Zero<V>,
     {
         self.value_and_gradient(function).map(|(_, gradient)| gradient)
     }
@@ -1910,7 +2027,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
     where
         V: Value<
                 Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextState, V, Input>>
-                          + DenseDifferentiableType<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                          + DenseDifferentiableType<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>,
             >,
         Input: Parameterized<
                 V,
@@ -1919,15 +2036,15 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
                 To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>: Parameterized<
                     LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                     To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>> = Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
-                    To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>> = Input::To<
-                        LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                    To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>> = Input::To<
+                        LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>,
                     >,
                     To<V::Type> = Input::To<V::Type>,
                 >,
                 Family: ParameterizedFamily<V::Type>
                             + ParameterizedFamily<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>
                             + ParameterizedFamily<
-                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>,
                 >,
             >,
         Capture: Parameterized<
@@ -1936,37 +2053,37 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
                 To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>: Parameterized<
                     LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                     To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>> = Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
-                    To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>> = Capture::To<
-                        LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                    To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>> = Capture::To<
+                        LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>,
                     >,
                 >,
                 Family: ParameterizedFamily<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>
                             + ParameterizedFamily<
-                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>,
                 >,
             >,
         Output: Parameterized<
-                LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>,
                 To<V::Type>: Clone,
                 Family: ParameterizedFamily<V::Type> + ParameterizedFamily<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
             >,
         ContextState: DifferentiationBuilderContext<V, Input>,
         F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>>,
-            Capture::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>>,
+            Input::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>>,
+            Capture::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>>,
         ) -> Result<Output, ProgramError>,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
                 Type = V::Type,
                 Value = V,
                 Operation: PartiallyEvaluatableOperation<DifferentiationBuilderExecutionContext<ContextState, V, Input>>
-                               + PartiallyEvaluatableOperation<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>
+                               + PartiallyEvaluatableOperation<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>
                                + PartiallyEvaluatableOperation<TracingContext<<DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant, <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation>>
                                + DifferentiableOperation<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>
                                + DifferentiableOperation<TracingContext<<DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant, <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation>>
                                + DifferentiableOperation<
                     PartialEvaluationContext<TracingContext<<DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant, <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation>>,
                 > + DifferentiableOperation<
-                    PartialEvaluationContext<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                    PartialEvaluationContext<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>,
                 > + TransposableOperation<<DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant, <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation>
                                + ResidualZeroProvider<V::Type>
                                + From<AddOperation<V::Type>>,
@@ -2051,9 +2168,11 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
             Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Output,
-        DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate + Zero<V>,
-        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation:
-            OneOperationProvider<V::Type> + From<ZeroLikeOperation<V::Type>>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate<
+                Operation: GradientOperationProvider<V::Type>
+                               + OneOperationProvider<V::Type>
+                               + From<ZeroLikeOperation<V::Type>>,
+            > + Zero<V>,
     {
         value_and_gradient_auxiliary_in_context(
             &self.context.resolve(&self.primal)?,
@@ -2127,9 +2246,11 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
             Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
         ) -> Output,
-        DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate + Zero<V>,
-        <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation:
-            OneOperationProvider<V::Type> + From<ZeroLikeOperation<V::Type>>,
+        DifferentiationBuilderExecutionContext<ContextState, V, Input>: ReverseModeDifferentiate<
+                Operation: GradientOperationProvider<V::Type>
+                               + OneOperationProvider<V::Type>
+                               + From<ZeroLikeOperation<V::Type>>,
+            > + Zero<V>,
     {
         self.value_and_gradient(function).map(|((_, auxiliary), gradient)| (gradient, auxiliary))
     }
@@ -2300,7 +2421,7 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
     where
         V: Value<
                 Type: DenseDifferentiableType<DifferentiationBuilderExecutionContext<ContextState, V, Input>>
-                          + DenseDifferentiableType<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                          + DenseDifferentiableType<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>,
             >,
         Input: Parameterized<
                 V,
@@ -2309,15 +2430,15 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
                 To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>: Parameterized<
                     LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                     To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>> = Input::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
-                    To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>> = Input::To<
-                        LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                    To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>> = Input::To<
+                        LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>,
                     >,
                     To<V::Type> = Input::To<V::Type>,
                 >,
                 Family: ParameterizedFamily<V::Type>
                             + ParameterizedFamily<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>
                             + ParameterizedFamily<
-                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>,
                 >,
             >,
         Capture: Parameterized<
@@ -2326,42 +2447,42 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
                 To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>: Parameterized<
                     LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>,
                     To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>> = Capture::To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
-                    To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>> = Capture::To<
-                        LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                    To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>> = Capture::To<
+                        LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>,
                     >,
                 >,
                 Family: ParameterizedFamily<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>
                             + ParameterizedFamily<
-                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>,
                 >,
             >,
         Output: Parameterized<
-                LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>,
                 To<V::Type>: Clone,
                 Family: ParameterizedFamily<V::Type> + ParameterizedFamily<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>,
             >,
         AuxiliaryOutput: Parameterized<
-                LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>,
                 To<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>: Parameterized<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, To<V> = AuxiliaryOutput::To<V>>,
                 Family: ParameterizedFamily<LinearizationTracer<DifferentiationBuilderExecutionContext<ContextState, V, Input>>> + ParameterizedFamily<V>,
             >,
         ContextState: DifferentiationBuilderContext<V, Input>,
         F: FnOnce(
-            Input::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>>,
-            Capture::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>>,
+            Input::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>>,
+            Capture::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>>,
         ) -> Result<(Output, AuxiliaryOutput), ProgramError>,
         DifferentiationBuilderExecutionContext<ContextState, V, Input>: Context<
                 Type = V::Type,
                 Value = V,
                 Operation: PartiallyEvaluatableOperation<DifferentiationBuilderExecutionContext<ContextState, V, Input>>
-                               + PartiallyEvaluatableOperation<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>
+                               + PartiallyEvaluatableOperation<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>
                                + PartiallyEvaluatableOperation<TracingContext<<DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant, <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation>>
                                + DifferentiableOperation<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>
                                + DifferentiableOperation<TracingContext<<DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant, <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation>>
                                + DifferentiableOperation<
                     PartialEvaluationContext<TracingContext<<DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant, <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation>>,
                 > + DifferentiableOperation<
-                    PartialEvaluationContext<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>>>,
+                    PartialEvaluationContext<DifferentiationContext<PartialEvaluationContext<DifferentiationBuilderExecutionContext<ContextState, V, Input>>, LinearizedDifferentiation>>,
                 > + TransposableOperation<<DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Constant, <DifferentiationBuilderExecutionContext<ContextState, V, Input> as Domain>::Operation>
                                + ResidualZeroProvider<V::Type>
                                + From<AddOperation<V::Type>>,
@@ -2561,13 +2682,13 @@ mod tests {
 
     use ryft_macros::Parameterized;
 
-    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
+    use crate::arrays::{Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType};
     use crate::batching::{BatchAxis, batch};
     use crate::contexts::{Context, EagerContext, StagingContext, ValueResolution};
     use crate::operations::complex::{Complex, Real};
     use crate::operations::{One, Reduce, ReductionKind};
     use crate::parameters::Parameter;
-    use crate::programs::{BindingRegionDriver, Provenance, ProvenanceScope};
+    use crate::programs::{BindingRegionDriver, Provenance, ProvenanceScope, ReferenceType};
     use crate::tracing::DomainTracingContext;
 
     use super::*;
@@ -2685,6 +2806,112 @@ mod tests {
         let differentiation_error =
             DifferentiationError::UndefinedTangentType { primal_type: "ref<f32[4]>".to_string() };
         assert_eq!(DifferentiationError::from(TypeError::from(differentiation_error.clone())), differentiation_error,);
+    }
+
+    #[test]
+    fn test_differentiation_boundary_position() {
+        for (position, expected) in [
+            (DifferentiationBoundaryPosition::Input(1), "input 1"),
+            (DifferentiationBoundaryPosition::Capture(2), "capture 2"),
+            (DifferentiationBoundaryPosition::Tangent(3), "tangent 3"),
+            (DifferentiationBoundaryPosition::Cotangent(4), "cotangent 4"),
+        ] {
+            assert_eq!(position.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn test_reference_boundary_new_for_differentiation() {
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let inputs = [
+            ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32))),
+            ArrayIrValue::Array(Array::scalar(2.0_f32)),
+        ];
+        let tangents = [
+            ArrayIrValue::Reference(ArrayReference::new(Array::scalar(0.0_f32))),
+            ArrayIrValue::Array(Array::scalar(1.0_f32)),
+        ];
+        let captures = [ArrayIrValue::Reference(ArrayReference::new(Array::scalar(3.0_f32)))];
+        assert_eq!(
+            ReferenceBoundary::new_for_differentiation(&context, &inputs, &tangents, &captures).map(|_| ()),
+            Ok(())
+        );
+
+        // Inputs and captures precede tangent aliases, and repeated tangents retain their own group indices.
+        assert!(matches!(
+            ReferenceBoundary::new_for_differentiation(&context, &inputs, [&inputs[0]], &captures),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "tangent 0 and input 0 bind the same reference allocation",
+        ));
+        assert!(matches!(
+            ReferenceBoundary::new_for_differentiation(&context, &inputs, [&captures[0]], &captures),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "tangent 0 and capture 0 bind the same reference allocation",
+        ));
+        assert!(matches!(
+            ReferenceBoundary::new_for_differentiation(&context, &inputs, [&tangents[0], &tangents[0]], []),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "tangent 1 and tangent 0 bind the same reference allocation",
+        ));
+        assert!(matches!(
+            ReferenceBoundary::new_for_differentiation(&context, &inputs, [&inputs[0]], [&inputs[0]]),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "capture 0 and input 0 bind the same reference allocation",
+        ));
+
+        // A tangent owned by a different trace cannot supply a boundary identity in the active trace.
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let foreign = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new()
+            .input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
+        assert!(matches!(
+            ReferenceBoundary::new_for_differentiation(&trace, [], [&foreign], []),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "tangent 0 has reference type `ref<f32[]>` but reports no reference allocation identity",
+        ));
+    }
+
+    #[test]
+    fn test_reference_boundary_validate_differentiation_arguments() {
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let primal = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
+        let derivative = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(0.0_f32)));
+        let boundary = ReferenceBoundary::new_for_differentiation(&context, [&primal], [], []).unwrap();
+        assert_eq!(
+            boundary.validate_differentiation_arguments(
+                &context,
+                [(DifferentiationBoundaryPosition::Cotangent(0), &derivative)],
+            ),
+            Ok(()),
+        );
+        assert!(matches!(
+            boundary.validate_differentiation_arguments(
+                &context,
+                [(DifferentiationBoundaryPosition::Tangent(0), &primal)],
+            ),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "tangent 0 aliases a reference bound at the primal boundary of the \
+                    differentiated function",
+        ));
+        assert!(matches!(
+            boundary.validate_differentiation_arguments(
+                &context,
+                [(DifferentiationBoundaryPosition::Cotangent(0), &primal)],
+            ),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "cotangent 0 aliases a reference bound at the primal boundary of the \
+                    differentiated function",
+        ));
+        assert!(matches!(
+            boundary.validate_differentiation_arguments(
+                &context,
+                [
+                    (DifferentiationBoundaryPosition::Cotangent(0), &derivative),
+                    (DifferentiationBoundaryPosition::Cotangent(1), &derivative),
+                ],
+            ),
+            Err(ProgramError::InvalidArgument { message })
+                if message == "cotangent 1 and cotangent 0 bind the same reference allocation",
+        ));
     }
 
     #[test]
@@ -2949,16 +3176,16 @@ mod tests {
                 self.0.provenance()
             }
 
+            fn resolve(&self, value: &Array) -> ValueResolution<Array> {
+                self.0.resolve(value)
+            }
+
             fn invoke_with_provenance_origin<R, F: FnOnce() -> R>(&self, origin: Provenance, function: F) -> R {
                 self.0.invoke_with_provenance_origin(origin, function)
             }
 
             fn invoke_with_provenance_scope<R, F: FnOnce() -> R>(&self, scope: ProvenanceScope, function: F) -> R {
                 self.0.invoke_with_provenance_scope(scope, function)
-            }
-
-            fn resolve(&self, value: &Array) -> ValueResolution<Array> {
-                self.0.resolve(value)
             }
         }
 
