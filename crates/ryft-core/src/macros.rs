@@ -1131,7 +1131,9 @@ macro_rules! impl_reference_dischargeable_operation {
 /// transformation driver. Elementwise operations should generally use [`impl_differentiable_elementwise_operation!`]
 /// instead because it provides lazy tangent contributions, primal alignment, and structured transposition cases. The
 /// closure-like syntax only names the generated method arguments; it does not allocate or dynamically dispatch a
-/// runtime closure.
+/// runtime closure. The transposition body receives the full [`TranspositionContext`](crate::TranspositionContext)
+/// and one [`CotangentAccumulator`](crate::CotangentAccumulator) per operand. It submits contributions through these
+/// handles and returns `Result<(), DifferentiationError>`; omitted contributions remain structural zeros.
 ///
 /// An optional leading generic list declares type parameters owned by the operation payload. Those parameters are
 /// available to both generated implementations, so each rule can tie the payload's type universe to the abstraction
@@ -1140,7 +1142,7 @@ macro_rules! impl_reference_dischargeable_operation {
 /// # Examples
 ///
 /// A structural linear operation can provide both algorithms directly. The JVP body receives differentiation duals,
-/// while the transposition body receives partial primal inputs and output cotangents:
+/// while the transposition body receives partial primal inputs, output cotangents, and operand accumulators:
 ///
 /// ```rust,ignore
 /// impl_differentiable_operation! {
@@ -1155,8 +1157,8 @@ macro_rules! impl_reference_dischargeable_operation {
 ///         V: Value<Type = ArrayType>,
 ///         O: Operation<Type = ArrayType> + From<BroadcastOperation>,
 ///     {
-///         |operation, context, driver, inputs, outputs| {
-///             broadcast_transpose(operation, context, driver, inputs, outputs)
+///         |operation, context, driver, inputs, outputs, accumulators| {
+///             broadcast_transpose(operation, context, driver, inputs, outputs, accumulators)
 ///         }
 ///     },
 /// }
@@ -1195,6 +1197,7 @@ macro_rules! impl_reference_dischargeable_operation {
 ///   - `$driver_binding`: Name bound to the instruction-scoped region driver inside a rule body.
 ///   - `$inputs`: Name bound to the complete input slice inside a rule body.
 ///   - `$outputs`: Name bound to the complete output-cotangent slice inside a transposition body.
+///   - `$accumulators`: Name bound to the operand-aligned cotangent accumulator slice inside a transposition body.
 #[macro_export]
 macro_rules! impl_differentiable_operation {
     // This branch normalizes an operation-generic invocation before parsing its JVP and transposition rules.
@@ -1328,8 +1331,15 @@ macro_rules! impl_differentiable_operation {
         @jvp_ready [$($generic:ident),*] [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*]
         { |$self:ident, $jvp_context:ident, $jvp_driver:ident, $inputs:ident| $jvp_body:block }
         transpose<$value:ident, $operations:ident>
-        { |$transpose_self:ident, $transpose_context:ident, $transpose_driver:ident, $transpose_inputs:ident,
-            $outputs:ident| $transpose_body:block } $(,)?
+        {
+            |
+                $transpose_self:ident,
+                $transpose_context:ident,
+                $transpose_driver:ident,
+                $transpose_inputs:ident,
+                $outputs:ident,
+                $accumulators:ident
+            | $transpose_body:block } $(,)?
     ) => {
         $crate::impl_differentiable_operation! {
             @impl_jvp
@@ -1344,7 +1354,14 @@ macro_rules! impl_differentiable_operation {
             @impl_transpose
             impl<$value, $operations $(, $generic)*> $operation
             where {}
-            |$transpose_self, $transpose_context, $transpose_driver, $transpose_inputs, $outputs| $transpose_body
+            |
+                $transpose_self,
+                $transpose_context,
+                $transpose_driver,
+                $transpose_inputs,
+                $outputs,
+                $accumulators
+            | $transpose_body
         }
     };
 
@@ -1354,8 +1371,15 @@ macro_rules! impl_differentiable_operation {
         [$($generic:ident),*] [$context:ident] [$operation:ty] [$($jvp_bounds:tt)*]
         [$self:ident] [$jvp_context:ident] [$jvp_driver:ident] [$inputs:ident] [$jvp_body:block]
         [$value:ident] [$operations:ident] [$($transpose_bounds:tt)*]
-        { |$transpose_self:ident, $transpose_context:ident, $transpose_driver:ident, $transpose_inputs:ident,
-            $outputs:ident| $transpose_body:block } $(,)?
+        {
+            |
+                $transpose_self:ident,
+                $transpose_context:ident,
+                $transpose_driver:ident,
+                $transpose_inputs:ident,
+                $outputs:ident,
+                $accumulators:ident
+            | $transpose_body:block } $(,)?
     ) => {
         $crate::impl_differentiable_operation! {
             @impl_jvp
@@ -1370,7 +1394,14 @@ macro_rules! impl_differentiable_operation {
             @impl_transpose
             impl<$value, $operations $(, $generic)*> $operation
             where { $($transpose_bounds)* }
-            |$transpose_self, $transpose_context, $transpose_driver, $transpose_inputs, $outputs| $transpose_body
+            |
+                $transpose_self,
+                $transpose_context,
+                $transpose_driver,
+                $transpose_inputs,
+                $outputs,
+                $accumulators
+            | $transpose_body
         }
     };
 
@@ -1422,7 +1453,7 @@ macro_rules! impl_differentiable_operation {
         @impl_transpose
         impl<$value:ident, $operations:ident $(, $generic:ident)*> $operation:ty
         where { $($bounds:tt)* }
-        |$self:ident, $context:ident, $driver:ident, $inputs:ident, $outputs:ident| $body:block
+        |$self:ident, $context:ident, $driver:ident, $inputs:ident, $outputs:ident, $accumulators:ident| $body:block
     ) => {
         impl<
             $value: $crate::Value,
@@ -1439,26 +1470,11 @@ macro_rules! impl_differentiable_operation {
                 $driver: &__D,
                 $inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<$value, $operations>>>],
                 $outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<$value, $operations>>>],
-                // TODO(eaplatanios): Shouldn't this be another generic parameter so the provided closure can use it?
-                accumulators: &[$crate::CotangentAccumulator],
+                $accumulators: &[$crate::CotangentAccumulator],
             ) -> Result<(), $crate::DifferentiationError> {
-                let contributions = (|| -> Result<
-                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<$value, $operations>>>>,
-                $crate::DifferentiationError,
-            > {
-                // Hand-written rule bodies stage ordinary linear operations only, so the transposition context is
-                // narrowed to its tracing context through `DerefMut` before the body runs. The body consequently
-                // cannot reach the reference accumulators, which only the hand-implemented reference-aware rules use.
-                let $context: &mut $crate::TracingContext<$value, $operations> = $context;
+                $crate::check_count!("input", $accumulators, $inputs.len(), ProgramError);
                 let $self = self;
                 $body
-
-                })()?;
-                $crate::check_count!("input", contributions, accumulators.len(), ProgramError);
-                for (accumulator, contribution) in accumulators.iter().zip(contributions) {
-                    accumulator.accumulate($context, contribution)?;
-                }
-                Ok(())
             }
         }
     };
@@ -2293,7 +2309,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                 $($generic: $crate::Type,)*
                 $($transpose_bounds)*
             }
-            |operation, _context, _driver, inputs, outputs| {
+            |operation, context, _driver, inputs, outputs, accumulators| {
                 $crate::check_count!("input", inputs, 2, ProgramError);
                 $crate::check_count!("output", outputs, 1, ProgramError);
                 let (linear_index, contribution) = match (inputs[0].is_unknown(), inputs[1].is_unknown()) {
@@ -2379,16 +2395,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                         .into());
                     }
                 };
-                let mut contributions = inputs
-                    .iter()
-                    .map(|input| {
-                        Ok($crate::MaybeZero::Zero($crate::DifferentiableType::cotangent(
-                            $crate::Typed::r#type(input).as_ref(),
-                        )?))
-                    })
-                    .collect::<Result<Vec<_>, $crate::DifferentiationError>>()?;
-                contributions[linear_index] = contribution;
-                Ok(contributions)
+                accumulators[linear_index].accumulate(context, contribution)
             }
         }
     };
@@ -2425,7 +2432,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                 $($generic: $crate::Type,)*
                 $($transpose_bounds)*
             }
-            |operation, _context, _driver, inputs, outputs| {
+            |operation, context, _driver, inputs, outputs, accumulators| {
                 $crate::check_count!("input", inputs, 2, ProgramError);
                 $crate::check_count!("output", outputs, 1, ProgramError);
                 let left_is_linear = inputs[0].is_unknown();
@@ -2471,12 +2478,7 @@ macro_rules! impl_differentiable_elementwise_operation {
                         )
                     }
                 };
-                Ok(vec![
-                    contribution,
-                    $crate::MaybeZero::Zero($crate::DifferentiableType::cotangent(
-                        $crate::Typed::r#type(&inputs[1]).as_ref(),
-                    )?),
-                ])
+                accumulators[0].accumulate(context, contribution)
             }
         }
     };
@@ -2494,8 +2496,14 @@ macro_rules! impl_differentiable_elementwise_operation {
             transpose<$value:ident, $operations:ident>
             where { $($transpose_bounds:tt)* }
             {
-                |$transpose_self:ident, $transpose_context:ident, $transpose_driver:ident, $transpose_inputs:ident,
-                    $outputs:ident| $transpose_body:block
+                |
+                    $transpose_self:ident,
+                    $transpose_context:ident,
+                    $transpose_driver:ident,
+                    $transpose_inputs:ident,
+                    $outputs:ident,
+                    $accumulators:ident
+                | $transpose_body:block
             }
         }
     ) => {
@@ -2513,7 +2521,14 @@ macro_rules! impl_differentiable_elementwise_operation {
                 $($generic: $crate::Type,)*
                 $($transpose_bounds)*
             }
-            |$transpose_self, $transpose_context, $transpose_driver, $transpose_inputs, $outputs| $transpose_body
+            |
+                $transpose_self,
+                $transpose_context,
+                $transpose_driver,
+                $transpose_inputs,
+                $outputs,
+                $accumulators
+            | $transpose_body
         }
     };
 
@@ -4837,10 +4852,17 @@ mod tests {
             }
         },
         transpose<V, O> {
-            |_operation, _context, _driver, inputs, outputs| {
+            |_operation, context, _driver, inputs, outputs, accumulators| {
                 check_count!("input", inputs, 2, ProgramError);
                 check_count!("output", outputs, 1, ProgramError);
-                Ok(vec![outputs[0].clone(), outputs[0].clone()])
+                check_count!("accumulators", accumulators, 2, ProgramError);
+                {
+                    let contribution = outputs[0].clone();
+                    accumulators[0].accumulate(context, contribution)?;
+                    let contribution = outputs[0].clone();
+                    accumulators[1].accumulate(context, contribution)?;
+                    Ok(())
+                }
             }
         },
     }
@@ -5407,8 +5429,6 @@ mod tests {
         );
     }
 
-    // TODO(eaplatanios): Generally about this `tests` module, the tests are not defined in the same order as the
-    //  corresponding macros. Re-order them accordingly.
     #[test]
     fn test_define_arithmetic_dimension_operation() {
         let left_type = DimensionType::new(DimensionVariable::new("left", DimensionBounds::new(1, Some(4)).unwrap()));
@@ -5471,397 +5491,6 @@ mod tests {
         assert_eq!(builder.instructions()[0].operation().name(), TEST_ARITHMETIC_DIMENSION_OPERATION_NAME,);
         assert_eq!(builder.instructions()[0].inputs(), &[left.atom_id().unwrap(), right.atom_id().unwrap()]);
         assert_eq!(builder.instructions()[0].outputs(), &[output.atom_id().unwrap()]);
-    }
-
-    #[test]
-    fn test_check_operation_type_inference() {
-        #[derive(Clone, Debug)]
-        struct TestMultiOutputOperation<T: Type>(PhantomData<fn() -> T>);
-
-        impl<T: Type> TestMultiOutputOperation<T> {
-            const fn new() -> Self {
-                Self(PhantomData)
-            }
-        }
-
-        impl<T: Type> Display for TestMultiOutputOperation<T> {
-            fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("test_multi_output")
-            }
-        }
-
-        impl<T: Type> Operation for TestMultiOutputOperation<T> {
-            type Type = T;
-
-            fn name(&self) -> &'static str {
-                "test_multi_output"
-            }
-
-            fn infer_output_types(
-                &self,
-                input_types: &[T],
-                _region_interfaces: &[crate::RegionInterface<T>],
-            ) -> Result<Vec<T>, TypeError> {
-                check_count!("input", input_types, 1, TypeError);
-                Ok(vec![input_types[0].clone(), input_types[0].clone()])
-            }
-        }
-
-        impl ElementwiseOperation for TestMultiOutputOperation<ArrayType> {
-            fn input_count(&self) -> usize {
-                1
-            }
-
-            fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-                Operation::infer_output_types(self, input_types, &[])
-            }
-        }
-
-        check_operation_type_inference!(
-            @elementwise @unary,
-            operation = TestMultiOutputOperation,
-            cases = [{
-                input_data_types = [DataType::F64],
-                output_data_types = [DataType::F64, DataType::F64],
-            }],
-        );
-
-        check_operation_type_inference!(
-            @elementwise @unary,
-            operation = AbsOperation,
-            cases = [
-                {
-                    input_data_types = [DataType::C64],
-                    output_data_types = [DataType::F32],
-                },
-                {
-                    input_data_types = [DataType::Boolean],
-                    error = "cannot compute the absolute value of a value of data type bool",
-                },
-            ],
-        );
-
-        check_operation_type_inference!(
-            @elementwise @binary,
-            operation = AddOperation,
-            cases = [
-                {
-                    input_data_types = [DataType::F32, DataType::F64],
-                    output_data_types = [DataType::F64],
-                },
-                {
-                    input_data_types = [DataType::Boolean, DataType::Boolean],
-                    error = "`add` does not support input data type bool",
-                },
-            ],
-        );
-
-        check_operation_type_inference!(
-            operation = AddOperation::<DataType>::new(),
-            cases = [
-                {
-                    input_types = [DataType::F32, DataType::F64],
-                    output_types = [DataType::F64],
-                },
-                {
-                    type = DataType,
-                    input_types = [],
-                    error = "expected 2 inputs but got 0",
-                },
-                {
-                    input_types = [DataType::Boolean, DataType::Boolean],
-                    error = "`add` does not support input data type bool",
-                },
-            ],
-        );
-
-        check_operation_type_inference!(
-            operation = AddOperation::<ArrayType>::new(),
-            cases = [{
-                input_types = [ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::F64)],
-                output_types = [ArrayType::scalar(DataType::F64)],
-            }],
-        );
-
-        check_operation_type_inference!(
-            @reject @unreduced,
-            operation = SinOperation::<ArrayType>::new(),
-            input_types = [ArrayType::scalar(DataType::F64)],
-        );
-
-        check_operation_type_inference!(
-            @reject @mismatched_reduced,
-            operation = AddOperation::<ArrayType>::new(),
-            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
-        );
-    }
-
-    #[test]
-    fn test_check_operation_partial_evaluation() {
-        check_operation_partial_evaluation!(
-            operation = NegOperation::new(),
-            inputs = [Array::scalar(2.0)],
-            expected = Array::scalar(-2.0),
-        );
-        check_operation_partial_evaluation!(
-            operation = AddOperation::new(),
-            cases = [
-                {
-                    inputs = [
-                        (@known, Array::scalar(2.0)),
-                        (@known, Array::scalar(3.5)),
-                    ],
-                    outputs = [
-                        (@known, Array::scalar(5.5)),
-                    ],
-                    residual_instructions = 0,
-                },
-                {
-                    inputs = [
-                        (@unknown(type = ArrayType::scalar(DataType::F64), replay = Array::scalar(2.0))),
-                        (@known, Array::scalar(3.5)),
-                    ],
-                    outputs = [
-                        (@residual, Array::scalar(5.5)),
-                    ],
-                    residual_instructions = 1,
-                },
-                {
-                    inputs = [
-                        (@known, Array::scalar(2.0)),
-                        (@unknown(type = ArrayType::scalar(DataType::F64), replay = Array::scalar(3.5))),
-                    ],
-                    outputs = [
-                        (@residual, Array::scalar(5.5)),
-                    ],
-                    residual_instructions = 1,
-                },
-                {
-                    inputs = [
-                        (@unknown(type = ArrayType::scalar(DataType::F64), replay = Array::scalar(2.0))),
-                        (@unknown(type = ArrayType::scalar(DataType::F64), replay = Array::scalar(3.5))),
-                    ],
-                    outputs = [
-                        (@residual, Array::scalar(5.5)),
-                    ],
-                    residual_instructions = 1,
-                },
-            ],
-        );
-    }
-
-    #[test]
-    fn test_check_operation_batching() {
-        #[derive(Clone)]
-        struct TestPairOperation;
-
-        impl Operation for TestPairOperation {
-            type Type = ArrayType;
-
-            fn name(&self) -> &'static str {
-                "test_pair"
-            }
-
-            fn infer_output_types(
-                &self,
-                input_types: &[ArrayType],
-                _region_interfaces: &[crate::RegionInterface<ArrayType>],
-            ) -> Result<Vec<ArrayType>, TypeError> {
-                check_count!("input", input_types, 1, TypeError);
-                Ok(vec![input_types[0].clone(), input_types[0].clone()])
-            }
-        }
-
-        impl ElementwiseOperation for TestPairOperation {
-            fn input_count(&self) -> usize {
-                1
-            }
-
-            fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
-                Operation::infer_output_types(self, input_types, &[])
-            }
-        }
-
-        impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for TestPairOperation {
-            fn interpret<D: InterpretationDriver<C>>(
-                &self,
-                _context: &C,
-                _driver: &D,
-                inputs: &[C::Value],
-            ) -> Result<Vec<C::Value>, ProgramError> {
-                check_count!("input", inputs, 1, ProgramError);
-                Ok(vec![inputs[0].clone(), inputs[0].clone()])
-            }
-        }
-
-        check_operation_batching!(
-            @exact,
-            operation = ZeroOperation::new(ArrayType::scalar(DataType::F64)),
-            axis_size = 2,
-            cases = [{
-                inputs = [],
-                outputs = [(@replicated, Array::scalar(0.0))],
-            }],
-        );
-
-        check_operation_batching!(
-            @exact,
-            context = EagerContext::<Array>::new(),
-            driver = &EmptyRegionDriver,
-            operation = TestPairOperation,
-            axis_size = 2,
-            axis_sharding = ShardingDimension::Replicated,
-            cases = [
-                {
-                    inputs = [
-                        (@mapped(axis = 1), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
-                    ],
-                    outputs = [
-                        (@mapped(axis = 1), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
-                        (@mapped(axis = 1), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
-                    ],
-                },
-                {
-                    inputs = [
-                        (@replicated, Array::scalar(3.0)),
-                    ],
-                    outputs = [
-                        (@replicated, Array::scalar(3.0)),
-                        (@replicated, Array::scalar(3.0)),
-                    ],
-                },
-            ],
-        );
-
-        check_operation_batching!(
-            @approx(epsilon = 1e-9),
-            operation = SubOperation::new(),
-            axis_size = 2,
-            cases = [
-                {
-                    inputs = [
-                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
-                        (@replicated, Array::scalar(3.0)),
-                    ],
-                    outputs = [
-                        (@mapped(axis = 0), Array::vector(vec![-2.0, -5.0])),
-                    ],
-                },
-                {
-                    inputs = [
-                        (@replicated, Array::scalar(3.0)),
-                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
-                    ],
-                    outputs = [
-                        (@mapped(axis = 0), Array::vector(vec![2.0, 5.0])),
-                    ],
-                },
-                {
-                    inputs = [
-                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
-                        (@mapped(axis = 0), Array::vector(vec![4.0, 1.0])),
-                    ],
-                    outputs = [
-                        (@mapped(axis = 0), Array::vector(vec![-3.0, -3.0])),
-                    ],
-                },
-                {
-                    inputs = [
-                        (@replicated, Array::scalar(3.0)),
-                        (@replicated, Array::scalar(1.0)),
-                    ],
-                    outputs = [
-                        (@replicated, Array::scalar(2.0)),
-                    ],
-                },
-            ],
-        );
-
-        check_operation_batching!(
-            @approx(epsilon = 1e-9),
-            operation = SinOperation::new(),
-            axis_size = 2,
-            cases = [
-                {
-                    inputs = [
-                        (@mapped(axis = 0), Array::vector(vec![0.5, -1.0])),
-                    ],
-                    outputs = [
-                        (@mapped(axis = 0), Array::vector(vec![0.5f64.sin(), (-1.0f64).sin()])),
-                    ],
-                },
-            ],
-        );
-    }
-
-    #[test]
-    fn test_check_operation_differentiation() {
-        check_operation_differentiation!(
-            @approx(step = 1e-6, epsilon = 1e-6),
-            backend = (Array, ArrayOperation<Array>),
-            operation = MulOperation::new(),
-            cases = [
-                {
-                    primals = [Array::scalar(2.0), Array::scalar(5.0)],
-                    tangents = [Array::scalar(3.0), Array::scalar(-1.0)],
-                    primal_outputs = [Array::scalar(10.0)],
-                    tangent_outputs = [Array::scalar(13.0)],
-                    jvp = indoc! {"
-                        lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
-                        let %4:f64[] = mul %0 %1
-                            %5:f64[] = mul %1 %2
-                            %6:f64[] = mul %0 %3
-                            %7:f64[] = add %5 %6
-                        in (%4, %7)
-                    "},
-                },
-                {
-                    primals = [Array::scalar(2.0), Array::vector(vec![1.0, 3.0])],
-                    tangents = [Array::scalar(0.5), Array::vector(vec![2.0, -1.0])],
-                    primal_outputs = [Array::vector(vec![2.0, 6.0])],
-                    tangent_outputs = [Array::vector(vec![4.5, -0.5])],
-                },
-            ],
-        );
-    }
-
-    #[test]
-    fn test_check_operation_transposition() {
-        check_operation_transposition!(
-            @exact,
-            backend = (Array, ArrayOperation<Array>),
-            operation = MulOperation::new(),
-            cases = [{
-                inputs = [
-                    (@known, Array::scalar(4.0)),
-                    (@linear(type = ArrayType::scalar(DataType::F64))),
-                ],
-                output_cotangents = [Array::scalar(3.0)],
-                input_cotangents = [Array::scalar(12.0)],
-                pullback = indoc! {"
-                    lambda %0:f64[], %1:f64[] .
-                    let %2:f64[] = mul %1 %0
-                    in (%2)
-                "},
-            }],
-        );
-        check_operation_transposition!(
-            @approx(epsilon = 1e-9),
-            operation = AddOperation::new(),
-            cases = [{
-                inputs = [
-                    (@linear(type = ArrayType::scalar(DataType::F64))),
-                    (@linear(type = ArrayType::scalar(DataType::F64))),
-                ],
-                output_cotangents = [Array::scalar(3.0)],
-                input_cotangents = [Array::scalar(3.0), Array::scalar(3.0)],
-            }],
-        );
-        check_operation_transposition!(
-            @rejected,
-            operation = SinOperation::<ArrayType>::new(),
-            input_types = [ArrayType::scalar(DataType::F64)],
-        );
     }
 
     #[test]
@@ -6419,14 +6048,20 @@ mod tests {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = context.input(ArrayType::scalar(DataType::F32));
         let outputs = [MaybeZero::Value(output_cotangent)];
+        let inputs = [
+            PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
+            PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
+        ];
+        let mut transpose_context = TranspositionContext::new(context.clone());
+        let accumulators = transpose_context.input_accumulators(&inputs, &[]).unwrap();
         assert!(matches!(
             <MulOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &MulOperation::new(),
-                &mut TranspositionContext::new(context.clone()),
+                &mut transpose_context,
                 &EmptyRegionDriver,
-                &[PartialValue::Unknown(ArrayType::scalar(DataType::F32)), PartialValue::Unknown(ArrayType::scalar(DataType::F32))],
+                &inputs,
                 &outputs,
-                &[],
+                &accumulators,
             ),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message
@@ -6436,14 +6071,17 @@ mod tests {
 
         let left = context.input(ArrayType::scalar(DataType::F32));
         let right = context.input(ArrayType::scalar(DataType::F32));
+        let inputs = [PartialValue::Known(left), PartialValue::Known(right)];
+        let mut transpose_context = TranspositionContext::new(context.clone());
+        let accumulators = transpose_context.input_accumulators(&inputs, &[]).unwrap();
         assert!(matches!(
             <MulOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &MulOperation::new(),
-                &mut TranspositionContext::new(context.clone()),
+                &mut transpose_context,
                 &EmptyRegionDriver,
-                &[PartialValue::Known(left), PartialValue::Known(right)],
+                &inputs,
                 &outputs,
-                &[],
+                &accumulators,
             ),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message
@@ -6453,14 +6091,17 @@ mod tests {
 
         let right = context.input(ArrayType::scalar(DataType::I32));
         let output_cotangent = context.input(ArrayType::scalar(DataType::I32));
+        let inputs = [PartialValue::Unknown(ArrayType::scalar(DataType::I32)), PartialValue::Known(right)];
+        let mut transpose_context = TranspositionContext::new(context.clone());
+        let accumulators = transpose_context.input_accumulators(&inputs, &[]).unwrap();
         assert!(matches!(
             <MulOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &MulOperation::new(),
-                &mut TranspositionContext::new(context.clone()),
+                &mut transpose_context,
                 &EmptyRegionDriver,
-                &[PartialValue::Unknown(ArrayType::scalar(DataType::I32)), PartialValue::Known(right)],
+                &inputs,
                 &[MaybeZero::Value(output_cotangent)],
-                &[],
+                &accumulators,
             ),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "linear input `left` of operation `mul` has no cotangent space",
@@ -6472,14 +6113,20 @@ mod tests {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = context.input(ArrayType::scalar(DataType::F32));
         let outputs = [MaybeZero::Value(output_cotangent)];
+        let inputs = [
+            PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
+            PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
+        ];
+        let mut transpose_context = TranspositionContext::new(context.clone());
+        let accumulators = transpose_context.input_accumulators(&inputs, &[]).unwrap();
         assert!(matches!(
             <DivOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &DivOperation::new(),
-                &mut TranspositionContext::new(context.clone()),
+                &mut transpose_context,
                 &EmptyRegionDriver,
-                &[PartialValue::Unknown(ArrayType::scalar(DataType::F32)), PartialValue::Unknown(ArrayType::scalar(DataType::F32))],
+                &inputs,
                 &outputs,
-                &[],
+                &accumulators,
             ),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message
@@ -6489,14 +6136,17 @@ mod tests {
 
         let numerator = context.input(ArrayType::scalar(DataType::F32));
         let denominator = context.input(ArrayType::scalar(DataType::F32));
+        let inputs = [PartialValue::Known(numerator), PartialValue::Known(denominator)];
+        let mut transpose_context = TranspositionContext::new(context.clone());
+        let accumulators = transpose_context.input_accumulators(&inputs, &[]).unwrap();
         assert!(matches!(
             <DivOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &DivOperation::new(),
-                &mut TranspositionContext::new(context.clone()),
+                &mut transpose_context,
                 &EmptyRegionDriver,
-                &[PartialValue::Known(numerator), PartialValue::Known(denominator)],
+                &inputs,
                 &outputs,
-                &[],
+                &accumulators,
             ),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message
@@ -6819,6 +6469,397 @@ mod tests {
         let builder = output.builder().borrow();
         assert_eq!(builder.instructions().len(), 1);
         assert_eq!(builder.instructions()[0].operation().name(), TEST_ARITHMETIC_DIMENSION_OPERATION_NAME);
+    }
+
+    #[test]
+    fn test_check_operation_type_inference() {
+        #[derive(Clone, Debug)]
+        struct TestMultiOutputOperation<T: Type>(PhantomData<fn() -> T>);
+
+        impl<T: Type> TestMultiOutputOperation<T> {
+            const fn new() -> Self {
+                Self(PhantomData)
+            }
+        }
+
+        impl<T: Type> Display for TestMultiOutputOperation<T> {
+            fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("test_multi_output")
+            }
+        }
+
+        impl<T: Type> Operation for TestMultiOutputOperation<T> {
+            type Type = T;
+
+            fn name(&self) -> &'static str {
+                "test_multi_output"
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[T],
+                _region_interfaces: &[crate::RegionInterface<T>],
+            ) -> Result<Vec<T>, TypeError> {
+                check_count!("input", input_types, 1, TypeError);
+                Ok(vec![input_types[0].clone(), input_types[0].clone()])
+            }
+        }
+
+        impl ElementwiseOperation for TestMultiOutputOperation<ArrayType> {
+            fn input_count(&self) -> usize {
+                1
+            }
+
+            fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+                Operation::infer_output_types(self, input_types, &[])
+            }
+        }
+
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = TestMultiOutputOperation,
+            cases = [{
+                input_data_types = [DataType::F64],
+                output_data_types = [DataType::F64, DataType::F64],
+            }],
+        );
+
+        check_operation_type_inference!(
+            @elementwise @unary,
+            operation = AbsOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::C64],
+                    output_data_types = [DataType::F32],
+                },
+                {
+                    input_data_types = [DataType::Boolean],
+                    error = "cannot compute the absolute value of a value of data type bool",
+                },
+            ],
+        );
+
+        check_operation_type_inference!(
+            @elementwise @binary,
+            operation = AddOperation,
+            cases = [
+                {
+                    input_data_types = [DataType::F32, DataType::F64],
+                    output_data_types = [DataType::F64],
+                },
+                {
+                    input_data_types = [DataType::Boolean, DataType::Boolean],
+                    error = "`add` does not support input data type bool",
+                },
+            ],
+        );
+
+        check_operation_type_inference!(
+            operation = AddOperation::<DataType>::new(),
+            cases = [
+                {
+                    input_types = [DataType::F32, DataType::F64],
+                    output_types = [DataType::F64],
+                },
+                {
+                    type = DataType,
+                    input_types = [],
+                    error = "expected 2 inputs but got 0",
+                },
+                {
+                    input_types = [DataType::Boolean, DataType::Boolean],
+                    error = "`add` does not support input data type bool",
+                },
+            ],
+        );
+
+        check_operation_type_inference!(
+            operation = AddOperation::<ArrayType>::new(),
+            cases = [{
+                input_types = [ArrayType::scalar(DataType::F32), ArrayType::scalar(DataType::F64)],
+                output_types = [ArrayType::scalar(DataType::F64)],
+            }],
+        );
+
+        check_operation_type_inference!(
+            @reject @unreduced,
+            operation = SinOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64)],
+        );
+
+        check_operation_type_inference!(
+            @reject @mismatched_reduced,
+            operation = AddOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64), ArrayType::scalar(DataType::F64)],
+        );
+    }
+
+    #[test]
+    fn test_check_operation_partial_evaluation() {
+        check_operation_partial_evaluation!(
+            operation = NegOperation::new(),
+            inputs = [Array::scalar(2.0)],
+            expected = Array::scalar(-2.0),
+        );
+        check_operation_partial_evaluation!(
+            operation = AddOperation::new(),
+            cases = [
+                {
+                    inputs = [
+                        (@known, Array::scalar(2.0)),
+                        (@known, Array::scalar(3.5)),
+                    ],
+                    outputs = [
+                        (@known, Array::scalar(5.5)),
+                    ],
+                    residual_instructions = 0,
+                },
+                {
+                    inputs = [
+                        (@unknown(type = ArrayType::scalar(DataType::F64), replay = Array::scalar(2.0))),
+                        (@known, Array::scalar(3.5)),
+                    ],
+                    outputs = [
+                        (@residual, Array::scalar(5.5)),
+                    ],
+                    residual_instructions = 1,
+                },
+                {
+                    inputs = [
+                        (@known, Array::scalar(2.0)),
+                        (@unknown(type = ArrayType::scalar(DataType::F64), replay = Array::scalar(3.5))),
+                    ],
+                    outputs = [
+                        (@residual, Array::scalar(5.5)),
+                    ],
+                    residual_instructions = 1,
+                },
+                {
+                    inputs = [
+                        (@unknown(type = ArrayType::scalar(DataType::F64), replay = Array::scalar(2.0))),
+                        (@unknown(type = ArrayType::scalar(DataType::F64), replay = Array::scalar(3.5))),
+                    ],
+                    outputs = [
+                        (@residual, Array::scalar(5.5)),
+                    ],
+                    residual_instructions = 1,
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_check_operation_batching() {
+        #[derive(Clone)]
+        struct TestPairOperation;
+
+        impl Operation for TestPairOperation {
+            type Type = ArrayType;
+
+            fn name(&self) -> &'static str {
+                "test_pair"
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayType],
+                _region_interfaces: &[crate::RegionInterface<ArrayType>],
+            ) -> Result<Vec<ArrayType>, TypeError> {
+                check_count!("input", input_types, 1, TypeError);
+                Ok(vec![input_types[0].clone(), input_types[0].clone()])
+            }
+        }
+
+        impl ElementwiseOperation for TestPairOperation {
+            fn input_count(&self) -> usize {
+                1
+            }
+
+            fn infer_output_types(&self, input_types: &[ArrayType]) -> Result<Vec<ArrayType>, TypeError> {
+                Operation::infer_output_types(self, input_types, &[])
+            }
+        }
+
+        impl<C: Domain<Type = ArrayType>> InterpretableOperation<C> for TestPairOperation {
+            fn interpret<D: InterpretationDriver<C>>(
+                &self,
+                _context: &C,
+                _driver: &D,
+                inputs: &[C::Value],
+            ) -> Result<Vec<C::Value>, ProgramError> {
+                check_count!("input", inputs, 1, ProgramError);
+                Ok(vec![inputs[0].clone(), inputs[0].clone()])
+            }
+        }
+
+        check_operation_batching!(
+            @exact,
+            operation = ZeroOperation::new(ArrayType::scalar(DataType::F64)),
+            axis_size = 2,
+            cases = [{
+                inputs = [],
+                outputs = [(@replicated, Array::scalar(0.0))],
+            }],
+        );
+
+        check_operation_batching!(
+            @exact,
+            context = EagerContext::<Array>::new(),
+            driver = &EmptyRegionDriver,
+            operation = TestPairOperation,
+            axis_size = 2,
+            axis_sharding = ShardingDimension::Replicated,
+            cases = [
+                {
+                    inputs = [
+                        (@mapped(axis = 1), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
+                    ],
+                    outputs = [
+                        (@mapped(axis = 1), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
+                        (@mapped(axis = 1), Array::matrix(2, 2, vec![1.0, 2.0, 3.0, 4.0])),
+                    ],
+                },
+                {
+                    inputs = [
+                        (@replicated, Array::scalar(3.0)),
+                    ],
+                    outputs = [
+                        (@replicated, Array::scalar(3.0)),
+                        (@replicated, Array::scalar(3.0)),
+                    ],
+                },
+            ],
+        );
+
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
+            operation = SubOperation::new(),
+            axis_size = 2,
+            cases = [
+                {
+                    inputs = [
+                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
+                        (@replicated, Array::scalar(3.0)),
+                    ],
+                    outputs = [
+                        (@mapped(axis = 0), Array::vector(vec![-2.0, -5.0])),
+                    ],
+                },
+                {
+                    inputs = [
+                        (@replicated, Array::scalar(3.0)),
+                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
+                    ],
+                    outputs = [
+                        (@mapped(axis = 0), Array::vector(vec![2.0, 5.0])),
+                    ],
+                },
+                {
+                    inputs = [
+                        (@mapped(axis = 0), Array::vector(vec![1.0, -2.0])),
+                        (@mapped(axis = 0), Array::vector(vec![4.0, 1.0])),
+                    ],
+                    outputs = [
+                        (@mapped(axis = 0), Array::vector(vec![-3.0, -3.0])),
+                    ],
+                },
+                {
+                    inputs = [
+                        (@replicated, Array::scalar(3.0)),
+                        (@replicated, Array::scalar(1.0)),
+                    ],
+                    outputs = [
+                        (@replicated, Array::scalar(2.0)),
+                    ],
+                },
+            ],
+        );
+
+        check_operation_batching!(
+            @approx(epsilon = 1e-9),
+            operation = SinOperation::new(),
+            axis_size = 2,
+            cases = [
+                {
+                    inputs = [
+                        (@mapped(axis = 0), Array::vector(vec![0.5, -1.0])),
+                    ],
+                    outputs = [
+                        (@mapped(axis = 0), Array::vector(vec![0.5f64.sin(), (-1.0f64).sin()])),
+                    ],
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_check_operation_differentiation() {
+        check_operation_differentiation!(
+            @approx(step = 1e-6, epsilon = 1e-6),
+            backend = (Array, ArrayOperation<Array>),
+            operation = MulOperation::new(),
+            cases = [
+                {
+                    primals = [Array::scalar(2.0), Array::scalar(5.0)],
+                    tangents = [Array::scalar(3.0), Array::scalar(-1.0)],
+                    primal_outputs = [Array::scalar(10.0)],
+                    tangent_outputs = [Array::scalar(13.0)],
+                    jvp = indoc! {"
+                        lambda %0:f64[], %1:f64[], %2:f64[], %3:f64[] .
+                        let %4:f64[] = mul %0 %1
+                            %5:f64[] = mul %1 %2
+                            %6:f64[] = mul %0 %3
+                            %7:f64[] = add %5 %6
+                        in (%4, %7)
+                    "},
+                },
+                {
+                    primals = [Array::scalar(2.0), Array::vector(vec![1.0, 3.0])],
+                    tangents = [Array::scalar(0.5), Array::vector(vec![2.0, -1.0])],
+                    primal_outputs = [Array::vector(vec![2.0, 6.0])],
+                    tangent_outputs = [Array::vector(vec![4.5, -0.5])],
+                },
+            ],
+        );
+    }
+
+    #[test]
+    fn test_check_operation_transposition() {
+        check_operation_transposition!(
+            @exact,
+            backend = (Array, ArrayOperation<Array>),
+            operation = MulOperation::new(),
+            cases = [{
+                inputs = [
+                    (@known, Array::scalar(4.0)),
+                    (@linear(type = ArrayType::scalar(DataType::F64))),
+                ],
+                output_cotangents = [Array::scalar(3.0)],
+                input_cotangents = [Array::scalar(12.0)],
+                pullback = indoc! {"
+                    lambda %0:f64[], %1:f64[] .
+                    let %2:f64[] = mul %1 %0
+                    in (%2)
+                "},
+            }],
+        );
+        check_operation_transposition!(
+            @approx(epsilon = 1e-9),
+            operation = AddOperation::new(),
+            cases = [{
+                inputs = [
+                    (@linear(type = ArrayType::scalar(DataType::F64))),
+                    (@linear(type = ArrayType::scalar(DataType::F64))),
+                ],
+                output_cotangents = [Array::scalar(3.0)],
+                input_cotangents = [Array::scalar(3.0), Array::scalar(3.0)],
+            }],
+        );
+        check_operation_transposition!(
+            @rejected,
+            operation = SinOperation::<ArrayType>::new(),
+            input_types = [ArrayType::scalar(DataType::F64)],
+        );
     }
 
     #[test]
