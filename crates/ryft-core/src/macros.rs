@@ -5409,7 +5409,6 @@ mod tests {
 
     // TODO(eaplatanios): Generally about this `tests` module, the tests are not defined in the same order as the
     //  corresponding macros. Re-order them accordingly.
-    // TODO(eaplatanios): Review this.
     #[test]
     fn test_define_arithmetic_dimension_operation() {
         let left_type = DimensionType::new(DimensionVariable::new("left", DimensionBounds::new(1, Some(4)).unwrap()));
@@ -5458,7 +5457,6 @@ mod tests {
         assert_partially_evaluatable::<TracingContext<DimensionValue, TestArithmeticDimensionOperation>>();
     }
 
-    // TODO(eaplatanios): Review this.
     #[test]
     fn test_define_arithmetic_dimension_capability() {
         let left_type = DimensionType::new(DimensionVariable::new("left", DimensionBounds::new(1, Some(4)).unwrap()));
@@ -5467,7 +5465,6 @@ mod tests {
         let left = context.input(left_type);
         let right = context.input(right_type);
         let output = left.test_arithmetic_dimension(&right).unwrap();
-
         assert_eq!(output.r#type().bounds(), DimensionBounds::new(3, Some(9)).unwrap());
         let builder = output.builder().borrow();
         assert_eq!(builder.instructions().len(), 1);
