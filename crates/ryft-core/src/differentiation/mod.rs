@@ -157,7 +157,8 @@ use crate::differentiation::jacobian::{jacobian_forward_in_context, jacobian_rev
 use crate::differentiation::reverse::{value_and_gradient_auxiliary_in_context, value_and_gradient_in_context};
 use crate::errors::MaybeFallible;
 use crate::operations::{
-    AddOperation, OneOperation, ReferenceFreezeOperation, ReferenceNewOperation, Zero, ZeroLikeOperation,
+    AddOperation, OneOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, Zero,
+    ZeroLikeOperation,
 };
 use crate::parameters::{ParameterError, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
@@ -187,9 +188,9 @@ pub use forward::{
 pub use hessian::{Hessian, HessianBlock};
 pub use jacobian::{Jacobian, JacobianBlock};
 pub use reverse::{
-    CotangentDestination, CotangentDestinationKind, CotangentReferenceAccumulator, CotangentSeed, Pullback,
-    ReferenceOperandCotangents, ReverseModeDifferentiate, TransposableOperation, TranspositionContext,
-    TranspositionDriver, reference_operand_cotangents, transpose_mixed_operation, transpose_projected_operation,
+    CotangentAccumulator, CotangentDestination, CotangentDestinationKind, CotangentReferenceAccumulator, CotangentSeed,
+    OperandCotangents, Pullback, ReverseModeDifferentiate, TransposableOperation, TranspositionContext,
+    TranspositionDriver, operand_cotangents, transpose_mixed_operation, transpose_projected_operation,
 };
 pub use types::{DenseDifferentiableType, DifferentiableType};
 pub use zeros::{ResidualZeroProvider, ZeroSpaceBoundaryReconstruction, ZeroSpaceBoundaryRole};
@@ -1052,6 +1053,8 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             + DifferentiableOperation<PartialEvaluationContext<C>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type>
+            + OperationProvider<V::Type, ReferenceNewOperation<V::Type, V::Type>, Operation = C::Operation>
+            + OperationProvider<V::Type, ReferenceAddUpdateOperation<V::Type, V::Type>, Operation = C::Operation>
             + From<AddOperation<V::Type>>,
         V: Value,
         V::Type: DenseDifferentiableType<C>,
@@ -1116,6 +1119,8 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type>
+            + OperationProvider<V::Type, ReferenceNewOperation<V::Type, V::Type>, Operation = C::Operation>
+            + OperationProvider<V::Type, ReferenceAddUpdateOperation<V::Type, V::Type>, Operation = C::Operation>
             + From<AddOperation<V::Type>>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>>,
@@ -1324,6 +1329,8 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             + DifferentiableOperation<PartialEvaluationContext<C>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type>
+            + OperationProvider<V::Type, ReferenceNewOperation<V::Type, V::Type>, Operation = C::Operation>
+            + OperationProvider<V::Type, ReferenceAddUpdateOperation<V::Type, V::Type>, Operation = C::Operation>
             + From<AddOperation<V::Type>>,
         V: Value,
         V::Type: DenseDifferentiableType<C>,
@@ -1377,6 +1384,8 @@ impl<Input, LinearityState: DifferentiationBuilderLinearityMode, ContextState>
             + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type>
+            + OperationProvider<V::Type, ReferenceNewOperation<V::Type, V::Type>, Operation = C::Operation>
+            + OperationProvider<V::Type, ReferenceAddUpdateOperation<V::Type, V::Type>, Operation = C::Operation>
             + From<AddOperation<V::Type>>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>>,
@@ -1686,6 +1695,8 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             + DifferentiableOperation<PartialEvaluationContext<C>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type>
+            + OperationProvider<V::Type, ReferenceNewOperation<V::Type, V::Type>, Operation = C::Operation>
+            + OperationProvider<V::Type, ReferenceAddUpdateOperation<V::Type, V::Type>, Operation = C::Operation>
             + From<AddOperation<V::Type>>,
         V: Value,
         V::Type: DenseDifferentiableType<C>,
@@ -1743,6 +1754,8 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type>
+            + OperationProvider<V::Type, ReferenceNewOperation<V::Type, V::Type>, Operation = C::Operation>
+            + OperationProvider<V::Type, ReferenceAddUpdateOperation<V::Type, V::Type>, Operation = C::Operation>
             + From<AddOperation<V::Type>>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>>,
@@ -1971,6 +1984,8 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             + DifferentiableOperation<PartialEvaluationContext<C>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type>
+            + OperationProvider<V::Type, ReferenceNewOperation<V::Type, V::Type>, Operation = C::Operation>
+            + OperationProvider<V::Type, ReferenceAddUpdateOperation<V::Type, V::Type>, Operation = C::Operation>
             + From<AddOperation<V::Type>>,
         V: Value,
         V::Type: DenseDifferentiableType<C>,
@@ -2029,6 +2044,8 @@ impl<Input, Capture, LinearityState: DifferentiationBuilderLinearityMode, Contex
             + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
             + TransposableOperation<C::Constant, C::Operation>
             + ResidualZeroProvider<V::Type>
+            + OperationProvider<V::Type, ReferenceNewOperation<V::Type, V::Type>, Operation = C::Operation>
+            + OperationProvider<V::Type, ReferenceAddUpdateOperation<V::Type, V::Type>, Operation = C::Operation>
             + From<AddOperation<V::Type>>,
         V: Value,
         V::Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>>,

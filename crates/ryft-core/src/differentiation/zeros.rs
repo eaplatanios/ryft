@@ -461,7 +461,7 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
         live_values: I,
     ) -> Result<Vec<C::Value>, ProgramError> {
         let mut live_values = live_values.into_iter();
-        let values = self.rebuild_with(context, |_, zero| match zero {
+        let values = self.rebuild_with(context, &[], |_, zero| match zero {
             Some(zero) => Ok(zero),
             None => live_values.next().ok_or_else(|| {
                 ProgramError::MalformedProgram(format!("{} omitted a nonzero differential value", self.role))
@@ -489,6 +489,8 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
     /// # Parameters
     ///
     ///   - `context`: Context in which residual-backed zero operations are bound.
+    ///   - `materialize_zeros`: Whether each boundary leaf needs its zero materialized. An empty slice enables every
+    ///     leaf. Otherwise, its length must match the boundary. Disabled zero leaves pass `None` to `reconstruct`.
     ///   - `reconstruct`: Function called once per leaf, in increasing index order, after materializing its zero if
     ///     needed. Its result becomes the corresponding element of the returned vector.
     ///
@@ -502,13 +504,21 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
     >(
         &self,
         context: &C,
+        materialize_zeros: &[bool],
         mut reconstruct: F,
     ) -> Result<Vec<R>, ProgramError> {
+        if !materialize_zeros.is_empty() {
+            check_count!("input", materialize_zeros, self.boundary_size, ProgramError);
+        }
         let mut zero_leaves = self.zero_leaves.iter().peekable();
         let mut values = Vec::with_capacity(self.boundary_size);
         for index in 0..self.boundary_size {
             let zero = if zero_leaves.peek().is_some_and(|leaf| leaf.index == index) {
                 let zero_leaf = zero_leaves.next().unwrap();
+                if !materialize_zeros.get(index).copied().unwrap_or(true) {
+                    values.push(reconstruct(index, None)?);
+                    continue;
+                }
                 let residuals = self.residuals.get(zero_leaf.residual_range.clone()).unwrap();
                 let (operation, operands) =
                     C::Operation::zero_operation_with_residuals(zero_leaf.r#type.clone(), residuals)?;
@@ -769,7 +779,7 @@ mod tests {
 
         // Each callback receives its original boundary index and only zero-space leaves carry a materialized value.
         let leaves = reconstruction
-            .rebuild_with(&context, |index, zero| Ok((index, zero.map(|zero| zero.r#type().into_owned()))))
+            .rebuild_with(&context, &[], |index, zero| Ok((index, zero.map(|zero| zero.r#type().into_owned()))))
             .unwrap();
         assert_eq!(
             leaves,
@@ -782,10 +792,20 @@ mod tests {
         );
         assert_eq!(context.builder().borrow().instructions().len(), 2);
 
+        // Ignored zero-space leaves retain their positions without staging zero constructors.
+        let instruction_count = context.builder().borrow().instructions().len();
+        let ignored = reconstruction
+            .rebuild_with(&context, &[true, false, true, false], |index, zero| {
+                Ok((index, zero.map(|zero| zero.r#type().into_owned())))
+            })
+            .unwrap();
+        assert_eq!(ignored, vec![(0, None), (1, None), (2, None), (3, None)]);
+        assert_eq!(context.builder().borrow().instructions().len(), instruction_count);
+
         // A callback error stops traversal immediately and retains the caller's diagnostic.
         let mut visited = Vec::new();
         assert!(matches!(
-            reconstruction.rebuild_with(&context, |index, _| {
+            reconstruction.rebuild_with(&context, &[], |index, _| {
                 visited.push(index);
                 if index == 1 {
                     return Err(ProgramError::InvalidArgument { message: "invalid reconstruction leaf".to_string() });
