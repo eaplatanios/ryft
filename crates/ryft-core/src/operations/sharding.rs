@@ -37,7 +37,7 @@ use crate::batching::{
     InterpretableBatchableOperation,
 };
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{DifferentiableType, DifferentiationDual};
+use crate::differentiation::{DifferentiableType, DifferentiationDual, DifferentiationError};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation};
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation};
@@ -233,13 +233,14 @@ impl_differentiable_operation! {
         V: Value<Type = ArrayType>,
         O: Operation<Type = ArrayType> + From<BroadcastOperation> + From<ReshardOperation>,
     {
-        |_operation, _context, _driver, inputs, outputs| {
+        |_operation, context, _driver, inputs, outputs, accumulators| {
             // Transpose rule for [`ReshardOperation`]: the cotangent of a reshard is itself a reshard of the output
             // cotangent to the cotangent dual of the *input*'s sharding (swapping its unreduced and reduced axes), so
             // the produced input cotangent is distributed like the input. An input that carries no sharding receives
             // an exactly unsharded cotangent through an identity-axis broadcast.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, 1, DifferentiationError);
             let input_cotangent_type = inputs[0].r#type().cotangent()?;
             match &outputs[0] {
                 MaybeZero::Value(cotangent) => {
@@ -250,9 +251,13 @@ impl_differentiable_operation! {
                             &(0..input_cotangent_type.shape().rank()).collect::<Vec<_>>(),
                         )?,
                     };
-                    Ok(vec![MaybeZero::Value(contribution)])
+                    {
+                        let contribution = MaybeZero::Value(contribution);
+                        accumulators[0].accumulate(context, contribution)?;
+                        Ok(())
+                    }
                 }
-                MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(input_cotangent_type)]),
+                MaybeZero::Zero(_) => Ok(()),
             }
         }
     },
@@ -455,18 +460,21 @@ impl_differentiable_operation! {
         V: Value<Type = ArrayType>,
         O: Operation<Type = ArrayType> + From<ShardingConstraintOperation>,
     {
-        |operation, _context, _driver, inputs, outputs| {
+        |operation, context, _driver, inputs, outputs, accumulators| {
             // Transpose rule for [`ShardingConstraintOperation`]: the operation is self-adjoint, so the cotangent of
             // the output is constrained by the *same* hint (mirroring JAX registering `with_sharding_constraint` with
             // `ad.deflinear2`). Unlike [`ReshardOperation`], the input's sharding is not consulted — the hint is the
             // operation's own.
             check_count!("input", inputs, 1, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
+            check_count!("accumulator", accumulators, 1, DifferentiationError);
             match &outputs[0] {
                 MaybeZero::Value(cotangent) => {
-                    Ok(vec![MaybeZero::Value(cotangent.constrain_sharding(operation.sharding()))])
+                    let contribution = MaybeZero::Value(cotangent.constrain_sharding(operation.sharding()));
+                    accumulators[0].accumulate(context, contribution)?;
+                    Ok(())
                 }
-                MaybeZero::Zero(_) => Ok(vec![MaybeZero::Zero(inputs[0].r#type().cotangent()?)]),
+                MaybeZero::Zero(_) => Ok(()),
             }
         }
     },

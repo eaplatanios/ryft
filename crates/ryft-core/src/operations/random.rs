@@ -9,7 +9,9 @@ use crate::arrays::{
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
 use crate::contexts::{Context, Domain};
-use crate::differentiation::{DifferentiationError, TransposableOperation, TranspositionContext, TranspositionDriver};
+use crate::differentiation::{
+    CotangentAccumulator, DifferentiationError, TransposableOperation, TranspositionContext, TranspositionDriver,
+};
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_reference_dischargeable_operation};
 use crate::operations::constants::constant::ConstantOperation;
@@ -436,7 +438,8 @@ where
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
+        _accumulators: &[CotangentAccumulator],
+    ) -> Result<(), DifferentiationError> {
         Err(ProgramError::UnsupportedOperation {
             message: format!(
                 "`{RNG_BIT_GENERATOR_OPERATION_NAME}` cannot be transposed because random bits are discrete"
