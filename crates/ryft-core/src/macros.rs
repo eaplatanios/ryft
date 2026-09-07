@@ -219,14 +219,13 @@ macro_rules! check_builders {
     }};
 }
 
-// TODO(eaplatanios): Review this.
-/// Defines a nominal binary dimension-arithmetic operation.
+/// Defines a nominal binary dimension arithmetic operation.
 ///
 /// The generated operation stores the two declared operand types and the name and bounds needed to infer one fresh
 /// result identity. The resulting program atom owns that inferred identity; the operation does not duplicate it. The
 /// generated type implements [`Operation`](crate::Operation),
 /// [`ArithmeticDimensionOperation`](crate::ArithmeticDimensionOperation), [`Display`](std::fmt::Display),
-/// identity renaming, capability-based interpretation, and ordinary partial evaluation.
+/// identity renaming, capability-based interpretation, and partial evaluation.
 ///
 /// The caller supplies the operation's public documentation and name, its value-level capability and semantic method,
 /// a diagnostic result-name expression, and a bounds-transfer expression. This keeps operation structure and
@@ -256,14 +255,13 @@ macro_rules! check_builders {
 ///   - `$capability`: Value-level capability required by the generated
 ///     [`InterpretableOperation`](crate::InterpretableOperation) implementation (e.g., `Add`).
 ///   - `$method`: Semantic capability method used for interpretation (e.g., `add`).
-///   - `$result_name`: Expression accepting the left and right [`DimensionType`](crate::DimensionType)s and returning
-///     the fresh result identity's diagnostic name.
-///   - `$infer_bounds`: Expression accepting the left and right [`DimensionType`](crate::DimensionType)s and returning
-///     a `Result<(DimensionBounds, bool), DimensionError>`. The Boolean reports whether their bounds leave a checked
-///     runtime failure possible.
+///   - `$result_name`: Expression evaluating to a function or closure that accepts references to the left and right
+///     [`DimensionType`](crate::DimensionType)s and returns the fresh result identity's diagnostic name.
+///   - `$infer_bounds`: Expression evaluating to a function or closure that accepts references to the left and right
+///     [`DimensionType`](crate::DimensionType)s and returns a `Result<(DimensionBounds, bool), DimensionError>`.
+///     The Boolean reports whether their bounds leave a checked runtime failure possible.
 #[macro_export]
 macro_rules! define_arithmetic_dimension_operation {
-    // This public branch defines one nominal binary dimension primitive and its shared operation machinery.
     (
         $(#[$documentation:meta])*
         $operation:ident, $name:ident,
@@ -274,12 +272,12 @@ macro_rules! define_arithmetic_dimension_operation {
         $(#[$documentation])*
         #[derive(Clone, Debug, PartialEq, Eq, Hash, ryft_macros::Parameter)]
         pub struct $operation {
-            /// Shared operand contract and result-inference metadata for this arithmetic dimension operation.
+            /// Shared operand contract and result inference metadata for this arithmetic dimension operation.
             metadata: $crate::operations::dimensions::ArithmeticDimensionOperationMetadata,
         }
 
         impl $operation {
-            /// Creates a new operation and derives its fresh bounded result dimension.
+            #[doc = ::std::concat!("Creates a new [`", ::std::stringify!($operation), "`].")]
             pub fn new(
                 left: &$crate::arrays::DimensionType,
                 right: &$crate::arrays::DimensionType,
@@ -354,7 +352,9 @@ macro_rules! define_arithmetic_dimension_operation {
             fn effects(&self) -> ::std::borrow::Cow<'_, $crate::programs::effects::Effects> {
                 if self.metadata.requires_runtime_assertion() {
                     ::std::borrow::Cow::Owned($crate::programs::effects::Effects::explicit(
-                        $crate::programs::effects::EffectClasses::single($crate::programs::effects::EffectClass::OrderedAssertion),
+                        $crate::programs::effects::EffectClasses::single(
+                            $crate::programs::effects::EffectClass::OrderedAssertion,
+                        ),
                     ))
                 } else {
                     ::std::borrow::Cow::Borrowed($crate::programs::effects::Effects::empty())
@@ -377,7 +377,7 @@ macro_rules! define_arithmetic_dimension_operation {
             ) -> ::std::fmt::Result {
                 // The result name and bounds are recoverable from the instruction's rendered output atom type, and each
                 // declared operand type is pinned by the input atom type that must refine it, so the only payload field
-                // this rendering must carry is the runtime-assertion classification, which is invisible to the types
+                // this rendering must carry is the runtime assertion classification, which is invisible to the types
                 // and decides this operation's effects. It is elided when it is `false`.
                 let operation =
                     $crate::programs::operations::OperationFormatter::new(formatter, indentation, $name)?;
@@ -448,8 +448,7 @@ macro_rules! define_arithmetic_dimension_operation {
     };
 }
 
-// TODO(eaplatanios): Review this.
-/// Defines a value-level capability for a binary dimension-arithmetic operation.
+/// Defines a value-level capability for a binary dimension arithmetic operation.
 ///
 /// The generated trait exposes one semantic binary method. Its blanket implementation constructs and stages the
 /// corresponding operation through a context-carrying value's dispatch domain; concrete eager values provide
@@ -461,8 +460,8 @@ macro_rules! define_arithmetic_dimension_operation {
 /// define_arithmetic_dimension_capability!(
 ///     /// Returns the maximum of two first-class runtime dimensions.
 ///     DimensionMax,
-///     /// Returns the maximum of `self` and `right`.
-///     dimension_max(right),
+///     /// Returns the maximum of `self` and `other`.
+///     dimension_max(other),
 ///     DimensionMaxOperation,
 /// );
 /// ```
@@ -473,12 +472,11 @@ macro_rules! define_arithmetic_dimension_operation {
 ///   - `$capability`: Identifier of the generated value-level capability trait (e.g., `DimensionMax`).
 ///   - `$(#[$method_documentation])*`: Documentation attributes attached to the generated capability method.
 ///   - `$method`: Identifier of the generated binary capability method (e.g., `dimension_max`).
-///   - `$argument`: Name of the capability method's non-receiver argument (e.g., `right`).
+///   - `$argument`: Name of the capability method's non-receiver argument (e.g., `other`).
 ///   - `$operation`: Dimension-arithmetic operation constructed and bound by the generated implementation (e.g.,
 ///     `DimensionMaxOperation`).
 #[macro_export]
 macro_rules! define_arithmetic_dimension_capability {
-    // This branch defines one semantic binary method plus its generic staging implementation.
     (
         $(#[$capability_documentation:meta])*
         $capability:ident,
@@ -1441,7 +1439,10 @@ macro_rules! impl_differentiable_operation {
                 $driver: &__D,
                 $inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<$value, $operations>>>],
                 $outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<$value, $operations>>>],
-            ) -> Result<
+                // TODO(eaplatanios): Shouldn't this be another generic parameter so the provided closure can use it?
+                accumulators: &[$crate::CotangentAccumulator],
+            ) -> Result<(), $crate::DifferentiationError> {
+                let contributions = (|| -> Result<
                 Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<$value, $operations>>>>,
                 $crate::DifferentiationError,
             > {
@@ -1451,6 +1452,13 @@ macro_rules! impl_differentiable_operation {
                 let $context: &mut $crate::TracingContext<$value, $operations> = $context;
                 let $self = self;
                 $body
+
+                })()?;
+                $crate::check_count!("input", contributions, accumulators.len(), ProgramError);
+                for (accumulator, contribution) in accumulators.iter().zip(contributions) {
+                    accumulator.accumulate($context, contribution)?;
+                }
+                Ok(())
             }
         }
     };
@@ -1608,15 +1616,12 @@ macro_rules! impl_differentiable_elementwise_operation {
                 _driver: &__D,
                 inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
                 outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
-            ) -> Result<
-                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>>,
-                $crate::DifferentiationError,
-            > {
+                accumulators: &[$crate::CotangentAccumulator],
+            ) -> Result<(), $crate::DifferentiationError> {
                 $crate::check_count!("input", inputs, 1, ProgramError);
                 $crate::check_count!("output", outputs, 1, ProgramError);
-                Ok(vec![$crate::MaybeZero::Zero($crate::DifferentiableType::cotangent(
-                    $crate::Typed::r#type(&inputs[0]).as_ref(),
-                )?)])
+                $crate::check_count!("accumulators", accumulators, 1, ProgramError);
+                Ok(())
             }
         }
     };
@@ -1661,17 +1666,16 @@ macro_rules! impl_differentiable_elementwise_operation {
         {
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
-                _context: &mut $crate::TranspositionContext<'_, __V, __O>,
+                context: &mut $crate::TranspositionContext<'_, __V, __O>,
                 _driver: &__D,
                 inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
                 outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
-            ) -> Result<
-                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>>,
-                $crate::DifferentiationError,
-            > {
+                accumulators: &[$crate::CotangentAccumulator],
+            ) -> Result<(), $crate::DifferentiationError> {
                 $crate::check_count!("input", inputs, 1, ProgramError);
                 $crate::check_count!("output", outputs, 1, ProgramError);
-                Ok(vec![outputs[0].clone()])
+                $crate::check_count!("accumulators", accumulators, 1, ProgramError);
+                accumulators[0].accumulate(context, outputs[0].clone())
             }
         }
     };
@@ -1708,15 +1712,12 @@ macro_rules! impl_differentiable_elementwise_operation {
                 _driver: &__D,
                 inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
                 outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
-            ) -> Result<
-                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>>,
-                $crate::DifferentiationError,
-            > {
+                accumulators: &[$crate::CotangentAccumulator],
+            ) -> Result<(), $crate::DifferentiationError> {
                 $crate::check_count!("input", inputs, 1, ProgramError);
                 $crate::check_count!("output", outputs, 1, ProgramError);
-                Ok(vec![$crate::MaybeZero::Zero($crate::DifferentiableType::cotangent(
-                    $crate::Typed::r#type(&inputs[0]).as_ref(),
-                )?)])
+                $crate::check_count!("accumulators", accumulators, 1, ProgramError);
+                Ok(())
             }
         }
     };
@@ -2072,21 +2073,23 @@ macro_rules! impl_differentiable_elementwise_operation {
         {
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
-                _context: &mut $crate::TranspositionContext<'_, __V, __O>,
+                context: &mut $crate::TranspositionContext<'_, __V, __O>,
                 _driver: &__D,
                 inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
                 outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
-            ) -> Result<
-                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>>,
-                $crate::DifferentiationError,
-            > {
+                accumulators: &[$crate::CotangentAccumulator],
+            ) -> Result<(), $crate::DifferentiationError> {
                 $crate::check_count!("input", inputs, 1, ProgramError);
                 $crate::check_count!("output", outputs, 1, ProgramError);
-                // Unary elementwise linear operations preserve their operand type, so applying the declared sign is
-                // sufficient; the output cotangent needs no unalignment before becoming the input contribution.
-                Ok(vec![outputs[0].clone().map(|cotangent| {
-                    $crate::impl_differentiable_elementwise_operation!(@apply_tangent_sign $sign, cotangent)
-                })])
+                $crate::check_count!("accumulators", accumulators, 1, ProgramError);
+                if accumulators[0].is_needed() {
+                    // Unary linear operations preserve the cotangent type; only their declared sign changes it.
+                    let contribution = outputs[0].clone().map(|cotangent| {
+                        $crate::impl_differentiable_elementwise_operation!(@apply_tangent_sign $sign, cotangent)
+                    });
+                    accumulators[0].accumulate(context, contribution)?;
+                }
+                Ok(())
             }
         }
     };
@@ -2185,38 +2188,32 @@ macro_rules! impl_differentiable_elementwise_operation {
         {
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
-                _context: &mut $crate::TranspositionContext<'_, __V, __O>,
+                context: &mut $crate::TranspositionContext<'_, __V, __O>,
                 _driver: &__D,
                 inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
                 outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
-            ) -> Result<
-                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>>,
-                $crate::DifferentiationError,
-            > {
+                accumulators: &[$crate::CotangentAccumulator],
+            ) -> Result<(), $crate::DifferentiationError> {
                 $crate::check_count!("input", inputs, 2, ProgramError);
                 $crate::check_count!("output", outputs, 1, ProgramError);
-                match &outputs[0] {
-                    $crate::MaybeZero::Zero(_) =>
-                        inputs
-                            .iter()
-                            .map(|input| {
-                                Ok($crate::MaybeZero::Zero($crate::DifferentiableType::cotangent(
-                                    $crate::Typed::r#type(input).as_ref(),
-                                )?))
-                            })
-                            .collect(),
-                    $crate::MaybeZero::Value(cotangent) => {
-                        let operation_name = $crate::Operation::name(self);
-                        Ok(vec![
-                            $crate::impl_differentiable_elementwise_operation!(
-                        @linear_transpose_contribution $left_sign, operation_name, &inputs[0], cotangent
-                            ),
-                            $crate::impl_differentiable_elementwise_operation!(
-                        @linear_transpose_contribution $right_sign, operation_name, &inputs[1], cotangent
-                            ),
-                        ])
+                $crate::check_count!("accumulators", accumulators, 2, ProgramError);
+                if let $crate::MaybeZero::Value(cotangent) = &outputs[0] {
+                    // Demand is separate from primal knownness: avoid unalignment and negation for unused inputs.
+                    let operation_name = $crate::Operation::name(self);
+                    if accumulators[0].is_needed() {
+                        let contribution = $crate::impl_differentiable_elementwise_operation!(
+                            @linear_transpose_contribution $left_sign, operation_name, &inputs[0], cotangent,
+                        );
+                        accumulators[0].accumulate(context, contribution)?;
+                    }
+                    if accumulators[1].is_needed() {
+                        let contribution = $crate::impl_differentiable_elementwise_operation!(
+                            @linear_transpose_contribution $right_sign, operation_name, &inputs[1], cotangent,
+                        );
+                        accumulators[1].accumulate(context, contribution)?;
                     }
                 }
+                Ok(())
             }
         }
     };
@@ -2248,7 +2245,7 @@ macro_rules! impl_differentiable_elementwise_operation {
     // This internal helper branch converts one live output cotangent into a signed input contribution for a binary
     // linear rule. It centralizes zero-space validation and broadcast unalignment because both operands require exactly
     // that boundary handling even though their signs can differ.
-    (@linear_transpose_contribution $sign:ident, $operation_name:ident, $input:expr, $cotangent:ident) => {{
+    (@linear_transpose_contribution $sign:ident, $operation_name:ident, $input:expr, $cotangent:ident $(,)?) => {{
         let target = $crate::DifferentiableType::cotangent($crate::Typed::r#type($input).as_ref())?;
         if $crate::DifferentiableType::is_zero_space(&target) {
             return Err($crate::ProgramError::UnsupportedOperation {
@@ -2741,10 +2738,8 @@ macro_rules! impl_non_transposable_operation {
                 _driver: &__D,
                 _inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
                 _outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
-            ) -> Result<
-                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>>,
-                $crate::DifferentiationError,
-            > {
+                _accumulators: &[$crate::CotangentAccumulator],
+            ) -> Result<(), $crate::DifferentiationError> {
                 Err($crate::ProgramError::UnsupportedOperation {
                     message: format!("operation `{}` is not transposable", $crate::Operation::name(self)),
                 }
@@ -2798,14 +2793,13 @@ macro_rules! impl_nullary_transposable_operation {
                 _driver: &__D,
                 inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
                 outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
-            ) -> Result<
-                Vec<$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>>,
-                $crate::DifferentiationError,
-            > {
+                accumulators: &[$crate::CotangentAccumulator],
+            ) -> Result<(), $crate::DifferentiationError> {
                 $crate::check_count!("input", inputs, 0, ProgramError);
                 let output_count = $crate::Operation::infer_output_types(self, &[], &[])?.len();
                 $crate::check_count!("output", outputs, output_count, ProgramError);
-                Ok(Vec::new())
+                $crate::check_count!("accumulators", accumulators, 0, ProgramError);
+                Ok(())
             }
         }
     };
@@ -6187,20 +6181,18 @@ mod tests {
 
         // The generic transposition shell likewise forwards the complete partial-input and cotangent slices to the
         // supplied body and preserves the driver's static dispatch.
-        let context = TracingContext::<Array, TestDifferentiableOperation<ArrayType>>::new();
+        let mut context = TranspositionContext::new(TracingContext::<Array, ArrayOperation<Array>>::new());
         let output_cotangent = context.input(ArrayType::scalar(DataType::F32));
         let output_cotangent_id = output_cotangent.atom_id();
-        let input_cotangents = TestDifferentiableOperation::<ArrayType>::new()
-            .transpose(
-                &mut TranspositionContext::new(context.clone()),
-                &EmptyRegionDriver,
-                &[
-                    PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
-                    PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
-                ],
-                &[MaybeZero::Value(output_cotangent)],
-            )
+        let inputs = [
+            PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
+            PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
+        ];
+        let accumulators = context.input_accumulators(&inputs, &[]).unwrap();
+        TestDifferentiableOperation::<ArrayType>::new()
+            .transpose(&mut context, &EmptyRegionDriver, &inputs, &[MaybeZero::Value(output_cotangent)], &accumulators)
             .unwrap();
+        let input_cotangents = context.take_cotangents(&accumulators).unwrap();
         assert_eq!(input_cotangents.len(), 2);
         assert!(input_cotangents.iter().all(
             |cotangent| matches!(cotangent, MaybeZero::Value(cotangent) if cotangent.atom_id() == output_cotangent_id)
@@ -6227,18 +6219,24 @@ mod tests {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = context.input(ArrayType::scalar(DataType::F32));
         let output_cotangent_id = output_cotangent.atom_id();
-        let input_cotangents =
+        let input_cotangents = {
+            let mut rule_context = TranspositionContext::new(context.clone());
+            let rule_inputs = &[
+                PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
+                PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
+            ];
+            let accumulators = rule_context.input_accumulators(rule_inputs, &[]).unwrap();
             <AddOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &AddOperation::new(),
-                &mut TranspositionContext::new(context.clone()),
+                &mut rule_context,
                 &EmptyRegionDriver,
-                &[
-                    PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
-                    PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
-                ],
+                rule_inputs,
                 &[MaybeZero::Value(output_cotangent.clone())],
+                &accumulators,
             )
             .unwrap();
+            rule_context.take_cotangents(&accumulators).unwrap()
+        };
         assert_eq!(input_cotangents.len(), 2);
         assert!(matches!(
             &input_cotangents[0],
@@ -6309,18 +6307,24 @@ mod tests {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = context.input(ArrayType::scalar(DataType::F32));
         let output_cotangent_id = output_cotangent.atom_id();
-        let input_cotangents =
+        let input_cotangents = {
+            let mut rule_context = TranspositionContext::new(context.clone());
+            let rule_inputs = &[
+                PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
+                PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
+            ];
+            let accumulators = rule_context.input_accumulators(rule_inputs, &[]).unwrap();
             <TestReversedSubOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &TestReversedSubOperation::<ArrayType>::new(),
-                &mut TranspositionContext::new(context.clone()),
+                &mut rule_context,
                 &EmptyRegionDriver,
-                &[
-                    PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
-                    PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
-                ],
+                rule_inputs,
                 &[MaybeZero::Value(output_cotangent.clone())],
+                &accumulators,
             )
             .unwrap();
+            rule_context.take_cotangents(&accumulators).unwrap()
+        };
         assert_eq!(input_cotangents.len(), 2);
         assert!(matches!(
             &input_cotangents[0],
@@ -6340,18 +6344,24 @@ mod tests {
         let context = TracingContext::<Array, ArrayOperation<Array>>::new();
         let output_cotangent = context.input(ArrayType::scalar(DataType::F32));
         let output_cotangent_id = output_cotangent.atom_id();
-        let input_cotangents =
+        let input_cotangents = {
+            let mut rule_context = TranspositionContext::new(context.clone());
+            let rule_inputs = &[
+                PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
+                PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
+            ];
+            let accumulators = rule_context.input_accumulators(rule_inputs, &[]).unwrap();
             <TestNegatedAddOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &TestNegatedAddOperation::<ArrayType>::new(),
-                &mut TranspositionContext::new(context.clone()),
+                &mut rule_context,
                 &EmptyRegionDriver,
-                &[
-                    PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
-                    PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
-                ],
+                rule_inputs,
                 &[MaybeZero::Value(output_cotangent)],
+                &accumulators,
             )
             .unwrap();
+            rule_context.take_cotangents(&accumulators).unwrap()
+        };
         assert_eq!(input_cotangents.len(), 2);
         for input_cotangent in &input_cotangents {
             assert!(matches!(
@@ -6419,6 +6429,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[PartialValue::Unknown(ArrayType::scalar(DataType::F32)), PartialValue::Unknown(ArrayType::scalar(DataType::F32))],
                 &outputs,
+                &[],
             ),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message
@@ -6435,6 +6446,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[PartialValue::Known(left), PartialValue::Known(right)],
                 &outputs,
+                &[],
             ),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message
@@ -6451,6 +6463,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[PartialValue::Unknown(ArrayType::scalar(DataType::I32)), PartialValue::Known(right)],
                 &[MaybeZero::Value(output_cotangent)],
+                &[],
             ),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "linear input `left` of operation `mul` has no cotangent space",
@@ -6469,6 +6482,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[PartialValue::Unknown(ArrayType::scalar(DataType::F32)), PartialValue::Unknown(ArrayType::scalar(DataType::F32))],
                 &outputs,
+                &[],
             ),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message
@@ -6485,6 +6499,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[PartialValue::Known(numerator), PartialValue::Known(denominator)],
                 &outputs,
+                &[],
             ),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message
@@ -6579,6 +6594,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &inputs,
                 &outputs,
+                &[],
             ),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
                 if message == "operation `test_unary` is not transposable",
@@ -6601,9 +6617,10 @@ mod tests {
             &EmptyRegionDriver,
             &inputs,
             &outputs,
+            &[],
         )
         .unwrap();
-        assert!(result.is_empty());
+        assert_eq!(result, ());
         let input = context.input(ArrayType::scalar(DataType::F64));
         assert!(matches!(
             <TestNullaryOperation<ArrayType> as TransposableOperation<Array, TestNullaryOperation<ArrayType>>>::transpose(
@@ -6612,6 +6629,7 @@ mod tests {
                 &EmptyRegionDriver,
                 &[PartialValue::Known(input)],
                 &outputs,
+                &[],
             ),
             Err(DifferentiationError::Program(ProgramError::InvalidInputCount { expected: 0, actual: 1 })),
         ));
@@ -6621,6 +6639,7 @@ mod tests {
                 &mut TranspositionContext::new(context.clone()),
                 &EmptyRegionDriver,
                 &inputs,
+                &[],
                 &[],
             ),
             Err(DifferentiationError::Program(ProgramError::InvalidOutputCount { expected: 2, actual: 0 })),
