@@ -1,4 +1,4 @@
-use crate::arrays::batching::{ArrayBatching, ArrayBatchingPolicy, ArrayIrBatching};
+use crate::arrays::batching::{ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatchingPolicy};
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::{Dimension, DimensionVariable, Shape};
@@ -277,8 +277,8 @@ pub enum ExactShapeDimension {
     Residual(usize),
 }
 
-impl<C: Context<Type = ArrayType, Operation: From<ReduceOperation>>, P: ArrayBatchingPolicy<C>>
-    CotangentBatchingPolicy<C> for ArrayBatching<P>
+impl<C: Context<Type = ArrayType, Operation: From<ReduceOperation>>, P: ArrayExtentBatchingPolicy<C>>
+    CotangentBatchingPolicy<C> for ArrayBatchingPolicy<P>
 {
     fn sum_mapped_cotangents(
         _context: &TracingContext<C::Constant, C::Operation>,
@@ -299,7 +299,7 @@ impl<
             Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
             Operation: OperationProjection<ArrayType, Projected: From<ReduceOperation>>,
         >,
-> CotangentBatchingPolicy<C> for ArrayIrBatching
+> CotangentBatchingPolicy<C> for ArrayIrBatchingPolicy
 {
     fn sum_mapped_cotangents(
         _context: &TracingContext<C::Constant, C::Operation>,
@@ -550,7 +550,7 @@ mod tests {
         let cotangent_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let cotangent = context.input(cotangent_type);
-        let summed = <ArrayBatching as CotangentBatchingPolicy<TestContext>>::sum_mapped_cotangents(
+        let summed = <ArrayBatchingPolicy as CotangentBatchingPolicy<TestContext>>::sum_mapped_cotangents(
             &context,
             cotangent.clone(),
             Axis::from(0),
@@ -566,7 +566,7 @@ mod tests {
 
         // An axis outside the cotangent's rank is rejected.
         assert!(matches!(
-            <ArrayBatching as CotangentBatchingPolicy<TestContext>>::sum_mapped_cotangents(
+            <ArrayBatchingPolicy as CotangentBatchingPolicy<TestContext>>::sum_mapped_cotangents(
                 &context,
                 cotangent,
                 Axis::from(5),
@@ -585,7 +585,7 @@ mod tests {
         let cotangent_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         let cotangent = context.input(cotangent_type.into());
-        let summed = <ArrayIrBatching as CotangentBatchingPolicy<TestContext>>::sum_mapped_cotangents(
+        let summed = <ArrayIrBatchingPolicy as CotangentBatchingPolicy<TestContext>>::sum_mapped_cotangents(
             &context,
             cotangent,
             Axis::from(-2),
@@ -606,7 +606,7 @@ mod tests {
         let dimension = context
             .input(DimensionType::new(DimensionVariable::new("k", DimensionBounds::new(1, Some(9)).unwrap())).into());
         assert!(matches!(
-            <ArrayIrBatching as CotangentBatchingPolicy<TestContext>>::sum_mapped_cotangents(
+            <ArrayIrBatchingPolicy as CotangentBatchingPolicy<TestContext>>::sum_mapped_cotangents(
                 &context,
                 dimension,
                 Axis::from(0),
