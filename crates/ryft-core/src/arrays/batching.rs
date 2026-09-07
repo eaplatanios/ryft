@@ -2268,8 +2268,6 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
         Ok(Self { value, batch_axis, member })
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Returns the [`BatchAxis`] marking which dimension of [`value`](Self::value) indexes the batch items, or a
     /// replicated axis for a value shared unchanged across the batch. The rank the axis is normalized against depends
     /// on the member kind (for an array member it is an axis of the packed array, for a mapped first-class dimension
@@ -2281,7 +2279,7 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
         self.batch_axis
     }
 
-    /// Returns the canonical nonnegative position of this [`ArrayIrBatch`]'s mapped [`BatchAxis`] for an array member
+    /// Returns the canonical non-negative position of this [`ArrayIrBatch`]'s mapped [`BatchAxis`] for an array member
     /// or, for a reference member, within its packed referent. The constructors normalize signed declarations before
     /// storing them, and so batching rules can use this index directly. A mapped first-class dimension reports the
     /// position within its packed integer extent array. Returns `None` for a replicated member, including a replicated
@@ -2298,6 +2296,7 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
             }
             ArrayIrBatchMember::Dimension => return None,
         };
+
         // The constructors normalize the mapped axis against this same rank, so the normalization cannot fail here.
         self.batch_axis.axis().map(|axis| axis.normalize(rank).unwrap())
     }
@@ -2311,8 +2310,8 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
     #[inline]
     pub fn mapped_dimension_type(&self) -> Option<&DimensionType> {
         match &self.member {
-            ArrayIrBatchMember::MappedDimension(r#type) => Some(r#type),
             ArrayIrBatchMember::Array { .. } | ArrayIrBatchMember::Reference | ArrayIrBatchMember::Dimension => None,
+            ArrayIrBatchMember::MappedDimension(r#type) => Some(r#type),
         }
     }
 
@@ -2324,8 +2323,8 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
         self.mapped_dimension_type().map(|_| &self.value)
     }
 
-    /// Returns the bounded ragged axes of an array member, each restoring a dynamic [`Dimension`] in the per-item type
-    /// where the packed array stores a finite physical bound. Refer to the documentation of
+    /// Returns the bounded ragged axes of an array member, each restoring a dynamic [`Dimension`] in the
+    /// per-item type where the packed array stores a finite physical bound. Refer to the documentation of
     /// [`with_ragged_axes`](Self::with_ragged_axes) for the structural requirements and the semantic claims they carry.
     /// Reference members carry none, and a mapped first-class dimension stores its per-item extents directly in
     /// [`value`](Self::value) and therefore does not duplicate them here.
@@ -2366,11 +2365,11 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
         (self.value, ragged_axes)
     }
 
-    /// Returns the logical per-item [`ArrayIrType`] reported to the transformed program. A mapped first-class dimension
-    /// reports the [`DimensionType`] it was created with, since its packed value only holds the per-item extents. Every
-    /// other carrier derives its per-item type from the packed value, an array member by removing the mapped batch
-    /// dimension and restoring the dynamic [`Dimension`] of every bounded ragged axis, and a replicated first-class
-    /// dimension by reporting the packed [`DimensionType`] unchanged.
+    /// Returns the logical per-item [`ArrayIrType`] of this batch. A mapped first-class dimension reports the
+    /// [`DimensionType`] it was created with, since its packed value only holds the per-item extents. Every other
+    /// carrier derives its per-item type from the packed value, an array member by removing the mapped batch dimension
+    /// and restoring the dynamic [`Dimension`] of every bounded ragged axis, and a replicated first-class dimension by
+    /// reporting the packed [`DimensionType`] unchanged.
     pub fn unbatched_type(&self) -> ArrayIrType {
         // The constructors derive the member kind from the packed value's type and validate this derivation against
         // it, and neither can change afterwards, so the projections and derivations below cannot fail.
@@ -2391,10 +2390,10 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
         }
     }
 
-    /// Validates that this [`ArrayIrBatch`] holds a replicated first-class dimension, which is what a rule requires of
-    /// a dimension operand that must be shared by every batch item (e.g., a shape operand). A mapped first-class
-    /// dimension and a dimension value carrying a mapped axis are rejected with [`BatchingError::MappedDimension`], and
-    /// an array or reference member fails the dimension type projection.
+    /// Validates that this [`ArrayIrBatch`] holds a replicated [`ArrayIrBatchMember::Dimension`], which is what
+    /// a rule requires of a dimension operand that must be shared by every batch item (e.g., a shape operand).
+    /// Both mapped first-class dimensions and dimension values carrying mapped axes are rejected, resulting in
+    /// a [`BatchingError::MappedDimension`], and array or reference members fail the dimension type projection.
     pub fn validate_replicated_dimension(&self) -> Result<(), BatchingError> {
         let value_type = self.value.r#type();
         let r#type = match &self.member {
@@ -2411,26 +2410,27 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
 impl<V: Value<Type = ArrayIrType>> Typed for ArrayIrBatch<V> {
     type Type = ArrayIrType;
 
-    /// The type of a batch carrier is its logical per-item type, as returned by [`Self::unbatched_type`].
     #[inline]
     fn r#type(&self) -> Cow<'_, ArrayIrType> {
+        // The type of a batch carrier is its logical per-item type.
         Cow::Owned(self.unbatched_type())
     }
 }
 
 impl<V: Value<Type = ArrayIrType>> Display for ArrayIrBatch<V> {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(formatter, "batch[{}, {}]({})", self.r#type(), self.batch_axis, self.value)
     }
 }
 
 /// Result of batching an array IR [`Region`], whose boundary explicitly threads its mapped extent. Composite regions
-/// are retraced as standalone programs and therefore cannot capture the parent program's first-class mapped-extent
-/// Single Static Assignment (SSA) value. Their boundary has one additional leading dimension input and output: the
+/// are retraced as standalone programs and therefore cannot capture the parent program's first-class mapped extent
+/// Single Static Assignment (SSA) value. Their boundary has one additional leading dimension input and output (the
 /// input defines the identity referenced by every inserted dynamic batch dimension, and the output forwards that same
-/// atom so enclosing higher-order operations can carry it through the sealed region. Output-axis metadata excludes this
-/// bookkeeping output, and [`BatchedProgram::into_parts`] documents the arity contract consumers must uphold. Consumers
-/// that instead need an ordinary [`Region`] boundary shed the widening through
+/// atom so enclosing higher-order operations can carry it through the sealed region). Output axis metadata excludes
+/// this bookkeeping output, and [`BatchedProgram::into_parts`] documents the arity contract consumers must uphold.
+/// Consumers that instead need an ordinary [`Region`] boundary shed the widening through
 /// [`BatchingPolicy::adapt_batched_program`] and complete the adapted program's
 /// operands with [`BatchingPolicy::boundary_operands`].
 pub struct ThreadedExtentBatchedProgram<V: Typed<Type = ArrayIrType> + Parameter, O> {
@@ -2440,6 +2440,8 @@ pub struct ThreadedExtentBatchedProgram<V: Typed<Type = ArrayIrType> + Parameter
     /// Mapped axes of the source region's outputs. The bookkeeping-only threaded extent is excluded.
     output_axes: Vec<BatchAxis>,
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Batching policy for programs whose values may be arrays, first-class dimensions, or references.
 ///
