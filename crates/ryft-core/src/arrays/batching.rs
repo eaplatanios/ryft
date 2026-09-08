@@ -3830,95 +3830,6 @@ where
         + OperationProjection<ArrayType>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: From<TransposeOperation>,
 {
-    fn align_batch_axis(
-        context: &BatchingContext<C, Self>,
-        batch: Self::Batch,
-        axis: Axis,
-    ) -> Result<Self::Batch, BatchingError> {
-        align_array_batch(context, batch, axis)
-    }
-
-    fn restore_batch(
-        value: C::Value,
-        batch_axis: BatchAxis,
-        r#type: &C::Type,
-        inputs: &[Self::Batch],
-    ) -> Result<Self::Batch, BatchingError> {
-        // Only array carriers hold transform-only metadata (their ragged axes); references and dimensions are fully
-        // described by the packed value and the batch axis.
-        let output = ArrayIrBatch::new(value, batch_axis)?;
-        let ArrayIrType::Array(logical_type) = r#type else {
-            return Ok(output);
-        };
-        let packed_value_type = output.value.r#type();
-        let packed_type = <&ArrayType>::try_from(packed_value_type.as_ref())?;
-        let output_batch_axis = output.batch_axis_position();
-        let mut ragged_axes = Vec::new();
-        for (logical_axis, dimension) in logical_type.shape().dimensions().iter().enumerate() {
-            let Dimension::Dynamic(variable) = dimension else {
-                continue;
-            };
-            // The per-item extents of a bounded dynamic dimension live in whichever input carrier already tracks that
-            // dimension identity as a ragged axis, since the region boundary erased them from the output.
-            let source = inputs.iter().find_map(|input| {
-                input
-                    .ragged_axes()
-                    .iter()
-                    .find(|ragged_axis| ragged_axis.dimension() == variable)
-                    .map(|ragged_axis| (input, ragged_axis))
-            });
-            let Some((source, ragged_axis)) = source else {
-                // A dynamic dimension no input tracks is acceptable only when the packed output still spells it as
-                // that same dynamic dimension, i.e., it is an ordinary symbolic extent rather than a bounded ragged
-                // one whose per-item extents have been lost.
-                let packed_axis =
-                    logical_axis + usize::from(output_batch_axis.is_some_and(|batch_axis| batch_axis <= logical_axis));
-                if packed_type.shape().dimensions().get(packed_axis) == Some(dimension) {
-                    continue;
-                }
-                return Err(BatchingError::UnsupportedOperation {
-                    message: format!(
-                        "linear call output {logical_type} has bounded dynamic dimension {variable} but no input \
-                         carries its per-item extents",
-                    ),
-                });
-            };
-            // The source records the axes its extents vary over in its own packed coordinates. Those are translated
-            // into the output's packed coordinates by stripping the source's batch axis and re-inserting the output's.
-            // An extent axis that *is* the source's batch axis means the extents vary per batch item, which the output
-            // can only represent if it is mapped as well.
-            let source_batch_axis = source.batch_axis_position();
-            let extent_axes = ragged_axis
-                .extent_axes()
-                .iter()
-                .map(|extent_axis| {
-                    if source_batch_axis == Some(*extent_axis) {
-                        return output_batch_axis.ok_or_else(|| BatchingError::InvalidBatchMetadata {
-                            message: format!(
-                                "linear call output {logical_type} is replicated but its ragged dimension {variable} \
-                                 varies along the mapped input axis",
-                            ),
-                        });
-                    }
-                    let logical_extent_axis =
-                        extent_axis - usize::from(source_batch_axis.is_some_and(|axis| axis < *extent_axis));
-                    Ok(logical_extent_axis
-                        + usize::from(output_batch_axis.is_some_and(|axis| axis <= logical_extent_axis)))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let physical_axis = logical_axis + usize::from(output_batch_axis.is_some_and(|axis| axis <= logical_axis));
-            ragged_axes.push(RaggedAxis::new(
-                physical_axis,
-                ragged_axis.extents().clone(),
-                variable.clone(),
-                extent_axes,
-            ));
-        }
-        // The ragged axes recovered above are exactly the dynamic dimensions of the declared per-item type, so the
-        // carrier's own derivation reproduces `logical_type` without threading it through the carrier.
-        output.with_ragged_axes(ragged_axes)
-    }
-
     fn batch_region(
         context: &BatchingContext<C, Self>,
         region: RegionRef<'_, C::Constant, C::Operation>,
@@ -4075,6 +3986,95 @@ where
             .build(output_atom_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?
             .into_simplified()?;
         Ok(ThreadedExtentBatchedProgram::new(program, output_axes)?)
+    }
+
+    fn restore_batch(
+        value: C::Value,
+        batch_axis: BatchAxis,
+        r#type: &C::Type,
+        inputs: &[Self::Batch],
+    ) -> Result<Self::Batch, BatchingError> {
+        // Only array carriers hold transform-only metadata (their ragged axes); references and dimensions are fully
+        // described by the packed value and the batch axis.
+        let output = ArrayIrBatch::new(value, batch_axis)?;
+        let ArrayIrType::Array(logical_type) = r#type else {
+            return Ok(output);
+        };
+        let packed_value_type = output.value.r#type();
+        let packed_type = <&ArrayType>::try_from(packed_value_type.as_ref())?;
+        let output_batch_axis = output.batch_axis_position();
+        let mut ragged_axes = Vec::new();
+        for (logical_axis, dimension) in logical_type.shape().dimensions().iter().enumerate() {
+            let Dimension::Dynamic(variable) = dimension else {
+                continue;
+            };
+            // The per-item extents of a bounded dynamic dimension live in whichever input carrier already tracks that
+            // dimension identity as a ragged axis, since the region boundary erased them from the output.
+            let source = inputs.iter().find_map(|input| {
+                input
+                    .ragged_axes()
+                    .iter()
+                    .find(|ragged_axis| ragged_axis.dimension() == variable)
+                    .map(|ragged_axis| (input, ragged_axis))
+            });
+            let Some((source, ragged_axis)) = source else {
+                // A dynamic dimension no input tracks is acceptable only when the packed output still spells it as
+                // that same dynamic dimension, i.e., it is an ordinary symbolic extent rather than a bounded ragged
+                // one whose per-item extents have been lost.
+                let packed_axis =
+                    logical_axis + usize::from(output_batch_axis.is_some_and(|batch_axis| batch_axis <= logical_axis));
+                if packed_type.shape().dimensions().get(packed_axis) == Some(dimension) {
+                    continue;
+                }
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "linear call output {logical_type} has bounded dynamic dimension {variable} but no input \
+                         carries its per-item extents",
+                    ),
+                });
+            };
+            // The source records the axes its extents vary over in its own packed coordinates. Those are translated
+            // into the output's packed coordinates by stripping the source's batch axis and re-inserting the output's.
+            // An extent axis that *is* the source's batch axis means the extents vary per batch item, which the output
+            // can only represent if it is mapped as well.
+            let source_batch_axis = source.batch_axis_position();
+            let extent_axes = ragged_axis
+                .extent_axes()
+                .iter()
+                .map(|extent_axis| {
+                    if source_batch_axis == Some(*extent_axis) {
+                        return output_batch_axis.ok_or_else(|| BatchingError::InvalidBatchMetadata {
+                            message: format!(
+                                "linear call output {logical_type} is replicated but its ragged dimension {variable} \
+                                 varies along the mapped input axis",
+                            ),
+                        });
+                    }
+                    let logical_extent_axis =
+                        extent_axis - usize::from(source_batch_axis.is_some_and(|axis| axis < *extent_axis));
+                    Ok(logical_extent_axis
+                        + usize::from(output_batch_axis.is_some_and(|axis| axis <= logical_extent_axis)))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let physical_axis = logical_axis + usize::from(output_batch_axis.is_some_and(|axis| axis <= logical_axis));
+            ragged_axes.push(RaggedAxis::new(
+                physical_axis,
+                ragged_axis.extents().clone(),
+                variable.clone(),
+                extent_axes,
+            ));
+        }
+        // The ragged axes recovered above are exactly the dynamic dimensions of the declared per-item type, so the
+        // carrier's own derivation reproduces `logical_type` without threading it through the carrier.
+        output.with_ragged_axes(ragged_axes)
+    }
+
+    fn align_batch_axis(
+        context: &BatchingContext<C, Self>,
+        batch: Self::Batch,
+        axis: Axis,
+    ) -> Result<Self::Batch, BatchingError> {
+        align_array_batch(context, batch, axis)
     }
 
     fn static_batch_axis_extent(context: &BatchingContext<C, Self>) -> Option<usize> {
