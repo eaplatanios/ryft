@@ -3466,56 +3466,6 @@ where
     Ok(context.bind(operation, Vec::new(), inputs.as_slice())?.remove(0))
 }
 
-/// Broadcasts the replicated array `value`, whose per-item type is `array_type`, so that it gains the mapped batch axis
-/// at `position` with the transform's `axis_extent` and `axis_sharding`. The per-item shape survives unchanged, so each
-/// of its axes contributes either an exact constant or a `dimension_size` read of `value`, and the inserted axis takes
-/// the transform's own extent. Returns the broadcast value together with the operand-to-output axis mapping, through
-/// which callers relocate their ragged-axis metadata.
-///
-/// # Parameters
-///
-///   - `context`: Parent context in which the dimension reads and the dynamic broadcast are bound.
-///   - `value`: Replicated packed array value to broadcast.
-///   - `array_type`: Per-item type of `value`, whose sharding (if any) gains the batch axis placement.
-///   - `position`: Normalized position of the inserted mapped axis in the broadcast output.
-///   - `axis_extent`: First-class extent of the transform's mapped axis.
-///   - `axis_sharding`: Sharding placement of the transform's mapped axis.
-pub(crate) fn broadcast_replicated_array<C>(
-    context: &C,
-    value: C::Value,
-    array_type: &ArrayType,
-    position: usize,
-    axis_extent: &C::Value,
-    axis_sharding: &ShardingDimension,
-) -> Result<(C::Value, Vec<usize>), BatchingError>
-where
-    C: Context<Type = ArrayIrType>,
-    C::Operation:
-        From<DynamicBroadcastOperation> + From<ConstantOperation<DimensionValue>> + From<DimensionSizeOperation>,
-{
-    // The output shape is the per-item shape with the mapped extent inserted at `position`: every per-item axis is read
-    // back from `value` (or folded to a constant when static) and keeps its relative order, shifting by one past the
-    // inserted axis. The resulting operand-to-output mapping is also what callers use to relocate ragged metadata.
-    let mut output_dimensions = (0..array_type.rank())
-        .map(|axis| folded_array_dimension(context, &value, axis))
-        .collect::<Result<Vec<_>, _>>()?;
-    output_dimensions.insert(position, axis_extent.clone());
-    let output_axes = (0..array_type.rank())
-        .map(|input_axis| if input_axis < position { input_axis } else { input_axis + 1 })
-        .collect::<Vec<_>>();
-    // The sharding, when present, gains the transform's placement for the mapped axis at the same position.
-    let output_sharding = array_type
-        .sharding()
-        .map(|sharding| {
-            sharding
-                .with_inserted_dimension(position, axis_sharding.clone())
-                .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })
-        })
-        .transpose()?;
-    let value = broadcast_array(context, value, output_dimensions, output_axes.clone(), output_sharding)?;
-    Ok((value, output_axes))
-}
-
 impl<C> BatchingEntrypointPolicy<C> for ArrayIrBatchingPolicy
 where
     C: Context<
@@ -4081,6 +4031,61 @@ where
             ValueResolution::Staged(_) | ValueResolution::Opaque => None,
         }
     }
+}
+
+/// Broadcasts the replicated array `value`, whose per-item type is `array_type`, so that it gains the mapped batch axis
+/// at `position` with the transform's `axis_extent` and `axis_sharding`. The per-item shape survives unchanged, so each
+/// of its axes contributes either an exact constant or a `dimension_size` read of `value`, and the inserted axis takes
+/// the transform's own extent. Returns the broadcast value together with the operand-to-output axis mapping, through
+/// which callers relocate their ragged-axis metadata.
+///
+/// # Parameters
+///
+///   - `context`: Parent context in which the dimension reads and the dynamic broadcast are bound.
+///   - `value`: Replicated packed array value to broadcast.
+///   - `array_type`: Per-item type of `value`, whose sharding (if any) gains the batch axis placement.
+///   - `position`: Normalized position of the inserted mapped axis in the broadcast output.
+///   - `axis_extent`: First-class extent of the transform's mapped axis.
+///   - `axis_sharding`: Sharding placement of the transform's mapped axis.
+fn broadcast_replicated_array<
+    C: Context<
+            Type = ArrayIrType,
+            Operation: From<DynamicBroadcastOperation>
+                           + From<ConstantOperation<DimensionValue>>
+                           + From<DimensionSizeOperation>,
+        >,
+>(
+    context: &C,
+    value: C::Value,
+    r#type: &ArrayType,
+    position: usize,
+    axis_extent: &C::Value,
+    axis_sharding: &ShardingDimension,
+) -> Result<(C::Value, Vec<usize>), BatchingError> {
+    // The output shape is the per-item shape with the mapped extent inserted at `position`. Every per-item axis is read
+    // back from `value` (or folded to a constant when static) and keeps its relative order, shifting by one past the
+    // inserted axis. The resulting operand-to-output mapping is also what callers use to relocate ragged metadata.
+    let mut output_dimensions = (0..r#type.rank())
+        .map(|axis| folded_array_dimension(context, &value, axis))
+        .collect::<Result<Vec<_>, _>>()?;
+    output_dimensions.insert(position, axis_extent.clone());
+
+    let output_axes = (0..r#type.rank())
+        .map(|input_axis| if input_axis < position { input_axis } else { input_axis + 1 })
+        .collect::<Vec<_>>();
+
+    // The sharding, when present, gains the transform's placement for the mapped axis at the same position.
+    let output_sharding = r#type
+        .sharding()
+        .map(|sharding| {
+            sharding
+                .with_inserted_dimension(position, axis_sharding.clone())
+                .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })
+        })
+        .transpose()?;
+
+    let value = broadcast_array(context, value, output_dimensions, output_axes.clone(), output_sharding)?;
+    Ok((value, output_axes))
 }
 
 #[cfg(test)]
