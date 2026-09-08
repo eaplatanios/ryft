@@ -2751,6 +2751,46 @@ mod tests {
     }
 
     #[test]
+    fn test_batch() {
+        // A single `BatchAxis` specification broadcasts into the whole input and output parameter structures, so both
+        // leaves of the pair are mapped on axis 0 without spelling out either structure.
+        let output: (Array, Array) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .batch(
+                |(left, right)| Ok((left.clone() + right.clone(), left * right)),
+                (Array::vector(vec![1.0, 3.0]), Array::vector(vec![2.0, 4.0])),
+                BatchAxis::new(0),
+                BatchAxis::new(0),
+                None,
+            )
+            .unwrap();
+        assert_eq!(output, (Array::vector(vec![3.0, 7.0]), Array::vector(vec![2.0, 12.0])));
+
+        // With no mapped input and no explicit batch size, the batch size is unobservable.
+        let error = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .batch(
+                |x| Ok(x.clone() * x),
+                Array::vector(vec![1.0, 2.0, 3.0]),
+                BatchAxis::replicated(),
+                BatchAxis::replicated(),
+                None,
+            )
+            .unwrap_err();
+        assert_eq!(error, BatchingError::EmptyBatch);
+
+        // With no leaf value to recover a context from, the free `batch` reports an empty batch even when an explicit
+        // batch size is provided.
+        let error = batch(
+            |x: Vec<BatchingTracer<EagerContext<Array, ArrayOperation<Array>>, ArrayBatchingPolicy>>| Ok(x),
+            Vec::<Array>::new(),
+            BatchAxis::replicated(),
+            BatchAxis::replicated(),
+            2,
+        )
+        .unwrap_err();
+        assert_eq!(error, BatchingError::EmptyBatch);
+    }
+
+    #[test]
     fn test_batch_projected_operation() {
         // The third fixture member is intentionally unrelated to arrays. Successfully applying its identity batching
         // rule proves that the adapter depends only on the projection and policy contracts, while preserving the

@@ -778,8 +778,8 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
-        ArrayReferenceDischarge, ArrayType, DataType, Dimension, DimensionBounds, DimensionValue, DimensionVariable,
-        LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+        ArrayReferenceDischarge, ArrayType, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue,
+        DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
     };
     use crate::axes::AxisIndexOperation;
     use crate::batching::{BatchAxis, ProgramBatchingOutputAxesPolicy, RecursiveBatchingDriver, batch};
@@ -1446,6 +1446,43 @@ mod tests {
             ])?,
             ArrayIrValue::Array(Array::vector(vec![2.0_f32, 9.0])),
         );
+        Ok(())
+    }
+
+    #[test]
+    fn test_linear_call_operation_batching_threads_the_mapped_extent() -> Result<(), ProgramError> {
+        type TestProgram =
+            Program<ArrayIrValue<Array>, ArrayIrOperation<Array>, Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>;
+
+        // The dimension residual remains replicated while the linear input and output carry the inferred mapped
+        // extent. Both attached regions are structurally batched with that extent threaded through their boundary.
+        let residual_type = DimensionType::new(DimensionVariable::new("residual", DimensionBounds::new(0, Some(9))?));
+        let array_type = ArrayType::scalar(DataType::F64);
+        let mut builder = ProgramBuilder::new();
+        builder.add_input(residual_type.clone().into());
+        let linear = builder.add_input(array_type.clone().into());
+        let forward: TestProgram = builder.build(vec![linear], vec![Placeholder; 2], vec![Placeholder])?;
+        let mut builder = ProgramBuilder::new();
+        builder.add_input(residual_type.clone().into());
+        let linear = builder.add_input(array_type.into());
+        let transpose: TestProgram = builder.build(vec![linear], vec![Placeholder; 2], vec![Placeholder])?;
+        let residual = ArrayIrValue::Dimension(DimensionValue::new(residual_type, 3)?);
+        let linear = ArrayIrValue::Array(Array::vector(vec![2.0_f64, 5.0]));
+        let output: ArrayIrValue<Array> = batch(
+            |(residual, linear)| {
+                let outputs = residual.context().bind(
+                    ArrayIrOperation::LinearCall(LinearCallOperation::new(1)),
+                    vec![forward, transpose],
+                    &[residual.clone(), linear],
+                )?;
+                Ok(outputs.into_iter().next().unwrap())
+            },
+            (residual, linear.clone()),
+            (BatchAxis::replicated(), BatchAxis::new(0)),
+            BatchAxis::new(0),
+            None,
+        )?;
+        assert_eq!(output, linear);
         Ok(())
     }
 

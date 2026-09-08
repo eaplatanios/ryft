@@ -1191,10 +1191,11 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionValue,
-        DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding, ShardingDimension,
-        StridedLayout,
+        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType,
+        DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
+        MeshAxisType, Sharding, ShardingDimension, StridedLayout,
     };
+    use crate::batching::{BatchAxis, BatchableOperation, BatchingContext, BatchingTracer, RecursiveBatchingDriver};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -1940,6 +1941,129 @@ mod tests {
                 }],
             );
         }
+    }
+
+    #[test]
+    fn test_concatenate_batching() {
+        // Concatenate aligns mapped array operands onto a common packed batch axis before shifting the per-item
+        // concatenation axis around it, and a replicated operand is broadcast across the batch. The trailing result
+        // extent remains a replicated shape value.
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+        );
+        let extent = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
+        let concatenate = ArrayIrOperation::<Array>::from(
+            ConcatenateOperation::<ArrayIrType>::from_input_types(
+                0,
+                &[
+                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])).into(),
+                    ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(1)])).into(),
+                    extent.r#type().into_owned(),
+                ],
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            concatenate
+                .batch(
+                    &context,
+                    &RecursiveBatchingDriver::new(&EmptyRegionDriver),
+                    &[
+                        ArrayIrBatch::new(
+                            ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f32, 3.0, 2.0, 4.0])),
+                            BatchAxis::new(1),
+                        )
+                        .unwrap(),
+                        ArrayIrBatch::new(
+                            ArrayIrValue::Array(Array::matrix(2, 1, vec![5.0_f32, 6.0])),
+                            BatchAxis::new(0)
+                        )
+                        .unwrap(),
+                        ArrayIrBatch::replicated(extent.clone()),
+                    ],
+                )
+                .unwrap()
+                .into_parts()
+                .0,
+            vec![
+                ArrayIrBatch::new(
+                    ArrayIrValue::Array(Array::matrix(3, 2, vec![1.0_f32, 3.0, 2.0, 4.0, 5.0, 6.0])),
+                    BatchAxis::new(1),
+                )
+                .unwrap()
+            ],
+        );
+        assert_eq!(
+            concatenate
+                .batch(
+                    &context,
+                    &RecursiveBatchingDriver::new(&EmptyRegionDriver),
+                    &[
+                        ArrayIrBatch::new(
+                            ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f32, 2.0, 3.0, 4.0])),
+                            BatchAxis::new(0),
+                        )
+                        .unwrap(),
+                        ArrayIrBatch::replicated(ArrayIrValue::Array(Array::vector(vec![5.0_f32]))),
+                        ArrayIrBatch::replicated(extent),
+                    ],
+                )
+                .unwrap()
+                .into_parts()
+                .0,
+            vec![
+                ArrayIrBatch::new(
+                    ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 5.0, 3.0, 4.0, 5.0])),
+                    BatchAxis::new(0),
+                )
+                .unwrap()
+            ],
+        );
+    }
+
+    #[test]
+    fn test_concatenate_batching_aligns_replicated_operands_under_a_dynamic_extent() -> Result<(), ProgramError> {
+        // Under a symbolic mapped extent, the replicated operand is broadcast with the first-class extent (its static
+        // axis folded to an exact constant) and the explicit concatenated result extent is passed to the lifted mixed
+        // operation unchanged.
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
+        let batch_extent = trace.input(DimensionType::new(batch.clone()).into());
+        let mapped = trace.input(
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(2)])).into(),
+        );
+        let replicated = trace.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])).into());
+        let result_extent = trace.input(DimensionValue::constant(4)?.r#type().into_owned().into());
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), batch_extent);
+        let inputs = [
+            BatchingTracer::new(context.clone(), ArrayIrBatch::new(mapped, BatchAxis::new(0))?),
+            BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(replicated)),
+            BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(result_extent)),
+        ];
+        let operation = ConcatenateOperation::<ArrayIrType>::from_input_types(
+            0,
+            &inputs.iter().map(|input| input.batch().unbatched_type().clone()).collect::<Vec<_>>(),
+        )?;
+        let [output] = context.bind(ArrayIrOperation::from(operation), Vec::new(), &inputs)?.try_into().unwrap();
+        assert_eq!(output.batch().batch_axis(), BatchAxis::new(0));
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![output.batch().value().atom_id()?],
+            vec![Placeholder; 4],
+            vec![Placeholder],
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[batch, 2], %2:f32[2], %3:dimension<4> .
+                let %4:dimension<2> = constant [value=2]
+                    %5:f32[batch, 2] = broadcast [output_axes=[1]] %2 %0 %4
+                    %6:f32[batch, 4] = concatenate [axis=1] %1 %5 %3
+                in (%6)
+            "}
+            .trim_end(),
+        );
+        Ok(())
     }
 
     #[test]

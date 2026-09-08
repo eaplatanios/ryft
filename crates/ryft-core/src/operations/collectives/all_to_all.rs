@@ -761,14 +761,19 @@ where
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionVariable, RaggedAxis,
+        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType,
+        DataType, Dimension, DimensionBounds, DimensionType, DimensionVariable, RaggedAxis, Shape,
     };
     use crate::axes::NamedAxis;
-    use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingContext, batch};
-    use crate::contexts::EagerContext;
+    use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingContext, BatchingTracer, batch};
+    use crate::contexts::{EagerContext, StagingContext};
+    use crate::parameters::Placeholder;
+    use crate::programs::ProgramError;
+    use crate::tracing::TracingContext;
 
     use super::*;
 
@@ -944,5 +949,76 @@ mod tests {
             panic!("`all_to_all` must preserve the array member kind");
         };
         assert_eq!(output.to_f64s(), vec![1.0, 2.0, 5.0, 6.0, 3.0, 4.0, 7.0, 8.0]);
+    }
+
+    #[test]
+    fn test_all_to_all_batching_derives_the_exchange_shape_under_a_dynamic_extent() -> Result<(), ProgramError> {
+        // Distinct-axis all-to-all derives its temporary pre-exchange shape from the supplied result extents and the
+        // mapped extent using ordinary dimension arithmetic; it never reads the source array shape.
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
+        let batch_extent = trace.input(DimensionType::new(batch.clone()).into());
+        let input_split = DimensionVariable::new("input_split", DimensionBounds::new(1, Some(65))?);
+        let input_concat = DimensionVariable::new("input_concat", DimensionBounds::new(1, Some(65))?);
+        let output_split = DimensionVariable::new("output_split", DimensionBounds::new(1, Some(65))?);
+        let output_concat = DimensionVariable::new("output_concat", DimensionBounds::new(1, Some(129))?);
+        let input = trace.input(
+            ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![
+                    Dimension::Dynamic(batch),
+                    Dimension::Dynamic(input_split),
+                    Dimension::Dynamic(input_concat),
+                ]),
+            )
+            .into(),
+        );
+        let output_split = trace.input(DimensionType::new(output_split).into());
+        let output_concat = trace.input(DimensionType::new(output_concat).into());
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), batch_extent)
+            .with_axis_name("items".to_string());
+        let [output] = context
+            .bind(
+                ArrayIrOperation::AllToAll(AllToAllOperation::new(
+                    "items".to_string(),
+                    4,
+                    0,
+                    1,
+                    CollectiveOptions::tiled(),
+                )),
+                Vec::new(),
+                &[
+                    BatchingTracer::new(context.clone(), ArrayIrBatch::new(input, BatchAxis::new(0))?),
+                    BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(output_split)),
+                    BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(output_concat)),
+                ],
+            )?
+            .try_into()
+            .unwrap();
+        assert_eq!(output.batch().batch_axis(), BatchAxis::new(0));
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![output.batch().value().atom_id()?],
+            vec![Placeholder; 4],
+            vec![Placeholder],
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[batch, input_split, input_concat], \
+                    %2:dimension<output_split ∈ [1, 65)>, %3:dimension<output_concat ∈ [1, 129)> .
+                let %4:dimension<4> = constant [value=4]
+                    dimension_require_equal %0 %4
+                    dimension_require_divisible_by %3 %0
+                    %5:dimension<output_split * batch ∈ [1, 513)> = dimension_mul %2 %0
+                    %6:dimension<output_concat // batch ∈ [0, 129)> = dimension_div_floor %3 %0
+                    %7:f32[batch, batch, output_split, output_concat // batch] = reshape %1 %0 %0 %2 %6
+                    %8:f32[batch, batch, output_split, output_concat // batch] = transpose [permutation=[1, 0, 2, 3]] %7
+                    %9:f32[batch, output_split, batch, output_concat // batch] = transpose [permutation=[0, 2, 1, 3]] %8
+                    %10:f32[batch, output_split, output_concat] = reshape %9 %0 %2 %3
+                in (%10)
+            "}
+            .trim_end(),
+        );
+        Ok(())
     }
 }

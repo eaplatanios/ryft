@@ -1698,9 +1698,9 @@ mod tests {
         ReferenceSwapOperation,
     };
     use crate::parameters::Placeholder;
-    use crate::programs::{EffectClasses, ProgramBuilder, ReferenceType};
+    use crate::programs::{EffectClasses, ProgramBuilder, ReferenceType, TypeError};
     use crate::tests::{CountingBatchingDriver, test_condition_program};
-    use crate::tracing::{DomainTracingContext, Trace};
+    use crate::tracing::{DomainTracingContext, Trace, TracingContext};
 
     use super::*;
 
@@ -2818,6 +2818,43 @@ mod tests {
             ),
             "{error}",
         );
+    }
+
+    #[test]
+    fn test_condition_batching_rejects_batch_varying_dimension_results() -> Result<(), ProgramError> {
+        // Under a batch-varying predicate, dimension results of the two branches stay replicated and are guarded by an
+        // equality requirement, so branches whose dimension results differ are rejected instead of becoming ragged
+        // values.
+        let mut true_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let true_extent = true_builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(2)?));
+        let true_branch = true_builder.build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![true_extent],
+            Vec::new(),
+            vec![Placeholder],
+        )?;
+        let mut false_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let false_extent = false_builder.add_constant(ArrayIrValue::Dimension(DimensionValue::constant(3)?));
+        let false_branch = false_builder.build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![false_extent],
+            Vec::new(),
+            vec![Placeholder],
+        )?;
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
+        let batch_extent = trace.input(DimensionType::new(batch.clone()).into());
+        let predicate =
+            trace.input(ArrayType::new(DataType::Boolean, Shape::new(vec![Dimension::Dynamic(batch)])).into());
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace, batch_extent);
+        let error = context
+            .bind(
+                ArrayIrOperation::Condition(ConditionOperation::new()),
+                vec![true_branch, false_branch],
+                &[BatchingTracer::new(context.clone(), ArrayIrBatch::new(predicate, BatchAxis::new(0))?)],
+            )
+            .unwrap_err();
+        assert!(matches!(error, ProgramError::Type(TypeError::Custom(_))));
+        assert_eq!(error.to_string(), "2 == 3; observed 2=2, 3=3");
+        Ok(())
     }
 
     #[test]

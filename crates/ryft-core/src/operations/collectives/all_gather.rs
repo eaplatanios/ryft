@@ -1068,17 +1068,22 @@ where
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, LogicalMesh, MeshAxis,
-        MeshAxisType, RaggedAxis, Sharding,
+        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType,
+        DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, LogicalMesh, MeshAxis,
+        MeshAxisType, RaggedAxis, Shape, Sharding,
     };
     use crate::axes::AxisError;
-    use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingContext, batch};
-    use crate::contexts::EagerContext;
+    use crate::batching::{BatchAxis, BatchAxisSpecification, BatchingContext, BatchingTracer, batch};
+    use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::collectives::parallel_sum_scatter::infer_explicit_parallel_sum_scatter_output_types;
     use crate::operations::collectives::tests::f32_vector;
+    use crate::parameters::Placeholder;
+    use crate::programs::ProgramError;
+    use crate::tracing::TracingContext;
 
     use super::*;
 
@@ -1564,5 +1569,133 @@ mod tests {
             panic!("`all_gather` must preserve the array member kind");
         };
         assert_eq!(output.to_f64s(), vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_all_gather_batching_materializes_replicated_operands_under_a_dynamic_extent() -> Result<(), ProgramError> {
+        // Matching-axis collective batching consumes a complete logical result shape. A replicated operand is
+        // materialized along the mapped axis from those extents, dynamic unchanged axes keep their boundary-provided
+        // identity, and the rule introduces no metadata read from the source array.
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
+        let batch_extent = trace.input(DimensionType::new(batch).into());
+        let sequence = DimensionVariable::new("sequence", DimensionBounds::new(1, Some(17))?);
+        let width = DimensionVariable::new("width", DimensionBounds::new(1, Some(33))?);
+        let gathered = DimensionVariable::new("gathered", DimensionBounds::new(1, Some(65))?);
+        let input = trace.input(
+            ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![Dimension::Dynamic(sequence), Dimension::Dynamic(width.clone())]),
+            )
+            .into(),
+        );
+        let gathered_extent = trace.input(DimensionType::new(gathered).into());
+        let width_extent = trace.input(DimensionType::new(width).into());
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), batch_extent)
+            .with_axis_name("items".to_string());
+        let [output] = context
+            .bind(
+                ArrayIrOperation::AllGather(AllGatherOperation::new(
+                    "items".to_string(),
+                    4,
+                    0,
+                    CollectiveOptions::tiled(),
+                    AllGatherOutputVariance::Varying,
+                )),
+                Vec::new(),
+                &[
+                    BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(input)),
+                    BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(gathered_extent)),
+                    BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(width_extent)),
+                ],
+            )?
+            .try_into()
+            .unwrap();
+        assert_eq!(output.batch().batch_axis(), BatchAxis::replicated());
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![output.batch().value().atom_id()?],
+            vec![Placeholder; 4],
+            vec![Placeholder],
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[sequence, width], %2:dimension<gathered ∈ [1, 65)>, \
+                    %3:dimension<width ∈ [1, 33)> .
+                let %4:dimension<4> = constant [value=4]
+                    dimension_require_equal %0 %4
+                    dimension_require_divisible_by %2 %0
+                    %5:dimension<gathered // batch ∈ [0, 65)> = dimension_div_floor %2 %0
+                    %6:f32[gathered // batch, width] = reshape %1 %5 %3
+                    %7:f32[batch, gathered // batch, width] = broadcast [output_axes=[1, 2]] %6 %0 %5 %3
+                    %8:f32[gathered, width] = reshape %7 %2 %3
+                in (%8)
+            "}
+            .trim_end(),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_all_gather_over_another_axis_is_forwarded_under_a_dynamic_extent() -> Result<(), ProgramError> {
+        // A collective over a different named axis is forwarded as the same mixed operation. Only its physical axis
+        // index and complete result shape are lifted around the current mapped axis, without reading the source shape.
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
+        let batch_extent = trace.input(DimensionType::new(batch.clone()).into());
+        let logical_extent = DimensionVariable::new("logical", DimensionBounds::new(1, Some(17))?);
+        let result_extent = DimensionVariable::new("result", DimensionBounds::new(1, Some(33))?);
+        let input = trace.input(
+            ArrayType::new(
+                DataType::F32,
+                Shape::new(vec![Dimension::Dynamic(logical_extent), Dimension::Dynamic(batch), Dimension::Static(3)]),
+            )
+            .into(),
+        );
+        let result_extent = trace.input(DimensionType::new(result_extent).into());
+        let width_extent = trace.input(DimensionValue::constant(3)?.r#type().into_owned().into());
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), batch_extent)
+            .with_axis_name("outer".to_string());
+        let [output] = context
+            .bind(
+                ArrayIrOperation::AllGather(AllGatherOperation::new(
+                    "inner".to_string(),
+                    2,
+                    0,
+                    CollectiveOptions::tiled(),
+                    AllGatherOutputVariance::Varying,
+                )),
+                Vec::new(),
+                &[
+                    BatchingTracer::new(context.clone(), ArrayIrBatch::new(input, BatchAxis::new(1))?),
+                    BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(result_extent)),
+                    BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(width_extent)),
+                ],
+            )?
+            .try_into()
+            .unwrap();
+        assert_eq!(output.batch().batch_axis(), BatchAxis::new(1));
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![output.batch().value().atom_id()?],
+            vec![Placeholder; 4],
+            vec![Placeholder],
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[logical, batch, 3], %2:dimension<result ∈ [1, 33)>, \
+                    %3:dimension<3> .
+                let %4:f32[result, batch, 3] = all_gather [
+                    axis_name=\"inner\",
+                    axis_size=2,
+                    concat_axis=0,
+                    options=Tiled,
+                    output_variance=Varying,
+                ] %1 %2 %0 %3
+                in (%4)
+            "}
+            .trim_end(),
+        );
+        Ok(())
     }
 }

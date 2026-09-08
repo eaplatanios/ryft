@@ -3,14 +3,16 @@ use indoc::indoc;
 use pretty_assertions::assert_eq;
 
 use crate::arrays::{
-    Array, ArrayBatch, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds, DimensionVariable, LogicalMesh,
-    MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension,
+    Array, ArrayBatch, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayType, DataType, Dimension, DimensionBounds,
+    DimensionVariable, LogicalMesh, MeshAxis, MeshAxisType, RaggedAxis, Shape, Sharding, ShardingDimension,
 };
 use crate::batching::{BatchAxis, BatchableOperation, BatchedProgram, BatchingContext, batch};
 use crate::contexts::EagerContext;
 use crate::differentiation::{TranspositionContext, differentiate_at};
 use crate::macros::{check_operation_transposition, check_operation_type_inference};
-use crate::programs::{EmptyRegionDriver, Operation, TypeError};
+use crate::parameters::Placeholder;
+use crate::programs::{EmptyRegionDriver, Operation, ProgramError, TypeError, ValueProjection};
+use crate::tracing::TracingContext;
 
 use super::*;
 
@@ -900,6 +902,64 @@ fn test_dot_batching_rejects_unsupported_ragged_configurations() {
             message: "`dot` does not support bounded ragged dimension `length` on a replicated operand".to_string(),
         },
     );
+}
+
+#[test]
+fn test_dot_batching_under_a_dynamic_mapped_extent() -> Result<(), ProgramError> {
+    // A dense contraction is batched under a dynamic mapped extent as well. The mapped operand keeps the dynamic batch
+    // dimension it already carries, and the replicated right-hand vector gains one through the policy's dynamic
+    // broadcast, whose inserted axis is grounded by the transform's first-class extent value (read off the mapped
+    // operand's own axis). The lifted dot then contracts the trailing axis under a dynamic batching dimension.
+    let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+    let batch_variable = DimensionVariable::new("batch", DimensionBounds::new(1, Some(5))?);
+    let rows = trace.input(
+        ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch_variable), Dimension::Static(3)]))
+            .into(),
+    );
+    let vector = trace.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)])).into());
+    let output = batch(
+        |(row, vector)| {
+            let row = ValueProjection::<ArrayType>::into_projected(row)?;
+            let vector = ValueProjection::<ArrayType>::into_projected(vector)?;
+            let mut outputs = row.dispatch_domain().bind(
+                DotOperation::new(DotDimensionNumbers::inner_product()),
+                Vec::new(),
+                &[row, vector],
+            )?;
+            Ok(outputs.remove(0).into_value())
+        },
+        (rows, vector),
+        (BatchAxis::new(0), BatchAxis::replicated()),
+        BatchAxis::new(0),
+        None,
+    )?;
+    let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, ArrayIrValue<Array>>(
+        vec![output.atom_id()?],
+        vec![Placeholder, Placeholder],
+        Placeholder,
+    )?;
+    assert_eq!(
+        program.to_string(),
+        indoc! {"
+            lambda %0:f32[batch, 3], %1:f32[3] .
+            let %2:dimension<batch ∈ [1, 5)> = dimension_size [axis=0] %0
+                %3:dimension<3> = constant [value=3]
+                %4:f32[batch, 3] = broadcast [output_axes=[1]] %1 %2 %3
+                %5:f32[batch] = dot [
+                    dimensions=(lhs_contracting=[1], rhs_contracting=[1], lhs_batching=[0], rhs_batching=[0]),
+                ] %0 %4
+            in (%5)
+        "}
+        .trim_end(),
+    );
+    assert_eq!(
+        program.interpret(vec![
+            ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0])),
+            ArrayIrValue::Array(Array::vector(vec![10.0_f32, 100.0, 1000.0])),
+        ])?,
+        ArrayIrValue::Array(Array::vector(vec![3210.0_f32, 6540.0])),
+    );
+    Ok(())
 }
 
 #[test]

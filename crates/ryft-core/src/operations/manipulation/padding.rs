@@ -1524,11 +1524,11 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, DataType, DimensionBounds, DimensionType,
-        DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType, Sharding,
-        ShardingDimension, StridedLayout,
+        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
+        DataType, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory,
+        MeshAxis, MeshAxisType, Sharding, ShardingDimension, StridedLayout,
     };
-    use crate::batching::{BatchAxis, BatchingContext};
+    use crate::batching::{BatchAxis, BatchingContext, BatchingTracer};
     use crate::contexts::EagerContext;
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
@@ -2336,5 +2336,85 @@ mod tests {
             assert_eq!(outputs[0].r#type().shape().dimensions(), &[Dimension::Static(0), Dimension::Static(3)]);
             assert!(outputs[0].value().storage_bytes().is_empty());
         }
+    }
+
+    #[test]
+    fn test_pad_batching_decomposes_mapped_padding_values() -> Result<(), ProgramError> {
+        // A mapped padding value is decomposed into zero-padding, a padding-position mask, a broadcast of the per-item
+        // scalar, and a select, so each batch item is padded with its own value.
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new(),
+            ArrayIrValue::Dimension(DimensionValue::constant(2)?),
+        );
+        let pad = ArrayIrOperation::<Array>::from(PadOperation::new(vec![1], vec![0], vec![0])?);
+        assert_eq!(
+            pad.batch(
+                &context,
+                &EmptyRegionDriver,
+                &[
+                    ArrayIrBatch::new(
+                        ArrayIrValue::Array(Array::matrix(2, 2, vec![1.0_f32, 2.0, 3.0, 4.0])),
+                        BatchAxis::new(0),
+                    )?,
+                    ArrayIrBatch::new(ArrayIrValue::Array(Array::vector(vec![8.0_f32, 9.0])), BatchAxis::new(0))?,
+                    ArrayIrBatch::replicated(ArrayIrValue::Dimension(DimensionValue::constant(3)?)),
+                ],
+            )?
+            .into_parts()
+            .0,
+            vec![ArrayIrBatch::new(
+                ArrayIrValue::Array(Array::matrix(2, 3, vec![8.0_f32, 1.0, 2.0, 9.0, 3.0, 4.0])),
+                BatchAxis::new(0),
+            )?],
+        );
+
+        // Under a symbolic mapped extent, the replicated operand is aligned through a dynamic broadcast and every
+        // shape-changing instruction of the decomposition receives the same explicit output extents, including the
+        // inserted batch extent.
+        let trace = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let batch = DimensionVariable::new("batch", DimensionBounds::new(1, Some(9))?);
+        let batch_extent = trace.input(DimensionType::new(batch.clone()).into());
+        let operand = trace.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(2)])).into());
+        let padding = trace.input(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch)])).into());
+        let result_extent = trace.input(DimensionValue::constant(3)?.r#type().into_owned().into());
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(trace.clone(), batch_extent);
+        let [output] = context
+            .bind(
+                ArrayIrOperation::from(PadOperation::new(vec![1], vec![0], vec![0])?),
+                Vec::new(),
+                &[
+                    BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(operand)),
+                    BatchingTracer::new(context.clone(), ArrayIrBatch::new(padding, BatchAxis::new(0))?),
+                    BatchingTracer::new(context.clone(), ArrayIrBatch::replicated(result_extent)),
+                ],
+            )?
+            .try_into()
+            .unwrap();
+        assert_eq!(output.batch().batch_axis(), BatchAxis::new(0));
+        let program = trace.builder().borrow().clone().build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+            vec![output.batch().value().atom_id()?],
+            vec![Placeholder; 4],
+            vec![Placeholder],
+        )?;
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:dimension<batch ∈ [1, 9)>, %1:f32[2], %2:f32[batch], %3:dimension<3> .
+                let %4:dimension<2> = constant [value=2]
+                    %5:f32[batch, 2] = broadcast [output_axes=[1]] %1 %0 %4
+                    %6:f32[] = zero [type=f32[]]
+                    %7:f32[batch, 3] = pad [edge_padding_low=[0, 1], edge_padding_high=[0, 0], \
+                        interior_padding=[0, 0]] %5 %6 %0 %3
+                    %8:bool[batch, 2] = one [type=bool[batch, 2]] %0
+                    %9:bool[] = zero [type=bool[]]
+                    %10:bool[batch, 3] = pad [edge_padding_low=[0, 1], edge_padding_high=[0, 0], \
+                        interior_padding=[0, 0]] %8 %9 %0 %3
+                    %11:f32[batch, 3] = broadcast [output_axes=[0]] %2 %0 %3
+                    %12:f32[batch, 3] = select %10 %7 %11
+                in (%12)
+            "}
+            .trim_end(),
+        );
+        Ok(())
     }
 }
