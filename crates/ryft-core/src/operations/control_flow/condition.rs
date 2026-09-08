@@ -6,6 +6,7 @@
 
 use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
+use std::sync::Arc;
 
 use crate::arrays::batching::require_equal_dimensions;
 use crate::arrays::{
@@ -733,8 +734,8 @@ where
                     branch_input_types.extend(tangent.input_types().into_iter().take(live_input_count));
                 }
                 partitions.push(PartitionedProgram::from_parts(
-                    primal,
-                    tangent,
+                    Arc::unwrap_or_clone(primal),
+                    Arc::unwrap_or_clone(tangent),
                     (0..primal_input_count).collect(),
                     (primal_input_count..primal_input_count + live_input_count)
                         .map(PartialEvaluationInput::Unknown)

@@ -212,18 +212,20 @@ fn can_materialize_zero_tangent_from_type<T: Type>(primal_type: &T, tangent_type
 /// [`Pushforward`] and [`Pullback`](crate::Pullback) callables additionally retain residual values from one
 /// linearization point; this [`Linearization`] itself does not.
 #[cfg_attr(doc, aquamarine::aquamarine)]
+#[derive(Clone, Debug)]
 pub struct Linearization<V: Value, O: Operation<Type = V::Type>> {
     /// Nonlinear primal sub-program `x ↦ (y, r)`. It takes the primal inputs `x` and produces the primal outputs
     /// `y = f(x)` followed by the residuals `r`, its trailing [`residual_count`](Self::residual_count) outputs, which
-    /// form the residual environment consumed by the tangent sub-program.
-    primal: Program<V, O, Vec<V>, Vec<V>>,
+    /// form the residual environment consumed by the tangent sub-program. Shared ownership preserves the cached
+    /// program identity when a linearization is cloned or its programs are attached as callees.
+    primal: Arc<Program<V, O, Vec<V>, Vec<V>>>,
 
     /// Linear tangent sub-program `(live(ẋ), r) ↦ live(ẏ)`. It has one leading Single Static Assignment (SSA) input
     /// for each selected primal input, in selection order and omitting zero differential spaces. [`Self::new`] selects
     /// all inputs in source order. These tangent inputs are followed by the residuals `r`, and one SSA output for each
     /// primal output with a nonzero differential space and a live tangent root. Inactive reference outputs have no
-    /// tangent slot.
-    tangent: Program<V, O, Vec<V>, Vec<V>>,
+    /// tangent slot. Shared ownership lets callers retain this program independently of the primal program.
+    tangent: Arc<Program<V, O, Vec<V>, Vec<V>>>,
 
     /// Number of residuals `r` threaded from the primal sub-program into the tangent sub-program (i.e., the count of
     /// the trailing outputs of [`primal`](Self::primal) and of the trailing inputs of [`tangent`](Self::tangent)).
@@ -292,7 +294,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
     where
         V::Type: DifferentiableType,
     {
-        let arguments = DifferentiationTransformArguments::new(primal.entry_region_ref(), input_indices)?;
+        let arguments = JvpAndLinearizationTransformArguments::new(primal.entry_region_ref(), input_indices)?;
         let primal_output_count = primal.output_ids().len().checked_sub(residual_count).ok_or_else(|| {
             ProgramError::MalformedProgram(format!(
                 "linearization primal program produces {} outputs which is fewer than its {} residuals",
@@ -377,7 +379,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
                 )));
             }
         }
-        Ok(Self { primal, tangent, residual_count })
+        Ok(Self { primal: Arc::new(primal), tangent: Arc::new(tangent), residual_count })
     }
 
     /// Returns the nonlinear primal sub-program `x ↦ (y, r)`. It takes the primal inputs `x` and produces the primal
@@ -386,7 +388,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
     /// environment consumed by the [`tangent`](Self::tangent) sub-program. Callers executing it must satisfy the
     /// [reference arguments contract](Linearization#reference-arguments), which this raw program does not validate.
     #[inline]
-    pub fn primal(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
+    pub fn primal(&self) -> &Arc<Program<V, O, Vec<V>, Vec<V>>> {
         &self.primal
     }
 
@@ -403,7 +405,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
     /// allocation. Reference-typed program constants remain constants in the tangent program and do not occupy
     /// residual input slots.
     #[inline]
-    pub fn tangent(&self) -> &Program<V, O, Vec<V>, Vec<V>> {
+    pub fn tangent(&self) -> &Arc<Program<V, O, Vec<V>, Vec<V>>> {
         &self.tangent
     }
 
@@ -416,20 +418,23 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
     }
 
     /// Consumes this [`Linearization`] and returns its [`primal`](Self::primal) sub-program, [`tangent`](Self::tangent)
-    /// sub-program, and [`residual_count`](Self::residual_count), in that order. Executing the returned programs
-    /// retains the caller obligations in the [reference argument contract](Linearization#reference-arguments).
+    /// sub-program, and [`residual_count`](Self::residual_count), in that order, moving the shared handles without
+    /// cloning the programs. Executing the returned programs retains the caller obligations in the
+    /// [reference argument contract](Linearization#reference-arguments).
+    #[allow(clippy::type_complexity)]
     #[inline]
-    pub fn into_parts(self) -> (Program<V, O, Vec<V>, Vec<V>>, Program<V, O, Vec<V>, Vec<V>>, usize) {
+    pub fn into_parts(self) -> (Arc<Program<V, O, Vec<V>, Vec<V>>>, Arc<Program<V, O, Vec<V>, Vec<V>>>, usize) {
         (self.primal, self.tangent, self.residual_count)
     }
 
     /// Returns the compact forward-mode pushforward program `(live(ẋ), r) ↦ live(ẏ)`. Because linearization already
-    /// produces the pushforward as its unknown half, this is the [`tangent`](Self::tangent) sub-program itself, cloned
-    /// (i.e., the identity counterpart of [`pullback`](Self::pullback), which derives its program by transposition).
-    /// The returned program has the same unchecked [reference argument contract](Linearization#reference-arguments)
-    /// as [`Self::tangent`]; use [`Pushforward::apply`] for a callable that validates the reference arguments.
+    /// produces the pushforward as its unknown half, this clones the shared handle to [`tangent`](Self::tangent),
+    /// without cloning its program (i.e., the identity counterpart of [`pullback`](Self::pullback), which derives its
+    /// program by transposition). The returned program has the same unchecked
+    /// [reference argument contract](Linearization#reference-arguments) as [`Self::tangent`];
+    /// use [`Pushforward::apply`] for a callable that validates the reference arguments.
     #[inline]
-    pub fn pushforward(&self) -> Program<V, O, Vec<V>, Vec<V>> {
+    pub fn pushforward(&self) -> Arc<Program<V, O, Vec<V>, Vec<V>>> {
         self.tangent.clone()
     }
 
@@ -1141,8 +1146,7 @@ where
         region: RegionRef<'_, C::Constant, C::Operation>,
         input_indices: &[usize],
     ) -> Result<Linearization<C::Constant, C::Operation>, DifferentiationError> {
-        let (primal, tangent, residual_count) = region.linearize_shared(input_indices)?;
-        Ok(Linearization { primal: (*primal).clone(), tangent: (*tangent).clone(), residual_count })
+        region.linearize_shared(input_indices)
     }
 
     #[inline]
@@ -1751,7 +1755,7 @@ impl<V: Value<Type: DifferentiableType>, O: Operation<Type = V::Type>> RegionRef
     pub fn tangent_output_mask(&self, input_indices: &[usize]) -> Result<Vec<bool>, DifferentiationError> {
         // Only membership matters for reference outputs, and so we sort the validated selection so that each root
         // lookup uses binary search without allocating another mask covering every region input.
-        let mut arguments = DifferentiationTransformArguments::new(*self, input_indices)?;
+        let mut arguments = JvpAndLinearizationTransformArguments::new(*self, input_indices)?;
         arguments.input_indices.sort_unstable();
         let has_reference_outputs =
             self.output_ids().iter().any(|output| self.atoms()[output.index()].r#type().is_reference());
@@ -1826,7 +1830,7 @@ where
     /// tangent-type derivation and the replayed forward-mode rules.
     #[inline]
     pub fn jvp(&self, input_indices: &[usize]) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
-        self.jvp_impl(&DifferentiationTransformArguments::new(*self, input_indices)?)
+        self.jvp_impl(&JvpAndLinearizationTransformArguments::new(*self, input_indices)?)
     }
 
     /// Builds the fused Jacobian-Vector Product (JVP) program for `input_indices` through this region's retained
@@ -1849,7 +1853,7 @@ where
         &self,
         input_indices: &[usize],
     ) -> Result<Arc<Program<V, O, Vec<V>, Vec<V>>>, DifferentiationError> {
-        let arguments = DifferentiationTransformArguments::new(*self, input_indices)?;
+        let arguments = JvpAndLinearizationTransformArguments::new(*self, input_indices)?;
         let artifact = (*self).transform::<JvpTransform, _, DifferentiationError>(arguments, |region, arguments| {
             Ok(TransformArtifact::new(vec![Arc::new(region.jvp_impl(arguments)?)], ()))
         })?;
@@ -1865,7 +1869,7 @@ where
     /// selection validation.
     fn jvp_impl(
         &self,
-        arguments: &DifferentiationTransformArguments,
+        arguments: &JvpAndLinearizationTransformArguments,
     ) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError> {
         self.validate_reference_output_views()?;
         let primal_input_count = self.input_ids().len();
@@ -2101,18 +2105,17 @@ where
     ///     An empty slice selects no inputs.
     #[inline]
     pub fn linearize(&self, input_indices: &[usize]) -> Result<Linearization<V, O>, DifferentiationError> {
-        self.linearize_impl(&DifferentiationTransformArguments::new(*self, input_indices)?)
+        self.linearize_impl(&JvpAndLinearizationTransformArguments::new(*self, input_indices)?)
     }
 
-    /// Linearizes this region for `input_indices` through its retained transform cache, returning shared primal and
-    /// tangent programs together with their residual count (i.e., the [`Linearization::into_parts`] triple behind
-    /// [`Arc`]s). Selection, validation, and reference boundary requirements are the same as for
-    /// [`linearize`](Self::linearize).
+    /// Linearizes this region for `input_indices` through its retained transform cache, returning a [`Linearization`]
+    /// whose primal and tangent programs share the cached handles. Selection, validation, and reference boundary
+    /// requirements are the same as for [`linearize`](Self::linearize).
     ///
     /// Content preserving copies of a sealed region share the derived programs when their ordered selections agree
     /// after omitting zero differential spaces, just as for [`jvp_shared`](Self::jvp_shared). This avoids repeatedly
     /// linearizing shared callees and preserves the program identities used to intern repeated attachments. Use
-    /// [`linearize`](Self::linearize) for owned programs without cache lookup or retention.
+    /// [`linearize`](Self::linearize) for freshly constructed programs without cache lookup or retention.
     ///
     /// Recursive requests for a linearization currently in flight on this thread use uncached construction, as they
     /// do through [`linearize`](Self::linearize). Cache lookup and publication remain managed by
@@ -2122,24 +2125,19 @@ where
     ///
     ///   - `input_indices`: Unique input indices in tangent input order. Zero differential spaces are omitted.
     ///     An empty slice selects no inputs.
-    #[allow(clippy::type_complexity)]
-    pub fn linearize_shared(
-        &self,
-        input_indices: &[usize],
-    ) -> Result<(Arc<Program<V, O, Vec<V>, Vec<V>>>, Arc<Program<V, O, Vec<V>, Vec<V>>>, usize), DifferentiationError>
-    {
-        let arguments = DifferentiationTransformArguments::new(*self, input_indices)?;
+    pub fn linearize_shared(&self, input_indices: &[usize]) -> Result<Linearization<V, O>, DifferentiationError> {
+        let arguments = JvpAndLinearizationTransformArguments::new(*self, input_indices)?;
         let artifact =
             (*self).transform::<LinearizationTransform, _, DifferentiationError>(arguments, |region, arguments| {
                 let (primal, tangent, residual_count) = region.linearize_impl(arguments)?.into_parts();
-                Ok(TransformArtifact::new(vec![Arc::new(primal), Arc::new(tangent)], residual_count))
+                Ok(TransformArtifact::new(vec![primal, tangent], residual_count))
             })?;
         let (programs, residual_count) = artifact.into_parts();
         let mut programs = programs.into_iter();
         let primal = programs.next().unwrap();
         let tangent = programs.next().unwrap();
         assert!(programs.next().is_none(), "linearization transform retained more than two programs");
-        Ok((primal, tangent, residual_count))
+        Ok(Linearization { primal, tangent, residual_count })
     }
 
     /// Linearizes this region from validated, normalized `arguments`. Both [`linearize`](Self::linearize) and
@@ -2147,7 +2145,7 @@ where
     /// validation.
     fn linearize_impl(
         &self,
-        arguments: &DifferentiationTransformArguments,
+        arguments: &JvpAndLinearizationTransformArguments,
     ) -> Result<Linearization<V, O>, DifferentiationError> {
         self.validate_reference_output_views()?;
         let primal_input_count = self.input_ids().len();
@@ -3210,7 +3208,7 @@ fn residualize_zero_from_residual_values<C: Context<Operation: ResidualZeroProvi
 struct JvpTransform;
 
 impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for JvpTransform {
-    type Arguments = DifferentiationTransformArguments;
+    type Arguments = JvpAndLinearizationTransformArguments;
     type Artifact = TransformArtifact<V, O, ()>;
 
     const DEFAULT_CACHE_CAPACITY: usize = 8;
@@ -3220,7 +3218,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for JvpTran
 struct LinearizationTransform;
 
 impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for LinearizationTransform {
-    type Arguments = DifferentiationTransformArguments;
+    type Arguments = JvpAndLinearizationTransformArguments;
     type Artifact = TransformArtifact<V, O, usize>;
 
     const DEFAULT_CACHE_CAPACITY: usize = 8;
@@ -3230,13 +3228,13 @@ impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for Lineari
 /// their requested order, with zero differential spaces omitted. Reordering live inputs changes the tangent boundary
 /// and therefore the cache key; adding or moving only zero space inputs does not.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct DifferentiationTransformArguments {
+struct JvpAndLinearizationTransformArguments {
     /// Selected input indices in tangent input order, excluding zero differential spaces.
     input_indices: Vec<usize>,
 }
 
-impl DifferentiationTransformArguments {
-    /// Creates a new [`DifferentiationTransformArguments`] instance after validating the provided input indices and
+impl JvpAndLinearizationTransformArguments {
+    /// Creates a new [`JvpAndLinearizationTransformArguments`] instance after validating the provided input indices and
     /// removing zero space inputs while preserving the remaining order.
     ///
     /// # Errors
@@ -3553,7 +3551,13 @@ mod tests {
         assert_eq!(linearization.tangent().to_string(), tangent.to_string());
         assert_eq!(linearization.residual_count(), 0);
         assert_eq!(linearization.pushforward().to_string(), tangent.to_string());
+        let cloned = linearization.clone();
+        assert!(Arc::ptr_eq(cloned.primal(), linearization.primal()));
+        assert!(Arc::ptr_eq(cloned.tangent(), linearization.tangent()));
+        assert!(Arc::ptr_eq(&linearization.pushforward(), linearization.tangent()));
         let (actual_primal, actual_tangent, residual_count) = linearization.into_parts();
+        assert!(Arc::ptr_eq(&actual_primal, cloned.primal()));
+        assert!(Arc::ptr_eq(&actual_tangent, cloned.tangent()));
         assert_eq!(actual_primal.to_string(), primal.to_string());
         assert_eq!(actual_tangent.to_string(), tangent.to_string());
         assert_eq!(residual_count, 0);
@@ -3624,6 +3628,8 @@ mod tests {
             .unwrap();
         let linearization = program.entry_region_ref().linearize(&[2, 0]).unwrap();
         let (primal, tangent, residual_count) = linearization.into_parts();
+        let primal = Arc::unwrap_or_clone(primal);
+        let tangent = Arc::unwrap_or_clone(tangent);
         // Constructor validation uses selected order and omits zero spaces just like the transform.
         let reconstructed =
             Linearization::new_with_respect_to(primal.clone(), tangent.clone(), residual_count, &[2, 1, 0]).unwrap();
@@ -4400,7 +4406,7 @@ mod tests {
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
         );
         program.entry_region_ref().insert_transform_artifact_for_testing::<JvpTransform, _>(
-            DifferentiationTransformArguments { input_indices: vec![0] },
+            JvpAndLinearizationTransformArguments { input_indices: vec![0] },
             TransformArtifact::new(vec![unrelated.clone()], ()),
         );
 
@@ -4666,7 +4672,7 @@ mod tests {
         let callee = Arc::new(
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
         );
-        let (primal, tangent, residual_count) = callee.entry_region_ref().linearize_shared(&[0]).unwrap();
+        let (primal, tangent, residual_count) = callee.entry_region_ref().linearize_shared(&[0]).unwrap().into_parts();
         assert_eq!(residual_count, 1);
         assert_eq!(primal.to_string(), callee.linearize().unwrap().primal().to_string());
         assert_eq!(tangent.to_string(), callee.linearize().unwrap().tangent().to_string());
@@ -4679,10 +4685,10 @@ mod tests {
         let second_region = second_builder.intern_callee(&callee, None).unwrap();
         let first = RegionRef::new(&first_builder.regions, first_region).unwrap().linearize_shared(&[0]).unwrap();
         let second = RegionRef::new(&second_builder.regions, second_region).unwrap().linearize_shared(&[0]).unwrap();
-        assert!(Arc::ptr_eq(&first.0, &primal));
-        assert!(Arc::ptr_eq(&first.1, &tangent));
-        assert!(Arc::ptr_eq(&second.0, &primal));
-        assert!(Arc::ptr_eq(&second.1, &tangent));
+        assert!(Arc::ptr_eq(first.primal(), &primal));
+        assert!(Arc::ptr_eq(first.tangent(), &tangent));
+        assert!(Arc::ptr_eq(second.primal(), &primal));
+        assert!(Arc::ptr_eq(second.tangent(), &tangent));
 
         // The original region produces the artifact, and both independently interned copies reuse it.
         let statistics = callee.entry_region_ref().transform_statistics::<LinearizationTransform>().unwrap();
@@ -4691,7 +4697,7 @@ mod tests {
         // Simplification rebuilds every region, so it keeps the retained linearization only when the rebuild left the
         // region's contents untouched. A program carrying dead work is genuinely rewritten and must not reuse it.
         let simplified = callee.simplified().unwrap();
-        assert!(Arc::ptr_eq(&simplified.entry_region_ref().linearize_shared(&[0]).unwrap().0, &primal));
+        assert!(Arc::ptr_eq(simplified.entry_region_ref().linearize_shared(&[0]).unwrap().primal(), &primal));
 
         let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -4702,8 +4708,8 @@ mod tests {
         let before = with_dead_work.entry_region_ref().linearize_shared(&[0]).unwrap();
         let after = with_dead_work.simplified().unwrap();
         let after = after.entry_region_ref().linearize_shared(&[0]).unwrap();
-        assert!(!Arc::ptr_eq(&after.0, &before.0));
-        assert_eq!(after.0.to_string(), primal.to_string());
+        assert!(!Arc::ptr_eq(after.primal(), before.primal()));
+        assert_eq!(after.primal().to_string(), primal.to_string());
 
         // Instantiating a program's type identities rewrites its types, so the rebuilt program starts over with no
         // retained transforms even though the source program keeps its own.
@@ -4724,8 +4730,11 @@ mod tests {
         );
         let instantiated = dynamic_callee.with_instantiated_type_identities(&[actual_type]).unwrap().into_owned();
         let instantiated = instantiated.entry_region_ref().linearize_shared(&[0]).unwrap();
-        assert!(!Arc::ptr_eq(&instantiated.0, &formal.0));
-        assert!(Arc::ptr_eq(&dynamic_callee.entry_region_ref().linearize_shared(&[0]).unwrap().0, &formal.0));
+        assert!(!Arc::ptr_eq(instantiated.primal(), formal.primal()));
+        assert!(Arc::ptr_eq(
+            dynamic_callee.entry_region_ref().linearize_shared(&[0]).unwrap().primal(),
+            formal.primal()
+        ));
     }
 
     #[test]
@@ -4758,16 +4767,16 @@ mod tests {
         )
         .unwrap();
         let derived = rebased.entry_region_ref().linearize_shared(&[0, 1]).unwrap();
-        assert!(!Arc::ptr_eq(&derived.0, &retained.0));
-        assert!(!Arc::ptr_eq(&derived.1, &retained.1));
+        assert!(!Arc::ptr_eq(derived.primal(), retained.primal()));
+        assert!(!Arc::ptr_eq(derived.tangent(), retained.tangent()));
 
         // The freshly derived tangent program differentiates the cosine branch the rebased arena actually attaches,
         // which is the wrong-derivative failure that serving the retained artifact would produce.
-        assert_eq!(derived.1.to_string(), rebased.linearize().unwrap().tangent().to_string());
-        assert_ne!(derived.1.to_string(), retained.1.to_string());
+        assert_eq!(derived.tangent().to_string(), rebased.linearize().unwrap().tangent().to_string());
+        assert_ne!(derived.tangent().to_string(), retained.tangent().to_string());
 
         // The source program keeps its own retained artifact, because only the re-sealed copy was rebased.
-        assert!(Arc::ptr_eq(&first.entry_region_ref().linearize_shared(&[0, 1]).unwrap().0, &retained.0));
+        assert!(Arc::ptr_eq(first.entry_region_ref().linearize_shared(&[0, 1]).unwrap().primal(), retained.primal()));
     }
 
     #[cfg(debug_assertions)]
@@ -4789,7 +4798,7 @@ mod tests {
             builder.build::<Vec<Array>, Vec<Array>>(vec![output], vec![Placeholder], vec![Placeholder]).unwrap(),
         );
         program.entry_region_ref().insert_transform_artifact_for_testing::<LinearizationTransform, _>(
-            DifferentiationTransformArguments { input_indices: vec![0] },
+            JvpAndLinearizationTransformArguments { input_indices: vec![0] },
             TransformArtifact::new(vec![unrelated.clone(), unrelated.clone()], 0),
         );
 
@@ -4830,9 +4839,9 @@ mod tests {
 
         // Publish the *other* region's genuine linearization against this region, which is the state a `jvp` rule that
         // is not a structural function of its operation would leave behind.
-        let (primal, tangent, residual_count) = other.entry_region_ref().linearize_shared(&[0]).unwrap();
+        let (primal, tangent, residual_count) = other.entry_region_ref().linearize_shared(&[0]).unwrap().into_parts();
         program.entry_region_ref().insert_transform_artifact_for_testing::<LinearizationTransform, _>(
-            DifferentiationTransformArguments { input_indices: vec![0] },
+            JvpAndLinearizationTransformArguments { input_indices: vec![0] },
             TransformArtifact::new(vec![primal.clone(), tangent.clone()], residual_count),
         );
 
@@ -4868,9 +4877,9 @@ mod tests {
 
         // Publish the *other* region's genuine linearization against this region, which is the state a `jvp` rule
         // that is not a structural function of the constants it embeds would leave behind.
-        let (primal, tangent, residual_count) = other.entry_region_ref().linearize_shared(&[0]).unwrap();
+        let (primal, tangent, residual_count) = other.entry_region_ref().linearize_shared(&[0]).unwrap().into_parts();
         program.entry_region_ref().insert_transform_artifact_for_testing::<LinearizationTransform, _>(
-            DifferentiationTransformArguments { input_indices: vec![0] },
+            JvpAndLinearizationTransformArguments { input_indices: vec![0] },
             TransformArtifact::new(vec![primal.clone(), tangent.clone()], residual_count),
         );
 
@@ -4903,7 +4912,7 @@ mod tests {
         let source_cache = program.entry_region().transform_cache.downgrade();
         let materialized = program.entry_region_ref().to_program();
         assert!(program.entry_region().transform_cache.ptr_eq(&materialized.entry_region().transform_cache));
-        let (primal, tangent, _) = materialized.entry_region_ref().linearize_shared(&[0]).unwrap();
+        let (primal, tangent, _) = materialized.entry_region_ref().linearize_shared(&[0]).unwrap().into_parts();
 
         drop(program);
         drop(materialized);
@@ -4930,10 +4939,10 @@ mod tests {
         let reversed = region.linearize_shared(&[2, 1, 0]).unwrap();
         let equivalent = region.linearize_shared(&[1, 2, 0]).unwrap();
         let source_order = region.linearize_shared(&[0, 2]).unwrap();
-        assert!(Arc::ptr_eq(&reversed.0, &equivalent.0));
-        assert!(Arc::ptr_eq(&reversed.1, &equivalent.1));
-        assert!(!Arc::ptr_eq(&reversed.0, &source_order.0));
-        assert!(!Arc::ptr_eq(&reversed.1, &source_order.1));
+        assert!(Arc::ptr_eq(reversed.primal(), equivalent.primal()));
+        assert!(Arc::ptr_eq(reversed.tangent(), equivalent.tangent()));
+        assert!(!Arc::ptr_eq(reversed.primal(), source_order.primal()));
+        assert!(!Arc::ptr_eq(reversed.tangent(), source_order.tangent()));
     }
 
     #[test]
@@ -4950,10 +4959,10 @@ mod tests {
         // The tangent half consumes one tangent input for the active input only, followed by the residuals, and
         // computes `ẏ = ẋ · right` without a term for the inactive input.
         // The retained linearization is keyed by the effective selection as well.
-        let (partial_primal, ..) = region.linearize_shared(&[0]).unwrap();
-        let (full_primal, ..) = region.linearize_shared(&[0, 1]).unwrap();
+        let (partial_primal, ..) = region.linearize_shared(&[0]).unwrap().into_parts();
+        let (full_primal, ..) = region.linearize_shared(&[0, 1]).unwrap().into_parts();
         assert!(!Arc::ptr_eq(&partial_primal, &full_primal));
-        assert!(Arc::ptr_eq(&region.linearize_shared(&[0]).unwrap().0, &partial_primal));
+        assert!(Arc::ptr_eq(region.linearize_shared(&[0]).unwrap().primal(), &partial_primal));
     }
 
     #[test]

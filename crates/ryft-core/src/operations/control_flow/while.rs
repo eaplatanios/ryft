@@ -1981,11 +1981,11 @@ where
             .copied()
             .chain(stacked_residual_indices.iter().map(|&index| outputs[state_count + index]))
             .collect::<Vec<_>>();
-        builder.build(
+        Arc::new(builder.build(
             selected_outputs,
             vec![Placeholder; inputs.len()],
             vec![Placeholder; state_count + stacked_residual_indices.len()],
-        )?
+        )?)
     };
 
     // Run the primal loop over its original state plus a counter, one stack per stored residual, and a validity mask.

@@ -1298,8 +1298,8 @@ where
                 })
                 .collect();
             let partition = PartitionedProgram::from_parts(
-                primal_program,
-                tangent_program,
+                Arc::unwrap_or_clone(primal_program),
+                Arc::unwrap_or_clone(tangent_program),
                 known_input_indices,
                 residual_inputs,
                 partition_outputs,

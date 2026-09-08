@@ -285,11 +285,7 @@ impl<C: Context<Type = ArrayType, Operation: From<ReduceOperation>>, P: ArrayExt
         cotangent: Tracer<TracingContext<C::Constant, C::Operation>>,
         axis: Axis,
     ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError> {
-        let axis = axis.normalize(cotangent.r#type().rank()).map_err(|_| BatchingError::BatchAxisOutOfBounds {
-            r#type: Box::new(cotangent.r#type().into_owned()),
-            axis,
-        })?;
-        Ok(cotangent.reduce(&[axis], ReductionKind::Sum))
+        sum_mapped_array_cotangents(cotangent, axis)
     }
 }
 
@@ -306,15 +302,25 @@ impl<
         cotangent: Tracer<TracingContext<C::Constant, C::Operation>>,
         axis: Axis,
     ) -> Result<Tracer<TracingContext<C::Constant, C::Operation>>, BatchingError> {
-        // Projecting the replayed array cotangent gives it the ordinary `Reduce` capability,
-        // whose staged operation lifts back through the composite operation family.
+        // Projecting the replayed array cotangent gives it the ordinary `Reduce` capability, whose staged operation
+        // lifts back through the composite operation family.
         let cotangent = ValueProjection::<ArrayType>::into_projected(cotangent)?;
-        let axis = axis.normalize(cotangent.r#type().rank()).map_err(|_| BatchingError::BatchAxisOutOfBounds {
-            r#type: Box::new(cotangent.r#type().into_owned()),
-            axis,
-        })?;
-        Ok(ValueProjection::from_projected(cotangent.reduce(&[axis], ReductionKind::Sum)))
+        Ok(ValueProjection::from_projected(sum_mapped_array_cotangents(cotangent, axis)?))
     }
+}
+
+/// Sums the per-item cotangents of the array-typed `cotangent` packed along `axis`, removing that axis. This is the
+/// representation-independent core of [`CotangentBatchingPolicy::sum_mapped_cotangents`] for both array policies (the
+/// homogeneous policy applies it to the replayed cotangent directly, while the composite policy applies it to the
+/// cotangent's projected array member).
+fn sum_mapped_array_cotangents<V: Typed<Type = ArrayType> + Reduce>(
+    cotangent: V,
+    axis: Axis,
+) -> Result<V, BatchingError> {
+    let normalized_axis = axis
+        .normalize(cotangent.r#type().rank())
+        .map_err(|_| BatchingError::BatchAxisOutOfBounds { r#type: Box::new(cotangent.r#type().into_owned()), axis })?;
+    Ok(cotangent.reduce(&[normalized_axis], ReductionKind::Sum))
 }
 
 /// Materializes one array operand's forward-mode tangent as a concrete projected array value, reading whatever runtime

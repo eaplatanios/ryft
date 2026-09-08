@@ -880,7 +880,7 @@ where
             *r#type = packed_residual_type(<&ArrayType>::try_from(&*r#type)?, &self.shard_map)?.into();
         }
         let known_input_types = known_program.input_types();
-        let packed_known_program = reshape_program_boundary(known_program, known_input_types, known_output_types)?;
+        let packed_known_program = reshape_program_boundary(&known_program, known_input_types, known_output_types)?;
         let residual_program = partition.residual_program().clone();
         let mut residual_input_types = residual_program.input_types();
         for (source, r#type) in partition.residual_inputs().iter().zip(&mut residual_input_types) {
@@ -890,7 +890,7 @@ where
         }
         let residual_output_types = residual_program.output_types();
         let packed_residual_program =
-            reshape_program_boundary(residual_program, residual_input_types, residual_output_types)?;
+            reshape_program_boundary(&residual_program, residual_input_types, residual_output_types)?;
 
         // Bind the known-side `shard_map` into the enclosing known-side context, emit the residual `shard_map`
         // over the surviving unknown boundary inputs plus the residual edges, and reassemble the original outputs.
@@ -979,7 +979,7 @@ fn packed_residual_type(local_type: &ArrayType, shard_map: &ShardMap) -> Result<
 
 /// Rewraps a body's array boundary with element-preserving reshapes. Reference positions must remain unchanged.
 fn reshape_program_boundary<V>(
-    program: Program<V, XlaOperation<V>, Vec<V>, Vec<V>>,
+    program: &Program<V, XlaOperation<V>, Vec<V>, Vec<V>>,
     input_types: Vec<ArrayIrType>,
     output_types: Vec<ArrayIrType>,
 ) -> Result<Program<V, XlaOperation<V>, Vec<V>, Vec<V>>, ProgramError>
@@ -1012,7 +1012,7 @@ where
         .zip(input_types.iter().zip(program.input_types()))
         .map(|(input, (source, target))| reshape(&mut builder, input, source, &target))
         .collect::<Result<Vec<_>, _>>()?;
-    let outputs = builder.splice_program(&program, &operands)?;
+    let outputs = builder.splice_program(program, &operands)?;
     let outputs = outputs
         .into_iter()
         .zip(program.output_types().iter().zip(&output_types))
@@ -1096,9 +1096,9 @@ where
     let tangent_residual_start = tangent_input_types.len() - residual_count;
     tangent_input_types[tangent_residual_start..].clone_from_slice(&primal_output_types[output_count..]);
     let primal_input_types = primal_program.input_types();
-    let primal_program = reshape_program_boundary(primal_program, primal_input_types, primal_output_types)?;
+    let primal_program = reshape_program_boundary(&primal_program, primal_input_types, primal_output_types)?;
     let tangent_output_types = tangent_program.output_types();
-    let tangent_program = reshape_program_boundary(tangent_program, tangent_input_types, tangent_output_types)?;
+    let tangent_program = reshape_program_boundary(&tangent_program, tangent_input_types, tangent_output_types)?;
 
     let primal_operation = ShardMapOperation::from_boundary(
         ShardMap::from_shardings(

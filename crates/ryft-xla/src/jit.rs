@@ -5122,8 +5122,6 @@ mod tests {
     /// `(sin(x), cos(x) * dx)` — within `1e-5`.
     #[test]
     fn test_jvp_of_jit_call_preserves_boundary_and_matches_legacy_jvp() {
-        use std::sync::Arc;
-
         use ryft_core::StagingContext;
 
         use crate::experimental::ops::{FlatXlaProgram, JitCallOperation};
@@ -5206,7 +5204,6 @@ mod tests {
         // structure the value-level reroute will stage and exercises the real XLA lowering and execution of both
         // jit_call boundaries.
         let (primal_half, tangent_half, residual_count) = linearization.into_parts();
-        let (primal_half, tangent_half) = (Arc::new(primal_half), Arc::new(tangent_half));
         let jvp_compiled: CompiledXlaFunction<'_, (ArrayType, ArrayType), (ArrayType, ArrayType)> = compile(
             move |(primal_input, tangent_input)| {
                 let context = primal_input.value().context().clone();

@@ -1187,7 +1187,6 @@ where
             .collect::<Vec<_>>();
         let output_activity = callee.tangent_output_mask(&input_indices)?;
         let (primal_program, tangent_program, _) = driver.linearize_program(callee, &input_indices)?.into_parts();
-        let (primal_program, tangent_program) = (Arc::new(primal_program), Arc::new(tangent_program));
 
         // Wrap the primal sub-program in a fresh `jit_call` and bind it over the operand primals, recovering the
         // primal outputs followed by the residual values. The shared sub-program handles are attached directly, so
