@@ -26,6 +26,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::cumulative::{cumulative_abstract, lift_cumulative_axis};
+use crate::operations::math::add::AddOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, ProgramError, RegionInterface, TypeError, Typed, Value,
@@ -220,7 +221,7 @@ where
 // primitive.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for CumulativeSumOperation
 where
-    O: Operation<Type = ArrayType> + From<CumulativeSumOperation>,
+    O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>> + From<CumulativeSumOperation>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,

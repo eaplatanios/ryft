@@ -15,6 +15,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::constants::zero::Zero;
+use crate::operations::math::add::AddOperation;
 use crate::operations::references::reference_freeze::ReferenceFreezeOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
@@ -218,7 +219,7 @@ where
     U: DifferentiableType,
     ReferenceNewOperation<T, U>: Operation<Type = U>,
     V: Value<Type = U>,
-    O: Operation<Type = U> + From<ReferenceFreezeOperation<T, U>>,
+    O: Operation<Type = U> + From<AddOperation<U>> + From<ReferenceFreezeOperation<T, U>>,
     ReferenceFreezeOperation<T, U>: Operation<Type = U>,
 {
     // The allocation is the map from the initial value to the initial state, so its transpose is the final step of the

@@ -24,6 +24,7 @@ use crate::operations::manipulation::broadcasting::Broadcast;
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::{Slice, UpdateSlice};
 use crate::operations::manipulation::transposition::Transpose;
+use crate::operations::math::add::AddOperation;
 use crate::operations::sharding::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
@@ -463,7 +464,10 @@ where
 /// structural zero. Non-additive combiners are not linear and are rejected.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ScatterOperation
 where
-    O: Operation<Type = ArrayType> + From<ZeroOperation<ArrayType>> + From<GatherOperation>,
+    O: Operation<Type = ArrayType>
+        + From<AddOperation<ArrayType>>
+        + From<ZeroOperation<ArrayType>>
+        + From<GatherOperation>,
     Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(

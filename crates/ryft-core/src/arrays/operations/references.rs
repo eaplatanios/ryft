@@ -35,8 +35,8 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::references::forwarded_tangent;
 use crate::operations::{
-    Add, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
-    ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation,
+    Add, AddOperation, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
+    ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation,
     ReferenceWrite, ReferenceWriteOperation, Reshape, Slice, UpdateSlice,
 };
 use crate::parameters::Parameter;
@@ -410,8 +410,8 @@ macro_rules! impl_default_reference_view_transposition {
         // A view is aliasing metadata rather than a linear map of its own: the cotangent of a view operand is reached
         // by reapplying the view path to its root's cotangent reference inside the transposition context, so the
         // reverse sweep never needs this rule to run and every operand receives a structural zero.
-        impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType>> TransposableOperation<V, O>
-            for $operation
+        impl<V: Value<Type = ArrayIrType>, O: Operation<Type = ArrayIrType> + From<AddOperation<ArrayIrType>>>
+            TransposableOperation<V, O> for $operation
         {
             fn transpose<D: TranspositionDriver<V, O>>(
                 &self,

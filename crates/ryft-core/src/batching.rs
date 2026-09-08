@@ -2379,7 +2379,7 @@ mod tests {
         assert_eq!(tracer.r#type(), Cow::Owned(ProjectedProgramType::Third(ProjectedMemberType::<2>)));
         assert_eq!(tracer.batch_extent(), &5);
 
-        let operation = ProjectedProgramOperation::from(ProjectedMemberOperation::<2>);
+        let operation = ProjectedProgramOperation::from(ProjectedMemberOperation::<2>::Identity);
         let outputs = operation.batch(&context, &EmptyRegionDriver, &[tracer.into_batch()]).unwrap().into_parts().0;
         assert_eq!(
             outputs,
@@ -2760,7 +2760,9 @@ mod tests {
             ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)),
         );
         let (outputs, evidence) =
-            batch_projected_operation(&context, &ProjectedMemberOperation::<2>, &[input]).unwrap().into_parts();
+            batch_projected_operation(&context, &ProjectedMemberOperation::<2>::Identity, &[input])
+                .unwrap()
+                .into_parts();
         assert_eq!(
             outputs,
             vec![ProjectedBatch {

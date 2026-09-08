@@ -14,6 +14,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types, impl_reference_dischargeable_operation};
 use crate::operations::constants::zero::Zero;
+use crate::operations::math::add::AddOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, OutputRegionProvenance, ProgramError, RegionInterface, RegionSlot,
@@ -644,7 +645,10 @@ impl<C: Context<Type: DifferentiableType, Operation: ResidualZeroProvider<C::Typ
 
 impl<
     V: Value<Type: DifferentiableType>,
-    O: Operation<Type = V::Type> + ResidualZeroProvider<V::Type> + From<LinearCallOperation<V::Type>>,
+    O: Operation<Type = V::Type>
+        + From<AddOperation<V::Type>>
+        + ResidualZeroProvider<V::Type>
+        + From<LinearCallOperation<V::Type>>,
 > TransposableOperation<V, O> for LinearCallOperation<V::Type>
 {
     fn transpose<D: TranspositionDriver<V, O>>(

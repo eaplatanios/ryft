@@ -14,7 +14,6 @@ use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::arrays::batching::align_array_batch;
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
     ArrayType, DataType, DimensionValue,
@@ -710,7 +709,7 @@ where
             .cloned()
             .map(|input| match input.unbatched_type() {
                 ArrayIrType::Array(_) if !input.batch_axis().is_replicated() => {
-                    align_array_batch(context, input, Axis::from(0))
+                    driver.align_batch_axis(context, input, Axis::from(0))
                 }
                 ArrayIrType::Array(_) | ArrayIrType::Reference(_) => Ok(input),
                 ArrayIrType::Dimension(_) => {
@@ -821,7 +820,7 @@ where
 
         for (value, axis) in state.iter_mut().zip(state_axes.iter()) {
             if !axis.is_replicated() && value.batch_axis().is_replicated() {
-                *value = align_array_batch(context, value.clone(), Axis::from(0))?;
+                *value = driver.align_batch_axis(context, value.clone(), Axis::from(0))?;
             }
         }
         let (batched_condition, _) = batched_condition.into_parts();

@@ -605,7 +605,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
                             }
                         }
                         panic!(
-                            "nondeterministic transform rule detected for `{}` with arguments {:?}: re-derivation \
+                            "nondeterministic transform rule detected for `{}` with arguments `{:?}`: re-derivation \
                              produced a different artifact than the region cache retained, but region transforms must \
                              be deterministic structural functions of their complete reachable contents and \
                              arguments\n\ncached metadata: {:?}\nderived metadata: {:?}\n\n{}",
@@ -725,7 +725,7 @@ mod tests {
             }
         }
         format!(
-            "nondeterministic transform rule detected for `{}` with arguments {:?}: re-derivation produced a \
+            "nondeterministic transform rule detected for `{}` with arguments `{:?}`: re-derivation produced a \
              different artifact than the region cache retained, but region transforms must be deterministic \
              structural functions of their complete reachable contents and arguments\n\ncached metadata: \
              {:?}\nderived metadata: {:?}\n\n{}",

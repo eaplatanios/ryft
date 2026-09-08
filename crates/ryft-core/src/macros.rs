@@ -1466,7 +1466,8 @@ macro_rules! impl_differentiable_operation {
     ) => {
         impl<
             $value: $crate::Value,
-            $operations: $crate::Operation<Type = <$value as $crate::Typed>::Type>,
+            $operations: $crate::Operation<Type = <$value as $crate::Typed>::Type>
+                + ::std::convert::From<$crate::AddOperation<<$value as $crate::Typed>::Type>>,
             $($generic,)*
         > $crate::TransposableOperation<$value, $operations> for $operation
         where
@@ -1683,7 +1684,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         impl<
             $type: $crate::Type,
             __V: $crate::Value<Type = $type>,
-            __O: $crate::Operation<Type = $type>,
+            __O: $crate::Operation<Type = $type> + ::std::convert::From<$crate::AddOperation<$type>>,
         > $crate::TransposableOperation<__V, __O> for $operation
         where
             $operation: $crate::Operation<Type = $type>,
@@ -2090,7 +2091,8 @@ macro_rules! impl_differentiable_elementwise_operation {
             __T: $($transpose_type_bound)+,
             $($generic: $crate::Type,)*
             __V: $crate::Value<Type = __T>,
-            __O: $crate::Operation<Type = __T> $($transpose_operation_bounds)*,
+            __O: $crate::Operation<Type = __T>
+                + ::std::convert::From<$crate::AddOperation<__T>> $($transpose_operation_bounds)*,
         > $crate::TransposableOperation<__V, __O> for $operation
         where
             $operation: $crate::Operation<Type = __T>,
@@ -2204,7 +2206,8 @@ macro_rules! impl_differentiable_elementwise_operation {
             __T: $crate::DifferentiableType,
             $($generic: $crate::Type,)*
             __V: $crate::Value<Type = __T>,
-            __O: $crate::Operation<Type = __T> $($transpose_operation_bounds)*,
+            __O: $crate::Operation<Type = __T>
+                + ::std::convert::From<$crate::AddOperation<__T>> $($transpose_operation_bounds)*,
         > $crate::TransposableOperation<__V, __O> for $operation
         where
             $crate::Tracer<$crate::TracingContext<__V, __O>>: $crate::ElementwiseDerivativeAlignment<__T>,

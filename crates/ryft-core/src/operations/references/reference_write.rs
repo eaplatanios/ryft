@@ -14,6 +14,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::constants::zero::Zero;
+use crate::operations::math::add::AddOperation;
 use crate::operations::references::reference_swap::ReferenceSwapOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
@@ -215,7 +216,10 @@ where
     U: DifferentiableType,
     ReferenceWriteOperation<T, U>: Operation<Type = U>,
     V: Value<Type = U>,
-    O: ReferenceViewOperation<Type = U> + ResidualZeroProvider<U> + From<ReferenceSwapOperation<T, U>>,
+    O: ReferenceViewOperation<Type = U>
+        + From<AddOperation<U>>
+        + ResidualZeroProvider<U>
+        + From<ReferenceSwapOperation<T, U>>,
     ReferenceSwapOperation<T, U>: Operation<Type = U>,
 {
     // A write is a swap whose previous contents are discarded, so its transpose is the swap transpose with a zero

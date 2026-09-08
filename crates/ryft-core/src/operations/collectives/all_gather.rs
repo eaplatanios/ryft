@@ -34,6 +34,7 @@ use crate::operations::manipulation::broadcasting::DynamicBroadcastOperation;
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape};
 use crate::operations::manipulation::slicing::{DynamicShapeSliceOperation, resized_output_sharding};
 use crate::operations::manipulation::transposition::Transpose;
+use crate::operations::math::add::AddOperation;
 use crate::operations::math::div::Div;
 use crate::operations::math::mul::Mul;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -401,7 +402,7 @@ shape_changing_collective!(@differentiation AllGatherOperation);
 impl<V, O> TransposableOperation<V, O> for AllGatherOperation
 where
     V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType> + From<ParallelSumScatterOperation>,
+    O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>> + From<ParallelSumScatterOperation>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,

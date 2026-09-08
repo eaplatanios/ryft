@@ -1864,7 +1864,7 @@ where
         Ok(program)
     }
 
-    /// Builds the fused fused Jacobian-Vector Product (JVP) program from validated, normalized `arguments`. Both
+    /// Builds the fused Jacobian-Vector Product (JVP) program from validated, normalized `arguments`. Both
     /// [`jvp`](Self::jvp) and [`jvp_shared`](Self::jvp_shared) use this implementation without repeating input
     /// selection validation.
     fn jvp_impl(
@@ -6106,7 +6106,9 @@ mod tests {
             ProjectedProgramValue::Third(ProjectedMemberValue::<2>(3)),
         )
         .unwrap();
-        let output = jvp_projected_operation(&context, &ProjectedMemberOperation::<2>, &[input]).unwrap().remove(0);
+        let output = jvp_projected_operation(&context, &ProjectedMemberOperation::<2>::Identity, &[input])
+            .unwrap()
+            .remove(0);
         let (primal, tangent) = output.into_parts();
         assert_eq!(primal, ProjectedProgramValue::Third(ProjectedMemberValue::<2>(7)));
         assert!(matches!(tangent, MaybeZero::Value(ProjectedProgramValue::Third(ProjectedMemberValue::<2>(3))),));
@@ -6117,7 +6119,9 @@ mod tests {
             MaybeZero::Zero(ProjectedProgramType::Third(ProjectedMemberType::<2>)),
         )
         .unwrap();
-        let output = jvp_projected_operation(&context, &ProjectedMemberOperation::<2>, &[input]).unwrap().remove(0);
+        let output = jvp_projected_operation(&context, &ProjectedMemberOperation::<2>::Identity, &[input])
+            .unwrap()
+            .remove(0);
         let (primal, tangent) = output.into_parts();
         assert_eq!(primal, ProjectedProgramValue::Third(ProjectedMemberValue::<2>(11)));
         assert!(matches!(tangent, MaybeZero::Zero(ProjectedProgramType::Third(ProjectedMemberType::<2>)),));

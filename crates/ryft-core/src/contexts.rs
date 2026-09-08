@@ -1078,15 +1078,30 @@ pub(crate) mod tests {
     impl_projected_test_member!(1, Second);
     impl_projected_test_member!(2, Third);
 
-    /// Test-only homogeneous identity operation for one projected member kind.
+    /// Test-only homogeneous identity and addition operations for one projected member kind.
     #[derive(Clone, Debug, PartialEq, Eq)]
-    pub(crate) struct ProjectedMemberOperation<const MEMBER: u8>;
+    pub(crate) enum ProjectedMemberOperation<const MEMBER: u8> {
+        /// Preserves one value.
+        Identity,
+
+        /// Adds two values in the same member family.
+        Add,
+    }
+
+    impl<const MEMBER: u8> From<AddOperation<ProjectedMemberType<MEMBER>>> for ProjectedMemberOperation<MEMBER> {
+        fn from(_: AddOperation<ProjectedMemberType<MEMBER>>) -> Self {
+            Self::Add
+        }
+    }
 
     impl<const MEMBER: u8> Operation for ProjectedMemberOperation<MEMBER> {
         type Type = ProjectedMemberType<MEMBER>;
 
         fn name(&self) -> &'static str {
-            "projected_member"
+            match self {
+                Self::Identity => "projected_member",
+                Self::Add => "add",
+            }
         }
 
         fn infer_output_types(
@@ -1094,8 +1109,8 @@ pub(crate) mod tests {
             input_types: &[ProjectedMemberType<MEMBER>],
             _region_interfaces: &[RegionInterface<ProjectedMemberType<MEMBER>>],
         ) -> Result<Vec<ProjectedMemberType<MEMBER>>, TypeError> {
-            check_count!("input", input_types, 1, TypeError);
-            Ok(input_types.to_vec())
+            check_count!("input", input_types, if matches!(self, Self::Identity) { 1 } else { 2 }, TypeError);
+            Ok(vec![ProjectedMemberType])
         }
     }
 
@@ -1108,17 +1123,27 @@ pub(crate) mod tests {
             _driver: &D,
             inputs: &[DifferentiationDual<C::Value>],
         ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
-            check_count!("input", inputs, 1, ProgramError);
-            let context = context.primal();
-            let primal = context.bind(self.clone(), Vec::new(), std::slice::from_ref(inputs[0].primal()))?.remove(0);
-            Ok(vec![DifferentiationDual::new(primal, inputs[0].tangent().clone())?])
+            check_count!("input", inputs, if matches!(self, Self::Identity) { 1 } else { 2 }, ProgramError);
+            let primals = inputs.iter().map(|input| input.primal().clone()).collect::<Vec<_>>();
+            let primal = context.primal().bind(self.clone(), Vec::new(), &primals)?.remove(0);
+            let tangent = if matches!(self, Self::Identity) {
+                inputs[0].tangent().clone()
+            } else {
+                match (inputs[0].tangent(), inputs[1].tangent()) {
+                    (MaybeZero::Zero(_), tangent) | (tangent, MaybeZero::Zero(_)) => tangent.clone(),
+                    (MaybeZero::Value(left), MaybeZero::Value(right)) => MaybeZero::Value(
+                        context.tangent().bind(self.clone(), Vec::new(), &[left.clone(), right.clone()])?.remove(0),
+                    ),
+                }
+            };
+            Ok(vec![DifferentiationDual::new(primal, tangent)?])
         }
     }
 
     impl<
         const MEMBER: u8,
         V: Value<Type = ProjectedMemberType<MEMBER>>,
-        O: Operation<Type = ProjectedMemberType<MEMBER>>,
+        O: Operation<Type = ProjectedMemberType<MEMBER>> + From<AddOperation<ProjectedMemberType<MEMBER>>>,
     > TransposableOperation<V, O> for ProjectedMemberOperation<MEMBER>
     {
         fn transpose<D: TranspositionDriver<V, O>>(
@@ -1129,10 +1154,13 @@ pub(crate) mod tests {
             outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
             accumulators: &[CotangentAccumulator],
         ) -> Result<(), DifferentiationError> {
-            check_count!("input", inputs, 1, ProgramError);
+            check_count!("input", inputs, if matches!(self, Self::Identity) { 1 } else { 2 }, ProgramError);
             check_count!("output", outputs, 1, ProgramError);
-            check_count!("accumulator", accumulators, 1, DifferentiationError);
-            accumulators[0].accumulate(context, outputs[0].clone())
+            check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+            for accumulator in accumulators {
+                accumulator.accumulate(context, outputs[0].clone())?;
+            }
+            Ok(())
         }
     }
 
@@ -1147,6 +1175,15 @@ pub(crate) mod tests {
 
         /// Third member operation, used by transform tests to prove that generic machinery is member-kind-agnostic.
         Third(ProjectedMemberOperation<2>),
+
+        /// Adds two values of the same composite member type.
+        Add,
+    }
+
+    impl From<AddOperation<ProjectedProgramType>> for ProjectedProgramOperation {
+        fn from(_: AddOperation<ProjectedProgramType>) -> Self {
+            Self::Add
+        }
     }
 
     impl ProjectedProgramOperation {
@@ -1178,6 +1215,7 @@ pub(crate) mod tests {
                 Self::First(operation) => operation.name(),
                 Self::Second(operation) => operation.name(),
                 Self::Third(operation) => operation.name(),
+                Self::Add => "add",
             }
         }
 
@@ -1190,6 +1228,13 @@ pub(crate) mod tests {
                 Self::First(operation) => Self::infer_member(operation, input_types),
                 Self::Second(operation) => Self::infer_member(operation, input_types),
                 Self::Third(operation) => Self::infer_member(operation, input_types),
+                Self::Add => {
+                    check_count!("input", input_types, 2, TypeError);
+                    if input_types[0] != input_types[1] {
+                        return Err(TypeError::invalid("addition requires matching member types"));
+                    }
+                    Ok(vec![input_types[0].clone()])
+                }
             }
         }
     }
@@ -1203,7 +1248,29 @@ pub(crate) mod tests {
         ) -> Result<Vec<ProjectedProgramValue>, ProgramError> {
             let input_types = inputs.iter().map(|input| input.r#type().into_owned()).collect::<Vec<_>>();
             self.infer_output_types(input_types.as_slice(), &[])?;
-            Ok(inputs.to_vec())
+            if matches!(
+                self,
+                Self::Add
+                    | Self::First(ProjectedMemberOperation::Add)
+                    | Self::Second(ProjectedMemberOperation::Add)
+                    | Self::Third(ProjectedMemberOperation::Add)
+            ) {
+                let output = match (&inputs[0], &inputs[1]) {
+                    (ProjectedProgramValue::First(left), ProjectedProgramValue::First(right)) => {
+                        ProjectedProgramValue::First(ProjectedMemberValue(left.0 + right.0))
+                    }
+                    (ProjectedProgramValue::Second(left), ProjectedProgramValue::Second(right)) => {
+                        ProjectedProgramValue::Second(ProjectedMemberValue(left.0 + right.0))
+                    }
+                    (ProjectedProgramValue::Third(left), ProjectedProgramValue::Third(right)) => {
+                        ProjectedProgramValue::Third(ProjectedMemberValue(left.0 + right.0))
+                    }
+                    _ => unreachable!(),
+                };
+                Ok(vec![output])
+            } else {
+                Ok(inputs.to_vec())
+            }
         }
     }
 
@@ -1365,7 +1432,7 @@ pub(crate) mod tests {
         );
         assert!(context.is_eager());
         assert_eq!(
-            context.bind(ProjectedMemberOperation, Vec::new(), &[ProjectedMemberValue::<0>(7)]),
+            context.bind(ProjectedMemberOperation::Identity, Vec::new(), &[ProjectedMemberValue::<0>(7)]),
             Ok(vec![ProjectedMemberValue::<0>(7)]),
         );
         assert_eq!(context.lift(ProjectedMemberValue::<0>(11)), Ok(ProjectedMemberValue::<0>(11)));
@@ -1386,7 +1453,7 @@ pub(crate) mod tests {
             .unwrap();
         assert!(matches!(
             context.bind(
-                ProjectedMemberOperation,
+                ProjectedMemberOperation::Identity,
                 vec![region],
                 &[ProjectedMemberValue::<0>(17)],
             ),
@@ -1405,7 +1472,7 @@ pub(crate) mod tests {
         let input =
             <Tracer<TestTracingContext> as ValueProjection<ProjectedMemberType<0>>>::into_projected(input).unwrap();
         let context = input.dispatch_domain();
-        let output = context.bind(ProjectedMemberOperation, Vec::new(), &[input]).unwrap().remove(0);
+        let output = context.bind(ProjectedMemberOperation::Identity, Vec::new(), &[input]).unwrap().remove(0);
 
         assert_eq!(output.value().atom_id(), Ok(AtomId::new(1)));
         assert_eq!(context.resolve(&output), ValueResolution::Staged(AtomId::new(1)));
@@ -1415,7 +1482,10 @@ pub(crate) mod tests {
         };
         assert_eq!(instruction.inputs(), &[input_atom]);
         assert_eq!(instruction.outputs(), &[AtomId::new(1)]);
-        assert!(matches!(instruction.operation(), ProjectedProgramOperation::First(ProjectedMemberOperation)));
+        assert!(matches!(
+            instruction.operation(),
+            ProjectedProgramOperation::First(ProjectedMemberOperation::Identity)
+        ));
         assert!(instruction.regions().is_empty());
     }
 
@@ -1436,11 +1506,15 @@ pub(crate) mod tests {
         let input = parent.input(ProjectedProgramType::Second(ProjectedMemberType));
         let input =
             <Tracer<TestTracingContext> as ValueProjection<ProjectedMemberType<1>>>::into_projected(input).unwrap();
-        let output = input.dispatch_domain().bind(ProjectedMemberOperation, Vec::new(), &[input]).unwrap().remove(0);
+        let output = input
+            .dispatch_domain()
+            .bind(ProjectedMemberOperation::Identity, Vec::new(), &[input])
+            .unwrap()
+            .remove(0);
         assert_eq!(output.value().atom_id(), Ok(AtomId::new(1)));
         assert!(matches!(
             parent.builder().borrow().instructions()[0].operation(),
-            ProjectedProgramOperation::Second(ProjectedMemberOperation),
+            ProjectedProgramOperation::Second(ProjectedMemberOperation::Identity),
         ));
     }
 

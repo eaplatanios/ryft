@@ -243,7 +243,7 @@ where
     U: DifferentiableType,
     ReferenceAddUpdateOperation<T, U>: Operation<Type = U>,
     V: Value<Type = U>,
-    O: ReferenceViewOperation<Type = U> + From<ReferenceReadOperation<T, U>>,
+    O: ReferenceViewOperation<Type = U> + From<AddOperation<U>> + From<ReferenceReadOperation<T, U>>,
     ReferenceReadOperation<T, U>: Operation<Type = U>,
 {
     // An accumulation maps `(state, x) ↦ state + x`, so its transpose reads the cotangent reference as the cotangent of

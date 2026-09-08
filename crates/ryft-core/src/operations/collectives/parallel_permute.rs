@@ -20,6 +20,7 @@ use crate::operations::constants::zero_like::ZeroLike;
 use crate::operations::manipulation::concatenation::Concatenate;
 use crate::operations::manipulation::slicing::Slice;
 use crate::operations::manipulation::transposition::Transpose;
+use crate::operations::math::add::AddOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     MaybeZero, Operation, OperationFormatter, ProgramError, ProjectedValue, RegionInterface, TypeError, Typed, Value,
@@ -172,7 +173,7 @@ shape_changing_collective!(@differentiation ParallelPermuteOperation);
 impl<V, O> TransposableOperation<V, O> for ParallelPermuteOperation
 where
     V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType> + From<ParallelPermuteOperation>,
+    O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>> + From<ParallelPermuteOperation>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,

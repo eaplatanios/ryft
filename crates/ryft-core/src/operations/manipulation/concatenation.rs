@@ -3,7 +3,6 @@ use std::collections::BTreeSet;
 use std::fmt::Display;
 use std::marker::PhantomData;
 
-use crate::arrays::batching::align_array_batch;
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
     ArrayType, Dimension, DimensionOperation, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding,
@@ -32,6 +31,7 @@ use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSize
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::slicing::{DynamicShapeSliceOperation, SliceOperation};
 use crate::operations::manipulation::transposition::Transpose;
+use crate::operations::math::add::AddOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
     EffectClass, EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, OperationProjection, ProgramError,
@@ -348,7 +348,7 @@ where
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
         context: &BatchingContext<C, ArrayIrBatchingPolicy>,
-        _driver: &D,
+        driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         let Some((result_extent, inputs)) = inputs.split_last() else {
@@ -400,7 +400,7 @@ where
         let aligned_inputs = inputs
             .iter()
             .cloned()
-            .map(|input| align_array_batch(context, input, Axis::from(batch_axis)))
+            .map(|input| driver.align_batch_axis(context, input, Axis::from(batch_axis)))
             .collect::<Result<Vec<_>, _>>()?;
         let lifted_axis = if batch_axis <= self.axis() { self.axis() + 1 } else { self.axis() };
         let mut lifted_inputs = aligned_inputs.into_iter().map(ArrayIrBatch::into_value).collect::<Vec<_>>();
@@ -674,6 +674,7 @@ impl<V, O> TransposableOperation<V, O> for ConcatenateOperation<ArrayIrType>
 where
     V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     O: Operation<Type = ArrayIrType>
+        + From<AddOperation<ArrayIrType>>
         + OperationProjection<ArrayType>
         + From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>

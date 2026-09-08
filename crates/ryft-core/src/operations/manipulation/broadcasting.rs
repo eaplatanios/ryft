@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use crate::arrays::batching::{RaggedAxis, align_array_batch, dimension_constant};
+use crate::arrays::batching::{RaggedAxis, dimension_constant};
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
     ArrayType, Dimension, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, ShardingDimension,
@@ -208,7 +208,7 @@ where
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
         context: &BatchingContext<C, ArrayIrBatchingPolicy>,
-        _driver: &D,
+        driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         let Some((input, output_extents)) = inputs.split_first() else {
@@ -236,7 +236,7 @@ where
                 .into());
         }
 
-        let moved_input = align_array_batch(context, input.clone(), Axis::from(0))?;
+        let moved_input = driver.align_batch_axis(context, input.clone(), Axis::from(0))?;
 
         let mut lifted_output_axes = Vec::with_capacity(self.output_axes().len() + 1);
         lifted_output_axes.push(0);
@@ -482,7 +482,7 @@ where
 impl<V, O> TransposableOperation<V, O> for DynamicBroadcastOperation
 where
     V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType>,
+    O: Operation<Type = ArrayIrType> + From<AddOperation<ArrayIrType>> + OperationProjection<ArrayType>,
     <O as OperationProjection<ArrayType>>::Projected: From<BroadcastOperation>
         + TransposableOperation<
             <V as ValueProjection<ArrayType>>::Projected,

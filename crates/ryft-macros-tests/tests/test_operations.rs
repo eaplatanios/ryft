@@ -1646,7 +1646,9 @@ mod mixed_members {
         }
     }
 
-    impl<V: Value<Type = ArrayType>, O: Operation<Type = ArrayType>> TransposableOperation<V, O> for InterleavedOperation {
+    impl<V: Value<Type = ArrayType>, O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>>>
+        TransposableOperation<V, O> for InterleavedOperation
+    {
         fn transpose<D: TranspositionDriver<V, O>>(
             &self,
             context: &mut TranspositionContext<'_, V, O>,
@@ -1758,7 +1760,7 @@ mod mixed_members {
         /// Member zero constructor, which is also the tangent constructor the family's structural mixed arm stages.
         Zero(ZeroOperation<ArrayType>),
 
-        /// Addition used when extracting accumulated cotangents.
+        /// Addition used to combine cotangent contributions as they arrive.
         Add(AddOperation<ArrayType>),
 
         /// Member view of the interleaved mixed payload, which owns its homogeneous transpose rule.
@@ -1780,7 +1782,7 @@ mod mixed_members {
             outputs: &[MaybeZero<Tracer<TracingContext<V, Self>>>],
             accumulators: &[CotangentAccumulator],
         ) -> Result<(), ryft::DifferentiationError> {
-            // The fixture only transposes its interleaved payload. Addition is a real instruction used to extract
+            // The fixture only transposes its interleaved payload. Addition is a real instruction that combines
             // contributions, but transposing that instruction would require unrelated array alignment capabilities.
             match self {
                 Self::Interleaved(operation) => operation.transpose(context, driver, inputs, outputs, accumulators),

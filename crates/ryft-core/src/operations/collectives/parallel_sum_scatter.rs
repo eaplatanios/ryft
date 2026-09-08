@@ -34,6 +34,7 @@ use crate::operations::manipulation::reshaping::{
 };
 use crate::operations::manipulation::slicing::resized_output_sharding;
 use crate::operations::manipulation::transposition::Transpose;
+use crate::operations::math::add::AddOperation;
 use crate::operations::math::div::Div;
 use crate::operations::math::mul::Mul;
 use crate::operations::math::reduce::{Reduce, ReductionKind};
@@ -338,7 +339,7 @@ shape_changing_collective!(@differentiation ParallelSumScatterOperation);
 impl<V, O> TransposableOperation<V, O> for ParallelSumScatterOperation
 where
     V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType> + From<AllGatherOperation>,
+    O: Operation<Type = ArrayType> + From<AddOperation<ArrayType>> + From<AllGatherOperation>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,

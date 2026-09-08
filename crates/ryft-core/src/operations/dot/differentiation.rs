@@ -1,5 +1,6 @@
 use crate::differentiation::{CotangentAccumulator, DifferentiationContext, DifferentiationPolicy};
 use crate::macros::check_count;
+use crate::operations::math::add::AddOperation;
 
 use super::*;
 
@@ -86,7 +87,10 @@ where
 // cotangent sharding and element representation.
 impl<
     V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType> + From<ConvertElementTypeOperation<ArrayType>> + From<DotOperation>,
+    O: Operation<Type = ArrayType>
+        + From<AddOperation<ArrayType>>
+        + From<ConvertElementTypeOperation<ArrayType>>
+        + From<DotOperation>,
 > TransposableOperation<V, O> for DotOperation
 {
     fn transpose<D: TranspositionDriver<V, O>>(
@@ -199,6 +203,7 @@ where
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for RaggedDotOperation
 where
     O: Operation<Type = ArrayType>
+        + From<AddOperation<ArrayType>>
         + From<ConvertElementTypeOperation<ArrayType>>
         + From<RaggedDotOperation>
         + From<crate::operations::manipulation::TransposeOperation>,

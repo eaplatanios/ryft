@@ -1,7 +1,6 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
-use crate::arrays::batching::align_array_batch;
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
     ArrayType, DataType, Dimension, DimensionType, DimensionValue, DimensionVariable, Shape, ShardingDimension,
@@ -373,7 +372,7 @@ where
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
         context: &BatchingContext<C, ArrayIrBatchingPolicy>,
-        _driver: &D,
+        driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         let Some((state, output_extents)) = inputs.split_first() else {
@@ -392,7 +391,7 @@ where
             });
         }
 
-        let state = align_array_batch(context, state.clone(), Axis::from(0))?;
+        let state = driver.align_batch_axis(context, state.clone(), Axis::from(0))?;
         let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
         let extent_inputs = output_extents
             .iter()

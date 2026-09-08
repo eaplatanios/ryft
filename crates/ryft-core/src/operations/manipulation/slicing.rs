@@ -297,6 +297,7 @@ where
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for SliceOperation
 where
     O: Operation<Type = ArrayType>
+        + From<AddOperation<ArrayType>>
         + From<UpdateSliceOperation>
         + From<PadOperation<ArrayType>>
         + From<ZeroOperation<ArrayType>>,
@@ -515,6 +516,7 @@ impl<V, O> MemberTransposableOperation<V, O> for SliceOperation
 where
     V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     O: Operation<Type = ArrayIrType>
+        + From<AddOperation<ArrayIrType>>
         + OperationProjection<ArrayType>
         + From<ReferenceSliceOperation>
         + From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType>>,
@@ -1260,7 +1262,11 @@ where
 // Symbolic-zero cotangents propagate unchanged.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for UpdateSliceOperation
 where
-    O: Operation<Type = ArrayType> + From<SliceOperation> + From<UpdateSliceOperation> + From<ZeroOperation<ArrayType>>,
+    O: Operation<Type = ArrayType>
+        + From<AddOperation<ArrayType>>
+        + From<SliceOperation>
+        + From<UpdateSliceOperation>
+        + From<ZeroOperation<ArrayType>>,
     Tracer<TracingContext<V, O>>: ElementwiseDerivativeAlignment<ArrayType>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
@@ -1658,7 +1664,10 @@ where
 // the same zero from the retained exact extents.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for DynamicSliceOperation
 where
-    O: Operation<Type = ArrayType> + From<ZeroOperation<ArrayType>> + From<DynamicUpdateSliceOperation>,
+    O: Operation<Type = ArrayType>
+        + From<AddOperation<ArrayType>>
+        + From<ZeroOperation<ArrayType>>
+        + From<DynamicUpdateSliceOperation>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -1803,6 +1812,7 @@ impl<V, O> MemberTransposableOperation<V, O> for DynamicSliceOperation
 where
     V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     O: Operation<Type = ArrayIrType>
+        + From<AddOperation<ArrayIrType>>
         + OperationProjection<ArrayType>
         + From<ReferenceReadOperation<ArrayType, ArrayIrType>>
         + From<ReferenceWriteOperation<ArrayType, ArrayIrType>>,
@@ -2187,6 +2197,7 @@ where
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for DynamicUpdateSliceOperation
 where
     O: Operation<Type = ArrayType>
+        + From<AddOperation<ArrayType>>
         + From<ZeroOperation<ArrayType>>
         + From<DynamicUpdateSliceOperation>
         + From<DynamicSliceOperation>,

@@ -5,7 +5,6 @@ use std::marker::PhantomData;
 // TODO(eaplatanios): Review this module.
 
 // TODO(eaplatanios): Why this import?
-use crate::arrays::batching::align_array_batch;
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
     ArrayType, Dimension, DimensionType, DimensionValue, DimensionVariable, Layout, RaggedAxis, ShardingDimension,
@@ -1710,7 +1709,7 @@ where
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
         context: &BatchingContext<C, ArrayIrBatchingPolicy>,
-        _driver: &D,
+        driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         let extent_count = self.dynamic_output_dimension_count();
@@ -1766,7 +1765,7 @@ where
                         aligned.push(input.clone());
                     } else {
                         stacked_indices.push(index);
-                        aligned.push(align_array_batch(context, input.clone(), Axis::from(0))?);
+                        aligned.push(driver.align_batch_axis(context, input.clone(), Axis::from(0))?);
                     }
                 }
 
@@ -1834,7 +1833,7 @@ where
             CustomCallBatching::BroadcastAll => {
                 let aligned = arrays
                     .iter()
-                    .map(|input| align_array_batch(context, input.clone(), Axis::from(0)))
+                    .map(|input| driver.align_batch_axis(context, input.clone(), Axis::from(0)))
                     .collect::<Result<Vec<_>, _>>()?;
                 let aligned_types = aligned
                     .iter()

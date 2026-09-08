@@ -20,6 +20,7 @@ use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::transposition::{Permutation, Transpose, TransposeOperation};
+use crate::operations::math::add::AddOperation;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation,
@@ -423,7 +424,7 @@ where
 impl<V, O> TransposableOperation<V, O> for DynamicReshapeOperation
 where
     V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType>,
+    O: Operation<Type = ArrayIrType> + From<AddOperation<ArrayIrType>> + OperationProjection<ArrayType>,
     <O as OperationProjection<ArrayType>>::Projected: From<ReshapeOperation>
         + From<TransposeOperation>
         + TransposableOperation<

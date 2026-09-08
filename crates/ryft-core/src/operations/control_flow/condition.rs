@@ -32,6 +32,7 @@ use crate::operations::dimensions::dimension_requirement::DimensionRequirementOp
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation, DynamicBroadcastOperation};
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
+use crate::operations::math::add::AddOperation;
 use crate::operations::references::ReferenceNewOperation;
 use crate::parameters::Placeholder;
 use crate::partial::{
@@ -805,7 +806,7 @@ where
 impl<V, O> TransposableOperation<V, O> for ConditionOperation<V>
 where
     V: Value<Type: ConditionTypeSemantics + DifferentiableType + ConditionTransposition<V, O>>,
-    O: Operation<Type = V::Type>,
+    O: Operation<Type = V::Type> + From<AddOperation<V::Type>>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
@@ -1531,9 +1532,9 @@ where
     // A condition with no live output cotangents and no live reference operand is a zero linear map, so every operand
     // cotangent is zero. A live reference operand keeps the rule live, because its accumulated state cotangent flows
     // through the transposed branches even when no ordinary output cotangent does.
-    check_count!("input", cotangents.destination_kinds(), inputs.len(), ProgramError);
+    check_count!("input", cotangents.kinds(), inputs.len(), ProgramError);
     if outputs.iter().all(MaybeZero::is_zero)
-        && !cotangents.has_live_reference_state()
+        && !cotangents.has_reference_state_destinations()
         && !driver.region(0)?.has_observable_transpose_effects()
         && !driver.region(1)?.has_observable_transpose_effects()
     {
@@ -1597,7 +1598,7 @@ where
     // and a dead reference tangent has no cotangent slot at all.
     let mut branch_linear = vec![true; branch_tangent_count];
     branch_linear.extend(std::iter::repeat_n(false, residual_count));
-    let branch_destination_kinds = &cotangents.destination_kinds()[1..];
+    let branch_destination_kinds = &cotangents.kinds()[1..];
     let transposed_branches = [
         driver.transpose_program(driver.region(0)?, branch_linear.as_slice(), branch_destination_kinds)?,
         driver.transpose_program(driver.region(1)?, branch_linear.as_slice(), branch_destination_kinds)?,

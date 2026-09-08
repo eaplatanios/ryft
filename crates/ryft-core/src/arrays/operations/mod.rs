@@ -1063,6 +1063,7 @@ where
     ArrayOperation<A>: TransposableOperation<<V as ValueProjection<ArrayType>>::Projected, ArrayOperation<A>>,
     O: Operation<Type = ArrayIrType>
         + OperationProjection<ArrayType, Projected = ArrayOperation<A>>
+        + From<AddOperation<ArrayIrType>>
         + From<ReferenceSliceOperation>
         + From<ReferenceAddUpdateOperation<ArrayType, ArrayIrType>>
         + From<ReferenceReadOperation<ArrayType, ArrayIrType>>

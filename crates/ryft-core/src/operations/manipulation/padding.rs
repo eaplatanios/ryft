@@ -1,7 +1,7 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
-use crate::arrays::batching::{align_array_batch, array_dimension};
+use crate::arrays::batching::array_dimension;
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
     ArrayType, DataType, Dimension, DimensionBounds, DimensionOperation, DimensionType, DimensionValue,
@@ -34,6 +34,7 @@ use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::slicing::{DynamicShapeSliceOperation, SliceOperation};
 use crate::operations::manipulation::transposition::Transpose;
+use crate::operations::math::add::AddOperation;
 use crate::operations::math::reduce::{ReduceOperation, ReductionKind};
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
@@ -461,7 +462,7 @@ where
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
         context: &BatchingContext<C, ArrayIrBatchingPolicy>,
-        _driver: &D,
+        driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         if inputs.len() < 2 {
@@ -501,7 +502,7 @@ where
                 .into());
         };
 
-        let operand_batch = align_array_batch(context, operand.clone(), Axis::from(batch_axis))?;
+        let operand_batch = driver.align_batch_axis(context, operand.clone(), Axis::from(batch_axis))?;
         let operand_batch = ArrayBatch::new(
             <C::Value as ValueProjection<ArrayType>>::into_projected(operand_batch.into_value())?,
             BatchAxis::from_position(batch_axis),
@@ -967,6 +968,7 @@ where
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for PadOperation<ArrayType>
 where
     O: Operation<Type = ArrayType>
+        + From<AddOperation<ArrayType>>
         + From<OneOperation<ArrayType>>
         + From<PadOperation<ArrayType>>
         + From<SelectOperation<ArrayType>>
@@ -1117,7 +1119,7 @@ where
 impl<V, O> TransposableOperation<V, O> for PadOperation<ArrayIrType>
 where
     V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    O: Operation<Type = ArrayIrType> + OperationProjection<ArrayType>,
+    O: Operation<Type = ArrayIrType> + From<AddOperation<ArrayIrType>> + OperationProjection<ArrayType>,
     <O as OperationProjection<ArrayType>>::Projected: From<PadOperation<ArrayType>>
         + TransposableOperation<
             <V as ValueProjection<ArrayType>>::Projected,

@@ -10,7 +10,7 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
-use crate::arrays::batching::{align_array_batch, array_dimension};
+use crate::arrays::batching::array_dimension;
 use crate::arrays::{
     ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, DimensionType, DimensionValue, DimensionVariable,
 };
@@ -157,7 +157,7 @@ where
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
         context: &BatchingContext<C, ArrayIrBatchingPolicy>,
-        _driver: &D,
+        driver: &D,
         inputs: &[ArrayIrBatch<C::Value>],
     ) -> Result<BatchedOutputs<C, ArrayIrBatchingPolicy>, BatchingError> {
         let [input] = inputs else {
@@ -176,7 +176,7 @@ where
                 .into());
         }
 
-        let input = align_array_batch(context, input.clone(), Axis::from(0))?;
+        let input = driver.align_batch_axis(context, input.clone(), Axis::from(0))?;
         let scan_extent = array_dimension(context.parent(), input.value(), 0)?;
         let scan_extent_type = scan_extent.r#type();
         let length = <&DimensionType>::try_from(scan_extent_type.as_ref())?.to_dimension();

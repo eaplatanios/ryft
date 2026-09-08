@@ -24,6 +24,7 @@ use crate::operations::manipulation::broadcasting::Broadcast;
 use crate::operations::manipulation::reshaping::Reshape;
 use crate::operations::manipulation::slicing::{Slice, UpdateSlice};
 use crate::operations::manipulation::transposition::Transpose;
+use crate::operations::math::add::AddOperation;
 use crate::operations::sharding::Reshard;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
@@ -430,7 +431,10 @@ where
 /// transpose region rebuilds the same zero from the retained exact extents.
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for GatherOperation
 where
-    O: Operation<Type = ArrayType> + From<ZeroOperation<ArrayType>> + From<ScatterOperation>,
+    O: Operation<Type = ArrayType>
+        + From<AddOperation<ArrayType>>
+        + From<ZeroOperation<ArrayType>>
+        + From<ScatterOperation>,
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,

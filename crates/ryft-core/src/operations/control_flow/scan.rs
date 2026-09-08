@@ -10,7 +10,6 @@ use std::collections::BTreeSet;
 use std::fmt::{Debug, Display};
 use std::sync::Arc;
 
-use crate::arrays::batching::align_array_batch;
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
     ArrayIrValue, ArrayReferenceViewTransform, ArrayType, Dimension, DimensionType, DimensionValue, Shape, ViewIndex,
@@ -36,6 +35,7 @@ use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperatio
 use crate::operations::manipulation::reshaping::{Reshape, ReshapeOperation};
 use crate::operations::manipulation::slicing::{Slice, SliceOperation, UpdateSlice, UpdateSliceOperation};
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
+use crate::operations::math::add::AddOperation;
 use crate::operations::references::ReferenceNewOperation;
 use crate::parameters::Placeholder;
 use crate::partial::{
@@ -1047,7 +1047,7 @@ where
             .cloned()
             .map(|input| match input.unbatched_type() {
                 ArrayIrType::Array(_) if !input.batch_axis().is_replicated() => {
-                    align_array_batch(context, input, Axis::from(0))
+                    driver.align_batch_axis(context, input, Axis::from(0))
                 }
                 ArrayIrType::Array(_) | ArrayIrType::Reference(_) => Ok(input),
                 ArrayIrType::Dimension(_) => {
@@ -1086,7 +1086,7 @@ where
                 }
                 <&ArrayType>::try_from(&input.unbatched_type())?;
                 let stack = if input.batch_axis_position() == Some(0) {
-                    align_array_batch(context, input, Axis::from(1))?
+                    driver.align_batch_axis(context, input, Axis::from(1))?
                 } else {
                     input
                 };
@@ -1155,7 +1155,7 @@ where
         )?;
         for (carry, axis) in carries.iter_mut().zip(carry_axes.iter()) {
             if !axis.is_replicated() && carry.batch_axis().is_replicated() {
-                *carry = align_array_batch(context, carry.clone(), Axis::from(0))?;
+                *carry = driver.align_batch_axis(context, carry.clone(), Axis::from(0))?;
             }
         }
 
@@ -1371,7 +1371,7 @@ where
     V: Value,
     V::Type: ScanTypeSemantics + ScanTransposition<V, F, Target>,
     F: Value<Type = V::Type>,
-    Target: Operation<Type = V::Type>,
+    Target: Operation<Type = V::Type> + From<AddOperation<V::Type>>,
 {
     fn transpose<D: TranspositionDriver<V, Target>>(
         &self,
@@ -3090,7 +3090,7 @@ where
     // keeps the rule live regardless, because the accumulated state cotangent flows through the reversed body even
     // when no ordinary output cotangent does.
     if outputs.iter().all(MaybeZero::is_zero)
-        && !cotangents.has_live_reference_state()
+        && !cotangents.has_reference_state_destinations()
         && !driver.region(0)?.has_observable_transpose_effects()
     {
         return inputs.iter().map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?))).collect();
@@ -3231,9 +3231,9 @@ where
     // A scan with only zero output cotangents and no live reference carry is a zero linear map, so every operand
     // cotangent is zero. A live reference carry keeps the rule live, because its accumulated state cotangent flows
     // through the reversed body even when no ordinary output cotangent does.
-    check_count!("input", cotangents.destination_kinds(), inputs.len(), ProgramError);
+    check_count!("input", cotangents.kinds(), inputs.len(), ProgramError);
     if outputs.iter().all(MaybeZero::is_zero)
-        && !cotangents.has_live_reference_state()
+        && !cotangents.has_reference_state_destinations()
         && !driver.region(0)?.has_observable_transpose_effects()
     {
         return inputs
@@ -3272,7 +3272,7 @@ where
     // reference stack never reaches a tangent program: a primal reference read inside a linear body is a known feeder
     // that `split_scan_by_knownness` residualizes whole, so this rejection guards
     // hand-built programs only.
-    let destination_kinds = &cotangents.destination_kinds()[..scan_inputs.len()];
+    let destination_kinds = &cotangents.kinds()[..scan_inputs.len()];
     if let Some(index) = (carry_count..scan_inputs.len())
         .find(|&index| !operand_linear[index] && scan_inputs[index].r#type().is_reference())
     {

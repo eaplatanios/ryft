@@ -27,6 +27,7 @@ use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::dimensions::dimension_to_scalar::DimensionToScalarOperation;
 use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation, DynamicBroadcastOperation};
 use crate::operations::manipulation::conversion::ConvertElementTypeOperation;
+use crate::operations::math::add::AddOperation;
 use crate::operations::math::div::DivOperation;
 use crate::operations::math::mul::MulOperation;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -357,6 +358,7 @@ where
 impl<V: Value<Type = ArrayType>, O> TransposableOperation<V, O> for ReduceOperation
 where
     O: Operation<Type = ArrayType>
+        + From<AddOperation<ArrayType>>
         + From<BroadcastOperation>
         + From<ConstantOperation<crate::arrays::Array>>
         + From<MulOperation<ArrayType>>,

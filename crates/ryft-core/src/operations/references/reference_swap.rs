@@ -14,6 +14,7 @@ use crate::differentiation::{
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::constants::zero::Zero;
+use crate::operations::math::add::AddOperation;
 use crate::operations::references::reference_new::ReferenceNewOperation;
 
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
@@ -225,6 +226,7 @@ where
     ReferenceSwapOperation<T, U>: Operation<Type = U>,
     V: Value<Type = U>,
     O: ReferenceViewOperation<Type = U>
+        + From<AddOperation<U>>
         + ResidualZeroProvider<U>
         + OperationProvider<U, ReferenceNewOperation<U, U>, Operation = O>
         + From<ReferenceSwapOperation<T, U>>,
