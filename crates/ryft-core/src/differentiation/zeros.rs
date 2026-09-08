@@ -10,23 +10,23 @@ use crate::programs::{
     AtomId, MaybeZero, Operation, OperationProvider, ProgramBuilder, ProgramError, Type, Typed, Value,
 };
 
-/// Differentiation-owned protocol through which an operation family materializes zeros whose runtime geometry must
-/// be supplied by explicitly captured _residual_ values, because it is not derivable from the zero's [`Type`] alone.
+/// Protocol through which an operation family materializes zeros that need runtime values, such as dynamic dimensions,
+/// that cannot be derived from the zero's [`Type`] alone. Those values are captured explicitly as _residuals_.
 ///
 /// # Why this Protocol Exists
 ///
-/// Differentiation is the one transform that must synthesize values with no data edge to derive them from. For example,
-/// transposition is *defined* to return a cotangent for every differentiated input, including inputs that are
-/// disconnected from every output, and the mathematically determined value for such an input is a zero of its cotangent
-/// type. For a static type this is easy as [`OperationProvider::provide`] constructs the zero from the type,
+/// Differentiation is the one transform that must synthesize values with no data edge to derive them from. For
+/// example, transposition is *defined* to return a cotangent for every differentiated input, including inputs that
+/// are disconnected from every output, and the mathematically determined value for such an input is a zero of its
+/// cotangent type. For a static type this is easy as [`OperationProvider::provide`] constructs the zero from the type,
 /// with no operands. For a type with dynamic axes it is impossible as a [`Type`] carries only dimension _identities_
 /// and bounds, never defining values, and so the zero operation needs one explicit dimension operand per dynamic axis.
 /// Also, the value that could supply those operands (i.e., the primal input the cotangent corresponds to) is _not an
-/// input of the pullback program_ where the zero must be staged. The only moment both the need and the geometry are in
-/// scope is during linearization, and so the required extents must be captured then and threaded to transposition as
-/// ordinary residuals. This trait is that capture/spend contract, expressed once per operation *family*. It is a set of
-/// associated functions with no receiver (i.e., `self` argument), because it is invoked precisely when no [`Operation`]
-/// instance exists.
+/// input of the pullback program_ where the zero must be staged. The only moment both the required zero type and its
+/// dimensions are in scope is during linearization, and so the required extents must be captured then and threaded to
+/// transposition as ordinary residuals. This trait is that capture/spend contract, expressed once per operation
+/// _family_. It is a set of associated functions with no receiver (i.e., `self` argument), because it is invoked
+/// precisely when no [`Operation`] instance exists.
 ///
 /// # How to Use It
 ///
@@ -60,19 +60,18 @@ use crate::programs::{
 /// # Who Implements It
 ///
 /// Almost nobody needs to implement this trait, by design. Every operation family with an input-free zero (i.e., every
-/// family with a `From<ZeroOperation<T>>` conversion) receives the whole protocol through a blanket implementation
-/// that declares nothing, captures nothing, and spends by constructing the type-only zero (i.e., the fail-loud default
+/// family with a `From<ZeroOperation<T>>` conversion) receives the whole protocol through a blanket implementation that
+/// declares nothing, captures nothing, and spends by constructing the type-only zero (i.e., the fail-loud default
 /// rejects unexpected residuals rather than ignoring them, so a mismatched linearize/transpose pairing cannot be
-/// silently accepted). Only families whose zero genuinely consumes runtime-geometry operands (e.g., the composite
+/// silently accepted). Only families whose zero genuinely consumes runtime dimension operands (e.g., the composite
 /// program family and its XLA counterpart) override the declaration, capture, and operation-assembly functions. Every
 /// spending path reuses that shared assembly.
 ///
-/// [`LinearCallOperation`](crate::LinearCallOperation) is this protocol's sibling. It retains residual geometry for the
-/// transpose of a *non-trivial* residual-parameterized linear map by attaching explicit forward/transpose regions to an
-/// instruction, while this trait retains it for the degenerate zero map, which has no instruction to attach anything
-/// to. Both exist for the same reason (i.e., reverse mode needs geometry at a moment when its defining values would
-/// otherwise be out of scope) and both keep residual selection and threading owned by the differentiation transform
-/// rather than leaking into primal operation payloads.
+/// [`LinearCallOperation`](crate::LinearCallOperation) retains residual values needed to transpose a non-trivial linear
+/// map by attaching explicit forward/transpose regions to an instruction. This trait retains the values needed to
+/// construct zeros, which have no instruction to attach a region to. Both preserve values that would otherwise be out
+/// of scope during reverse mode, and both leave residual selection and threading to the differentiation transform
+/// rather than storing residuals in primal operation payloads.
 pub trait ResidualZeroProvider<T: Type>: Operation + OperationProvider<T, ZeroOperation<T>, Operation = Self> {
     /// Returns the types of the residual values that a zero of `r#type` needs, in the exact order in which
     /// [`Self::capture_zero_residuals`] captures them and [`Self::zero_operation_with_residuals`] consumes them.
@@ -126,7 +125,7 @@ pub trait ResidualZeroProvider<T: Type>: Operation + OperationProvider<T, ZeroOp
 
     /// Captures the single residual value declared at `residual_type` from `source`, or returns [`None`] when `source`
     /// does not carry the runtime quantity that residual names. This is the _identity-directed_ capture step used by
-    /// [`Self::materialize_zero_from_residual_sources`], where the geometry of one zero may have to be assembled from
+    /// [`Self::materialize_zero_from_residual_sources`], where the dimensions of one zero may have to be assembled from
     /// several unrelated values rather than read off one primal of exactly the zero's own type.
     ///
     /// Implementations must inspect `source`'s [`Type`] before staging anything and return [`None`] without side
@@ -143,7 +142,7 @@ pub trait ResidualZeroProvider<T: Type>: Operation + OperationProvider<T, ZeroOp
     }
 
     /// Returns the canonical zero operation for `r#type` and expands `residuals` into its operand order. The default
-    /// represents an input-free zero operation. Families whose zero consumes runtime geometry override this function
+    /// represents an input-free zero operation. Families whose zero consumes runtime dimensions override this function
     /// so that value-level binding, residualization, and builder-level staging share one operation assembly.
     #[inline]
     fn zero_operation_with_residuals<R: Clone>(r#type: T, residuals: &[R]) -> Result<(Self, Vec<R>), ProgramError>
@@ -159,19 +158,19 @@ pub trait ResidualZeroProvider<T: Type>: Operation + OperationProvider<T, ZeroOp
     }
 
     /// Returns the value inside `zero`, materializing a structural [`MaybeZero::Zero`] whose [`Type`] cannot construct
-    /// it alone by reading the runtime geometry it names from the values in `geometry_sources`. This is the boundary
-    /// form of the residual protocol. [`Self::capture_zero_residuals`] and [`Self::capture_zero_residual_values`]
-    /// capture from _the_ primal, which every linearization site has in hand. A transform boundary often does not.
-    /// A transposed control-flow instruction needs a real operand for the cotangent of a dead output, and the primal
-    /// that pinned that output's extents is long out of scope. What is in scope is a set of peers (i.e., live sibling
-    /// cotangents, known operands, and first-class dimension operands), among which the named runtime quantities are
-    /// collectively available even when no single peer has the zero's type. This function therefore works _per declared
-    /// residual_ rather than per exemplar: it asks each candidate in turn for one named quantity through
+    /// it alone by reading the runtime dimensions it names from the values in `sources`. This is the boundary form of
+    /// the residual protocol. [`Self::capture_zero_residuals`] and [`Self::capture_zero_residual_values`] capture from
+    /// _the_ primal, which every linearization site has in hand. A transform boundary often does not. A transposed
+    /// control-flow instruction needs a real operand for the cotangent of a dead output, and the primal that pinned
+    /// that output's extents is long out of scope. What is in scope is a set of peers (i.e., live sibling cotangents,
+    /// known operands, and first-class dimension operands), among which the named runtime quantities are collectively
+    /// available even when no single peer has the zero's type. This function therefore works _per declared residual_
+    /// rather than per exemplar: it asks each candidate in turn for one named quantity through
     /// [`Self::capture_zero_residual_value`] and assembles the zero from the answers.
     ///
-    /// Being identity-directed rather than exemplar-directed is what makes it type-general. A tangent or cotangent
-    /// type is derived from its primal's by [`DifferentiableType`], which rewrites element representation, layout, and
-    /// sharding while preserving geometry exactly, so requiring an exemplar of the zero's own type would reject every
+    /// Being identity-directed rather than exemplar-directed is what makes it type-general. A tangent or cotangent type
+    /// is derived from its primal's by [`DifferentiableType`], which rewrites element representation, layout, and
+    /// sharding while preserving dimensions exactly, so requiring an exemplar of the zero's own type would reject every
     /// widened differential representation (e.g., an `f8e8m0fnu[n]` primal whose tangent is `f32[n]`). Naming the
     /// runtime quantity instead of matching the whole type accepts them all.
     ///
@@ -182,7 +181,7 @@ pub trait ResidualZeroProvider<T: Type>: Operation + OperationProvider<T, ZeroOp
     ///
     /// # Parameters
     ///
-    ///   - `context`: [`Context`] in which the zero and any geometry reads are staged or computed.
+    ///   - `context`: [`Context`] in which the zero and any dimension reads are staged or computed.
     ///   - `zero`: Structural zero or live value to materialize.
     ///   - `sources`: Candidate values in scope at the boundary, searched in order for each declared residual. Only
     ///     zero types that declare residuals consult them.
@@ -248,7 +247,7 @@ impl<T: Type, O: Operation<Type = T> + From<ZeroOperation<T>>> ResidualZeroProvi
 /// [`ResidualZeroProvider::capture_zero_residual_values`] performs the operation-family-specific reads from `source`.
 /// This helper calls both and verifies that capture returns exactly the declared number and types of values, in the
 /// declared order. A disagreement is a malformed provider implementation and is reported as a
-/// [`ProgramError::MalformedProgram`] before the residuals can construct a zero with incorrect runtime geometry.
+/// [`ProgramError::MalformedProgram`] before the residuals can construct a zero with incorrect runtime dimensions.
 ///
 /// For example, suppose `r#type` is `zero[n, n, m]` and `source` is the corresponding primal array. A composite array
 /// provider declares one dimension residual per distinct dynamic identity, `[dimension(n), dimension(m)]`, and captures
@@ -256,14 +255,14 @@ impl<T: Type, O: Operation<Type = T> + From<ZeroOperation<T>>> ResidualZeroProvi
 /// captured values. Later, [`ResidualZeroProvider::zero_operation_with_residuals`] expands them into the per-axis
 /// operand order `[n, n, m]`. A static zero declares and captures no residuals.
 ///
-/// This function neither chooses which geometry to retain nor constructs the zero; those responsibilities belong to
-/// the operation family. It only enforces the declaration/capture contract for concrete or tracer [`Value`]s. The
-/// program-level [`AtomId`] capture path performs the corresponding validation where its atoms are staged.
+/// This function neither chooses which runtime dimensions to retain nor constructs the zero; those responsibilities
+/// belong to the operation family. It only enforces the declaration/capture contract for concrete or tracer [`Value`]s.
+/// The program-level [`AtomId`] capture path performs the corresponding validation where its atoms are staged.
 ///
 /// # Parameters
 ///
 ///   - `context`: Context in which the provider reads residual values from `source`.
-///   - `source`: Primal value whose runtime geometry determines the zero.
+///   - `source`: Primal value whose runtime dimensions determine the zero.
 ///   - `r#type`: Type of the zero that will eventually consume the captured residuals.
 ///   - `site`: Description of the capture site included in malformed-provider diagnostics.
 pub(crate) fn capture_and_validate_zero_residual_values<C: Context<Operation: ResidualZeroProvider<C::Type>>>(
@@ -345,7 +344,8 @@ pub(crate) struct ZeroSpaceBoundaryLeaf<T: Type> {
     residual_range: Range<usize>,
 }
 
-/// Runtime-geometry residuals used to reconstruct the zero-space leaves omitted from one compact derivative boundary.
+/// Residual values supplying runtime dimensions used to reconstruct the zero-space leaves omitted from one compact
+/// derivative boundary.
 ///
 /// Let a flattened primal boundary have leaf types `T₁, …, Tₙ`, and let `D(Tᵢ)` denote the corresponding tangent or
 /// cotangent type. When `D(Tᵢ)` is a _zero space_, it contains exactly one value, `0ᵢ`, so the executable derivative
@@ -356,7 +356,7 @@ pub(crate) struct ZeroSpaceBoundaryLeaf<T: Type> {
 ///
 /// Static zeros can be constructed from their types alone. Dynamic zeros cannot. For example, the cotangent of a primal
 /// `u64[n]` array has type `zero[n]` which records the identity and bounds of `n`, but not its runtime extent. While
-/// the primal value is available, linearization therefore captures the minimal runtime geometry declared by
+/// the primal value is available, linearization therefore captures the runtime values declared by
 /// [`ResidualZeroProvider::zero_residual_types`] (e.g., the concrete value of `n`). This type stores the flattened
 /// concatenation of those captured values in primal-leaf order together with a sparse reconstruction plan for the
 /// zero-space leaves. [`Self::rebuild`] replays that plan to materialize each omitted `0ᵢ` and interleave it with the
@@ -371,7 +371,7 @@ pub struct ZeroSpaceBoundaryReconstruction<V: Value> {
     /// Semantic role of the differential boundary reconstructed by this instance.
     role: ZeroSpaceBoundaryRole,
 
-    /// Flattened runtime-geometry residuals captured in zero-leaf and provider-declaration order.
+    /// Residual values supplying runtime dimensions, flattened in zero-leaf and provider-declaration order.
     residuals: Vec<V>,
 
     /// Number of leaves in the complete public differential boundary.
@@ -382,7 +382,7 @@ pub struct ZeroSpaceBoundaryReconstruction<V: Value> {
 }
 
 impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
-    /// Captures the runtime geometry and reconstruction plan for every zero-space leaf of one differential boundary.
+    /// Captures the runtime dimensions and reconstruction plan for every zero-space leaf of one differential boundary.
     ///
     /// For each primal leaf type `Tᵢ`, `role` determines the boundary type `D(Tᵢ)`. A nonzero-space `D(Tᵢ)` remains a
     /// live input or output of the compact derivative program and needs no entry in the stored plan. For a zero-space
@@ -393,7 +393,7 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
     ///
     /// # Parameters
     ///
-    ///   - `context`: Context in which the operation family reads runtime geometry from the primal values.
+    ///   - `context`: Context in which the operation family reads runtime dimensions from the primal values.
     ///   - `primal_values`: Complete flattened primal boundary values in leaf order.
     ///   - `primal_types`: Complete flattened primal boundary types in the same order as `primal_values`.
     ///   - `role`: Semantic boundary role that selects the tangent/cotangent mapping and identifies diagnostics.
@@ -478,7 +478,7 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
 
     /// Rebuilds the complete differential boundary described by this instance using `reconstruct` to handle each leaf
     /// in boundary order. The callback receives the leaf index and a materialized zero for a zero-space leaf, or
-    /// [`None`] for a nonzero-space leaf. Zero types and runtime geometry come from [`Self::capture`], and so
+    /// [`None`] for a nonzero-space leaf. Zero types and runtime dimensions come from [`Self::capture`], and so
     /// reconstruction does not read the primal values.
     ///
     /// Unlike [`Self::rebuild`], the `reconstruct` callback decides whether a non-zero-space leaf consumes a program
