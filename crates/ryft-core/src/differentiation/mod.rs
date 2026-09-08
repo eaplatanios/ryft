@@ -188,9 +188,9 @@ pub use forward::{
 pub use hessian::{Hessian, HessianBlock};
 pub use jacobian::{Jacobian, JacobianBlock};
 pub use reverse::{
-    CotangentAccumulator, CotangentDestination, CotangentDestinationKind, CotangentReferenceAccumulator, CotangentSeed,
-    MemberTransposableOperation, OperandCotangents, Pullback, ReverseModeDifferentiate, TransposableOperation,
-    TranspositionContext, TranspositionDriver, operand_cotangents, transpose_mixed_operation,
+    CotangentAccumulator, CotangentDestination, CotangentDestinationKind, CotangentDestinations,
+    CotangentReferenceAccumulator, CotangentSeed, MemberTransposableOperation, Pullback, ReverseModeDifferentiate,
+    TransposableOperation, TranspositionContext, TranspositionDriver, transpose_mixed_operation,
     transpose_projected_operation,
 };
 pub use types::{DenseDifferentiableType, DifferentiableType};

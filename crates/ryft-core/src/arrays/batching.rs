@@ -31,7 +31,7 @@ use crate::batching::{
     BatchingTracer, BoundaryPreservingBatchedProgram, InterpretableBatchableOperation, ProgramBatchingOutputAxesPolicy,
     RecursiveBatchingDriver, RecursiveBatchingPolicy,
 };
-use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext};
+use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext, ValueResolution};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count, dispatch_on_array_element_type};
 use crate::operations::{
@@ -1455,6 +1455,12 @@ where
     ) -> Result<ArrayBatch<C::Value>, BatchingError> {
         batch.match_axis(axis, *context.axis_extent(), context.axis_sharding().clone())
     }
+
+    #[inline]
+    fn static_batch_axis_extent(context: &BatchingContext<C, Self>) -> Option<usize> {
+        // The homogeneous policy's extent is one host `usize` fixed when the transform was constructed.
+        Some(*context.axis_extent())
+    }
 }
 
 /// [`Region`] [`Transform`] marker for retained homogeneous array batched [`Program`]s.
@@ -2693,7 +2699,8 @@ where
 impl<C: Context<Type = ArrayIrType>, T: Type> ValueProjection<T> for BatchingTracer<C, ArrayIrBatchingPolicy>
 where
     C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+        + ValueProjection<DimensionType, Projected = DimensionValue>,
     C::Operation: BatchableOperation<C, ArrayIrBatchingPolicy>
         + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayIrBatchingPolicy>
         + From<DynamicBroadcastOperation>
@@ -2733,7 +2740,9 @@ where
 
 impl<V, O> Program<V, O, Vec<V>, Vec<V>>
 where
-    V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    V: Value<Type = ArrayIrType>
+        + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+        + ValueProjection<DimensionType, Projected = DimensionValue>,
     O: Operation<Type = ArrayIrType>
         + BatchableOperation<TracingContext<V, O>, ArrayIrBatchingPolicy>
         + From<ConstantOperation<DimensionValue>>
@@ -3776,7 +3785,8 @@ impl<C> RecursiveBatchingPolicy<C> for ArrayIrBatchingPolicy
 where
     C: Context<Type = ArrayIrType>,
     C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+        + ValueProjection<DimensionType, Projected = DimensionValue>,
     C::Operation: BatchableOperation<C, ArrayIrBatchingPolicy>
         + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayIrBatchingPolicy>
         + From<DynamicBroadcastOperation>
@@ -4016,6 +4026,21 @@ where
             .build(output_atom_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?
             .into_simplified()?;
         Ok(ThreadedExtentBatchedProgram::new(program, output_axes)?)
+    }
+
+    fn static_batch_axis_extent(context: &BatchingContext<C, Self>) -> Option<usize> {
+        // The composite policy's extent is a first-class dimension value owned by the parent context, so its size is
+        // known statically only when the parent resolves that value to a concrete dimension constant (e.g., under eager
+        // batching), in which case it is projected to a `DimensionValue` and its extent is reported. A staged or opaque
+        // extent (e.g., under a trace with a symbolic batch dimension) has no static size.
+        match context.parent().resolve(context.axis_extent()) {
+            ValueResolution::Constant(axis_extent) => {
+                <C::Constant as ValueProjection<DimensionType>>::into_projected(axis_extent)
+                    .ok()
+                    .map(|axis_extent| axis_extent.extent())
+            }
+            ValueResolution::Staged(_) | ValueResolution::Opaque => None,
+        }
     }
 }
 

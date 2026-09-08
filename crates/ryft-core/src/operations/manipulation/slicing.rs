@@ -2813,17 +2813,19 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, DataType,
-        DimensionBounds, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis, MeshAxisType,
-        Sharding, ShardingDimension, StridedLayout,
+        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference,
+        DataType, DimensionBounds, DimensionValue, DimensionVariable, Layout, LogicalMesh, Memory, MeshAxis,
+        MeshAxisType, Sharding, ShardingDimension, StridedLayout,
     };
     use crate::batching::{BatchAxis, BatchingContext, batch};
     use crate::contexts::EagerContext;
-    use crate::differentiation::{CotangentDestinationKind, differentiate_at};
+    use crate::differentiation::{CotangentDestination, CotangentDestinationKind, CotangentSeed, differentiate_at};
     use crate::macros::{
         check_operation_batching, check_operation_differentiation, check_operation_partial_evaluation,
         check_operation_transposition, check_operation_type_inference,
     };
+    use crate::operations::constants::constant::Constant;
+    use crate::operations::math::mul::MulOperation;
     use crate::operations::math::reduce::{Reduce, ReductionKind};
     use crate::operations::references::{ReferenceNew, ReferenceRead};
     use crate::parameters::Placeholder;
@@ -3595,6 +3597,76 @@ mod tests {
     }
 
     #[test]
+    fn test_dynamic_slice_differentiation_pullback_batching_orders() {
+        // Batching a pullback and pulling back a batched function must preserve the same indexed linear map.
+        let input = Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        let batched_pullback = batch(
+            |value| {
+                let seed = value.context().constant(Array::vector(vec![2.0_f32]))?;
+                let (_, pullback) = differentiate_at(value).vjp(|value| {
+                    let start = value.context().constant(Array::scalar(1_i32))?;
+                    value.dynamic_slice(&[start], &[1])
+                })?;
+                pullback.apply(seed)
+            },
+            input.clone(),
+            BatchAxis::new(0),
+            BatchAxis::new(0),
+            None,
+        );
+        assert_eq!(batched_pullback, Ok(Array::matrix(2, 3, vec![0.0_f32, 2.0, 0.0, 0.0, 2.0, 0.0])));
+
+        let (_, pullback) = differentiate_at(input)
+            .vjp(|value| {
+                Ok(batch(
+                    |value| {
+                        let start = value.context().constant(Array::scalar(1_i32))?;
+                        value.dynamic_slice(&[start], &[1])
+                    },
+                    value,
+                    BatchAxis::new(0),
+                    BatchAxis::new(0),
+                    None,
+                )?)
+            })
+            .unwrap();
+        assert_eq!(
+            pullback.apply(Array::matrix(2, 1, vec![2.0_f32, 2.0])),
+            Ok(Array::matrix(2, 3, vec![0.0_f32, 2.0, 0.0, 0.0, 2.0, 0.0])),
+        );
+    }
+
+    #[test]
+    fn test_dynamic_slice_differentiation_pullback_higher_order() {
+        // Squaring before indexing leaves the primal value as a runtime coefficient of the pullback. Its derivative
+        // must survive expanding the indexed backward rule, in both forward-over-reverse and reverse-over-reverse.
+        let (gradient, tangent) = differentiate_at(Array::vector(vec![3.0_f32, 5.0, 7.0]))
+            .jvp(Array::vector(vec![1.0_f32; 3]), |value| {
+                let seed = value.context().constant(Array::vector(vec![1.0_f32]))?;
+                let (_, pullback) = differentiate_at(value).vjp(|value| {
+                    let start = value.context().constant(Array::scalar(1_i32))?;
+                    (value.clone() * value).dynamic_slice(&[start], &[1])
+                })?;
+                pullback.apply(seed)
+            })
+            .unwrap();
+        assert_eq!(gradient, Array::vector(vec![0.0_f32, 10.0, 0.0]));
+        assert_eq!(tangent, Array::vector(vec![0.0_f32, 2.0, 0.0]));
+
+        let (_, pullback) = differentiate_at(Array::vector(vec![3.0_f32, 5.0, 7.0]))
+            .vjp(|value| {
+                let seed = value.context().constant(Array::vector(vec![1.0_f32]))?;
+                let (_, pullback) = differentiate_at(value).vjp(|value| {
+                    let start = value.context().constant(Array::scalar(1_i32))?;
+                    (value.clone() * value).dynamic_slice(&[start], &[1])
+                })?;
+                pullback.apply(seed)
+            })
+            .unwrap();
+        assert_eq!(pullback.apply(Array::vector(vec![1.0_f32; 3])), Ok(Array::vector(vec![0.0_f32, 2.0, 0.0])));
+    }
+
+    #[test]
     fn test_dynamic_slice_transpose_in_parent() {
         let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let input = builder.add_input(ArrayType::new_static(DataType::F64, [5]).into());
@@ -3651,6 +3723,93 @@ mod tests {
         let ignored = program.transpose_with_respect_to(&[0], &[CotangentDestinationKind::Ignore]).unwrap();
         assert!(ignored.instructions().is_empty());
         assert!(ignored.output_ids().is_empty());
+    }
+
+    #[test]
+    fn test_dynamic_slice_transpose_in_parent_batching() {
+        let destination = ArrayReference::new(Array::matrix(2, 3, vec![10.0_f32; 6]));
+        let result = batch(
+            |(value, destination)| {
+                let seed = value.context().lift(ArrayIrValue::Array(Array::vector(vec![2.0_f32])))?;
+                let (_, pullback) = differentiate_at(value).vjp(|value| {
+                    let start = value.context().constant(ArrayIrValue::Array(Array::scalar(1_i32)))?;
+                    Ok(value
+                        .context()
+                        .bind(
+                            ArrayOperation::DynamicSlice(DynamicSliceOperation::new(vec![1])),
+                            Vec::new(),
+                            &[value.clone(), start],
+                        )?
+                        .remove(0))
+                })?;
+                pullback.apply_with_destinations(
+                    CotangentSeed::Value(seed),
+                    CotangentDestination::Reference(destination.clone()),
+                )?;
+                destination.read()
+            },
+            (
+                ArrayIrValue::Array(Array::matrix(2, 3, vec![1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0])),
+                ArrayIrValue::Reference(destination.clone()),
+            ),
+            (BatchAxis::new(0), BatchAxis::new(0)),
+            BatchAxis::new(0),
+            None,
+        );
+        // Each mapped buffer keeps its existing contents outside the selected coordinate, and batching preserves
+        // additive updates to the selected coordinate rather than sharing one member's temporary storage.
+        assert_eq!(result, Ok(ArrayIrValue::Array(Array::matrix(2, 3, vec![10.0_f32, 12.0, 10.0, 10.0, 12.0, 10.0]))));
+        assert_eq!(destination.read(), Ok(Array::matrix(2, 3, vec![10.0_f32, 12.0, 10.0, 10.0, 12.0, 10.0])));
+    }
+
+    #[test]
+    fn test_dynamic_slice_transpose_in_parent_higher_order() {
+        let (output, pullback) = differentiate_at(ArrayIrValue::Array(Array::vector(vec![3.0_f32, 5.0, 7.0])))
+            .vjp(|value| {
+                let initial = value.context().constant(ArrayIrValue::Array(Array::vector(vec![10.0_f32; 3])))?;
+                let destination = initial.reference_new()?;
+                let start = value.context().constant(ArrayIrValue::Array(Array::scalar(1_i32)))?;
+                let selected = value
+                    .context()
+                    .bind(
+                        ArrayOperation::DynamicSlice(DynamicSliceOperation::new(vec![1])),
+                        Vec::new(),
+                        &[value.clone(), start],
+                    )?
+                    .remove(0);
+                let seed = selected
+                    .context()
+                    .bind(
+                        ArrayOperation::from(MulOperation::<ArrayType>::new()),
+                        Vec::new(),
+                        &[selected.clone(), selected.clone()],
+                    )?
+                    .remove(0);
+                let (_, pullback) = differentiate_at(value).vjp(|value| {
+                    let start = value.context().constant(ArrayIrValue::Array(Array::scalar(1_i32)))?;
+                    Ok(value
+                        .context()
+                        .bind(
+                            ArrayOperation::DynamicSlice(DynamicSliceOperation::new(vec![1])),
+                            Vec::new(),
+                            &[value.clone(), start],
+                        )?
+                        .remove(0))
+                })?;
+                pullback.apply_with_destinations(
+                    CotangentSeed::Value(seed),
+                    CotangentDestination::Reference(destination.clone()),
+                )?;
+                destination.read()
+            })
+            .unwrap();
+        assert_eq!(output, ArrayIrValue::Array(Array::vector(vec![10.0_f32, 35.0, 10.0])));
+        // The inner slice receives the caller's buffer directly. Its seed depends on the differentiated value, so
+        // the outer pullback must differentiate the emitted buffer read/update/write operations as well.
+        assert_eq!(
+            pullback.apply(ArrayIrValue::Array(Array::vector(vec![1.0_f32; 3]))),
+            Ok(ArrayIrValue::Array(Array::vector(vec![0.0_f32, 10.0, 0.0]))),
+        );
     }
 
     #[test]

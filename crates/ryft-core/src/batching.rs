@@ -854,6 +854,16 @@ pub trait RecursiveBatchingPolicy<C: Context>: BatchingPolicy<C> {
             ),
         })
     }
+
+    /// Returns the extent of the batch axis introduced by `context` when it is statically known, or `None` when the
+    /// extent is only known at runtime. This is how a [`BatchingContext`] reports the size of the named axis it binds
+    /// (refer to the documentation of [`NamedAxes`](crate::NamedAxes)) independently of how the policy represents its
+    /// extent: a host `usize` extent is always known, while a first-class dimension value is known only when the
+    /// parent context resolves it to a constant.
+    #[inline]
+    fn static_batch_axis_extent(_context: &BatchingContext<C, Self>) -> Option<usize> {
+        None
+    }
 }
 
 /// Policy capability for invoking the public batching transform on flat parent values. [`Batch::batch`] owns

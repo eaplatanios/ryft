@@ -5522,7 +5522,11 @@ mod tests {
             .vjp(|input, ()| batched_bounded_while(input), Array::vector(vec![1.0, 5.0, 9.0]), ())
             .unwrap();
         assert_eq!(output.to_f64s(), vec![8.0, 10.0, 9.0]);
-        let rendered_pullback = pullback.transposed_program(&[]).unwrap().to_string();
+        let rendered_pullback = pullback
+            .linear_program()
+            .transpose_with_trailing_residuals_shared(pullback.residuals().len(), &[])
+            .unwrap()
+            .to_string();
         assert!(rendered_pullback.contains("scan"), "{rendered_pullback}");
         assert!(rendered_pullback.contains("reverse=true"), "{rendered_pullback}");
         assert!(!rendered_pullback.contains("while"), "{rendered_pullback}");

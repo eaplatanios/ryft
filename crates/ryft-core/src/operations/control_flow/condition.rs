@@ -19,10 +19,9 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain};
 use crate::differentiation::{
-    CotangentAccumulator, CotangentDestinationKind, DifferentiableOperation, DifferentiableType,
+    CotangentAccumulator, CotangentDestinationKind, CotangentDestinations, DifferentiableOperation, DifferentiableType,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    OperandCotangents, ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
-    operand_cotangents,
+    ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
@@ -1450,7 +1449,7 @@ where
         accumulators: &[CotangentAccumulator],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         let cotangents =
-            OperandCotangents::without_references(accumulators.iter().map(CotangentAccumulator::is_needed));
+            CotangentDestinations::without_references(accumulators.iter().map(CotangentAccumulator::is_needed));
         transpose_primal_condition(context, driver, inputs, outputs, &cotangents).map_err(DifferentiationError::from)
     }
 }
@@ -1473,7 +1472,7 @@ where
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         accumulators: &[CotangentAccumulator],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        let cotangents = operand_cotangents(context, inputs, accumulators)?;
+        let cotangents = context.cotangent_destinations(inputs, accumulators)?;
         transpose_primal_condition(context, driver, inputs, outputs, &cotangents).map_err(DifferentiationError::from)
     }
 }
@@ -1509,20 +1508,21 @@ where
 ///   - `context`: Active transpose tracing context the pullback is staged into.
 ///   - `inputs`: Per-operand [`PartialValue`] knowledge. The [`Unknown`](PartialValue::Unknown) entries are the branch
 ///     tangents; the [`Known`](PartialValue::Known) entries carry the predicate and residual tracers the pullback
-/// reads.
+///     reads.
 ///   - `outputs`: Symbolic cotangents for the condition's outputs.
 ///   - `cotangents`: Cotangent destinations of the operands (refer to the documentation of
-///     [`operand_cotangents`]). Both branches are transposed with the
-///     destination kinds of the branch operands. The cotangent reference of a `Reference`-kind operand is passed into
-///     both transposed branches at that operand's slot and the branch that runs accumulates into it in place, so the
-///     transposed condition's output at that position is the reference itself and the operand receives a structural
-///     zero; an `Ignore`-kind operand has no slot in either transposed branch and receives a structural zero as well.
+///     [`TranspositionContext::cotangent_destinations`]). Both branches are transposed with the destination kinds of
+///     the branch operands. A `Reference` destination passes the operand's cotangent reference into both transposed
+///     branches, and the selected branch accumulates into it in place. For a reference-state operand, the branch also
+///     returns that reference by identity; an ordinary value using a cotangent buffer produces no corresponding
+///     output. Both receive structural-zero contributions from this function. An `Ignore`-kind operand has no slot
+///     in either transposed branch and receives a structural zero as well.
 pub fn transpose_primal_condition<V, O, D: TranspositionDriver<V, O>>(
     context: &mut TracingContext<V, O>,
     driver: &D,
     inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
     outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    cotangents: &OperandCotangents<Tracer<TracingContext<V, O>>>,
+    cotangents: &CotangentDestinations<Tracer<TracingContext<V, O>>>,
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError>
 where
     V: Value<Type: ConditionTypeSemantics + DifferentiableType>,
@@ -1533,7 +1533,7 @@ where
     // through the transposed branches even when no ordinary output cotangent does.
     check_count!("input", cotangents.destination_kinds(), inputs.len(), ProgramError);
     if outputs.iter().all(MaybeZero::is_zero)
-        && !cotangents.is_live()
+        && !cotangents.has_live_reference_state()
         && !driver.region(0)?.has_observable_transpose_effects()
         && !driver.region(1)?.has_observable_transpose_effects()
     {
@@ -1651,7 +1651,7 @@ where
             match cotangents.kind(index) {
                 CotangentDestinationKind::Return if linear => Ok(MaybeZero::Value(branch_cotangents.next().unwrap())),
                 CotangentDestinationKind::Reference => {
-                    if cotangents.is_reference(index) {
+                    if cotangents.is_reference_input(index) {
                         branch_cotangents.next();
                     }
                     Ok(MaybeZero::Zero(input.r#type().cotangent()?))

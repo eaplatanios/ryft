@@ -1109,7 +1109,10 @@ mod tests {
             context.vjp(|inputs: Vec<_>, ()| Ok(vec![inputs[1].clone()]), vec![dynamic, scalar], ()).unwrap();
         assert_eq!(pullback.residuals().len(), 1);
         assert!(matches!(pullback.residuals()[0].r#type().as_ref(), ArrayIrType::Dimension(_)));
-        let transposed = pullback.transposed_program(&[]).unwrap();
+        let transposed = pullback
+            .linear_program()
+            .transpose_with_trailing_residuals_shared(pullback.residuals().len(), &[])
+            .unwrap();
         let zero = transposed.instructions().last().unwrap();
         assert!(matches!(zero.operation(), ArrayIrOperation::Zero(_)));
         assert_eq!(zero.inputs(), &[AtomId::new(1)]);

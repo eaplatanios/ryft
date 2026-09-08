@@ -6,18 +6,18 @@ use ryft_core::macros::check_count;
 use ryft_core::{
     Array as CpuArray, ArrayIrType, ArrayOperation, ArrayReferenceDischarge, ArrayType, BroadcastOperation,
     CalleeRegionDriver, CaptureConstant, Concretizable, ConstantOperation, Context, ConvertElementType,
-    CotangentDestinationKind, DifferentiableOperation, DifferentiableType, DifferentiationContext,
-    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, Dimension, DivOperation,
-    InputRegionProvenance, LogicalMesh, MaybeZero, MeshAxisType, OperandCotangents, Operation, OperationFormatter,
-    OutputRegionProvenance, ParallelReduceOperation, ParallelReductionKind, Parameterized, ParameterizedFamily,
-    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput, PartialEvaluationValue, PartialValue,
-    PartiallyEvaluatableOperation, Placeholder, Program, ProgramBuilder, ProgramError, ProjectedValue,
-    ReferenceAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceNewOperation,
-    ReferenceRoot, ReferenceSource, ReferenceType, RegionInterface, RegionRef, RegionSlot, ReshapeOperation,
-    ReshapeParameters, Shape, Sharding, ShardingDimension, StagingContext, Tracer, TracingContext,
+    CotangentDestinationKind, CotangentDestinations, DifferentiableOperation, DifferentiableType,
+    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
+    Dimension, DivOperation, InputRegionProvenance, LogicalMesh, MaybeZero, MeshAxisType, Operation,
+    OperationFormatter, OutputRegionProvenance, ParallelReduceOperation, ParallelReductionKind, Parameterized,
+    ParameterizedFamily, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput,
+    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, Placeholder, Program, ProgramBuilder,
+    ProgramError, ProjectedValue, ReferenceAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceFreezeOperation,
+    ReferenceNewOperation, ReferenceRoot, ReferenceSource, ReferenceType, RegionInterface, RegionRef, RegionSlot,
+    ReshapeOperation, ReshapeParameters, Shape, Sharding, ShardingDimension, StagingContext, Tracer, TracingContext,
     TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError, Typed, Value, ValueId,
-    ValueProjection, Zero, ZeroOperation, discharge_reference_free_operation, operand_cotangents,
+    ValueProjection, Zero, ZeroOperation, discharge_reference_free_operation,
 };
 
 use crate::experimental::ops::{XlaConstant, XlaOperation, XlaProgram, materialize_transpose_cotangent};
@@ -1301,7 +1301,7 @@ where
 ///     carry the residual tracers the pullback reads.
 ///   - `outputs`: Symbolic cotangents for the tangent `shard_map`'s outputs.
 ///   - `cotangents`: Cotangent destinations of the operands (refer to the documentation of
-///     [`operand_cotangents`]). The body is transposed with their destination kinds, so a live
+///     [`TranspositionContext::cotangent_destinations`]). The body is transposed with their destination kinds, so a live
 ///     (`Reference`-kind) reference operand accumulates into its destination using the sharded or replicated policy
 ///     above. A dead (`Ignore`-kind) reference operand has no slot in the transposed body.
 pub fn transpose_primal_shard_map<
@@ -1313,7 +1313,7 @@ pub fn transpose_primal_shard_map<
     driver: &D,
     inputs: &[PartialValue<Tracer<TracingContext<V, XlaOperation<V>>>>],
     outputs: &[MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>],
-    cotangents: &OperandCotangents<Tracer<TracingContext<V, XlaOperation<V>>>>,
+    cotangents: &CotangentDestinations<Tracer<TracingContext<V, XlaOperation<V>>>>,
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, ProgramError> {
     let operand_linear = inputs.iter().map(PartialValue::is_unknown).collect::<Vec<_>>();
     check_count!("input", operand_linear, operation.input_types.len(), ProgramError);
@@ -1323,7 +1323,7 @@ pub fn transpose_primal_shard_map<
     // cotangent is zero. A live reference operand keeps the shard map live, because its accumulated state cotangent
     // flows through the transposed body even when no ordinary output cotangent does.
     if outputs.iter().all(MaybeZero::is_zero)
-        && !cotangents.is_live()
+        && !cotangents.has_live_reference_state()
         && !driver.region(0)?.has_observable_transpose_effects()
     {
         return inputs
@@ -1400,7 +1400,8 @@ pub fn transpose_primal_shard_map<
             CotangentDestinationKind::Return if linear => Ok(MaybeZero::Value(input_cotangents.next().unwrap())),
             CotangentDestinationKind::Reference => {
                 let destination = reference_destinations.next().unwrap();
-                if cotangents.is_reference(index) || !operation.shard_map.input_replicated_manual_axes(index).is_empty()
+                if cotangents.is_reference_input(index)
+                    || !operation.shard_map.input_replicated_manual_axes(index).is_empty()
                 {
                     let cotangent = input_cotangents.next().unwrap();
                     if !operation.shard_map.input_replicated_manual_axes(index).is_empty() {
@@ -1441,7 +1442,7 @@ where
         check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
         let contributions =
             (|| -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, DifferentiationError> {
-                let cotangents = operand_cotangents(context, inputs, accumulators)?;
+                let cotangents = context.cotangent_destinations(inputs, accumulators)?;
                 transpose_primal_shard_map(self, context, driver, inputs, outputs, &cotangents)
                     .map_err(DifferentiationError::from)
             })()?;
@@ -1926,9 +1927,9 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayIrType, ArrayOperation, ArrayType, CaptureReference, Context, CotangentDestinationKind,
-        DataType, DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionType,
-        DimensionVariable, DomainTracingContext, EffectClasses, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType,
-        MulOperation, OperandCotangents, Operation, PartialValue, Placeholder, Program, ProgramBuilder, ProgramError,
+        CotangentDestinations, DataType, DifferentiableType, DifferentiationError, Dimension, DimensionBounds,
+        DimensionType, DimensionVariable, DomainTracingContext, EffectClasses, LogicalMesh, MaybeZero, MeshAxis,
+        MeshAxisType, MulOperation, Operation, PartialValue, Placeholder, Program, ProgramBuilder, ProgramError,
         ReferenceAddUpdateOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSource, ReferenceType,
         RegionDriver, RegionInterface, RegionRef, Shape, Sharding, ShardingDimension, StagingContext, TracingContext,
         TransposableOperation, TranspositionContext, TranspositionDriver, TypeError, Typed, ZeroOperation,
@@ -2394,7 +2395,7 @@ mod tests {
             &driver,
             &[PartialValue::Known(known)],
             &[MaybeZero::Zero(ArrayIrType::Array(tangent_type))],
-            &OperandCotangents::without_references([true]),
+            &CotangentDestinations::without_references([true]),
         )
         .unwrap();
         assert!(matches!(&cotangents[..], [MaybeZero::Zero(actual)] if actual == &ArrayIrType::Array(cotangent_type)));
@@ -2457,7 +2458,7 @@ mod tests {
                 MaybeZero::Value(value_cotangent),
                 MaybeZero::Zero(ArrayIrType::Array(predicate_type.cotangent().unwrap())),
             ],
-            &OperandCotangents::without_references([true]),
+            &CotangentDestinations::without_references([true]),
         )
         .unwrap();
 

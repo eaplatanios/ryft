@@ -22,10 +22,9 @@ use crate::batching::{
 };
 use crate::contexts::{Context, Domain, StagingContext};
 use crate::differentiation::{
-    CotangentAccumulator, CotangentDestinationKind, DifferentiableOperation, DifferentiableType,
+    CotangentAccumulator, CotangentDestinationKind, CotangentDestinations, DifferentiableOperation, DifferentiableType,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    OperandCotangents, ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
-    operand_cotangents,
+    ResidualZeroProvider, TransposableOperation, TranspositionContext, TranspositionDriver,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, check_types};
@@ -3041,7 +3040,7 @@ where
         inputs: &[PartialValue<Tracer<TracingContext<V, Target>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, Target>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, DifferentiationError> {
-        let cotangents = OperandCotangents::without_references(std::iter::repeat_n(true, inputs.len()));
+        let cotangents = CotangentDestinations::without_references(std::iter::repeat_n(true, inputs.len()));
         transpose_array_scan(operation, context, driver, inputs, outputs, &cotangents)
     }
 }
@@ -3067,7 +3066,7 @@ where
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, DifferentiationError> {
         // A scan's ordinary carry gradients drive earlier iterations, and its scanned gradients have element
         // geometry inside the body. Return those values before the outer rule applies demand or gradient buffers.
-        let cotangents = operand_cotangents(context, inputs, &[])?;
+        let cotangents = context.cotangent_destinations(inputs, &[])?;
         transpose_array_scan(operation, context, driver, inputs, outputs, &cotangents)
     }
 }
@@ -3079,7 +3078,7 @@ fn transpose_array_scan<V, F, Target, D>(
     driver: &D,
     inputs: &[PartialValue<Tracer<TracingContext<V, Target>>>],
     outputs: &[MaybeZero<Tracer<TracingContext<V, Target>>>],
-    cotangents: &OperandCotangents<Tracer<TracingContext<V, Target>>>,
+    cotangents: &CotangentDestinations<Tracer<TracingContext<V, Target>>>,
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, DifferentiationError>
 where
     V: Value<Type: DifferentiableType + ScanTypeSemantics>,
@@ -3091,7 +3090,7 @@ where
     // keeps the rule live regardless, because the accumulated state cotangent flows through the reversed body even
     // when no ordinary output cotangent does.
     if outputs.iter().all(MaybeZero::is_zero)
-        && !cotangents.is_live()
+        && !cotangents.has_live_reference_state()
         && !driver.region(0)?.has_observable_transpose_effects()
     {
         return inputs.iter().map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?))).collect();
@@ -3205,8 +3204,8 @@ where
 ///     [`Known`](PartialValue::Known) of the residual-stack tracer the pullback reads.
 ///   - `outputs`: Symbolic cotangents for the scan's outputs.
 ///   - `cotangents`: Cotangent destinations of the operands (refer to the documentation of
-///     [`operand_cotangents`]). A live (`Reference`-kind) reference
-///     carry is threaded through the reversed scan as a carry at its own position: the reversed body receives its
+///     [`TranspositionContext::cotangent_destinations`]). A live (`Reference`-kind) reference carry is threaded through
+///     the reversed scan as a carry at its own position: the reversed body receives its
 ///     cotangent reference as that carry's input and passes it back out by identity as that carry's output, so every
 ///     reversed iteration accumulates into and reads from one shared cotangent reference. A live reference *stack*
 ///     (a linear reference-typed scanned operand, whose body input is the per-iteration view of the stack) is
@@ -3222,7 +3221,7 @@ pub fn transpose_primal_scan<V, O, F, D: TranspositionDriver<V, O>>(
     driver: &D,
     inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
     outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
-    cotangents: &OperandCotangents<Tracer<TracingContext<V, O>>>,
+    cotangents: &CotangentDestinations<Tracer<TracingContext<V, O>>>,
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError>
 where
     V: Value<Type: DifferentiableType + ScanTypeSemantics>,
@@ -3234,7 +3233,7 @@ where
     // through the reversed body even when no ordinary output cotangent does.
     check_count!("input", cotangents.destination_kinds(), inputs.len(), ProgramError);
     if outputs.iter().all(MaybeZero::is_zero)
-        && !cotangents.is_live()
+        && !cotangents.has_live_reference_state()
         && !driver.region(0)?.has_observable_transpose_effects()
     {
         return inputs
@@ -3313,7 +3312,7 @@ where
     // rather than a property of the body, so the shared artifact is rebuilt here instead of being retained in its
     // threaded form.
     let linear_carry_count = operand_linear[..carry_count].iter().filter(|&&linear| linear).count();
-    if linear_carry_count != carry_count || (0..scan_inputs.len()).any(|index| cotangents.is_reference(index)) {
+    if linear_carry_count != carry_count || (0..scan_inputs.len()).any(|index| cotangents.is_reference_input(index)) {
         transposed_body = Arc::new(thread_scan_carries(
             transposed_body.as_ref().clone(),
             body.output_types().as_slice(),

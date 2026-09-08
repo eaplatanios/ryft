@@ -3468,14 +3468,14 @@ mod tests {
             }
         }
         format!(
-            "nondeterministic transform rule detected for `{}` with arguments DifferentiationTransformArguments {{ \
-                input_indices: [0] }}: re-derivation produced a different artifact than the region cache retained, \
-                but region transforms must be deterministic structural functions of their complete reachable \
-                contents and arguments\n\ncached metadata: {}\nderived metadata: {}\n\n{}",
+            "nondeterministic transform rule detected for `{}` with arguments `JvpAndLinearizationTransformArguments` \
+             {{ input_indices: [0] }}: re-derivation produced a different artifact than the region cache retained, \
+             but region transforms must be deterministic structural functions of their complete reachable \
+             contents and arguments\n\ncached metadata: {}\nderived metadata: {}\n\n{}",
+            std::any::type_name::<T>(),
             cached_metadata,
             derived_metadata,
             programs,
-            std::any::type_name::<T>(),
         )
     }
 

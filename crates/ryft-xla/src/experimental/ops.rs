@@ -21,33 +21,33 @@ use ryft_core::{
     BatchingDriver, BatchingError, BroadcastOperation, CalleeRegionDriver, CaptureConstant, CaptureReference,
     CeilOperation, CompareOperation, CompiledCallOperation, ConcatenateOperation, Concretizable, ConditionOperation,
     ConstantOperation, Context, ConvertElementTypeOperation, CosOperation, CotangentDestinationKind,
-    CumulativeLogSumExpOperation, CumulativeMaxOperation, CumulativeMinOperation, CumulativeProductOperation,
-    CumulativeSumOperation, CustomJvpOperation, CustomVjpOperation, DifferentiableOperation, DifferentiableType,
-    DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    Dimension, DimensionAddOperation, DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionMaxOperation,
-    DimensionMinOperation, DimensionMulOperation, DimensionOperation, DimensionPowOperation, DimensionRemOperation,
-    DimensionRequirementOperation, DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation,
-    DimensionToScalarOperation, DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation,
-    DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
-    EagerContext, ErfOperation, ExpOperation, FloorOperation, GatherOperation, InputRegionProvenance, IotaOperation,
-    LinearCallOperation, Log1pOperation, LogAddExpOperation, LogOperation, LogSumExpOperation, LogisticOperation,
-    MaxOperation, MaybeZero, MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation,
-    OperandCotangents, Operation, OperationFormatter, OperationProvider, OrOperation, OutputRegionProvenance,
-    PadOperation, ParallelReduceOperation, Parameter, PartialEvaluationContext, PartialEvaluationDriver,
-    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program,
-    ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation, ReduceOperation,
-    ReferenceAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceIndexOperation,
-    ReferenceNewOperation, ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation,
-    ReferenceViewOperation, ReferenceViewValidationError, ReferenceWriteOperation, RegionInterface, RegionSlot,
-    RemOperation, ReshapeOperation, ReshardOperation, ResidualZeroProvider, RoundOperation, RsqrtOperation,
-    ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation,
-    SinOperation, SliceOperation, SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation,
-    TanhOperation, Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation,
-    TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation,
-    Value, ValueProjection, ViewIndex, ViewSymbol, WhileOperation, XorOperation, Zero, ZeroLikeOperation,
-    ZeroOperation, discharge_positional_region_operation, operand_cotangents, reapply_array_reference_view,
-    validate_array_reference_view,
+    CotangentDestinations, CumulativeLogSumExpOperation, CumulativeMaxOperation, CumulativeMinOperation,
+    CumulativeProductOperation, CumulativeSumOperation, CustomJvpOperation, CustomVjpOperation,
+    DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver, DifferentiationDual,
+    DifferentiationError, DifferentiationPolicy, Dimension, DimensionAddOperation, DimensionDivFloorOperation,
+    DimensionFromScalarOperation, DimensionMaxOperation, DimensionMinOperation, DimensionMulOperation,
+    DimensionOperation, DimensionPowOperation, DimensionRemOperation, DimensionRequirementOperation,
+    DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation,
+    DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
+    DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, ErfOperation,
+    ExpOperation, FloorOperation, GatherOperation, InputRegionProvenance, IotaOperation, LinearCallOperation,
+    Log1pOperation, LogAddExpOperation, LogOperation, LogSumExpOperation, LogisticOperation, MaxOperation, MaybeZero,
+    MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation,
+    OperationFormatter, OperationProvider, OrOperation, OutputRegionProvenance, PadOperation, ParallelReduceOperation,
+    Parameter, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
+    PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program, ProgramBatchingOutputAxesPolicy,
+    ProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation, ReduceOperation, ReferenceAddUpdateOperation,
+    ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
+    ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceIndexOperation, ReferenceNewOperation,
+    ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation, ReferenceViewOperation,
+    ReferenceViewValidationError, ReferenceWriteOperation, RegionInterface, RegionSlot, RemOperation, ReshapeOperation,
+    ReshardOperation, ResidualZeroProvider, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation,
+    ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation, SinOperation, SliceOperation,
+    SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation, TanhOperation, Tracer,
+    TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionContext,
+    TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection,
+    ViewIndex, ViewSymbol, WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
+    discharge_positional_region_operation, reapply_array_reference_view, validate_array_reference_view,
 };
 use ryft_macros::Parameter;
 
@@ -1322,7 +1322,7 @@ pub(crate) fn materialize_transpose_cotangent<
 ///     carry the residual and captured-constant-tangent tracers the pullback reads.
 ///   - `outputs`: Symbolic cotangents for the tangent call's outputs.
 ///   - `cotangents`: Cotangent destinations of the operands (refer to the documentation of
-///     [`operand_cotangents`]). The callee is transposed with their destination kinds, so a live
+///     [`TranspositionContext::cotangent_destinations`]). The callee is transposed with their destination kinds, so a live
 ///     (`Reference`-kind) reference operand's cotangent reference is an operand of the transposed call, which
 ///     accumulates into it in place and returns it by identity, while a dead (`Ignore`-kind) reference operand has no
 ///     slot in the transposed callee at all.
@@ -1335,14 +1335,14 @@ pub fn transpose_primal_jit_call<
     driver: &D,
     inputs: &[PartialValue<Tracer<TracingContext<V, XlaOperation<V>>>>],
     outputs: &[MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>],
-    cotangents: &OperandCotangents<Tracer<TracingContext<V, XlaOperation<V>>>>,
+    cotangents: &CotangentDestinations<Tracer<TracingContext<V, XlaOperation<V>>>>,
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, ProgramError> {
     // A jitted call with no live output cotangents and no live reference operand is a zero linear map, so every
     // operand cotangent is zero. A live reference operand keeps the call live, because its accumulated state cotangent
     // flows through the transposed callee even when no ordinary output cotangent does.
     check_count!("input", cotangents.destination_kinds(), inputs.len(), ProgramError);
     if outputs.iter().all(MaybeZero::is_zero)
-        && !cotangents.is_live()
+        && !cotangents.has_live_reference_state()
         && !driver.region(0)?.has_observable_transpose_effects()
     {
         return inputs
@@ -1408,7 +1408,7 @@ pub fn transpose_primal_jit_call<
         .map(|(index, (&linear, input))| match cotangents.kind(index) {
             CotangentDestinationKind::Return if linear => Ok(MaybeZero::Value(input_cotangents.next().unwrap())),
             CotangentDestinationKind::Reference => {
-                if cotangents.is_reference(index) {
+                if cotangents.is_reference_input(index) {
                     input_cotangents.next();
                 }
                 input.r#type().cotangent().map(MaybeZero::Zero).map_err(ProgramError::from)
@@ -1441,7 +1441,7 @@ where
         check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
         let contributions =
             (|| -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, DifferentiationError> {
-                let cotangents = operand_cotangents(context, inputs, accumulators)?;
+                let cotangents = context.cotangent_destinations(inputs, accumulators)?;
                 transpose_primal_jit_call(self, context, driver, inputs, outputs, &cotangents)
                     .map_err(DifferentiationError::from)
             })()?;
@@ -1462,11 +1462,11 @@ mod tests {
     use ryft_core::{
         AddOperation, ArrayIrOperation, ArrayIrOperations, ArrayIrType, ArrayOperation, ArrayOperations,
         ArrayReferenceViewTransform, ArrayType, CaptureReference, CapturingContext, ConditionOperation, Context,
-        CotangentDestinationKind, CustomJvpOperation, CustomVjpOperation, DataType, DifferentiableType,
-        DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation, DimensionType, DimensionValue,
-        DimensionVariable, DomainTracingContext, DynamicBroadcastOperation, EffectClasses, ExternalReferenceBinding,
-        InputRegionProvenance, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation, OperandCotangents,
-        Operation, OutputRegionProvenance, PartialValue, Placeholder, ProgramBuilder, ProgramError,
+        CotangentDestinationKind, CotangentDestinations, CustomJvpOperation, CustomVjpOperation, DataType,
+        DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation,
+        DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, DynamicBroadcastOperation,
+        EffectClasses, ExternalReferenceBinding, InputRegionProvenance, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType,
+        MulOperation, Operation, OutputRegionProvenance, PartialValue, Placeholder, ProgramBuilder, ProgramError,
         ReferenceAddUpdateOperation, ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceFreezeOperation,
         ReferenceIndexOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSource,
         ReferenceSwapOperation, ReferenceType, ReferenceViewOperation, ReferenceViewValidationError,
@@ -2626,7 +2626,7 @@ mod tests {
             &driver,
             &[PartialValue::Unknown(tangent_type.clone())],
             &[MaybeZero::Zero(tangent_type.clone())],
-            &OperandCotangents::without_references([true]),
+            &CotangentDestinations::without_references([true]),
         )
         .unwrap();
         assert!(matches!(&cotangents[..], [MaybeZero::Zero(actual)] if actual == &expected));
@@ -2638,7 +2638,7 @@ mod tests {
             &driver,
             &[PartialValue::Known(known)],
             &[MaybeZero::Zero(tangent_type)],
-            &OperandCotangents::without_references([true]),
+            &CotangentDestinations::without_references([true]),
         )
         .unwrap();
         assert!(matches!(&cotangents[..], [MaybeZero::Zero(actual)] if actual == &expected));
@@ -2716,7 +2716,7 @@ mod tests {
                 MaybeZero::Value(value_cotangent),
                 MaybeZero::Zero(ArrayIrType::Array(predicate_type.cotangent().unwrap())),
             ],
-            &OperandCotangents::without_references([true]),
+            &CotangentDestinations::without_references([true]),
         )
         .unwrap();
 
