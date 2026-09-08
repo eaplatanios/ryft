@@ -50,16 +50,20 @@ use thiserror::Error;
 use ryft_macros::Parameter;
 
 use crate::arrays::{
-    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType, DataType, Dimension, Shape,
+    ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatchingPolicy, ArrayIrType, ArrayType,
+    DataType, Dimension, DimensionType, DimensionValue, Shape,
 };
 use crate::batching::{BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
-use crate::contexts::{Context, Domain, EagerContext, ProjectedContext};
+use crate::contexts::{Context, Domain, EagerContext, ProjectedContext, ValueResolution};
 use crate::differentiation::{
     DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationPolicy, ResidualZeroProvider,
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_non_differentiable_operation, impl_nullary_transposable_operation};
-use crate::operations::{Broadcast, BroadcastOperation, IotaOperation, Transpose, TransposeOperation};
+use crate::operations::{
+    Broadcast, BroadcastOperation, ConstantOperation, DimensionSizeOperation, DynamicBroadcastOperation, IotaOperation,
+    Transpose, TransposeOperation,
+};
 use crate::parameters::Parameter;
 use crate::partial::{
     PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartiallyEvaluatableOperation,
@@ -371,14 +375,14 @@ where
     }
 }
 
-impl<C: NamedAxes<Type = ArrayType, Value: Broadcast + Transpose>> NamedAxes for BatchingContext<C, ArrayBatchingPolicy>
+impl<C: NamedAxes<Type = ArrayType>> NamedAxes for BatchingContext<C, ArrayBatchingPolicy>
 where
+    C::Value: Broadcast + Transpose,
     C::Operation: BatchableOperation<C, ArrayBatchingPolicy>
         + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayBatchingPolicy>
         + From<TransposeOperation>
         + From<BroadcastOperation>,
 {
-    #[inline]
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {
         // A batching level binds the axis it introduces: a lookup for this level's `axis_name` resolves to
         // `NamedAxis::Batched` with this level's batch size, and any other name delegates to the parent context.
@@ -386,6 +390,41 @@ where
         // bindings with inner ones.
         if self.axis_name() == Some(name) {
             Some(NamedAxis::Batched { size: Some(*self.axis_extent()) })
+        } else {
+            self.parent().named_axis(name)
+        }
+    }
+}
+
+impl<C: NamedAxes<Type = ArrayIrType>> NamedAxes for BatchingContext<C, ArrayIrBatchingPolicy>
+where
+    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+        + ValueProjection<DimensionType, Projected = DimensionValue>,
+    C::Operation: BatchableOperation<C, ArrayIrBatchingPolicy>
+        + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayIrBatchingPolicy>
+        + From<DynamicBroadcastOperation>
+        + From<ConstantOperation<DimensionValue>>
+        + From<DimensionSizeOperation>
+        + OperationProjection<ArrayType, Projected: From<TransposeOperation>>,
+{
+    fn named_axis(&self, name: &str) -> Option<NamedAxis> {
+        // A composite batching level binds the axis it introduces, just like the homogeneous one, but its extent is a
+        // first-class dimension value owned by the parent context rather than a host `usize`. The binding's size is
+        // therefore only known when the parent resolves that value to a concrete dimension constant (e.g., under eager
+        // batching), in which case it is projected to a `DimensionValue` and its extent is reported. A staged or opaque
+        // extent (e.g., under a trace with a symbolic batch dimension) is reported as a dynamic binding with no static
+        // size. Any other name delegates to the parent context, so nested levels shadow outer bindings as usual.
+        if self.axis_name() == Some(name) {
+            let size = match self.parent().resolve(self.axis_extent()) {
+                ValueResolution::Constant(axis_extent) => {
+                    <C::Constant as ValueProjection<DimensionType>>::into_projected(axis_extent)
+                        .ok()
+                        .map(|axis_extent| axis_extent.extent())
+                }
+                ValueResolution::Staged(_) | ValueResolution::Opaque => None,
+            };
+            Some(NamedAxis::Batched { size })
         } else {
             self.parent().named_axis(name)
         }

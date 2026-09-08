@@ -24,14 +24,14 @@ use crate::arrays::encoding::ArrayElement;
 use crate::arrays::operations::ElementExtremum;
 use crate::arrays::sharding::{MeshAxisType, Sharding, ShardingDimension, ShardingError};
 use crate::arrays::types::{ArrayIrType, ArrayType, DataType, Dimension, DimensionType, DimensionVariable, Shape};
-use crate::axes::{Axis, NamedAxes, NamedAxis};
+use crate::axes::Axis;
 use crate::batching::{
     BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableType, BatchedOutputs, BatchedProgram,
     BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError, BatchingPolicy, BatchingPolicyProjection,
     BatchingTracer, BoundaryPreservingBatchedProgram, InterpretableBatchableOperation, ProgramBatchingOutputAxesPolicy,
     RecursiveBatchingDriver, RecursiveBatchingPolicy,
 };
-use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext, ValueResolution};
+use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count, dispatch_on_array_element_type};
 use crate::operations::{
@@ -2693,19 +2693,15 @@ where
 
 impl<C: Context<Type = ArrayIrType>, T: Type> ValueProjection<T> for BatchingTracer<C, ArrayIrBatchingPolicy>
 where
-    C::Value: ValueProjection<T, Projected: Value<Type = T>>
-        + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
-    C::Constant:
-        ValueProjection<ArrayType, Projected: Value<Type = ArrayType>> + ValueProjection<T, Projected: Value<Type = T>>,
+    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: BatchableOperation<C, ArrayIrBatchingPolicy>
         + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayIrBatchingPolicy>
         + From<DynamicBroadcastOperation>
         + From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>
-        + OperationProjection<T>
         + OperationProjection<ArrayType, Projected: From<TransposeOperation>>,
     for<'t> &'t T: TryFrom<&'t ArrayIrType, Error = TypeError>,
-    ArrayIrBatchingPolicy: BatchingPolicyProjection<C, T>,
 {
     type Projected = ProjectedValue<T, Self>;
     type ProjectedRef<'v>
@@ -2793,6 +2789,7 @@ where
     }
 }
 
+// TODO(eaplatanios): Should this be defined earlier in this module?
 /// [`ArrayExtentBatchingPolicy`] used while a homogeneous array rule runs inside an array IR batching transform.
 ///
 /// When composite batching reaches an array member operation, it projects the operation and its batches into the
@@ -2898,6 +2895,7 @@ where
     }
 }
 
+// TODO(eaplatanios): Should this be defined earlier in this module?
 /// [`BatchingPolicy`] used while a homogeneous first-class-dimension operation runs inside an array IR batching
 /// transform. A dimension is shared shape metadata and so its projected value is itself the complete batch carrier.
 /// Replicated inputs pass through unchanged, while any mapped input is rejected because a different extent per batch
@@ -4023,37 +4021,6 @@ where
     }
 }
 
-impl<C> NamedAxes for BatchingContext<C, ArrayIrBatchingPolicy>
-where
-    C: NamedAxes<Type = ArrayIrType>,
-    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
-        + ValueProjection<DimensionType, Projected = DimensionValue>,
-    C::Operation: BatchableOperation<C, ArrayIrBatchingPolicy>
-        + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayIrBatchingPolicy>
-        + From<DynamicBroadcastOperation>
-        + From<ConstantOperation<DimensionValue>>
-        + From<DimensionSizeOperation>
-        + OperationProjection<ArrayType>,
-    <C::Operation as OperationProjection<ArrayType>>::Projected: From<TransposeOperation>,
-{
-    fn named_axis(&self, name: &str) -> Option<NamedAxis> {
-        if self.axis_name() == Some(name) {
-            let size = match self.parent().resolve(self.axis_extent()) {
-                ValueResolution::Constant(axis_extent) => {
-                    <C::Constant as ValueProjection<DimensionType>>::into_projected(axis_extent)
-                        .ok()
-                        .map(|axis_extent| axis_extent.extent())
-                }
-                ValueResolution::Staged(_) | ValueResolution::Opaque => None,
-            };
-            Some(NamedAxis::Batched { size })
-        } else {
-            self.parent().named_axis(name)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
@@ -4072,6 +4039,7 @@ mod tests {
     use crate::arrays::sharding::shardings::ShardingDimension;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionVariable, Shape};
+    use crate::axes::{NamedAxes, NamedAxis};
     use crate::batching::{
         Batch, BatchAxisSpecification, BatchingPolicy, BatchingTracer, InterpretableBatchableOperation,
         RecursiveBatchingPolicy, batch,
