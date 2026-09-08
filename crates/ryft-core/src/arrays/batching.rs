@@ -23,7 +23,7 @@ use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::encoding::ArrayElement;
 use crate::arrays::operations::ElementExtremum;
 use crate::arrays::sharding::{MeshAxisType, Sharding, ShardingDimension, ShardingError};
-use crate::arrays::types::{ArrayIrType, ArrayType, DataType, Dimension, DimensionType, DimensionVariable, Shape};
+use crate::arrays::types::{ArrayIrType, ArrayType, Dimension, DimensionType, DimensionVariable, Shape};
 use crate::axes::Axis;
 use crate::batching::{
     BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableType, BatchedOutputs, BatchedProgram,
@@ -954,6 +954,18 @@ pub enum RaggedMaskIdentity {
 
     /// Highest value of the operand data type, and the identity of a minimum operation.
     Highest,
+}
+
+impl Display for RaggedMaskIdentity {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Zero => write!(formatter, "zero"),
+            Self::One => write!(formatter, "one"),
+            Self::Lowest => write!(formatter, "lowest"),
+            Self::Highest => write!(formatter, "highest"),
+        }
+    }
 }
 
 /// Ragged surface of an [`ArrayExtentBatchingPolicy`], providing the per-discipline hooks through which batching rules
@@ -3106,6 +3118,43 @@ where
         let lifted_input_value = <C::Value as ValueProjection<ArrayType>>::from_projected(input_value.clone());
         let packed_type = input.r#type().into_owned();
 
+        // A non-zero identity is written over padding as a broadcast rank-zero constant of the operand's element type,
+        // which is built here on the host before anything is staged. The extrema reuse the element-level reduction
+        // identities, so `Lowest` writes exactly the value a maximum reduction starts from. The arithmetic identity is
+        // converted into the element type and the conversion is verified, because an identity that does not survive
+        // it is not an identity: `from_real` lands on whatever the element type's own encoding makes of the requested
+        // constant, which for a narrow type need not be that constant at all (e.g., `1.0` becomes `-1` in the `i1`
+        // type, whose range is `{-1, 0}`), and masking live padding with such a value would corrupt every prefix it
+        // enters. The payload-free element types hold no constant of any kind. The zero identity instead takes the
+        // operand's own zero-like value below and needs no data type reasoning.
+        let data_type = packed_type.data_type();
+        let identity_scalar = match identity {
+            RaggedMaskIdentity::Zero => None,
+            identity if data_type.is_token() || data_type.is_zero() => {
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "ragged identity masking cannot build a `{identity}` constant of type `{data_type}`",
+                    ),
+                });
+            }
+            identity => Some(dispatch_on_array_element_type!(data_type, |Element| {
+                let element = match identity {
+                    RaggedMaskIdentity::Zero => <Element as ArrayElement>::from_real(0.0)?,
+                    RaggedMaskIdentity::One => <Element as ArrayElement>::from_real(1.0)?,
+                    RaggedMaskIdentity::Lowest => <Element as ElementExtremum>::maximum_identity(),
+                    RaggedMaskIdentity::Highest => <Element as ElementExtremum>::minimum_identity(),
+                };
+                if identity == RaggedMaskIdentity::One && element.convert_to::<f64>()? != 1.0 {
+                    return Err(BatchingError::UnsupportedOperation {
+                        message: format!(
+                            "ragged identity masking cannot represent a `{identity}` constant in type `{data_type}`",
+                        ),
+                    });
+                }
+                Array::scalar(element)
+            })),
+        };
+
         // The masked value is built entirely from primitives staged below, so the nested scopes cover exactly the
         // instructions this masking owns.
         let masked_value = outer_context.invoke_with_provenance_scope(ProvenanceScope::new("ryft"), || {
@@ -3187,8 +3236,8 @@ where
                         // The replacement written over padding is the requested identity materialized at the packed
                         // shape, and the final select keeps live elements from the operand and takes the identity
                         // everywhere else.
-                        let replacement = match identity {
-                            RaggedMaskIdentity::Zero => {
+                        let replacement = match identity_scalar {
+                            None => {
                                 let mut zero = array_context.bind(
                                     ZeroLikeOperation::<ArrayType>::new(),
                                     Vec::new(),
@@ -3197,8 +3246,7 @@ where
                                 check_count!("output", zero, 1, ProgramError);
                                 zero.remove(0)
                             }
-                            identity => {
-                                let scalar = ragged_mask_identity_scalar(packed_type.data_type(), identity)?;
+                            Some(scalar) => {
                                 let mut constant =
                                     array_context.bind(ConstantOperation::new(scalar), Vec::new(), &[])?;
                                 check_count!("output", constant, 1, ProgramError);
@@ -3466,44 +3514,6 @@ where
         .transpose()?;
     let value = broadcast_array(context, value, output_dimensions, output_axes.clone(), output_sharding)?;
     Ok((value, output_axes))
-}
-
-/// Returns the rank-zero [`Array`] holding `identity` in `data_type`, which the dynamic policy stages as the constant
-/// it broadcasts over ragged padding. The extrema reuse the element-level reduction identities, so masking a ragged
-/// axis with [`RaggedMaskIdentity::Lowest`] writes exactly the value a maximum reduction starts from. The arithmetic
-/// identities are converted into the element type and the conversion is verified, because an identity that does not
-/// survive it is not an identity.
-fn ragged_mask_identity_scalar(data_type: DataType, identity: RaggedMaskIdentity) -> Result<Array, BatchingError> {
-    if data_type.is_token() || data_type.is_zero() {
-        return Err(BatchingError::UnsupportedOperation {
-            message: format!("ragged identity masking cannot build a `{identity:?}` constant of type `{data_type}`"),
-        });
-    }
-    Ok(dispatch_on_array_element_type!(data_type, |Element| {
-        let element = match identity {
-            // Unreachable from `mask_identity_input`, which takes the operand's own zero-like value for this
-            // identity; the arm is kept for match exhaustiveness and stays correct if another caller appears.
-            RaggedMaskIdentity::Zero => <Element as ArrayElement>::from_real(0.0)?,
-            RaggedMaskIdentity::One => <Element as ArrayElement>::from_real(1.0)?,
-            RaggedMaskIdentity::Lowest => <Element as ElementExtremum>::maximum_identity(),
-            RaggedMaskIdentity::Highest => <Element as ElementExtremum>::minimum_identity(),
-        };
-        // `from_real` lands on whatever the element type's own encoding makes of the requested constant, which for a
-        // narrow type need not be that constant at all: `1.0` becomes `-1` in the two-valued `i1` type, whose range
-        // is `{-1, 0}`. Masking live padding with a value that is not the identity would corrupt every prefix it
-        // enters, so the round trip is checked before the constant is handed back.
-        if let RaggedMaskIdentity::Zero | RaggedMaskIdentity::One = identity {
-            let requested = f64::from(u8::from(matches!(identity, RaggedMaskIdentity::One)));
-            if element.convert_to::<f64>()? != requested {
-                return Err(BatchingError::UnsupportedOperation {
-                    message: format!(
-                        "ragged identity masking cannot represent a `{identity:?}` constant in type `{data_type}`"
-                    ),
-                });
-            }
-        }
-        Array::scalar(element)
-    }))
 }
 
 /// Aligns one composite array batch to `axis`, moving an existing mapped axis or dynamically broadcasting a
@@ -9508,18 +9518,53 @@ mod tests {
     }
 
     #[test]
-    fn test_ragged_mask_identity_scalar_rejects_identities_the_element_type_cannot_hold() {
+    fn test_dynamic_array_batching_mask_identity_input_builds_identities_the_element_type_can_hold() {
+        // Stages identity masking of the ragged axis 1 (physical bound 3) of one mapped `[items, 3]` operand whose
+        // element type is `data_type`, returning the trace so the staged identity constant can be inspected.
+        type TraceContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+        let mask = |data_type: DataType, identity: RaggedMaskIdentity| {
+            let trace = TraceContext::new();
+            let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
+            let length = DimensionVariable::new("length", DimensionBounds::new(0, Some(3)).unwrap());
+            let batch_extent = trace.input(DimensionType::new(items.clone()).into());
+            let packed = trace.input(
+                ArrayType::new(data_type, Shape::new(vec![Dimension::Dynamic(items.clone()), Dimension::Static(3)]))
+                    .into(),
+            );
+            let extents =
+                trace.input(ArrayType::new(DataType::I32, Shape::new(vec![Dimension::Dynamic(items)])).into());
+            let context = BatchingContext::<_, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>::with_policy(
+                ProjectedContext::new(trace.clone()),
+                batch_extent,
+            );
+            let input = ArrayBatch::new(packed.into_projected().unwrap(), BatchAxis::new(0))
+                .unwrap()
+                .with_ragged_axes(vec![RaggedAxis::new(1, extents.into_projected().unwrap(), length, vec![0])])
+                .unwrap();
+            let result = DynamicArrayExtentBatchingPolicy::mask_identity_input(&context, &input, &[1], identity);
+            (trace, result)
+        };
+        let staged_constant = |trace: &TraceContext, expected: Array| {
+            trace.builder().borrow().instructions().iter().any(|instruction| {
+                matches!(
+                    instruction.operation(),
+                    ArrayIrOperation::Array(ArrayOperation::Constant(operation)) if operation.value() == &expected,
+                )
+            })
+        };
+
         // A payload-carrying element type produces the element-level identity directly.
-        assert_eq!(
-            ragged_mask_identity_scalar(DataType::F32, RaggedMaskIdentity::Lowest),
-            Ok(Array::scalar(f32::NEG_INFINITY)),
-        );
-        assert_eq!(ragged_mask_identity_scalar(DataType::I8, RaggedMaskIdentity::One), Ok(Array::scalar(1_i8)));
+        let (trace, result) = mask(DataType::F32, RaggedMaskIdentity::Lowest);
+        assert!(result.is_ok());
+        assert!(staged_constant(&trace, Array::scalar(f32::NEG_INFINITY)));
+        let (trace, result) = mask(DataType::I8, RaggedMaskIdentity::One);
+        assert!(result.is_ok());
+        assert!(staged_constant(&trace, Array::scalar(1_i8)));
 
         // The two-valued `i1` type holds only `{-1, 0}`, so converting a one into it lands on `-1` instead. Masking
         // padding with that value would corrupt every prefix it enters, so the conversion is rejected.
         assert!(matches!(
-            ragged_mask_identity_scalar(DataType::I1, RaggedMaskIdentity::One),
+            mask(DataType::I1, RaggedMaskIdentity::One).1,
             Err(BatchingError::UnsupportedOperation { message })
                 if message == "ragged identity masking cannot represent a `One` constant in type `i1`",
         ));
@@ -9527,7 +9572,7 @@ mod tests {
         // The payload-free element types hold no constant of any kind.
         for data_type in [DataType::Token, DataType::Zero] {
             assert!(matches!(
-                ragged_mask_identity_scalar(data_type, RaggedMaskIdentity::Lowest),
+                mask(data_type, RaggedMaskIdentity::Lowest).1,
                 Err(BatchingError::UnsupportedOperation { message })
                     if message
                         == format!("ragged identity masking cannot build a `Lowest` constant of type `{data_type}`"),

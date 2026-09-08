@@ -1,6 +1,6 @@
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
-use std::fmt::{Debug, Display, Formatter};
+use std::fmt::{Debug, Display};
 use std::hash::{Hash, Hasher};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -30,7 +30,7 @@ pub enum MeshAxisType {
 
 impl Display for MeshAxisType {
     #[inline]
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Auto => write!(formatter, "auto"),
             Self::Explicit => write!(formatter, "explicit"),
@@ -187,7 +187,7 @@ impl LogicalMesh {
 
 impl Debug for LogicalMesh {
     #[inline]
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("LogicalMesh")
             .field("axes", &self.axes)
