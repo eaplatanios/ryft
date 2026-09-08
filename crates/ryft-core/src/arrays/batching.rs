@@ -2627,7 +2627,114 @@ impl<C: Context<Type = ArrayIrType>> BatchingPolicy<C> for ArrayIrBatchingPolicy
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
+impl<C: Context<Type = ArrayIrType>> BatchingPolicyProjection<C, ArrayType> for ArrayIrBatchingPolicy
+where
+    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Operation: OperationProjection<ArrayType>,
+    ProjectedContext<C, ArrayType>: Context<
+            Type = ArrayType,
+            Value = <C::Value as ValueProjection<ArrayType>>::Projected,
+            Constant = <C::Constant as ValueProjection<ArrayType>>::Projected,
+            Operation = <C::Operation as OperationProjection<ArrayType>>::Projected,
+        >,
+{
+    type Projected = ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>;
+
+    fn project_batch(
+        batch: &Self::Batch,
+    ) -> Result<<Self::Projected as BatchingPolicy<ProjectedContext<C, ArrayType>>>::Batch, BatchingError> {
+        let value = C::Value::into_projected(batch.value().clone())?;
+        let ragged_axes = batch
+            .ragged_axes()
+            .iter()
+            .cloned()
+            .map(|ragged_axis| -> Result<_, BatchingError> {
+                Ok(RaggedAxis::new(
+                    ragged_axis.axis(),
+                    C::Value::into_projected(ragged_axis.extents)?,
+                    ragged_axis.dimension,
+                    ragged_axis.extent_axes,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        ArrayBatch::new(value, batch.batch_axis())?.with_ragged_axes(ragged_axes)
+    }
+
+    fn lift_batch(
+        batch: &<Self::Projected as BatchingPolicy<ProjectedContext<C, ArrayType>>>::Batch,
+    ) -> Result<Self::Batch, BatchingError> {
+        let ragged_axes = batch
+            .ragged_axes()
+            .iter()
+            .cloned()
+            .map(|ragged_axis| {
+                RaggedAxis::new(
+                    ragged_axis.axis,
+                    C::Value::from_projected(ragged_axis.extents),
+                    ragged_axis.dimension,
+                    ragged_axis.extent_axes,
+                )
+            })
+            .collect();
+        ArrayIrBatch::new(C::Value::from_projected(batch.value().clone()), batch.batch_axis())?
+            .with_ragged_axes(ragged_axes)
+    }
+}
+
+impl<C: Context<Type = ArrayIrType>> BatchingPolicyProjection<C, DimensionType> for ArrayIrBatchingPolicy
+where
+    C::Constant: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
+    C::Value: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
+    C::Operation: OperationProjection<DimensionType>,
+{
+    type Projected = ReplicatedDimensionBatchingPolicy;
+}
+
+impl<C: Context<Type = ArrayIrType>, T: Type> ValueProjection<T> for BatchingTracer<C, ArrayIrBatchingPolicy>
+where
+    C::Value: ValueProjection<T, Projected: Value<Type = T>>
+        + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Constant:
+        ValueProjection<ArrayType, Projected: Value<Type = ArrayType>> + ValueProjection<T, Projected: Value<Type = T>>,
+    C::Operation: BatchableOperation<C, ArrayIrBatchingPolicy>
+        + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayIrBatchingPolicy>
+        + From<DynamicBroadcastOperation>
+        + From<ConstantOperation<DimensionValue>>
+        + From<DimensionSizeOperation>
+        + OperationProjection<T>
+        + OperationProjection<ArrayType, Projected: From<TransposeOperation>>,
+    for<'t> &'t T: TryFrom<&'t ArrayIrType, Error = TypeError>,
+    ArrayIrBatchingPolicy: BatchingPolicyProjection<C, T>,
+{
+    type Projected = ProjectedValue<T, Self>;
+    type ProjectedRef<'v>
+        = ProjectedValue<T, &'v Self>
+    where
+        Self: 'v,
+        T: 'v;
+
+    #[inline]
+    fn from_projected(value: Self::Projected) -> Self {
+        value.into_value()
+    }
+
+    #[inline]
+    fn projected<'v>(&'v self) -> Result<Self::ProjectedRef<'v>, TypeError>
+    where
+        T: 'v,
+    {
+        let unbatched_type = <ArrayIrBatchingPolicy as BatchingPolicy<C>>::unbatched_type(self.batch());
+        Ok(ProjectedValue::new(self, <&T>::try_from(unbatched_type.as_ref())?.clone()))
+    }
+
+    #[inline]
+    fn into_projected(self) -> Result<Self::Projected, TypeError> {
+        let unbatched_type = <ArrayIrBatchingPolicy as BatchingPolicy<C>>::unbatched_type(self.batch());
+        let r#type = <&T>::try_from(unbatched_type.as_ref())?.clone();
+        Ok(ProjectedValue::new(self, r#type))
+    }
+}
 
 impl<V, O> Program<V, O, Vec<V>, Vec<V>>
 where
@@ -2645,18 +2752,18 @@ where
     /// extent as a leading runtime dimension input instead of specializing on a static size.
     ///
     /// This is the composite counterpart of the homogeneous [`ArrayType`] `Program::batched` entry point: the mapped
-    /// extent is a first-class [`DimensionType`] value supplied at invocation time, so the transformed program
-    /// carries [`ArrayIrBatchingPolicy`]'s leading mapped-extent input and forwarded output, while its
+    /// extent is a first-class [`DimensionType`] value supplied at invocation time, so the transformed program carries
+    /// [`ArrayIrBatchingPolicy`]'s leading mapped-extent input and forwarded output, while its
     /// [`BatchedProgram::output_axes`] continue to describe only the source program's public outputs. The new batch
     /// axis is unnamed, mirroring the homogeneous entry, whose public batching contract has no named-axis parameter.
     ///
-    /// Reference inputs batch like any other input: a reference input declared mapped at axis `k` becomes
-    /// `ref<T with the batch extent inserted at k>`, and every operation on it reads and writes per-item values at that
-    /// axis, while a reference input declared replicated stays one shared holder for the whole batch and rejects any
-    /// write of a batched value (pass the reference as a batched input instead). Local allocations always produce
-    /// batched references, so a program that allocates, mutates, reads, and freezes its own state batches exactly like
-    /// its discharged counterpart. A reference-typed output carries the batch axis of the root it forwards and cannot
-    /// be realigned by `output_axes_policy`. Captured references are unbatched: they arrive replicated. Discharging
+    /// Reference inputs batch like any other input: a reference input declared mapped at axis `k` becomes `ref<T with
+    /// the batch extent inserted at k>`, and every operation on it reads and writes per-item values at that axis, while
+    /// a reference input declared replicated stays one shared holder for the whole batch and rejects any write of a
+    /// batched value (pass the reference as a batched input instead). Local allocations always produce batched
+    /// references, so a program that allocates, mutates, reads, and freezes its own state batches exactly like its
+    /// discharged counterpart. A reference-typed output carries the batch axis of the root it forwards and cannot be
+    /// realigned by `output_axes_policy`. Captured references are unbatched and arrive replicated. Discharging
     /// references through [`Program::discharge_references`] first remains valid and yields the same batched semantics
     /// over ordinary arrays.
     ///
@@ -2668,13 +2775,13 @@ where
     ///   - `output_axes_policy`: Policy controlling the transformed public output axes.
     pub fn batched_with_threaded_extent(
         &self,
-        axis_extent_type: DimensionType,
+        axis_type: DimensionType,
         axis_sharding: ShardingDimension,
         input_batch_axes: &[BatchAxis],
         output_axes_policy: ProgramBatchingOutputAxesPolicy,
     ) -> Result<ThreadedExtentBatchedProgram<V, O>, BatchingError> {
         let context = TracingContext::<V, O>::new();
-        let axis_extent = context.input(axis_extent_type.into());
+        let axis_extent = context.input(axis_type.into());
         let context =
             BatchingContext::<_, ArrayIrBatchingPolicy>::new(context, axis_extent).with_axis_sharding(axis_sharding);
         <ArrayIrBatchingPolicy as RecursiveBatchingPolicy<TracingContext<V, O>>>::batch_program(
@@ -2688,11 +2795,11 @@ where
 
 /// [`ArrayExtentBatchingPolicy`] used while a homogeneous array rule runs inside an array IR batching transform.
 ///
-/// When composite batching reaches an array-member operation, it projects the operation and its batches into the
+/// When composite batching reaches an array member operation, it projects the operation and its batches into the
 /// zero-state [`ProjectedContext`] over [`ArrayType`] and reuses the homogeneous rule unchanged: batches remain
-/// ordinary [`ArrayBatch`]es, so the rule cannot tell it is running inside a composite program. What does change is
-/// extent representation — the mapped-axis extent is the outer composite context's first-class dimension value rather
-/// than a static host `usize`, so a dynamic batch extent stays an ordinary SSA operand edge.
+/// ordinary [`ArrayBatch`]es, and so the rule cannot tell it is running inside a composite program. What does change is
+/// extent representation. The mapped-axis extent is the outer composite context's first-class dimension value rather
+/// than a static host `usize`, and so a dynamic batch extent remains an ordinary Single Static Assignment (SSA) value.
 ///
 /// This [`ArrayExtentBatchingPolicy`] implementation is correspondingly the only place that translates a homogeneous
 /// rule's extent and move-or-broadcast requests into mixed array IR operations: static per-item dimensions become exact
@@ -2705,8 +2812,8 @@ pub struct DynamicArrayExtentBatchingPolicy;
 
 impl<C: Context<Type = ArrayIrType>> BatchingPolicy<ProjectedContext<C, ArrayType>> for DynamicArrayExtentBatchingPolicy
 where
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: OperationProjection<ArrayType>,
 {
     type Batch = ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>;
@@ -2791,13 +2898,13 @@ where
     }
 }
 
-/// Batching policy used while a homogeneous first-class-dimension operation runs inside an array IR batching
-/// transform. A dimension is shared shape metadata, so its projected value is itself the complete batch carrier:
-/// replicated inputs pass through unchanged, while any mapped input is rejected because a different extent per batch
-/// item would require a ragged array representation. The policy still carries the outer transform's first-class
-/// mapped extent and ragged-dimension evidence representation so
+/// [`BatchingPolicy`] used while a homogeneous first-class-dimension operation runs inside an array IR batching
+/// transform. A dimension is shared shape metadata and so its projected value is itself the complete batch carrier.
+/// Replicated inputs pass through unchanged, while any mapped input is rejected because a different extent per batch
+/// item would require a ragged array representation. The policy still carries the outer transform's first-class mapped
+/// extent and ragged-dimension evidence representation and so
 /// [`batch_projected_operation`](crate::batch_projected_operation) can construct one uniform projected batching context
-/// for every member kind without specializing either. A dimension rule never consumes a ragged dimension, so its
+/// for every member kind without specializing either. A dimension rule never consumes a ragged dimension, and so its
 /// evidence is always empty.
 #[derive(Copy, Clone, Debug, Default)]
 pub struct ReplicatedDimensionBatchingPolicy;
@@ -2805,8 +2912,8 @@ pub struct ReplicatedDimensionBatchingPolicy;
 impl<C: Context<Type = ArrayIrType>> BatchingPolicy<ProjectedContext<C, DimensionType>>
     for ReplicatedDimensionBatchingPolicy
 where
-    C::Constant: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
     C::Value: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
+    C::Constant: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
     C::Operation: OperationProjection<DimensionType>,
 {
     type Batch = <C::Value as ValueProjection<DimensionType>>::Projected;
@@ -2817,6 +2924,7 @@ where
         <C::Operation as OperationProjection<DimensionType>>::Projected,
     >;
 
+    #[inline]
     fn batch(
         value: <C::Value as ValueProjection<DimensionType>>::Projected,
         batch_axis: BatchAxis,
@@ -2896,116 +3004,7 @@ where
     }
 }
 
-impl<C: Context<Type = ArrayIrType>> BatchingPolicyProjection<C, ArrayType> for ArrayIrBatchingPolicy
-where
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Operation: OperationProjection<ArrayType>,
-    ProjectedContext<C, ArrayType>: Context<
-            Type = ArrayType,
-            Value = <C::Value as ValueProjection<ArrayType>>::Projected,
-            Constant = <C::Constant as ValueProjection<ArrayType>>::Projected,
-            Operation = <C::Operation as OperationProjection<ArrayType>>::Projected,
-        >,
-{
-    type Projected = ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>;
-
-    fn project_batch(
-        batch: &Self::Batch,
-    ) -> Result<<Self::Projected as BatchingPolicy<ProjectedContext<C, ArrayType>>>::Batch, BatchingError> {
-        let value = C::Value::into_projected(batch.value().clone())?;
-        let ragged_axes = batch
-            .ragged_axes()
-            .iter()
-            .cloned()
-            .map(|ragged_axis| -> Result<_, BatchingError> {
-                Ok(RaggedAxis::new(
-                    ragged_axis.axis(),
-                    C::Value::into_projected(ragged_axis.extents)?,
-                    ragged_axis.dimension,
-                    ragged_axis.extent_axes,
-                ))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        ArrayBatch::new(value, batch.batch_axis())?.with_ragged_axes(ragged_axes)
-    }
-
-    fn lift_batch(
-        batch: &<Self::Projected as BatchingPolicy<ProjectedContext<C, ArrayType>>>::Batch,
-    ) -> Result<Self::Batch, BatchingError> {
-        let ragged_axes = batch
-            .ragged_axes()
-            .iter()
-            .cloned()
-            .map(|ragged_axis| {
-                RaggedAxis::new(
-                    ragged_axis.axis,
-                    C::Value::from_projected(ragged_axis.extents),
-                    ragged_axis.dimension,
-                    ragged_axis.extent_axes,
-                )
-            })
-            .collect();
-        ArrayIrBatch::new(C::Value::from_projected(batch.value().clone()), batch.batch_axis())?
-            .with_ragged_axes(ragged_axes)
-    }
-}
-
-impl<C: Context<Type = ArrayIrType>> BatchingPolicyProjection<C, DimensionType> for ArrayIrBatchingPolicy
-where
-    C::Constant: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
-    C::Value: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
-    C::Operation: OperationProjection<DimensionType>,
-{
-    type Projected = ReplicatedDimensionBatchingPolicy;
-}
-
-impl<C, T> ValueProjection<T> for BatchingTracer<C, ArrayIrBatchingPolicy>
-where
-    C: Context<Type = ArrayIrType, Operation: BatchableOperation<C, ArrayIrBatchingPolicy>>,
-    ArrayIrBatchingPolicy: BatchingPolicyProjection<C, T>,
-    C::Constant:
-        ValueProjection<ArrayType, Projected: Value<Type = ArrayType>> + ValueProjection<T, Projected: Value<Type = T>>,
-    C::Value: ValueProjection<T, Projected: Value<Type = T>>
-        + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
-    C::Operation: BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayIrBatchingPolicy>
-        + From<DynamicBroadcastOperation>
-        + From<ConstantOperation<DimensionValue>>
-        + From<DimensionSizeOperation>
-        + OperationProjection<ArrayType>
-        + OperationProjection<T>,
-    <C::Operation as OperationProjection<ArrayType>>::Projected: From<TransposeOperation>,
-    T: Type,
-    for<'t> &'t T: TryFrom<&'t ArrayIrType, Error = TypeError>,
-{
-    type Projected = ProjectedValue<T, Self>;
-    type ProjectedRef<'v>
-        = ProjectedValue<T, &'v Self>
-    where
-        Self: 'v,
-        T: 'v;
-
-    #[inline]
-    fn from_projected(value: Self::Projected) -> Self {
-        value.into_value()
-    }
-
-    #[inline]
-    fn projected<'v>(&'v self) -> Result<Self::ProjectedRef<'v>, TypeError>
-    where
-        T: 'v,
-    {
-        let unbatched_type = <ArrayIrBatchingPolicy as BatchingPolicy<C>>::unbatched_type(self.batch());
-        Ok(ProjectedValue::new(self, <&T>::try_from(unbatched_type.as_ref())?.clone()))
-    }
-
-    #[inline]
-    fn into_projected(self) -> Result<Self::Projected, TypeError> {
-        let unbatched_type = <ArrayIrBatchingPolicy as BatchingPolicy<C>>::unbatched_type(self.batch());
-        let r#type = <&T>::try_from(unbatched_type.as_ref())?.clone();
-        Ok(ProjectedValue::new(self, r#type))
-    }
-}
+// TODO(eaplatanios): Review from here onwards.
 
 /// Reads one packed array axis as a first-class dimension value in `context`.
 pub(crate) fn array_dimension<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>>(
