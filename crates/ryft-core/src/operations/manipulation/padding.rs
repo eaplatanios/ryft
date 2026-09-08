@@ -1,7 +1,6 @@
 use std::fmt::Display;
 use std::marker::PhantomData;
 
-use crate::arrays::batching::array_dimension;
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
     ArrayType, DataType, Dimension, DimensionBounds, DimensionOperation, DimensionType, DimensionValue,
@@ -30,7 +29,7 @@ use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_add::DimensionAddOperation;
 use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
 use crate::operations::dimensions::dimension_saturating_sub::DimensionSaturatingSubOperation;
-use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
+use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::slicing::{DynamicShapeSliceOperation, SliceOperation};
 use crate::operations::manipulation::transposition::Transpose;
@@ -451,7 +450,7 @@ impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy
 where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
-    C::Value: ValueProjection<ArrayType, Projected: Broadcast + Transpose + Value<Type = ArrayType>>,
+    C::Value: DimensionSize + ValueProjection<ArrayType, Projected: Broadcast + Transpose + Value<Type = ArrayType>>,
     C::Operation: From<DynamicBroadcastOperation>
         + From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>
@@ -563,7 +562,7 @@ where
                     if axis == batch_axis {
                         Ok(context.axis_extent().clone())
                     } else {
-                        array_dimension(context.parent(), &operand, axis)
+                        Ok(operand.dimension_size(axis)?)
                     }
                 })
             })

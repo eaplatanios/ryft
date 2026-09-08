@@ -22,7 +22,7 @@ use crate::operations::constants::fill::Fill;
 use crate::operations::constants::iota::Iota;
 use crate::operations::control_flow::select::Select;
 use crate::operations::dimensions::dimension_mul::DimensionMulOperation;
-use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
+use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::dot::{Dot, DotDimensionNumbers};
 use crate::operations::logical::and::And;
 use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcastOperation};

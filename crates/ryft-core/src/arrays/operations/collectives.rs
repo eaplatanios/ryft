@@ -896,13 +896,14 @@ mod tests {
         )
         .unwrap();
 
-        let [dimension_size, multiplied_extent, all_gather] = program.instructions() else {
-            panic!("expected dimension observation, multiplication, and all-gather");
+        let [dimension_size, axis_size, multiplied_extent, all_gather] = program.instructions() else {
+            panic!("expected dimension observation, axis-size constant, multiplication, and all-gather");
         };
         assert!(matches!(dimension_size.operation(), ArrayIrOperation::DimensionSize(_)));
+        assert!(matches!(axis_size.operation(), ArrayIrOperation::Dimension(DimensionOperation::Constant(_))));
         assert!(matches!(multiplied_extent.operation(), ArrayIrOperation::Dimension(DimensionOperation::Mul(_)),));
         assert!(matches!(all_gather.operation(), ArrayIrOperation::AllGather(_)));
-        assert_eq!(multiplied_extent.inputs()[0], dimension_size.outputs()[0]);
+        assert_eq!(multiplied_extent.inputs(), &[dimension_size.outputs()[0], axis_size.outputs()[0]]);
         assert_eq!(all_gather.inputs(), &[program.input_ids()[0], multiplied_extent.outputs()[0]]);
         let rendered = program.to_string();
         assert!(rendered.contains("dimension_size"));
@@ -920,7 +921,7 @@ mod tests {
         let mut destination = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let imported_input = destination.add_input(target_type.into());
         let imported_outputs = destination.splice_program(&instantiated, &[imported_input]).unwrap();
-        let [imported_dimension_size, imported_multiplied_extent, imported_all_gather] = destination.instructions()
+        let [imported_dimension_size, _, imported_multiplied_extent, imported_all_gather] = destination.instructions()
         else {
             panic!("expected the imported explicit collective graph");
         };
@@ -942,11 +943,13 @@ mod tests {
         )
         .unwrap();
 
-        let [dimension_size, requirement, parallel_sum_scatter] = program.instructions() else {
-            panic!("expected dimension observation, equality requirement, and sum-scatter");
+        let [dimension_size, axis_size, requirement, parallel_sum_scatter] = program.instructions() else {
+            panic!("expected dimension observation, axis-size constant, equality requirement, and sum-scatter");
         };
         assert!(matches!(dimension_size.operation(), ArrayIrOperation::DimensionSize(_)));
+        assert!(matches!(axis_size.operation(), ArrayIrOperation::Dimension(DimensionOperation::Constant(_))));
         assert!(matches!(requirement.operation(), ArrayIrOperation::Dimension(DimensionOperation::Requirement(_)),));
+        assert_eq!(requirement.inputs(), &[dimension_size.outputs()[0], axis_size.outputs()[0]]);
         assert!(matches!(parallel_sum_scatter.operation(), ArrayIrOperation::ParallelSumScatter(_)));
         assert_eq!(requirement.inputs()[0], dimension_size.outputs()[0]);
         assert_eq!(parallel_sum_scatter.inputs(), &[program.input_ids()[0]]);

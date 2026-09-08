@@ -10,7 +10,6 @@ use std::fmt::Display;
 
 use ryft_macros::Parameter;
 
-use crate::arrays::batching::array_dimension;
 use crate::arrays::{
     ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, DimensionType, DimensionValue, DimensionVariable,
 };
@@ -22,6 +21,7 @@ use crate::macros::{
     check_count, impl_non_differentiable_operation, impl_non_transposable_operation,
     impl_reference_dischargeable_operation,
 };
+use crate::operations::dimensions::dimension_size::DimensionSize;
 use crate::operations::{
     ConstantOperation, DimensionSizeOperation, DimensionToScalarOperation, DynamicBroadcastOperation, ScanOperation,
     TransposeOperation,
@@ -144,7 +144,8 @@ impl<C> BatchableOperation<C, ArrayIrBatchingPolicy> for DimensionFromScalarOper
 where
     C: Context<Type = ArrayIrType>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value: ValueProjection<ArrayType, Projected: crate::operations::Transpose + Value<Type = ArrayType>>,
+    C::Value:
+        DimensionSize + ValueProjection<ArrayType, Projected: crate::operations::Transpose + Value<Type = ArrayType>>,
     C::Operation: From<DimensionFromScalarOperation>
         + From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>
@@ -177,7 +178,7 @@ where
         }
 
         let input = driver.align_batch_axis(context, input.clone(), Axis::from(0))?;
-        let scan_extent = array_dimension(context.parent(), input.value(), 0)?;
+        let scan_extent = input.value().dimension_size(0)?;
         let scan_extent_type = scan_extent.r#type();
         let length = <&DimensionType>::try_from(scan_extent_type.as_ref())?.to_dimension();
         let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();

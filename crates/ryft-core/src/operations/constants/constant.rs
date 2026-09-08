@@ -241,7 +241,7 @@ mod tests {
     use crate::interpretation::InterpretableOperation;
     use crate::macros::{check_operation_batching, check_operation_partial_evaluation};
     use crate::parameters::Placeholder;
-    use crate::programs::{Atom, AtomId, EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder};
+    use crate::programs::{Atom, AtomId, EmptyRegionDriver, MaybeZero, Operation, ProgramBuilder, Typed};
     use crate::tracing::{DomainTracingContext, TracingContext};
 
     use super::*;
@@ -357,29 +357,31 @@ mod tests {
 
     #[test]
     fn test_dimension_constant() {
+        // Dimension variables carry a distinct identity per construction, so the literals are compared by extent.
+        let dimension_extent = |value: ArrayIrValue<Array>| match value {
+            ArrayIrValue::Dimension(dimension) => (dimension.extent(), dimension.r#type().extent()),
+            value => panic!("expected a dimension value but got {value}"),
+        };
+
         // Eager contexts materialize the literal directly, both in the full array IR operation family and in the
         // minimal family that backs the eager dispatch domain of `ArrayIrValue`, whose only operation is a constant.
-        let expected = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
-        assert_eq!(
-            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new().dimension_constant(3),
-            Ok(expected.clone())
-        );
-        assert_eq!(EagerContext::<ArrayIrValue<Array>>::new().dimension_constant(3), Ok(expected));
+        let full = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new().dimension_constant(3).unwrap();
+        assert_eq!(dimension_extent(full), (3, Some(3)));
+        let minimal = EagerContext::<ArrayIrValue<Array>>::new().dimension_constant(3).unwrap();
+        assert_eq!(dimension_extent(minimal), (3, Some(3)));
 
         // The capability is not tied to the array IR family: a pure dimension program materializes the same literal.
-        assert_eq!(
-            EagerContext::<DimensionValue, DimensionOperation<DimensionValue>>::new().dimension_constant(2),
-            Ok(DimensionValue::constant(2).unwrap()),
-        );
+        let dimension = EagerContext::<DimensionValue, DimensionOperation<DimensionValue>>::new().dimension_constant(2);
+        assert_eq!(dimension.map(|dimension| dimension.extent()), Ok(2));
 
         // Staging records the literal as a `constant` instruction with an exact dimension type, never as a program
         // constant atom.
         let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
         let output = context.dimension_constant(3).unwrap();
-        assert_eq!(
-            output.r#type().as_ref(),
-            &ArrayIrType::Dimension(DimensionValue::constant(3).unwrap().r#type().into_owned())
-        );
+        let ArrayIrType::Dimension(output_type) = output.r#type().into_owned() else {
+            panic!("expected a dimension type");
+        };
+        assert_eq!(output_type.extent(), Some(3));
         let builder = context.builder().borrow();
         let [instruction] = builder.instructions() else {
             panic!("expected exactly one staged instruction");

@@ -28,7 +28,7 @@ use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::control_flow::select::{Select, SelectOperation};
 use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
-use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
+use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
 use crate::operations::manipulation::broadcasting::{
     Broadcast, BroadcastOperation, DynamicBroadcast, DynamicBroadcastOperation,
 };
@@ -494,7 +494,8 @@ where
                            + OperationProjection<ArrayType>,
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value: DynamicBroadcast
+    C::Value: DimensionSize
+        + DynamicBroadcast
         + ValueProjection<ArrayType, Projected: Broadcast + Select + Transpose + Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected: DimensionRequirement>,
     <C::Operation as OperationProjection<ArrayType>>::Projected:

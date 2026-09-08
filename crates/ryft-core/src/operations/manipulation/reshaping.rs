@@ -1599,13 +1599,23 @@ mod tests {
             .trim_end(),
         );
 
-        // A static identity reshape observes none of its extent operands and therefore stages no instruction.
+        // A static identity reshape is elided, so the only staged instruction is the dimension literal it received and
+        // never observed. Simplification drops that literal along with any other unused instruction.
         let (_, program) = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::trace(
             |input| input.dynamic_reshape_to_sizes(&[6]),
             ArrayIrType::Array(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(6)]))),
         )
         .unwrap();
-        assert!(program.instructions().is_empty());
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda %0:f64[6] .
+                let %1:dimension<6> = constant [value=6]
+                in (%0)
+            "}
+            .trim_end(),
+        );
+        assert!(program.into_simplified().unwrap().instructions().is_empty());
     }
 
     #[test]

@@ -36,9 +36,9 @@ use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count, dispatch_on_array_element_type};
 use crate::operations::{
     AndOperation, Broadcast, BroadcastOperation, CompareOperation, ComparisonDirection, ConstantOperation,
-    DimensionConstant, DimensionRequirement, DimensionSizeOperation, DynamicBroadcast, DynamicBroadcastOperation,
-    ElementwiseOperation, IotaOperation, ReductionKind, SelectOperation, Transpose, TransposeOperation,
-    ZeroLikeOperation,
+    DimensionConstant, DimensionRequirement, DimensionSize, DimensionSizeOperation, DynamicBroadcast,
+    DynamicBroadcastOperation, ElementwiseOperation, IotaOperation, ReductionKind, SelectOperation, Transpose,
+    TransposeOperation, ZeroLikeOperation,
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
@@ -2709,7 +2709,8 @@ where
 
 impl<C: Context<Type = ArrayIrType>, T: Type> ValueProjection<T> for BatchingTracer<C, ArrayIrBatchingPolicy>
 where
-    C::Value: DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Value:
+        DimensionSize + DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected = DimensionValue>,
     C::Operation: BatchableOperation<C, ArrayIrBatchingPolicy>
@@ -2916,7 +2917,8 @@ where
 impl<C: Context<Type = ArrayIrType>> ArrayExtentBatchingPolicy<ProjectedContext<C, ArrayType>>
     for DynamicArrayExtentBatchingPolicy
 where
-    C::Value: DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Value:
+        DimensionSize + DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation:
         From<ConstantOperation<DimensionValue>> + From<DimensionSizeOperation> + OperationProjection<ArrayType>,
@@ -2999,7 +3001,7 @@ where
                     DimensionSource::Static(extent) => Ok(outer_context.dimension_constant(extent)?),
                     DimensionSource::Value { source, axis } => {
                         let source = <C::Value as ValueProjection<ArrayType>>::from_projected(source);
-                        array_dimension(outer_context, &source, axis)
+                        Ok(source.dimension_size(axis)?)
                     }
                     DimensionSource::BatchExtent => Ok(context.axis_extent().clone()),
                 }
@@ -3029,7 +3031,8 @@ where
 impl<C: Context<Type = ArrayIrType>> RaggedArrayExtentBatchingPolicy<ProjectedContext<C, ArrayType>>
     for DynamicArrayExtentBatchingPolicy
 where
-    C::Value: DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Value:
+        DimensionSize + DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Operation: From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>
@@ -3373,31 +3376,19 @@ where
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Reads one packed array axis as a first-class dimension value in `context`.
-pub(crate) fn array_dimension<C: Context<Type = ArrayIrType, Operation: From<DimensionSizeOperation>>>(
-    context: &C,
-    value: &C::Value,
-    axis: usize,
-) -> Result<C::Value, BatchingError> {
-    let value_type = value.r#type();
-    let array_type = <&ArrayType>::try_from(value_type.as_ref())?;
-    let operation = DimensionSizeOperation::new(array_type, axis)?;
-    Ok(context.bind(operation, Vec::new(), std::slice::from_ref(value))?.remove(0))
-}
-
 /// Returns one packed array axis as a first-class dimension value, staging an exact constant when the axis extent is
 /// statically known and reading the axis through [`array_dimension`] only when it is genuinely dynamic. Folding the
 /// static axes keeps staged programs free of `dimension_size` reads whose results the type system already knows.
 pub(crate) fn folded_array_dimension<C>(context: &C, value: &C::Value, axis: usize) -> Result<C::Value, BatchingError>
 where
-    C: Context<Type = ArrayIrType>,
-    C::Operation: From<ConstantOperation<DimensionValue>> + From<DimensionSizeOperation>,
+    C: Context<Type = ArrayIrType> + DimensionConstant,
+    C::Value: DimensionSize,
 {
     let value_type = value.r#type();
     let array_type = <&ArrayType>::try_from(value_type.as_ref())?;
     match array_type.shape().dimensions().get(axis) {
         Some(Dimension::Static(extent)) => Ok(context.dimension_constant(*extent)?),
-        _ => array_dimension(context, value, axis),
+        _ => Ok(value.dimension_size(axis)?),
     }
 }
 
@@ -3414,7 +3405,8 @@ where
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected = DimensionValue>,
-    C::Value: DynamicBroadcast
+    C::Value: DimensionSize
+        + DynamicBroadcast
         + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected: DimensionRequirement>,
 {
@@ -3487,7 +3479,7 @@ where
                     }
                 },
                 // A mapped array's extent is read from its packed batch axis.
-                _ => array_dimension(context, &batch.value, position)?,
+                _ => batch.value.dimension_size(position)?,
             };
             if let Some(axis_extent) = &axis_extent {
                 // Binding the requirement through the dimension member, rather than comparing on the host, lets
@@ -3623,7 +3615,8 @@ where
 impl<C> RecursiveBatchingPolicy<C> for ArrayIrBatchingPolicy
 where
     C: Context<Type = ArrayIrType>,
-    C::Value: DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Value:
+        DimensionSize + DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected = DimensionValue>,
     C::Operation: BatchableOperation<C, ArrayIrBatchingPolicy>
@@ -3973,8 +3966,8 @@ where
 fn broadcast_replicated_array<
     C: Context<
             Type = ArrayIrType,
-            Value: DynamicBroadcast,
-            Operation: From<ConstantOperation<DimensionValue>> + From<DimensionSizeOperation>,
+            Value: DimensionSize + DynamicBroadcast,
+            Operation: From<ConstantOperation<DimensionValue>>,
         >,
 >(
     context: &C,
