@@ -212,7 +212,7 @@ pub mod one_like;
 pub mod zero;
 pub mod zero_like;
 
-pub use constant::{CONSTANT_OPERATION_NAME, Constant, ConstantOperation};
+pub use constant::{CONSTANT_OPERATION_NAME, Constant, ConstantOperation, DimensionConstant};
 pub use fill::Fill;
 pub use iota::{IOTA_OPERATION_NAME, Iota, IotaOperation};
 pub use one::{ONE_OPERATION_NAME, One, OneOperation};

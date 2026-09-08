@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use ryft_macros::Parameterized;
 
-use crate::arrays::batching::{DynamicArrayExtentBatchingPolicy, dimension_constant, folded_array_dimension};
+use crate::arrays::batching::{DynamicArrayExtentBatchingPolicy, folded_array_dimension};
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayType, DataType, Dimension,
     DimensionType, DimensionValue, Shape, Sharding, StaticArrayExtentBatchingPolicy,
@@ -17,6 +17,7 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::compare::{Compare, ComparisonDirection};
 use crate::operations::constants::constant::ConstantOperation;
+use crate::operations::constants::constant::DimensionConstant;
 use crate::operations::constants::fill::Fill;
 use crate::operations::constants::iota::Iota;
 use crate::operations::control_flow::select::Select;

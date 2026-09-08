@@ -4,7 +4,7 @@ use std::fmt::{Debug, Display};
 
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayIrValue, ArrayType, DataType,
-    DimensionType, DimensionValue,
+    DimensionType,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -17,6 +17,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
+use crate::operations::constants::constant::DimensionConstant;
 use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
 use crate::operations::dimensions::dimension_size::DimensionSize;
 use crate::operations::dot::{Dot, DotDimensionNumbers, dot_abstract, lift_dot_dimensions};

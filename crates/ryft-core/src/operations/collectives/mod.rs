@@ -30,7 +30,7 @@ use crate::differentiation::{
     DifferentiableType, DifferentiationContext, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
 };
 use crate::macros::check_count;
-use crate::operations::constants::constant::ConstantOperation;
+use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
@@ -913,10 +913,9 @@ pub(super) use impl_shape_changing_collective_member_operation;
 pub(super) fn collective_extent_constant<V>(context: &V::DispatchDomain, extent: usize) -> Result<V, ProgramError>
 where
     V: Value<Type = ArrayIrType>,
-    V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+    V::DispatchDomain: DimensionConstant<Value = V>,
 {
-    context.lift(DimensionValue::constant(extent)?.into())
+    context.dimension_constant(extent)
 }
 
 /// Returns one first-class dimension for every input array axis, using exact constants for static axes and explicit
@@ -925,7 +924,7 @@ pub(super) fn collective_input_extents<V>(context: &V::DispatchDomain, value: &V
 where
     V: Value<Type = ArrayIrType> + DimensionSize<V>,
     V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+    V::DispatchDomain: DimensionConstant,
 {
     let r#type = value.r#type();
     let input_type = <&ArrayType>::try_from(r#type.as_ref())?;
@@ -950,7 +949,7 @@ pub(super) fn multiplied_collective_extent<V>(
 where
     V: Value<Type = ArrayIrType> + ValueProjection<DimensionType>,
     V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+    V::DispatchDomain: DimensionConstant,
     <V as ValueProjection<DimensionType>>::Projected: Mul,
 {
     let input_extent = <V as ValueProjection<DimensionType>>::into_projected(input_extent.clone())?;
@@ -969,7 +968,7 @@ pub(super) fn divided_collective_extent<V>(
 where
     V: Value<Type = ArrayIrType> + ValueProjection<DimensionType>,
     V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+    V::DispatchDomain: DimensionConstant,
     <V as ValueProjection<DimensionType>>::Projected: DimensionRequirement + Div,
 {
     let input_extent = <V as ValueProjection<DimensionType>>::into_projected(input_extent.clone())?;
@@ -988,7 +987,7 @@ pub(super) fn require_collective_axis_extent<V>(
 where
     V: Value<Type = ArrayIrType> + ValueProjection<DimensionType>,
     V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+    V::DispatchDomain: DimensionConstant,
     <V as ValueProjection<DimensionType>>::Projected: DimensionRequirement,
 {
     let input_extent = <V as ValueProjection<DimensionType>>::into_projected(input_extent.clone())?;
@@ -1006,7 +1005,7 @@ pub(super) fn require_collective_axis_divisible<V>(
 where
     V: Value<Type = ArrayIrType> + ValueProjection<DimensionType>,
     V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+    V::DispatchDomain: DimensionConstant,
     <V as ValueProjection<DimensionType>>::Projected: DimensionRequirement,
 {
     let input_extent = <V as ValueProjection<DimensionType>>::into_projected(input_extent.clone())?;

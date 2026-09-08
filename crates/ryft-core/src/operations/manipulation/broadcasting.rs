@@ -1,6 +1,6 @@
 use std::fmt::Display;
 
-use crate::arrays::batching::{RaggedAxis, dimension_constant};
+use crate::arrays::batching::RaggedAxis;
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
     ArrayType, Dimension, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding, ShardingDimension,
@@ -15,7 +15,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
-use crate::operations::constants::constant::ConstantOperation;
+use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::constants::zero::ZeroOperation;
 use crate::operations::constants::zero_like::ZeroLikeOperation;
 use crate::operations::differentiation::linear_call::LinearCallOperation;
@@ -265,7 +265,7 @@ where
                             ),
                         }
                     })?;
-                lifted_inputs.push(dimension_constant(context.parent(), physical_extent)?);
+                lifted_inputs.push(context.parent().dimension_constant(physical_extent)?);
             } else {
                 lifted_inputs.push(extent.value().clone());
             }
@@ -1038,7 +1038,7 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
     where
         Self: DimensionSize,
         Self::DispatchDomain: Context<Type = ArrayIrType>,
-        <Self::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+        Self::DispatchDomain: DimensionConstant,
     {
         let r#type = self.r#type();
         let input_type = <&ArrayType>::try_from(r#type.as_ref())?;
@@ -1046,7 +1046,7 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
         output_dimensions.extend_from_slice(leading_dimensions);
         for (axis, dimension) in input_type.shape().dimensions().iter().enumerate() {
             output_dimensions.push(match dimension {
-                Dimension::Static(extent) => self.dispatch_domain().lift(DimensionValue::constant(*extent)?.into())?,
+                Dimension::Static(extent) => self.dispatch_domain().dimension_constant(*extent)?,
                 Dimension::Dynamic(_) => self.dimension_size(axis)?,
             });
         }
@@ -1058,11 +1058,11 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
     fn dynamic_broadcast_to_sizes(&self, output_sizes: &[usize]) -> Result<Self, ProgramError>
     where
         Self::DispatchDomain: Context<Type = ArrayIrType>,
-        <Self::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+        Self::DispatchDomain: DimensionConstant,
     {
         let output_dimensions = output_sizes
             .iter()
-            .map(|extent| self.dispatch_domain().lift(DimensionValue::constant(*extent)?.into()))
+            .map(|extent| self.dispatch_domain().dimension_constant(*extent))
             .collect::<Result<Vec<_>, _>>()?;
         self.dynamic_broadcast_to(output_dimensions.as_slice())
     }
@@ -1072,12 +1072,12 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
     where
         Self: DimensionSize,
         Self::DispatchDomain: Context<Type = ArrayIrType>,
-        <Self::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+        Self::DispatchDomain: DimensionConstant,
     {
         let context = self.dispatch_domain();
         let leading_dimensions = leading_sizes
             .iter()
-            .map(|extent| context.lift(DimensionValue::constant(*extent)?.into()))
+            .map(|extent| context.dimension_constant(*extent))
             .collect::<Result<Vec<_>, _>>()?;
         self.dynamic_broadcast_leading(leading_dimensions.as_slice())
     }

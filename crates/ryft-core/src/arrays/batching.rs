@@ -36,8 +36,9 @@ use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count, dispatch_on_array_element_type};
 use crate::operations::{
     AndOperation, Broadcast, BroadcastOperation, CompareOperation, ComparisonDirection, ConstantOperation,
-    DimensionRequirement, DimensionSizeOperation, DynamicBroadcast, DynamicBroadcastOperation, ElementwiseOperation,
-    IotaOperation, ReductionKind, SelectOperation, Transpose, TransposeOperation, ZeroLikeOperation,
+    DimensionConstant, DimensionRequirement, DimensionSizeOperation, DynamicBroadcast, DynamicBroadcastOperation,
+    ElementwiseOperation, IotaOperation, ReductionKind, SelectOperation, Transpose, TransposeOperation,
+    ZeroLikeOperation,
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
@@ -2995,7 +2996,7 @@ where
             .into_iter()
             .map(|dimension_source| -> Result<C::Value, BatchingError> {
                 match dimension_source {
-                    DimensionSource::Static(extent) => dimension_constant(outer_context, extent),
+                    DimensionSource::Static(extent) => Ok(outer_context.dimension_constant(extent)?),
                     DimensionSource::Value { source, axis } => {
                         let source = <C::Value as ValueProjection<ArrayType>>::from_projected(source);
                         array_dimension(outer_context, &source, axis)
@@ -3384,17 +3385,6 @@ pub(crate) fn array_dimension<C: Context<Type = ArrayIrType, Operation: From<Dim
     Ok(context.bind(operation, Vec::new(), std::slice::from_ref(value))?.remove(0))
 }
 
-/// Stages one exact first-class dimension constant carrying `extent` in `context`.
-pub(crate) fn dimension_constant<C>(context: &C, extent: usize) -> Result<C::Value, BatchingError>
-where
-    C: Context<Type = ArrayIrType, Operation: From<ConstantOperation<DimensionValue>>>,
-{
-    let value = DimensionValue::constant(extent).map_err(ProgramError::from)?;
-    let mut outputs = context.bind(ConstantOperation::new(value), Vec::new(), &[])?;
-    check_count!("output", outputs, 1, ProgramError);
-    Ok(outputs.remove(0))
-}
-
 /// Returns one packed array axis as a first-class dimension value, staging an exact constant when the axis extent is
 /// statically known and reading the axis through [`array_dimension`] only when it is genuinely dynamic. Folding the
 /// static axes keeps staged programs free of `dimension_size` reads whose results the type system already knows.
@@ -3406,7 +3396,7 @@ where
     let value_type = value.r#type();
     let array_type = <&ArrayType>::try_from(value_type.as_ref())?;
     match array_type.shape().dimensions().get(axis) {
-        Some(Dimension::Static(extent)) => dimension_constant(context, *extent),
+        Some(Dimension::Static(extent)) => Ok(context.dimension_constant(*extent)?),
         _ => array_dimension(context, value, axis),
     }
 }
@@ -3468,9 +3458,9 @@ where
             // evidence: accepting it would silently give different inputs different batch lengths.
             let input_extent = match batch.value.r#type().as_ref() {
                 ArrayIrType::Reference(r#type) => match r#type.referent().shape().dimensions().get(position) {
-                    Some(Dimension::Static(extent)) => dimension_constant(context, *extent)?,
+                    Some(Dimension::Static(extent)) => context.dimension_constant(*extent)?,
                     Some(Dimension::Dynamic(variable)) if DimensionType::new(variable.clone()).extent().is_some() => {
-                        dimension_constant(context, DimensionType::new(variable.clone()).extent().unwrap())?
+                        context.dimension_constant(DimensionType::new(variable.clone()).extent().unwrap())?
                     }
                     // A symbolic referent extent whose identity is already carried by the explicit extent or by a
                     // mapped array needs no further evidence: equality is implied by the shared dimension identity.

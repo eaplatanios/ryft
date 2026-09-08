@@ -310,7 +310,7 @@ where
     let batch_extent = if query_rank == 4 {
         folded_array_dimension(outer_context, &query, 1)?
     } else {
-        dimension_constant(outer_context, 1)?
+        outer_context.dimension_constant(1)?
     };
     let query_sequence_extent = folded_array_dimension(outer_context, &query, 1 + query_rank - 3)?;
     let head_extent = folded_array_dimension(outer_context, &query, 1 + query_rank - 2)?;

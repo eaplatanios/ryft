@@ -16,7 +16,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::{check_count, impl_differentiable_operation, impl_reference_dischargeable_operation};
-use crate::operations::constants::constant::ConstantOperation;
+use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::transposition::{Permutation, Transpose, TransposeOperation};
@@ -1276,11 +1276,11 @@ pub trait DynamicReshape: Value<Type = ArrayIrType> + Sized {
     fn dynamic_reshape_to_sizes(&self, output_sizes: &[usize]) -> Result<Self, ProgramError>
     where
         Self::DispatchDomain: Context<Type = ArrayIrType>,
-        <Self::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+        Self::DispatchDomain: DimensionConstant,
     {
         let output_dimensions = output_sizes
             .iter()
-            .map(|extent| self.dispatch_domain().lift(DimensionValue::constant(*extent)?.into()))
+            .map(|extent| self.dispatch_domain().dimension_constant(*extent))
             .collect::<Result<Vec<_>, _>>()?;
         self.dynamic_reshape(output_dimensions.as_slice())
     }

@@ -821,6 +821,16 @@ impl<A: Value<Type = ArrayType>> From<ConstantOperation<DimensionValue>> for Arr
     }
 }
 
+// The eager dispatch domain of `ArrayIrValue` binds only `ConstantOperation<ArrayIrValue<A>>`, so the same
+// family-neutral `From<ConstantOperation<DimensionValue>>` bound is satisfied there by wrapping the dimension payload
+// into the composite value. This is what lets `DimensionConstant` stage dimension literals against eager values too.
+impl<A: Value<Type = ArrayType>> From<ConstantOperation<DimensionValue>> for ConstantOperation<ArrayIrValue<A>> {
+    #[inline]
+    fn from(operation: ConstantOperation<DimensionValue>) -> Self {
+        ConstantOperation::new(ArrayIrValue::Dimension(operation.value().clone()))
+    }
+}
+
 /// Replicates the operands of an implicitly broadcasting elementwise [`ArrayOperation`] into its result geometry, when
 /// that geometry carries a runtime extent, so that the projected member rule differentiates operands that already have
 /// the result shape.

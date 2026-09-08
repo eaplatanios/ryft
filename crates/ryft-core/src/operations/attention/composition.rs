@@ -1,6 +1,7 @@
 use crate::arrays::ir::ArrayIrValue;
-use crate::arrays::{ArrayIrType, DimensionType, DimensionValue};
+use crate::arrays::{ArrayIrType, DimensionType};
 use crate::differentiation::DifferentiableType;
+use crate::operations::constants::constant::DimensionConstant;
 use crate::operations::constants::iota::IotaOperation;
 use crate::operations::differentiation::stop_gradient::StopGradient;
 use crate::operations::dimensions::DimensionSize;
@@ -114,7 +115,7 @@ fn expand_key_value_heads_ir<V>(operand: &V, dimensions: &AttentionDimensions) -
 where
     V: Value<Type = ArrayIrType> + DimensionSize + DynamicBroadcast + DynamicReshape + ValueProjection<ArrayType>,
     V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+    V::DispatchDomain: DimensionConstant,
 {
     if dimensions.key_value_heads == dimensions.query_heads {
         return Ok(operand.clone());
@@ -122,9 +123,9 @@ where
     let context = operand.dispatch_domain();
     let group = dimensions.query_heads / dimensions.key_value_heads;
     let operand_dimensions = array_dimensions(operand)?;
-    let key_value_heads = context.lift(DimensionValue::constant(dimensions.key_value_heads)?.into())?;
-    let group = context.lift(DimensionValue::constant(group)?.into())?;
-    let query_heads = context.lift(DimensionValue::constant(dimensions.query_heads)?.into())?;
+    let key_value_heads = context.dimension_constant(dimensions.key_value_heads)?;
+    let group = context.dimension_constant(group)?;
+    let query_heads = context.dimension_constant(dimensions.query_heads)?;
     let expanded = operand.dynamic_broadcast(
         &[
             operand_dimensions[0].clone(),
@@ -148,14 +149,14 @@ fn normalize_attention_operand_ir<V>(operand: &V) -> Result<V, ProgramError>
 where
     V: Value<Type = ArrayIrType> + DimensionSize + DynamicReshape + ValueProjection<ArrayType>,
     V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+    V::DispatchDomain: DimensionConstant,
 {
     let r#type = operand.r#type();
     let r#type = <&ArrayType>::try_from(r#type.as_ref())?;
     if r#type.rank() == 4 {
         return Ok(operand.clone());
     }
-    let batch = operand.dispatch_domain().lift(DimensionValue::constant(1)?.into())?;
+    let batch = operand.dispatch_domain().dimension_constant(1)?;
     let mut dimensions = array_dimensions(operand)?;
     dimensions.insert(0, batch);
     operand.clone().dynamic_reshape(dimensions.as_slice())
@@ -166,7 +167,7 @@ fn normalize_attention_score_operand_ir<V>(operand: &V) -> Result<V, ProgramErro
 where
     V: Value<Type = ArrayIrType> + DimensionSize + DynamicReshape + ValueProjection<ArrayType>,
     V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+    V::DispatchDomain: DimensionConstant,
 {
     let r#type = operand.r#type();
     let r#type = <&ArrayType>::try_from(r#type.as_ref())?;
@@ -174,7 +175,7 @@ where
         return Ok(operand.clone());
     }
     let context = operand.dispatch_domain();
-    let singleton = context.lift(DimensionValue::constant(1)?.into())?;
+    let singleton = context.dimension_constant(1)?;
     let mut dimensions = vec![singleton; 4 - r#type.rank()];
     dimensions.extend(array_dimensions(operand)?);
     operand.clone().dynamic_reshape(dimensions.as_slice())
@@ -202,14 +203,14 @@ fn normalize_attention_residual_ir<V>(residual: &V) -> Result<V, ProgramError>
 where
     V: Value<Type = ArrayIrType> + DimensionSize + DynamicReshape + ValueProjection<ArrayType>,
     V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+    V::DispatchDomain: DimensionConstant,
 {
     let r#type = residual.r#type();
     let r#type = <&ArrayType>::try_from(r#type.as_ref())?;
     if r#type.rank() == 3 {
         return Ok(residual.clone());
     }
-    let batch = residual.dispatch_domain().lift(DimensionValue::constant(1)?.into())?;
+    let batch = residual.dispatch_domain().dimension_constant(1)?;
     let mut dimensions = array_dimensions(residual)?;
     dimensions.insert(0, batch);
     residual.clone().dynamic_reshape(dimensions.as_slice())
@@ -231,7 +232,7 @@ where
         + DynamicReshape
         + ValueProjection<ArrayType, Projected: Value<Type = ArrayType> + Add + And + Compare + Select + Sub>,
     V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+    V::DispatchDomain: DimensionConstant,
     <<V as ValueProjection<ArrayType>>::Projected as Value>::DispatchDomain:
         Fill<f64, <V as ValueProjection<ArrayType>>::Projected>,
 {
@@ -365,7 +366,7 @@ where
         + Select
         + Sub,
     V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+    V::DispatchDomain: DimensionConstant,
     <ArrayProjection<V> as Value>::DispatchDomain: Fill<f64, ArrayProjection<V>>,
 {
     let query = normalize_attention_operand_ir(&inputs.query)?;
@@ -445,7 +446,7 @@ where
         + Sub
         + Transpose,
     V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+    V::DispatchDomain: DimensionConstant,
     <ArrayProjection<V> as Value>::DispatchDomain: Fill<f64, ArrayProjection<V>>,
 {
     if configuration.dropout().is_some() {
@@ -578,7 +579,7 @@ where
         + Sub
         + Transpose,
     V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+    V::DispatchDomain: DimensionConstant,
     <ArrayProjection<V> as Value>::DispatchDomain: Fill<f64, ArrayProjection<V>>,
 {
     if configuration.dropout().is_some() {
@@ -683,9 +684,9 @@ where
         let context = prepared.query.dispatch_domain();
         let group = dimensions.query_heads / dimensions.key_value_heads;
         let key_dimensions = array_dimensions(&prepared.key)?;
-        let key_value_heads = context.lift(DimensionValue::constant(dimensions.key_value_heads)?.into())?;
-        let group = context.lift(DimensionValue::constant(group)?.into())?;
-        let head_dimension = context.lift(DimensionValue::constant(dimensions.head_dimension)?.into())?;
+        let key_value_heads = context.dimension_constant(dimensions.key_value_heads)?;
+        let group = context.dimension_constant(group)?;
+        let head_dimension = context.dimension_constant(dimensions.head_dimension)?;
         let grouped_dimensions =
             [key_dimensions[0].clone(), key_dimensions[1].clone(), key_value_heads, group, head_dimension];
         let grouped_key =

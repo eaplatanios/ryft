@@ -24,7 +24,7 @@ use crate::differentiation::{
 };
 use crate::interpretation::{InterpretableOperation, InterpretationDriver, MemberInterpretableOperation};
 use crate::macros::check_count;
-use crate::operations::constants::constant::ConstantOperation;
+use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
@@ -563,7 +563,7 @@ impl<V> AllToAll for V
 where
     V: Value<Type = ArrayIrType> + DimensionSize<V> + ValueProjection<DimensionType>,
     V::DispatchDomain: Context<Type = ArrayIrType> + NamedAxes,
-    <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+    V::DispatchDomain: DimensionConstant,
     <V::DispatchDomain as Domain>::Operation: From<AllToAllOperation>,
     <V as ValueProjection<DimensionType>>::Projected: DimensionRequirement + Div + Mul,
 {

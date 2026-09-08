@@ -428,7 +428,7 @@ where
     <V as ValueProjection<ArrayType>>::Projected: Value<Type = ArrayType> + ConvertElementType + Dot + Mul,
     <V as ValueProjection<DimensionType>>::Projected: Value<Type = DimensionType> + DimensionRequirement + Div,
     V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+    V::DispatchDomain: DimensionConstant,
 {
     let array_type = |value: &V| -> Result<ArrayType, ProgramError> {
         let r#type = value.r#type();
@@ -466,7 +466,7 @@ where
     <V as ValueProjection<ArrayType>>::Projected: Value<Type = ArrayType> + ConvertElementType + Mul,
     <V as ValueProjection<DimensionType>>::Projected: Value<Type = DimensionType> + DimensionRequirement + Div,
     V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+    V::DispatchDomain: DimensionConstant,
 {
     let context = elements.dispatch_domain();
     let element_type = elements.r#type();
@@ -492,9 +492,7 @@ where
             let scale_extent = <V as ValueProjection<DimensionType>>::into_projected(scale_dimension.clone())?;
             element_extent.require_divisible_by(&scale_extent)?;
             let ratio = element_extent.div(&scale_extent)?;
-            let two = <V as ValueProjection<DimensionType>>::into_projected(
-                context.lift(DimensionValue::constant(2)?.into())?,
-            )?;
+            let two = <V as ValueProjection<DimensionType>>::into_projected(context.dimension_constant(2)?)?;
             two.require_less_than_or_equal(&ratio)?;
             expanded_dimensions.push(<V as ValueProjection<DimensionType>>::from_projected(ratio));
         }

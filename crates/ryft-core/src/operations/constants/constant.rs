@@ -1,7 +1,7 @@
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
 
-use crate::arrays::{ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType};
+use crate::arrays::{ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayType, DimensionValue};
 use crate::batching::{
     BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError, BatchingTracer,
 };
@@ -207,12 +207,35 @@ impl<C: Context<Type: DifferentiableType>, P: DifferentiationPolicy<C>>
     }
 }
 
+/// Capability to stage an exact first-class dimension literal in a [`Context`]. This is the dimension literal
+/// counterpart of [`Constant`], and it is the one way a static extent enters a program as a value: the literal is
+/// staged as a [`ConstantOperation`] carrying a [`DimensionValue`], so it is an ordinary instruction that partial
+/// evaluation folds, rendering shows as `constant [value=n]`, and lowering emits as a constant. It is never stored as a
+/// program constant atom, which is the representation of captured runtime values. The capability is blanket-implemented
+/// for every context whose operation family includes [`ConstantOperation<DimensionValue>`], so it is available under
+/// eager, tracing, batching, partial-evaluation, and differentiation contexts alike without per-context support.
+pub trait DimensionConstant: Context {
+    /// Stages the dimension literal `extent` in this context and returns the resulting value.
+    fn dimension_constant(&self, extent: usize) -> Result<Self::Value, ProgramError>;
+}
+
+impl<C: Context<Operation: From<ConstantOperation<DimensionValue>>>> DimensionConstant for C {
+    #[inline]
+    fn dimension_constant(&self, extent: usize) -> Result<Self::Value, ProgramError> {
+        let mut outputs = self.bind(ConstantOperation::new(DimensionValue::constant(extent)?), Vec::new(), &[])?;
+        check_count!("output", outputs, 1, ProgramError);
+        Ok(outputs.remove(0))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
-    use crate::arrays::{Array, ArrayOperation, ArrayType, DataType};
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayType, DataType, DimensionOperation,
+    };
     use crate::contexts::EagerContext;
     use crate::differentiation::{TransposableOperation, TranspositionContext};
     use crate::interpretation::InterpretableOperation;
@@ -330,5 +353,55 @@ mod tests {
             )
             .unwrap();
         assert_eq!(input_cotangents, ());
+    }
+
+    #[test]
+    fn test_dimension_constant() {
+        // Eager contexts materialize the literal directly, both in the full array IR operation family and in the
+        // minimal family that backs the eager dispatch domain of `ArrayIrValue`, whose only operation is a constant.
+        let expected = ArrayIrValue::Dimension(DimensionValue::constant(3).unwrap());
+        assert_eq!(
+            EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new().dimension_constant(3),
+            Ok(expected.clone())
+        );
+        assert_eq!(EagerContext::<ArrayIrValue<Array>>::new().dimension_constant(3), Ok(expected));
+
+        // The capability is not tied to the array IR family: a pure dimension program materializes the same literal.
+        assert_eq!(
+            EagerContext::<DimensionValue, DimensionOperation<DimensionValue>>::new().dimension_constant(2),
+            Ok(DimensionValue::constant(2).unwrap()),
+        );
+
+        // Staging records the literal as a `constant` instruction with an exact dimension type, never as a program
+        // constant atom.
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let output = context.dimension_constant(3).unwrap();
+        assert_eq!(
+            output.r#type().as_ref(),
+            &ArrayIrType::Dimension(DimensionValue::constant(3).unwrap().r#type().into_owned())
+        );
+        let builder = context.builder().borrow();
+        let [instruction] = builder.instructions() else {
+            panic!("expected exactly one staged instruction");
+        };
+        assert!(matches!(instruction.operation(), ArrayIrOperation::Dimension(DimensionOperation::Constant(_))));
+        assert!(!builder.atoms().iter().any(|atom| matches!(atom, Atom::Constant(_))));
+        let program = builder
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output.atom_id().unwrap()],
+                vec![],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert_eq!(
+            program.to_string(),
+            indoc! {"
+                lambda  .
+                let %0:dimension<3> = constant [value=3]
+                in (%0)
+            "}
+            .trim_end(),
+        );
     }
 }
