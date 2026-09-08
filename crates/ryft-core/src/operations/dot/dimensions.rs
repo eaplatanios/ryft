@@ -317,10 +317,9 @@ pub(super) fn lift_output_sharding(
     axis_sharding: ShardingDimension,
 ) -> Result<Option<Sharding>, ProgramError> {
     match (output_sharding, output_axis) {
-        (Some(output_sharding), Some(axis)) => output_sharding
-            .with_inserted_dimension(axis, axis_sharding)
-            .map(Some)
-            .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() }.into()),
+        (Some(output_sharding), Some(axis)) => {
+            output_sharding.batched(axis, axis_sharding).map(Some).map_err(Into::into)
+        }
         (Some(output_sharding), None) => Ok(Some(output_sharding.clone())),
         (None, _) => Ok(None),
     }

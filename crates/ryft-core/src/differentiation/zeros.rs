@@ -183,8 +183,8 @@ pub trait ResidualZeroProvider<T: Type>: Operation + OperationProvider<T, ZeroOp
     ///
     ///   - `context`: [`Context`] in which the zero and any dimension reads are staged or computed.
     ///   - `zero`: Structural zero or live value to materialize.
-    ///   - `sources`: Candidate values in scope at the boundary, searched in order for each declared residual. Only
-    ///     zero types that declare residuals consult them.
+    ///   - `sources`: Candidate values in scope at the boundary, searched in order for each declared residual.
+    ///     Only zero types that declare residuals consult them.
     fn materialize_zero_from_residual_sources<
         'v,
         C: Context<Type = T, Value: 'v, Operation = Self> + Zero<C::Value>,

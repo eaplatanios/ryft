@@ -239,14 +239,7 @@ where
                     return input.move_axis(0);
                 }
                 let unbatched_type = input.unbatched_type();
-                let mut physical_type = unbatched_type.with_inserted_dimension(0, Dimension::Static(axis_size))?;
-                if let Some(sharding) = unbatched_type.sharding() {
-                    physical_type.sharding = Some(
-                        sharding
-                            .with_inserted_dimension(0, axis_sharding.clone())
-                            .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?,
-                    );
-                }
+                let physical_type = unbatched_type.batched(0, Dimension::Static(axis_size), axis_sharding.clone())?;
                 let output_axes = (1..physical_type.rank()).collect::<Vec<_>>();
                 let broadcasted = input.value().clone().broadcast(physical_type.clone(), output_axes.as_slice())?;
                 ArrayBatch::new(broadcasted, 0)

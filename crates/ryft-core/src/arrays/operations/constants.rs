@@ -935,7 +935,7 @@ mod tests {
                 TranspositionContext::new(TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new());
             let output_cotangent = context.input(output_type.clone().into());
             let inputs = [PartialValue::Unknown(extent_type.clone().into())];
-            let accumulators = context.input_accumulators(&inputs, &[]).unwrap();
+            let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
             operation
                 .transpose(
                     &mut context,

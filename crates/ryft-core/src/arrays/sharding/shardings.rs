@@ -41,6 +41,21 @@ impl ShardingDimension {
     pub fn unconstrained() -> Self {
         Self::Unconstrained
     }
+
+    /// Returns the [`MeshAxisType::Manual`] axes of `mesh` that this [`ShardingDimension`] partitions along. Inside a
+    /// manual region, a value whose dimension is partitioned along a manual axis holds a different slice on each device
+    /// along that axis, so introducing such a placement there makes the value vary along those axes (refer to the
+    /// documentation of [`Sharding::varying_manual_axes`]).
+    pub fn manual_axes(&self, mesh: &LogicalMesh) -> Vec<String> {
+        match self {
+            Self::Sharded(axis_names) => axis_names
+                .iter()
+                .filter(|name| mesh.axis_type(name) == Some(MeshAxisType::Manual))
+                .cloned()
+                .collect(),
+            Self::Replicated | Self::Unconstrained => Vec::new(),
+        }
+    }
 }
 
 impl Display for ShardingDimension {
@@ -480,6 +495,9 @@ impl Sharding {
     /// shifting all subsequent dimensions one position to the right. Batching rules use this to extend an explicit
     /// output sharding with an entry for a newly introduced batch dimension. The resulting sharding is revalidated,
     /// and so inserting a [`ShardingDimension::Sharded`] entry that references unknown or already-used mesh axes fails.
+    ///
+    /// This is a placement-only insertion. A batch axis introduced inside a batched computation must be inserted with
+    /// [`Self::batched`] instead, which additionally records the variation the placement introduces along manual axes.
     pub fn with_inserted_dimension(&self, index: usize, dimension: ShardingDimension) -> Result<Self, ShardingError> {
         if index > self.dimensions.len() {
             return Err(ShardingError::DimensionOutOfBounds { dimension: index, rank: self.rank() });
@@ -684,11 +702,20 @@ mod tests {
 
     #[test]
     fn test_sharding_dimension() {
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("data", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
         assert_eq!(ShardingDimension::replicated().to_string(), "{}");
         assert_eq!(ShardingDimension::unconstrained().to_string(), "{?}");
         assert_eq!(ShardingDimension::sharded(["x"]).to_string(), "{'x'}");
         assert_eq!(ShardingDimension::sharded(["x", "y"]).to_string(), "{'x', 'y'}");
         assert_eq!(ShardingDimension::sharded([r"path\to", "x'y"]).to_string(), "{'path\\to', 'x\\'y'}");
+        assert_eq!(ShardingDimension::sharded(["x", "data"]).manual_axes(&mesh), vec!["x".to_string()]);
+        assert!(ShardingDimension::sharded(["data"]).manual_axes(&mesh).is_empty());
+        assert!(ShardingDimension::replicated().manual_axes(&mesh).is_empty());
+        assert!(ShardingDimension::unconstrained().manual_axes(&mesh).is_empty());
     }
 
     #[test]

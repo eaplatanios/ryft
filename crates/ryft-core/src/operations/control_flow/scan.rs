@@ -3342,7 +3342,7 @@ where
     // operand (a first-class dimension) and any known residual stack, while its inner extents ride the carries and
     // per-iteration peers. No peer has the stacked type as a whole, which is exactly why exemplar matching cannot
     // close this case and identity-directed capture can.
-    let geometry_sources = || {
+    let dimension_sources = || {
         outputs
             .iter()
             .filter_map(MaybeZero::as_value)
@@ -3359,7 +3359,7 @@ where
                 operands.push(O::materialize_zero_from_residual_sources(
                     context,
                     outputs[index].clone(),
-                    geometry_sources(),
+                    dimension_sources(),
                 )?);
             }
             CotangentDestinationKind::Return => {
@@ -3373,7 +3373,7 @@ where
     }
     for (cotangent, output_type) in outputs[carry_count..].iter().zip(&body.output_types()[carry_count..]) {
         if !output_type.is_reference() && !output_type.cotangent()?.is_zero_space() {
-            operands.push(O::materialize_zero_from_residual_sources(context, cotangent.clone(), geometry_sources())?);
+            operands.push(O::materialize_zero_from_residual_sources(context, cotangent.clone(), dimension_sources())?);
         }
     }
 

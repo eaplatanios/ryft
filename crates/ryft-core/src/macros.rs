@@ -5840,7 +5840,7 @@ mod tests {
             PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
             PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
         ];
-        let accumulators = context.input_accumulators(&inputs, &[]).unwrap();
+        let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
         TestDifferentiableOperation::<ArrayType>::new()
             .transpose(&mut context, &EmptyRegionDriver, &inputs, &[MaybeZero::Value(output_cotangent)], &accumulators)
             .unwrap();
@@ -5877,7 +5877,7 @@ mod tests {
                 PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
                 PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
             ];
-            let accumulators = rule_context.input_accumulators(rule_inputs, &[]).unwrap();
+            let accumulators = rule_context.cotangent_accumulators(rule_inputs, &[]).unwrap();
             <AddOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &AddOperation::new(),
                 &mut rule_context,
@@ -5965,7 +5965,7 @@ mod tests {
                 PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
                 PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
             ];
-            let accumulators = rule_context.input_accumulators(rule_inputs, &[]).unwrap();
+            let accumulators = rule_context.cotangent_accumulators(rule_inputs, &[]).unwrap();
             <TestReversedSubOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &TestReversedSubOperation::<ArrayType>::new(),
                 &mut rule_context,
@@ -6002,7 +6002,7 @@ mod tests {
                 PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
                 PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
             ];
-            let accumulators = rule_context.input_accumulators(rule_inputs, &[]).unwrap();
+            let accumulators = rule_context.cotangent_accumulators(rule_inputs, &[]).unwrap();
             <TestNegatedAddOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &TestNegatedAddOperation::<ArrayType>::new(),
                 &mut rule_context,
@@ -6079,7 +6079,7 @@ mod tests {
             PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
         ];
         let mut transpose_context = TranspositionContext::new(context.clone());
-        let accumulators = transpose_context.input_accumulators(&inputs, &[]).unwrap();
+        let accumulators = transpose_context.cotangent_accumulators(&inputs, &[]).unwrap();
 
         // Boundary counts are checked before input-linearity diagnostics, with output validation first.
         assert_eq!(
@@ -6116,7 +6116,7 @@ mod tests {
         let right = context.input(ArrayType::scalar(DataType::F32));
         let inputs = [PartialValue::Known(left), PartialValue::Known(right)];
         let mut transpose_context = TranspositionContext::new(context.clone());
-        let accumulators = transpose_context.input_accumulators(&inputs, &[]).unwrap();
+        let accumulators = transpose_context.cotangent_accumulators(&inputs, &[]).unwrap();
         assert!(matches!(
             <MulOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &MulOperation::new(),
@@ -6136,7 +6136,7 @@ mod tests {
         let output_cotangent = context.input(ArrayType::scalar(DataType::I32));
         let inputs = [PartialValue::Unknown(ArrayType::scalar(DataType::I32)), PartialValue::Known(right)];
         let mut transpose_context = TranspositionContext::new(context.clone());
-        let accumulators = transpose_context.input_accumulators(&inputs, &[]).unwrap();
+        let accumulators = transpose_context.cotangent_accumulators(&inputs, &[]).unwrap();
         assert!(matches!(
             <MulOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &MulOperation::new(),
@@ -6161,7 +6161,7 @@ mod tests {
             PartialValue::Unknown(ArrayType::scalar(DataType::F32)),
         ];
         let mut transpose_context = TranspositionContext::new(context.clone());
-        let accumulators = transpose_context.input_accumulators(&inputs, &[]).unwrap();
+        let accumulators = transpose_context.cotangent_accumulators(&inputs, &[]).unwrap();
         assert!(matches!(
             <DivOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &DivOperation::new(),
@@ -6181,7 +6181,7 @@ mod tests {
         let denominator = context.input(ArrayType::scalar(DataType::F32));
         let inputs = [PartialValue::Known(numerator), PartialValue::Known(denominator)];
         let mut transpose_context = TranspositionContext::new(context.clone());
-        let accumulators = transpose_context.input_accumulators(&inputs, &[]).unwrap();
+        let accumulators = transpose_context.cotangent_accumulators(&inputs, &[]).unwrap();
         assert!(matches!(
             <DivOperation<ArrayType> as TransposableOperation<Array, ArrayOperation<Array>>>::transpose(
                 &DivOperation::new(),

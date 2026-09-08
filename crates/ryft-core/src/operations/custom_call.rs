@@ -757,15 +757,7 @@ impl<T: Type> CustomCallOperation<T> {
                 {
                     return Ok(aligned_type.clone());
                 }
-                let mut batched_type = output_type.with_inserted_dimension(0, batch_dimension.clone())?;
-                if let Some(sharding) = output_type.sharding() {
-                    let sharding = sharding
-                        .with_inserted_dimension(0, axis_sharding.clone())
-                        .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
-                    batched_type = batched_type
-                        .with_sharding(sharding)
-                        .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
-                }
+                let batched_type = output_type.batched(0, batch_dimension.clone(), axis_sharding.clone())?;
                 Ok(match output_type.layout() {
                     None => batched_type,
                     Some(Layout::Tiled(layout)) => {
@@ -1558,7 +1550,7 @@ where
                         value: input.value(),
                         batch_axis: input.batch_axis_position(),
                         ragged_axes: input.ragged_axes(),
-                        physical_type: input.r#type().unbatched_type(input.batch_axis())?,
+                        physical_type: input.r#type().unbatched(input.batch_axis())?,
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1601,14 +1593,14 @@ where
                 let carry_inputs = carry_indices
                     .iter()
                     .map(|&index| {
-                        let input_type = aligned[index].r#type().unbatched_type(aligned[index].batch_axis())?;
+                        let input_type = aligned[index].r#type().unbatched(aligned[index].batch_axis())?;
                         let input = builder.add_input(input_type);
                         operands[index] = Some(input);
                         Ok(input)
                     })
                     .collect::<Result<Vec<_>, BatchingError>>()?;
                 for &index in &stacked_indices {
-                    let input_type = aligned[index].r#type().unbatched_type(aligned[index].batch_axis())?;
+                    let input_type = aligned[index].r#type().unbatched(aligned[index].batch_axis())?;
                     operands[index] = Some(builder.add_input(input_type));
                 }
                 let operands = operands.into_iter().map(Option::unwrap).collect::<Vec<_>>();
@@ -1728,8 +1720,7 @@ where
                         value: input.value(),
                         batch_axis: input.batch_axis_position(),
                         ragged_axes: input.ragged_axes(),
-                        physical_type: <&ArrayType>::try_from(value_type.as_ref())?
-                            .unbatched_type(input.batch_axis())?,
+                        physical_type: <&ArrayType>::try_from(value_type.as_ref())?.unbatched(input.batch_axis())?,
                     })
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -1780,7 +1771,7 @@ where
                 for &index in &carry_indices {
                     let value_type = aligned[index].value().r#type();
                     let input_type =
-                        <&ArrayType>::try_from(value_type.as_ref())?.unbatched_type(aligned[index].batch_axis())?;
+                        <&ArrayType>::try_from(value_type.as_ref())?.unbatched(aligned[index].batch_axis())?;
                     let input = builder.add_input(input_type.into());
                     carry_inputs.push(input);
                     operands[index] = Some(input);
@@ -1788,7 +1779,7 @@ where
                 for &index in &stacked_indices {
                     let value_type = aligned[index].value().r#type();
                     let input_type =
-                        <&ArrayType>::try_from(value_type.as_ref())?.unbatched_type(aligned[index].batch_axis())?;
+                        <&ArrayType>::try_from(value_type.as_ref())?.unbatched(aligned[index].batch_axis())?;
                     operands[index] = Some(builder.add_input(input_type.into()));
                 }
                 let operands = operands

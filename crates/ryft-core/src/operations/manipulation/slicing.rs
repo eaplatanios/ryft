@@ -4420,7 +4420,7 @@ mod tests {
         let mut context = TranspositionContext::new(TracingContext::<Array, ArrayOperation<Array>>::new());
         let inputs = [PartialValue::Unknown(ArrayType::new_static(DataType::F64, [5]))];
         let outputs = [MaybeZero::Zero(ArrayType::new_static(DataType::F64, [2]))];
-        let accumulators = context.input_accumulators(&inputs, &[]).unwrap();
+        let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
         let operation = SliceOperation::new(vec![1], vec![3]);
 
         // Even a structural-zero cotangent must validate its boundary before skipping the update.

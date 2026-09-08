@@ -364,7 +364,7 @@ where
         let input_type = if input.ragged_axes().is_empty() {
             input.unbatched_type()
         } else {
-            input.value().r#type().unbatched_type(input.batch_axis())?
+            input.value().r#type().unbatched(input.batch_axis())?
         };
         let mut output_types = self.infer_output_types(std::slice::from_ref(&input_type), &[])?;
         let output_type = output_types.remove(0);

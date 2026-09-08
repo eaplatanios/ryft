@@ -194,10 +194,7 @@ where
         let (lifted_sharding, output_axis) = match inputs[0].batch_axis_position() {
             Some(batch_axis) => {
                 let axis_sharding = ArrayBatch::sharding_for_inputs(inputs)?;
-                let lifted = self
-                    .sharding()
-                    .with_inserted_dimension(batch_axis, axis_sharding)
-                    .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
+                let lifted = self.sharding().batched(batch_axis, axis_sharding)?;
                 (lifted, Some(batch_axis))
             }
             None => (self.sharding().clone(), None),
@@ -421,10 +418,7 @@ where
         ArrayBatch::common_batch_size(inputs)?;
         let (lifted_sharding, output_axis) = match inputs[0].batch_axis_position() {
             Some(batch_axis) => {
-                let lifted = self
-                    .sharding()
-                    .with_inserted_dimension(batch_axis, ShardingDimension::Unconstrained)
-                    .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
+                let lifted = self.sharding().batched(batch_axis, ShardingDimension::Unconstrained)?;
                 (lifted, Some(batch_axis))
             }
             None => (self.sharding().clone(), None),

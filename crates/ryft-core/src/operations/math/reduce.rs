@@ -261,11 +261,9 @@ where
         // A requested output sharding gains the mapped axis's sharding at the new output batch axis, mirroring the
         // dot batch rule.
         let lifted_output_sharding = match &self.output_sharding {
-            Some(output_sharding) => Some(
-                output_sharding
-                    .with_inserted_dimension(output_axis, ArrayBatch::sharding_for_inputs(inputs)?)
-                    .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?,
-            ),
+            Some(output_sharding) => {
+                Some(output_sharding.batched(output_axis, ArrayBatch::sharding_for_inputs(inputs)?)?)
+            }
             None => None,
         };
         let lifted_op = ReduceOperation::new(lifted_axes, self.kind).with_output_sharding(lifted_output_sharding);
@@ -1289,7 +1287,7 @@ mod tests {
             };
             let inputs = [PartialValue::Unknown(input_type.clone())];
             let mut transposition = TranspositionContext::new(context.clone());
-            let accumulators = transposition.input_accumulators(&inputs, &[]).unwrap();
+            let accumulators = transposition.cotangent_accumulators(&inputs, &[]).unwrap();
             assert!(matches!(
                 ReduceOperation::new(vec![0], kind).transpose(
                     &mut transposition,
@@ -1373,7 +1371,7 @@ mod tests {
         let contribution = {
             let mut context = TranspositionContext::new(context.clone());
             let inputs = &[PartialValue::Unknown(input_type)];
-            let accumulators = context.input_accumulators(inputs, &[]).unwrap();
+            let accumulators = context.cotangent_accumulators(inputs, &[]).unwrap();
             ReduceOperation::new(vec![0], ReductionKind::Mean)
                 .transpose(
                     &mut context,
@@ -1421,7 +1419,7 @@ mod tests {
 
         let inputs = [PartialValue::Unknown(input_type.clone())];
         let mut transposition = TranspositionContext::new(context.clone());
-        let accumulators = transposition.input_accumulators(&inputs, &[]).unwrap();
+        let accumulators = transposition.cotangent_accumulators(&inputs, &[]).unwrap();
         assert!(matches!(
             ReduceOperation::new(vec![0, 1], ReductionKind::Mean).transpose(
                 &mut transposition,
@@ -1456,7 +1454,7 @@ mod tests {
         let contributions = {
             let mut context = TranspositionContext::new(context.clone());
             let inputs = &[PartialValue::Unknown(input_type.clone())];
-            let accumulators = context.input_accumulators(inputs, &[]).unwrap();
+            let accumulators = context.cotangent_accumulators(inputs, &[]).unwrap();
             ReduceOperation::new(vec![0, 1, 2], ReductionKind::Mean)
                 .transpose(
                     &mut context,

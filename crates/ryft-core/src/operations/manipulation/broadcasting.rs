@@ -679,13 +679,8 @@ impl<C: Context<Type = ArrayType, Value: Broadcast>, P: ArrayExtentBatchingPolic
                     (None, None) => None,
                     (None, Some(_)) => None,
                 };
-                if let Some(sharding) = output_sharding {
-                    output_type.sharding = Some(
-                        sharding
-                            .with_inserted_dimension(batch_axis, axis_sharding)
-                            .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?,
-                    );
-                }
+                output_type.sharding =
+                    output_sharding.map(|sharding| sharding.batched(batch_axis, axis_sharding)).transpose()?;
                 let output_value = inputs[0].value().broadcast(output_type.clone(), output_axes.as_slice())?;
                 Ok(vec![ArrayBatch::new(output_value, BatchAxis::from_position(batch_axis))?].into())
             }
@@ -1578,7 +1573,7 @@ mod tests {
         let contributions = {
             let mut rule_context = TranspositionContext::new(context.clone());
             let rule_inputs = &[PartialValue::Unknown(input_type)];
-            let accumulators = rule_context.input_accumulators(rule_inputs, &[]).unwrap();
+            let accumulators = rule_context.cotangent_accumulators(rule_inputs, &[]).unwrap();
             operation
                 .transpose(
                     &mut rule_context,
@@ -1601,7 +1596,7 @@ mod tests {
         let contributions = {
             let mut rule_context = TranspositionContext::new(context.clone());
             let rule_inputs = &[PartialValue::Unknown(input_type.clone())];
-            let accumulators = rule_context.input_accumulators(rule_inputs, &[]).unwrap();
+            let accumulators = rule_context.cotangent_accumulators(rule_inputs, &[]).unwrap();
             operation
                 .transpose(
                     &mut rule_context,

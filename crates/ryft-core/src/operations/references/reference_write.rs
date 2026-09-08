@@ -245,7 +245,7 @@ where
             &**context,
             MaybeZero::Zero(value_cotangent_type),
             context
-                .geometry_sources()
+                .dimension_sources()
                 .chain(inputs.iter().filter_map(PartialValue::as_known))
                 .chain(std::iter::once(&accumulator)),
         )?;

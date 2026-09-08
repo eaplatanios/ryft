@@ -550,11 +550,7 @@ where
         let output_axes = (1..=input_type.rank()).collect::<Vec<_>>();
         let output_sharding = input_type
             .sharding()
-            .map(|sharding| {
-                sharding
-                    .with_inserted_dimension(0, context.axis_sharding().clone())
-                    .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })
-            })
+            .map(|sharding| sharding.batched(0, context.axis_sharding().clone()))
             .transpose()?;
         let mut output_extents = Vec::with_capacity(input_extents.len() + 1);
         output_extents.push(context.axis_extent().clone());
@@ -1282,7 +1278,7 @@ mod tests {
         let extent_type = DimensionValue::constant(3)?.r#type().into_owned();
         let mut context = crate::differentiation::TranspositionContext::new(context);
         let inputs = [PartialValue::Unknown(array_type.into()), PartialValue::Unknown(extent_type.into())];
-        let accumulators = context.input_accumulators(&inputs, &[])?;
+        let accumulators = context.cotangent_accumulators(&inputs, &[])?;
         transpose_mixed_operation(
             &mut context,
             &ParallelSumScatterOperation::new("x".to_string(), 1, 0, CollectiveOptions::tiled()),

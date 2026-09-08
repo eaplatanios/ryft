@@ -1012,7 +1012,7 @@ mod tests {
         let output_cotangent = context.input(r#type.clone());
         let inputs = [PartialValue::Unknown(r#type.clone()), PartialValue::Unknown(r#type.clone())];
         let mut context = TranspositionContext::new(context);
-        let accumulators = context.input_accumulators(&inputs, &[]).unwrap();
+        let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
         assert!(matches!(
             LinearCallOperation::transpose_only(1, vec![r#type.clone()], vec![r#type.clone()]).transpose(
                 &mut context,
@@ -1645,7 +1645,7 @@ mod tests {
         let zero_cotangents = {
             let mut rule_context = TranspositionContext::new(zero_context.clone());
             let rule_inputs = &[PartialValue::Known(residual), PartialValue::Unknown(r#type.clone())];
-            let accumulators = rule_context.input_accumulators(rule_inputs, &[]).unwrap();
+            let accumulators = rule_context.cotangent_accumulators(rule_inputs, &[]).unwrap();
             LinearCallOperation::new(1)
                 .transpose(&mut rule_context, &driver, rule_inputs, &[MaybeZero::Zero(r#type.clone())], &accumulators)
                 .unwrap();
@@ -1664,7 +1664,7 @@ mod tests {
         let cotangents = {
             let mut rule_context = TranspositionContext::new(context.clone());
             let rule_inputs = &[PartialValue::Known(residual), PartialValue::Unknown(r#type)];
-            let accumulators = rule_context.input_accumulators(rule_inputs, &[]).unwrap();
+            let accumulators = rule_context.cotangent_accumulators(rule_inputs, &[]).unwrap();
             LinearCallOperation::new(1)
                 .transpose(
                     &mut rule_context,
@@ -1747,7 +1747,7 @@ mod tests {
                 PartialValue::Unknown(r#type.clone()),
                 PartialValue::Known(known_linear),
             ];
-            let accumulators = rule_context.input_accumulators(rule_inputs, &[]).unwrap();
+            let accumulators = rule_context.cotangent_accumulators(rule_inputs, &[]).unwrap();
             LinearCallOperation::transpose_only(1, linear_types, vec![r#type.clone()])
                 .transpose(
                     &mut rule_context,
@@ -1792,7 +1792,7 @@ mod tests {
         let cotangents = {
             let mut rule_context = TranspositionContext::new(context.clone());
             let rule_inputs = &[PartialValue::Unknown(tangent_type.clone())];
-            let accumulators = rule_context.input_accumulators(rule_inputs, &[]).unwrap();
+            let accumulators = rule_context.cotangent_accumulators(rule_inputs, &[]).unwrap();
             LinearCallOperation::transpose_only(0, vec![tangent_type.clone()], vec![tangent_type.clone()])
                 .transpose(
                     &mut rule_context,
@@ -1822,7 +1822,7 @@ mod tests {
         let cotangents = {
             let mut rule_context = TranspositionContext::new(context.clone());
             let rule_inputs = &[PartialValue::Unknown(primal_type.tangent().unwrap())];
-            let accumulators = rule_context.input_accumulators(rule_inputs, &[]).unwrap();
+            let accumulators = rule_context.cotangent_accumulators(rule_inputs, &[]).unwrap();
             LinearCallOperation::transpose_only(0, vec![tangent_type.clone()], vec![tangent_type])
                 .transpose(
                     &mut rule_context,

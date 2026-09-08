@@ -22,7 +22,7 @@ use crate::arrays::broadcasting::Broadcastable;
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::encoding::ArrayElement;
 use crate::arrays::operations::ElementExtremum;
-use crate::arrays::sharding::{MeshAxisType, Sharding, ShardingDimension, ShardingError};
+use crate::arrays::sharding::{Sharding, ShardingDimension, ShardingError};
 use crate::arrays::types::{ArrayIrType, ArrayType, Dimension, DimensionType, DimensionVariable, Shape};
 use crate::axes::Axis;
 use crate::batching::{
@@ -414,20 +414,10 @@ impl<V: Value<Type = ArrayType>> ArrayBatch<V> {
         let position = axis
             .normalize(output_rank)
             .map_err(|_| BatchingError::BatchAxisOutOfBounds { r#type: Box::new(self.r#type().into_owned()), axis })?;
-
-        let mut batched_type = packed_type.with_inserted_dimension(position, Dimension::Static(axis_size))?;
-        if let Some(sharding) = packed_type.sharding() {
-            batched_type.sharding = Some(
-                sharding
-                    .with_inserted_dimension(position, axis_sharding)
-                    .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?,
-            );
-        }
-
+        let batched_type = packed_type.batched(position, Dimension::Static(axis_size), axis_sharding)?;
         let output_axes = (0..packed_type.rank())
             .map(|dimension| if dimension < position { dimension } else { dimension + 1 })
             .collect::<Vec<_>>();
-
         let broadcasted = self.value().broadcast(batched_type, output_axes.as_slice())?;
         let ragged_axes = self
             .ragged_axes
@@ -594,6 +584,28 @@ impl<V: Value<Type = ArrayType>> Value for ArrayBatch<V> {
     }
 }
 
+impl Sharding {
+    /// Returns this [`Sharding`] with the mapped batch axis inserted at `position` on the placement `axis_sharding`.
+    /// Besides gaining that placement, the result records that the value now varies along every
+    /// [`MeshAxisType`](crate::MeshAxisType::Manual) axis the placement names: a batch axis placed on a manual axis
+    /// spreads the batch items across that axis's shards, so the batched value differs from device to device along it.
+    /// This is the body-side rule for values produced inside a batched computation.
+    ///
+    /// Batching rules must construct every batched sharding through this function, or through [`ArrayType::batched`],
+    /// which uses it, rather than inserting the batch placement with [`Self::with_inserted_dimension`] directly, so
+    /// that placement and variation cannot drift apart.
+    pub fn batched(&self, position: usize, axis_sharding: ShardingDimension) -> Result<Self, BatchingError> {
+        let varying_manual_axes = axis_sharding.manual_axes(self.mesh());
+        let mut batched = self
+            .with_inserted_dimension(position, axis_sharding)
+            .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
+        batched
+            .extend_varying_manual_axes(varying_manual_axes)
+            .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
+        Ok(batched)
+    }
+}
+
 impl ArrayType {
     /// Normalizes and validates the provided [`BatchAxis`] against this packed [`ArrayType`],
     /// returning its canonical [`BatchAxis`] and position.
@@ -611,20 +623,40 @@ impl ArrayType {
         })
     }
 
+    /// Returns the packed [`ArrayType`] obtained by inserting the mapped batch axis at `position` into this per-item
+    /// [`ArrayType`]. Its shape gains `dimension` there and any sharding gains `axis_sharding` at the same position
+    /// through [`Sharding::batched`], which also records the variation that placement introduces along manual mesh
+    /// axes. This is the inverse of [`Self::unbatched`], and batching rules must construct every batched array type
+    /// through it for the reason documented on [`Sharding::batched`].
+    #[inline]
+    pub fn batched(
+        &self,
+        position: usize,
+        dimension: Dimension,
+        axis_sharding: ShardingDimension,
+    ) -> Result<Self, BatchingError> {
+        let mut batched = self.with_inserted_dimension(position, dimension)?;
+        if let Some(sharding) = self.sharding() {
+            batched.sharding = Some(sharding.batched(position, axis_sharding)?);
+        }
+        Ok(batched)
+    }
+
     /// Returns the unbatched per-item [`ArrayType`] obtained by removing `batch_axis` from this packed [`ArrayType`].
     /// A replicated axis leaves the type unchanged. Possibly-negative mapped axes are normalized against the packed
     /// rank. When the removed dimension carries sharding, only manual mesh axes remain visible as varying manual axes
-    /// in the per-item type because all other placement belongs to the transform-owned batch dimension.
+    /// in the per-item type because all other placement belongs to the transform-owned batch dimension. This is the
+    /// inverse of [`Self::batched`].
     #[inline]
-    pub fn unbatched_type<A: Into<BatchAxis>>(&self, batch_axis: A) -> Result<Self, BatchingError> {
+    pub fn unbatched<A: Into<BatchAxis>>(&self, batch_axis: A) -> Result<Self, BatchingError> {
         self.unbatched_type_and_axis::<()>(batch_axis.into(), &[]).map(|(r#type, _)| r#type)
     }
 
     /// Returns the unbatched per-item [`ArrayType`] together with the normalized [`BatchAxis`]. This derivation
     /// _defines_ what the logical type of a packed array batch is. It removes the mapped batch dimension, exactly as
-    /// [`ArrayType::unbatched_type`] documents, and then restores the dynamic [`Dimension`] of every provided bounded
-    /// ragged axis, because a packed ragged axis stores the finite physical bound shared by the whole batch while each
-    /// item logically extends only as far as its own per-item extent. Ragged axis positions index the packed type. This
+    /// [`ArrayType::unbatched`] documents, and then restores the dynamic [`Dimension`] of every provided bounded agged
+    /// axis, because a packed ragged axis stores the finite physical bound shared by the whole batch while each item
+    /// logically extends only as far as its own per-item extent. Ragged axis positions index the packed type. This
     /// internal form lets composite batch carriers validate and retain canonical axis metadata without cloning or
     /// otherwise projecting their array payloads.
     pub(crate) fn unbatched_type_and_axis<V>(
@@ -673,14 +705,7 @@ impl ArrayType {
                 // Manual axes remain semantically visible after their ranked dimension is removed because values may
                 // still vary across those axes. All other mesh axes are intentionally omitted (they placed the batch
                 // dimension itself, which is outside the unbatched per-item type).
-                if let ShardingDimension::Sharded(axis_names) = removed_dimension {
-                    projected_sharding.extend_varying_manual_axes(
-                        axis_names
-                            .into_iter()
-                            .filter(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Manual)),
-                    )?;
-                }
-
+                projected_sharding.extend_varying_manual_axes(removed_dimension.manual_axes(sharding.mesh()))?;
                 Ok(projected_sharding)
             })
             .transpose()
@@ -783,14 +808,7 @@ pub(crate) fn normalized_batch_axis_type(
     // A value sharded along a manual mesh axis varies across that axis inside a manual region. Preserve the variation
     // facts already known for the input and add any manual axes introduced by the replacement placement.
     let mut varying_manual_axes = sharding.varying_manual_axes().clone();
-    if let ShardingDimension::Sharded(axis_names) = axis_sharding {
-        varying_manual_axes.extend(
-            axis_names
-                .iter()
-                .filter(|name| sharding.mesh().axis_type(name) == Some(MeshAxisType::Manual))
-                .cloned(),
-        );
-    }
+    varying_manual_axes.extend(axis_sharding.manual_axes(sharding.mesh()));
 
     // `Sharding::new` validates the new per-dimension placement and starts with empty auxiliary axis state. Reapply the
     // input's reduction state and the updated manual-variation state to construct the complete normalized sharding.
@@ -1560,14 +1578,8 @@ impl<
             .iter()
             .map(|input| -> Result<_, BatchingError> {
                 let mut unbatched_type = input.unbatched_type();
-                if let (Some(sharding), ShardingDimension::Sharded(axis_names)) =
-                    (unbatched_type.sharding.as_mut(), &axis_sharding)
-                {
-                    let varying_manual_axes = axis_names
-                        .iter()
-                        .filter(|name| sharding.mesh().axis_type(name.as_str()) == Some(MeshAxisType::Manual))
-                        .cloned()
-                        .collect::<Vec<_>>();
+                if let Some(sharding) = unbatched_type.sharding.as_mut() {
+                    let varying_manual_axes = axis_sharding.manual_axes(sharding.mesh());
                     sharding
                         .extend_varying_manual_axes(varying_manual_axes)
                         .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
@@ -1587,15 +1599,8 @@ impl<
             .map(|(input, unbatched_type)| -> Result<ArrayBatch<C::Value>, BatchingError> {
                 let mut target_type = common_unbatched_type.as_ref().unwrap_or(unbatched_type).clone();
                 target_type.data_type = unbatched_type.data_type();
-                let mut batched_type =
-                    target_type.with_inserted_dimension(batch_axis_position, axis_dimension.clone())?;
-                if let Some(sharding) = target_type.sharding() {
-                    batched_type.sharding = Some(
-                        sharding
-                            .with_inserted_dimension(batch_axis_position, axis_sharding.clone())
-                            .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?,
-                    );
-                }
+                let batched_type =
+                    target_type.batched(batch_axis_position, axis_dimension.clone(), axis_sharding.clone())?;
                 if batched_type == *input.r#type() {
                     return Ok(input.clone());
                 }
@@ -1906,18 +1911,11 @@ impl<
                                     // The mapped axis is already normalized against the packed input rank (i.e., with
                                     // the inserted batch dimension counted), so reading its position back cannot fail.
                                     let position = usize::try_from(axis.value()).unwrap();
-                                    let mut batched_type = unbatched_type
-                                        .with_inserted_dimension(position, Dimension::Static(*axis_size))?;
-                                    if let Some(sharding) = unbatched_type.sharding() {
-                                        batched_type.sharding = Some(
-                                            sharding.with_inserted_dimension(position, axis_sharding.clone()).map_err(
-                                                |error| BatchingError::MisalignedBatchAxes {
-                                                    message: error.to_string(),
-                                                },
-                                            )?,
-                                        );
-                                    }
-                                    batched_type
+                                    unbatched_type.batched(
+                                        position,
+                                        Dimension::Static(*axis_size),
+                                        axis_sharding.clone(),
+                                    )?
                                 }
                                 None => unbatched_type.clone(),
                             };
@@ -2403,7 +2401,7 @@ impl<V: Value<Type = ArrayIrType>> ArrayIrBatch<V> {
                 .into(),
             ArrayIrBatchMember::Reference => {
                 let referent = <&ReferenceType<ArrayType>>::try_from(value_type.as_ref()).unwrap().referent();
-                ReferenceType::new(referent.unbatched_type(self.batch_axis).unwrap()).into()
+                ReferenceType::new(referent.unbatched(self.batch_axis).unwrap()).into()
             }
             ArrayIrBatchMember::Dimension => value_type.into_owned(),
             ArrayIrBatchMember::MappedDimension(r#type) => r#type.clone().into(),
@@ -3751,20 +3749,7 @@ where
                         let position = axis.normalize(batched_rank).map_err(|_| {
                             BatchingError::BatchAxisOutOfBounds { r#type: Box::new(array_type.clone()), axis }
                         })?;
-                        let mut batched_type =
-                            array_type.with_inserted_dimension(position, extent_dimension.clone())?;
-                        if let Some(sharding) = array_type.sharding() {
-                            batched_type = batched_type
-                                .with_sharding(Some(
-                                    sharding
-                                        .with_inserted_dimension(position, context.axis_sharding().clone())
-                                        .map_err(|error| BatchingError::MisalignedBatchAxes {
-                                            message: error.to_string(),
-                                        })?,
-                                ))
-                                .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })?;
-                        }
-                        Ok(batched_type)
+                        array_type.batched(position, extent_dimension.clone(), context.axis_sharding().clone())
                     };
                     let batched_type = match (unbatched_type, batch_axis.axis()) {
                         (ArrayIrType::Array(array_type), Some(axis)) => {
@@ -4041,14 +4026,8 @@ fn broadcast_replicated_array<
         .collect::<Vec<_>>();
 
     // The sharding, when present, gains the transform's placement for the mapped axis at the same position.
-    let output_sharding = r#type
-        .sharding()
-        .map(|sharding| {
-            sharding
-                .with_inserted_dimension(position, axis_sharding.clone())
-                .map_err(|error| BatchingError::MisalignedBatchAxes { message: error.to_string() })
-        })
-        .transpose()?;
+    let output_sharding =
+        r#type.sharding().map(|sharding| sharding.batched(position, axis_sharding.clone())).transpose()?;
 
     let value = value.dynamic_broadcast_with_output_sharding(&output_dimensions, &output_axes, output_sharding)?;
     Ok((value, output_axes))
@@ -4068,7 +4047,7 @@ mod tests {
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, DimensionOperation};
     use crate::arrays::reference_views::ArrayReference;
-    use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxis};
+    use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxis, MeshAxisType};
     use crate::arrays::sharding::shardings::ShardingDimension;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionVariable, Shape};
@@ -4255,6 +4234,64 @@ mod tests {
                     .to_string(),
             }),
         );
+    }
+
+    #[test]
+    fn test_array_batch_broadcast_marks_manual_batch_axis_placement_varying() {
+        // Broadcasting a replicated value onto a batch axis placed on a manual mesh axis distributes the batch items
+        // across that axis's shards, so the result varies along it. A non-manual placement records no variation.
+        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
+            let replicated_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))
+                .with_sharding(Sharding::replicated(mesh.clone(), 1))
+                .unwrap();
+            let replicated = ArrayBatch::replicated(Array::from_f64s(replicated_type, vec![1.0, 2.0, 3.0]));
+            let broadcasted = replicated.broadcast(0, 2, ShardingDimension::sharded(["x"])).unwrap();
+            let expected_sharding =
+                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
+                    .unwrap();
+            assert_eq!(broadcasted.batch_axis(), BatchAxis::new(0));
+            assert_eq!(broadcasted.value().r#type().sharding(), Some(&expected_sharding));
+        }
+    }
+
+    #[test]
+    fn test_array_batch_axis_dynamic_alignment_marks_manual_batch_axis_placement_varying() {
+        // The composite alignment path inserts the batch axis through a dynamic broadcast and must record the same
+        // variation as the homogeneous path.
+        type Parent = EagerContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
+
+        for axis_type in [MeshAxisType::Explicit, MeshAxisType::Manual] {
+            let mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, axis_type).unwrap()]).unwrap();
+            let replicated_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))
+                .with_sharding(Sharding::replicated(mesh.clone(), 1))
+                .unwrap();
+            let replicated =
+                ArrayIrBatch::replicated(ArrayIrValue::Array(Array::from_f64s(replicated_type, vec![1.0, 2.0, 3.0])));
+            let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(
+                Parent::new(),
+                ArrayIrValue::Dimension(DimensionValue::constant(2).unwrap()),
+            )
+            .with_axis_sharding(ShardingDimension::sharded(["x"]));
+            let aligned = <ArrayIrBatchingPolicy as RecursiveBatchingPolicy<Parent>>::align_batch_axis(
+                &context,
+                replicated,
+                Axis::from(0),
+            )
+            .unwrap();
+            let expected_sharding =
+                Sharding::new(mesh, vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
+                    .unwrap()
+                    .with_varying_manual_axes((axis_type == MeshAxisType::Manual).then_some("x"))
+                    .unwrap();
+            assert_eq!(aligned.batch_axis(), BatchAxis::new(0));
+            let ArrayIrType::Array(packed_type) = aligned.value().r#type().into_owned() else {
+                panic!("expected an array carrier");
+            };
+            assert_eq!(packed_type.sharding(), Some(&expected_sharding));
+        }
     }
 
     #[test]
@@ -4528,6 +4565,42 @@ mod tests {
     }
 
     #[test]
+    fn test_sharding_batched_records_manual_axis_variation() {
+        // The batch axis takes the requested placement, and only a placement on a manual axis makes the value vary.
+        let mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("data", 2, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let sharding = Sharding::new(mesh.clone(), vec![ShardingDimension::sharded(["data"])]).unwrap();
+        for (axis_sharding, expected_varying) in [
+            (ShardingDimension::sharded(["x"]), vec!["x".to_string()]),
+            (ShardingDimension::replicated(), Vec::new()),
+            (ShardingDimension::unconstrained(), Vec::new()),
+        ] {
+            let batched = sharding.batched(1, axis_sharding.clone()).unwrap();
+            assert_eq!(batched.dimensions(), &[ShardingDimension::sharded(["data"]), axis_sharding]);
+            assert_eq!(batched.varying_manual_axes().iter().cloned().collect::<Vec<_>>(), expected_varying);
+        }
+        assert!(matches!(
+            sharding.batched(2, ShardingDimension::replicated()),
+            Err(BatchingError::MisalignedBatchAxes { .. }),
+        ));
+
+        // The array-level form inserts the dimension and threads the sharding through the same rule.
+        let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))
+            .with_sharding(sharding.clone())
+            .unwrap();
+        let batched = r#type.batched(0, Dimension::Static(2), ShardingDimension::sharded(["x"])).unwrap();
+        assert_eq!(batched.shape(), &Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
+        assert_eq!(batched.sharding(), Some(&sharding.batched(0, ShardingDimension::sharded(["x"])).unwrap()));
+        assert_eq!(
+            batched.unbatched(0),
+            Ok(r#type.with_sharding(sharding.with_varying_manual_axes(["x"]).unwrap()).unwrap())
+        );
+    }
+
+    #[test]
     fn test_array_type_normalize_batch_axis() {
         let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
         assert_eq!(r#type.normalize_batch_axis(BatchAxis::replicated()), Ok((BatchAxis::replicated(), None)));
@@ -4544,12 +4617,12 @@ mod tests {
     }
 
     #[test]
-    fn test_array_type_unbatched_type() {
+    fn test_array_type_unbatched() {
         let r#type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2), Dimension::Static(3)]));
-        assert_eq!(r#type.unbatched_type(BatchAxis::replicated()), Ok(r#type.clone()));
-        assert_eq!(r#type.unbatched_type(0), Ok(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))));
+        assert_eq!(r#type.unbatched(BatchAxis::replicated()), Ok(r#type.clone()));
+        assert_eq!(r#type.unbatched(0), Ok(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]))));
         assert_eq!(
-            r#type.unbatched_type(BatchAxis::new(-1)),
+            r#type.unbatched(BatchAxis::new(-1)),
             Ok(ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(2)]))),
         );
     }

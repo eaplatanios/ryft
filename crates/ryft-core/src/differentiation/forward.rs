@@ -3463,15 +3463,16 @@ mod tests {
                 let rendering = entries.get(index).map(|program| program.to_string());
                 programs.push_str(&format!(
                     "--- {label} program {index} ---\n{}\n",
-                    rendering.as_deref().unwrap_or("<absent>")
+                    rendering.as_deref().unwrap_or("<absent>"),
                 ));
             }
         }
+        let arguments = JvpAndLinearizationTransformArguments { input_indices: vec![0] };
         format!(
-            "nondeterministic transform rule detected for `{}` with arguments `JvpAndLinearizationTransformArguments` \
-             {{ input_indices: [0] }}: re-derivation produced a different artifact than the region cache retained, \
-             but region transforms must be deterministic structural functions of their complete reachable \
-             contents and arguments\n\ncached metadata: {}\nderived metadata: {}\n\n{}",
+            "nondeterministic transform rule detected for `{}` with arguments `{arguments:?}`: re-derivation \
+             produced a different artifact than the region cache retained, but region transforms must be deterministic \
+             structural functions of their complete reachable contents and arguments\n\n\
+             cached metadata: {}\nderived metadata: {}\n\n{}",
             std::any::type_name::<T>(),
             cached_metadata,
             derived_metadata,

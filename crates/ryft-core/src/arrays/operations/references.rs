@@ -1768,7 +1768,7 @@ mod tests {
         let value_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let inputs = [PartialValue::Unknown(reference_type), PartialValue::Unknown(value_type.clone())];
         let mut context = TranspositionContext::new(TracingContext::<TestValue, TestOperation>::new());
-        let accumulators = context.input_accumulators(&inputs, &[]).unwrap();
+        let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
         assert!(matches!(
             TestWrite::new().transpose(
                 &mut context,
@@ -1784,7 +1784,7 @@ mod tests {
         let context = TracingContext::<TestValue, TestOperation>::new();
         let cotangent = context.input(value_type);
         let mut context = TranspositionContext::new(context);
-        let accumulators = context.input_accumulators(&inputs, &[]).unwrap();
+        let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
         assert!(matches!(
             TestSwap::new().transpose(
                 &mut context,

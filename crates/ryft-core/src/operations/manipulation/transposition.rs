@@ -1251,7 +1251,7 @@ mod tests {
         let contributions = {
             let mut rule_context = TranspositionContext::new(context.clone());
             let rule_inputs = &[PartialValue::Unknown(cycle_input_type.clone())];
-            let accumulators = rule_context.input_accumulators(rule_inputs, &[]).unwrap();
+            let accumulators = rule_context.cotangent_accumulators(rule_inputs, &[]).unwrap();
             TransposeOperation::new([2, 0, 1])
                 .transpose(
                     &mut rule_context,

@@ -964,7 +964,7 @@ fn test_dot_transposition_omits_unrequested_cotangent() {
     let right = context.input(ArrayType::new_static(DataType::F64, [3, 2]));
     let seed = context.input(ArrayType::new_static(DataType::F64, [2, 2]));
     let inputs = [PartialValue::Unknown(ArrayType::new_static(DataType::F64, [2, 3])), PartialValue::Known(right)];
-    let accumulators = context.input_accumulators(&inputs, &[false, false]).unwrap();
+    let accumulators = context.cotangent_accumulators(&inputs, &[false, false]).unwrap();
     DotOperation::matmul()
         .transpose(&mut context, &EmptyRegionDriver, &inputs, &[MaybeZero::Value(seed.clone())], &accumulators)
         .unwrap();
@@ -972,7 +972,7 @@ fn test_dot_transposition_omits_unrequested_cotangent() {
     assert!(context.take_cotangents(&accumulators).unwrap().iter().all(MaybeZero::is_zero));
 
     // Requesting the same unknown input constructs its adjoint matrix multiplication; knownness is unchanged.
-    let accumulators = context.input_accumulators(&inputs, &[true, false]).unwrap();
+    let accumulators = context.cotangent_accumulators(&inputs, &[true, false]).unwrap();
     DotOperation::matmul()
         .transpose(&mut context, &EmptyRegionDriver, &inputs, &[MaybeZero::Value(seed)], &accumulators)
         .unwrap();

@@ -1924,7 +1924,7 @@ mod mixed_members {
             PartialValue::Unknown(dimension_type.clone().into()),
         ];
         let mut transposition = TranspositionContext::new(context.clone());
-        let accumulators = transposition.input_accumulators(&inputs, &[]).unwrap();
+        let accumulators = transposition.cotangent_accumulators(&inputs, &[]).unwrap();
         operation
             .transpose(
                 &mut transposition,
@@ -1964,7 +1964,7 @@ mod mixed_members {
         let inputs =
             [PartialValue::Unknown(array_type.clone().into()), PartialValue::Unknown(array_type.clone().into())];
         let mut transposition = TranspositionContext::new(context);
-        let accumulators = transposition.input_accumulators(&inputs, &[]).unwrap();
+        let accumulators = transposition.cotangent_accumulators(&inputs, &[]).unwrap();
         operation
             .transpose(&mut transposition, &EmptyRegionDriver, &inputs, &[MaybeZero::Value(output)], &accumulators)
             .unwrap();
