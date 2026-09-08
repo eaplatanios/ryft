@@ -9566,7 +9566,7 @@ mod tests {
         assert!(matches!(
             mask(DataType::I1, RaggedMaskIdentity::One).1,
             Err(BatchingError::UnsupportedOperation { message })
-                if message == "ragged identity masking cannot represent a `One` constant in type `i1`",
+                if message == "ragged identity masking cannot represent a `one` constant in type `i1`",
         ));
 
         // The payload-free element types hold no constant of any kind.
