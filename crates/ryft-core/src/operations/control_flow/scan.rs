@@ -3623,7 +3623,7 @@ mod tests {
     use crate::batching::{BatchingTracer, batch};
     use crate::captures::{CaptureReference, ClosedProgram};
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::reverse::TranspositionTransform;
+    use crate::differentiation::reverse::tests::transposition_statistics;
     use crate::differentiation::{
         CotangentDestination, CotangentSeed, Differentiate, LinearizationTracer, ReverseModeDifferentiate,
         differentiate_at,
@@ -7403,12 +7403,8 @@ mod tests {
             .iter()
             .find(|instruction| matches!(instruction.operation(), ArrayOperation::Scan(_)))
             .unwrap();
-        let statistics = first
-            .tangent()
-            .region_ref(tangent_scan.regions()[0])
-            .unwrap()
-            .transform_statistics::<TranspositionTransform>()
-            .unwrap();
+        let statistics =
+            transposition_statistics(first.tangent().region_ref(tangent_scan.regions()[0]).unwrap()).unwrap();
         assert_eq!((statistics.productions, statistics.hits), (1, 1));
         assert_eq!(
             pullback.to_string(),

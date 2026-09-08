@@ -1681,7 +1681,7 @@ mod tests {
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
     use crate::captures::CaptureReference;
     use crate::contexts::{EagerContext, StagingContext};
-    use crate::differentiation::reverse::TranspositionTransform;
+    use crate::differentiation::reverse::tests::transposition_statistics;
     use crate::differentiation::{Differentiate, ReverseModeDifferentiate, differentiate_at};
     use crate::operations::compare::{CompareOperation, ComparisonDirection};
     use crate::operations::constants::zero_like::ZeroLikeOperation;
@@ -3584,12 +3584,7 @@ mod tests {
             .find(|instruction| matches!(instruction.operation(), ArrayOperation::Condition(_)))
             .unwrap();
         for region in tangent_condition.regions() {
-            let statistics = first
-                .tangent()
-                .region_ref(*region)
-                .unwrap()
-                .transform_statistics::<TranspositionTransform>()
-                .unwrap();
+            let statistics = transposition_statistics(first.tangent().region_ref(*region).unwrap()).unwrap();
             assert_eq!((statistics.productions, statistics.hits), (1, 1));
         }
         assert_eq!(
