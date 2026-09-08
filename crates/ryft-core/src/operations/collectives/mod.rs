@@ -17,7 +17,7 @@
 
 use std::fmt::Debug;
 
-use crate::arrays::batching::{DynamicArrayExtentBatchingPolicy, broadcast_array};
+use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
     ArrayType, Dimension, DimensionType, DimensionValue, LinearResiduals, Shape, Sharding,
@@ -34,7 +34,7 @@ use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
-use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcastOperation};
+use crate::operations::manipulation::broadcasting::{Broadcast, DynamicBroadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::reshaping::{DynamicReshapeOperation, Reshape, ReshapeParameters};
 use crate::operations::manipulation::slicing::resized_output_sharding;
 use crate::operations::manipulation::transposition::Transpose;
@@ -493,8 +493,9 @@ where
                            + OperationProjection<ArrayType>,
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value:
-        ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>> + ValueProjection<DimensionType>,
+    C::Value: DynamicBroadcast
+        + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>
+        + ValueProjection<DimensionType>,
     <C::Value as ValueProjection<DimensionType>>::Projected:
         DimensionRequirement + Div + Mul + Value<Type = DimensionType>,
 {
@@ -559,13 +560,8 @@ where
         output_extents.push(context.axis_extent().clone());
         output_extents
             .extend(input_extents.iter().cloned().map(<C::Value as ValueProjection<DimensionType>>::from_projected));
-        let value = broadcast_array(
-            context.parent().parent(),
-            <C::Value as ValueProjection<ArrayType>>::from_projected(value),
-            output_extents,
-            output_axes,
-            output_sharding,
-        )?;
+        let value = <C::Value as ValueProjection<ArrayType>>::from_projected(value)
+            .dynamic_broadcast_with_output_sharding(&output_extents, &output_axes, output_sharding)?;
         ArrayBatch::new(<C::Value as ValueProjection<ArrayType>>::into_projected(value)?, BatchAxis::from_position(0))
     }
 

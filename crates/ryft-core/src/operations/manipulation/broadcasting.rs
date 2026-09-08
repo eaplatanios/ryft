@@ -491,7 +491,7 @@ where
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        context: &mut TranspositionContext<'_, V, O>,
+        context: &mut TranspositionContext<V, O>,
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -1004,7 +1004,7 @@ impl<V: Value<Type = ArrayType, DispatchDomain: Context<Type = ArrayType, Operat
 /// let output = scalar.dynamic_broadcast_to(&[extent]).unwrap();
 /// assert_eq!(output.r#type().to_string(), "f32[extent]");
 /// ```
-pub trait DynamicBroadcast: Value<Type = ArrayIrType> + DimensionSize + Sized {
+pub trait DynamicBroadcast: Value<Type = ArrayIrType> + Sized {
     /// Broadcasts `self` using an explicit input-to-output axis mapping and one first-class value per output extent.
     ///
     /// # Parameters
@@ -1041,6 +1041,7 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + DimensionSize + Sized {
     /// Broadcasts `self` by prepending the supplied first-class leading dimensions.
     fn dynamic_broadcast_leading(&self, leading_dimensions: &[Self]) -> Result<Self, ProgramError>
     where
+        Self: DimensionSize,
         Self::DispatchDomain: Context<Type = ArrayIrType>,
         <Self::DispatchDomain as Domain>::Constant: From<DimensionValue>,
     {
@@ -1074,6 +1075,7 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + DimensionSize + Sized {
     /// Broadcasts `self` by prepending exact static leading dimensions.
     fn dynamic_broadcast_leading_sizes(&self, leading_sizes: &[usize]) -> Result<Self, ProgramError>
     where
+        Self: DimensionSize,
         Self::DispatchDomain: Context<Type = ArrayIrType>,
         <Self::DispatchDomain as Domain>::Constant: From<DimensionValue>,
     {
@@ -1086,17 +1088,9 @@ pub trait DynamicBroadcast: Value<Type = ArrayIrType> + DimensionSize + Sized {
     }
 }
 
-impl<
-    V: Value<
-            Type = ArrayIrType,
-            DispatchDomain: Context<
-                Type = ArrayIrType,
-                Operation: From<DynamicBroadcastOperation> + From<DimensionSizeOperation>,
-            >,
-        >,
-> DynamicBroadcast for V
+impl<V: Value<Type = ArrayIrType>> DynamicBroadcast for V
 where
-    <V::DispatchDomain as Domain>::Constant: From<DimensionValue>,
+    V::DispatchDomain: Context<Type = ArrayIrType, Operation: From<DynamicBroadcastOperation>>,
 {
     #[inline]
     fn dynamic_broadcast_with_output_sharding(

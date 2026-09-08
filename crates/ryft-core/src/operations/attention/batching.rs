@@ -1,3 +1,5 @@
+use crate::operations::manipulation::broadcasting::DynamicBroadcast;
+
 use super::*;
 
 /// Semantic role of one attention batching operand.
@@ -275,12 +277,11 @@ where
             Operation: From<ConstantOperation<DimensionValue>>
                            + From<DimensionMulOperation>
                            + From<DimensionSizeOperation>
-                           + From<DynamicBroadcastOperation>
                            + From<DynamicReshapeOperation>
                            + OperationProjection<ArrayType>,
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Value: DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: From<O> + From<ReduceOperation>,
     O: Operation<Type = ArrayType> + Clone,
 {
@@ -341,18 +342,15 @@ where
                     let rank = logical_type.rank();
                     let output_axes =
                         std::iter::once(0).chain((0..rank).map(|axis| 5 - rank + axis)).collect::<Vec<_>>();
-                    let normalized = broadcast_array(
-                        outer_context,
-                        value,
-                        vec![
+                    let normalized = value.dynamic_broadcast(
+                        &[
                             mapped_extent.clone(),
                             batch_extent.clone(),
                             head_extent.clone(),
                             query_sequence_extent.clone(),
                             key_sequence_extent.clone(),
                         ],
-                        output_axes,
-                        None,
+                        &output_axes,
                     )?;
                     reshape_attention_array(
                         outer_context,
@@ -515,7 +513,7 @@ where
                            + OperationProjection<ArrayType>,
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Value: DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     <C::Operation as OperationProjection<ArrayType>>::Projected:
         From<DotProductAttentionOperation> + From<ReduceOperation>,
 {
@@ -552,7 +550,7 @@ where
                            + OperationProjection<ArrayType>,
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Value: DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     <C::Operation as OperationProjection<ArrayType>>::Projected:
         From<DotProductAttentionBackwardOperation> + From<ReduceOperation>,
 {

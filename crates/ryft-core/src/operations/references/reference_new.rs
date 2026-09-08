@@ -228,8 +228,8 @@ where
     // value's cotangent is a symbolic zero and neither `reference_new` nor `reference_freeze` is staged.
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        context: &mut TranspositionContext<'_, V, O>,
-        _driver: &D,
+        context: &mut TranspositionContext<V, O>,
+        driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         accumulators: &[CotangentAccumulator],
@@ -237,7 +237,7 @@ where
         check_count!("input", inputs, 1, ProgramError);
         check_count!("output", outputs, 1, ProgramError);
         check_count!("accumulator", accumulators, 1, DifferentiationError);
-        let contribution = match context.allocation_cotangent(0)? {
+        let contribution = match context.allocation_cotangent(driver, 0)? {
             Some(accumulator) => {
                 MaybeZero::Value(context.bind(ReferenceFreezeOperation::new(), Vec::new(), &[accumulator])?.remove(0))
             }

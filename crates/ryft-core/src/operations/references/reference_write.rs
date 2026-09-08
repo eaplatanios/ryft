@@ -228,8 +228,8 @@ where
     // reached yet already holds zero, so nothing is staged and the stored value's cotangent stays symbolic.
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        context: &mut TranspositionContext<'_, V, O>,
-        _driver: &D,
+        context: &mut TranspositionContext<V, O>,
+        driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         accumulators: &[CotangentAccumulator],
@@ -238,7 +238,7 @@ where
         check_count!("output", outputs, 0, ProgramError);
         check_count!("accumulator", accumulators, 2, DifferentiationError);
         let value_cotangent_type = inputs[1].r#type().cotangent()?;
-        let Some(accumulator) = context.cotangent_reference_if_allocated(0)? else {
+        let Some(accumulator) = context.cotangent_reference_if_allocated(driver, 0)? else {
             return Ok(());
         };
         let zero = O::materialize_zero_from_residual_sources(

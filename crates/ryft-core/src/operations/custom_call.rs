@@ -23,7 +23,7 @@ use crate::operations::control_flow::scan::ScanOperation;
 use crate::operations::differentiation::custom_jvp::CUSTOM_JVP_OPERATION_NAME;
 use crate::operations::differentiation::custom_vjp::CUSTOM_VJP_OPERATION_NAME;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
-use crate::operations::manipulation::broadcasting::DynamicBroadcastOperation;
+use crate::operations::manipulation::broadcasting::{DynamicBroadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
 use crate::parameters::Placeholder;
 use crate::partial::PartiallyEvaluatableOperation;
@@ -1695,7 +1695,9 @@ where
 impl<C: Context<Type = ArrayIrType>> BatchableOperation<C, ArrayIrBatchingPolicy> for CustomCallOperation<ArrayIrType>
 where
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value: PartialEq + ValueProjection<ArrayType, Projected: PartialEq + Transpose + Value<Type = ArrayType>>,
+    C::Value: PartialEq
+        + DynamicBroadcast
+        + ValueProjection<ArrayType, Projected: PartialEq + Transpose + Value<Type = ArrayType>>,
     C::Operation: From<CustomCallOperation<ArrayIrType>>
         + From<DynamicBroadcastOperation>
         + From<ConstantOperation<DimensionValue>>

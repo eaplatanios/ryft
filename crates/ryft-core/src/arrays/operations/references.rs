@@ -415,7 +415,7 @@ macro_rules! impl_default_reference_view_transposition {
         {
             fn transpose<D: TranspositionDriver<V, O>>(
                 &self,
-                context: &mut TranspositionContext<'_, V, O>,
+                context: &mut TranspositionContext<V, O>,
                 _driver: &D,
                 inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
                 outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],

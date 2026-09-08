@@ -1476,7 +1476,7 @@ macro_rules! impl_differentiable_operation {
         {
             fn transpose<__D: $crate::TranspositionDriver<$value, $operations>>(
                 &self,
-                $context: &mut $crate::TranspositionContext<'_, $value, $operations>,
+                $context: &mut $crate::TranspositionContext<$value, $operations>,
                 $driver: &__D,
                 $inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<$value, $operations>>>],
                 $outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<$value, $operations>>>],
@@ -1637,7 +1637,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         {
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
-                _context: &mut $crate::TranspositionContext<'_, __V, __O>,
+                _context: &mut $crate::TranspositionContext<__V, __O>,
                 _driver: &__D,
                 inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
                 outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
@@ -1691,7 +1691,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         {
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
-                context: &mut $crate::TranspositionContext<'_, __V, __O>,
+                context: &mut $crate::TranspositionContext<__V, __O>,
                 _driver: &__D,
                 inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
                 outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
@@ -1733,7 +1733,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         {
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
-                _context: &mut $crate::TranspositionContext<'_, __V, __O>,
+                _context: &mut $crate::TranspositionContext<__V, __O>,
                 _driver: &__D,
                 inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
                 outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
@@ -2099,7 +2099,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         {
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
-                context: &mut $crate::TranspositionContext<'_, __V, __O>,
+                context: &mut $crate::TranspositionContext<__V, __O>,
                 _driver: &__D,
                 inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
                 outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
@@ -2215,7 +2215,7 @@ macro_rules! impl_differentiable_elementwise_operation {
         {
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
-                context: &mut $crate::TranspositionContext<'_, __V, __O>,
+                context: &mut $crate::TranspositionContext<__V, __O>,
                 _driver: &__D,
                 inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
                 outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
@@ -2762,7 +2762,7 @@ macro_rules! impl_non_transposable_operation {
             #[inline]
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
-                _context: &mut $crate::TranspositionContext<'_, __V, __O>,
+                _context: &mut $crate::TranspositionContext<__V, __O>,
                 _driver: &__D,
                 _inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
                 _outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
@@ -2817,7 +2817,7 @@ macro_rules! impl_nullary_transposable_operation {
             #[inline]
             fn transpose<__D: $crate::TranspositionDriver<__V, __O>>(
                 &self,
-                _context: &mut $crate::TranspositionContext<'_, __V, __O>,
+                _context: &mut $crate::TranspositionContext<__V, __O>,
                 _driver: &__D,
                 inputs: &[$crate::PartialValue<$crate::Tracer<$crate::TracingContext<__V, __O>>>],
                 outputs: &[$crate::MaybeZero<$crate::Tracer<$crate::TracingContext<__V, __O>>>],

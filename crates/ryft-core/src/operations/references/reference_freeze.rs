@@ -236,8 +236,8 @@ where
     // earlier (in program order) accesses that the reverse sweep visits next.
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        context: &mut TranspositionContext<'_, V, O>,
-        _driver: &D,
+        context: &mut TranspositionContext<V, O>,
+        driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         accumulators: &[CotangentAccumulator],
@@ -246,7 +246,7 @@ where
         check_count!("output", outputs, 1, ProgramError);
         check_count!("accumulator", accumulators, 1, DifferentiationError);
         if let MaybeZero::Value(cotangent) = &outputs[0] {
-            let reference = context.cotangent_reference(0)?;
+            let reference = context.cotangent_reference(driver, 0)?;
             reference.add_update(cotangent)?;
         }
         Ok(())

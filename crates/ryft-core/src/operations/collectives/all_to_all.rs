@@ -28,7 +28,7 @@ use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::differentiation::linear_call::LinearCallOperation;
 use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
 use crate::operations::dimensions::dimension_size::{DimensionSize, DimensionSizeOperation};
-use crate::operations::manipulation::broadcasting::DynamicBroadcastOperation;
+use crate::operations::manipulation::broadcasting::{DynamicBroadcast, DynamicBroadcastOperation};
 use crate::operations::manipulation::reshaping::{
     DynamicReshapeOperation, Reshape, lift_output_sharding_for_leading_batch_axis,
 };
@@ -370,7 +370,7 @@ where
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        context: &mut TranspositionContext<'_, V, O>,
+        context: &mut TranspositionContext<V, O>,
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -418,8 +418,9 @@ where
                            + OperationProjection<ArrayType>,
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value:
-        ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>> + ValueProjection<DimensionType>,
+    C::Value: DynamicBroadcast
+        + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>
+        + ValueProjection<DimensionType>,
     <C::Value as ValueProjection<DimensionType>>::Projected:
         DimensionRequirement + Div + Mul + Value<Type = DimensionType>,
 {

@@ -1375,7 +1375,7 @@ where
 {
     fn transpose<D: TranspositionDriver<V, Target>>(
         &self,
-        context: &mut TranspositionContext<'_, V, Target>,
+        context: &mut TranspositionContext<V, Target>,
         driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, Target>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, Target>>>],
@@ -3006,7 +3006,7 @@ where
     /// [`TransposableOperation::transpose`] for the contract.
     fn transpose_scan<D: TranspositionDriver<V, Target>>(
         operation: &ScanOperation<F>,
-        context: &mut TranspositionContext<'_, V, Target>,
+        context: &mut TranspositionContext<V, Target>,
         driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, Target>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, Target>>>],
@@ -3035,7 +3035,7 @@ where
     // The array universe has no reference types, so no operand carries a cotangent reference.
     fn transpose_scan<D: TranspositionDriver<V, Target>>(
         operation: &ScanOperation<F>,
-        context: &mut TranspositionContext<'_, V, Target>,
+        context: &mut TranspositionContext<V, Target>,
         driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, Target>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, Target>>>],
@@ -3059,14 +3059,14 @@ where
     // through the reversed scan.
     fn transpose_scan<D: TranspositionDriver<V, Target>>(
         operation: &ScanOperation<F>,
-        context: &mut TranspositionContext<'_, V, Target>,
+        context: &mut TranspositionContext<V, Target>,
         driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, Target>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, Target>>>],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, Target>>>>, DifferentiationError> {
         // A scan's ordinary carry gradients drive earlier iterations, and its scanned gradients have element
         // geometry inside the body. Return those values before the outer rule applies demand or gradient buffers.
-        let cotangents = context.cotangent_destinations(inputs, &[])?;
+        let cotangents = context.cotangent_destinations(driver, inputs, &[])?;
         transpose_array_scan(operation, context, driver, inputs, outputs, &cotangents)
     }
 }

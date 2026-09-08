@@ -1788,7 +1788,6 @@ impl OperationEnum {
                 >>(
                     &self,
                     context: &mut #ryft::TranspositionContext<
-                        '_,
                         #transposed_value_type,
                         #operation_self_type,
                     >,

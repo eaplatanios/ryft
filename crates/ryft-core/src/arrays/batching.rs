@@ -36,8 +36,9 @@ use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count, dispatch_on_array_element_type};
 use crate::operations::{
     AndOperation, Broadcast, BroadcastOperation, CompareOperation, ComparisonDirection, ConstantOperation,
-    DimensionRequirementOperation, DimensionSizeOperation, DynamicBroadcastOperation, ElementwiseOperation,
-    IotaOperation, ReductionKind, SelectOperation, Transpose, TransposeOperation, ZeroLikeOperation,
+    DimensionRequirementOperation, DimensionSizeOperation, DynamicBroadcast, DynamicBroadcastOperation,
+    ElementwiseOperation, IotaOperation, ReductionKind, SelectOperation, Transpose, TransposeOperation,
+    ZeroLikeOperation,
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
@@ -2710,7 +2711,7 @@ where
 
 impl<C: Context<Type = ArrayIrType>, T: Type> ValueProjection<T> for BatchingTracer<C, ArrayIrBatchingPolicy>
 where
-    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Value: DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected = DimensionValue>,
     C::Operation: BatchableOperation<C, ArrayIrBatchingPolicy>
@@ -2917,12 +2918,10 @@ where
 impl<C: Context<Type = ArrayIrType>> ArrayExtentBatchingPolicy<ProjectedContext<C, ArrayType>>
     for DynamicArrayExtentBatchingPolicy
 where
-    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Value: DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Operation: From<DynamicBroadcastOperation>
-        + From<ConstantOperation<DimensionValue>>
-        + From<DimensionSizeOperation>
-        + OperationProjection<ArrayType>,
+    C::Operation:
+        From<ConstantOperation<DimensionValue>> + From<DimensionSizeOperation> + OperationProjection<ArrayType>,
 {
     fn axis_dimension(
         context: &BatchingContext<
@@ -3013,8 +3012,11 @@ where
         // the result carries, so this step only stages the mixed broadcast in the composite parent and relocates
         // the operand's ragged metadata through that same axis mapping.
         let value = <C::Value as ValueProjection<ArrayType>>::from_projected(input.value().clone());
-        let value =
-            broadcast_array(outer_context, value, output_dimensions, output_axes.clone(), r#type.sharding().cloned())?;
+        let value = value.dynamic_broadcast_with_output_sharding(
+            &output_dimensions,
+            &output_axes,
+            r#type.sharding().cloned(),
+        )?;
         let ragged_axes = input
             .ragged_axes()
             .iter()
@@ -3029,10 +3031,9 @@ where
 impl<C: Context<Type = ArrayIrType>> RaggedArrayExtentBatchingPolicy<ProjectedContext<C, ArrayType>>
     for DynamicArrayExtentBatchingPolicy
 where
-    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Value: DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Operation: From<DynamicBroadcastOperation>
-        + From<ConstantOperation<DimensionValue>>
+    C::Operation: From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>
         + OperationProjection<
             ArrayType,
@@ -3195,20 +3196,11 @@ where
                             );
                             let mut iota = array_context.bind(IotaOperation::new(iota_type, 0)?, Vec::new(), &[])?;
                             check_count!("output", iota, 1, ProgramError);
-                            let iota = broadcast_array(
-                                outer_context,
-                                <C::Value as ValueProjection<ArrayType>>::from_projected(iota.remove(0)),
-                                output_dimensions.clone(),
-                                vec![ragged_axis.axis()],
-                                None,
-                            )?;
-                            let broadcasted_extent = broadcast_array(
-                                outer_context,
-                                <C::Value as ValueProjection<ArrayType>>::from_projected(extent_value),
-                                output_dimensions.clone(),
-                                ragged_axis.extent_axes().to_vec(),
-                                None,
-                            )?;
+                            let iota = <C::Value as ValueProjection<ArrayType>>::from_projected(iota.remove(0))
+                                .dynamic_broadcast(&output_dimensions, &[ragged_axis.axis()])?;
+                            let broadcasted_extent =
+                                <C::Value as ValueProjection<ArrayType>>::from_projected(extent_value)
+                                    .dynamic_broadcast(&output_dimensions, ragged_axis.extent_axes())?;
                             let mut current = array_context.bind(
                                 CompareOperation::<ArrayType>::new(ComparisonDirection::LessThan),
                                 Vec::new(),
@@ -3250,13 +3242,9 @@ where
                                 let mut constant =
                                     array_context.bind(ConstantOperation::new(scalar), Vec::new(), &[])?;
                                 check_count!("output", constant, 1, ProgramError);
-                                let broadcasted = broadcast_array(
-                                    outer_context,
-                                    <C::Value as ValueProjection<ArrayType>>::from_projected(constant.remove(0)),
-                                    output_dimensions,
-                                    Vec::new(),
-                                    None,
-                                )?;
+                                let broadcasted =
+                                    <C::Value as ValueProjection<ArrayType>>::from_projected(constant.remove(0))
+                                        .dynamic_broadcast(&output_dimensions, &[])?;
                                 <C::Value as ValueProjection<ArrayType>>::into_projected(broadcasted)?
                             }
                         };
@@ -3446,26 +3434,6 @@ where
     Ok(())
 }
 
-/// Binds one mixed dynamic broadcast against explicit first-class output dimensions.
-pub(crate) fn broadcast_array<C>(
-    context: &C,
-    value: C::Value,
-    output_dimensions: Vec<C::Value>,
-    output_axes: Vec<usize>,
-    output_sharding: Option<Sharding>,
-) -> Result<C::Value, BatchingError>
-where
-    C: Context<Type = ArrayIrType, Operation: From<DynamicBroadcastOperation>>,
-{
-    // A dynamic broadcast takes the operand followed by one first-class dimension operand per output axis, so the
-    // output shape is carried entirely by SSA values rather than by static attributes.
-    let operation = DynamicBroadcastOperation::new(output_axes).with_output_sharding(output_sharding);
-    let mut inputs = Vec::with_capacity(output_dimensions.len() + 1);
-    inputs.push(value);
-    inputs.extend(output_dimensions);
-    Ok(context.bind(operation, Vec::new(), inputs.as_slice())?.remove(0))
-}
-
 impl<C> BatchingEntrypointPolicy<C> for ArrayIrBatchingPolicy
 where
     C: Context<
@@ -3480,7 +3448,8 @@ where
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected = DimensionValue>,
-    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>
+    C::Value: DynamicBroadcast
+        + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
     <C::Operation as OperationProjection<DimensionType>>::Projected: From<DimensionRequirementOperation>,
 {
@@ -3624,11 +3593,9 @@ where
                     .collect::<Result<Vec<_>, _>>()?;
                 let output_axes = (0..array_type.rank()).collect::<Vec<_>>();
                 let batch_axis = batch.batch_axis;
-                let value = broadcast_array(
-                    batching_context.parent(),
-                    batch.value,
-                    output_dimensions,
-                    output_axes,
+                let value = batch.value.dynamic_broadcast_with_output_sharding(
+                    &output_dimensions,
+                    &output_axes,
                     normalized_type.sharding().cloned(),
                 )?;
                 ArrayIrBatch::new(value, batch_axis)
@@ -3687,7 +3654,7 @@ where
 impl<C> RecursiveBatchingPolicy<C> for ArrayIrBatchingPolicy
 where
     C: Context<Type = ArrayIrType>,
-    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Value: DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected = DimensionValue>,
     C::Operation: BatchableOperation<C, ArrayIrBatchingPolicy>
@@ -4050,9 +4017,8 @@ where
 fn broadcast_replicated_array<
     C: Context<
             Type = ArrayIrType,
-            Operation: From<DynamicBroadcastOperation>
-                           + From<ConstantOperation<DimensionValue>>
-                           + From<DimensionSizeOperation>,
+            Value: DynamicBroadcast,
+            Operation: From<ConstantOperation<DimensionValue>> + From<DimensionSizeOperation>,
         >,
 >(
     context: &C,
@@ -4084,7 +4050,7 @@ fn broadcast_replicated_array<
         })
         .transpose()?;
 
-    let value = broadcast_array(context, value, output_dimensions, output_axes.clone(), output_sharding)?;
+    let value = value.dynamic_broadcast_with_output_sharding(&output_dimensions, &output_axes, output_sharding)?;
     Ok((value, output_axes))
 }
 

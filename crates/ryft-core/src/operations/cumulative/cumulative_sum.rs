@@ -225,7 +225,7 @@ where
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        _context: &mut TranspositionContext<'_, V, O>,
+        _context: &mut TranspositionContext<V, O>,
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],

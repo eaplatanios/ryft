@@ -438,7 +438,7 @@ where
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        context: &mut TranspositionContext<'_, V, O>,
+        context: &mut TranspositionContext<V, O>,
         _driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -1289,7 +1289,7 @@ mod tests {
     impl<V: Value<Type = ArrayType>> TransposableOperation<V, TestGatherOperation<V>> for TestGatherOperation<V> {
         fn transpose<D: TranspositionDriver<V, TestGatherOperation<V>>>(
             &self,
-            context: &mut TranspositionContext<'_, V, TestGatherOperation<V>>,
+            context: &mut TranspositionContext<V, TestGatherOperation<V>>,
             driver: &D,
             inputs: &[PartialValue<Tracer<TracingContext<V, TestGatherOperation<V>>>>],
             outputs: &[MaybeZero<Tracer<TracingContext<V, TestGatherOperation<V>>>>],

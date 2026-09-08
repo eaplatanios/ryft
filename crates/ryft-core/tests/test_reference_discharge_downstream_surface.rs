@@ -1196,7 +1196,7 @@ impl<C: Context<Type = RegisterIrType, Operation = RegisterOperation> + Zero<C::
 impl TransposableOperation<RegisterValue, RegisterOperation> for RegisterOperation {
     fn transpose<D: TranspositionDriver<RegisterValue, RegisterOperation>>(
         &self,
-        context: &mut TranspositionContext<'_, RegisterValue, RegisterOperation>,
+        context: &mut TranspositionContext<RegisterValue, RegisterOperation>,
         driver: &D,
         inputs: &[PartialValue<RegisterTracer>],
         outputs: &[MaybeZero<RegisterTracer>],
@@ -1239,7 +1239,7 @@ impl TransposableOperation<RegisterValue, RegisterOperation> for RegisterOperati
                 check_count!("input", inputs, 2, ProgramError);
                 check_count!("output", outputs, 0, ProgramError);
                 check_count!("accumulator", accumulators, 2, DifferentiationError);
-                let update_cotangent = match context.cotangent_reference_if_allocated(0)? {
+                let update_cotangent = match context.cotangent_reference_if_allocated(driver, 0)? {
                     Some(accumulator) => MaybeZero::Value(bind_register_output(
                         &**context,
                         Self::Read(ReferenceReadOperation::new()),

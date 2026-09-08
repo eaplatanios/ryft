@@ -30,7 +30,9 @@ use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::control_flow::select::{Select, SelectOperation};
 use crate::operations::dimensions::dimension_requirement::DimensionRequirementOperation;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
-use crate::operations::manipulation::broadcasting::{Broadcast, BroadcastOperation, DynamicBroadcastOperation};
+use crate::operations::manipulation::broadcasting::{
+    Broadcast, BroadcastOperation, DynamicBroadcast, DynamicBroadcastOperation,
+};
 use crate::operations::manipulation::transposition::{Transpose, TransposeOperation};
 use crate::operations::math::add::AddOperation;
 use crate::operations::references::ReferenceNewOperation;
@@ -495,7 +497,8 @@ where
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
-    C::Value: ValueProjection<ArrayType, Projected: Broadcast + Select + Transpose + Value<Type = ArrayType>>
+    C::Value: DynamicBroadcast
+        + ValueProjection<ArrayType, Projected: Broadcast + Select + Transpose + Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
     <C::Operation as OperationProjection<ArrayType>>::Projected:
         From<BroadcastOperation> + From<SelectOperation<ArrayType>> + From<TransposeOperation>,
@@ -810,7 +813,7 @@ where
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        context: &mut TranspositionContext<'_, V, O>,
+        context: &mut TranspositionContext<V, O>,
         driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -1428,7 +1431,7 @@ where
     /// Applies the type family's `condition` transpose rule using the instruction's driver; refer to the documentation
     /// of [`TransposableOperation::transpose`] for the contract.
     fn transpose_condition<D: TranspositionDriver<V, O>>(
-        context: &mut TranspositionContext<'_, V, O>,
+        context: &mut TranspositionContext<V, O>,
         driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -1443,7 +1446,7 @@ where
 {
     // The array universe has no reference types, so no operand carries a cotangent reference.
     fn transpose_condition<D: TranspositionDriver<V, O>>(
-        context: &mut TranspositionContext<'_, V, O>,
+        context: &mut TranspositionContext<V, O>,
         driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -1467,13 +1470,13 @@ where
     // allocated on first use when their state cotangent is live) before the shared rule passes them into both
     // transposed branches.
     fn transpose_condition<D: TranspositionDriver<V, O>>(
-        context: &mut TranspositionContext<'_, V, O>,
+        context: &mut TranspositionContext<V, O>,
         driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
         accumulators: &[CotangentAccumulator],
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-        let cotangents = context.cotangent_destinations(inputs, accumulators)?;
+        let cotangents = context.cotangent_destinations(driver, inputs, accumulators)?;
         transpose_primal_condition(context, driver, inputs, outputs, &cotangents).map_err(DifferentiationError::from)
     }
 }

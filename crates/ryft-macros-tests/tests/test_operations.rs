@@ -478,15 +478,14 @@ impl<V: Value, O: Operation<Type = V::Type>> Value for Tracer<TracingContext<V, 
     type Type = V::Type;
 }
 
-/// Stand-in for `ryft_core::TranspositionContext`. Mirrors the real context's region lifetime and its dereferencing to
-/// the wrapped tracing context, which is what generated transposition dispatchers pass through to payload rules.
-struct TranspositionContext<'r, V: Value, O: Operation<Type = V::Type>> {
+/// Stand-in for `ryft_core::TranspositionContext`. Mirrors its dereferencing to the wrapped tracing context, which
+/// generated transposition dispatchers pass through to payload rules.
+struct TranspositionContext<V: Value, O: Operation<Type = V::Type>> {
     contributions: Vec<MaybeZero<Tracer<TracingContext<V, O>>>>,
     context: TracingContext<V, O>,
-    marker: PhantomData<&'r ()>,
 }
 
-impl<V: Value, O: Operation<Type = V::Type>> std::ops::Deref for TranspositionContext<'_, V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> std::ops::Deref for TranspositionContext<V, O> {
     type Target = TracingContext<V, O>;
 
     fn deref(&self) -> &TracingContext<V, O> {
@@ -494,7 +493,7 @@ impl<V: Value, O: Operation<Type = V::Type>> std::ops::Deref for TranspositionCo
     }
 }
 
-impl<V: Value, O: Operation<Type = V::Type>> std::ops::DerefMut for TranspositionContext<'_, V, O> {
+impl<V: Value, O: Operation<Type = V::Type>> std::ops::DerefMut for TranspositionContext<V, O> {
     fn deref_mut(&mut self) -> &mut TracingContext<V, O> {
         &mut self.context
     }
@@ -507,7 +506,7 @@ impl CotangentAccumulator {
     /// Records a contribution in the fixture context.
     fn accumulate<V: Value, O: Operation<Type = V::Type>>(
         &self,
-        context: &mut TranspositionContext<'_, V, O>,
+        context: &mut TranspositionContext<V, O>,
         contribution: MaybeZero<Tracer<TracingContext<V, O>>>,
     ) -> Result<(), DifferentiationError> {
         context.contributions.push(contribution);
@@ -546,7 +545,7 @@ impl<V> Eq for MaybeZero<V> {}
 trait TransposableOperation<V: Value, O: Operation<Type = V::Type>>: Operation<Type = V::Type> {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        context: &mut TranspositionContext<'_, V, O>,
+        context: &mut TranspositionContext<V, O>,
         driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -1002,7 +1001,7 @@ impl<T: Type, C: Context<Type = T>> DifferentiableOperation<C> for ZeroOperation
 impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>> TransposableOperation<V, O> for ZeroOperation<T> {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        context: &mut TranspositionContext<'_, V, O>,
+        context: &mut TranspositionContext<V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -1051,7 +1050,7 @@ impl<C: Context<Type = DataType>> partial::PartiallyEvaluatableOperation<C> for 
 impl<V: Value<Type = DataType>, O: Operation<Type = DataType>> TransposableOperation<V, O> for AddOperation {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        context: &mut TranspositionContext<'_, V, O>,
+        context: &mut TranspositionContext<V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -1197,7 +1196,7 @@ impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>, F: Clone> Transposable
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        context: &mut TranspositionContext<'_, V, O>,
+        context: &mut TranspositionContext<V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -1367,7 +1366,7 @@ impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>, F: Clone> Transposable
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        context: &mut TranspositionContext<'_, V, O>,
+        context: &mut TranspositionContext<V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -1651,7 +1650,7 @@ mod mixed_members {
     {
         fn transpose<D: TranspositionDriver<V, O>>(
             &self,
-            context: &mut TranspositionContext<'_, V, O>,
+            context: &mut TranspositionContext<V, O>,
             _driver: &D,
             inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
             outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -1741,7 +1740,7 @@ mod mixed_members {
     {
         fn transpose<D: TranspositionDriver<V, O>>(
             &self,
-            _context: &mut TranspositionContext<'_, V, O>,
+            _context: &mut TranspositionContext<V, O>,
             _driver: &D,
             inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
             outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -1776,7 +1775,7 @@ mod mixed_members {
     impl<V: Value<Type = ArrayType>> TransposableOperation<V, Self> for MixedMemberOperation<V> {
         fn transpose<D: TranspositionDriver<V, Self>>(
             &self,
-            context: &mut TranspositionContext<'_, V, Self>,
+            context: &mut TranspositionContext<V, Self>,
             driver: &D,
             inputs: &[PartialValue<Tracer<TracingContext<V, Self>>>],
             outputs: &[MaybeZero<Tracer<TracingContext<V, Self>>>],
@@ -1847,7 +1846,7 @@ mod mixed_members {
     {
         fn transpose_in_parent<D: TranspositionDriver<V, MixedProgramOperation<A>>>(
             &self,
-            _context: &mut TranspositionContext<'_, V, MixedProgramOperation<A>>,
+            _context: &mut TranspositionContext<V, MixedProgramOperation<A>>,
             _driver: &D,
             inputs: &[PartialValue<Tracer<TracingContext<V, MixedProgramOperation<A>>>>],
             outputs: &[MaybeZero<Tracer<TracingContext<V, MixedProgramOperation<A>>>>],
@@ -2084,7 +2083,7 @@ impl<C: Context<Type = ArrayType>> partial::PartiallyEvaluatableOperation<C> for
 impl<V: Value<Type = ArrayType>, O: Operation<Type = ArrayType>> TransposableOperation<V, O> for BackendPayload {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        _context: &mut TranspositionContext<'_, V, O>,
+        _context: &mut TranspositionContext<V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -2151,7 +2150,7 @@ where
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        context: &mut TranspositionContext<'_, V, O>,
+        context: &mut TranspositionContext<V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -2270,7 +2269,7 @@ impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>, W: Clone, P: Clone> Tr
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        context: &mut TranspositionContext<'_, V, O>,
+        context: &mut TranspositionContext<V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -2325,7 +2324,7 @@ impl<V: Value<Type = ArrayType>, O: Operation<Type = ArrayType>, P: Operation<Ty
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        context: &mut TranspositionContext<'_, V, O>,
+        context: &mut TranspositionContext<V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -2382,7 +2381,7 @@ impl<T: Type, V: Value<Type = T>, O: Operation<Type = T>, C: Clone, P: Clone, F:
 {
     fn transpose<D: TranspositionDriver<V, O>>(
         &self,
-        context: &mut TranspositionContext<'_, V, O>,
+        context: &mut TranspositionContext<V, O>,
         _driver: &D,
         _inputs: &[PartialValue<Tracer<TracingContext<V, O>>>],
         _outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
@@ -2487,7 +2486,6 @@ fn test_transposable_operation_dispatches_to_payloads() {
     let mut context = TranspositionContext::<ScalarFactor, Operation> {
         contributions: Vec::new(),
         context: TracingContext { marker: PhantomData },
-        marker: PhantomData,
     };
 
     operation.transpose(&mut context, &EmptyRegionDriver, &[], &[], &[CotangentAccumulator]).unwrap();
@@ -3310,7 +3308,6 @@ fn test_operation_generates_all_selected_dispatchers() {
     let mut transposition_context = TranspositionContext {
         contributions: Vec::new(),
         context: TracingContext::<Factor, Operation> { marker: PhantomData },
-        marker: PhantomData,
     };
     operation
         .transpose(&mut transposition_context, &EmptyRegionDriver, &[], &[], &[CotangentAccumulator])
