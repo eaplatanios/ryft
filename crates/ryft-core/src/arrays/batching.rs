@@ -36,9 +36,8 @@ use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count, dispatch_on_array_element_type};
 use crate::operations::{
     AndOperation, Broadcast, BroadcastOperation, CompareOperation, ComparisonDirection, ConstantOperation,
-    DimensionRequirementOperation, DimensionSizeOperation, DynamicBroadcast, DynamicBroadcastOperation,
-    ElementwiseOperation, IotaOperation, ReductionKind, SelectOperation, Transpose, TransposeOperation,
-    ZeroLikeOperation,
+    DimensionRequirement, DimensionSizeOperation, DynamicBroadcast, DynamicBroadcastOperation, ElementwiseOperation,
+    IotaOperation, ReductionKind, SelectOperation, Transpose, TransposeOperation, ZeroLikeOperation,
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
@@ -3412,26 +3411,6 @@ where
     }
 }
 
-/// Requires two composite dimension values to describe the same mapped extent.
-pub(crate) fn require_equal_dimensions<C>(context: &C, left: &C::Value, right: &C::Value) -> Result<(), BatchingError>
-where
-    C: Context<Type = ArrayIrType>,
-    C::Constant: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
-    C::Value: ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
-    C::Operation: OperationProjection<DimensionType>,
-    <C::Operation as OperationProjection<DimensionType>>::Projected: From<DimensionRequirementOperation>,
-{
-    // The requirement is a dimension-universe operation, so both operands are projected to their dimension member and
-    // the check is bound through a projected view of `context`. Binding, rather than comparing on the host, is what
-    // lets the same check fold against concrete extents under eager batching and stay staged as a runtime requirement
-    // when either extent is symbolic.
-    let left = <C::Value as ValueProjection<DimensionType>>::into_projected(left.clone())?;
-    let right = <C::Value as ValueProjection<DimensionType>>::into_projected(right.clone())?;
-    let operation = DimensionRequirementOperation::equal(left.r#type().as_ref(), right.r#type().as_ref());
-    ProjectedContext::<C, DimensionType>::new(context.clone()).bind(operation, Vec::new(), &[left, right])?;
-    Ok(())
-}
-
 impl<C> BatchingEntrypointPolicy<C> for ArrayIrBatchingPolicy
 where
     C: Context<
@@ -3441,15 +3420,13 @@ where
                            + From<DynamicBroadcastOperation>
                            + From<ConstantOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
-                           + OperationProjection<ArrayType, Projected: From<TransposeOperation>>
-                           + OperationProjection<DimensionType>,
+                           + OperationProjection<ArrayType, Projected: From<TransposeOperation>>,
         >,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
         + ValueProjection<DimensionType, Projected = DimensionValue>,
     C::Value: DynamicBroadcast
         + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>
-        + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
-    <C::Operation as OperationProjection<DimensionType>>::Projected: From<DimensionRequirementOperation>,
+        + ValueProjection<DimensionType, Projected: DimensionRequirement>,
 {
     fn pack_inputs(
         context: &C,
@@ -3523,7 +3500,11 @@ where
                 _ => array_dimension(context, &batch.value, position)?,
             };
             if let Some(axis_extent) = &axis_extent {
-                require_equal_dimensions(context, axis_extent, &input_extent)?;
+                // Binding the requirement through the dimension member, rather than comparing on the host, lets
+                // the same check fold against concrete extents under eager batching and stay staged as a runtime
+                // requirement when either extent is symbolic.
+                <C::Value as ValueProjection<DimensionType>>::into_projected(axis_extent.clone())?
+                    .require_equal(&<C::Value as ValueProjection<DimensionType>>::into_projected(input_extent)?)?;
             } else {
                 axis_extent = Some(input_extent);
             }
@@ -4058,6 +4039,7 @@ mod tests {
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{Differentiate, ForwardModeDifferentiate, LinearizationTracer};
+    use crate::operations::DimensionRequirementOperation;
     use crate::operations::collectives::{
         AllGatherOperation, AllGatherOutputVariance, AllToAllOperation, CollectiveOptions, ParallelSumScatterOperation,
     };

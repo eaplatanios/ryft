@@ -8,7 +8,6 @@ use std::fmt::{Debug, Display};
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::arrays::batching::require_equal_dimensions;
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
     ArrayIrValue, ArrayType, DimensionType, DimensionValue,
@@ -28,7 +27,7 @@ use crate::macros::{check_count, check_types};
 use crate::operations::constants::constant::ConstantOperation;
 use crate::operations::constants::zero::{Zero, ZeroOperation};
 use crate::operations::control_flow::select::{Select, SelectOperation};
-use crate::operations::dimensions::dimension_requirement::DimensionRequirementOperation;
+use crate::operations::dimensions::dimension_requirement::DimensionRequirement;
 use crate::operations::dimensions::dimension_size::DimensionSizeOperation;
 use crate::operations::manipulation::broadcasting::{
     Broadcast, BroadcastOperation, DynamicBroadcast, DynamicBroadcastOperation,
@@ -492,17 +491,14 @@ where
                            + From<ConditionOperation<ArrayIrValue<A>>>
                            + From<ConstantOperation<DimensionValue>>
                            + From<DimensionSizeOperation>
-                           + OperationProjection<ArrayType>
-                           + OperationProjection<DimensionType>,
+                           + OperationProjection<ArrayType>,
         >,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
-        + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: DynamicBroadcast
         + ValueProjection<ArrayType, Projected: Broadcast + Select + Transpose + Value<Type = ArrayType>>
-        + ValueProjection<DimensionType, Projected: Value<Type = DimensionType>>,
+        + ValueProjection<DimensionType, Projected: DimensionRequirement>,
     <C::Operation as OperationProjection<ArrayType>>::Projected:
         From<BroadcastOperation> + From<SelectOperation<ArrayType>> + From<TransposeOperation>,
-    <C::Operation as OperationProjection<DimensionType>>::Projected: From<DimensionRequirementOperation>,
 {
     fn batch<D: BatchingDriver<C, ArrayIrBatchingPolicy>>(
         &self,
@@ -621,7 +617,10 @@ where
                 ArrayIrType::Dimension(_) => {
                     true_output.validate_replicated_dimension()?;
                     false_output.validate_replicated_dimension()?;
-                    require_equal_dimensions(context.parent(), true_output.value(), false_output.value())?;
+                    <C::Value as ValueProjection<DimensionType>>::into_projected(true_output.value().clone())?
+                        .require_equal(&<C::Value as ValueProjection<DimensionType>>::into_projected(
+                            false_output.value().clone(),
+                        )?)?;
                     Ok(true_output)
                 }
                 ArrayIrType::Reference(_) => {
