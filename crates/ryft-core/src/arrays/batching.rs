@@ -2958,14 +2958,8 @@ where
         // batching level and past the projected array view) on the lifted composite value, and the result is projected
         // back into the array member afterward. Ragged metadata follows the operand-to-output axis mapping.
         let value = <C::Value as ValueProjection<ArrayType>>::from_projected(batch.value().clone());
-        let (value, output_axes) = broadcast_replicated_array(
-            context.parent().parent(),
-            value,
-            &array_type,
-            position,
-            context.axis_extent(),
-            context.axis_sharding(),
-        )?;
+        let (value, output_axes) =
+            broadcast_replicated_array(value, &array_type, position, context.axis_extent(), context.axis_sharding())?;
         let ragged_axes = batch
             .ragged_axes()
             .iter()
@@ -3167,7 +3161,7 @@ where
                         // Every broadcast below targets the operand's full packed shape, so its first-class dimensions
                         // are read once and shared.
                         let output_dimensions = (0..packed_type.rank())
-                            .map(|axis| folded_array_dimension(outer_context, &lifted_input_value, axis))
+                            .map(|axis| lifted_input_value.dimension_size(axis))
                             .collect::<Result<Vec<_>, _>>()?;
 
                         // Each masked ragged axis contributes one `iota < extents` predicate that is true exactly on
@@ -3376,22 +3370,6 @@ where
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Returns one packed array axis as a first-class dimension value, staging an exact constant when the axis extent is
-/// statically known and reading the axis through [`array_dimension`] only when it is genuinely dynamic. Folding the
-/// static axes keeps staged programs free of `dimension_size` reads whose results the type system already knows.
-pub(crate) fn folded_array_dimension<C>(context: &C, value: &C::Value, axis: usize) -> Result<C::Value, BatchingError>
-where
-    C: Context<Type = ArrayIrType> + DimensionConstant,
-    C::Value: DimensionSize,
-{
-    let value_type = value.r#type();
-    let array_type = <&ArrayType>::try_from(value_type.as_ref())?;
-    match array_type.shape().dimensions().get(axis) {
-        Some(Dimension::Static(extent)) => Ok(context.dimension_constant(*extent)?),
-        _ => Ok(value.dimension_size(axis)?),
-    }
-}
-
 impl<C> BatchingEntrypointPolicy<C> for ArrayIrBatchingPolicy
 where
     C: Context<
@@ -3549,7 +3527,7 @@ where
                 let output_dimensions = (0..array_type.rank())
                     .map(|axis| match axis == position {
                         true => Ok(batching_context.axis_extent().clone()),
-                        false => folded_array_dimension(batching_context.parent(), &batch.value, axis),
+                        false => batch.value.dimension_size(axis),
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let output_axes = (0..array_type.rank()).collect::<Vec<_>>();
@@ -3900,7 +3878,6 @@ where
                 .map_err(|_| BatchingError::BatchAxisOutOfBounds { r#type: Box::new(array_type.clone()), axis })?;
             let (value, ragged_axes) = batch.into_value_and_ragged_axes();
             let (value, output_axes) = broadcast_replicated_array(
-                context.parent(),
                 value,
                 array_type,
                 position,
@@ -3949,40 +3926,31 @@ where
     }
 }
 
-/// Broadcasts the replicated array `value`, whose per-item type is `array_type`, so that it gains the mapped batch axis
-/// at `position` with the transform's `axis_extent` and `axis_sharding`. The per-item shape survives unchanged, so each
-/// of its axes contributes either an exact constant or a `dimension_size` read of `value`, and the inserted axis takes
-/// the transform's own extent. Returns the broadcast value together with the operand-to-output axis mapping, through
-/// which callers relocate their ragged-axis metadata.
+/// Broadcasts the replicated array `value`, whose per-item type is `r#type`, so that it gains the mapped batch axis at
+/// `position` with the transform's `axis_extent` and `axis_sharding`. The per-item shape survives unchanged, so each of
+/// its axes is read through [`DimensionSize`], which folds statically known extents into literals, and the inserted
+/// axis takes the transform's own extent. Returns the broadcast value together with the operand-to-output axis
+/// mapping, through which callers relocate their ragged-axis metadata.
 ///
 /// # Parameters
 ///
-///   - `context`: Parent context in which the dimension reads and the dynamic broadcast are bound.
 ///   - `value`: Replicated packed array value to broadcast.
-///   - `array_type`: Per-item type of `value`, whose sharding (if any) gains the batch axis placement.
+///   - `r#type`: Per-item type of `value`, whose sharding (if any) gains the batch axis placement.
 ///   - `position`: Normalized position of the inserted mapped axis in the broadcast output.
 ///   - `axis_extent`: First-class extent of the transform's mapped axis.
 ///   - `axis_sharding`: Sharding placement of the transform's mapped axis.
-fn broadcast_replicated_array<
-    C: Context<
-            Type = ArrayIrType,
-            Value: DimensionSize + DynamicBroadcast,
-            Operation: From<ConstantOperation<DimensionValue>>,
-        >,
->(
-    context: &C,
-    value: C::Value,
+fn broadcast_replicated_array<V: DimensionSize + DynamicBroadcast>(
+    value: V,
     r#type: &ArrayType,
     position: usize,
-    axis_extent: &C::Value,
+    axis_extent: &V,
     axis_sharding: &ShardingDimension,
-) -> Result<(C::Value, Vec<usize>), BatchingError> {
+) -> Result<(V, Vec<usize>), BatchingError> {
     // The output shape is the per-item shape with the mapped extent inserted at `position`. Every per-item axis is read
     // back from `value` (or folded to a constant when static) and keeps its relative order, shifting by one past the
     // inserted axis. The resulting operand-to-output mapping is also what callers use to relocate ragged metadata.
-    let mut output_dimensions = (0..r#type.rank())
-        .map(|axis| folded_array_dimension(context, &value, axis))
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut output_dimensions =
+        (0..r#type.rank()).map(|axis| value.dimension_size(axis)).collect::<Result<Vec<_>, _>>()?;
     output_dimensions.insert(position, axis_extent.clone());
 
     let output_axes = (0..r#type.rank())
@@ -6823,7 +6791,7 @@ mod tests {
         )
         .err()
         .unwrap();
-        assert_eq!(error.to_string(), "size(axis=0) == 4; observed size(axis=0)=2, 4=4");
+        assert_eq!(error.to_string(), "2 == 4; observed 2=2, 4=4");
         Ok(())
     }
 
@@ -7034,10 +7002,10 @@ mod tests {
         let operations = builder.instructions().iter().map(|instruction| instruction.operation()).collect::<Vec<_>>();
         assert_eq!(operations.len(), 5);
 
-        // Both mapped inputs still spend explicit extent reads for the mapped axis itself, which the ordered
-        // requirement checks against each other.
-        assert!(matches!(operations[0], ArrayIrOperation::DimensionSize(_)));
-        assert!(matches!(operations[1], ArrayIrOperation::DimensionSize(_)));
+        // Both mapped inputs still materialize the extent of the mapped axis itself, folded to exact literals because
+        // the axis is static, which the ordered requirement checks against each other.
+        assert!(matches!(operations[0], ArrayIrOperation::Dimension(DimensionOperation::Constant(_))));
+        assert!(matches!(operations[1], ArrayIrOperation::Dimension(DimensionOperation::Constant(_))));
         assert!(matches!(operations[2], ArrayIrOperation::Dimension(DimensionOperation::Requirement(_))));
 
         // Only the trailing static axis of the renormalized input costs an instruction, and it is an exact constant

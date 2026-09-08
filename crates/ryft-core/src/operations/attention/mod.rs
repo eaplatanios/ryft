@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use ryft_macros::Parameterized;
 
-use crate::arrays::batching::{DynamicArrayExtentBatchingPolicy, folded_array_dimension};
+use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrType, ArrayType, DataType, Dimension,
     DimensionType, DimensionValue, Shape, Sharding, StaticArrayExtentBatchingPolicy,

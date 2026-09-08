@@ -308,14 +308,10 @@ where
     let query = C::Value::from_projected(aligned_inputs[0].value().clone());
     let key = C::Value::from_projected(aligned_inputs[1].value().clone());
     let mapped_extent = context.axis_extent().clone();
-    let batch_extent = if query_rank == 4 {
-        folded_array_dimension(outer_context, &query, 1)?
-    } else {
-        outer_context.dimension_constant(1)?
-    };
-    let query_sequence_extent = folded_array_dimension(outer_context, &query, 1 + query_rank - 3)?;
-    let head_extent = folded_array_dimension(outer_context, &query, 1 + query_rank - 2)?;
-    let key_sequence_extent = folded_array_dimension(outer_context, &key, 1 + key_type.rank() - 3)?;
+    let batch_extent = if query_rank == 4 { query.dimension_size(1)? } else { outer_context.dimension_constant(1)? };
+    let query_sequence_extent = query.dimension_size(1 + query_rank - 3)?;
+    let head_extent = query.dimension_size(1 + query_rank - 2)?;
+    let key_sequence_extent = key.dimension_size(1 + key_type.rank() - 3)?;
     let merged_batch_extent = multiply_attention_dimensions(outer_context, &mapped_extent, &batch_extent)?;
 
     let merged_values = aligned_inputs
@@ -330,7 +326,7 @@ where
                         let dimensions = std::iter::once(merged_batch_extent.clone())
                             .chain(
                                 (2..aligned.r#type().rank())
-                                    .map(|axis| folded_array_dimension(outer_context, &value, axis))
+                                    .map(|axis| value.dimension_size(axis))
                                     .collect::<Result<Vec<_>, _>>()?,
                             )
                             .collect();
@@ -372,7 +368,7 @@ where
                         let dimensions = std::iter::once(merged_batch_extent.clone())
                             .chain(
                                 (2..aligned.r#type().rank())
-                                    .map(|axis| folded_array_dimension(outer_context, &value, axis))
+                                    .map(|axis| value.dimension_size(axis))
                                     .collect::<Result<Vec<_>, _>>()?,
                             )
                             .collect();
@@ -398,7 +394,7 @@ where
                         let aligned = &aligned_inputs[*input_index];
                         let aligned_value = C::Value::from_projected(aligned.value().clone());
                         let dimensions = (0..aligned.r#type().rank())
-                            .map(|axis| folded_array_dimension(outer_context, &aligned_value, axis))
+                            .map(|axis| aligned_value.dimension_size(axis))
                             .collect::<Result<Vec<_>, _>>()?;
                         reshape_attention_array(outer_context, output, dimensions)?
                     } else {
@@ -408,7 +404,7 @@ where
                 AttentionBatchOutput::Statistic => {
                     if query_rank == 4 {
                         let dimensions = (0..aligned_inputs[0].r#type().rank() - 1)
-                            .map(|axis| folded_array_dimension(outer_context, &query, axis))
+                            .map(|axis| query.dimension_size(axis))
                             .collect::<Result<Vec<_>, _>>()?;
                         reshape_attention_array(outer_context, output, dimensions)?
                     } else {
@@ -448,7 +444,7 @@ where
                     let aligned = &aligned_inputs[*input_index];
                     let aligned_value = C::Value::from_projected(aligned.value().clone());
                     let dimensions = (0..aligned.r#type().rank())
-                        .map(|axis| folded_array_dimension(outer_context, &aligned_value, axis))
+                        .map(|axis| aligned_value.dimension_size(axis))
                         .collect::<Result<Vec<_>, _>>()?;
                     reshape_attention_array(outer_context, reduced, dimensions)?
                 }

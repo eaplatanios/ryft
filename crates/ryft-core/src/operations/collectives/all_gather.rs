@@ -6,7 +6,7 @@
 
 use std::fmt::Display;
 
-use crate::arrays::batching::{DynamicArrayExtentBatchingPolicy, folded_array_dimension};
+use crate::arrays::batching::DynamicArrayExtentBatchingPolicy;
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, Dimension,
     DimensionOperation, DimensionType, DimensionValue, DimensionVariable, LinearResiduals, RaggedAxis, Shape, Sharding,
@@ -583,7 +583,7 @@ where
                 };
                 // The packed capacity comes from the operand axis. A dimension variable's exclusive upper bound
                 // only constrains logical extents and may be looser than that physical capacity.
-                let physical_extent = folded_array_dimension(context.parent(), array.value(), ragged_axis.axis())?;
+                let physical_extent = array.value().dimension_size(ragged_axis.axis())?;
                 Ok((
                     output_axis,
                     physical_extent,

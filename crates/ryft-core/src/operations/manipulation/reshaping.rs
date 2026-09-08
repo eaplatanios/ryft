@@ -1590,8 +1590,8 @@ mod tests {
             indoc! {"
                 lambda %0:f64[batch, 2, 3] .
                 let %1:dimension<batch ∈ [1, 9)> = dimension_size [axis=0] %0
-                    %2:dimension<2> = dimension_size [axis=1] %0
-                    %3:dimension<3> = dimension_size [axis=2] %0
+                    %2:dimension<2> = constant [value=2]
+                    %3:dimension<3> = constant [value=3]
                     %4:dimension<6> = dimension_mul %2 %3
                     %5:f64[batch, 6] = reshape %0 %1 %4
                 in (%5)

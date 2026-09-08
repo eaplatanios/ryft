@@ -9,7 +9,7 @@ use ryft_macros::Parameter;
 
 use crate::arrays::{
     ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, Dimension, DimensionError, DimensionType,
-    DimensionVariable, MAX_DIMENSION_EXTENT,
+    DimensionValue, DimensionVariable, MAX_DIMENSION_EXTENT,
 };
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -19,6 +19,7 @@ use crate::macros::{
     check_count, impl_non_differentiable_operation, impl_non_transposable_operation,
     impl_reference_dischargeable_operation,
 };
+use crate::operations::constants::constant::{ConstantOperation, DimensionConstant};
 use crate::parameters::Parameter;
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
@@ -264,8 +265,12 @@ impl_non_transposable_operation!(DimensionSizeOperation);
 /// [`ProjectedValue<ArrayType, V>`]. The projected form stages into and returns the parent composite carrier, allowing
 /// an array operation result to feed shape computation without exposing an adapter conversion in user code.
 ///
-/// Negative axes index from the final array axis. A dynamic selected axis preserves its existing
-/// [`DimensionVariable`], while a static selected axis produces a fresh dimension with exact bounds.
+/// Negative axes index from the final array axis. The representation of the result depends on whether the type already
+/// pins the extent. A dynamic selected axis stages a [`DimensionSizeOperation`] read that preserves the axis's
+/// [`DimensionVariable`]. A static selected axis is folded: its extent is known from the type, so staging
+/// implementations return a dimension literal through [`DimensionConstant`] instead of reading it back from the array,
+/// and staged programs therefore contain no `dimension_size` reads whose results the type system already knows. Eager
+/// implementations return the host extent either way.
 ///
 /// # Example
 ///
@@ -290,12 +295,20 @@ pub trait DimensionSize<Output = Self>: Typed + Sized {
 impl<V: Value<Type = ArrayIrType>> DimensionSize<V> for V
 where
     V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<DimensionSizeOperation>,
+    <V::DispatchDomain as Domain>::Operation: From<DimensionSizeOperation> + From<ConstantOperation<DimensionValue>>,
 {
     fn dimension_size<AxisValue: Into<Axis>>(&self, axis: AxisValue) -> Result<V, ProgramError> {
         let r#type = self.r#type();
         let input_type = <&ArrayType>::try_from(r#type.as_ref())?;
+
+        // Constructing the operation first validates and normalizes `axis`. A statically known extent is then folded
+        // into a literal rather than read back from the array.
         let operation = DimensionSizeOperation::new(input_type, axis)?;
+
+        if let Dimension::Static(extent) = operation.input_dimension() {
+            return self.dispatch_domain().dimension_constant(*extent);
+        }
+
         Ok(self.dispatch_domain().bind(operation, Vec::new(), std::slice::from_ref(self))?.remove(0))
     }
 }
@@ -303,10 +316,15 @@ where
 impl<V: Value<Type = ArrayIrType>> DimensionSize<V> for ProjectedValue<ArrayType, V>
 where
     V::DispatchDomain: Context<Type = ArrayIrType>,
-    <V::DispatchDomain as Domain>::Operation: From<DimensionSizeOperation>,
+    <V::DispatchDomain as Domain>::Operation: From<DimensionSizeOperation> + From<ConstantOperation<DimensionValue>>,
 {
     fn dimension_size<AxisValue: Into<Axis>>(&self, axis: AxisValue) -> Result<V, ProgramError> {
+        // The projected view stages into and returns the parent composite carrier, folding static axes exactly like
+        // the composite implementation above.
         let operation = DimensionSizeOperation::new(self.r#type().as_ref(), axis)?;
+        if let Dimension::Static(extent) = operation.input_dimension() {
+            return self.value().dispatch_domain().dimension_constant(*extent);
+        }
         Ok(self
             .value()
             .dispatch_domain()
@@ -323,7 +341,7 @@ mod tests {
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, DataType, DimensionBounds, DimensionOperation, DimensionValue, Shape,
     };
-    use crate::contexts::{Context, EagerContext};
+    use crate::contexts::{Context, EagerContext, StagingContext};
     use crate::operations::dimensions::dimension_add::DimensionAddOperation;
     use crate::operations::manipulation::concatenation::ConcatenateOperation;
     use crate::operations::manipulation::reshaping::DynamicReshapeOperation;
@@ -650,7 +668,7 @@ mod tests {
 
     #[test]
     fn test_dimension_size_partial_evaluation() {
-        type TestContext = TracingContext<ArrayIrValue<Array>, DimensionSizeOperation>;
+        type TestContext = TracingContext<ArrayIrValue<Array>, ArrayIrOperation<Array>>;
 
         let variable = DimensionVariable::new("extent", DimensionBounds::new(2, Some(8)).unwrap());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(variable)]));
@@ -670,5 +688,29 @@ mod tests {
         let unknown = program.partially_evaluate(&[PartialValue::Unknown(input_type.into())]).unwrap();
         assert_eq!(unknown.program().instructions().len(), 1);
         assert!(matches!(unknown.outputs(), [PartialEvaluationOutput::Unknown(_)],));
+    }
+
+    #[test]
+    fn test_dimension_size_folds_static_axes() {
+        // A dynamic axis is read back from the array and keeps its dimension identity, while a static axis is folded
+        // into a literal instead of a read, so the trace carries no `dimension_size` whose result the type already
+        // knows.
+        let items = DimensionVariable::new("items", DimensionBounds::new(1, Some(9)).unwrap());
+        let context = TracingContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let array = context.input(
+            ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(items.clone()), Dimension::Static(3)]))
+                .into(),
+        );
+        let dynamic = array.dimension_size(0).unwrap();
+        let r#static = array.dimension_size(-1).unwrap();
+        assert!(matches!(dynamic.r#type().as_ref(), ArrayIrType::Dimension(r#type) if r#type.variable() == &items));
+        assert!(matches!(r#static.r#type().as_ref(), ArrayIrType::Dimension(r#type) if r#type.extent() == Some(3)));
+        let builder = context.builder().borrow();
+        let [read, literal] = builder.instructions() else {
+            panic!("expected one dimension read followed by one dimension literal");
+        };
+        assert!(matches!(read.operation(), ArrayIrOperation::DimensionSize(operation) if operation.axis() == 0));
+        assert!(matches!(literal.operation(), ArrayIrOperation::Dimension(DimensionOperation::Constant(_))));
+        assert!(literal.inputs().is_empty());
     }
 }
