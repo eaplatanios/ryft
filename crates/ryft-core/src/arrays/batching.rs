@@ -2707,6 +2707,579 @@ where
     type Projected = ReplicatedDimensionBatchingPolicy;
 }
 
+impl<C: Context<Type = ArrayIrType>> RecursiveBatchingPolicy<C> for ArrayIrBatchingPolicy
+where
+    C::Value:
+        DimensionSize + DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+        + ValueProjection<DimensionType, Projected = DimensionValue>,
+    C::Operation: BatchableOperation<C, ArrayIrBatchingPolicy>
+        + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayIrBatchingPolicy>
+        + From<DynamicBroadcastOperation>
+        + From<ConstantOperation<DimensionValue>>
+        + From<DimensionSizeOperation>
+        + OperationProjection<ArrayType, Projected: From<TransposeOperation>>,
+{
+    fn batch_region(
+        context: &BatchingContext<C, Self>,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        inputs: Vec<Self::Batch>,
+    ) -> Result<Vec<Self::Batch>, BatchingError> {
+        // Regions are replayed through the checked constant and operation boundaries.
+        let region_mappings = RegionReplayMappings::new();
+        region.interpret_with(
+            inputs,
+            |_, constant| {
+                // Constants are lifted through the checked constructor. The infallible replicated wrapper would let
+                // a reference-typed capture constant ride through structural batching unchanged.
+                <Self as BatchingPolicy<C>>::batch(context.parent().lift(constant.clone())?, BatchAxis::replicated())
+            },
+            |instruction, instruction_inputs| {
+                // Run the batching rule inside the source instruction's recorded origin so that every staged
+                // instruction records where it came from.
+                let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
+                let (outputs, evidence) = context
+                    .invoke_with_provenance_origin(instruction.provenance().clone(), || {
+                        instruction.operation().batch(
+                            context,
+                            &RecursiveBatchingDriver::new(&regions),
+                            instruction_inputs,
+                        )
+                    })?
+                    .into_parts();
+                <Self as BatchingPolicy<C>>::validate_operation_outputs(
+                    instruction.operation().name(),
+                    instruction_inputs,
+                    outputs.as_slice(),
+                    &evidence,
+                )?;
+                Ok(outputs)
+            },
+        )
+    }
+
+    fn batch_program(
+        context: &BatchingContext<C, Self>,
+        region: RegionRef<'_, C::Constant, C::Operation>,
+        input_axes: &[BatchAxis],
+        output_axes_policy: ProgramBatchingOutputAxesPolicy,
+    ) -> Result<Self::BatchedProgram, BatchingError> {
+        // There is deliberately no `ArrayIrBatchingTransform` analogous to `ArrayBatchingTransform` here. Homogeneous
+        // array batching is determined entirely by a sealed region plus static host metadata, including a `usize`
+        // mapped extent, so that complete request can key a region-owned artifact directly. Array IR batching instead
+        // receives `context.axis_extent()` as a live `C::Value` (i.e., a single static assignment value owned by the
+        // caller's current parent context). Such a value is neither stable cache-key material nor something a retained
+        // region artifact may capture. This function already makes the required template/runtime split: it converts
+        // only the live extent's _type_ into a fresh leading input/output of the transformed program, while each
+        // consumer supplies the current extent through `BatchingPolicy::boundary_operands` and removes the bookkeeping
+        // output through `BatchingPolicy::adapt_batched_program`. A future cache could therefore retain this widened,
+        // context-neutral template. It would need its own marker and a complete normalized key containing the extent
+        // type and identity contract, named-axis scope, sharding, input axes, and output policy. The live extent would
+        // remain a per-call boundary operand. The current measured cache consumer is the simpler homogeneous path, so
+        // adding that separate specialization mechanism here would be premature rather than technically impossible.
+        check_count!("input", input_axes, region.input_types().len(), ProgramError);
+        let extent_type = context.axis_extent().r#type();
+        let extent_type = <&DimensionType>::try_from(extent_type.as_ref())?.clone();
+        let extent_dimension = extent_type.to_dimension();
+        let parent_context = TracingContext::<C::Constant, C::Operation>::new();
+        let builder = parent_context.builder().clone();
+
+        // The fresh structural trace cannot refer to the parent trace's mapped-extent Single Static Assignment (SSA)
+        // value directly. Give the transformed region one leading dimension input and carry that same atom out as its
+        // leading output. Every inserted packed batch axis below references this input's type identity.
+        let (output_atom_ids, output_axes) = {
+            let extent = parent_context.input(extent_type.into());
+            let extent_atom_id = extent.atom_id()?;
+            let batching_context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent_context, extent)
+                .with_axis_name(context.axis_name().map(str::to_string))
+                .with_axis_sharding(context.axis_sharding().clone());
+            let inputs = region
+                .input_types()
+                .iter()
+                .zip(input_axes)
+                .map(|(unbatched_type, batch_axis)| {
+                    // Inserts the mapped extent (and its sharding placement) into one per-item array type. A reference
+                    // is batched by batching its referent, so both the array and the reference arm share this step.
+                    let insert_batch_dimension = |array_type: &ArrayType, axis: Axis| -> Result<_, BatchingError> {
+                        let batched_rank = array_type.rank() + 1;
+                        let position = axis.normalize(batched_rank).map_err(|_| {
+                            BatchingError::BatchAxisOutOfBounds { r#type: Box::new(array_type.clone()), axis }
+                        })?;
+                        array_type.batched(position, extent_dimension.clone(), context.axis_sharding().clone())
+                    };
+                    let batched_type = match (unbatched_type, batch_axis.axis()) {
+                        (ArrayIrType::Array(array_type), Some(axis)) => {
+                            ArrayIrType::Array(insert_batch_dimension(array_type, axis)?)
+                        }
+                        (ArrayIrType::Reference(reference_type), Some(axis)) => {
+                            ReferenceType::new(insert_batch_dimension(reference_type.referent(), axis)?).into()
+                        }
+                        _ => unbatched_type.clone(),
+                    };
+                    let value = batching_context.parent().input(batched_type);
+                    ArrayIrBatch::new(value, *batch_axis)
+                })
+                .collect::<Result<Vec<_>, BatchingError>>()?;
+
+            let outputs = <Self as RecursiveBatchingPolicy<TracingContext<C::Constant, C::Operation>>>::batch_region(
+                &batching_context,
+                region,
+                inputs,
+            )?;
+
+            // Resolve the policy into one optional target axis per output. `None` keeps the axis the rule produced.
+            let output_target_axes = match &output_axes_policy {
+                ProgramBatchingOutputAxesPolicy::Natural => vec![None; outputs.len()],
+                ProgramBatchingOutputAxesPolicy::AlignAllTo(axis) => {
+                    vec![Some(BatchAxis::new(*axis)); outputs.len()]
+                }
+                ProgramBatchingOutputAxesPolicy::AlignEachTo(axes) => {
+                    check_count!("output", axes, outputs.len(), ProgramError);
+                    axes.iter().map(|axis| (!axis.is_replicated()).then_some(*axis)).collect()
+                }
+            };
+
+            let mut output_atom_ids = Vec::with_capacity(outputs.len() + 1);
+            let mut output_axes = Vec::with_capacity(outputs.len());
+            output_atom_ids.push(extent_atom_id);
+            for (output, target_axis) in outputs.into_iter().zip(output_target_axes) {
+                let output = match target_axis {
+                    Some(target_axis) => {
+                        Self::align_batch_axis(&batching_context, output, target_axis.axis().unwrap())?
+                    }
+                    None => output,
+                };
+                check_builders!(&builder, output.value().builder())?;
+                output_axes.push(output.batch_axis());
+                output_atom_ids.push(output.into_value().atom_id()?);
+            }
+
+            Ok::<_, BatchingError>((output_atom_ids, output_axes))
+        }?;
+
+        // The batching context and every tracer it produced were dropped with the block above, so the builder must be
+        // uniquely owned here. A remaining reference means that a tracer escaped the structural trace.
+        let input_count = region.input_types().len() + 1;
+        let output_count = output_atom_ids.len();
+        let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
+        let program = builder
+            .build(output_atom_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?
+            .into_simplified()?;
+        Ok(ThreadedExtentBatchedProgram::new(program, output_axes)?)
+    }
+
+    fn restore_batch(
+        value: C::Value,
+        batch_axis: BatchAxis,
+        r#type: &C::Type,
+        inputs: &[Self::Batch],
+    ) -> Result<Self::Batch, BatchingError> {
+        // Only array carriers hold transform-only metadata (their ragged axes). References and dimensions are fully
+        // described by the packed value and the batch axis.
+        let output = ArrayIrBatch::new(value, batch_axis)?;
+        let ArrayIrType::Array(r#type) = r#type else {
+            return Ok(output);
+        };
+        let packed_value_type = output.value.r#type();
+        let packed_type = <&ArrayType>::try_from(packed_value_type.as_ref())?;
+        let output_batch_axis = output.batch_axis_position();
+        let mut ragged_axes = Vec::new();
+        for (logical_axis, dimension) in r#type.shape().dimensions().iter().enumerate() {
+            let Dimension::Dynamic(variable) = dimension else {
+                continue;
+            };
+
+            // The per-item extents of a bounded dynamic dimension live in whichever input carrier already tracks that
+            // dimension identity as a ragged axis, since the region boundary erased them from the output.
+            let source = inputs.iter().find_map(|input| {
+                input
+                    .ragged_axes()
+                    .iter()
+                    .find(|ragged_axis| ragged_axis.dimension() == variable)
+                    .map(|ragged_axis| (input, ragged_axis))
+            });
+
+            let Some((source, ragged_axis)) = source else {
+                // A dynamic dimension no input tracks is acceptable only when the packed output still spells it as
+                // that same dynamic dimension (i.e., it is an ordinary symbolic extent rather than a bounded ragged
+                // one whose per-item extents have been lost).
+                let packed_axis =
+                    logical_axis + usize::from(output_batch_axis.is_some_and(|batch_axis| batch_axis <= logical_axis));
+                if packed_type.shape().dimensions().get(packed_axis) == Some(dimension) {
+                    continue;
+                }
+                return Err(BatchingError::UnsupportedOperation {
+                    message: format!(
+                        "linear call output {} has bounded dynamic dimension {} but no input \
+                         carries its per-item extents",
+                        r#type, variable,
+                    ),
+                });
+            };
+
+            // The source records the axes its extents vary over in its own packed coordinates. Those are translated
+            // into the output's packed coordinates by stripping the source's batch axis and re-inserting the output's.
+            // An extent axis that _is_ the source's batch axis means the extents vary per batch item, which the output
+            // can only represent if it is mapped as well.
+            let source_batch_axis = source.batch_axis_position();
+            let extent_axes = ragged_axis
+                .extent_axes()
+                .iter()
+                .map(|extent_axis| {
+                    if source_batch_axis == Some(*extent_axis) {
+                        return output_batch_axis.ok_or_else(|| BatchingError::InvalidBatchMetadata {
+                            message: format!(
+                                "linear call output {} is replicated but its ragged dimension {} \
+                                 varies along the mapped input axis",
+                                r#type, variable,
+                            ),
+                        });
+                    }
+                    let logical_extent_axis =
+                        extent_axis - usize::from(source_batch_axis.is_some_and(|axis| axis < *extent_axis));
+                    Ok(logical_extent_axis
+                        + usize::from(output_batch_axis.is_some_and(|axis| axis <= logical_extent_axis)))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let physical_axis = logical_axis + usize::from(output_batch_axis.is_some_and(|axis| axis <= logical_axis));
+            ragged_axes.push(RaggedAxis::new(
+                physical_axis,
+                ragged_axis.extents().clone(),
+                variable.clone(),
+                extent_axes,
+            ));
+        }
+
+        // The ragged axes recovered above are exactly the dynamic dimensions of the declared per-item type,
+        // so the carrier's own derivation reproduces `r#type` without threading it through the carrier.
+        output.with_ragged_axes(ragged_axes)
+    }
+
+    fn align_batch_axis(
+        context: &BatchingContext<C, Self>,
+        batch: Self::Batch,
+        axis: Axis,
+    ) -> Result<Self::Batch, BatchingError> {
+        // Aligns one composite array batch to `axis`, moving an existing mapped axis or dynamically broadcasting a
+        // replicated array with the context's first-class extent. A reference's batch axis is fixed by its referent,
+        // so a reference batch is returned unchanged when it already carries `axis` and rejected otherwise; first-class
+        // dimensions have no packed axis and are always rejected. The mapped move transposes through the value's
+        // projected `Transpose` capability. Dynamic broadcasts are emitted through the parent context.
+        //
+        // Only an array member has a packed axis to align, so both a mapped and a replicated first-class dimension are
+        // rejected here. The per-item type covers both spellings of a dimension carrier: a mapped dimension records its
+        // per-item type in the carrier, while a replicated one reports the packed value's own dimension type.
+        if let ArrayIrType::Dimension(r#type) = batch.unbatched_type() {
+            return Err(BatchingError::MappedDimension { r#type: Box::new(r#type), axis: BatchAxis::from(axis) });
+        }
+
+        if let ArrayIrType::Reference(r#type) = batch.value.r#type().as_ref() {
+            // A mapped reference already carrying the requested axis is an identity alignment. Anything else would have
+            // to move or broadcast shared storage, which no reference can do. The request is normalized against the
+            // referent's packed rank, so an out-of-bounds axis is reported as such rather than as an alignment failure.
+            let position = axis.normalize(r#type.referent().rank()).map_err(|_| {
+                BatchingError::BatchAxisOutOfBounds { r#type: Box::new(r#type.referent().clone()), axis }
+            })?;
+            if Some(position) == batch.batch_axis_position() {
+                return Ok(batch);
+            }
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "a reference's batch axis is fixed by its referent, so a reference batch carrying {} cannot be \
+                     aligned to axis {}; pass the reference as a batched input at that axis instead",
+                    batch.batch_axis, axis,
+                ),
+            });
+        }
+
+        let Some(current_position) = batch.batch_axis_position() else {
+            // A replicated array gains the mapped axis through one dynamic broadcast along the transform's own extent.
+            let unbatched_type = batch.unbatched_type();
+            let array_type = <&ArrayType>::try_from(&unbatched_type)?;
+            let output_rank = array_type.rank() + 1;
+            let position = axis
+                .normalize(output_rank)
+                .map_err(|_| BatchingError::BatchAxisOutOfBounds { r#type: Box::new(array_type.clone()), axis })?;
+            let (value, ragged_axes) = batch.into_value_and_ragged_axes();
+            let (value, output_axes) = broadcast_replicated_array(
+                value,
+                array_type,
+                position,
+                context.axis_extent(),
+                context.axis_sharding(),
+            )?;
+            let ragged_axes =
+                ragged_axes.into_iter().map(|ragged_axis| ragged_axis.broadcasted(output_axes.as_slice())).collect();
+            return ArrayIrBatch::new(value, BatchAxis::from_position(position))?.with_ragged_axes(ragged_axes);
+        };
+
+        // A mapped array moves its axis with one transpose that keeps every other axis in its relative order.
+        // The target is normalized against the packed value's unchanged rank.
+        let packed_type = batch.value.r#type();
+        let packed_type = <&ArrayType>::try_from(packed_type.as_ref())?;
+        let rank = packed_type.rank();
+        let position = axis
+            .normalize(rank)
+            .map_err(|_| BatchingError::BatchAxisOutOfBounds { r#type: Box::new(packed_type.clone()), axis })?;
+        if current_position == position {
+            return Ok(batch);
+        }
+        let mut permutation = (0..rank).filter(|axis| *axis != current_position).collect::<Vec<_>>();
+        permutation.insert(position, current_position);
+        let (value, ragged_axes) = batch.into_value_and_ragged_axes();
+        let projected = <C::Value as ValueProjection<ArrayType>>::into_projected(value)?;
+        let value = C::Value::from_projected(projected.transpose(permutation)?);
+        let ragged_axes =
+            ragged_axes.into_iter().map(|ragged_axis| ragged_axis.moved(current_position, position)).collect();
+        ArrayIrBatch::new(value, BatchAxis::from_position(position))?.with_ragged_axes(ragged_axes)
+    }
+
+    fn static_batch_axis_extent(context: &BatchingContext<C, Self>) -> Option<usize> {
+        // The composite policy's extent is a first-class dimension value owned by the parent context, so its size is
+        // known statically only when the parent resolves that value to a concrete dimension constant (e.g., under eager
+        // batching), in which case it is projected to a `DimensionValue` and its extent is reported. A staged or opaque
+        // extent (e.g., under a trace with a symbolic batch dimension) has no static size.
+        match context.parent().resolve(context.axis_extent()) {
+            ValueResolution::Constant(axis_extent) => {
+                <C::Constant as ValueProjection<DimensionType>>::into_projected(axis_extent)
+                    .ok()
+                    .map(|axis_extent| axis_extent.extent())
+            }
+            ValueResolution::Staged(_) | ValueResolution::Opaque => None,
+        }
+    }
+}
+
+impl<C: Context<Type = ArrayIrType>> BatchingEntrypointPolicy<C> for ArrayIrBatchingPolicy
+where
+    C::Value: DimensionSize
+        + DynamicBroadcast
+        + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>
+        + ValueProjection<DimensionType, Projected: DimensionRequirement>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
+        + ValueProjection<DimensionType, Projected = DimensionValue>,
+    C::Operation: BatchableOperation<C, ArrayIrBatchingPolicy>
+        + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayIrBatchingPolicy>
+        + From<DynamicBroadcastOperation>
+        + From<ConstantOperation<DimensionValue>>
+        + From<DimensionSizeOperation>
+        + OperationProjection<ArrayType, Projected: From<TransposeOperation>>,
+{
+    fn pack_inputs(
+        context: &C,
+        inputs: Vec<C::Value>,
+        input_batch_axes: Vec<BatchAxis>,
+        batch_axis: BatchAxisSpecification<Self::Extent>,
+    ) -> Result<(BatchingContext<C, Self>, Vec<Self::Batch>), BatchingError> {
+        if inputs.len() != input_batch_axes.len() {
+            return Err(
+                ProgramError::InvalidInputCount { expected: inputs.len(), actual: input_batch_axes.len() }.into()
+            );
+        }
+
+        let batches = inputs
+            .into_iter()
+            .zip(input_batch_axes)
+            .map(|(input, input_batch_axis)| ArrayIrBatch::new(input, input_batch_axis))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // An explicitly supplied extent must be a first-class dimension value. It then acts as the reference every
+        // mapped input's extent is checked against below; without one, the first mapped input's extent takes that
+        // role.
+        let mut axis_extent = batch_axis.extent().cloned();
+        if let Some(axis_extent) = &axis_extent {
+            let extent_type = axis_extent.r#type();
+            <&DimensionType>::try_from(extent_type.as_ref())?;
+        }
+
+        // Mapped arrays are visited before mapped references so that the extent evidence a reference is validated
+        // against is complete regardless of the order in which the caller listed the inputs.
+        let is_reference =
+            |batch: &&ArrayIrBatch<C::Value>| matches!(batch.value.r#type().as_ref(), ArrayIrType::Reference(_));
+        let arrays_first =
+            batches.iter().filter(|batch| !is_reference(batch)).chain(batches.iter().filter(is_reference));
+        for batch in arrays_first {
+            let Some(position) = batch.batch_axis_position() else {
+                continue;
+            };
+
+            // A reference's extent is available without reading its contents only when its bounds are exact or a
+            // dimension value or mapped array supplies the same symbolic dimension. An unrelated extent is not
+            // evidence as accepting it would silently give different inputs different batch lengths.
+            let input_extent = match batch.value.r#type().as_ref() {
+                ArrayIrType::Reference(r#type) => match r#type.referent().shape().dimensions().get(position) {
+                    Some(Dimension::Static(extent)) => context.dimension_constant(*extent)?,
+                    Some(Dimension::Dynamic(variable)) if DimensionType::new(variable.clone()).extent().is_some() => {
+                        context.dimension_constant(DimensionType::new(variable.clone()).extent().unwrap())?
+                    }
+                    Some(Dimension::Dynamic(variable))
+                        if axis_extent.as_ref().is_some_and(|extent| {
+                            matches!(extent.r#type().as_ref(), ArrayIrType::Dimension(r#type)
+                                if r#type.variable() == variable)
+                        }) || batches.iter().any(|candidate| {
+                            let Some(axis) = candidate.batch_axis_position() else { return false };
+                            matches!(candidate.value.r#type().as_ref(), ArrayIrType::Array(r#type)
+                                if r#type.shape().dimensions()[axis].variable() == Some(variable))
+                        }) =>
+                    {
+                        // A symbolic referent extent whose identity is already carried by the explicit extent or
+                        // by a mapped array needs no further evidence (equality is implied by the shared dimension
+                        // identity).
+                        continue;
+                    }
+                    _ => {
+                        return Err(BatchingError::UnsupportedOperation {
+                            message: format!(
+                                "cannot infer the mapped extent from reference type {} whose batch axis {} has \
+                                 a dynamic extent; pass an extent or a mapped array with the same dimension identity",
+                                r#type, position,
+                            ),
+                        });
+                    }
+                },
+                _ => {
+                    // A mapped array's extent is read from its packed batch axis.
+                    batch.value.dimension_size(position)?
+                }
+            };
+
+            if let Some(axis_extent) = &axis_extent {
+                // Binding the requirement through the dimension member, rather than comparing on the host, lets
+                // the same check fold against concrete extents under eager batching and stay staged as a runtime
+                // requirement when either extent is symbolic.
+                <C::Value as ValueProjection<DimensionType>>::into_projected(axis_extent.clone())?
+                    .require_equal(&<C::Value as ValueProjection<DimensionType>>::into_projected(input_extent)?)?;
+            } else {
+                axis_extent = Some(input_extent);
+            }
+        }
+
+        // With neither an explicit extent nor a mapped input there is nothing that determines the batch size.
+        let axis_extent = axis_extent.ok_or(BatchingError::EmptyBatch)?;
+
+        // A mapped reference's referent is batched like an array, so its batch-axis placement participates in the
+        // sharding join alongside the mapped arrays.
+        let axis_sharding = batch_axis_sharding(batches.iter().filter_map(|batch| {
+            let array_type = match batch.value.r#type() {
+                Cow::Borrowed(ArrayIrType::Array(array_type)) => Cow::Borrowed(array_type),
+                Cow::Owned(ArrayIrType::Array(array_type)) => Cow::Owned(array_type),
+                Cow::Borrowed(ArrayIrType::Reference(r#type)) => Cow::Borrowed(r#type.referent()),
+                Cow::Owned(ArrayIrType::Reference(r#type)) => Cow::Owned(r#type.referent().clone()),
+                _ => return None,
+            };
+            Some((array_type, batch.batch_axis_position()))
+        }))?;
+        let batching_context = BatchingContext::new(context.clone(), axis_extent)
+            .with_axis_name(batch_axis.name().map(String::from))
+            .with_axis_sharding(axis_sharding);
+        let batches = batches
+            .into_iter()
+            .enumerate()
+            .map(|(index, batch)| -> Result<_, BatchingError> {
+                // Only a mapped array has a batch-axis placement to normalize. A reference's referent placement is
+                // part of the shared storage and cannot be rewritten by a broadcast, so it must already agree with the
+                // placement selected for the batch axis.
+                let Some(position) = batch.batch_axis_position() else {
+                    return Ok(batch);
+                };
+                let value_type = batch.value.r#type();
+                let array_type = match value_type.as_ref() {
+                    ArrayIrType::Array(array_type) => array_type,
+                    ArrayIrType::Reference(r#type) => {
+                        let axis_sharding = batching_context.axis_sharding();
+                        if normalized_batch_axis_type(r#type.referent(), position, axis_sharding)?.is_some() {
+                            return Err(BatchingError::MisalignedBatchAxes {
+                                message: format!(
+                                    "mapped reference input {} of type {} does not place its batch axis \
+                                     {} on {}; a reference's referent placement is fixed by its storage \
+                                     and cannot be renormalized",
+                                    index, r#type, position, axis_sharding,
+                                ),
+                            });
+                        }
+                        return Ok(batch);
+                    }
+                    ArrayIrType::Dimension(_) => return Ok(batch),
+                };
+                let Some(normalized_type) =
+                    normalized_batch_axis_type(array_type, position, batching_context.axis_sharding())?
+                else {
+                    return Ok(batch);
+                };
+
+                // The mapped axis takes the transform's own extent, and every other axis is either an exact constant
+                // or a `dimension_size` read of the input being renormalized.
+                let output_dimensions = (0..array_type.rank())
+                    .map(|axis| match axis == position {
+                        true => Ok(batching_context.axis_extent().clone()),
+                        false => batch.value.dimension_size(axis),
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let output_axes = (0..array_type.rank()).collect::<Vec<_>>();
+                let batch_axis = batch.batch_axis;
+                let value = batch.value.dynamic_broadcast_with_output_sharding(
+                    &output_dimensions,
+                    &output_axes,
+                    normalized_type.sharding().cloned(),
+                )?;
+                ArrayIrBatch::new(value, batch_axis)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok((batching_context, batches))
+    }
+
+    fn materialize_output(
+        context: &BatchingContext<C, Self>,
+        output: Self::Batch,
+        output_batch_axis: BatchAxis,
+    ) -> Result<C::Value, BatchingError> {
+        if let ArrayIrType::Reference(r#type) = output.value().r#type().as_ref() {
+            // A reference output carries the batch axis of the root it forwards or of its allocation. That axis is
+            // fixed by the referent, so the request must already agree with it (a replicated request for a replicated
+            // reference, or a mapped request naming the referent's own mapped axis).
+            let aligned = match (output.batch_axis().axis(), output_batch_axis.axis()) {
+                (None, None) => true,
+                (Some(_), Some(_)) => {
+                    r#type.referent().normalize_batch_axis(output_batch_axis)?.0 == output.batch_axis()
+                }
+                _ => false,
+            };
+
+            if aligned {
+                return Ok(output.into_value());
+            }
+
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!(
+                    "a reference output carrying {} cannot be materialized with {} requested because \
+                     a reference's batch axis is fixed by its referent",
+                    output.batch_axis(),
+                    output_batch_axis,
+                ),
+            });
+        }
+
+        if !output.ragged_axes().is_empty() {
+            return Err(BatchingError::UnsupportedOperation {
+                message: "a bounded ragged array cannot cross the batching transform output boundary".to_string(),
+            });
+        }
+
+        // A mapped output cannot be presented as replicated, because dropping the axis would need a reduction the
+        // caller did not ask for. A mapped request is satisfied by alignment, which moves an existing axis or
+        // broadcasts a replicated output along the transform's extent.
+        match (output.batch_axis.axis(), output_batch_axis.axis()) {
+            (None, None) => Ok(output.into_value()),
+            (Some(_), None) => {
+                Err(BatchingError::MismatchedOutputAxes { expected: output_batch_axis, actual: output.batch_axis })
+            }
+            (_, Some(axis)) => {
+                Ok(<Self as RecursiveBatchingPolicy<C>>::align_batch_axis(context, output, axis)?.into_value())
+            }
+        }
+    }
+}
+
 impl<C: Context<Type = ArrayIrType>, T: Type> ValueProjection<T> for BatchingTracer<C, ArrayIrBatchingPolicy>
 where
     C::Value:
@@ -3365,564 +3938,6 @@ where
             0,
             collapse_fn,
         )
-    }
-}
-
-// TODO(eaplatanios): Review from here onwards.
-
-impl<C> BatchingEntrypointPolicy<C> for ArrayIrBatchingPolicy
-where
-    C: Context<
-            Type = ArrayIrType,
-            Operation: BatchableOperation<C, ArrayIrBatchingPolicy>
-                           + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayIrBatchingPolicy>
-                           + From<DynamicBroadcastOperation>
-                           + From<ConstantOperation<DimensionValue>>
-                           + From<DimensionSizeOperation>
-                           + OperationProjection<ArrayType, Projected: From<TransposeOperation>>,
-        >,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
-        + ValueProjection<DimensionType, Projected = DimensionValue>,
-    C::Value: DimensionSize
-        + DynamicBroadcast
-        + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>
-        + ValueProjection<DimensionType, Projected: DimensionRequirement>,
-{
-    fn pack_inputs(
-        context: &C,
-        inputs: Vec<C::Value>,
-        input_batch_axes: Vec<BatchAxis>,
-        batch_axis: BatchAxisSpecification<Self::Extent>,
-    ) -> Result<(BatchingContext<C, Self>, Vec<Self::Batch>), BatchingError> {
-        if inputs.len() != input_batch_axes.len() {
-            return Err(
-                ProgramError::InvalidInputCount { expected: inputs.len(), actual: input_batch_axes.len() }.into()
-            );
-        }
-        let batches = inputs
-            .into_iter()
-            .zip(input_batch_axes)
-            .map(|(input, input_batch_axis)| ArrayIrBatch::new(input, input_batch_axis))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // An explicitly supplied extent must be a first-class dimension value. It then acts as the reference every
-        // mapped input's extent is checked against below; without one, the first mapped input's extent takes that
-        // role.
-        let mut axis_extent = batch_axis.extent().cloned();
-        if let Some(axis_extent) = &axis_extent {
-            let extent_type = axis_extent.r#type();
-            <&DimensionType>::try_from(extent_type.as_ref())?;
-        }
-        // Mapped arrays are visited before mapped references so that the extent evidence a reference is validated
-        // against is complete regardless of the order in which the caller listed the inputs.
-        let is_reference =
-            |batch: &&ArrayIrBatch<C::Value>| matches!(batch.value.r#type().as_ref(), ArrayIrType::Reference(_));
-        let arrays_first =
-            batches.iter().filter(|batch| !is_reference(batch)).chain(batches.iter().filter(is_reference));
-        for batch in arrays_first {
-            let Some(position) = batch.batch_axis_position() else {
-                continue;
-            };
-            // A reference's extent is available without reading its contents only when its bounds are exact or a
-            // dimension value or mapped array supplies the same symbolic dimension. An unrelated extent is not
-            // evidence: accepting it would silently give different inputs different batch lengths.
-            let input_extent = match batch.value.r#type().as_ref() {
-                ArrayIrType::Reference(r#type) => match r#type.referent().shape().dimensions().get(position) {
-                    Some(Dimension::Static(extent)) => context.dimension_constant(*extent)?,
-                    Some(Dimension::Dynamic(variable)) if DimensionType::new(variable.clone()).extent().is_some() => {
-                        context.dimension_constant(DimensionType::new(variable.clone()).extent().unwrap())?
-                    }
-                    // A symbolic referent extent whose identity is already carried by the explicit extent or by a
-                    // mapped array needs no further evidence: equality is implied by the shared dimension identity.
-                    Some(Dimension::Dynamic(variable))
-                        if axis_extent.as_ref().is_some_and(|extent| {
-                            matches!(extent.r#type().as_ref(), ArrayIrType::Dimension(r#type)
-                                if r#type.variable() == variable)
-                        }) || batches.iter().any(|candidate| {
-                            let Some(axis) = candidate.batch_axis_position() else { return false };
-                            matches!(candidate.value.r#type().as_ref(), ArrayIrType::Array(r#type)
-                                if r#type.shape().dimensions()[axis].variable() == Some(variable))
-                        }) =>
-                    {
-                        continue;
-                    }
-                    _ => {
-                        return Err(BatchingError::UnsupportedOperation {
-                            message: format!(
-                                "cannot infer the mapped extent from reference type {} whose batch axis {position} has \
-                                 a dynamic extent; pass an extent or a mapped array with the same dimension identity",
-                                r#type,
-                            ),
-                        });
-                    }
-                },
-                // A mapped array's extent is read from its packed batch axis.
-                _ => batch.value.dimension_size(position)?,
-            };
-            if let Some(axis_extent) = &axis_extent {
-                // Binding the requirement through the dimension member, rather than comparing on the host, lets
-                // the same check fold against concrete extents under eager batching and stay staged as a runtime
-                // requirement when either extent is symbolic.
-                <C::Value as ValueProjection<DimensionType>>::into_projected(axis_extent.clone())?
-                    .require_equal(&<C::Value as ValueProjection<DimensionType>>::into_projected(input_extent)?)?;
-            } else {
-                axis_extent = Some(input_extent);
-            }
-        }
-        // With neither an explicit extent nor a mapped input there is nothing that determines the batch size.
-        let axis_extent = axis_extent.ok_or(BatchingError::EmptyBatch)?;
-
-        // A mapped reference's referent is batched like an array, so its batch-axis placement participates in the
-        // sharding join alongside the mapped arrays.
-        let axis_sharding = batch_axis_sharding(batches.iter().filter_map(|batch| {
-            let array_type = match batch.value.r#type() {
-                Cow::Borrowed(ArrayIrType::Array(array_type)) => Cow::Borrowed(array_type),
-                Cow::Owned(ArrayIrType::Array(array_type)) => Cow::Owned(array_type),
-                Cow::Borrowed(ArrayIrType::Reference(r#type)) => Cow::Borrowed(r#type.referent()),
-                Cow::Owned(ArrayIrType::Reference(r#type)) => Cow::Owned(r#type.referent().clone()),
-                _ => return None,
-            };
-            Some((array_type, batch.batch_axis_position()))
-        }))?;
-        let batching_context = BatchingContext::new(context.clone(), axis_extent)
-            .with_axis_name(batch_axis.name().map(String::from))
-            .with_axis_sharding(axis_sharding);
-        let batches = batches
-            .into_iter()
-            .enumerate()
-            .map(|(index, batch)| -> Result<_, BatchingError> {
-                // Only a mapped array has a batch-axis placement to normalize. A reference's referent placement is
-                // part of the shared storage and cannot be rewritten by a broadcast, so it must already agree with the
-                // placement selected for the batch axis.
-                let Some(position) = batch.batch_axis_position() else {
-                    return Ok(batch);
-                };
-                let value_type = batch.value.r#type();
-                let array_type = match value_type.as_ref() {
-                    ArrayIrType::Array(array_type) => array_type,
-                    ArrayIrType::Reference(r#type) => {
-                        let axis_sharding = batching_context.axis_sharding();
-                        if normalized_batch_axis_type(r#type.referent(), position, axis_sharding)?.is_some() {
-                            return Err(BatchingError::MisalignedBatchAxes {
-                                message: format!(
-                                    "mapped reference input {index} of type {} does not place its batch axis \
-                                     {position} on {axis_sharding}; a reference's referent placement is fixed by its \
-                                     storage and cannot be renormalized",
-                                    r#type,
-                                ),
-                            });
-                        }
-                        return Ok(batch);
-                    }
-                    ArrayIrType::Dimension(_) => return Ok(batch),
-                };
-                let Some(normalized_type) =
-                    normalized_batch_axis_type(array_type, position, batching_context.axis_sharding())?
-                else {
-                    return Ok(batch);
-                };
-
-                // The mapped axis takes the transform's own extent, and every other axis is either an exact constant
-                // or a `dimension_size` read of the input being renormalized.
-                let output_dimensions = (0..array_type.rank())
-                    .map(|axis| match axis == position {
-                        true => Ok(batching_context.axis_extent().clone()),
-                        false => batch.value.dimension_size(axis),
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let output_axes = (0..array_type.rank()).collect::<Vec<_>>();
-                let batch_axis = batch.batch_axis;
-                let value = batch.value.dynamic_broadcast_with_output_sharding(
-                    &output_dimensions,
-                    &output_axes,
-                    normalized_type.sharding().cloned(),
-                )?;
-                ArrayIrBatch::new(value, batch_axis)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok((batching_context, batches))
-    }
-
-    fn materialize_output(
-        context: &BatchingContext<C, Self>,
-        output: Self::Batch,
-        output_batch_axis: BatchAxis,
-    ) -> Result<C::Value, BatchingError> {
-        if let ArrayIrType::Reference(r#type) = output.value().r#type().as_ref() {
-            // A reference output carries the batch axis of the root it forwards or of its allocation. That axis is
-            // fixed by the referent, so the request must already agree with it: a replicated request for a replicated
-            // reference, or a mapped request naming the referent's own mapped axis.
-            let aligned = match (output.batch_axis().axis(), output_batch_axis.axis()) {
-                (None, None) => true,
-                (Some(_), Some(_)) => {
-                    r#type.referent().normalize_batch_axis(output_batch_axis)?.0 == output.batch_axis()
-                }
-                _ => false,
-            };
-            if aligned {
-                return Ok(output.into_value());
-            }
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!(
-                    "a reference output carrying {} cannot be materialized with {output_batch_axis} requested because \
-                     a reference's batch axis is fixed by its referent",
-                    output.batch_axis(),
-                ),
-            });
-        }
-        if !output.ragged_axes().is_empty() {
-            return Err(BatchingError::UnsupportedOperation {
-                message: "a bounded ragged array cannot cross the batching transform output boundary".to_string(),
-            });
-        }
-        // A mapped output cannot be presented as replicated, because dropping the axis would need a reduction the
-        // caller did not ask for. A mapped request is satisfied by alignment, which moves an existing axis or
-        // broadcasts a replicated output along the transform's extent.
-        match (output.batch_axis.axis(), output_batch_axis.axis()) {
-            (None, None) => Ok(output.into_value()),
-            (Some(_), None) => {
-                Err(BatchingError::MismatchedOutputAxes { expected: output_batch_axis, actual: output.batch_axis })
-            }
-            (_, Some(axis)) => {
-                Ok(<Self as RecursiveBatchingPolicy<C>>::align_batch_axis(context, output, axis)?.into_value())
-            }
-        }
-    }
-}
-
-impl<C> RecursiveBatchingPolicy<C> for ArrayIrBatchingPolicy
-where
-    C: Context<Type = ArrayIrType>,
-    C::Value:
-        DimensionSize + DynamicBroadcast + ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>
-        + ValueProjection<DimensionType, Projected = DimensionValue>,
-    C::Operation: BatchableOperation<C, ArrayIrBatchingPolicy>
-        + BatchableOperation<TracingContext<C::Constant, C::Operation>, ArrayIrBatchingPolicy>
-        + From<DynamicBroadcastOperation>
-        + From<ConstantOperation<DimensionValue>>
-        + From<DimensionSizeOperation>
-        + OperationProjection<ArrayType>,
-    <C::Operation as OperationProjection<ArrayType>>::Projected: From<TransposeOperation>,
-{
-    fn batch_region(
-        context: &BatchingContext<C, Self>,
-        region: RegionRef<'_, C::Constant, C::Operation>,
-        inputs: Vec<Self::Batch>,
-    ) -> Result<Vec<Self::Batch>, BatchingError> {
-        // Regions are replayed through the checked constant and operation boundaries.
-        let region_mappings = RegionReplayMappings::new();
-        region.interpret_with(
-            inputs,
-            // Constants are lifted through the checked constructor; the infallible replicated wrapper would let a
-            // reference-typed capture constant ride through structural batching unchanged.
-            |_, constant| {
-                <Self as BatchingPolicy<C>>::batch(context.parent().lift(constant.clone())?, BatchAxis::replicated())
-            },
-            |instruction, instruction_inputs| {
-                // Run the batching rule inside the source instruction's recorded origin so that every staged
-                // instruction records where it came from.
-                let regions = ReplayRegionDriver::new(region, instruction.regions(), &region_mappings)?;
-                let (outputs, evidence) = context
-                    .invoke_with_provenance_origin(instruction.provenance().clone(), || {
-                        instruction.operation().batch(
-                            context,
-                            &RecursiveBatchingDriver::new(&regions),
-                            instruction_inputs,
-                        )
-                    })?
-                    .into_parts();
-                <Self as BatchingPolicy<C>>::validate_operation_outputs(
-                    instruction.operation().name(),
-                    instruction_inputs,
-                    outputs.as_slice(),
-                    &evidence,
-                )?;
-                Ok(outputs)
-            },
-        )
-    }
-
-    fn batch_program(
-        context: &BatchingContext<C, Self>,
-        region: RegionRef<'_, C::Constant, C::Operation>,
-        input_axes: &[BatchAxis],
-        output_axes_policy: ProgramBatchingOutputAxesPolicy,
-    ) -> Result<Self::BatchedProgram, BatchingError> {
-        // There is deliberately no `ArrayIrBatchingTransform` analogous to `ArrayBatchingTransform` here. Homogeneous
-        // array batching is determined entirely by a sealed region plus static host metadata, including a `usize`
-        // mapped extent, so that complete request can key a region-owned artifact directly. Array IR batching instead
-        // receives `context.axis_extent()` as a live `C::Value` (i.e., a single static assignment value owned by the
-        // caller's current parent context). Such a value is neither stable cache-key material nor something a retained
-        // region artifact may capture. This function already makes the required template/runtime split: it converts
-        // only the live extent's _type_ into a fresh leading input/output of the transformed program, while each
-        // consumer supplies the current extent through `BatchingPolicy::boundary_operands` and removes the bookkeeping
-        // output through `BatchingPolicy::adapt_batched_program`. A future cache could therefore retain this widened,
-        // context-neutral template. It would need its own marker and a complete normalized key containing the extent
-        // type and identity contract, named-axis scope, sharding, input axes, and output policy; the live extent would
-        // remain a per-call boundary operand. The current measured cache consumer is the simpler homogeneous path, so
-        // adding that separate specialization mechanism here would be premature rather than technically impossible.
-
-        check_count!("input", input_axes, region.input_types().len(), ProgramError);
-        let extent_type = context.axis_extent().r#type();
-        let extent_type = <&DimensionType>::try_from(extent_type.as_ref())?.clone();
-        let extent_dimension = extent_type.to_dimension();
-        let parent_context = TracingContext::<C::Constant, C::Operation>::new();
-        let builder = parent_context.builder().clone();
-
-        // The fresh structural trace cannot refer to the parent trace's mapped-extent SSA value directly. Give the
-        // transformed region one leading dimension input and carry that same atom out as its leading output. Every
-        // inserted packed batch axis below references this input's type identity.
-        let (output_atom_ids, output_axes) = {
-            let extent = parent_context.input(extent_type.into());
-            let extent_atom_id = extent.atom_id()?;
-            let batching_context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent_context, extent)
-                .with_axis_name(context.axis_name().map(str::to_string))
-                .with_axis_sharding(context.axis_sharding().clone());
-            let inputs = region
-                .input_types()
-                .iter()
-                .zip(input_axes)
-                .map(|(unbatched_type, batch_axis)| {
-                    // Inserts the mapped extent (and its sharding placement) into one per-item array type. A reference
-                    // is batched by batching its referent, so both the array and the reference arm share this step.
-                    let insert_batch_dimension = |array_type: &ArrayType, axis: Axis| -> Result<_, BatchingError> {
-                        let batched_rank = array_type.rank() + 1;
-                        let position = axis.normalize(batched_rank).map_err(|_| {
-                            BatchingError::BatchAxisOutOfBounds { r#type: Box::new(array_type.clone()), axis }
-                        })?;
-                        array_type.batched(position, extent_dimension.clone(), context.axis_sharding().clone())
-                    };
-                    let batched_type = match (unbatched_type, batch_axis.axis()) {
-                        (ArrayIrType::Array(array_type), Some(axis)) => {
-                            ArrayIrType::Array(insert_batch_dimension(array_type, axis)?)
-                        }
-                        (ArrayIrType::Reference(reference_type), Some(axis)) => {
-                            ReferenceType::new(insert_batch_dimension(reference_type.referent(), axis)?).into()
-                        }
-                        _ => unbatched_type.clone(),
-                    };
-                    let value = batching_context.parent().input(batched_type);
-                    ArrayIrBatch::new(value, *batch_axis)
-                })
-                .collect::<Result<Vec<_>, BatchingError>>()?;
-
-            let outputs = <Self as RecursiveBatchingPolicy<TracingContext<C::Constant, C::Operation>>>::batch_region(
-                &batching_context,
-                region,
-                inputs,
-            )?;
-
-            // Resolve the policy into one optional target axis per output: `None` keeps the axis the rule produced.
-            let output_target_axes = match &output_axes_policy {
-                ProgramBatchingOutputAxesPolicy::Natural => vec![None; outputs.len()],
-                ProgramBatchingOutputAxesPolicy::AlignAllTo(axis) => {
-                    vec![Some(BatchAxis::new(*axis)); outputs.len()]
-                }
-                ProgramBatchingOutputAxesPolicy::AlignEachTo(axes) => {
-                    check_count!("output", axes, outputs.len(), ProgramError);
-                    axes.iter().map(|axis| (!axis.is_replicated()).then_some(*axis)).collect()
-                }
-            };
-            let mut output_atom_ids = Vec::with_capacity(outputs.len() + 1);
-            let mut output_axes = Vec::with_capacity(outputs.len());
-            output_atom_ids.push(extent_atom_id);
-            for (output, target_axis) in outputs.into_iter().zip(output_target_axes) {
-                let output = match target_axis {
-                    Some(target_axis) => {
-                        Self::align_batch_axis(&batching_context, output, target_axis.axis().unwrap())?
-                    }
-                    None => output,
-                };
-                check_builders!(&builder, output.value().builder())?;
-                output_axes.push(output.batch_axis());
-                output_atom_ids.push(output.into_value().atom_id()?);
-            }
-            Ok::<_, BatchingError>((output_atom_ids, output_axes))
-        }?;
-
-        // The batching context and every tracer it produced were dropped with the block above, so the builder must be
-        // uniquely owned here; a remaining reference means a tracer escaped the structural trace.
-        let input_count = region.input_types().len() + 1;
-        let output_count = output_atom_ids.len();
-        let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
-        let program = builder
-            .build(output_atom_ids, vec![Placeholder; input_count], vec![Placeholder; output_count])?
-            .into_simplified()?;
-        Ok(ThreadedExtentBatchedProgram::new(program, output_axes)?)
-    }
-
-    fn restore_batch(
-        value: C::Value,
-        batch_axis: BatchAxis,
-        r#type: &C::Type,
-        inputs: &[Self::Batch],
-    ) -> Result<Self::Batch, BatchingError> {
-        // Only array carriers hold transform-only metadata (their ragged axes); references and dimensions are fully
-        // described by the packed value and the batch axis.
-        let output = ArrayIrBatch::new(value, batch_axis)?;
-        let ArrayIrType::Array(logical_type) = r#type else {
-            return Ok(output);
-        };
-        let packed_value_type = output.value.r#type();
-        let packed_type = <&ArrayType>::try_from(packed_value_type.as_ref())?;
-        let output_batch_axis = output.batch_axis_position();
-        let mut ragged_axes = Vec::new();
-        for (logical_axis, dimension) in logical_type.shape().dimensions().iter().enumerate() {
-            let Dimension::Dynamic(variable) = dimension else {
-                continue;
-            };
-            // The per-item extents of a bounded dynamic dimension live in whichever input carrier already tracks that
-            // dimension identity as a ragged axis, since the region boundary erased them from the output.
-            let source = inputs.iter().find_map(|input| {
-                input
-                    .ragged_axes()
-                    .iter()
-                    .find(|ragged_axis| ragged_axis.dimension() == variable)
-                    .map(|ragged_axis| (input, ragged_axis))
-            });
-            let Some((source, ragged_axis)) = source else {
-                // A dynamic dimension no input tracks is acceptable only when the packed output still spells it as
-                // that same dynamic dimension, i.e., it is an ordinary symbolic extent rather than a bounded ragged
-                // one whose per-item extents have been lost.
-                let packed_axis =
-                    logical_axis + usize::from(output_batch_axis.is_some_and(|batch_axis| batch_axis <= logical_axis));
-                if packed_type.shape().dimensions().get(packed_axis) == Some(dimension) {
-                    continue;
-                }
-                return Err(BatchingError::UnsupportedOperation {
-                    message: format!(
-                        "linear call output {logical_type} has bounded dynamic dimension {variable} but no input \
-                         carries its per-item extents",
-                    ),
-                });
-            };
-            // The source records the axes its extents vary over in its own packed coordinates. Those are translated
-            // into the output's packed coordinates by stripping the source's batch axis and re-inserting the output's.
-            // An extent axis that *is* the source's batch axis means the extents vary per batch item, which the output
-            // can only represent if it is mapped as well.
-            let source_batch_axis = source.batch_axis_position();
-            let extent_axes = ragged_axis
-                .extent_axes()
-                .iter()
-                .map(|extent_axis| {
-                    if source_batch_axis == Some(*extent_axis) {
-                        return output_batch_axis.ok_or_else(|| BatchingError::InvalidBatchMetadata {
-                            message: format!(
-                                "linear call output {logical_type} is replicated but its ragged dimension {variable} \
-                                 varies along the mapped input axis",
-                            ),
-                        });
-                    }
-                    let logical_extent_axis =
-                        extent_axis - usize::from(source_batch_axis.is_some_and(|axis| axis < *extent_axis));
-                    Ok(logical_extent_axis
-                        + usize::from(output_batch_axis.is_some_and(|axis| axis <= logical_extent_axis)))
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let physical_axis = logical_axis + usize::from(output_batch_axis.is_some_and(|axis| axis <= logical_axis));
-            ragged_axes.push(RaggedAxis::new(
-                physical_axis,
-                ragged_axis.extents().clone(),
-                variable.clone(),
-                extent_axes,
-            ));
-        }
-        // The ragged axes recovered above are exactly the dynamic dimensions of the declared per-item type, so the
-        // carrier's own derivation reproduces `logical_type` without threading it through the carrier.
-        output.with_ragged_axes(ragged_axes)
-    }
-
-    fn align_batch_axis(
-        context: &BatchingContext<C, Self>,
-        batch: Self::Batch,
-        axis: Axis,
-    ) -> Result<Self::Batch, BatchingError> {
-        // Aligns one composite array batch to `axis`, moving an existing mapped axis or dynamically broadcasting a
-        // replicated array with the context's first-class extent. A reference's batch axis is fixed by its referent,
-        // so a reference batch is returned unchanged when it already carries `axis` and rejected otherwise;
-        // first-class dimensions have no packed axis and are always rejected. The mapped move transposes through the
-        // value's projected `Transpose` capability. Dynamic broadcasts are emitted through the parent context.
-        //
-        // Only an array member has a packed axis to align, so both a mapped and a replicated first-class dimension are
-        // rejected here. The per-item type covers both spellings of a dimension carrier: a mapped dimension records its
-        // per-item type in the carrier, while a replicated one reports the packed value's own dimension type.
-        if let ArrayIrType::Dimension(r#type) = batch.unbatched_type() {
-            return Err(BatchingError::MappedDimension { r#type: Box::new(r#type), axis: BatchAxis::from(axis) });
-        }
-        if let ArrayIrType::Reference(r#type) = batch.value.r#type().as_ref() {
-            // A mapped reference already carrying the requested axis is an identity alignment. Anything else would have
-            // to move or broadcast shared storage, which no reference can do. The request is normalized against the
-            // referent's packed rank, so an out-of-bounds axis is reported as such rather than as an alignment failure.
-            let position = axis.normalize(r#type.referent().rank()).map_err(|_| {
-                BatchingError::BatchAxisOutOfBounds { r#type: Box::new(r#type.referent().clone()), axis }
-            })?;
-            if Some(position) == batch.batch_axis_position() {
-                return Ok(batch);
-            }
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!(
-                    "a reference's batch axis is fixed by its referent, so a reference batch carrying {} cannot be \
-                     aligned to axis {axis}; pass the reference as a batched input at that axis instead",
-                    batch.batch_axis,
-                ),
-            });
-        }
-        let Some(current_position) = batch.batch_axis_position() else {
-            // A replicated array gains the mapped axis through one dynamic broadcast along the transform's own extent.
-            let unbatched_type = batch.unbatched_type();
-            let array_type = <&ArrayType>::try_from(&unbatched_type)?;
-            let output_rank = array_type.rank() + 1;
-            let position = axis
-                .normalize(output_rank)
-                .map_err(|_| BatchingError::BatchAxisOutOfBounds { r#type: Box::new(array_type.clone()), axis })?;
-            let (value, ragged_axes) = batch.into_value_and_ragged_axes();
-            let (value, output_axes) = broadcast_replicated_array(
-                value,
-                array_type,
-                position,
-                context.axis_extent(),
-                context.axis_sharding(),
-            )?;
-            let ragged_axes =
-                ragged_axes.into_iter().map(|ragged_axis| ragged_axis.broadcasted(output_axes.as_slice())).collect();
-            return ArrayIrBatch::new(value, BatchAxis::from_position(position))?.with_ragged_axes(ragged_axes);
-        };
-
-        // A mapped array moves its axis with one transpose that keeps every other axis in its relative order. The
-        // target is normalized against the packed value's unchanged rank.
-        let packed_type = batch.value.r#type();
-        let packed_type = <&ArrayType>::try_from(packed_type.as_ref())?;
-        let rank = packed_type.rank();
-        let position = axis
-            .normalize(rank)
-            .map_err(|_| BatchingError::BatchAxisOutOfBounds { r#type: Box::new(packed_type.clone()), axis })?;
-        if current_position == position {
-            return Ok(batch);
-        }
-        let mut permutation = (0..rank).filter(|axis| *axis != current_position).collect::<Vec<_>>();
-        permutation.insert(position, current_position);
-        let (value, ragged_axes) = batch.into_value_and_ragged_axes();
-        let projected = <C::Value as ValueProjection<ArrayType>>::into_projected(value)?;
-        let value = C::Value::from_projected(projected.transpose(permutation)?);
-        let ragged_axes =
-            ragged_axes.into_iter().map(|ragged_axis| ragged_axis.moved(current_position, position)).collect();
-        ArrayIrBatch::new(value, BatchAxis::from_position(position))?.with_ragged_axes(ragged_axes)
-    }
-
-    fn static_batch_axis_extent(context: &BatchingContext<C, Self>) -> Option<usize> {
-        // The composite policy's extent is a first-class dimension value owned by the parent context, so its size is
-        // known statically only when the parent resolves that value to a concrete dimension constant (e.g., under eager
-        // batching), in which case it is projected to a `DimensionValue` and its extent is reported. A staged or opaque
-        // extent (e.g., under a trace with a symbolic batch dimension) has no static size.
-        match context.parent().resolve(context.axis_extent()) {
-            ValueResolution::Constant(axis_extent) => {
-                <C::Constant as ValueProjection<DimensionType>>::into_projected(axis_extent)
-                    .ok()
-                    .map(|axis_extent| axis_extent.extent())
-            }
-            ValueResolution::Staged(_) | ValueResolution::Opaque => None,
-        }
     }
 }
 
