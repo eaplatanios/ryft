@@ -2902,6 +2902,334 @@ where
     }
 }
 
+impl<C: Context<Type = ArrayIrType>> ArrayExtentBatchingPolicy<ProjectedContext<C, ArrayType>>
+    for DynamicArrayExtentBatchingPolicy
+where
+    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Operation: From<DynamicBroadcastOperation>
+        + From<ConstantOperation<DimensionValue>>
+        + From<DimensionSizeOperation>
+        + OperationProjection<ArrayType>,
+{
+    fn axis_dimension(
+        context: &BatchingContext<
+            ProjectedContext<C, ArrayType>,
+            ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>,
+        >,
+    ) -> Result<Dimension, BatchingError> {
+        // The mapped axis is described by the _type_ of the first-class extent value (i.e., an exact dimension when the
+        // extent is a constant, and the symbolic dimension it names otherwise).
+        Ok(<&DimensionType>::try_from(context.axis_extent().r#type().as_ref())?.to_dimension())
+    }
+
+    fn match_axis(
+        context: &BatchingContext<
+            ProjectedContext<C, ArrayType>,
+            ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>,
+        >,
+        batch: &ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>,
+        axis: Axis,
+    ) -> Result<ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>, BatchingError> {
+        // A mapped batch already carries the axis, so aligning it is a plain transpose that needs no extent at all.
+        if !batch.batch_axis().is_replicated() {
+            return batch.move_axis(axis);
+        }
+
+        // A replicated batch gains the mapped axis, so the request is normalized against the rank _after_ insertion.
+        let array_type = batch.unbatched_type();
+        let output_rank = array_type.rank() + 1;
+        let position = axis
+            .normalize(output_rank)
+            .map_err(|_| BatchingError::BatchAxisOutOfBounds { r#type: Box::new(array_type.clone()), axis })?;
+
+        // The broadcast is a mixed operation, so it is staged in the composite parent (i.e., two levels up, past this
+        // batching level and past the projected array view) on the lifted composite value, and the result is projected
+        // back into the array member afterward. Ragged metadata follows the operand-to-output axis mapping.
+        let value = <C::Value as ValueProjection<ArrayType>>::from_projected(batch.value().clone());
+        let (value, output_axes) = broadcast_replicated_array(
+            context.parent().parent(),
+            value,
+            &array_type,
+            position,
+            context.axis_extent(),
+            context.axis_sharding(),
+        )?;
+        let ragged_axes = batch
+            .ragged_axes()
+            .iter()
+            .cloned()
+            .map(|ragged_axis| ragged_axis.broadcasted(output_axes.as_slice()))
+            .collect();
+        ArrayBatch::new(
+            <C::Value as ValueProjection<ArrayType>>::into_projected(value)?,
+            BatchAxis::from_position(position),
+        )
+        .and_then(|output| output.with_ragged_axes(ragged_axes))
+    }
+
+    fn broadcast_input(
+        context: &BatchingContext<
+            ProjectedContext<C, ArrayType>,
+            ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>,
+        >,
+        input: &ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>,
+        r#type: ArrayType,
+        output_axes: Vec<usize>,
+        batch_axis: Axis,
+        dimension_sources: Vec<DimensionSource<<C::Value as ValueProjection<ArrayType>>::Projected>>,
+    ) -> Result<ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>, BatchingError> {
+        // Materialize every algorithm-provided output-dimension source in first-class form: exact constants for static
+        // dimensions, `dimension_size` reads of the provided source values for dynamic per-item dimensions, and the
+        // transform's extent value for the mapped axis.
+        let outer_context = context.parent().parent();
+        let output_dimensions = dimension_sources
+            .into_iter()
+            .map(|dimension_source| -> Result<C::Value, BatchingError> {
+                match dimension_source {
+                    DimensionSource::Static(extent) => dimension_constant(outer_context, extent),
+                    DimensionSource::Value { source, axis } => {
+                        let source = <C::Value as ValueProjection<ArrayType>>::from_projected(source);
+                        array_dimension(outer_context, &source, axis)
+                    }
+                    DimensionSource::BatchExtent => Ok(context.axis_extent().clone()),
+                }
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // The algorithm already decided where every operand axis lands (i.e., `output_axes`) and which batch axis
+        // the result carries, so this step only stages the mixed broadcast in the composite parent and relocates
+        // the operand's ragged metadata through that same axis mapping.
+        let value = <C::Value as ValueProjection<ArrayType>>::from_projected(input.value().clone());
+        let value =
+            broadcast_array(outer_context, value, output_dimensions, output_axes.clone(), r#type.sharding().cloned())?;
+        let ragged_axes = input
+            .ragged_axes()
+            .iter()
+            .cloned()
+            .map(|ragged_axis| ragged_axis.broadcasted(output_axes.as_slice()))
+            .collect();
+        ArrayBatch::new(<C::Value as ValueProjection<ArrayType>>::into_projected(value)?, batch_axis)?
+            .with_ragged_axes(ragged_axes)
+    }
+}
+
+impl<C: Context<Type = ArrayIrType>> RaggedArrayExtentBatchingPolicy<ProjectedContext<C, ArrayType>>
+    for DynamicArrayExtentBatchingPolicy
+where
+    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
+    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
+    C::Operation: From<DynamicBroadcastOperation>
+        + From<ConstantOperation<DimensionValue>>
+        + From<DimensionSizeOperation>
+        + OperationProjection<
+            ArrayType,
+            Projected: From<AndOperation<ArrayType>>
+                           + From<CompareOperation<ArrayType>>
+                           + From<ConstantOperation<Array>>
+                           + From<IotaOperation<ArrayType>>
+                           + From<SelectOperation<ArrayType>>
+                           + From<ZeroLikeOperation<ArrayType>>,
+        >,
+{
+    // Zero is both the identity of the one reduction kind whose padding this policy neutralizes and the identity of
+    // a contraction, so those two disciplines are the zero case of the generalized identity masking that serves all
+    // three, and they differ only in the discipline-specific validation they perform first.
+
+    fn mask_reduction_input(
+        context: &BatchingContext<
+            ProjectedContext<C, ArrayType>,
+            ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>,
+        >,
+        input: &ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>,
+        reduced_axes: &[usize],
+        kind: ReductionKind,
+    ) -> Result<ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>, BatchingError> {
+        // Zero is the identity of a sum and nothing else, so a reduction that actually reduces a ragged axis under any
+        // other kind would observe the padding this policy can only zero.
+        if kind != ReductionKind::Sum
+            && input.ragged_axes().iter().any(|ragged_axis| reduced_axes.contains(&ragged_axis.axis()))
+        {
+            return Err(BatchingError::UnsupportedOperation {
+                message: format!("ragged reduction kind {kind} is not supported; use reduce_sum"),
+            });
+        }
+        Self::mask_identity_input(context, input, reduced_axes, RaggedMaskIdentity::Zero)
+    }
+
+    #[inline]
+    fn pad_contraction_input(
+        context: &BatchingContext<
+            ProjectedContext<C, ArrayType>,
+            ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>,
+        >,
+        input: &ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>,
+        contracted_axes: &[usize],
+    ) -> Result<ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>, BatchingError> {
+        Self::mask_identity_input(context, input, contracted_axes, RaggedMaskIdentity::Zero)
+    }
+
+    fn mask_identity_input(
+        context: &BatchingContext<
+            ProjectedContext<C, ArrayType>,
+            ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>,
+        >,
+        input: &ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>,
+        masked_axes: &[usize],
+        identity: RaggedMaskIdentity,
+    ) -> Result<ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>, BatchingError> {
+        // This is the identity masking behind every ragged discipline of the dynamic policy: each ragged axis
+        // of `input` named in `masked_axes` contributes an `iota < extents` predicate over the packed shape,
+        // the predicates are combined, and the padded elements are selected away in favor of `identity`.
+        // `RaggedMaskIdentity::Zero` takes the operand's own zero-like value, which needs no data type reasoning.
+        // Every other identity stages a rank-zero constant of the operand's element data type and broadcasts it across
+        // the packed shape. Input with no masked ragged axis is returned unchanged, so nothing is staged for an operand
+        // this discipline does not touch.
+        //
+        // The staged instructions carry the nested `ryft::batching::ragged_identity_mask` provenance scopes.
+        // Those scopes are purely diagnostic; nothing may match on them for correctness.
+        let mut masked = input
+            .ragged_axes()
+            .iter()
+            .filter(|ragged_axis| masked_axes.contains(&ragged_axis.axis()))
+            .peekable();
+        if masked.peek().is_none() {
+            return Ok(input.clone());
+        }
+
+        // Homogeneous array primitives (e.g., `iota`, `compare`, `and`, `select`, constants, etc.) are bound in the
+        // projected array view, while the mixed dynamic broadcasts that give them the packed shape are bound in the
+        // composite parent two levels up, so both views of the same underlying context are kept at hand.
+        let outer_context = context.parent().parent();
+        let array_context = context.parent();
+        let input_value = input.value().clone();
+        let lifted_input_value = <C::Value as ValueProjection<ArrayType>>::from_projected(input_value.clone());
+        let packed_type = input.r#type().into_owned();
+
+        // The masked value is built entirely from primitives staged below, so the nested scopes cover exactly the
+        // instructions this masking owns.
+        let masked_value = outer_context.invoke_with_provenance_scope(ProvenanceScope::new("ryft"), || {
+            outer_context.invoke_with_provenance_scope(ProvenanceScope::new("batching"), || {
+                outer_context.invoke_with_provenance_scope(
+                    ProvenanceScope::new("ragged_identity_mask"),
+                    || -> Result<<C::Value as ValueProjection<ArrayType>>::Projected, BatchingError> {
+                        // Every broadcast below targets the operand's full packed shape, so its first-class dimensions
+                        // are read once and shared.
+                        let output_dimensions = (0..packed_type.rank())
+                            .map(|axis| folded_array_dimension(outer_context, &lifted_input_value, axis))
+                            .collect::<Result<Vec<_>, _>>()?;
+
+                        // Each masked ragged axis contributes one `iota < extents` predicate that is true exactly on
+                        // the live elements of that axis. The iota counts positions along the ragged axis, and the
+                        // per-item extents are broadcast along the axes they vary over, so the two align elementwise
+                        // over the packed shape. The predicates are then conjoined into one liveness mask.
+                        let mut mask = None;
+                        for ragged_axis in masked {
+                            let extent_value = ragged_axis.extents().clone();
+                            let extent_value_type = extent_value.r#type();
+                            let extent_type = extent_value_type.as_ref();
+
+                            // A ragged axis stores its per-item extents against a finite physical bound, which is what
+                            // the packed type records, so a non-static packed extent is malformed batch metadata.
+                            let physical_extent = packed_type.shape()[ragged_axis.axis()].value().ok_or_else(|| {
+                                BatchingError::InvalidBatchMetadata {
+                                    message: format!(
+                                        "ragged axis {} of packed array type `{}` has no static physical extent",
+                                        ragged_axis.axis(),
+                                        packed_type,
+                                    ),
+                                }
+                            })?;
+                            let iota_type = ArrayType::new(
+                                extent_type.data_type(),
+                                Shape::new(vec![Dimension::Static(physical_extent)]),
+                            );
+                            let mut iota = array_context.bind(IotaOperation::new(iota_type, 0)?, Vec::new(), &[])?;
+                            check_count!("output", iota, 1, ProgramError);
+                            let iota = broadcast_array(
+                                outer_context,
+                                <C::Value as ValueProjection<ArrayType>>::from_projected(iota.remove(0)),
+                                output_dimensions.clone(),
+                                vec![ragged_axis.axis()],
+                                None,
+                            )?;
+                            let broadcasted_extent = broadcast_array(
+                                outer_context,
+                                <C::Value as ValueProjection<ArrayType>>::from_projected(extent_value),
+                                output_dimensions.clone(),
+                                ragged_axis.extent_axes().to_vec(),
+                                None,
+                            )?;
+                            let mut current = array_context.bind(
+                                CompareOperation::<ArrayType>::new(ComparisonDirection::LessThan),
+                                Vec::new(),
+                                &[
+                                    <C::Value as ValueProjection<ArrayType>>::into_projected(iota)?,
+                                    <C::Value as ValueProjection<ArrayType>>::into_projected(broadcasted_extent)?,
+                                ],
+                            )?;
+
+                            check_count!("output", current, 1, ProgramError);
+                            mask = Some(match mask {
+                                None => current.remove(0),
+                                Some(mask) => {
+                                    let mut combined = array_context.bind(
+                                        AndOperation::<ArrayType>::new(),
+                                        Vec::new(),
+                                        &[mask, current.remove(0)],
+                                    )?;
+                                    check_count!("output", combined, 1, ProgramError);
+                                    combined.remove(0)
+                                }
+                            });
+                        }
+
+                        // The replacement written over padding is the requested identity materialized at the packed
+                        // shape, and the final select keeps live elements from the operand and takes the identity
+                        // everywhere else.
+                        let replacement = match identity {
+                            RaggedMaskIdentity::Zero => {
+                                let mut zero = array_context.bind(
+                                    ZeroLikeOperation::<ArrayType>::new(),
+                                    Vec::new(),
+                                    std::slice::from_ref(&input_value),
+                                )?;
+                                check_count!("output", zero, 1, ProgramError);
+                                zero.remove(0)
+                            }
+                            identity => {
+                                let scalar = ragged_mask_identity_scalar(packed_type.data_type(), identity)?;
+                                let mut constant =
+                                    array_context.bind(ConstantOperation::new(scalar), Vec::new(), &[])?;
+                                check_count!("output", constant, 1, ProgramError);
+                                let broadcasted = broadcast_array(
+                                    outer_context,
+                                    <C::Value as ValueProjection<ArrayType>>::from_projected(constant.remove(0)),
+                                    output_dimensions,
+                                    Vec::new(),
+                                    None,
+                                )?;
+                                <C::Value as ValueProjection<ArrayType>>::into_projected(broadcasted)?
+                            }
+                        };
+
+                        let mut masked = array_context.bind(
+                            SelectOperation::<ArrayType>::new(),
+                            Vec::new(),
+                            &[mask.unwrap(), input_value, replacement],
+                        )?;
+
+                        check_count!("output", masked, 1, ProgramError);
+                        Ok(masked.remove(0))
+                    },
+                )
+            })
+        })?;
+
+        ArrayBatch::new(masked_value, input.batch_axis())?.with_ragged_axes(input.ragged_axes().to_vec())
+    }
+}
+
 // TODO(eaplatanios): Should this be defined earlier in this module?
 /// [`BatchingPolicy`] used while a homogeneous first-class-dimension operation runs inside an array IR batching
 /// transform. A dimension is shared shape metadata and so its projected value is itself the complete batch carrier.
@@ -3059,6 +3387,10 @@ where
     C::Operation: OperationProjection<DimensionType>,
     <C::Operation as OperationProjection<DimensionType>>::Projected: From<DimensionRequirementOperation>,
 {
+    // The requirement is a dimension-universe operation, so both operands are projected to their dimension member and
+    // the check is bound through a projected view of `context`. Binding, rather than comparing on the host, is what
+    // lets the same check fold against concrete extents under eager batching and stay staged as a runtime requirement
+    // when either extent is symbolic.
     let left = <C::Value as ValueProjection<DimensionType>>::into_projected(left.clone())?;
     let right = <C::Value as ValueProjection<DimensionType>>::into_projected(right.clone())?;
     let operation = DimensionRequirementOperation::equal(left.r#type().as_ref(), right.r#type().as_ref());
@@ -3077,6 +3409,8 @@ pub(crate) fn broadcast_array<C>(
 where
     C: Context<Type = ArrayIrType, Operation: From<DynamicBroadcastOperation>>,
 {
+    // A dynamic broadcast takes the operand followed by one first-class dimension operand per output axis, so the
+    // output shape is carried entirely by SSA values rather than by static attributes.
     let operation = DynamicBroadcastOperation::new(output_axes).with_output_sharding(output_sharding);
     let mut inputs = Vec::with_capacity(output_dimensions.len() + 1);
     inputs.push(value);
@@ -3111,6 +3445,9 @@ where
     C::Operation:
         From<DynamicBroadcastOperation> + From<ConstantOperation<DimensionValue>> + From<DimensionSizeOperation>,
 {
+    // The output shape is the per-item shape with the mapped extent inserted at `position`: every per-item axis is read
+    // back from `value` (or folded to a constant when static) and keeps its relative order, shifting by one past the
+    // inserted axis. The resulting operand-to-output mapping is also what callers use to relocate ragged metadata.
     let mut output_dimensions = (0..array_type.rank())
         .map(|axis| folded_array_dimension(context, &value, axis))
         .collect::<Result<Vec<_>, _>>()?;
@@ -3118,6 +3455,7 @@ where
     let output_axes = (0..array_type.rank())
         .map(|input_axis| if input_axis < position { input_axis } else { input_axis + 1 })
         .collect::<Vec<_>>();
+    // The sharding, when present, gains the transform's placement for the mapped axis at the same position.
     let output_sharding = array_type
         .sharding()
         .map(|sharding| {
@@ -3128,329 +3466,6 @@ where
         .transpose()?;
     let value = broadcast_array(context, value, output_dimensions, output_axes.clone(), output_sharding)?;
     Ok((value, output_axes))
-}
-
-impl<C> ArrayExtentBatchingPolicy<ProjectedContext<C, ArrayType>> for DynamicArrayExtentBatchingPolicy
-where
-    C: Context<
-            Type = ArrayIrType,
-            Operation: From<DynamicBroadcastOperation>
-                           + From<ConstantOperation<DimensionValue>>
-                           + From<DimensionSizeOperation>
-                           + OperationProjection<ArrayType>,
-        >,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
-{
-    fn axis_dimension(
-        context: &BatchingContext<
-            ProjectedContext<C, ArrayType>,
-            ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>,
-        >,
-    ) -> Result<Dimension, BatchingError> {
-        let extent_type = context.axis_extent().r#type();
-        Ok(<&DimensionType>::try_from(extent_type.as_ref())?.to_dimension())
-    }
-
-    fn match_axis(
-        context: &BatchingContext<
-            ProjectedContext<C, ArrayType>,
-            ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>,
-        >,
-        batch: &ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>,
-        axis: Axis,
-    ) -> Result<ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>, BatchingError> {
-        if !batch.batch_axis().is_replicated() {
-            return batch.move_axis(axis);
-        }
-        let array_type = batch.unbatched_type();
-        let output_rank = array_type.rank() + 1;
-        let position = axis
-            .normalize(output_rank)
-            .map_err(|_| BatchingError::BatchAxisOutOfBounds { r#type: Box::new(array_type.clone()), axis })?;
-        let value = <C::Value as ValueProjection<ArrayType>>::from_projected(batch.value().clone());
-        let (value, output_axes) = broadcast_replicated_array(
-            context.parent().parent(),
-            value,
-            &array_type,
-            position,
-            context.axis_extent(),
-            context.axis_sharding(),
-        )?;
-        let ragged_axes = batch
-            .ragged_axes()
-            .iter()
-            .cloned()
-            .map(|ragged_axis| ragged_axis.broadcasted(output_axes.as_slice()))
-            .collect();
-        ArrayBatch::new(
-            <C::Value as ValueProjection<ArrayType>>::into_projected(value)?,
-            BatchAxis::from_position(position),
-        )
-        .and_then(|output| output.with_ragged_axes(ragged_axes))
-    }
-
-    fn broadcast_input(
-        context: &BatchingContext<
-            ProjectedContext<C, ArrayType>,
-            ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>,
-        >,
-        input: &ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>,
-        r#type: ArrayType,
-        output_axes: Vec<usize>,
-        batch_axis: Axis,
-        dimension_sources: Vec<DimensionSource<<C::Value as ValueProjection<ArrayType>>::Projected>>,
-    ) -> Result<ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>, BatchingError> {
-        // Materialize every algorithm-provided output-dimension source in first-class form: exact
-        // constants for static dimensions, `dimension_size` reads of the provided source values for dynamic per-item
-        // dimensions, and the transform's extent value for the mapped axis.
-        let outer_context = context.parent().parent();
-        let output_dimensions = dimension_sources
-            .into_iter()
-            .map(|dimension_source| -> Result<C::Value, BatchingError> {
-                match dimension_source {
-                    DimensionSource::Static(extent) => dimension_constant(outer_context, extent),
-                    DimensionSource::Value { source, axis } => {
-                        let source = <C::Value as ValueProjection<ArrayType>>::from_projected(source);
-                        array_dimension(outer_context, &source, axis)
-                    }
-                    DimensionSource::BatchExtent => Ok(context.axis_extent().clone()),
-                }
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let value = <C::Value as ValueProjection<ArrayType>>::from_projected(input.value().clone());
-        let value =
-            broadcast_array(outer_context, value, output_dimensions, output_axes.clone(), r#type.sharding().cloned())?;
-        let ragged_axes = input
-            .ragged_axes()
-            .iter()
-            .cloned()
-            .map(|ragged_axis| ragged_axis.broadcasted(output_axes.as_slice()))
-            .collect();
-        ArrayBatch::new(<C::Value as ValueProjection<ArrayType>>::into_projected(value)?, batch_axis)?
-            .with_ragged_axes(ragged_axes)
-    }
-}
-
-impl<C> RaggedArrayExtentBatchingPolicy<ProjectedContext<C, ArrayType>> for DynamicArrayExtentBatchingPolicy
-where
-    C: Context<
-            Type = ArrayIrType,
-            Operation: From<DynamicBroadcastOperation>
-                           + From<ConstantOperation<DimensionValue>>
-                           + From<DimensionSizeOperation>
-                           + OperationProjection<ArrayType>,
-        >,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
-    <C::Operation as OperationProjection<ArrayType>>::Projected: From<AndOperation<ArrayType>>
-        + From<CompareOperation<ArrayType>>
-        + From<ConstantOperation<Array>>
-        + From<IotaOperation<ArrayType>>
-        + From<SelectOperation<ArrayType>>
-        + From<ZeroLikeOperation<ArrayType>>,
-{
-    // Zero is both the identity of the one reduction kind whose padding this policy neutralizes and the identity of a
-    // contraction, so those two disciplines are the zero case of the generalized identity masking that serves all
-    // three, and they differ only in the discipline-specific validation they perform first.
-    fn mask_reduction_input(
-        context: &BatchingContext<
-            ProjectedContext<C, ArrayType>,
-            ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>,
-        >,
-        input: &ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>,
-        reduced_axes: &[usize],
-        kind: ReductionKind,
-    ) -> Result<ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>, BatchingError> {
-        // Zero is the identity of a sum and nothing else, so a reduction that actually reduces a ragged axis under any
-        // other kind would observe the padding this policy can only zero.
-        if kind != ReductionKind::Sum
-            && input.ragged_axes().iter().any(|ragged_axis| reduced_axes.contains(&ragged_axis.axis()))
-        {
-            return Err(BatchingError::UnsupportedOperation {
-                message: format!("ragged reduction kind {kind} is not supported; use reduce_sum"),
-            });
-        }
-        mask_ragged_padding(context, input, reduced_axes, RaggedMaskIdentity::Zero)
-    }
-
-    #[inline]
-    fn pad_contraction_input(
-        context: &BatchingContext<
-            ProjectedContext<C, ArrayType>,
-            ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>,
-        >,
-        input: &ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>,
-        contracted_axes: &[usize],
-    ) -> Result<ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>, BatchingError> {
-        mask_ragged_padding(context, input, contracted_axes, RaggedMaskIdentity::Zero)
-    }
-
-    #[inline]
-    fn mask_identity_input(
-        context: &BatchingContext<
-            ProjectedContext<C, ArrayType>,
-            ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>,
-        >,
-        input: &ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>,
-        masked_axes: &[usize],
-        identity: RaggedMaskIdentity,
-    ) -> Result<ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>, BatchingError> {
-        mask_ragged_padding(context, input, masked_axes, identity)
-    }
-}
-
-/// Stages the identity-masking behind every ragged discipline of the dynamic policy: each ragged axis of `input` named
-/// in `masked_axes` contributes an `iota < extents` predicate over the packed shape, the predicates are combined, and
-/// the padded elements are selected away in favor of `identity`. [`RaggedMaskIdentity::Zero`] takes the operand's own
-/// [`ZeroLikeOperation`], which needs no data-type reasoning; every other identity stages a rank-zero constant of the
-/// operand's element data type and broadcasts it across the packed shape. Input with no masked ragged axis is returned
-/// unchanged, so nothing is staged for an operand this discipline does not touch.
-///
-/// The staged instructions carry the nested `ryft::batching::ragged_identity_mask` provenance scopes. Those scopes are
-/// purely diagnostic: nothing may match on them for correctness.
-fn mask_ragged_padding<C>(
-    context: &BatchingContext<ProjectedContext<C, ArrayType>, ArrayBatchingPolicy<DynamicArrayExtentBatchingPolicy>>,
-    input: &ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>,
-    masked_axes: &[usize],
-    identity: RaggedMaskIdentity,
-) -> Result<ArrayBatch<<C::Value as ValueProjection<ArrayType>>::Projected>, BatchingError>
-where
-    C: Context<
-            Type = ArrayIrType,
-            Operation: From<DynamicBroadcastOperation>
-                           + From<ConstantOperation<DimensionValue>>
-                           + From<DimensionSizeOperation>
-                           + OperationProjection<ArrayType>,
-        >,
-    C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Value: ValueProjection<ArrayType, Projected: Transpose + Value<Type = ArrayType>>,
-    <C::Operation as OperationProjection<ArrayType>>::Projected: From<AndOperation<ArrayType>>
-        + From<CompareOperation<ArrayType>>
-        + From<ConstantOperation<Array>>
-        + From<IotaOperation<ArrayType>>
-        + From<SelectOperation<ArrayType>>
-        + From<ZeroLikeOperation<ArrayType>>,
-{
-    let mut masked = input
-        .ragged_axes()
-        .iter()
-        .filter(|ragged_axis| masked_axes.contains(&ragged_axis.axis()))
-        .peekable();
-    if masked.peek().is_none() {
-        return Ok(input.clone());
-    }
-
-    let outer_context = context.parent().parent();
-    let array_context = context.parent();
-    let input_value = input.value().clone();
-    let lifted_input_value = <C::Value as ValueProjection<ArrayType>>::from_projected(input_value.clone());
-    let packed_type = input.r#type().into_owned();
-    // The masked value is built entirely from primitives staged below, so the nested scopes cover exactly the
-    // instructions this masking owns.
-    let masked_value = outer_context.invoke_with_provenance_scope(ProvenanceScope::new("ryft"), || {
-        outer_context.invoke_with_provenance_scope(ProvenanceScope::new("batching"), || {
-            outer_context.invoke_with_provenance_scope(
-                ProvenanceScope::new("ragged_identity_mask"),
-                || -> Result<<C::Value as ValueProjection<ArrayType>>::Projected, BatchingError> {
-                    let output_dimensions = (0..packed_type.rank())
-                        .map(|axis| folded_array_dimension(outer_context, &lifted_input_value, axis))
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let mut mask = None;
-                    for ragged_axis in masked {
-                        let extent_value = ragged_axis.extents().clone();
-                        let extent_value_type = extent_value.r#type();
-                        let extent_type = extent_value_type.as_ref();
-                        // A ragged axis stores its per-item extents against a finite physical bound, which is what
-                        // the packed type records, so a non-static packed extent is malformed batch metadata.
-                        let physical_extent = packed_type.shape()[ragged_axis.axis()].value().ok_or_else(|| {
-                            BatchingError::InvalidBatchMetadata {
-                                message: format!(
-                                    "ragged axis {} of packed array type `{packed_type}` has no static \
-                                     physical extent",
-                                    ragged_axis.axis(),
-                                ),
-                            }
-                        })?;
-                        let iota_type = ArrayType::new(
-                            extent_type.data_type(),
-                            Shape::new(vec![Dimension::Static(physical_extent)]),
-                        );
-                        let mut iota = array_context.bind(IotaOperation::new(iota_type, 0)?, Vec::new(), &[])?;
-                        check_count!("output", iota, 1, ProgramError);
-                        let iota = broadcast_array(
-                            outer_context,
-                            <C::Value as ValueProjection<ArrayType>>::from_projected(iota.remove(0)),
-                            output_dimensions.clone(),
-                            vec![ragged_axis.axis()],
-                            None,
-                        )?;
-                        let broadcasted_extent = broadcast_array(
-                            outer_context,
-                            <C::Value as ValueProjection<ArrayType>>::from_projected(extent_value),
-                            output_dimensions.clone(),
-                            ragged_axis.extent_axes().to_vec(),
-                            None,
-                        )?;
-                        let mut current = array_context.bind(
-                            CompareOperation::<ArrayType>::new(ComparisonDirection::LessThan),
-                            Vec::new(),
-                            &[
-                                <C::Value as ValueProjection<ArrayType>>::into_projected(iota)?,
-                                <C::Value as ValueProjection<ArrayType>>::into_projected(broadcasted_extent)?,
-                            ],
-                        )?;
-                        check_count!("output", current, 1, ProgramError);
-                        mask = Some(match mask {
-                            None => current.remove(0),
-                            Some(mask) => {
-                                let mut combined = array_context.bind(
-                                    AndOperation::<ArrayType>::new(),
-                                    Vec::new(),
-                                    &[mask, current.remove(0)],
-                                )?;
-                                check_count!("output", combined, 1, ProgramError);
-                                combined.remove(0)
-                            }
-                        });
-                    }
-
-                    let replacement = match identity {
-                        RaggedMaskIdentity::Zero => {
-                            let mut zero = array_context.bind(
-                                ZeroLikeOperation::<ArrayType>::new(),
-                                Vec::new(),
-                                std::slice::from_ref(&input_value),
-                            )?;
-                            check_count!("output", zero, 1, ProgramError);
-                            zero.remove(0)
-                        }
-                        identity => {
-                            let scalar = ragged_mask_identity_scalar(packed_type.data_type(), identity)?;
-                            let mut constant = array_context.bind(ConstantOperation::new(scalar), Vec::new(), &[])?;
-                            check_count!("output", constant, 1, ProgramError);
-                            let broadcasted = broadcast_array(
-                                outer_context,
-                                <C::Value as ValueProjection<ArrayType>>::from_projected(constant.remove(0)),
-                                output_dimensions,
-                                Vec::new(),
-                                None,
-                            )?;
-                            <C::Value as ValueProjection<ArrayType>>::into_projected(broadcasted)?
-                        }
-                    };
-                    let mut masked = array_context.bind(
-                        SelectOperation::<ArrayType>::new(),
-                        Vec::new(),
-                        &[mask.unwrap(), input_value, replacement],
-                    )?;
-                    check_count!("output", masked, 1, ProgramError);
-                    Ok(masked.remove(0))
-                },
-            )
-        })
-    })?;
-    ArrayBatch::new(masked_value, input.batch_axis())?.with_ragged_axes(input.ragged_axes().to_vec())
 }
 
 /// Returns the rank-zero [`Array`] holding `identity` in `data_type`, which the dynamic policy stages as the constant
@@ -3466,7 +3481,7 @@ fn ragged_mask_identity_scalar(data_type: DataType, identity: RaggedMaskIdentity
     }
     Ok(dispatch_on_array_element_type!(data_type, |Element| {
         let element = match identity {
-            // Unreachable from `mask_ragged_padding`, which takes the operand's own zero-like value for this
+            // Unreachable from `mask_identity_input`, which takes the operand's own zero-like value for this
             // identity; the arm is kept for match exhaustiveness and stays correct if another caller appears.
             RaggedMaskIdentity::Zero => <Element as ArrayElement>::from_real(0.0)?,
             RaggedMaskIdentity::One => <Element as ArrayElement>::from_real(1.0)?,
@@ -3610,6 +3625,9 @@ where
             .map(|(input, input_batch_axis)| ArrayIrBatch::new(input, input_batch_axis))
             .collect::<Result<Vec<_>, _>>()?;
 
+        // An explicitly supplied extent must be a first-class dimension value. It then acts as the reference every
+        // mapped input's extent is checked against below; without one, the first mapped input's extent takes that
+        // role.
         let mut axis_extent = batch_axis.extent().cloned();
         if let Some(axis_extent) = &axis_extent {
             let extent_type = axis_extent.r#type();
@@ -3634,6 +3652,8 @@ where
                     Some(Dimension::Dynamic(variable)) if DimensionType::new(variable.clone()).extent().is_some() => {
                         dimension_constant(context, DimensionType::new(variable.clone()).extent().unwrap())?
                     }
+                    // A symbolic referent extent whose identity is already carried by the explicit extent or by a
+                    // mapped array needs no further evidence: equality is implied by the shared dimension identity.
                     Some(Dimension::Dynamic(variable))
                         if axis_extent.as_ref().is_some_and(|extent| {
                             matches!(extent.r#type().as_ref(), ArrayIrType::Dimension(r#type)
@@ -3656,6 +3676,7 @@ where
                         });
                     }
                 },
+                // A mapped array's extent is read from its packed batch axis.
                 _ => array_dimension(context, &batch.value, position)?,
             };
             if let Some(axis_extent) = &axis_extent {
@@ -3664,6 +3685,7 @@ where
                 axis_extent = Some(input_extent);
             }
         }
+        // With neither an explicit extent nor a mapped input there is nothing that determines the batch size.
         let axis_extent = axis_extent.ok_or(BatchingError::EmptyBatch)?;
 
         // A mapped reference's referent is batched like an array, so its batch-axis placement participates in the
@@ -3771,6 +3793,9 @@ where
                 message: "a bounded ragged array cannot cross the batching transform output boundary".to_string(),
             });
         }
+        // A mapped output cannot be presented as replicated, because dropping the axis would need a reduction the
+        // caller did not ask for. A mapped request is satisfied by alignment, which moves an existing axis or
+        // broadcasts a replicated output along the transform's extent.
         match (output.batch_axis.axis(), output_batch_axis.axis()) {
             (None, None) => Ok(output.into_value()),
             (Some(_), None) => {
@@ -3809,6 +3834,8 @@ where
         r#type: &C::Type,
         inputs: &[Self::Batch],
     ) -> Result<Self::Batch, BatchingError> {
+        // Only array carriers hold transform-only metadata (their ragged axes); references and dimensions are fully
+        // described by the packed value and the batch axis.
         let output = ArrayIrBatch::new(value, batch_axis)?;
         let ArrayIrType::Array(logical_type) = r#type else {
             return Ok(output);
@@ -3821,6 +3848,8 @@ where
             let Dimension::Dynamic(variable) = dimension else {
                 continue;
             };
+            // The per-item extents of a bounded dynamic dimension live in whichever input carrier already tracks that
+            // dimension identity as a ragged axis, since the region boundary erased them from the output.
             let source = inputs.iter().find_map(|input| {
                 input
                     .ragged_axes()
@@ -3829,6 +3858,9 @@ where
                     .map(|ragged_axis| (input, ragged_axis))
             });
             let Some((source, ragged_axis)) = source else {
+                // A dynamic dimension no input tracks is acceptable only when the packed output still spells it as
+                // that same dynamic dimension, i.e., it is an ordinary symbolic extent rather than a bounded ragged
+                // one whose per-item extents have been lost.
                 let packed_axis =
                     logical_axis + usize::from(output_batch_axis.is_some_and(|batch_axis| batch_axis <= logical_axis));
                 if packed_type.shape().dimensions().get(packed_axis) == Some(dimension) {
@@ -3841,6 +3873,10 @@ where
                     ),
                 });
             };
+            // The source records the axes its extents vary over in its own packed coordinates. Those are translated
+            // into the output's packed coordinates by stripping the source's batch axis and re-inserting the output's.
+            // An extent axis that *is* the source's batch axis means the extents vary per batch item, which the output
+            // can only represent if it is mapped as well.
             let source_batch_axis = source.batch_axis_position();
             let extent_axes = ragged_axis
                 .extent_axes()
@@ -3994,6 +4030,7 @@ where
                 inputs,
             )?;
 
+            // Resolve the policy into one optional target axis per output: `None` keeps the axis the rule produced.
             let output_target_axes = match &output_axes_policy {
                 ProgramBatchingOutputAxesPolicy::Natural => vec![None; outputs.len()],
                 ProgramBatchingOutputAxesPolicy::AlignAllTo(axis) => {
@@ -4019,6 +4056,8 @@ where
             Ok::<_, BatchingError>((output_atom_ids, output_axes))
         }?;
 
+        // The batching context and every tracer it produced were dropped with the block above, so the builder must be
+        // uniquely owned here; a remaining reference means a tracer escaped the structural trace.
         let input_count = region.input_types().len() + 1;
         let output_count = output_atom_ids.len();
         let builder = Rc::try_unwrap(builder).map_err(|_| ProgramError::EscapedProgramBuilder)?.into_inner();
