@@ -35,10 +35,9 @@ use crate::contexts::{Context, EagerContext, ProjectedContext, StagingContext};
 use crate::interpretation::InterpretableOperation;
 use crate::macros::{check_builders, check_count, dispatch_on_array_element_type};
 use crate::operations::{
-    AddOperation, AndOperation, Broadcast, BroadcastOperation, CompareOperation, ComparisonDirection,
-    ConstantOperation, DimensionRequirementOperation, DimensionSizeOperation, DynamicBroadcastOperation,
-    ElementwiseOperation, IotaOperation, ReductionKind, SelectOperation, Transpose, TransposeOperation,
-    ZeroLikeOperation,
+    AndOperation, Broadcast, BroadcastOperation, CompareOperation, ComparisonDirection, ConstantOperation,
+    DimensionRequirementOperation, DimensionSizeOperation, DynamicBroadcastOperation, ElementwiseOperation,
+    IotaOperation, ReductionKind, SelectOperation, Transpose, TransposeOperation, ZeroLikeOperation,
 };
 use crate::parameters::{Parameter, Placeholder};
 use crate::programs::{
@@ -2737,7 +2736,6 @@ where
     V: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     O: Operation<Type = ArrayIrType>
         + BatchableOperation<TracingContext<V, O>, ArrayIrBatchingPolicy>
-        + From<AddOperation<ArrayIrType>>
         + From<ConstantOperation<DimensionValue>>
         + From<DimensionSizeOperation>
         + From<DynamicBroadcastOperation>
