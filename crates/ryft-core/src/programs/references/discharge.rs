@@ -939,7 +939,7 @@ pub struct ReferenceDischargeReference<C: Domain, P: ReferenceDischargePolicy<C>
     /// Refer to the documentation of [`Self::allocation_id`].
     allocation_id: ReferenceDischargeAllocationId,
 
-    /// Refer to the documentation of [`Typed::r#type`](Typed::type).
+    /// Refer to the documentation of the `r#type` function on [`Typed`].
     r#type: ReferenceType<P::Referent>,
 
     /// Refer to the documentation of [`Self::is_view`].

@@ -106,8 +106,8 @@ pub trait Value: Clone + Debug + Display + Parameter + Typed + Sized {
     /// only concrete runtime payloads. Some values, such as metadata-only values and captured-value references, store
     /// their [`Type`](Typed::Type) or other type metadata directly. When a program or region is instantiated under
     /// renamed [`TypeIdentity`](crate::TypeIdentity)s, that metadata must be renamed together with atom types and
-    /// [`Operation`](crate::Operation) metadata so that [`Typed::r#type`](Typed::type) cannot continue to expose stale
-    /// identities.
+    /// [`Operation`](crate::Operation) metadata so that the `r#type` function on [`Typed`] cannot continue to expose
+    /// stale identities.
     ///
     /// This compiler-managed operation must preserve the represented runtime data, Single Static Assignment (SSA)
     /// identity, and execution semantics; it may only reconstruct metadata that depends on the value's type. The
