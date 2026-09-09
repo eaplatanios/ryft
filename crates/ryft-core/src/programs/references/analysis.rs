@@ -988,16 +988,14 @@ impl ReferenceAnalysis {
     }
 }
 
-// TODO(eaplatanios): Review from this point onwards.
-
 impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
-    /// Returns the [`ReferenceAnalysis`] of this [`Region`]'s closure, retained in the region's transform cache so that
-    /// kernel validation and transform rules consulting the same closure share one analysis. Discharge shares the
-    /// traversal through a separate uncached entry point that supplies its boundary identities.
-    /// The analysis is a pure structural function of the closure and `capture_count`, because reference-typed capture
-    /// constants resolve through [`Value::capture_index`], and it is keyed by the closure's region identifiers as
-    /// well, so a topology-preserving import that renumbers regions derives its own entry instead of being served
-    /// identifiers from another arena. Refer to [`ReferenceAnalysis`] for the analysis semantics and validation rules.
+    /// Returns the [`ReferenceAnalysis`] of this [`Region`]'s closure, retained in the region's transform cache so
+    /// that kernel validation and transform rules consulting the same closure share one analysis. Discharge shares the
+    /// traversal through a separate uncached entry point that supplies its boundary identities. The analysis is a pure
+    /// structural function of the closure and `capture_count`, because reference-typed capture constants resolve
+    /// through [`Value::capture_index`], and it is keyed by the closure's region identifiers as well, so a
+    /// topology-preserving import that renumbers regions derives its own entry instead of being served identifiers
+    /// from another arena. Refer to [`ReferenceAnalysis`] for the analysis semantics and validation rules.
     ///
     /// # Parameters
     ///
@@ -1036,26 +1034,26 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     /// # Errors
     ///
     /// Returns the first [`ReferenceAnalysisError`] in program order. Failed analyses are not retained.
+    #[inline]
     pub fn reference_analysis_with_configuration(
         self,
         capture_scope: Option<usize>,
         resolve_constants: bool,
         consumable_input_indices: &[usize],
     ) -> Result<Arc<ReferenceAnalysis>, ReferenceAnalysisError> {
-        let arguments = ReferenceAnalysisTransformArguments::new(
+        self.reference_analysis_impl(&ReferenceAnalysisTransformArguments::new(
             self,
             consumable_input_indices.to_vec(),
             capture_scope,
             resolve_constants,
-        );
-        self.reference_analysis_impl(&arguments)
+        ))
     }
 
     /// Returns the [`ReferenceAnalysis`] of this [`Region`]'s closure under the already-derived cache key `arguments`.
     /// Refer to the documentation of [`reference_analysis`](Self::reference_analysis) for the analysis and its cache
     /// identity. Analyses derived from these facts under the same key (e.g., the retained
-    /// [`ReferenceViewAnalysis`](crate::programs::references::ReferenceViewAnalysis)) call this so that the closure is
-    /// walked once per derivation rather than once more to rebuild the key.
+    /// [`ReferenceViewAnalysis`](crate::ReferenceViewAnalysis)) call this so that the closure is walked once per
+    /// derivation rather than once more to rebuild the key.
     pub(super) fn reference_analysis_impl(
         self,
         arguments: &ReferenceAnalysisTransformArguments,
@@ -1077,8 +1075,6 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
         Ok(analysis)
     }
 }
-
-// TODO(eaplatanios): Review up to here.
 
 impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Parameterized<V>>
     Program<V, O, Input, Output>
