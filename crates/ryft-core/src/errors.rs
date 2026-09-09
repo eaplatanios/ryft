@@ -8,7 +8,7 @@ use thiserror::Error;
 use crate::arrays::{BroadcastingError, DataTypeError, LayoutError, ShardingError};
 use crate::axes::AxisError;
 use crate::parameters::ParameterError;
-use crate::programs::TypeError;
+use crate::programs::{ProgramError, ReferenceError, TypeError};
 
 /// Represents errors that can occur in `ryft-core`.
 #[derive(Clone, Debug, Error, PartialEq, Eq, Hash)]
@@ -23,9 +23,6 @@ pub enum Error {
     Layout(#[from] LayoutError),
 
     #[error(transparent)]
-    Type(#[from] TypeError),
-
-    #[error(transparent)]
     Broadcasting(#[from] BroadcastingError),
 
     #[error(transparent)]
@@ -33,6 +30,15 @@ pub enum Error {
 
     #[error(transparent)]
     Axis(#[from] AxisError),
+
+    #[error(transparent)]
+    Type(#[from] TypeError),
+
+    #[error(transparent)]
+    Reference(#[from] ReferenceError),
+
+    #[error(transparent)]
+    Program(#[from] ProgramError),
 
     #[error("{0}")]
     Custom(Arc<dyn CustomError>),
@@ -110,5 +116,28 @@ impl<T, E> MaybeFallible<T, E> for Result<T, E> {
     #[inline]
     fn into_result(self) -> Result<T, E> {
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[test]
+    fn test_error_from_reference_error() {
+        let error = Error::from(ReferenceError::Frozen);
+        assert_eq!(error, Error::Reference(ReferenceError::Frozen));
+        assert_eq!(error.to_string(), "reference is frozen");
+        assert_eq!(format!("{error:?}"), "Reference(Frozen)");
+    }
+
+    #[test]
+    fn test_error_from_program_error() {
+        let error = Error::from(ProgramError::PoisonedValue);
+        assert_eq!(error, Error::Program(ProgramError::PoisonedValue));
+        assert_eq!(error.to_string(), "encountered poisoned value where a live value was required");
+        assert_eq!(format!("{error:?}"), "Program(PoisonedValue)");
     }
 }

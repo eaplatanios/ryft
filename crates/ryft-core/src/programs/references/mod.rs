@@ -207,7 +207,8 @@
 
 use thiserror::Error;
 
-/// Error produced while accessing the shared state of an eager [`Reference`] allocation.
+/// Error produced while accessing the shared state of an eager [`Reference`] allocation, validating reference views,
+/// or analyzing references in a program with [`ReferenceAnalysis`] or [`ReferenceViewAnalysis`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum ReferenceError {
     /// A reference allocation attempted to store another reference as its immediate referent.
@@ -253,6 +254,18 @@ pub enum ReferenceError {
         /// Backend-owned reason the state can no longer be used safely.
         reason: String,
     },
+
+    /// A program violates the reference rules checked by [`ReferenceAnalysis`].
+    #[error(transparent)]
+    Analysis(#[from] ReferenceAnalysisError),
+
+    /// A reference view description is invalid for its source or declared output type.
+    #[error(transparent)]
+    ViewValidation(#[from] ReferenceViewValidationError),
+
+    /// Reference view analysis rejects a program's view descriptions or paths.
+    #[error(transparent)]
+    ViewAnalysis(#[from] ReferenceViewAnalysisError),
 }
 
 mod analysis;
@@ -293,6 +306,11 @@ pub use views::{
 
 #[cfg(test)]
 mod tests {
+    use pretty_assertions::assert_eq;
+
+    use crate::programs::instructions::InstructionId;
+    use crate::programs::regions::RegionId;
+
     use super::*;
 
     #[test]
@@ -324,5 +342,47 @@ mod tests {
         let error = ReferenceError::Frozen;
         assert_eq!(format!("{error:?}"), "Frozen");
         assert!(std::error::Error::source(&error).is_none());
+    }
+
+    #[test]
+    fn test_reference_error_from_reference_analysis_error() {
+        let analysis_error = ReferenceAnalysisError::UnresolvedReference {
+            operation: "reference_read",
+            instruction: InstructionId::new(RegionId::new(0), 1),
+            input_index: 0,
+        };
+        let error = ReferenceError::from(analysis_error.clone());
+        assert_eq!(error, ReferenceError::Analysis(analysis_error.clone()));
+        assert_eq!(
+            error.to_string(),
+            "operation `reference_read` at ^0[1] uses input 0 as a reference but it resolves to no reference root",
+        );
+        assert_eq!(format!("{error:?}"), format!("Analysis({analysis_error:?})"));
+    }
+
+    #[test]
+    fn test_reference_error_from_reference_view_validation_error() {
+        let validation_error =
+            ReferenceViewValidationError::TypeMismatch { expected: "f32[3]".to_string(), actual: "f32[2]".to_string() };
+        let error = ReferenceError::from(validation_error.clone());
+        assert_eq!(error, ReferenceError::ViewValidation(validation_error));
+        assert_eq!(
+            error.to_string(),
+            "view declares referent type `f32[2]` but derives referent type `f32[3]` from its source",
+        );
+    }
+
+    #[test]
+    fn test_reference_error_from_reference_view_analysis_error() {
+        let analysis_error = ReferenceViewAnalysisError::MissingView {
+            operation: "view",
+            instruction: InstructionId::new(RegionId::new(0), 1),
+        };
+        let error = ReferenceError::from(analysis_error.clone());
+        assert_eq!(error, ReferenceError::ViewAnalysis(analysis_error));
+        assert_eq!(
+            error.to_string(),
+            "operation `view` at ^0[1] derives a reference view but exposes no view transform",
+        );
     }
 }

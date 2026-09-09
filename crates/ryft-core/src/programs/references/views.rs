@@ -104,7 +104,7 @@ use crate::programs::values::{Value, ValueId};
 
 /// Error produced by [`ReferenceViewOperation::validate_view`] when one view description does not compose onto its
 /// source reference type or does not derive the declared output reference type.
-#[derive(Clone, Debug, PartialEq, Eq, Error)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum ReferenceViewValidationError {
     /// The description composes onto the source but derives a referent type that differs from the declared one.
     #[error("view declares referent type `{actual}` but derives referent type `{expected}` from its source")]
@@ -125,8 +125,10 @@ pub enum ReferenceViewValidationError {
 }
 
 /// Error produced by [`ReferenceViewAnalysis`] when the generic reference analysis fails or when a derived view path
-/// cannot be reconciled with the program's declared reference types.
-#[derive(Clone, Debug, PartialEq, Eq, Error)]
+/// cannot be reconciled with the program's declared reference types. Conversion to [`ProgramError`] preserves an
+/// underlying [`ReferenceAnalysisError`] through its typed conversion; view-specific failures are preserved through
+/// [`ReferenceError::ViewAnalysis`](crate::programs::references::ReferenceError::ViewAnalysis).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum ReferenceViewAnalysisError {
     /// The generic reference analysis rejected the region closure.
     #[error(transparent)]
@@ -251,7 +253,10 @@ pub enum ReferenceViewAnalysisError {
 impl From<ReferenceViewAnalysisError> for ProgramError {
     #[inline]
     fn from(error: ReferenceViewAnalysisError) -> Self {
-        ProgramError::MalformedProgram(error.to_string())
+        match error {
+            ReferenceViewAnalysisError::Analysis(error) => error.into(),
+            error => ProgramError::Reference(error.into()),
+        }
     }
 }
 
@@ -1387,10 +1392,15 @@ mod tests {
 
     #[test]
     fn test_reference_view_analysis_error() {
-        let analysis = ReferenceAnalysisError::ReferenceConstant { region: RegionId::new(0), atom: AtomId::new(1) };
+        let analysis =
+            ReferenceAnalysisError::InvalidReferenceConstant { region: RegionId::new(0), atom: AtomId::new(1) };
         assert_eq!(
             ReferenceViewAnalysisError::from(analysis.clone()),
             ReferenceViewAnalysisError::Analysis(analysis.clone())
+        );
+        assert_eq!(
+            ProgramError::from(ReferenceViewAnalysisError::Analysis(analysis.clone())),
+            ProgramError::from(analysis.clone()),
         );
         assert_eq!(
             ReferenceViewAnalysisError::Analysis(analysis).to_string(),
@@ -1466,9 +1476,9 @@ mod tests {
         );
         assert_eq!(
             ProgramError::from(ReferenceViewAnalysisError::MissingView { operation: "view", instruction: id(0, 2) }),
-            ProgramError::MalformedProgram(
-                "operation `view` at ^0[2] derives a reference view but exposes no view transform".to_string(),
-            ),
+            ProgramError::Reference(crate::programs::references::ReferenceError::ViewAnalysis(
+                ReferenceViewAnalysisError::MissingView { operation: "view", instruction: id(0, 2) },
+            )),
         );
     }
 

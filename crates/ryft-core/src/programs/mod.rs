@@ -225,6 +225,9 @@ pub enum ProgramError {
     #[error(transparent)]
     Type(#[from] TypeError),
 
+    #[error(transparent)]
+    Reference(#[from] ReferenceError),
+
     #[error("{0}")]
     Custom(Arc<dyn CustomError>),
 }
@@ -247,5 +250,20 @@ impl ProgramError {
             ProgramError::Custom(custom) => (&**custom as &dyn std::error::Error).downcast_ref::<T>(),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use pretty_assertions::assert_eq;
+
+    use super::*;
+
+    #[test]
+    fn test_program_error_from_reference_error() {
+        let error = ProgramError::from(ReferenceError::Frozen);
+        assert_eq!(error, ProgramError::Reference(ReferenceError::Frozen));
+        assert_eq!(error.to_string(), "reference is frozen");
+        assert_eq!(format!("{error:?}"), "Reference(Frozen)");
     }
 }

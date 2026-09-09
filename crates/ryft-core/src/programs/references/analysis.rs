@@ -61,7 +61,7 @@
 //! which operand position), because a region is analyzed once and shared by every instruction attaching it; the
 //! caller-side source root lives on the per-attachment [`ReferenceRegionInputBinding`], and a shared region reached
 //! with a different boundary shape (an input that is a view under one attachment and a complete handle under another)
-//! is rejected with [`ReferenceAnalysisError::InvalidBoundaryShape`]. No other view enters or leaves an attached
+//! is rejected with [`ReferenceAnalysisError::InconsistentBoundaryViews`]. No other view enters or leaves an attached
 //! region; a region that needs one recreates it from the carried root. Reference-typed outputs of region-carrying
 //! operations resolve through [`Operation::reference_output_identity_input`] (every provenance origin must return
 //! exactly the constrained root) or through [`Operation::output_region_provenance`] (all origins must agree).
@@ -108,15 +108,17 @@ use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::{Value, ValueId};
 
-/// Error produced by [`ReferenceAnalysis`] when a [`Region`] closure violates the reference model. Every variant names
-/// the [`Operation`] and [`Instruction`](crate::Instruction) (or [`Region`] and [`Atom`]) at fault together with the
-/// violated rule, so that consumers can surface it without re-deriving it.
-#[derive(Clone, Debug, PartialEq, Eq, Error)]
+/// Error produced by [`ReferenceAnalysis`] when a [`Region`] closure violates the reference model. Each variant
+/// identifies the region or [`Instruction`](crate::Instruction) at fault and includes the details needed to explain
+/// the violated rule without repeating the analysis. Conversion to [`ProgramError`] preserves this error through
+/// [`ReferenceError::Analysis`](crate::ReferenceError::Analysis).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum ReferenceAnalysisError {
-    /// An operation's declared [`Effects`](crate::Effects) or region hooks name inputs, outputs, or regions that the
-    /// application does not have, or classify a non-reference output as a reference.
-    #[error("operation `{operation}` at {instruction} declares malformed effects: {message}")]
-    MalformedEffects {
+    /// An operation's reference effects or region provenance declarations are missing or invalid. This includes
+    /// undeclared reference inputs or outputs, positions outside the application's inputs, outputs, or regions,
+    /// and reference classifications applied to non-reference values.
+    #[error("operation `{operation}` at {instruction} has an invalid reference declaration: {message}")]
+    InvalidReferenceDeclaration {
         /// Name of the operation.
         operation: &'static str,
 
@@ -143,12 +145,13 @@ pub enum ReferenceAnalysisError {
         input_index: usize,
     },
 
-    /// A region stores a reference-typed constant that names no capture.
+    /// A region stores a reference-typed constant that names no capture, but the requested analysis requires
+    /// references to enter through explicit inputs or captures rather than concrete constants.
     #[error(
         "region {region} stores reference-typed constant {atom} that names no capture; references enter a program \
          only through inputs and captures"
     )]
-    ReferenceConstant {
+    InvalidReferenceConstant {
         /// Region storing the constant.
         region: RegionId,
 
@@ -157,12 +160,12 @@ pub enum ReferenceAnalysisError {
     },
 
     /// A reference-typed capture constant names a capture position that the active capture scope does not bind to a
-    /// reference.
+    /// reference. The position may be outside the scope or may bind a non-reference value.
     #[error(
         "reference-typed constant {atom} in region {region} names capture {capture_index}, which the active capture \
          scope of {capture_count} captures does not bind to a reference"
     )]
-    CaptureOutOfScope {
+    InvalidReferenceCapture {
         /// Region storing the constant.
         region: RegionId,
 
@@ -189,85 +192,30 @@ pub enum ReferenceAnalysisError {
 
     /// A shared region is reached by attachments that disagree on which of its reference-typed inputs are boundary
     /// views created by the attaching operation.
-    #[error("region {region} has an invalid boundary shape: {message}")]
-    InvalidBoundaryShape {
-        /// Region whose boundary shape is invalid.
+    #[error("region {region} has inconsistent boundary views: {message}")]
+    InconsistentBoundaryViews {
+        /// Shared region whose attachments disagree on which inputs are views.
         region: RegionId,
 
-        /// Description of the invalid shape.
+        /// Description of the conflicting boundary view declarations.
         message: String,
     },
 
-    /// An operation passes a reference into an attached region input without declaring which input supplies it.
+    /// An attached region returns a reference root that disagrees with the root required for an operation output.
+    /// The expected root comes from the operation's input-identity constraint, or from the first forwarded region
+    /// output when several regions supply the same output.
     #[error(
-        "operation `{operation}` at {instruction} passes a reference into region {region_index} input {input_index} \
-         without declaring which input supplies it"
-    )]
-    UndeclaredRegionInputProvenance {
-        /// Name of the operation.
-        operation: &'static str,
-
-        /// Instruction applying the operation.
-        instruction: InstructionId,
-
-        /// Position of the attached region.
-        region_index: usize,
-
-        /// Reference-typed input of the attached region.
-        input_index: usize,
-    },
-
-    /// An operation produces a reference-typed output that it neither classifies, constrains, nor forwards.
-    #[error(
-        "operation `{operation}` at {instruction} produces a reference at output {output_index} without declaring \
-         whether it allocates, aliases, preserves an input identity, or forwards a region output"
-    )]
-    UndeclaredReferenceOutput {
-        /// Name of the operation.
-        operation: &'static str,
-
-        /// Instruction applying the operation.
-        instruction: InstructionId,
-
-        /// Reference-typed output position.
-        output_index: usize,
-    },
-
-    /// An operation forwards an output from region outputs that denote different reference roots.
-    #[error(
-        "operation `{operation}` at {instruction} forwards output {output_index} from region outputs that denote \
-         different reference roots, {first} and {other}"
-    )]
-    InconsistentForwardedRoots {
-        /// Name of the operation.
-        operation: &'static str,
-
-        /// Instruction applying the operation.
-        instruction: InstructionId,
-
-        /// Forwarded output position.
-        output_index: usize,
-
-        /// Root denoted by the first provenance origin.
-        first: ReferenceRoot,
-
-        /// Disagreeing root denoted by a later provenance origin.
-        other: ReferenceRoot,
-    },
-
-    /// An attached region returns a root other than the one an identity-constrained output must preserve.
-    #[error(
-        "operation `{operation}` at {instruction} constrains output {output_index} to preserve {expected}, but \
+        "operation `{operation}` at {instruction} requires output {output_index} to denote {expected}, but \
          region {region_index} returns {actual} at output {region_output_index}"
     )]
-    FixedPointRootMismatch {
+    ReferenceRootMismatch {
         /// Name of the operation.
         operation: &'static str,
 
         /// Instruction applying the operation.
         instruction: InstructionId,
 
-        /// Identity-constrained output position.
+        /// Operation output whose reference root must be consistent.
         output_index: usize,
 
         /// Position of the attached region returning the mismatched root.
@@ -354,7 +302,7 @@ pub enum ReferenceAnalysisError {
         "operation `{operation}` at {instruction} consumes a derived view of {root} through input {input_index}, but \
          consumption invalidates the complete alias family; consume the root handle instead"
     )]
-    ConsumeThroughView {
+    ConsumptionThroughView {
         /// Name of the operation.
         operation: &'static str,
 
@@ -373,7 +321,7 @@ pub enum ReferenceAnalysisError {
         "operation `{operation}` at {instruction} consumes external reference {root} ({external_source}), which \
          its caller owns"
     )]
-    ConsumeExternal {
+    ExternalReferenceConsumption {
         /// Name of the operation.
         operation: &'static str,
 
@@ -393,7 +341,7 @@ pub enum ReferenceAnalysisError {
         "operation `{operation}` at {instruction} consumes {root}, which entered region {region} from its parent; a \
          reference may only be consumed in the region that allocated it"
     )]
-    ConsumeOutsideCreationScope {
+    ConsumptionOutsideCreationScope {
         /// Name of the operation.
         operation: &'static str,
 
@@ -433,7 +381,7 @@ pub enum ReferenceAnalysisError {
 impl From<ReferenceAnalysisError> for ProgramError {
     #[inline]
     fn from(error: ReferenceAnalysisError) -> Self {
-        ProgramError::MalformedProgram(error.to_string())
+        ProgramError::Reference(error.into())
     }
 }
 
@@ -1291,7 +1239,8 @@ fn forwarded_root(
     origin: OutputRegionProvenance,
     attached: &[AttachedRegion],
 ) -> Result<ReferenceRoot, ReferenceAnalysisError> {
-    let malformed = |message: String| ReferenceAnalysisError::MalformedEffects { operation, instruction, message };
+    let malformed =
+        |message: String| ReferenceAnalysisError::InvalidReferenceDeclaration { operation, instruction, message };
     let region = attached.get(origin.region_index).ok_or_else(|| {
         malformed(format!(
             "output {output_index} forwards region {} output {}, but the application attaches {} regions",
@@ -1388,7 +1337,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                 });
             }
             if summary.boundary.iter().map(Option::is_some).ne(boundary.iter().map(Option::is_some)) {
-                return Err(ReferenceAnalysisError::InvalidBoundaryShape {
+                return Err(ReferenceAnalysisError::InconsistentBoundaryViews {
                     region: region_id,
                     message: "shared region is reached with two different sets of boundary view inputs".to_string(),
                 });
@@ -1442,9 +1391,12 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                 }
                 None => {
                     let Some(capture_index) = capture_index else {
-                        return Err(ReferenceAnalysisError::ReferenceConstant { region: region_id, atom: atom_id });
+                        return Err(ReferenceAnalysisError::InvalidReferenceConstant {
+                            region: region_id,
+                            atom: atom_id,
+                        });
                     };
-                    return Err(ReferenceAnalysisError::CaptureOutOfScope {
+                    return Err(ReferenceAnalysisError::InvalidReferenceCapture {
                         region: region_id,
                         atom: atom_id,
                         capture_index,
@@ -1466,7 +1418,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
             let id = InstructionId::new(region_id, index);
             let operation = instruction.operation();
             let name = operation.name();
-            let malformed = |message: String| ReferenceAnalysisError::MalformedEffects {
+            let malformed = |message: String| ReferenceAnalysisError::InvalidReferenceDeclaration {
                 operation: name,
                 instruction: id,
                 message,
@@ -1499,7 +1451,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                 }
                 if mode.is_consuming() {
                     if record.narrows {
-                        return Err(ReferenceAnalysisError::ConsumeThroughView {
+                        return Err(ReferenceAnalysisError::ConsumptionThroughView {
                             operation: name,
                             instruction: id,
                             input_index,
@@ -1611,12 +1563,10 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                     // be a complete-value handle, and the region input is bound to its root.
                     let (supplying_index, view) = match operation.input_region_provenance(region_index, input_index) {
                         None => {
-                            return Err(ReferenceAnalysisError::UndeclaredRegionInputProvenance {
-                                operation: name,
-                                instruction: id,
-                                region_index,
-                                input_index,
-                            });
+                            return Err(malformed(format!(
+                                "reference input {input_index} of region {region_index} has no declared supplying \
+                                 input",
+                            )));
                         }
                         Some(InputRegionProvenance::Forwarded { input_index }) => (input_index, false),
                         Some(InputRegionProvenance::View { input_index }) => (input_index, true),
@@ -1688,7 +1638,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                         for origin in provenance {
                             let actual = forwarded_root(name, id, output_index, origin, &attached)?;
                             if actual != source.root {
-                                return Err(ReferenceAnalysisError::FixedPointRootMismatch {
+                                return Err(ReferenceAnalysisError::ReferenceRootMismatch {
                                     operation: name,
                                     instruction: id,
                                     output_index,
@@ -1715,23 +1665,24 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                             match forwarded {
                                 None => forwarded = Some(root),
                                 Some(first) if first != root => {
-                                    return Err(ReferenceAnalysisError::InconsistentForwardedRoots {
+                                    return Err(ReferenceAnalysisError::ReferenceRootMismatch {
                                         operation: name,
                                         instruction: id,
                                         output_index,
-                                        first,
-                                        other: root,
+                                        region_index: origin.region_index,
+                                        region_output_index: origin.output_index,
+                                        expected: first,
+                                        actual: root,
                                     });
                                 }
                                 Some(_) => {}
                             }
                         }
                         let Some(root) = forwarded else {
-                            return Err(ReferenceAnalysisError::UndeclaredReferenceOutput {
-                                operation: name,
-                                instruction: id,
-                                output_index,
-                            });
+                            return Err(malformed(format!(
+                                "reference output {output_index} has no declared allocation, alias, input identity, \
+                                 or forwarded region output",
+                            )));
                         };
                         ValueRecord { root, narrows: false, alias: None }
                     }
@@ -1794,14 +1745,14 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                 Ok(())
             }
             ReferenceRoot::RegionInput { region: root_region, input_index } if root_region == self.entry.id() => {
-                Err(ReferenceAnalysisError::ConsumeExternal {
+                Err(ReferenceAnalysisError::ExternalReferenceConsumption {
                     operation,
                     instruction,
                     root,
                     external_source: ReferenceSource::from_flat_input_index(input_index, self.capture_count),
                 })
             }
-            _ => Err(ReferenceAnalysisError::ConsumeOutsideCreationScope { operation, instruction, region, root }),
+            _ => Err(ReferenceAnalysisError::ConsumptionOutsideCreationScope { operation, instruction, region, root }),
         }
     }
 
@@ -2243,13 +2194,13 @@ mod tests {
     fn test_reference_analysis_error() {
         let cases = [
             (
-                ReferenceAnalysisError::MalformedEffects {
+                ReferenceAnalysisError::InvalidReferenceDeclaration {
                     operation: "test.malformed",
                     instruction: id(0, 1),
                     message: "accessed input 3 is out of range for an application with 1 inputs".to_string(),
                 },
-                "operation `test.malformed` at ^0[1] declares malformed effects: accessed input 3 is out of range for \
-                 an application with 1 inputs",
+                "operation `test.malformed` at ^0[1] has an invalid reference declaration: accessed input 3 is out of \
+                 range for an application with 1 inputs",
             ),
             (
                 ReferenceAnalysisError::UnresolvedReference {
@@ -2260,12 +2211,12 @@ mod tests {
                 "operation `test.read` at ^0[1] uses input 0 as a reference but it resolves to no reference root",
             ),
             (
-                ReferenceAnalysisError::ReferenceConstant { region: RegionId::new(2), atom: AtomId::new(3) },
+                ReferenceAnalysisError::InvalidReferenceConstant { region: RegionId::new(2), atom: AtomId::new(3) },
                 "region ^2 stores reference-typed constant %3 that names no capture; references enter a program only \
                  through inputs and captures",
             ),
             (
-                ReferenceAnalysisError::CaptureOutOfScope {
+                ReferenceAnalysisError::InvalidReferenceCapture {
                     region: RegionId::new(2),
                     atom: AtomId::new(3),
                     capture_index: 4,
@@ -2282,45 +2233,15 @@ mod tests {
                 "region ^2 has an invalid capture scope: the capture prefix of 3 inputs exceeds the region's 1 inputs",
             ),
             (
-                ReferenceAnalysisError::InvalidBoundaryShape {
+                ReferenceAnalysisError::InconsistentBoundaryViews {
                     region: RegionId::new(2),
                     message: "shared region is reached with two different sets of boundary view inputs".to_string(),
                 },
-                "region ^2 has an invalid boundary shape: shared region is reached with two different sets of boundary \
-                 view inputs",
+                "region ^2 has inconsistent boundary views: shared region is reached with two different sets of \
+                 boundary view inputs",
             ),
             (
-                ReferenceAnalysisError::UndeclaredRegionInputProvenance {
-                    operation: "test.opaque",
-                    instruction: id(1, 0),
-                    region_index: 0,
-                    input_index: 2,
-                },
-                "operation `test.opaque` at ^1[0] passes a reference into region 0 input 2 without declaring which \
-                 input supplies it",
-            ),
-            (
-                ReferenceAnalysisError::UndeclaredReferenceOutput {
-                    operation: "test.opaque",
-                    instruction: id(1, 0),
-                    output_index: 1,
-                },
-                "operation `test.opaque` at ^1[0] produces a reference at output 1 without declaring whether it \
-                 allocates, aliases, preserves an input identity, or forwards a region output",
-            ),
-            (
-                ReferenceAnalysisError::InconsistentForwardedRoots {
-                    operation: "test.condition",
-                    instruction: id(2, 0),
-                    output_index: 0,
-                    first: input_root(2, 1),
-                    other: input_root(2, 2),
-                },
-                "operation `test.condition` at ^2[0] forwards output 0 from region outputs that denote different \
-                 reference roots, region ^2 input 1 and region ^2 input 2",
-            ),
-            (
-                ReferenceAnalysisError::FixedPointRootMismatch {
+                ReferenceAnalysisError::ReferenceRootMismatch {
                     operation: "test.while",
                     instruction: id(2, 0),
                     output_index: 0,
@@ -2329,7 +2250,7 @@ mod tests {
                     expected: input_root(2, 0),
                     actual: input_root(2, 1),
                 },
-                "operation `test.while` at ^2[0] constrains output 0 to preserve region ^2 input 0, but region 1 \
+                "operation `test.while` at ^2[0] requires output 0 to denote region ^2 input 0, but region 1 \
                  returns region ^2 input 1 at output 0",
             ),
             (
@@ -2366,7 +2287,7 @@ mod tests {
                  the region from its parent, with mode `write`",
             ),
             (
-                ReferenceAnalysisError::ConsumeThroughView {
+                ReferenceAnalysisError::ConsumptionThroughView {
                     operation: "test.consume",
                     instruction: id(0, 2),
                     input_index: 0,
@@ -2376,7 +2297,7 @@ mod tests {
                  input 0, but consumption invalidates the complete alias family; consume the root handle instead",
             ),
             (
-                ReferenceAnalysisError::ConsumeExternal {
+                ReferenceAnalysisError::ExternalReferenceConsumption {
                     operation: "test.consume",
                     instruction: id(0, 0),
                     root: input_root(0, 0),
@@ -2386,7 +2307,7 @@ mod tests {
                  its caller owns",
             ),
             (
-                ReferenceAnalysisError::ConsumeOutsideCreationScope {
+                ReferenceAnalysisError::ConsumptionOutsideCreationScope {
                     operation: "test.consume",
                     instruction: id(0, 0),
                     region: RegionId::new(0),
@@ -2409,7 +2330,10 @@ mod tests {
         ];
         for (error, expected) in cases {
             assert_eq!(error.to_string(), expected);
-            assert_eq!(ProgramError::from(error.clone()), ProgramError::MalformedProgram(expected.to_string()));
+            assert_eq!(
+                ProgramError::from(error.clone()),
+                ProgramError::Reference(crate::programs::references::ReferenceError::Analysis(error.clone())),
+            );
             assert_eq!(error.clone(), error);
         }
     }
@@ -2916,7 +2840,7 @@ mod tests {
         builder.add_instruction(TestOperation::Call, vec![body], vec![carry, stacked], None).unwrap();
         assert!(matches!(
             build(builder, Vec::new()).reference_analysis(0),
-            Err(ReferenceAnalysisError::InvalidBoundaryShape { region, message })
+            Err(ReferenceAnalysisError::InconsistentBoundaryViews { region, message })
                 if region == RegionId::new(0)
                     && message == "shared region is reached with two different sets of boundary view inputs",
         ));
@@ -2946,7 +2870,7 @@ mod tests {
         let body = build(body, vec![carry]);
         assert!(matches!(
             stacked_scan_program(body, false).reference_analysis(0),
-            Err(ReferenceAnalysisError::ConsumeThroughView {
+            Err(ReferenceAnalysisError::ConsumptionThroughView {
                 operation: "test.consume",
                 instruction,
                 input_index: 0,
@@ -2995,7 +2919,11 @@ mod tests {
         let program = build(builder, Vec::new());
         assert!(matches!(
             program.reference_analysis(0),
-            Err(ReferenceAnalysisError::MalformedEffects { operation: "test.malformed", instruction, message })
+            Err(ReferenceAnalysisError::InvalidReferenceDeclaration {
+                operation: "test.malformed",
+                instruction,
+                message,
+            })
                 if instruction == id(0, 0)
                     && message == "accessed input 3 is out of range for an application with 1 inputs",
         ));
@@ -3013,7 +2941,11 @@ mod tests {
         let program = build(builder, Vec::new());
         assert!(matches!(
             program.reference_analysis(0),
-            Err(ReferenceAnalysisError::MalformedEffects { operation: "test.malformed", instruction, message })
+            Err(ReferenceAnalysisError::InvalidReferenceDeclaration {
+                operation: "test.malformed",
+                instruction,
+                message,
+            })
                 if instruction == id(0, 0)
                     && message == "classified output 2 is out of range for an application with 0 outputs",
         ));
@@ -3032,7 +2964,11 @@ mod tests {
         let program = build(builder, Vec::new());
         assert!(matches!(
             program.reference_analysis(0),
-            Err(ReferenceAnalysisError::MalformedEffects { operation: "test.malformed", instruction, message })
+            Err(ReferenceAnalysisError::InvalidReferenceDeclaration {
+                operation: "test.malformed",
+                instruction,
+                message,
+            })
                 if instruction == id(0, 0) && message == "classified output 0 has non-reference type `value<1>`",
         ));
     }
@@ -3066,13 +3002,13 @@ mod tests {
         let program = build(builder, Vec::new());
         assert!(matches!(
             ReferenceAnalysis::new(program.entry_region_ref(), 0),
-            Err(ReferenceAnalysisError::CaptureOutOfScope { region, atom, capture_index: 0, capture_count: 0 })
+            Err(ReferenceAnalysisError::InvalidReferenceCapture { region, atom, capture_index: 0, capture_count: 0 })
                 if region == RegionId::new(0) && atom == AtomId::new(0),
         ));
     }
 
     #[test]
-    fn test_reference_analysis_new_rejects_captures_out_of_scope() {
+    fn test_reference_analysis_new_rejects_invalid_reference_captures() {
         // A capture index past the scope is rejected, and so is one whose scope position binds a value.
         let mut builder = TestBuilder::new();
         builder.add_input(reference_type(0));
@@ -3081,7 +3017,7 @@ mod tests {
         let program = build(builder, Vec::new());
         assert!(matches!(
             program.reference_analysis(1),
-            Err(ReferenceAnalysisError::CaptureOutOfScope { region, atom, capture_index: 1, capture_count: 1 })
+            Err(ReferenceAnalysisError::InvalidReferenceCapture { region, atom, capture_index: 1, capture_count: 1 })
                 if region == RegionId::new(0) && atom == AtomId::new(1),
         ));
 
@@ -3092,7 +3028,7 @@ mod tests {
         let program = build(builder, Vec::new());
         assert!(matches!(
             program.reference_analysis(1),
-            Err(ReferenceAnalysisError::CaptureOutOfScope { region, atom, capture_index: 0, capture_count: 1 })
+            Err(ReferenceAnalysisError::InvalidReferenceCapture { region, atom, capture_index: 0, capture_count: 1 })
                 if region == RegionId::new(0) && atom == AtomId::new(1),
         ));
     }
@@ -3154,12 +3090,12 @@ mod tests {
         let program = build(builder, Vec::new());
         assert!(matches!(
             program.reference_analysis(0),
-            Err(ReferenceAnalysisError::UndeclaredRegionInputProvenance {
+            Err(ReferenceAnalysisError::InvalidReferenceDeclaration {
                 operation: "test.opaque",
                 instruction,
-                region_index: 0,
-                input_index: 0,
-            }) if instruction == id(1, 0),
+                message,
+            }) if instruction == id(1, 0)
+                && message == "reference input 0 of region 0 has no declared supplying input",
         ));
     }
 
@@ -3184,11 +3120,13 @@ mod tests {
         let program = build(builder, Vec::new());
         assert!(matches!(
             program.reference_analysis(0),
-            Err(ReferenceAnalysisError::UndeclaredReferenceOutput {
+            Err(ReferenceAnalysisError::InvalidReferenceDeclaration {
                 operation: "test.opaque",
                 instruction,
-                output_index: 0,
-            }) if instruction == id(1, 0),
+                message,
+            }) if instruction == id(1, 0)
+                && message == "reference output 0 has no declared allocation, alias, input identity, or forwarded \
+                               region output",
         ));
     }
 
@@ -3212,18 +3150,20 @@ mod tests {
         let program = build(builder, Vec::new());
         assert!(matches!(
             program.reference_analysis(0),
-            Err(ReferenceAnalysisError::InconsistentForwardedRoots {
+            Err(ReferenceAnalysisError::ReferenceRootMismatch {
                 operation: "test.condition",
                 instruction,
                 output_index: 0,
-                first,
-                other,
-            }) if instruction == id(2, 0) && first == input_root(2, 1) && other == input_root(2, 2),
+                region_index: 1,
+                region_output_index: 0,
+                expected,
+                actual,
+            }) if instruction == id(2, 0) && expected == input_root(2, 1) && actual == input_root(2, 2),
         ));
     }
 
     #[test]
-    fn test_reference_analysis_new_rejects_fixed_point_root_mismatch() {
+    fn test_reference_analysis_new_rejects_preserved_reference_root_mismatch() {
         let mut condition = TestBuilder::new();
         let first = condition.add_input(reference_type(0));
         condition.add_input(reference_type(0));
@@ -3242,7 +3182,7 @@ mod tests {
         let program = build(builder, Vec::new());
         assert!(matches!(
             program.reference_analysis(0),
-            Err(ReferenceAnalysisError::FixedPointRootMismatch {
+            Err(ReferenceAnalysisError::ReferenceRootMismatch {
                 operation: "test.while",
                 instruction,
                 output_index: 0,
@@ -3351,7 +3291,7 @@ mod tests {
         let program = build(builder, vec![output]);
         assert!(matches!(
             program.reference_analysis(0),
-            Err(ReferenceAnalysisError::ConsumeThroughView {
+            Err(ReferenceAnalysisError::ConsumptionThroughView {
                 operation: "test.consume",
                 instruction,
                 input_index: 0,
@@ -3368,7 +3308,7 @@ mod tests {
         let program = build(builder, vec![output]);
         assert!(matches!(
             program.reference_analysis(1),
-            Err(ReferenceAnalysisError::ConsumeExternal {
+            Err(ReferenceAnalysisError::ExternalReferenceConsumption {
                 operation: "test.consume",
                 instruction,
                 root,
@@ -3377,7 +3317,7 @@ mod tests {
         ));
         assert!(matches!(
             program.reference_analysis(0),
-            Err(ReferenceAnalysisError::ConsumeExternal {
+            Err(ReferenceAnalysisError::ExternalReferenceConsumption {
                 operation: "test.consume",
                 instruction,
                 root,
@@ -3400,7 +3340,7 @@ mod tests {
         let program = build(builder, Vec::new());
         assert!(matches!(
             program.reference_analysis(0),
-            Err(ReferenceAnalysisError::ConsumeOutsideCreationScope {
+            Err(ReferenceAnalysisError::ConsumptionOutsideCreationScope {
                 operation: "test.consume",
                 instruction,
                 region,
@@ -3708,7 +3648,7 @@ mod tests {
             .unwrap();
         assert!(matches!(
             ReferenceAnalysis::new(program.entry_region_ref(), 0),
-            Err(ReferenceAnalysisError::FixedPointRootMismatch {
+            Err(ReferenceAnalysisError::ReferenceRootMismatch {
                 operation: "while",
                 instruction,
                 output_index: 0,
@@ -3947,7 +3887,7 @@ mod tests {
     fn test_region_ref_reference_analysis_separates_capture_scopes() {
         let program = fixture();
         let failure = program.reference_analysis(0).unwrap_err();
-        assert!(matches!(failure, ReferenceAnalysisError::CaptureOutOfScope { capture_count: 0, .. }));
+        assert!(matches!(failure, ReferenceAnalysisError::InvalidReferenceCapture { capture_count: 0, .. }));
         assert_eq!(program.reference_analysis(0).unwrap_err(), failure);
         assert_eq!(program.reference_analysis(1).unwrap().region(), program.entry_region_ref().id());
     }
@@ -4027,7 +3967,7 @@ mod tests {
         assert!(Arc::ptr_eq(&analysis, &region.reference_analysis_with_constants().unwrap()));
         assert!(matches!(
             region.reference_analysis(0),
-            Err(ReferenceAnalysisError::CaptureOutOfScope { capture_index: 4, capture_count: 0, .. })
+            Err(ReferenceAnalysisError::InvalidReferenceCapture { capture_index: 4, capture_count: 0, .. })
         ));
     }
 
@@ -4073,7 +4013,7 @@ mod tests {
         let program = build(builder, vec![output]);
         assert_eq!(
             program.entry_region_ref().reference_analysis_with_constants(),
-            Err(ReferenceAnalysisError::CaptureOutOfScope {
+            Err(ReferenceAnalysisError::InvalidReferenceCapture {
                 region: child,
                 atom: AtomId::new(1),
                 capture_index: 0,
@@ -4083,7 +4023,7 @@ mod tests {
         let child_region = program.region_ref(child).unwrap();
         assert_eq!(
             child_region.reference_analysis_with_capture_scope(Some(1)),
-            Err(ReferenceAnalysisError::CaptureOutOfScope {
+            Err(ReferenceAnalysisError::InvalidReferenceCapture {
                 region: child,
                 atom: AtomId::new(1),
                 capture_index: 0,
@@ -4209,11 +4149,17 @@ mod tests {
         // An ownership-aware cache entry must not satisfy a borrowed-input or capture-boundary request.
         assert!(matches!(
             region.reference_analysis(0),
-            Err(ReferenceAnalysisError::ConsumeExternal { external_source: ReferenceSource::Input { index: 0 }, .. })
+            Err(ReferenceAnalysisError::ExternalReferenceConsumption {
+                external_source: ReferenceSource::Input { index: 0 },
+                ..
+            })
         ));
         assert!(matches!(
             region.reference_analysis_with_consumable_inputs(1, vec![0]),
-            Err(ReferenceAnalysisError::ConsumeExternal { external_source: ReferenceSource::Capture { index: 0 }, .. })
+            Err(ReferenceAnalysisError::ExternalReferenceConsumption {
+                external_source: ReferenceSource::Capture { index: 0 },
+                ..
+            })
         ));
 
         // Ownership belongs to the analyzed entry region; passing its input to a child does not transfer it again.
@@ -4224,7 +4170,7 @@ mod tests {
         let program = build(builder, vec![output]);
         assert!(matches!(
             program.entry_region_ref().reference_analysis_with_consumable_inputs(0, vec![0]),
-            Err(ReferenceAnalysisError::ConsumeOutsideCreationScope { operation: "test.consume", .. })
+            Err(ReferenceAnalysisError::ConsumptionOutsideCreationScope { operation: "test.consume", .. })
         ));
     }
 }

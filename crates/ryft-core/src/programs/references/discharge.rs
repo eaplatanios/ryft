@@ -151,7 +151,7 @@ use crate::contexts::{Context, Domain, StagingContext};
 use crate::macros::check_count;
 use crate::parameters::{Parameterized, Placeholder};
 use crate::programs::ProgramError;
-use crate::programs::atoms::{Atom, AtomId};
+use crate::programs::atoms::AtomId;
 use crate::programs::effects::ReferenceAccessMode;
 use crate::programs::instructions::{Instruction, InstructionId};
 use crate::programs::operations::Operation;
@@ -1425,7 +1425,6 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeRegionResult<V, O
     }
 }
 
-// TODO(eaplatanios): Review this.
 /// Transitive reference-access summary of a [`Region`](crate::Region) closure, expressed in the caller allocations
 /// its boundary names. This is the analysis a structured rule needs before it can size its state boundary, and it is
 /// computed entirely from generic hooks (i.e., operation-local [`Operation::effects`], the input- and output-region
@@ -1437,7 +1436,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeRegionResult<V, O
 /// what sizes the state boundary through [`boundary_widening`](ReferenceDischargeContext::boundary_widening).
 /// [`accessed_allocations`](Self::accessed_allocations) and [`access_modes`](Self::access_modes) hold only the
 /// allocations the closure semantically accesses, which is what region access policies validate. Sizing a boundary
-/// from the accessed allocations would under-thread merely-forwarded captures.
+/// from the accessed allocations would under-thread merely forwarded captures.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReferenceDischargeRegionSummary {
     /// Refer to the documentation of [`Self::reached_allocations`].
@@ -1453,8 +1452,9 @@ pub struct ReferenceDischargeRegionSummary {
 
 // TODO(eaplatanios): Review this.
 impl ReferenceDischargeRegionSummary {
-    /// Summarizes the caller allocations that `region` reaches, accesses, and returns, including its nested
-    /// computation regions. The region is attached to `operation` at `region_index`.
+    /// Creates a new [`ReferenceDischargeRegionSummary`] summarizing the caller allocations that `region` reaches,
+    /// accesses, and returns, including its nested computation [`Region`](crate::Region)s. The region is attached to
+    /// `operation` at `region_index`.
     ///
     /// Structured discharge rules use this summary to decide which references or immutable allocation states must
     /// cross the rewritten boundary and which final states must be returned. A captured reference that is merely
@@ -1682,9 +1682,13 @@ impl ReferenceDischargeSummaryState {
 
         let mut summary = Self::default();
         let is_reference = |atom: AtomId| region.atoms()[atom.index()].r#type().is_reference();
-        let mut allocations = HashMap::<AtomId, ReferenceDischargeRoot>::new();
-        for (input, allocation) in region.input_ids().iter().copied().zip(inputs) {
-            if is_reference(input) {
+        let mut allocations = region
+            .input_ids()
+            .iter()
+            .copied()
+            .zip(inputs)
+            .filter(|(input, _)| is_reference(*input))
+            .map(|(input, allocation)| {
                 let allocation = allocation.ok_or_else(|| {
                     ProgramError::MalformedProgram(format!(
                         "reference input `{}` of region `{}` has no supplying allocation",
@@ -1692,9 +1696,9 @@ impl ReferenceDischargeSummaryState {
                         region.id(),
                     ))
                 })?;
-                allocations.insert(input, allocation);
-            }
-        }
+                Ok((input, allocation))
+            })
+            .collect::<Result<HashMap<_, _>, ProgramError>>()?;
 
         // A capture-scoped constant is seeded exactly like a boundary position. Materializing one makes its allocation
         // reachable during replay but is not itself a semantic reference read; actual accesses are recorded from
@@ -1707,19 +1711,21 @@ impl ReferenceDischargeSummaryState {
             .flat_map(|instruction| instruction.inputs().iter().copied())
             .chain(region.output_ids().iter().copied())
             .collect::<HashSet<_>>();
-        for (atom_index, atom) in region.atoms().iter().enumerate() {
-            let atom_id = AtomId::new(atom_index);
-            if let Atom::Constant(constant) = atom
-                && constant.r#type().is_reference()
-                && let Some(allocation) =
-                    constant.capture_index().and_then(|index| captures.get(index).copied().flatten())
-            {
+        region
+            .atoms()
+            .iter()
+            .enumerate()
+            .filter_map(|(atom_index, atom)| {
+                let constant = atom.as_constant().filter(|constant| constant.r#type().is_reference())?;
+                let allocation = constant.capture_index().and_then(|index| captures.get(index).copied().flatten())?;
+                Some((AtomId::new(atom_index), allocation))
+            })
+            .for_each(|(atom_id, allocation)| {
                 allocations.insert(atom_id, allocation);
                 if materialized_atoms.contains(&atom_id) {
                     summary.reached_allocations.insert(allocation);
                 }
-            }
-        }
+            });
 
         let input_atom = |instruction: &Instruction<O>, index: usize, role: &str| {
             instruction.inputs().get(index).copied().ok_or_else(|| {
@@ -1853,9 +1859,9 @@ impl ReferenceDischargeSummaryState {
                 let nested_summary =
                     Self::new(nested_operation, nested_region_index, attached, nested.as_slice(), captures)?;
                 summary.reached_allocations.extend(nested_summary.reached_allocations);
-                for (allocation, modes) in nested_summary.accessed_allocations {
+                nested_summary.accessed_allocations.into_iter().for_each(|(allocation, modes)| {
                     summary.accessed_allocations.entry(allocation).or_default().extend(modes);
-                }
+                });
                 attached_output_allocations.push(nested_summary.output_allocations);
             }
 
@@ -1948,19 +1954,20 @@ impl ReferenceDischargeSummaryState {
             }
         }
 
-        for output in region.output_ids().iter().copied() {
-            summary.output_allocations.push(match allocations.get(&output) {
-                Some(allocation) => Some(*allocation),
-                None if is_reference(output) => {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "region `{}` returns a reference that entered it neither through its boundary nor through its \
-                         capture scope",
-                        region.id(),
-                    )));
-                }
-                None => None,
-            });
-        }
+        summary.output_allocations = region
+            .output_ids()
+            .iter()
+            .copied()
+            .map(|output| match allocations.get(&output) {
+                Some(allocation) => Ok(Some(*allocation)),
+                None if is_reference(output) => Err(ProgramError::MalformedProgram(format!(
+                    "region `{}` returns a reference that entered it neither through its boundary nor through its \
+                     capture scope",
+                    region.id(),
+                ))),
+                None => Ok(None),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
 
         summary.reached_allocations.extend(summary.output_allocations.iter().copied().flatten());
 
@@ -1972,18 +1979,19 @@ impl ReferenceDischargeSummaryState {
 
         // Every exact access mode the closure performs is held to the region access policy that the owning operation
         // declares for this region.
-        for (allocation, modes) in &summary.accessed_allocations {
-            for mode in modes {
-                if !operation.allows_reference_access_through_region_input(region_index, *mode) {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "operation `{}` does not allow region {} to access {} with mode `{}`",
-                        operation.name(),
-                        region_index,
-                        allocation,
-                        mode,
-                    )));
-                }
-            }
+        if let Some((allocation, mode)) = summary
+            .accessed_allocations
+            .iter()
+            .flat_map(|(allocation, modes)| modes.iter().copied().map(move |mode| (*allocation, mode)))
+            .find(|(_, mode)| !operation.allows_reference_access_through_region_input(region_index, *mode))
+        {
+            return Err(ProgramError::MalformedProgram(format!(
+                "operation `{}` does not allow region {} to access {} with mode `{}`",
+                operation.name(),
+                region_index,
+                allocation,
+                mode,
+            )));
         }
 
         Ok(summary)

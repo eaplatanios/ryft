@@ -131,7 +131,8 @@ mod tests {
 
     #[test]
     fn test_array_reference_analysis_error() {
-        let analysis = ReferenceAnalysisError::ReferenceConstant { region: RegionId::new(0), atom: AtomId::new(1) };
+        let analysis =
+            ReferenceAnalysisError::InvalidReferenceConstant { region: RegionId::new(0), atom: AtomId::new(1) };
         assert_eq!(
             ArrayReferenceAnalysisError::Analysis(analysis.clone()).to_string(),
             "region ^0 stores reference-typed constant %1 that names no capture; references enter a program only \
@@ -168,9 +169,9 @@ mod tests {
         );
         assert_eq!(
             ProgramError::from(ArrayReferenceAnalysisError::MissingView { operation: "view", instruction: id(0, 2) }),
-            ProgramError::MalformedProgram(
-                "operation `view` at ^0[2] derives a reference view but exposes no view transform".to_string(),
-            ),
+            ProgramError::Reference(crate::programs::ReferenceError::ViewAnalysis(
+                ReferenceViewAnalysisError::MissingView { operation: "view", instruction: id(0, 2) },
+            )),
         );
     }
 
@@ -559,7 +560,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             ArrayReferenceAnalysis::new(program.entry_region_ref(), 0).err(),
-            Some(ArrayReferenceAnalysisError::Analysis(ReferenceAnalysisError::ConsumeExternal {
+            Some(ArrayReferenceAnalysisError::Analysis(ReferenceAnalysisError::ExternalReferenceConsumption {
                 operation: "reference_freeze",
                 instruction: id(0, 0),
                 root: ReferenceRoot::RegionInput { region: RegionId::new(0), input_index: 0 },
