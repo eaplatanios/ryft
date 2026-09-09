@@ -344,7 +344,7 @@ impl<C: Domain<Type = ArrayIrType, Value: ReferenceSlice<C::Value>>> Interpretab
 /// symbol beyond the reference, [`ProgramError::MalformedProgram`] when the first operand is a value rather than a
 /// reference handle, when a symbol operand is a reference rather than a value, or when a symbol names the reference
 /// operand or an operand outside the application, [`ProgramError::UnsupportedOperation`] for a
-/// [`ReferenceViewSymbol::Iteration`] coordinate, and [`ProgramError::InvalidOutputCount`] when replaying the view on a
+/// [`ReferenceViewSymbol::RegionLocal`] coordinate, and [`ProgramError::InvalidOutputCount`] when replaying the view on a
 /// preserved allocation does not produce exactly one value. Propagates the view algebra's own [`TypeError`] when
 /// `transform` does not compose onto the incoming handle's referent, and the discharge context's own
 /// [`ProgramError::MalformedProgram`] when the replayed reference does not carry the composed type.
@@ -375,9 +375,9 @@ where
                     inputs.len(),
                 ))),
             },
-            ReferenceViewSymbol::Iteration => Err(ProgramError::UnsupportedOperation {
-                message: "an iteration view is created by its region-carrying operation and never discharged as an \
-                          instruction"
+            ReferenceViewSymbol::RegionLocal { .. } => Err(ProgramError::UnsupportedOperation {
+                message: "a region-local view coordinate is supplied by its attaching operation and cannot be \
+                          discharged as an instruction"
                     .to_string(),
             }),
         })

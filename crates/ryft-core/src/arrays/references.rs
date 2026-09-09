@@ -16,9 +16,10 @@
 //! # Symbolic Coordinates
 //!
 //! An [`Index`](ArrayReferenceViewTransform::Index) transform selects a static coordinate or a [`ReferenceViewSymbol`]:
-//! an operation operand or an attached region's iteration counter. Analysis binds symbols to their program values or
-//! regions. Eager handles carry [`NoReferenceViewBinding`] and accept only static transforms. Discharge paths can store
-//! context values as bindings, but accesses through symbolic coordinates currently return
+//! an instruction input or an operation-defined coordinate local to an attached region. Analysis binds input symbols
+//! to program values and local symbols to their region, semantic name, and coordinate index. Eager handles carry
+//! [`NoReferenceViewBinding`] and accept only static transforms. Discharge paths can store context values as bindings,
+//! but accesses through symbolic coordinates currently return
 //! [`ProgramError::UnsupportedOperation`] because the reconstruction policy does not yet provide dynamic slicing.
 
 use std::borrow::Cow;
@@ -86,9 +87,9 @@ pub enum ArrayReferenceViewError {
 ///
 /// Transforms are interpreted in order from the root outward. [`Index`](Self::Index) removes one axis at a static or
 /// symbolic coordinate; [`Slice`](Self::Slice) preserves rank and selects one static unit-stride range per axis.
-/// Only `scan` currently resolves symbolic coordinates, through its per-iteration reference slices and discharged
-/// stacked operands and outputs. Eager handles and standalone view discharge reject symbolic steps; traced reference
-/// indexing and strided slicing remain unsupported.
+/// The built-in scan supplies its local coordinate when it creates per-iteration reference slices. Other operation
+/// families may supply their own region-local coordinates through the same view contract. Eager handles and
+/// standalone view discharge reject symbolic steps; traced reference indexing and strided slicing remain unsupported.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 #[non_exhaustive]
 pub enum ArrayReferenceViewTransform {
@@ -534,17 +535,16 @@ impl ViewSelection {
 ///
 /// This type is structural metadata only: it owns neither the referenced array nor its resource identity, liveness,
 /// or synchronization state. [`ArrayReference`] pairs it with a handle to the shared reference allocation, and the
-/// array view overlay ([`ArrayReferenceAnalysis`]) records one per reference-typed
-/// program value. The view determines that handle's referent type and selected coordinates; mutations reconstruct
-/// the root by applying the inverse update of each transform in reverse order. Consequently, overlapping handles may
-/// select the same root coordinates and observe one another's ordered mutations, while equality and hashing
-/// distinguish different transform sequences.
+/// array view overlay ([`ArrayReferenceAnalysis`]) records one per reference-typed program value. The view determines
+/// that handle's referent type and selected coordinates; mutations reconstruct the root by applying the inverse update
+/// of each transform in reverse order. Consequently, overlapping handles may select the same root coordinates and
+/// observe one another's ordered mutations, while equality and hashing distinguish different transform sequences.
 ///
 /// `Binding` supplies symbolic coordinates: [`ReferenceViewSymbolBinding`] identifies program values, the uninhabited
 /// [`NoReferenceViewBinding`] restricts eager handles to static steps, and `C::Value` binds discharge coordinates
 /// directly to context values. Supported coordinate transforms are described by [`ArrayReferenceViewTransform`]. Pass
 /// root handles across attached-region and external runtime boundaries and recreate views inside the receiving scope;
-/// the only boundary view is the per-iteration slice that `scan` itself creates for a reference-typed stacked operand.
+/// an attaching operation may create a boundary view, such as a scan's per-iteration slice of a stacked reference.
 pub type ArrayReferenceView<Binding = ReferenceViewSymbolBinding> =
     ReferenceViewPath<ArrayReferenceViewTransform, Binding>;
 
@@ -1011,9 +1011,8 @@ impl<A: Value<Type = ArrayType>> Typed for ArrayReference<A> {
 /// operation's [`ArrayReferenceViewTransform`]. The resulting view reproduces the value's declared referent shape when
 /// applied to its root's array type. An attached region input has its own root: complete-handle inputs have empty
 /// views, while boundary views, such as a stacked `scan` input's per-iteration slice, retain the attaching operation's
-/// transform
-/// with its iteration symbol bound to that region. Their coordinates are relative to the nested input, not the caller's
-/// root.
+/// transform with its local coordinate bound to that region. Their coordinates are relative to the nested input, not
+/// the caller's root.
 ///
 /// Construct an analysis with [`ReferenceViewAnalysis::new`] or reuse a cached one through
 /// [`RegionRef::reference_view_analysis`](crate::RegionRef::reference_view_analysis). Validation is explicit: consumers
@@ -1313,7 +1312,10 @@ mod tests {
         assert_eq!(
             ArrayReferenceViewTransform::Index {
                 axis: 2,
-                index: ArrayReferenceViewIndex::Symbolic(ReferenceViewSymbol::Iteration)
+                index: ArrayReferenceViewIndex::Symbolic(ReferenceViewSymbol::RegionLocal {
+                    name: "test::array_coordinates",
+                    index: 0
+                })
             }
             .output_type(&matrix_type),
             Err(TypeError::invalid("reference index axis 2 is out of bounds for rank 2")),
@@ -1578,17 +1580,21 @@ mod tests {
         };
         let first = ReferenceViewSymbolBinding::Value(ValueId::new(RegionId::new(0), AtomId::new(1)));
         let second = ReferenceViewSymbolBinding::Value(ValueId::new(RegionId::new(0), AtomId::new(2)));
-        let iteration = ReferenceViewSymbolBinding::Iteration(RegionId::new(1));
+        let local_coordinate = ReferenceViewSymbolBinding::RegionLocal {
+            region: RegionId::new(1),
+            name: "test::array_coordinates",
+            index: 0,
+        };
         let row_first = empty.with_step(symbolic.clone(), vec![first]);
         let row_second = empty.with_step(symbolic.clone(), vec![second]);
-        let row_iteration = empty.with_step(symbolic.clone(), vec![iteration]);
+        let row_local_coordinate = empty.with_step(symbolic.clone(), vec![local_coordinate]);
         let shifted_row_first = rows_1_2.with_step(symbolic.clone(), vec![first]);
         assert_eq!(
             row_first.overlap(&empty.with_step(symbolic.clone(), vec![first]), &root),
             ReferenceViewOverlap::Same
         );
         assert_eq!(row_first.overlap(&row_second, &root), ReferenceViewOverlap::MayOverlap);
-        assert_eq!(row_first.overlap(&row_iteration, &root), ReferenceViewOverlap::MayOverlap);
+        assert_eq!(row_first.overlap(&row_local_coordinate, &root), ReferenceViewOverlap::MayOverlap);
         assert_eq!(row_first.overlap(&row_1, &root), ReferenceViewOverlap::MayOverlap);
         assert_eq!(row_first.overlap(&rows_2_3, &root), ReferenceViewOverlap::MayOverlap);
         assert_eq!(row_first.overlap(&empty, &root), ReferenceViewOverlap::MayOverlap);

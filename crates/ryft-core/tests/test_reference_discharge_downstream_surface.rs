@@ -908,7 +908,7 @@ enum RegisterView {
 
     /// One bit of a register, selected by `register.bit` at the index the symbol names:
     /// [`ReferenceViewSymbol::Input`] of the index input for an instruction output, or
-    /// [`ReferenceViewSymbol::Iteration`] for a hypothetical boundary view.
+    /// [`ReferenceViewSymbol::RegionLocal`] for a coordinate supplied by a region-carrying operation.
     Bit(ReferenceViewSymbol),
 }
 
@@ -1005,9 +1005,8 @@ impl ReferenceViewOperation for RegisterOperation {
                 check_count!("output", outputs, 1, ProgramError);
                 Ok(outputs.remove(0))
             }
-            RegisterView::Bit(ReferenceViewSymbol::Iteration) => Err(ProgramError::UnsupportedOperation {
-                message: "a register bit indexed by the iteration counter is created by its region-carrying operation \
-                          and cannot be reapplied"
+            RegisterView::Bit(ReferenceViewSymbol::RegionLocal { .. }) => Err(ProgramError::UnsupportedOperation {
+                message: "`register.bit` cannot reapply a coordinate supplied only within an attached region"
                     .to_string(),
             }),
         }
@@ -2116,9 +2115,40 @@ fn test_downstream_dynamic_view_analysis_closes_the_index_input() {
 }
 
 #[test]
+fn test_downstream_reference_view_path_region_local_coordinates() {
+    // A downstream operation can supply more than one coordinate without adding a core symbol variant. Their
+    // declaration names distinguish unrelated operation contracts, while indices distinguish coordinates belonging
+    // to one contract. The region identity confines each closed coordinate to the region that supplies it.
+    let root = RegisterIrType::Reference(ReferenceType::new(RegisterType));
+    let first_symbol = ReferenceViewSymbol::RegionLocal { name: "register.window.bit", index: 0 };
+    let second_symbol = ReferenceViewSymbol::RegionLocal { name: "register.window.bit", index: 1 };
+    let other_symbol = ReferenceViewSymbol::RegionLocal { name: "register.packet.bit", index: 0 };
+    let first_binding =
+        ReferenceViewSymbolBinding::RegionLocal { region: RegionId::new(0), name: "register.window.bit", index: 0 };
+    let second_binding =
+        ReferenceViewSymbolBinding::RegionLocal { region: RegionId::new(0), name: "register.window.bit", index: 1 };
+    let other_binding =
+        ReferenceViewSymbolBinding::RegionLocal { region: RegionId::new(0), name: "register.packet.bit", index: 0 };
+    let nested_binding =
+        ReferenceViewSymbolBinding::RegionLocal { region: RegionId::new(1), name: "register.window.bit", index: 0 };
+    let first = ReferenceViewPath::root().with_step(RegisterView::Bit(first_symbol), vec![first_binding]);
+    let second = ReferenceViewPath::root().with_step(RegisterView::Bit(second_symbol), vec![second_binding]);
+    let other = ReferenceViewPath::root().with_step(RegisterView::Bit(other_symbol), vec![other_binding]);
+    let nested = ReferenceViewPath::root().with_step(RegisterView::Bit(first_symbol), vec![nested_binding]);
+    assert_eq!(first.overlap(&first, &root), ReferenceViewOverlap::Same);
+    assert_eq!(first.overlap(&second, &root), ReferenceViewOverlap::MayOverlap);
+    assert_eq!(first.overlap(&other, &root), ReferenceViewOverlap::MayOverlap);
+    assert_eq!(first.overlap(&nested, &root), ReferenceViewOverlap::MayOverlap);
+    assert_ne!(first, second);
+    assert_ne!(first, other);
+    assert_ne!(first, nested);
+}
+
+#[test]
 fn test_downstream_dynamic_view_reapplies_with_its_index() {
     // Reapplication binds the view over another source with the supplied index value, here eagerly into a bit handle,
-    // and rejects a symbol count that disagrees with the description or a description bound to the iteration counter.
+    // and rejects a symbol count that disagrees with the description or a coordinate supplied only within an attached
+    // region.
     let context = RegisterDestination::new();
     let reference = Reference::new(RegisterValue::Register(6)).unwrap();
     let source = RegisterValue::Reference(reference.clone());
@@ -2143,13 +2173,12 @@ fn test_downstream_dynamic_view_reapplies_with_its_index() {
     assert!(matches!(
         RegisterOperation::reapply_view(
             &context,
-            &RegisterView::Bit(ReferenceViewSymbol::Iteration),
+            &RegisterView::Bit(ReferenceViewSymbol::RegionLocal { name: "register.window.bit", index: 0 }),
             source,
             &[RegisterValue::Register(1)],
         ),
         Err(ProgramError::UnsupportedOperation { message })
-            if message == "a register bit indexed by the iteration counter is created by its region-carrying operation \
-                and cannot be reapplied",
+            if message == "`register.bit` cannot reapply a coordinate supplied only within an attached region",
     ));
 }
 

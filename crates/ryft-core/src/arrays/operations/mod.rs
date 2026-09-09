@@ -59,16 +59,16 @@ use crate::operations::{
     ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
     ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation,
     ReferenceWrite, ReferenceWriteOperation, Rem, RemOperation, Reshape, ReshapeOperation, ReshardOperation, Round,
-    RoundOperation, Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation, ScanOperation, Scatter, ScatterOperation,
-    Select, SelectOperation, ShardingConstraintOperation, Sign, SignOperation, Sin, SinOperation, Slice,
-    SliceOperation, Sqrt, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, TagOperation, Tanh,
-    TanhOperation, TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
-    WhileOperation, Xor, XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    RoundOperation, Rsqrt, RsqrtOperation, SCAN_ITERATION_SYMBOL, ScaledDot, ScaledDotOperation, ScanOperation,
+    Scatter, ScatterOperation, Select, SelectOperation, ShardingConstraintOperation, Sign, SignOperation, Sin,
+    SinOperation, Slice, SliceOperation, Sqrt, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation,
+    TagOperation, Tanh, TanhOperation, TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice,
+    UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::partial::PartialValue;
 use crate::programs::{
-    MaybeZero, Operation, OperationProjection, ProgramError, ReferenceViewOperation, ReferenceViewSymbol,
-    ReferenceViewValidationError, Type, TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
+    MaybeZero, Operation, OperationProjection, ProgramError, ReferenceViewOperation, ReferenceViewValidationError,
+    Type, TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 use crate::tracing_v2::RematerializeOperation;
@@ -595,7 +595,7 @@ impl<A: Value<Type = ArrayType>> ReferenceViewOperation for ArrayIrOperation<A> 
             Self::Scan(operation) if region_index == 0 && input_index >= operation.carry_count() => {
                 Some(ArrayReferenceViewTransform::Index {
                     axis: 0,
-                    index: ArrayReferenceViewIndex::Symbolic(ReferenceViewSymbol::Iteration),
+                    index: ArrayReferenceViewIndex::Symbolic(SCAN_ITERATION_SYMBOL),
                 })
             }
             _ => None,
@@ -1810,7 +1810,7 @@ mod tests {
         // forwarded complete handles and no other member attaches a region with a view input.
         let view = ArrayReferenceViewTransform::Index {
             axis: 0,
-            index: ArrayReferenceViewIndex::Symbolic(ReferenceViewSymbol::Iteration),
+            index: ArrayReferenceViewIndex::Symbolic(SCAN_ITERATION_SYMBOL),
         };
         let scan = TestOperation::Scan(ScanOperation::new(1, 3));
         assert_eq!(scan.region_input_view(0, 0), None);

@@ -549,7 +549,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Typed for CotangentStorage<V, O> {
 /// so repeated accesses reuse staged operations; consuming a root accumulator removes its cached views.
 ///
 /// Generic view reconstruction requires known coordinate values. It rejects a view bound to a linear coordinate or a
-/// nested region's iteration counter. An enclosing operation's transpose rule must handle iteration-bound views when
+/// coordinate supplied locally by a nested region. An enclosing operation's transpose rule must handle these views when
 /// supporting that case; the context cannot reconstruct them from the region's non-reference operands alone.
 ///
 /// # Nested Regions
@@ -907,7 +907,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
             view = path.steps().iter().try_fold(view, |view, step| {
                 // The overlay bound each symbolic coordinate to a known primal operand of the view-creating
                 // instruction, whose transposed program value the reverse sweep materialized before this rule
-                // ran. An iteration-bound boundary view has no such value: the transpose rule of the attaching
+                // ran. A region-local boundary coordinate has no such value: the transpose rule of the attaching
                 // operation re-creates it.
                 let symbols = step
                     .bindings()
@@ -920,16 +920,19 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
                             .ok_or_else(|| ProgramError::UnsupportedOperation {
                                 message: format!(
                                     "the view coordinate {id:?} of reference operand {value:?} is a linear value, so \
-                                     the view cannot be reapplied to the operand's cotangent reference"
+                                     the view cannot be reapplied to the operand's cotangent reference",
                                 ),
                             }),
-                        ReferenceViewSymbolBinding::Iteration(region) => Err(ProgramError::UnsupportedOperation {
-                            message: format!(
-                                "reference operand {value:?} views its root through the iteration counter of region \
-                                 {region:?}; boundary views are re-created by the transpose rule of the attaching \
-                                 operation and cannot be reapplied to a cotangent reference"
-                            ),
-                        }),
+                        ReferenceViewSymbolBinding::RegionLocal { region, name, index } => {
+                            Err(ProgramError::UnsupportedOperation {
+                                message: format!(
+                                    "reference operand {value:?} views its root through region-local symbol `{name}` \
+                                     at index {index} of region {region:?}; boundary views are re-created by the \
+                                     transpose rule of the attaching operation and cannot be reapplied to a \
+                                     cotangent reference",
+                                ),
+                            })
+                        }
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 O::reapply_view(&self.parent, step.view(), view, symbols.as_slice())
@@ -2730,7 +2733,8 @@ impl<
                     let mut value = ValueId::new(self.id(), *operand);
                     while let Some(edge) = analysis.alias(value) {
                         // Views created outside this region have no local coordinate operands. The enclosing
-                        // operation's transpose rule must handle those boundary views, including iteration-bound ones.
+                        // operation's transpose rule must handle those boundary views, including ones with
+                        // region-local coordinates.
                         if edge.kind() == ReferenceAliasKind::View && edge.instruction().region() == self.id() {
                             for coordinate in self.instructions()[edge.instruction().index()].inputs() {
                                 let id = ValueId::new(self.id(), *coordinate);

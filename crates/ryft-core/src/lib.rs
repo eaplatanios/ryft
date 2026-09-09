@@ -86,8 +86,8 @@ pub use operations::constants::{
     ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 pub use operations::control_flow::{
-    CONDITION_OPERATION_NAME, ConditionOperation, SCAN_OPERATION_NAME, SELECT_OPERATION_NAME, ScanOperation, Select,
-    SelectOperation, WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileTypeSemantics,
+    CONDITION_OPERATION_NAME, ConditionOperation, SCAN_ITERATION_SYMBOL, SCAN_OPERATION_NAME, SELECT_OPERATION_NAME,
+    ScanOperation, Select, SelectOperation, WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileTypeSemantics,
     transpose_primal_condition, transpose_primal_scan,
 };
 pub use operations::cumulative::{

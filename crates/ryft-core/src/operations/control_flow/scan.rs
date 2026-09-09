@@ -59,6 +59,12 @@ use crate::tracing::{Tracer, TracingContext};
 /// Canonical operation name for [`ScanOperation`].
 pub const SCAN_OPERATION_NAME: &str = "scan";
 
+/// Region-local reference-view coordinate selecting the current slice of a [`ScanOperation`]'s stacked input.
+/// Its value is the selected slice index, so a reverse scan visits values from `length - 1` to `0` rather than
+/// counting upward in execution order. The scan rule binds and reconstructs this coordinate inside its body.
+pub const SCAN_ITERATION_SYMBOL: ReferenceViewSymbol =
+    ReferenceViewSymbol::RegionLocal { name: concat!(module_path!(), "::iteration"), index: 0 };
+
 /// [`Operation`] that applies a nested body [`Program`] a shape-determined number of times over loop-carried state
 /// while
 /// consuming one slice of each stacked input per iteration and stacking the body's per-iteration outputs. This is the
@@ -441,7 +447,13 @@ where
                 .symbols()
                 .into_iter()
                 .map(|symbol| match symbol {
-                    ReferenceViewSymbol::Iteration => Ok(ReferenceViewSymbolBinding::Iteration(body.id())),
+                    ReferenceViewSymbol::RegionLocal { name, index } if symbol == SCAN_ITERATION_SYMBOL => {
+                        Ok(ReferenceViewSymbolBinding::RegionLocal { region: body.id(), name, index })
+                    }
+                    ReferenceViewSymbol::RegionLocal { .. } => Err(ProgramError::MalformedProgram(format!(
+                        "operation `{name}` describes the boundary view of body input {position} through \
+                         unsupported symbol `{symbol}`",
+                    ))),
                     ReferenceViewSymbol::Input(input_index) => Err(ProgramError::MalformedProgram(format!(
                         "operation `{name}` describes the boundary view of body input {position} through input \
                          {input_index}, which a scan body cannot bind",
@@ -1073,7 +1085,7 @@ where
                 if matches!(input.unbatched_type(), ArrayIrType::Reference(_)) {
                     let boundary_view = ArrayReferenceViewTransform::Index {
                         axis: 0,
-                        index: ArrayReferenceViewIndex::Symbolic(ReferenceViewSymbol::Iteration),
+                        index: ArrayReferenceViewIndex::Symbolic(SCAN_ITERATION_SYMBOL),
                     };
                     let (packed_view, slice_axis) = boundary_view.batch(&input.value().r#type(), input.batch_axis())?;
                     if packed_view != boundary_view {
