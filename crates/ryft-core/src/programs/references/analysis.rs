@@ -1223,16 +1223,18 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
         }
     }
 
-    /// Consumes this traversal to analyze its entry region's computation closure. Returns the accumulated analysis
-    /// and the entry region's summary; structural analysis uses the former, while boundary summarization uses the
-    /// latter. Entry inputs have no boundary views because only attaching instructions introduce those views.
+    // TODO(eaplatanios): Review up to here.
+
+    /// Consumes this traversal, starting [`visit_region`](Self::visit_region) from the entry region supplied at
+    /// construction. Returns the accumulated [`ReferenceAnalysis`] and the entry region's [`RegionSummary`].
+    /// Structural analysis uses the former while reference discharge uses the latter. Entry inputs start without
+    /// boundary views, which only attaching instructions introduce.
     ///
     /// # Parameters
     ///
-    ///   - `scope`: Reference root at each inherited capture position, or [`None`] for a non-reference capture.
-    ///   - `inputs`: Caller roots for entry inputs when summarizing a boundary, with [`None`] entries for
-    ///     non-reference inputs. The caller must validate their count and types. Passing [`None`] instead analyzes
-    ///     the closure structurally, treating reference inputs as distinct roots.
+    ///   - `scope`: Active capture bindings for the entry region, passed unchanged to [`Self::visit_region`].
+    ///   - `inputs`: Optional caller bindings for the entry inputs. Refer to [`Self::visit_region`]
+    ///     for their validation requirements and how they select the analysis mode.
     fn analyze(
         mut self,
         scope: Rc<[Option<ReferenceRoot>]>,
@@ -1242,8 +1244,6 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
         let summary = self.visit_region(self.entry, scope, boundary, inputs)?;
         Ok((self.analysis, summary))
     }
-
-    // TODO(eaplatanios): Review up to here.
 
     /// Analyzes references in `region` and its attached computation regions, updating this traversal's records and
     /// returning a [`RegionSummary`] of reference accesses and outputs. Dormant rule regions are skipped. The initial
