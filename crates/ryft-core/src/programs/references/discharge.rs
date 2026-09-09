@@ -1504,14 +1504,14 @@ impl ReferenceDischargeRegionSummary {
 
         // Public boundaries supply caller identities; source-local identities exist only during traversal.
         // Reject a missing reference binding rather than treating it as a locally allocated reference.
-        for (index, (input, allocation)) in region.input_ids().iter().zip(inputs).enumerate() {
-            if region.atoms()[input.index()].r#type().is_reference() != allocation.is_some() {
-                return Err(ProgramError::MalformedProgram(format!(
-                    "reference discharge allocation binding for region `{}` input {} does not match its reference type",
-                    region.id(),
-                    index,
-                )));
-            }
+        if let Some((index, _)) = region.input_ids().iter().zip(inputs).enumerate().find(|(_, (input, allocation))| {
+            region.atoms()[input.index()].r#type().is_reference() != allocation.is_some()
+        }) {
+            return Err(ProgramError::MalformedProgram(format!(
+                "reference discharge allocation binding for region `{}` input {} does not match its reference type",
+                region.id(),
+                index,
+            )));
         }
 
         // Give each caller allocation one source-program representative. Repeated inputs and input/capture aliases
@@ -1536,19 +1536,19 @@ impl ReferenceDischargeRegionSummary {
                 // Captures already represented by inputs need no scan. Otherwise, choose source constants for the
                 // remaining caller allocations; the shared traversal determines which captures replay actually uses.
                 if captures.allocations().iter().flatten().any(|allocation| !roots.contains_key(allocation)) {
-                    for nested in region.computation_regions() {
-                        for (index, atom) in nested.atoms().iter().enumerate() {
-                            if let Some(constant) = atom.as_constant()
-                                && constant.r#type().is_reference()
-                                && let Some(allocation) = constant.capture_index()
-                                    .and_then(|index| captures.allocations().get(index).copied().flatten())
-                            {
-                                roots.entry(allocation).or_insert(ReferenceRoot::Constant {
-                                    value: ValueId::new(nested.id(), AtomId::new(index)),
-                                });
-                            }
-                        }
-                    }
+                    region.computation_regions()
+                        .flat_map(|nested| nested.atoms().iter().enumerate().map(move |(index, atom)| {
+                            (ValueId::new(nested.id(), AtomId::new(index)), atom)
+                        }))
+                        .filter_map(|(value, atom)| {
+                            let constant = atom.as_constant().filter(|constant| constant.r#type().is_reference())?;
+                            let allocation = constant.capture_index()
+                                .and_then(|index| captures.allocations().get(index).copied().flatten())?;
+                            Some((allocation, value))
+                        })
+                        .for_each(|(allocation, value)| {
+                            roots.entry(allocation).or_insert(ReferenceRoot::Constant { value });
+                        });
                 }
                 captures.allocations().iter()
                     .map(|allocation| allocation.and_then(|allocation| roots.get(&allocation).copied()))
