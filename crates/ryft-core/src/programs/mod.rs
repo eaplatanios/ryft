@@ -151,7 +151,7 @@ pub use operations::{
 pub use programs::{FlatProgram, Program, ProgramLiveSets, ProgramRenderingMode};
 pub use provenance::{Provenance, ProvenanceScope, ProvenanceState};
 pub use references::{
-    ExternalReferenceBinding, NoBinding, PartialReferenceDischargeResult, PreparedReferenceReplacement,
+    ExternalReferenceBinding, NoReferenceViewBinding, PartialReferenceDischargeResult, PreparedReferenceReplacement,
     ReadyOrPendingReferenceGuard, ReadyReferenceGuard, RecursiveReferenceDischargeDriver, Reference, ReferenceAccess,
     ReferenceAccumulationPolicy, ReferenceAliasEdge, ReferenceAliasPosition, ReferenceAnalysis, ReferenceAnalysisError,
     ReferenceBoundary, ReferenceBoundaryError, ReferenceBoundaryPosition, ReferenceCompletion,
@@ -164,10 +164,10 @@ pub use references::{
     ReferenceObservation, ReferenceRegionInputBinding, ReferenceReplacementPreparation,
     ReferenceReplacementTransaction, ReferenceRoot, ReferenceSource, ReferenceTransitiveAccess, ReferenceType,
     ReferenceTypeRefinements, ReferenceView, ReferenceViewAnalysis, ReferenceViewAnalysisError, ReferenceViewOperation,
-    ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError, TakenReferenceGuard,
-    ValidatedPendingReplacementTransaction, ViewOverlap, ViewSymbol, ViewSymbolBinding, batch_reference_view_operation,
-    discharge_local_reference_operation, discharge_positional_region_operation, discharge_reference_free_operation,
-    validate_reference_boundary,
+    ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep, ReferenceViewSymbol, ReferenceViewSymbolBinding,
+    ReferenceViewValidationError, TakenReferenceGuard, ValidatedPendingReplacementTransaction,
+    batch_reference_view_operation, discharge_local_reference_operation, discharge_positional_region_operation,
+    discharge_reference_free_operation, validate_reference_boundary,
 };
 pub use regions::{
     BindingRegionDriver, CalleeRegionDriver, DestinationRegionMapping, EmptyRegionDriver, InputRegionProvenance,

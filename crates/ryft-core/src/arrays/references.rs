@@ -15,10 +15,10 @@
 //!
 //! # Symbolic Coordinates
 //!
-//! An [`Index`](ArrayReferenceViewTransform::Index) transform selects a static coordinate or a [`ViewSymbol`]: an
-//! operation operand or an attached region's iteration counter. Analysis binds symbols to their program values or
-//! regions. Eager handles carry [`NoBinding`] and accept only static transforms. Discharge paths can store context
-//! values as bindings, but accesses through symbolic coordinates currently return
+//! An [`Index`](ArrayReferenceViewTransform::Index) transform selects a static coordinate or a [`ReferenceViewSymbol`]:
+//! an operation operand or an attached region's iteration counter. Analysis binds symbols to their program values or
+//! regions. Eager handles carry [`NoReferenceViewBinding`] and accept only static transforms. Discharge paths can store
+//! context values as bindings, but accesses through symbolic coordinates currently return
 //! [`ProgramError::UnsupportedOperation`] because the reconstruction policy does not yet provide dynamic slicing.
 
 use std::borrow::Cow;
@@ -42,10 +42,10 @@ use crate::operations::{
 };
 use crate::parameters::Parameter;
 use crate::programs::{
-    NoBinding, ProgramError, ReadyOrPendingReferenceGuard, Reference, ReferenceAccumulationPolicy,
+    NoReferenceViewBinding, ProgramError, ReadyOrPendingReferenceGuard, Reference, ReferenceAccumulationPolicy,
     ReferenceDischargePolicy, ReferenceDischargeableType, ReferenceError, ReferenceId, ReferenceType, ReferenceView,
-    ReferenceViewAnalysis, ReferenceViewAnalysisError, ReferenceViewPath, ReferenceViewStep, Type, TypeError,
-    TypeIdentityRenaming, Typed, Value, ViewOverlap, ViewSymbol, ViewSymbolBinding,
+    ReferenceViewAnalysis, ReferenceViewAnalysisError, ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep,
+    ReferenceViewSymbol, ReferenceViewSymbolBinding, Type, TypeError, TypeIdentityRenaming, Typed, Value,
 };
 
 /// Error produced by [`ArrayReferenceAnalysis`]. Structural reference errors come from the generic
@@ -98,7 +98,7 @@ pub enum ArrayReferenceViewTransform {
         axis: usize,
 
         /// Coordinate selected on `axis`.
-        index: ViewIndex,
+        index: ArrayReferenceViewIndex,
     },
 
     /// Selects one static unit-stride range on every axis while preserving rank.
@@ -110,12 +110,12 @@ pub enum ArrayReferenceViewTransform {
 
 /// Coordinate selected by an [`Index`](ArrayReferenceViewTransform::Index) transform.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
-pub enum ViewIndex {
+pub enum ArrayReferenceViewIndex {
     /// A coordinate known when the view is described.
     Static(usize),
 
     /// A coordinate supplied by the named symbol, which the operation creating the view resolves.
-    Symbolic(ViewSymbol),
+    Symbolic(ReferenceViewSymbol),
 }
 
 impl ArrayReferenceViewTransform {
@@ -123,7 +123,7 @@ impl ArrayReferenceViewTransform {
     /// like a static one, without the static bounds check and reconstruction proof, because the coordinate it selects
     /// is only known to the operation that creates the view.
     pub fn output_type(&self, input: &ArrayType) -> Result<ArrayType, TypeError> {
-        if let Self::Index { axis, index: ViewIndex::Symbolic(_) } = self {
+        if let Self::Index { axis, index: ArrayReferenceViewIndex::Symbolic(_) } = self {
             Self::indexed_shape(*axis, input)?;
             return Ok(input.without_dimension(*axis)?.0);
         }
@@ -160,8 +160,8 @@ impl ArrayReferenceViewTransform {
             Self::Index { axis, index } => {
                 let shape = Self::indexed_shape(*axis, input)?;
                 let index = match index {
-                    ViewIndex::Static(index) => *index,
-                    ViewIndex::Symbolic(_) => {
+                    ArrayReferenceViewIndex::Static(index) => *index,
+                    ArrayReferenceViewIndex::Symbolic(_) => {
                         return Err(TypeError::invalid(
                             "a symbolic coordinate has no static selection; the operation that creates the view \
                              resolves it",
@@ -235,7 +235,7 @@ impl ArrayReferenceViewTransform {
         input: &C::Value,
         bindings: &[C::Binding],
     ) -> Result<C::Value, ProgramError> {
-        if let (Self::Index { axis, index: ViewIndex::Symbolic(_) }, [binding]) = (self, bindings) {
+        if let (Self::Index { axis, index: ArrayReferenceViewIndex::Symbolic(_) }, [binding]) = (self, bindings) {
             return carrier.index_symbolic(input, *axis, binding);
         }
         let selection = self.selection(carrier.array_type(input)?.as_ref())?;
@@ -255,7 +255,7 @@ impl ArrayReferenceViewTransform {
         replacement: &C::Value,
         bindings: &[C::Binding],
     ) -> Result<C::Value, ProgramError> {
-        if let (Self::Index { axis, index: ViewIndex::Symbolic(_) }, [binding]) = (self, bindings) {
+        if let (Self::Index { axis, index: ArrayReferenceViewIndex::Symbolic(_) }, [binding]) = (self, bindings) {
             return carrier.update_index_symbolic(input, replacement, *axis, binding);
         }
         let selection = self.selection(carrier.array_type(input)?.as_ref())?;
@@ -302,10 +302,10 @@ impl ArrayReferenceViewTransform {
 impl ReferenceView for ArrayReferenceViewTransform {
     type Type = ArrayIrType;
 
-    fn symbols(&self) -> Vec<ViewSymbol> {
+    fn symbols(&self) -> Vec<ReferenceViewSymbol> {
         // A transform depends on at most one symbol: the coordinate of a symbolic index.
         match self {
-            Self::Index { index: ViewIndex::Symbolic(symbol), .. } => vec![*symbol],
+            Self::Index { index: ArrayReferenceViewIndex::Symbolic(symbol), .. } => vec![*symbol],
             Self::Index { .. } | Self::Slice { .. } => Vec::new(),
         }
     }
@@ -359,21 +359,25 @@ impl ReferenceView for ArrayReferenceViewTransform {
     // intersect make the paths disjoint, identical static ranges and equal symbolic coordinates (same binding at the
     // same offset) are the same, and everything else may overlap. A malformed path cannot be folded and is treated as
     // possibly overlapping, because paths are validated when they are derived and this query must not fail.
-    fn overlap(root: &ArrayIrType, a: &[ReferenceViewStep<Self>], b: &[ReferenceViewStep<Self>]) -> ViewOverlap {
+    fn overlap(
+        root: &ArrayIrType,
+        a: &[ReferenceViewStep<Self>],
+        b: &[ReferenceViewStep<Self>],
+    ) -> ReferenceViewOverlap {
         let Some(shape) =
             <&ReferenceType<ArrayType>>::try_from(root).ok().and_then(|root| root.referent().static_shape())
         else {
-            return ViewOverlap::MayOverlap;
+            return ReferenceViewOverlap::MayOverlap;
         };
         let (Some(a), Some(b)) = (RootCoordinate::fold(&shape, a), RootCoordinate::fold(&shape, b)) else {
-            return ViewOverlap::MayOverlap;
+            return ReferenceViewOverlap::MayOverlap;
         };
-        let mut overlap = ViewOverlap::Same;
+        let mut overlap = ReferenceViewOverlap::Same;
         for (a, b) in a.iter().zip(b.iter()) {
             match a.overlap(b) {
-                ViewOverlap::Disjoint => return ViewOverlap::Disjoint,
-                ViewOverlap::Same => {}
-                ViewOverlap::MayOverlap => overlap = ViewOverlap::MayOverlap,
+                ReferenceViewOverlap::Disjoint => return ReferenceViewOverlap::Disjoint,
+                ReferenceViewOverlap::Same => {}
+                ReferenceViewOverlap::MayOverlap => overlap = ReferenceViewOverlap::MayOverlap,
             }
         }
         overlap
@@ -398,7 +402,7 @@ enum RootCoordinate {
     /// relative to the range `[offset, ..)` that the earlier steps narrowed the axis to.
     Symbolic {
         /// Binding of the symbolic coordinate.
-        binding: ViewSymbolBinding,
+        binding: ReferenceViewSymbolBinding,
 
         /// Start of the narrowed range that the symbolic coordinate is relative to.
         offset: usize,
@@ -425,7 +429,7 @@ impl RootCoordinate {
                         return None;
                     };
                     coordinates[root_axis] = match index {
-                        ViewIndex::Static(index) => {
+                        ArrayReferenceViewIndex::Static(index) => {
                             // Invalid paths must remain conservative even when the relative coordinate overflows.
                             let coordinate = start.checked_add(*index)?;
                             if coordinate >= limit {
@@ -433,7 +437,9 @@ impl RootCoordinate {
                             }
                             Self::Range { start: coordinate, limit: coordinate + 1 }
                         }
-                        ViewIndex::Symbolic(_) => Self::Symbolic { binding: *step.bindings().first()?, offset: start },
+                        ArrayReferenceViewIndex::Symbolic(_) => {
+                            Self::Symbolic { binding: *step.bindings().first()?, offset: start }
+                        }
                     };
                 }
                 ArrayReferenceViewTransform::Slice { axes } => {
@@ -458,15 +464,15 @@ impl RootCoordinate {
     }
 
     /// Returns the relation between the coordinates that this and `other` select on one root axis.
-    fn overlap(&self, other: &Self) -> ViewOverlap {
+    fn overlap(&self, other: &Self) -> ReferenceViewOverlap {
         match (self, other) {
             (Self::Range { start: a_start, limit: a_limit }, Self::Range { start: b_start, limit: b_limit }) => {
                 if a_limit <= b_start || b_limit <= a_start {
-                    ViewOverlap::Disjoint
+                    ReferenceViewOverlap::Disjoint
                 } else if a_start == b_start && a_limit == b_limit {
-                    ViewOverlap::Same
+                    ReferenceViewOverlap::Same
                 } else {
-                    ViewOverlap::MayOverlap
+                    ReferenceViewOverlap::MayOverlap
                 }
             }
             (
@@ -474,14 +480,14 @@ impl RootCoordinate {
                 Self::Symbolic { binding: b_binding, offset: b_offset },
             ) if a_binding == b_binding => {
                 if a_offset == b_offset {
-                    ViewOverlap::Same
+                    ReferenceViewOverlap::Same
                 } else {
-                    ViewOverlap::Disjoint
+                    ReferenceViewOverlap::Disjoint
                 }
             }
             (Self::Symbolic { .. }, Self::Symbolic { .. })
             | (Self::Range { .. }, Self::Symbolic { .. })
-            | (Self::Symbolic { .. }, Self::Range { .. }) => ViewOverlap::MayOverlap,
+            | (Self::Symbolic { .. }, Self::Range { .. }) => ReferenceViewOverlap::MayOverlap,
         }
     }
 }
@@ -534,12 +540,13 @@ impl ViewSelection {
 /// select the same root coordinates and observe one another's ordered mutations, while equality and hashing
 /// distinguish different transform sequences.
 ///
-/// `Binding` supplies symbolic coordinates: [`ViewSymbolBinding`] identifies program values, the uninhabited
-/// [`NoBinding`] restricts eager handles to static steps, and `C::Value` binds discharge coordinates directly to
-/// context values. Supported coordinate transforms are described by [`ArrayReferenceViewTransform`]. Pass root handles
-/// across attached-region and external runtime boundaries and recreate views inside the receiving scope; the only
-/// boundary view is the per-iteration slice that `scan` itself creates for a reference-typed stacked operand.
-pub type ArrayReferenceView<Binding = ViewSymbolBinding> = ReferenceViewPath<ArrayReferenceViewTransform, Binding>;
+/// `Binding` supplies symbolic coordinates: [`ReferenceViewSymbolBinding`] identifies program values, the uninhabited
+/// [`NoReferenceViewBinding`] restricts eager handles to static steps, and `C::Value` binds discharge coordinates
+/// directly to context values. Supported coordinate transforms are described by [`ArrayReferenceViewTransform`]. Pass
+/// root handles across attached-region and external runtime boundaries and recreate views inside the receiving scope;
+/// the only boundary view is the per-iteration slice that `scan` itself creates for a reference-typed stacked operand.
+pub type ArrayReferenceView<Binding = ReferenceViewSymbolBinding> =
+    ReferenceViewPath<ArrayReferenceViewTransform, Binding>;
 
 impl<Binding> ArrayReferenceView<Binding> {
     /// Returns the exact view type derived from `root_type`.
@@ -634,7 +641,7 @@ impl<Binding> ArrayReferenceView<Binding> {
     }
 }
 
-impl ArrayReferenceView<NoBinding> {
+impl ArrayReferenceView<NoReferenceViewBinding> {
     /// Applies the complete static mapping to one root snapshot.
     fn apply<A>(&self, root: &A) -> Result<A, ProgramError>
     where
@@ -722,7 +729,7 @@ struct EagerViewCarrier<A>(PhantomData<A>);
 
 impl<A: Value<Type = ArrayType> + Reshape + Slice> ViewReadCarrier for EagerViewCarrier<A> {
     type Value = A;
-    type Binding = NoBinding;
+    type Binding = NoReferenceViewBinding;
 
     fn array_type<'c>(&'c self, value: &'c A) -> Result<Cow<'c, ArrayType>, ProgramError> {
         Ok(value.r#type())
@@ -736,7 +743,12 @@ impl<A: Value<Type = ArrayType> + Reshape + Slice> ViewReadCarrier for EagerView
         input.reshape(shape)
     }
 
-    fn index_symbolic(&mut self, _input: &A, _axis: usize, binding: &NoBinding) -> Result<A, ProgramError> {
+    fn index_symbolic(
+        &mut self,
+        _input: &A,
+        _axis: usize,
+        binding: &NoReferenceViewBinding,
+    ) -> Result<A, ProgramError> {
         match *binding {}
     }
 }
@@ -751,7 +763,7 @@ impl<A: Value<Type = ArrayType> + Reshape + Slice + UpdateSlice> ViewWriteCarrie
         _target: &A,
         _update: &A,
         _axis: usize,
-        binding: &NoBinding,
+        binding: &NoReferenceViewBinding,
     ) -> Result<A, ProgramError> {
         match *binding {}
     }
@@ -768,7 +780,7 @@ pub struct ArrayReference<A: Value<Type = ArrayType>> {
 
     /// Ordered mapping from the shared root to this handle's referent. Eager handles only ever carry static steps,
     /// so no symbol is ever bound on this path.
-    view: ArrayReferenceView<NoBinding>,
+    view: ArrayReferenceView<NoReferenceViewBinding>,
 
     /// Exact handle type derived once from the root type and view, so that repeated [`Typed::r#type`] calls
     /// borrow the cached type instead of re-deriving the complete transform chain.
@@ -1205,8 +1217,8 @@ mod tests {
     };
     use crate::parameters::Placeholder;
     use crate::programs::{
-        AtomId, Program, ProgramBuilder, ReferenceCompletion, ReferenceReplacementPreparation, ReferenceType, RegionId,
-        ValueId, ViewSymbol,
+        AtomId, Program, ProgramBuilder, ReferenceCompletion, ReferenceReplacementPreparation, ReferenceType,
+        ReferenceViewSymbol, RegionId, ValueId,
     };
     use crate::tracing::{Trace, Tracer, TracingContext};
 
@@ -1260,7 +1272,8 @@ mod tests {
     fn test_array_reference_view_transform_output_type() {
         let input = ArrayType::new_static(DataType::F32, [3, 4]);
         assert_eq!(
-            ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) }.output_type(&input),
+            ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) }
+                .output_type(&input),
             Ok(ArrayType::new_static(DataType::F32, [4])),
         );
         assert_eq!(
@@ -1288,16 +1301,21 @@ mod tests {
         // Static indexing selects one existing coordinate on one existing axis; a symbolic coordinate still names an
         // existing axis.
         assert_eq!(
-            ArrayReferenceViewTransform::Index { axis: 2, index: ViewIndex::Static(0) }.output_type(&matrix_type),
+            ArrayReferenceViewTransform::Index { axis: 2, index: ArrayReferenceViewIndex::Static(0) }
+                .output_type(&matrix_type),
             Err(TypeError::invalid("reference index axis 2 is out of bounds for rank 2")),
         );
         assert_eq!(
-            ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(3) }.output_type(&matrix_type),
+            ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(3) }
+                .output_type(&matrix_type),
             Err(TypeError::invalid("reference index 3 on axis 0 is out of bounds for size 3")),
         );
         assert_eq!(
-            ArrayReferenceViewTransform::Index { axis: 2, index: ViewIndex::Symbolic(ViewSymbol::Iteration) }
-                .output_type(&matrix_type),
+            ArrayReferenceViewTransform::Index {
+                axis: 2,
+                index: ArrayReferenceViewIndex::Symbolic(ReferenceViewSymbol::Iteration)
+            }
+            .output_type(&matrix_type),
             Err(TypeError::invalid("reference index axis 2 is out of bounds for rank 2")),
         );
 
@@ -1334,7 +1352,8 @@ mod tests {
             Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("length", DimensionBounds::unbounded()))]),
         );
         assert_eq!(
-            ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(0) }.output_type(&input),
+            ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(0) }
+                .output_type(&input),
             Err(TypeError::invalid(format!("reference indexing requires a static referent type but got `{input}`"))),
         );
         assert_eq!(
@@ -1346,9 +1365,11 @@ mod tests {
     #[test]
     fn test_array_reference_view_transform_output_type_symbolic_index() {
         let matrix_type = ArrayType::new_static(DataType::F32, [3, 4]);
-        let symbolic =
-            ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Symbolic(ViewSymbol::Operand(1)) };
-        let static_index = ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) };
+        let symbolic = ArrayReferenceViewTransform::Index {
+            axis: 0,
+            index: ArrayReferenceViewIndex::Symbolic(ReferenceViewSymbol::Input(1)),
+        };
+        let static_index = ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) };
         // Removing a symbolic axis derives the same type even when no static coordinate could select it.
         assert_eq!(symbolic.output_type(&matrix_type), static_index.output_type(&matrix_type));
         assert_eq!(symbolic.output_type(&matrix_type), Ok(ArrayType::new_static(DataType::F32, [4])));
@@ -1360,10 +1381,15 @@ mod tests {
 
     #[test]
     fn test_array_reference_view_transform_symbols() {
-        let symbolic =
-            ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Symbolic(ViewSymbol::Operand(1)) };
-        assert_eq!(symbolic.symbols(), vec![ViewSymbol::Operand(1)]);
-        assert_eq!(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) }.symbols(), Vec::new(),);
+        let symbolic = ArrayReferenceViewTransform::Index {
+            axis: 0,
+            index: ArrayReferenceViewIndex::Symbolic(ReferenceViewSymbol::Input(1)),
+        };
+        assert_eq!(symbolic.symbols(), vec![ReferenceViewSymbol::Input(1)]);
+        assert_eq!(
+            ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) }.symbols(),
+            Vec::new(),
+        );
         assert_eq!(
             ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(0, 2, 1)] }.symbols(),
             Vec::new(),
@@ -1373,7 +1399,7 @@ mod tests {
     #[test]
     fn test_array_reference_view_transform_batch() {
         let packed = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2, 3, 4])));
-        let index = ArrayReferenceViewTransform::Index { axis: 1, index: ViewIndex::Static(2) };
+        let index = ArrayReferenceViewTransform::Index { axis: 1, index: ArrayReferenceViewIndex::Static(2) };
         let slice = ArrayReferenceViewTransform::Slice {
             axes: vec![ArraySliceAxis::new(1, 1, 1), ArraySliceAxis::new(1, 2, 1)],
         };
@@ -1383,28 +1409,45 @@ mod tests {
         // output batch axis moves one position earlier. Negative batch axes normalize against the packed rank.
         assert_eq!(
             index.batch(&packed, BatchAxis::new(0)),
-            Ok((ArrayReferenceViewTransform::Index { axis: 2, index: ViewIndex::Static(2) }, BatchAxis::new(0))),
+            Ok((
+                ArrayReferenceViewTransform::Index { axis: 2, index: ArrayReferenceViewIndex::Static(2) },
+                BatchAxis::new(0)
+            )),
         );
         assert_eq!(
             index.batch(&packed, BatchAxis::new(1)),
-            Ok((ArrayReferenceViewTransform::Index { axis: 2, index: ViewIndex::Static(2) }, BatchAxis::new(1))),
+            Ok((
+                ArrayReferenceViewTransform::Index { axis: 2, index: ArrayReferenceViewIndex::Static(2) },
+                BatchAxis::new(1)
+            )),
         );
         assert_eq!(
             index.batch(&packed, BatchAxis::new(2)),
-            Ok((ArrayReferenceViewTransform::Index { axis: 1, index: ViewIndex::Static(2) }, BatchAxis::new(1))),
+            Ok((
+                ArrayReferenceViewTransform::Index { axis: 1, index: ArrayReferenceViewIndex::Static(2) },
+                BatchAxis::new(1)
+            )),
         );
         assert_eq!(
             index.batch(&packed, BatchAxis::new(-1)),
-            Ok((ArrayReferenceViewTransform::Index { axis: 1, index: ViewIndex::Static(2) }, BatchAxis::new(1))),
+            Ok((
+                ArrayReferenceViewTransform::Index { axis: 1, index: ArrayReferenceViewIndex::Static(2) },
+                BatchAxis::new(1)
+            )),
         );
 
         // The symbol of a symbolic coordinate rides along untouched.
-        let symbolic =
-            ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Symbolic(ViewSymbol::Operand(1)) };
+        let symbolic = ArrayReferenceViewTransform::Index {
+            axis: 0,
+            index: ArrayReferenceViewIndex::Symbolic(ReferenceViewSymbol::Input(1)),
+        };
         assert_eq!(
             symbolic.batch(&packed, BatchAxis::new(0)),
             Ok((
-                ArrayReferenceViewTransform::Index { axis: 1, index: ViewIndex::Symbolic(ViewSymbol::Operand(1)) },
+                ArrayReferenceViewTransform::Index {
+                    axis: 1,
+                    index: ArrayReferenceViewIndex::Symbolic(ReferenceViewSymbol::Input(1))
+                },
                 BatchAxis::new(0),
             )),
         );
@@ -1446,13 +1489,13 @@ mod tests {
     fn test_array_reference_view_transform_batch_rejects_invalid_axes() {
         let packed = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2, 3, 4])));
         assert_eq!(
-            ArrayReferenceViewTransform::Index { axis: 2, index: ViewIndex::Static(0) }
+            ArrayReferenceViewTransform::Index { axis: 2, index: ArrayReferenceViewIndex::Static(0) }
                 .batch(&packed, BatchAxis::new(0)),
             Err(TypeError::invalid("reference index axis 2 is out of bounds for rank 2").into()),
         );
         // Shifting an unchecked maximum axis used to overflow before it could be rejected.
         assert_eq!(
-            ArrayReferenceViewTransform::Index { axis: usize::MAX, index: ViewIndex::Static(0) }
+            ArrayReferenceViewTransform::Index { axis: usize::MAX, index: ArrayReferenceViewIndex::Static(0) }
                 .batch(&packed, BatchAxis::new(0)),
             Err(TypeError::invalid(format!("reference index axis {} is out of bounds for rank 2", usize::MAX,)).into()),
         );
@@ -1481,95 +1524,105 @@ mod tests {
         let rows_2_3 = empty.with_view(ArrayReferenceViewTransform::Slice {
             axes: vec![ArraySliceAxis::new(2, 2, 1), ArraySliceAxis::new(0, 3, 1)],
         });
-        let row_1 = empty.with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) });
-        let column_0 = empty.with_view(ArrayReferenceViewTransform::Index { axis: 1, index: ViewIndex::Static(0) });
+        let row_1 =
+            empty.with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) });
+        let column_0 =
+            empty.with_view(ArrayReferenceViewTransform::Index { axis: 1, index: ArrayReferenceViewIndex::Static(0) });
 
         // Static coordinates fold to one range per root axis: disjoint ranges on any axis make the paths disjoint,
         // identical ranges on every axis make them the same, and intersecting ranges may overlap. The trait function
         // and the path method agree.
         assert_eq!(
             ArrayReferenceViewTransform::overlap(&root, rows_0_1.steps(), rows_2_3.steps()),
-            ViewOverlap::Disjoint,
+            ReferenceViewOverlap::Disjoint,
         );
-        assert_eq!(rows_0_1.overlap(&rows_2_3, &root), ViewOverlap::Disjoint);
-        assert_eq!(row_1.overlap(&row_1, &root), ViewOverlap::Same);
-        assert_eq!(rows_0_1.overlap(&rows_1_2, &root), ViewOverlap::MayOverlap);
-        assert_eq!(row_1.overlap(&rows_0_1, &root), ViewOverlap::MayOverlap);
-        assert_eq!(row_1.overlap(&rows_2_3, &root), ViewOverlap::Disjoint);
+        assert_eq!(rows_0_1.overlap(&rows_2_3, &root), ReferenceViewOverlap::Disjoint);
+        assert_eq!(row_1.overlap(&row_1, &root), ReferenceViewOverlap::Same);
+        assert_eq!(rows_0_1.overlap(&rows_1_2, &root), ReferenceViewOverlap::MayOverlap);
+        assert_eq!(row_1.overlap(&rows_0_1, &root), ReferenceViewOverlap::MayOverlap);
+        assert_eq!(row_1.overlap(&rows_2_3, &root), ReferenceViewOverlap::Disjoint);
 
         // Rank changes are tracked while folding: an index removes its axis, so a slice that follows it addresses the
         // remaining root axes, and different step sequences that select the same coordinates are the same.
         let row_1_columns_1_2 =
             row_1.with_view(ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] });
         let row_1_column_1 =
-            row_1.with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) });
+            row_1.with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) });
         let rows_1_columns_1_2_row_0 = empty
             .with_view(ArrayReferenceViewTransform::Slice {
                 axes: vec![ArraySliceAxis::new(1, 1, 1), ArraySliceAxis::new(1, 2, 1)],
             })
-            .with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(0) });
-        assert_eq!(row_1_columns_1_2.overlap(&column_0, &root), ViewOverlap::Disjoint);
-        assert_eq!(row_1_columns_1_2.overlap(&row_1, &root), ViewOverlap::MayOverlap);
-        assert_eq!(row_1_columns_1_2.overlap(&row_1_column_1, &root), ViewOverlap::MayOverlap);
-        assert_eq!(row_1_columns_1_2.overlap(&rows_1_columns_1_2_row_0, &root), ViewOverlap::Same);
-        assert_eq!(row_1_column_1.overlap(&column_0, &root), ViewOverlap::Disjoint);
+            .with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(0) });
+        assert_eq!(row_1_columns_1_2.overlap(&column_0, &root), ReferenceViewOverlap::Disjoint);
+        assert_eq!(row_1_columns_1_2.overlap(&row_1, &root), ReferenceViewOverlap::MayOverlap);
+        assert_eq!(row_1_columns_1_2.overlap(&row_1_column_1, &root), ReferenceViewOverlap::MayOverlap);
+        assert_eq!(row_1_columns_1_2.overlap(&rows_1_columns_1_2_row_0, &root), ReferenceViewOverlap::Same);
+        assert_eq!(row_1_column_1.overlap(&column_0, &root), ReferenceViewOverlap::Disjoint);
 
         // The complete root is the same as itself and as a slice spanning every axis, and may overlap with any
         // narrowing path.
         let complete = empty.with_view(ArrayReferenceViewTransform::Slice {
             axes: vec![ArraySliceAxis::new(0, 4, 1), ArraySliceAxis::new(0, 3, 1)],
         });
-        assert_eq!(empty.overlap(&empty, &root), ViewOverlap::Same);
-        assert_eq!(empty.overlap(&complete, &root), ViewOverlap::Same);
-        assert_eq!(empty.overlap(&rows_0_1, &root), ViewOverlap::MayOverlap);
-        assert_eq!(empty.overlap(&row_1_column_1, &root), ViewOverlap::MayOverlap);
+        assert_eq!(empty.overlap(&empty, &root), ReferenceViewOverlap::Same);
+        assert_eq!(empty.overlap(&complete, &root), ReferenceViewOverlap::Same);
+        assert_eq!(empty.overlap(&rows_0_1, &root), ReferenceViewOverlap::MayOverlap);
+        assert_eq!(empty.overlap(&row_1_column_1, &root), ReferenceViewOverlap::MayOverlap);
 
         // Symbolic coordinates compare by binding: the same binding at the same offset is the same coordinate, the
         // same binding relative to differently narrowed axes is provably different, and different bindings or a
         // binding against a static coordinate may overlap.
-        let symbolic =
-            ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Symbolic(ViewSymbol::Operand(1)) };
-        let first = ViewSymbolBinding::Value(ValueId::new(RegionId::new(0), AtomId::new(1)));
-        let second = ViewSymbolBinding::Value(ValueId::new(RegionId::new(0), AtomId::new(2)));
-        let iteration = ViewSymbolBinding::Iteration(RegionId::new(1));
+        let symbolic = ArrayReferenceViewTransform::Index {
+            axis: 0,
+            index: ArrayReferenceViewIndex::Symbolic(ReferenceViewSymbol::Input(1)),
+        };
+        let first = ReferenceViewSymbolBinding::Value(ValueId::new(RegionId::new(0), AtomId::new(1)));
+        let second = ReferenceViewSymbolBinding::Value(ValueId::new(RegionId::new(0), AtomId::new(2)));
+        let iteration = ReferenceViewSymbolBinding::Iteration(RegionId::new(1));
         let row_first = empty.with_step(symbolic.clone(), vec![first]);
         let row_second = empty.with_step(symbolic.clone(), vec![second]);
         let row_iteration = empty.with_step(symbolic.clone(), vec![iteration]);
         let shifted_row_first = rows_1_2.with_step(symbolic.clone(), vec![first]);
-        assert_eq!(row_first.overlap(&empty.with_step(symbolic.clone(), vec![first]), &root), ViewOverlap::Same);
-        assert_eq!(row_first.overlap(&row_second, &root), ViewOverlap::MayOverlap);
-        assert_eq!(row_first.overlap(&row_iteration, &root), ViewOverlap::MayOverlap);
-        assert_eq!(row_first.overlap(&row_1, &root), ViewOverlap::MayOverlap);
-        assert_eq!(row_first.overlap(&rows_2_3, &root), ViewOverlap::MayOverlap);
-        assert_eq!(row_first.overlap(&empty, &root), ViewOverlap::MayOverlap);
-        assert_eq!(row_first.overlap(&shifted_row_first, &root), ViewOverlap::Disjoint);
+        assert_eq!(
+            row_first.overlap(&empty.with_step(symbolic.clone(), vec![first]), &root),
+            ReferenceViewOverlap::Same
+        );
+        assert_eq!(row_first.overlap(&row_second, &root), ReferenceViewOverlap::MayOverlap);
+        assert_eq!(row_first.overlap(&row_iteration, &root), ReferenceViewOverlap::MayOverlap);
+        assert_eq!(row_first.overlap(&row_1, &root), ReferenceViewOverlap::MayOverlap);
+        assert_eq!(row_first.overlap(&rows_2_3, &root), ReferenceViewOverlap::MayOverlap);
+        assert_eq!(row_first.overlap(&empty, &root), ReferenceViewOverlap::MayOverlap);
+        assert_eq!(row_first.overlap(&shifted_row_first, &root), ReferenceViewOverlap::Disjoint);
         assert_eq!(
             row_first
-                .with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(0) })
+                .with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(0) })
                 .overlap(
-                    &row_second.with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(2) }),
+                    &row_second.with_view(ArrayReferenceViewTransform::Index {
+                        axis: 0,
+                        index: ArrayReferenceViewIndex::Static(2)
+                    }),
                     &root,
                 ),
-            ViewOverlap::Disjoint,
+            ReferenceViewOverlap::Disjoint,
         );
 
         // A path or root that cannot be folded (an out-of-bounds axis or coordinate, a symbolic step without its
         // binding, a non-reference root, or a root without a static shape) is conservatively reported as possibly
         // overlapping rather than failing.
         let out_of_bounds =
-            empty.with_view(ArrayReferenceViewTransform::Index { axis: 2, index: ViewIndex::Static(0) });
+            empty.with_view(ArrayReferenceViewTransform::Index { axis: 2, index: ArrayReferenceViewIndex::Static(0) });
         let unbound = empty.with_view(symbolic);
-        assert_eq!(out_of_bounds.overlap(&rows_2_3, &root), ViewOverlap::MayOverlap);
+        assert_eq!(out_of_bounds.overlap(&rows_2_3, &root), ReferenceViewOverlap::MayOverlap);
         assert_eq!(
             empty
-                .with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(4) })
+                .with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(4) })
                 .overlap(&rows_2_3, &root),
-            ViewOverlap::MayOverlap,
+            ReferenceViewOverlap::MayOverlap,
         );
-        assert_eq!(unbound.overlap(&rows_2_3, &root), ViewOverlap::MayOverlap);
+        assert_eq!(unbound.overlap(&rows_2_3, &root), ReferenceViewOverlap::MayOverlap);
         assert_eq!(
             rows_0_1.overlap(&rows_2_3, &ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4, 3]))),
-            ViewOverlap::MayOverlap,
+            ReferenceViewOverlap::MayOverlap,
         );
         let dynamic = ArrayType::new(
             DataType::F32,
@@ -1580,7 +1633,7 @@ mod tests {
         );
         assert_eq!(
             rows_0_1.overlap(&rows_2_3, &ArrayIrType::Reference(ReferenceType::new(dynamic))),
-            ViewOverlap::MayOverlap,
+            ReferenceViewOverlap::MayOverlap,
         );
     }
 
@@ -1589,9 +1642,12 @@ mod tests {
         let root = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])));
         let view: ArrayReferenceView = ArrayReferenceView::root()
             .with_view(ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] })
-            .with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(usize::MAX) });
+            .with_view(ArrayReferenceViewTransform::Index {
+                axis: 0,
+                index: ArrayReferenceViewIndex::Static(usize::MAX),
+            });
         // Malformed relative coordinates cannot wrap around to become valid root coordinates.
-        assert_eq!(view.overlap(&ArrayReferenceView::root(), &root), ViewOverlap::MayOverlap);
+        assert_eq!(view.overlap(&ArrayReferenceView::root(), &root), ReferenceViewOverlap::MayOverlap);
     }
 
     #[test]
@@ -1605,7 +1661,7 @@ mod tests {
         let slice = ArrayReferenceViewTransform::Slice {
             axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 3, 1)],
         };
-        let index = ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) };
+        let index = ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) };
         let sliced = root.with_view(slice);
         let indexed = sliced.with_view(index);
         assert_eq!(sliced.output_type(&root_type), Ok(ArrayType::new_static(DataType::F32, [2, 3])));
@@ -1614,9 +1670,9 @@ mod tests {
 
     #[test]
     fn test_array_reference_view_intermediates_in() {
-        let view: ArrayReferenceView<NoBinding> = ArrayReferenceView::root()
+        let view: ArrayReferenceView<NoReferenceViewBinding> = ArrayReferenceView::root()
             .with_view(ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] })
-            .with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) });
+            .with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) });
         let root = Array::vector(vec![1.0_f32, 2.0, 3.0, 4.0]);
         let mut carrier = EagerViewCarrier::<Array>(PhantomData);
         assert_eq!(
@@ -1628,9 +1684,9 @@ mod tests {
 
     #[test]
     fn test_array_reference_view_reconstruct_in() {
-        let view: ArrayReferenceView<NoBinding> = ArrayReferenceView::root()
+        let view: ArrayReferenceView<NoReferenceViewBinding> = ArrayReferenceView::root()
             .with_view(ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] })
-            .with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) });
+            .with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) });
         let mut carrier = EagerViewCarrier::<Array>(PhantomData);
         // Reconstruction consumes strict parents in reverse order; the old selected scalar is unnecessary.
         assert_eq!(
@@ -1649,8 +1705,8 @@ mod tests {
 
     #[test]
     fn test_array_reference_view_reconstruct_in_rejects_invalid_parent_count() {
-        let view: ArrayReferenceView<NoBinding> = ArrayReferenceView::root()
-            .with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(0) });
+        let view: ArrayReferenceView<NoReferenceViewBinding> = ArrayReferenceView::root()
+            .with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(0) });
         let mut carrier = EagerViewCarrier::<Array>(PhantomData);
         assert_eq!(
             view.reconstruct_in(&mut carrier, &[], Array::scalar(1.0_f32)),
@@ -1678,7 +1734,7 @@ mod tests {
         let alias = root.clone();
         let separate = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]));
         let view = root
-            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(0) })
+            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(0) })
             .unwrap();
         assert_eq!(root, alias);
         assert_ne!(root, separate);
@@ -1694,7 +1750,7 @@ mod tests {
     fn test_array_reference_id() {
         let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]));
         let view = root
-            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(0) })
+            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(0) })
             .unwrap();
         assert_eq!(root.id(), root.clone().id());
         assert_eq!(root.id(), view.id());
@@ -1705,7 +1761,7 @@ mod tests {
     fn test_array_reference_is_runtime_root_handle() {
         let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]));
         let view = root
-            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(0) })
+            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(0) })
             .unwrap();
         assert!(root.is_runtime_root_handle());
         assert!(!view.is_runtime_root_handle());
@@ -1715,7 +1771,7 @@ mod tests {
     fn test_array_reference_lock_root() {
         let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]));
         let view = root
-            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(0) })
+            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(0) })
             .unwrap();
         drop(root.lock_root().unwrap());
         let error = view.lock_root().err().unwrap();
@@ -1740,7 +1796,10 @@ mod tests {
         assert_eq!(handle.read(), Ok(Array::matrix(2, 3, vec![5.0_f32, 6.0, 7.0, 9.0, 10.0, 11.0])));
         assert_eq!(
             handle
-                .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(2) })
+                .with_transform(ArrayReferenceViewTransform::Index {
+                    axis: 0,
+                    index: ArrayReferenceViewIndex::Static(2)
+                })
                 .unwrap_err(),
             TypeError::invalid("reference index 2 on axis 0 is out of bounds for size 2").into(),
         );
@@ -1750,9 +1809,11 @@ mod tests {
     fn test_array_reference_with_transform_rejects_symbolic_coordinates() {
         // A symbolic coordinate has no static selection, so neither an eager traversal nor an eager handle can carry
         // it: the operation that creates the view resolves the coordinate.
-        let symbolic =
-            ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Symbolic(ViewSymbol::Operand(1)) };
-        let view: ArrayReferenceView<NoBinding> = ArrayReferenceView::root().with_view(symbolic.clone());
+        let symbolic = ArrayReferenceViewTransform::Index {
+            axis: 0,
+            index: ArrayReferenceViewIndex::Symbolic(ReferenceViewSymbol::Input(1)),
+        };
+        let view: ArrayReferenceView<NoReferenceViewBinding> = ArrayReferenceView::root().with_view(symbolic.clone());
         assert_eq!(
             view.apply(&Array::matrix(3, 4, (1..=12).map(|value| value as f32).collect())),
             Err(TypeError::invalid(
@@ -1794,7 +1855,7 @@ mod tests {
         let poisoned = ReferenceError::ExecutionPoisoned { reason: "submission failed".to_string() };
         assert_eq!(root.read().unwrap_err().downcast_custom::<ReferenceError>(), Some(&poisoned));
         let composed = derived
-            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(0) })
+            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(0) })
             .unwrap();
         assert_eq!(composed.r#type().as_ref(), &ReferenceType::new(ArrayType::scalar(DataType::F32)));
         assert_eq!(composed.read().unwrap_err().downcast_custom::<ReferenceError>(), Some(&poisoned));
@@ -1802,7 +1863,7 @@ mod tests {
         let frozen = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]));
         assert_eq!(frozen.freeze(), Ok(Array::vector(vec![1.0_f32, 2.0])));
         let frozen_view = frozen
-            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) })
+            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) })
             .unwrap();
         assert_eq!(frozen_view.read().unwrap_err().downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
     }
@@ -1841,7 +1902,7 @@ mod tests {
     fn test_array_reference_swap() {
         let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0]));
         let view = root
-            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) })
+            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) })
             .unwrap();
         assert_eq!(view.swap(Array::scalar(5.0_f32)), Ok(Array::scalar(2.0_f32)));
         assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 5.0, 3.0])));
@@ -1875,7 +1936,7 @@ mod tests {
     fn test_array_reference_write() {
         let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0]));
         let view = root
-            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) })
+            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) })
             .unwrap();
         assert_eq!(view.write(Array::scalar(5.0_f32)), Ok(()));
         assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 5.0, 3.0])));
@@ -1912,7 +1973,7 @@ mod tests {
                 axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 2, 1)],
             })
             .unwrap()
-            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) })
+            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) })
             .unwrap();
         assert_eq!(view.r#type().as_ref(), &ReferenceType::new(ArrayType::new_static(DataType::F32, [2])));
 
@@ -1925,7 +1986,7 @@ mod tests {
     fn test_array_reference_add_update() {
         let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0, 3.0]));
         let view = root
-            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) })
+            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) })
             .unwrap();
         assert_eq!(view.add_update(&Array::scalar(5.0_f32)), Ok(()));
         assert_eq!(root.read(), Ok(Array::vector(vec![1.0_f32, 7.0, 3.0])));
@@ -1955,7 +2016,7 @@ mod tests {
     fn test_array_reference_freeze() {
         let root = ArrayReference::new(Array::vector(vec![1.0_f32, 2.0]));
         let view = root
-            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(0) })
+            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(0) })
             .unwrap();
         let error = view.freeze().unwrap_err();
         assert_eq!(
@@ -1975,7 +2036,7 @@ mod tests {
         let slice = ArrayReferenceViewTransform::Slice {
             axes: vec![ArraySliceAxis::new(0, 2, 1), ArraySliceAxis::new(1, 2, 1)],
         };
-        let index = ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) };
+        let index = ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) };
         let handle = root.with_transform(slice.clone()).unwrap().with_transform(index.clone()).unwrap();
 
         // Composition derives each handle type incrementally, which must agree with folding the complete mapping
@@ -2019,10 +2080,10 @@ mod tests {
         let analysis = ArrayReferenceAnalysis::new(program.entry_region_ref(), 0).unwrap();
         let row_view =
             ArrayReferenceView::root().with_view(ArrayReferenceViewTransform::Slice { axes: row_axes.clone() });
-        let row_contents_view =
-            row_view.with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(0) });
+        let row_contents_view = row_view
+            .with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(0) });
         let column_view = ArrayReferenceView::root()
-            .with_view(ArrayReferenceViewTransform::Index { axis: 1, index: ViewIndex::Static(2) });
+            .with_view(ArrayReferenceViewTransform::Index { axis: 1, index: ArrayReferenceViewIndex::Static(2) });
         assert_eq!(analysis.path(value_id(0, 0)), Some(&ArrayReferenceView::root()));
         assert_eq!(analysis.path(value_id(0, 1)), Some(&row_view));
         assert_eq!(analysis.path(value_id(0, 2)), Some(&row_contents_view));
@@ -2066,7 +2127,7 @@ mod tests {
             .with_view(ArrayReferenceViewTransform::Slice {
                 axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 2, 1)],
             })
-            .with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) });
+            .with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) });
         let stage = |inputs: Vec<Tracer<TracingContext<TestValue, TestOperation>>>| {
             let context = inputs[0].context().clone();
             Ok(vec![ArrayReferenceDischarge::write(&context, &inputs[0], inputs[1].clone(), &alias)?])
@@ -2200,7 +2261,7 @@ mod tests {
             .with_view(ArrayReferenceViewTransform::Slice {
                 axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 2, 1)],
             })
-            .with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) });
+            .with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) });
         let stage = |inputs: Vec<Tracer<TracingContext<TestValue, TestOperation>>>| {
             let context = inputs[0].context().clone();
             let read = ArrayReferenceDischarge::read(&context, &inputs[0], &alias)?;
@@ -2386,8 +2447,10 @@ mod tests {
         };
         let stage = |inputs: Vec<Tracer<TestContext>>| {
             let context = inputs[0].context().clone();
-            let symbolic =
-                ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Symbolic(ViewSymbol::Operand(1)) };
+            let symbolic = ArrayReferenceViewTransform::Index {
+                axis: 0,
+                index: ArrayReferenceViewIndex::Symbolic(ReferenceViewSymbol::Input(1)),
+            };
             let leaf: ArrayReferenceView<Tracer<TestContext>> =
                 ArrayReferenceView::root().with_step(symbolic.clone(), vec![inputs[1].clone()]);
             let parent =

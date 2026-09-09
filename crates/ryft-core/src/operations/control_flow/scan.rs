@@ -12,7 +12,8 @@ use std::sync::Arc;
 
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
-    ArrayIrValue, ArrayReferenceViewTransform, ArrayType, Dimension, DimensionType, DimensionValue, Shape, ViewIndex,
+    ArrayIrValue, ArrayReferenceViewIndex, ArrayReferenceViewTransform, ArrayType, Dimension, DimensionType,
+    DimensionValue, Shape,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -48,8 +49,8 @@ use crate::programs::{
     ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary,
     ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeRegionInput, ReferenceDischargeRegionOutput,
     ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceType, ReferenceView, ReferenceViewOperation,
-    ReferenceViewPath, RegionInterface, RegionRef, RegionSlot, Type, TypeError, TypeIdentityPosition,
-    TypeIdentityRenaming, Typed, Value, ValueProjection, ViewOverlap, ViewSymbol, ViewSymbolBinding,
+    ReferenceViewOverlap, ReferenceViewPath, ReferenceViewSymbol, ReferenceViewSymbolBinding, RegionInterface,
+    RegionRef, RegionSlot, Type, TypeError, TypeIdentityPosition, TypeIdentityRenaming, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -440,10 +441,10 @@ where
                 .symbols()
                 .into_iter()
                 .map(|symbol| match symbol {
-                    ViewSymbol::Iteration => Ok(ViewSymbolBinding::Iteration(body.id())),
-                    ViewSymbol::Operand(operand_index) => Err(ProgramError::MalformedProgram(format!(
-                        "operation `{name}` describes the boundary view of body input {position} through operand \
-                         {operand_index}, which a scan body cannot bind",
+                    ReferenceViewSymbol::Iteration => Ok(ReferenceViewSymbolBinding::Iteration(body.id())),
+                    ReferenceViewSymbol::Input(input_index) => Err(ProgramError::MalformedProgram(format!(
+                        "operation `{name}` describes the boundary view of body input {position} through input \
+                         {input_index}, which a scan body cannot bind",
                     ))),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
@@ -463,7 +464,7 @@ where
                     true => ("carry", ReferenceViewPath::root()),
                     false => ("stacked operand", stacked_path(other_position)?),
                 };
-                if view_path.overlap(&other_path, &root) != ViewOverlap::Disjoint {
+                if view_path.overlap(&other_path, &root) != ReferenceViewOverlap::Disjoint {
                     return Err(ProgramError::MalformedProgram(format!(
                         "operation `{name}` passes the allocation of stacked reference operand {position} also as \
                          {role} {other_position}, whose handles may address the same coordinates inside the body; a \
@@ -1072,7 +1073,7 @@ where
                 if matches!(input.unbatched_type(), ArrayIrType::Reference(_)) {
                     let boundary_view = ArrayReferenceViewTransform::Index {
                         axis: 0,
-                        index: ViewIndex::Symbolic(ViewSymbol::Iteration),
+                        index: ArrayReferenceViewIndex::Symbolic(ReferenceViewSymbol::Iteration),
                     };
                     let (packed_view, slice_axis) = boundary_view.batch(&input.value().r#type(), input.batch_axis())?;
                     if packed_view != boundary_view {

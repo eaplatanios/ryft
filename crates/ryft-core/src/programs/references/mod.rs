@@ -315,9 +315,9 @@ pub use values::{
 };
 
 pub use views::{
-    NoBinding, ReferenceView, ReferenceViewAnalysis, ReferenceViewAnalysisError, ReferenceViewOperation,
-    ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError, ViewOverlap, ViewSymbol, ViewSymbolBinding,
-    batch_reference_view_operation,
+    NoReferenceViewBinding, ReferenceView, ReferenceViewAnalysis, ReferenceViewAnalysisError, ReferenceViewOperation,
+    ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep, ReferenceViewSymbol, ReferenceViewSymbolBinding,
+    ReferenceViewValidationError, batch_reference_view_operation,
 };
 
 #[cfg(test)]
@@ -393,12 +393,13 @@ mod tests {
         let analysis_error = ReferenceViewAnalysisError::MissingView {
             operation: "view",
             instruction: InstructionId::new(RegionId::new(0), 1),
+            position: ReferenceAliasPosition::Output(0),
         };
         let error = ReferenceError::from(analysis_error.clone());
         assert_eq!(error, ReferenceError::ViewAnalysis(Box::new(analysis_error)));
         assert_eq!(
             error.to_string(),
-            "operation `view` at ^0[1] derives a reference view but exposes no view transform",
+            "operation `view` at ^0[1] declares a reference view at output 0 but describes no view",
         );
     }
 }

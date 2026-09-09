@@ -19,7 +19,9 @@ use ryft_macros::Parameter;
 
 use crate::arrays::addressing::ArraySliceAxis;
 use crate::arrays::ir::ArrayIrValue;
-use crate::arrays::references::{ArrayReference, ArrayReferenceView, ArrayReferenceViewTransform, ViewIndex};
+use crate::arrays::references::{
+    ArrayReference, ArrayReferenceView, ArrayReferenceViewIndex, ArrayReferenceViewTransform,
+};
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::ir::ArrayIrType;
@@ -45,7 +47,7 @@ use crate::programs::{
     EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, OperationProvider, ProgramError, ProjectedValue,
     ReferenceAlias, ReferenceAliasKind, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
     ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceType, ReferenceView, ReferenceViewOperation,
-    ReferenceViewValidationError, RegionInterface, TypeError, Typed, Value, ValueProjection, ViewSymbol,
+    ReferenceViewSymbol, ReferenceViewValidationError, RegionInterface, TypeError, Typed, Value, ValueProjection,
     batch_reference_view_operation,
 };
 use crate::tracing::{Tracer, TracingContext};
@@ -161,7 +163,7 @@ impl ReferenceIndexOperation {
 
     /// Returns this operation's allocation-preserving view transform.
     pub const fn transform(&self) -> ArrayReferenceViewTransform {
-        ArrayReferenceViewTransform::Index { axis: self.axis, index: ViewIndex::Static(self.index) }
+        ArrayReferenceViewTransform::Index { axis: self.axis, index: ArrayReferenceViewIndex::Static(self.index) }
     }
 }
 
@@ -320,9 +322,9 @@ impl<C: Domain<Type = ArrayIrType, Value: ReferenceSlice<C::Value>>> Interpretab
 /// it validates the composed referent type with exactly the eager handle's arithmetic, rejecting an invalid composition
 /// before any handle exists, and then records the composed chain as the new handle's authoritative alias. Nothing is
 /// bound into the destination, because the portion this handle selects is materialized at each access rather than at
-/// the view. The step is closed over destination values: each [`ViewSymbol::Operand`] the transform reports binds the
-/// destination value of that operand, so the operands of a view operation are its reference followed by one value per
-/// symbol, and a static transform binds nothing.
+/// the view. The step is closed over destination values: each [`ReferenceViewSymbol::Input`] the transform reports
+/// binds the destination value of that operand, so the operands of a view operation are its reference followed by one
+/// value per symbol, and a static transform binds nothing.
 ///
 /// On an allocation that partial discharge *preserved*, the view is additionally replayed into the destination, and the
 /// reference it produces becomes the alias handle's own destination value, so that later accesses consume that
@@ -342,7 +344,7 @@ impl<C: Domain<Type = ArrayIrType, Value: ReferenceSlice<C::Value>>> Interpretab
 /// symbol beyond the reference, [`ProgramError::MalformedProgram`] when the first operand is a value rather than a
 /// reference handle, when a symbol operand is a reference rather than a value, or when a symbol names the reference
 /// operand or an operand outside the application, [`ProgramError::UnsupportedOperation`] for a
-/// [`ViewSymbol::Iteration`] coordinate, and [`ProgramError::InvalidOutputCount`] when replaying the view on a
+/// [`ReferenceViewSymbol::Iteration`] coordinate, and [`ProgramError::InvalidOutputCount`] when replaying the view on a
 /// preserved allocation does not produce exactly one value. Propagates the view algebra's own [`TypeError`] when
 /// `transform` does not compose onto the incoming handle's referent, and the discharge context's own
 /// [`ProgramError::MalformedProgram`] when the replayed reference does not carry the composed type.
@@ -364,16 +366,16 @@ where
     let bindings = symbols
         .iter()
         .map(|symbol| match symbol {
-            ViewSymbol::Operand(index) => match inputs.get(*index) {
+            ReferenceViewSymbol::Input(index) => match inputs.get(*index) {
                 Some(input) if *index > 0 => input.try_as_value("a view coordinate").cloned(),
                 _ => Err(ProgramError::MalformedProgram(format!(
-                    "reference view symbol names operand {index} but the coordinate operands of a view with {} \
-                     operands are 1..{}",
+                    "reference view symbol names input {index} but the coordinate inputs of a view with {} \
+                     inputs are 1..{}",
                     inputs.len(),
                     inputs.len(),
                 ))),
             },
-            ViewSymbol::Iteration => Err(ProgramError::UnsupportedOperation {
+            ReferenceViewSymbol::Iteration => Err(ProgramError::UnsupportedOperation {
                 message: "an iteration view is created by its region-carrying operation and never discharged as an \
                           instruction"
                     .to_string(),
@@ -573,10 +575,10 @@ where
         )));
     }
     let mut outputs = match view {
-        ArrayReferenceViewTransform::Index { axis, index: ViewIndex::Static(index) } => {
+        ArrayReferenceViewTransform::Index { axis, index: ArrayReferenceViewIndex::Static(index) } => {
             context.bind(ReferenceIndexOperation::new(*axis, *index), Vec::new(), std::slice::from_ref(&source))?
         }
-        ArrayReferenceViewTransform::Index { index: ViewIndex::Symbolic(_), .. } => {
+        ArrayReferenceViewTransform::Index { index: ArrayReferenceViewIndex::Symbolic(_), .. } => {
             return Err(ProgramError::UnsupportedOperation {
                 message: "no array operation reapplies a symbolic reference index until dynamic indexing is supported"
                     .to_string(),
@@ -931,7 +933,7 @@ impl<A: Value<Type = ArrayType>> ReferenceIndex for ArrayIrValue<A> {
         // Projection rejects value operands and `with_transform` validates the transform against the handle's
         // cached referent type, so a separate operation-level inference pass would only repeat both checks.
         let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
-        let transform = ArrayReferenceViewTransform::Index { axis, index: ViewIndex::Static(index) };
+        let transform = ArrayReferenceViewTransform::Index { axis, index: ArrayReferenceViewIndex::Static(index) };
         Ok(Self::Reference(reference.with_transform(transform)?))
     }
 }
@@ -973,8 +975,8 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, ReferencePlacement};
     use crate::programs::{
-        EffectClass, EffectClasses, EmptyRegionDriver, ProgramBuilder, ProgramError, ReferenceError, TypeError,
-        ViewSymbol,
+        EffectClass, EffectClasses, EmptyRegionDriver, ProgramBuilder, ProgramError, ReferenceError,
+        ReferenceViewSymbol, TypeError,
     };
     use crate::tracing::{Tracer, TracingContext};
 
@@ -1006,7 +1008,10 @@ mod tests {
         assert_eq!(index.effects().reference_aliases(), &[ReferenceAlias::new(0, 0, ReferenceAliasKind::View)]);
         assert_eq!(index.effects().reference_effects(), &[]);
 
-        assert_eq!(index.transform(), ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) });
+        assert_eq!(
+            index.transform(),
+            ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) }
+        );
         assert_eq!(index.to_string(), "reference_index [axis=0, index=1]");
 
         let slice = ReferenceSliceOperation::new(vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 3, 1)]);
@@ -1069,7 +1074,7 @@ mod tests {
                 .with_view(ArrayReferenceViewTransform::Slice {
                     axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 2, 1)],
                 })
-                .with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) }),
+                .with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) }),
         );
         assert_eq!(context.read(&indexed), Ok(TestValue::Array(Array::vector(vec![7.0_f32, 8.0]))));
 
@@ -1128,7 +1133,7 @@ mod tests {
         assert_eq!(
             view.alias(),
             &ArrayReferenceView::root()
-                .with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(0) }),
+                .with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(0) }),
         );
         assert_eq!(
             view.preserved().map(|value| value.r#type().into_owned()),
@@ -1840,7 +1845,7 @@ mod tests {
                 )?;
                 reapply_array_reference_view(
                     input.context(),
-                    &ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) },
+                    &ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) },
                     sliced,
                     &[],
                 )
@@ -1873,7 +1878,8 @@ mod tests {
         let coordinate_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let error = TestContext::trace(
             |inputs: Vec<Tracer<TestContext>>| {
-                let r#static = ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) };
+                let r#static =
+                    ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) };
                 reapply_array_reference_view(inputs[0].context(), &r#static, inputs[0].clone(), &inputs[1..])
             },
             vec![root_type.clone(), coordinate_type.clone()],
@@ -1889,8 +1895,10 @@ mod tests {
         );
         let error = TestContext::trace(
             |inputs: Vec<Tracer<TestContext>>| {
-                let symbolic =
-                    ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Symbolic(ViewSymbol::Operand(1)) };
+                let symbolic = ArrayReferenceViewTransform::Index {
+                    axis: 0,
+                    index: ArrayReferenceViewIndex::Symbolic(ReferenceViewSymbol::Input(1)),
+                };
                 reapply_array_reference_view(inputs[0].context(), &symbolic, inputs[0].clone(), &inputs[1..])
             },
             vec![root_type, coordinate_type],

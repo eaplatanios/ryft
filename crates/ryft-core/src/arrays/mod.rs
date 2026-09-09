@@ -37,7 +37,7 @@ pub use operations::{
 };
 pub use references::{
     ArrayReference, ArrayReferenceAnalysis, ArrayReferenceAnalysisError, ArrayReferenceDischarge, ArrayReferenceView,
-    ArrayReferenceViewError, ArrayReferenceViewTransform, ViewIndex,
+    ArrayReferenceViewError, ArrayReferenceViewIndex, ArrayReferenceViewTransform,
 };
 pub use sharding::{
     Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProcessIndex, Sharding, ShardingDimension,

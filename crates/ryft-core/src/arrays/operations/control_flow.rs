@@ -434,7 +434,7 @@ mod tests {
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
-    use crate::arrays::references::{ArrayReference, ArrayReferenceViewTransform, ViewIndex};
+    use crate::arrays::references::{ArrayReference, ArrayReferenceViewIndex, ArrayReferenceViewTransform};
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
@@ -950,7 +950,7 @@ mod tests {
             for &iteration in iterations {
                 let element = stack.with_transform(ArrayReferenceViewTransform::Index {
                     axis: 0,
-                    index: ViewIndex::Static(iteration),
+                    index: ArrayReferenceViewIndex::Static(iteration),
                 })?;
                 element.add_update(&carry)?;
                 carry = carry.add(&element.read()?)?;

@@ -17,14 +17,14 @@
 //! [`ReferenceViewOperation`]) from downstream position. `register.halves` is a static two-output view whose outputs
 //! carry two distinct descriptions; it has no discharge rule, no eager interpretation, and no transform rules, so it
 //! pins the analysis side of the contract only. `register.bit` is a dynamic single-output view of one bit of a
-//! register, described through the operand that carries the bit index ([`ViewSymbol::Operand`]): the analysis closes
-//! the description over that operand, the discharge alias is the view path closed over destination values
+//! register, described through the input that carries the bit index ([`ReferenceViewSymbol::Input`]): the analysis
+//! closes the description over that input, the discharge alias is the view path closed over destination values
 //! (`ReferenceViewPath<RegisterView, C::Value>`) through which the policy reads and writes by binding the family's own
 //! bit operations on the destination, forward mode reapplies the view to the tangent reference with the primal index,
-//! reverse mode reaches the viewed cotangent reference through [`TranspositionContext`], which resolves the bound
-//! index to its transposed-program value, and batching goes through the shared [`batch_reference_view_operation`]
-//! rule. Eagerly, a bit view is a [`RegisterValue::BitReference`] handle over the root reference; a bit of a bit has no
-//! eager handle, so nested bit views are reachable only through staged programs and their discharge.
+//! reverse mode reaches the viewed cotangent reference through [`TranspositionContext`], which resolves the bound index
+//! to its transposed-program value, and batching goes through the shared [`batch_reference_view_operation`] rule.
+//! Eagerly, a bit view is a [`RegisterValue::BitReference`] handle over the root reference; a bit of a bit has no eager
+//! handle, so nested bit views are reachable only through staged programs and their discharge.
 //!
 //! The transform legs are reached through the public entry points ([`differentiate_at`] for `jvp`, `vjp`, and
 //! `value_and_gradient`, and [`batch`]) over a live register reference. The generic reference primitives
@@ -64,11 +64,12 @@ use ryft_core::{
     ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceEffect,
     ReferenceFreeze, ReferenceFreezeOperation, ReferenceId, ReferenceNew, ReferenceNewOperation, ReferenceRead,
     ReferenceReadOperation, ReferenceSource, ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceView,
-    ReferenceViewOperation, ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError, ReferenceWrite,
-    ReferenceWriteOperation, RegionId, RegionInterface, RegionRef, RegionSlot, Trace, Tracer, TracingContext,
-    TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError, Typed, Value, ValueId,
-    ViewOverlap, ViewSymbol, ViewSymbolBinding, Zero, ZeroOperation, batch, batch_reference_view_operation,
-    check_count, differentiate_at, discharge_reference_free_operation, validate_reference_boundary,
+    ReferenceViewOperation, ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep, ReferenceViewSymbol,
+    ReferenceViewSymbolBinding, ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation, RegionId,
+    RegionInterface, RegionRef, RegionSlot, Trace, Tracer, TracingContext, TransposableOperation, TranspositionContext,
+    TranspositionDriver, Type, TypeError, Typed, Value, ValueId, Zero, ZeroOperation, batch,
+    batch_reference_view_operation, check_count, differentiate_at, discharge_reference_free_operation,
+    validate_reference_boundary,
 };
 
 /// Destination universe of the downstream programs: the eager context over the register family, which is what a
@@ -745,7 +746,7 @@ impl Operation for RegisterOperation {
                 )
                 .unwrap(),
             ),
-            // The bit is a narrowing view of the reference operand; the index operand is a coordinate, not a reference.
+            // The bit is a narrowing view of the reference operand; the index input is a coordinate, not a reference.
             Self::Bit => Cow::Owned(
                 Effects::new(
                     EffectClasses::NONE,
@@ -814,7 +815,8 @@ where
                 check_count!("input", inputs, 2, ProgramError);
                 let reference = inputs[0].try_as_reference("a reference to view")?;
                 let index = inputs[1].try_as_value("a bit index")?.clone();
-                let alias = reference.alias().with_step(RegisterView::Bit(ViewSymbol::Operand(1)), vec![index.clone()]);
+                let alias =
+                    reference.alias().with_step(RegisterView::Bit(ReferenceViewSymbol::Input(1)), vec![index.clone()]);
                 let viewed = context.alias_reference(reference, alias, ReferenceType::new(RegisterType), |parent| {
                     bind_register_output(context.parent(), Self::Bit, &[parent.clone(), index])
                 })?;
@@ -904,9 +906,10 @@ enum RegisterView {
     /// Static half of a register, selected by `register.halves`.
     Half(RegisterHalf),
 
-    /// One bit of a register, selected by `register.bit` at the index the symbol names: [`ViewSymbol::Operand`] of the
-    /// index operand for an instruction output, or [`ViewSymbol::Iteration`] for a hypothetical boundary view.
-    Bit(ViewSymbol),
+    /// One bit of a register, selected by `register.bit` at the index the symbol names:
+    /// [`ReferenceViewSymbol::Input`] of the index input for an instruction output, or
+    /// [`ReferenceViewSymbol::Iteration`] for a hypothetical boundary view.
+    Bit(ReferenceViewSymbol),
 }
 
 // A half is a static description while a bit depends on the one coordinate its symbol names. Registers have no axes,
@@ -917,7 +920,7 @@ enum RegisterView {
 impl ReferenceView for RegisterView {
     type Type = RegisterIrType;
 
-    fn symbols(&self) -> Vec<ViewSymbol> {
+    fn symbols(&self) -> Vec<ReferenceViewSymbol> {
         match self {
             Self::Half(_) => Vec::new(),
             Self::Bit(symbol) => vec![*symbol],
@@ -933,16 +936,20 @@ impl ReferenceView for RegisterView {
         Ok((*self, batch_axis))
     }
 
-    fn overlap(_root: &RegisterIrType, a: &[ReferenceViewStep<Self>], b: &[ReferenceViewStep<Self>]) -> ViewOverlap {
+    fn overlap(
+        _root: &RegisterIrType,
+        a: &[ReferenceViewStep<Self>],
+        b: &[ReferenceViewStep<Self>],
+    ) -> ReferenceViewOverlap {
         for (a, b) in a.iter().zip(b.iter()) {
             match (a.view(), b.view()) {
-                (Self::Half(a_half), Self::Half(b_half)) if a_half != b_half => return ViewOverlap::Disjoint,
+                (Self::Half(a_half), Self::Half(b_half)) if a_half != b_half => return ReferenceViewOverlap::Disjoint,
                 (Self::Half(_), Self::Half(_)) => {}
                 (Self::Bit(_), Self::Bit(_)) if a == b => {}
-                _ => return ViewOverlap::MayOverlap,
+                _ => return ReferenceViewOverlap::MayOverlap,
             }
         }
-        if a.len() == b.len() { ViewOverlap::Same } else { ViewOverlap::MayOverlap }
+        if a.len() == b.len() { ReferenceViewOverlap::Same } else { ReferenceViewOverlap::MayOverlap }
     }
 }
 
@@ -956,7 +963,7 @@ impl ReferenceViewOperation for RegisterOperation {
         match (self, output_index) {
             (Self::Halves, 0) => Some(RegisterView::Half(RegisterHalf::Low)),
             (Self::Halves, 1) => Some(RegisterView::Half(RegisterHalf::High)),
-            (Self::Bit, 0) => Some(RegisterView::Bit(ViewSymbol::Operand(1))),
+            (Self::Bit, 0) => Some(RegisterView::Bit(ReferenceViewSymbol::Input(1))),
             _ => None,
         }
     }
@@ -992,13 +999,13 @@ impl ReferenceViewOperation for RegisterOperation {
                     RegisterHalf::High => 1,
                 }))
             }
-            RegisterView::Bit(ViewSymbol::Operand(_)) => {
+            RegisterView::Bit(ReferenceViewSymbol::Input(_)) => {
                 check_count!("input", symbols, 1, ProgramError);
                 let mut outputs = context.bind(Self::Bit, Vec::new(), &[source, symbols[0].clone()])?;
                 check_count!("output", outputs, 1, ProgramError);
                 Ok(outputs.remove(0))
             }
-            RegisterView::Bit(ViewSymbol::Iteration) => Err(ProgramError::UnsupportedOperation {
+            RegisterView::Bit(ReferenceViewSymbol::Iteration) => Err(ProgramError::UnsupportedOperation {
                 message: "a register bit indexed by the iteration counter is created by its region-carrying operation \
                           and cannot be reapplied"
                     .to_string(),
@@ -1982,22 +1989,27 @@ fn test_downstream_view_description_overlap_and_batch() {
     let low = empty.with_view(RegisterView::Half(RegisterHalf::Low));
     let high = empty.with_view(RegisterView::Half(RegisterHalf::High));
     let low_high = low.with_view(RegisterView::Half(RegisterHalf::High));
-    let bit_of_1 = empty.with_step(RegisterView::Bit(ViewSymbol::Operand(1)), vec![ViewSymbolBinding::Value(value(1))]);
-    let bit_of_2 = empty.with_step(RegisterView::Bit(ViewSymbol::Operand(1)), vec![ViewSymbolBinding::Value(value(2))]);
-    assert_eq!(low.overlap(&high, &root), ViewOverlap::Disjoint);
-    assert_eq!(low.overlap(&low, &root), ViewOverlap::Same);
-    assert_eq!(empty.overlap(&empty, &root), ViewOverlap::Same);
-    assert_eq!(empty.overlap(&low, &root), ViewOverlap::MayOverlap);
-    assert_eq!(low_high.overlap(&low, &root), ViewOverlap::MayOverlap);
-    assert_eq!(low_high.overlap(&high, &root), ViewOverlap::Disjoint);
-    assert_eq!(bit_of_1.overlap(&bit_of_1, &root), ViewOverlap::Same);
-    assert_eq!(bit_of_1.overlap(&bit_of_2, &root), ViewOverlap::MayOverlap);
-    assert_eq!(bit_of_1.overlap(&low, &root), ViewOverlap::MayOverlap);
-    assert_eq!(empty.overlap(&bit_of_1, &root), ViewOverlap::MayOverlap);
+    let bit_of_1 = empty
+        .with_step(RegisterView::Bit(ReferenceViewSymbol::Input(1)), vec![ReferenceViewSymbolBinding::Value(value(1))]);
+    let bit_of_2 = empty
+        .with_step(RegisterView::Bit(ReferenceViewSymbol::Input(1)), vec![ReferenceViewSymbolBinding::Value(value(2))]);
+    assert_eq!(low.overlap(&high, &root), ReferenceViewOverlap::Disjoint);
+    assert_eq!(low.overlap(&low, &root), ReferenceViewOverlap::Same);
+    assert_eq!(empty.overlap(&empty, &root), ReferenceViewOverlap::Same);
+    assert_eq!(empty.overlap(&low, &root), ReferenceViewOverlap::MayOverlap);
+    assert_eq!(low_high.overlap(&low, &root), ReferenceViewOverlap::MayOverlap);
+    assert_eq!(low_high.overlap(&high, &root), ReferenceViewOverlap::Disjoint);
+    assert_eq!(bit_of_1.overlap(&bit_of_1, &root), ReferenceViewOverlap::Same);
+    assert_eq!(bit_of_1.overlap(&bit_of_2, &root), ReferenceViewOverlap::MayOverlap);
+    assert_eq!(bit_of_1.overlap(&low, &root), ReferenceViewOverlap::MayOverlap);
+    assert_eq!(empty.overlap(&bit_of_1, &root), ReferenceViewOverlap::MayOverlap);
     assert_eq!(
-        low.with_step(RegisterView::Bit(ViewSymbol::Operand(1)), vec![ViewSymbolBinding::Value(value(1))])
-            .overlap(&bit_of_1, &root),
-        ViewOverlap::MayOverlap
+        low.with_step(
+            RegisterView::Bit(ReferenceViewSymbol::Input(1)),
+            vec![ReferenceViewSymbolBinding::Value(value(1))]
+        )
+        .overlap(&bit_of_1, &root),
+        ReferenceViewOverlap::MayOverlap
     );
 
     // The analysis-level query resolves both values to their roots first: `f(register) = (read(low), read(high))`
@@ -2024,9 +2036,9 @@ fn test_downstream_view_description_overlap_and_batch() {
         .unwrap();
     let region = program.entry_region_ref();
     let analysis = region.reference_view_analysis(0).unwrap();
-    assert_eq!(analysis.overlap(region, value(1), value(2)), Some(ViewOverlap::Disjoint));
-    assert_eq!(analysis.overlap(region, value(0), value(1)), Some(ViewOverlap::MayOverlap));
-    assert_eq!(analysis.overlap(region, value(2), value(2)), Some(ViewOverlap::Same));
+    assert_eq!(analysis.overlap(region, value(1), value(2)), Some(ReferenceViewOverlap::Disjoint));
+    assert_eq!(analysis.overlap(region, value(0), value(1)), Some(ReferenceViewOverlap::MayOverlap));
+    assert_eq!(analysis.overlap(region, value(2), value(2)), Some(ReferenceViewOverlap::Same));
     assert_eq!(analysis.overlap(region, value(1), value(3)), None);
 
     // Registers have no axes, so a description batches only replicated sources and passes through unchanged, symbols
@@ -2036,8 +2048,8 @@ fn test_downstream_view_description_overlap_and_batch() {
         Ok((RegisterView::Half(RegisterHalf::Low), BatchAxis::replicated()))
     );
     assert_eq!(
-        RegisterView::Bit(ViewSymbol::Operand(1)).batch(&root, BatchAxis::replicated()),
-        Ok((RegisterView::Bit(ViewSymbol::Operand(1)), BatchAxis::replicated()))
+        RegisterView::Bit(ReferenceViewSymbol::Input(1)).batch(&root, BatchAxis::replicated()),
+        Ok((RegisterView::Bit(ReferenceViewSymbol::Input(1)), BatchAxis::replicated()))
     );
     assert!(matches!(
         RegisterView::Half(RegisterHalf::High).batch(&root, BatchAxis::new(0)),
@@ -2047,9 +2059,9 @@ fn test_downstream_view_description_overlap_and_batch() {
 }
 
 #[test]
-fn test_downstream_dynamic_view_analysis_closes_the_index_operand() {
-    // `f(r, i, j) = read(bit(r, i))` with two more views alongside: a second bit at the same index operand, a bit at
-    // another index operand, and the two static halves.
+fn test_downstream_dynamic_view_analysis_closes_the_index_input() {
+    // `f(r, i, j) = read(bit(r, i))` with two more views alongside: a second bit at the same index input, a bit at
+    // another index input, and the two static halves.
     let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
     let reference = builder.add_input(RegisterIrType::Reference(ReferenceType::new(RegisterType)));
     let i = builder.add_input(RegisterIrType::Register(RegisterType));
@@ -2065,13 +2077,13 @@ fn test_downstream_dynamic_view_analysis_closes_the_index_operand() {
         .build::<Vec<RegisterValue>, Vec<RegisterValue>>(vec![observed], vec![Placeholder; 3], vec![Placeholder])
         .unwrap();
 
-    // The dynamic description names the index operand symbolically and reports it as its one symbol.
-    assert_eq!(RegisterOperation::Bit.reference_view(0), Some(RegisterView::Bit(ViewSymbol::Operand(1))));
+    // The dynamic description names the index input symbolically and reports it as its one symbol.
+    assert_eq!(RegisterOperation::Bit.reference_view(0), Some(RegisterView::Bit(ReferenceViewSymbol::Input(1))));
     assert_eq!(RegisterOperation::Bit.reference_view(1), None);
-    assert_eq!(RegisterView::Bit(ViewSymbol::Operand(1)).symbols(), vec![ViewSymbol::Operand(1)]);
+    assert_eq!(RegisterView::Bit(ReferenceViewSymbol::Input(1)).symbols(), vec![ReferenceViewSymbol::Input(1)]);
     assert_eq!(RegisterView::Half(RegisterHalf::Low).symbols(), Vec::new());
 
-    // The overlay closes the symbol over the index operand of the instruction that created each view, so the two bits
+    // The overlay closes the symbol over the index input of the instruction that created each view, so the two bits
     // at the same operand share one path, the bit at the other operand has a different path, and the overlap query
     // decides all three outcomes from the closed paths alone.
     let region = program.entry_region_ref();
@@ -2088,17 +2100,19 @@ fn test_downstream_dynamic_view_analysis_closes_the_index_operand() {
         )),
     );
     let bit_path = |index: usize| {
-        ReferenceViewPath::root()
-            .with_step(RegisterView::Bit(ViewSymbol::Operand(1)), vec![ViewSymbolBinding::Value(value(index))])
+        ReferenceViewPath::root().with_step(
+            RegisterView::Bit(ReferenceViewSymbol::Input(1)),
+            vec![ReferenceViewSymbolBinding::Value(value(index))],
+        )
     };
     assert_eq!(analysis.path(value(3)), Some(&bit_path(1)));
     assert_eq!(analysis.path(value(4)), Some(&bit_path(1)));
     assert_eq!(analysis.path(value(5)), Some(&bit_path(2)));
-    assert_eq!(analysis.overlap(region, value(3), value(4)), Some(ViewOverlap::Same));
-    assert_eq!(analysis.overlap(region, value(3), value(5)), Some(ViewOverlap::MayOverlap));
-    assert_eq!(analysis.overlap(region, value(3), value(6)), Some(ViewOverlap::MayOverlap));
-    assert_eq!(analysis.overlap(region, value(6), value(7)), Some(ViewOverlap::Disjoint));
-    assert_eq!(analysis.overlap(region, value(0), value(3)), Some(ViewOverlap::MayOverlap));
+    assert_eq!(analysis.overlap(region, value(3), value(4)), Some(ReferenceViewOverlap::Same));
+    assert_eq!(analysis.overlap(region, value(3), value(5)), Some(ReferenceViewOverlap::MayOverlap));
+    assert_eq!(analysis.overlap(region, value(3), value(6)), Some(ReferenceViewOverlap::MayOverlap));
+    assert_eq!(analysis.overlap(region, value(6), value(7)), Some(ReferenceViewOverlap::Disjoint));
+    assert_eq!(analysis.overlap(region, value(0), value(3)), Some(ReferenceViewOverlap::MayOverlap));
 }
 
 #[test]
@@ -2108,7 +2122,7 @@ fn test_downstream_dynamic_view_reapplies_with_its_index() {
     let context = RegisterDestination::new();
     let reference = Reference::new(RegisterValue::Register(6)).unwrap();
     let source = RegisterValue::Reference(reference.clone());
-    let bit = RegisterView::Bit(ViewSymbol::Operand(1));
+    let bit = RegisterView::Bit(ReferenceViewSymbol::Input(1));
     let reapplied =
         RegisterOperation::reapply_view(&context, &bit, source.clone(), &[RegisterValue::Register(1)]).unwrap();
     assert_eq!(reapplied, RegisterValue::BitReference { root: reference.clone(), index: 1 });
@@ -2129,7 +2143,7 @@ fn test_downstream_dynamic_view_reapplies_with_its_index() {
     assert!(matches!(
         RegisterOperation::reapply_view(
             &context,
-            &RegisterView::Bit(ViewSymbol::Iteration),
+            &RegisterView::Bit(ReferenceViewSymbol::Iteration),
             source,
             &[RegisterValue::Register(1)],
         ),
@@ -2478,7 +2492,7 @@ fn test_downstream_dynamic_view_jvp_reapplies_the_view_to_the_tangent_reference(
 fn test_downstream_dynamic_view_vjp_resolves_the_index_of_the_viewed_cotangent_reference() {
     // Reverse mode reaches the cotangent of the bit through the transposition context: the linear program views the
     // tangent reference at the residual index, so the transposed program views the destination at that index, which
-    // the context resolves to the transposed-program value of the index operand. The read accumulates `ȳ = 1` into
+    // the context resolves to the transposed-program value of the index input. The read accumulates `ȳ = 1` into
     // bit 2 of the destination (`0b1000 ↦ 0b1100`), the write's transpose swaps a zero back out of it (`x̄ = 1`, the
     // destination returns to `0b1000`), and the index receives a zero cotangent.
     let reference = Reference::new(RegisterValue::Register(1)).unwrap();

@@ -13,7 +13,7 @@ use ryft_macros::Operation;
 use crate::arrays::arrays::Array;
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::ir::ArrayIrValue;
-use crate::arrays::references::{ArrayReferenceViewTransform, ViewIndex};
+use crate::arrays::references::{ArrayReferenceViewIndex, ArrayReferenceViewTransform};
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::{Dimension, DimensionType};
 use crate::arrays::types::ir::ArrayIrType;
@@ -67,8 +67,8 @@ use crate::operations::{
 };
 use crate::partial::PartialValue;
 use crate::programs::{
-    MaybeZero, Operation, OperationProjection, ProgramError, ReferenceViewOperation, ReferenceViewValidationError,
-    Type, TypeError, TypeIdentityPosition, Typed, Value, ValueProjection, ViewSymbol,
+    MaybeZero, Operation, OperationProjection, ProgramError, ReferenceViewOperation, ReferenceViewSymbol,
+    ReferenceViewValidationError, Type, TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 use crate::tracing_v2::RematerializeOperation;
@@ -593,7 +593,10 @@ impl<A: Value<Type = ArrayType>> ReferenceViewOperation for ArrayIrOperation<A> 
         // the stacked reference indexed on its leading axis by the iteration counter.
         match self {
             Self::Scan(operation) if region_index == 0 && input_index >= operation.carry_count() => {
-                Some(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Symbolic(ViewSymbol::Iteration) })
+                Some(ArrayReferenceViewTransform::Index {
+                    axis: 0,
+                    index: ArrayReferenceViewIndex::Symbolic(ReferenceViewSymbol::Iteration),
+                })
             }
             _ => None,
         }
@@ -1805,7 +1808,10 @@ mod tests {
         // Only the scan member creates boundary views: every trailing body input is the per-iteration slice of the
         // stacked operand at its position, indexed on the leading axis by the iteration counter, while carries are
         // forwarded complete handles and no other member attaches a region with a view input.
-        let view = ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Symbolic(ViewSymbol::Iteration) };
+        let view = ArrayReferenceViewTransform::Index {
+            axis: 0,
+            index: ArrayReferenceViewIndex::Symbolic(ReferenceViewSymbol::Iteration),
+        };
         let scan = TestOperation::Scan(ScanOperation::new(1, 3));
         assert_eq!(scan.region_input_view(0, 0), None);
         assert_eq!(scan.region_input_view(0, 1), Some(view.clone()));

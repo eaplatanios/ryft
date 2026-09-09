@@ -27,8 +27,8 @@ use crate::programs::{
     Atom, AtomId, BindingRegionDriver, EffectClass, EmptyRegionDriver, Instruction, InstructionId, MaybeZero,
     Operation, OperationProjection, OperationProvider, Program, ProgramBuilder, ProgramError, Provenance,
     ReferenceAccessMode, ReferenceAliasKind, ReferenceAnalysis, ReferenceBoundary, ReferenceRoot,
-    ReferenceViewOperation, Region, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, TypeError,
-    TypeIdentityPosition, Typed, Value, ValueId, ValueProjection, ViewSymbolBinding,
+    ReferenceViewOperation, ReferenceViewSymbolBinding, Region, RegionDriver, RegionRef, RegionReplayMappings,
+    ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, Typed, Value, ValueId, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -913,15 +913,17 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
                     .bindings()
                     .iter()
                     .map(|binding| match binding {
-                        ViewSymbolBinding::Value(id) => self.cotangent_view_coordinates.get(id).cloned().ok_or_else(
-                            || ProgramError::UnsupportedOperation {
+                        ReferenceViewSymbolBinding::Value(id) => self
+                            .cotangent_view_coordinates
+                            .get(id)
+                            .cloned()
+                            .ok_or_else(|| ProgramError::UnsupportedOperation {
                                 message: format!(
                                     "the view coordinate {id:?} of reference operand {value:?} is a linear value, so \
                                      the view cannot be reapplied to the operand's cotangent reference"
                                 ),
-                            },
-                        ),
-                        ViewSymbolBinding::Iteration(region) => Err(ProgramError::UnsupportedOperation {
+                            }),
+                        ReferenceViewSymbolBinding::Iteration(region) => Err(ProgramError::UnsupportedOperation {
                             message: format!(
                                 "reference operand {value:?} views its root through the iteration counter of region \
                                  {region:?}; boundary views are re-created by the transpose rule of the attaching \
