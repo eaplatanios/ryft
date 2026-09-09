@@ -741,33 +741,39 @@ impl ReferenceTransitiveAccess {
     }
 }
 
-// TODO(eaplatanios): Review from this point onwards.
-
-/// Reference topology, access, and lifetime analysis of one [`Region`] computation closure. Transform rules, boundary
-/// validation, diagnostics, and lowering share this analysis through [`RegionRef::reference_analysis`]. It runs when
-/// requested and is retained in the region's transform cache; constructing a program does not require this full
-/// traversal. Reference discharge shares the traversal, but supplies caller identities and computes an uncached
-/// boundary summary instead of treating formal inputs as independent roots.
+/// Reference topology, access, and lifetime analysis of one [`Computation`](RegionRole::Computation) [`Region`]
+/// closure. Transform rules, boundary validation, diagnostics, and lowering share this analysis through
+/// [`RegionRef::reference_analysis`]. It runs when requested and is retained in the region's transform cache.
+/// Constructing a [`Program`] does not require this full traversal. Reference discharge shares the traversal,
+/// but supplies caller identities and computes an uncached boundary summary instead of treating formal inputs
+/// as independent roots.
 ///
 /// The analysis resolves every reference-typed value of the closure to exactly one canonical [`ReferenceRoot`] in the
-/// namespace of the region containing it: the region's own reference-typed inputs, its own allocations, and the
-/// capture roots it inherits from an enclosing capture scope (the first `capture_count` inputs of the analyzed region,
-/// or the fresh prefix an operation declares through [`Operation::region_capture_input_count`]). Nested regions are
-/// analyzed in their own namespace, shared regions exactly once; each attachment records one
+/// namespace of the region containing it, including the region's own reference-typed inputs, its own allocations, and
+/// the capture roots it inherits from an enclosing capture scope (i.e., the first `capture_count` inputs of the
+/// analyzed region, or the fresh prefix an operation declares through [`Operation::region_capture_input_count`]).
+/// Nested regions are analyzed in their own namespace, shared regions exactly once; each attachment records one
 /// [`ReferenceRegionInputBinding`] per reference-typed region input, and the attaching instruction's
 /// [`ReferenceTransitiveAccess`] summary is expressed in the caller's namespace with nested-local allocations dropped.
 ///
-/// Along the way it enforces the reference model: operation effect declarations and region hooks must be well-formed,
-/// only complete-value handles cross region boundaries (a derived view neither enters nor leaves an attached region
-/// unless the attaching operation itself creates it for a region input, as described in the module documentation), a
-/// reference-typed output of a region-carrying operation must preserve its identity-constrained input root or be
-/// forwarded consistently from region outputs that are not nested-local allocations, attached regions may only perform
-/// the access modes their operation permits on entering roots, and consumption must go through a complete-value handle
-/// in the root's allocating region with no later access in program order. External roots are borrowed by default and
-/// cannot be consumed. Internal callers may explicitly transfer ownership of selected non-capture entry inputs; those
-/// inputs may be consumed in the entry region, but never through a view or in an attached region.
+/// The analysis validates the following reference rules:
 ///
-/// Every accessor is deterministic: roots, values, and summaries are stored in ordered maps, and accesses and bindings
+///   - Operation effect declarations and region hooks must describe valid inputs, outputs, and attached regions.
+///   - References passed into or returned from attached regions must denote complete values. An attaching operation
+///     may create a view for a region input, as described in the module documentation, but a view cannot be returned
+///     from the region.
+///   - A reference output that preserves a declared input identity must have that input's root. Any attached region
+///     outputs forwarded to it must agree on that root; without a declared input identity, they establish the root
+///     instead. An allocation created inside an attached region cannot escape through a region output.
+///   - Attached regions may access incoming references only in the modes permitted by the attaching operation.
+///   - Consumption must use a complete value reference in the region that allocated it, and no later instruction in
+///     program order may access the consumed root.
+///
+/// External roots are borrowed by default and cannot be consumed. Internal callers may explicitly transfer ownership
+/// of selected non-capture entry inputs, allowing their consumption in the entry region. This permission does not
+/// extend to attached regions or allow consumption through a view; captures always remain borrowed.
+///
+/// Every accessor is deterministic. Roots, values, and summaries are stored in ordered maps, and accesses and bindings
 /// in program order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReferenceAnalysis {
@@ -776,21 +782,26 @@ pub struct ReferenceAnalysis {
 
     /// Contains every [`ReferenceRoot`] of the [`Region`] closure that was analyzed, including roots of nested regions,
     /// in canonical root order.
-    roots: BTreeMap<ReferenceRoot, RootRecord>,
+    roots: BTreeMap<ReferenceRoot, ReferenceRootRecord>,
 
-    /// Values returned by [`Self::values`], with their roots, view status, and aliases.
+    /// Contains every reference-typed value of the [`Region`] closure that was analyzed, including values of nested
+    /// regions, in canonical [`ValueId`] order.
     values: BTreeMap<ValueId, ValueRecord>,
 
-    /// Refer to [`Self::accesses`].
-    accesses: Vec<ReferenceAccess>,
+    /// Contains every direct [`ReferenceAccess`] of the [`Region`] closure that was analyzed, in program order
+    /// within each region.
+    access_modes: Vec<ReferenceAccess>,
 
-    /// Refer to [`Self::region_input_bindings`].
+    /// Contains every attached region [`ReferenceRegionInputBinding`] of the [`Region`] closure that was analyzed,
+    /// in program order of the attaching [`Instruction`](crate::Instruction)s.
     region_input_bindings: Vec<ReferenceRegionInputBinding>,
 
-    /// Instruction summaries returned by [`Self::transitive_access`].
+    /// [`ReferenceTransitiveAccess`] for each [`Instruction`](crate::Instruction) that contains reference accesses
+    /// directly or through its attached regions, in the [`Region`] closure that was analyzed.
     transitive_accesses: BTreeMap<InstructionId, ReferenceTransitiveAccess>,
 
-    /// Refer to [`Self::output_roots`].
+    /// [`ReferenceRoot`] denoted by each output of the analyzed [`Region`], with [`None`] representing value (i.e.,
+    /// non-reference) outputs.
     output_roots: Vec<Option<ReferenceRoot>>,
 }
 
@@ -852,7 +863,104 @@ impl ReferenceAnalysis {
         Ok(analysis)
     }
 
-    /// Summarizes a region under supplied reference identities instead of assuming distinct formal inputs.
+    /// Returns the [`RegionId`] of the [`Region`] that was analyzed to produce this [`ReferenceAnalysis`].
+    #[inline]
+    pub fn region(&self) -> RegionId {
+        self.region
+    }
+
+    /// Returns every [`ReferenceRoot`] of the [`Region`] closure that was analyzed, including roots of nested regions,
+    /// in canonical root order.
+    #[inline]
+    pub fn roots(&self) -> impl '_ + Iterator<Item = ReferenceRoot> {
+        self.roots.keys().copied()
+    }
+
+    /// Returns the [`ReferenceRoot`] that the reference-typed `value` denotes, in the namespace of the [`Region`]
+    /// containing it, or [`None`] when `value` is not a reference-typed value of the [`Region`] closure that was
+    /// analyzed.
+    #[inline]
+    pub fn root_of(&self, value: ValueId) -> Option<ReferenceRoot> {
+        self.values.get(&value).map(|record| record.root)
+    }
+
+    /// Returns every reference-typed value of the [`Region`] closure that was analyzed, including values of nested
+    /// regions, in canonical [`ValueId`] order.
+    #[inline]
+    pub fn values(&self) -> impl '_ + Iterator<Item = ValueId> {
+        self.values.keys().copied()
+    }
+
+    /// Returns the [`ReferenceAliasEdge`] defining `value` from another reference-typed value, or [`None`] when `value`
+    /// is a root handle, a capture constant, a forwarded region output, or not a reference-typed value of the closure.
+    #[inline]
+    pub fn alias(&self, value: ValueId) -> Option<ReferenceAliasEdge> {
+        self.values.get(&value).and_then(|record| record.alias)
+    }
+
+    /// Returns every direct [`ReferenceAccess`] of the [`Region`] closure that was analyzed, in program order
+    /// within each region.
+    #[inline]
+    pub fn access_modes(&self) -> &[ReferenceAccess] {
+        self.access_modes.as_slice()
+    }
+
+    /// Returns every [`ReferenceAccess`] performed on `root`, directly or transitively through nested [`Region`]s,
+    /// in [`ReferenceAccessMode`] declaration order.
+    #[inline]
+    pub fn access_modes_for(&self, root: ReferenceRoot) -> impl '_ + Iterator<Item = ReferenceAccessMode> {
+        self.roots.get(&root).into_iter().flat_map(|record| record.access_modes.iter().copied())
+    }
+
+    /// Returns every attached region [`ReferenceRegionInputBinding`] of the [`Region`] closure that was analyzed,
+    /// in program order of the attaching [`Instruction`](crate::Instruction)s.
+    #[inline]
+    pub fn region_input_bindings(&self) -> &[ReferenceRegionInputBinding] {
+        self.region_input_bindings.as_slice()
+    }
+
+    /// Returns the [`ReferenceTransitiveAccess`] of `instruction` if it contains reference accesses directly or through
+    /// its attached regions, and [`None`] otherwise.
+    #[inline]
+    pub fn transitive_access(&self, instruction: InstructionId) -> Option<&ReferenceTransitiveAccess> {
+        self.transitive_accesses.get(&instruction)
+    }
+
+    /// Returns the [`ReferenceRoot`] denoted by each output of the analyzed [`Region`], with [`None`] representing
+    /// value (i.e., non-reference) outputs.
+    #[inline]
+    pub fn output_roots(&self) -> &[Option<ReferenceRoot>] {
+        self.output_roots.as_slice()
+    }
+
+    /// Returns the logical external source of `root` when it is a reference-typed input of the analyzed [`Region`],
+    /// and [`None`] for allocations, external constants, and inputs of nested regions.
+    #[inline]
+    pub fn external_source(&self, root: ReferenceRoot) -> Option<ReferenceSource> {
+        self.roots.get(&root).and_then(|record| record.source)
+    }
+
+    /// Returns whether `value` is a derived view of its [`ReferenceRoot`] (i.e., whether its alias chain contains a
+    /// [`ReferenceAliasKind::View`] edge). Root handles and unknown values are not views.
+    #[inline]
+    pub fn is_view(&self, value: ValueId) -> bool {
+        self.values.get(&value).is_some_and(|record| record.narrows)
+    }
+
+    /// Returns whether any statically reachable reference access writes, swaps, or accumulates into `root`. This is
+    /// deliberately conservative across structured control flow. Specifically, a write operation in either branch of
+    /// a condition or in a loop body, etc. counts even when execution may never take that path.
+    #[inline]
+    pub fn is_mutated(&self, root: ReferenceRoot) -> bool {
+        self.access_modes_for(root).any(|mode| {
+            matches!(
+                mode,
+                ReferenceAccessMode::Write | ReferenceAccessMode::ReadWrite | ReferenceAccessMode::Accumulate
+            )
+        })
+    }
+
+    /// Summarizes a [`Region`] under supplied reference identities instead of assuming distinct formal inputs.
     /// This internal path shares structural validation with cached analysis, but analyzes each attachment separately:
     /// aliases and capture bindings may differ between callers. Unused constants are ignored, as in region replay.
     ///
@@ -878,107 +986,9 @@ impl ReferenceAnalysis {
         let (_, summary) = traversal.analyze(captures.into(), Some(inputs))?;
         Ok(summary)
     }
-
-    /// Returns the [`RegionId`] of the analyzed region.
-    #[inline]
-    pub fn region(&self) -> RegionId {
-        self.region
-    }
-
-    /// Returns every root of the closure, including roots of nested regions, in canonical root order.
-    #[inline]
-    pub fn roots(&self) -> impl Iterator<Item = ReferenceRoot> + '_ {
-        self.roots.keys().copied()
-    }
-
-    /// Returns every reference-typed value of the closure, including values of nested regions, in canonical
-    /// [`ValueId`] order.
-    #[inline]
-    pub fn values(&self) -> impl Iterator<Item = ValueId> + '_ {
-        self.values.keys().copied()
-    }
-
-    /// Returns the root that the reference-typed `value` denotes, in the namespace of the region containing it, or
-    /// [`None`] when `value` is not a reference-typed value of the closure.
-    #[inline]
-    pub fn root_of(&self, value: ValueId) -> Option<ReferenceRoot> {
-        self.values.get(&value).map(|record| record.root)
-    }
-
-    /// Returns the logical external source of `root` when it is a reference-typed input of the analyzed region, and
-    /// [`None`] for allocations, external constants, and inputs of nested regions.
-    #[inline]
-    pub fn external_source(&self, root: ReferenceRoot) -> Option<ReferenceSource> {
-        self.roots.get(&root).and_then(|record| record.source)
-    }
-
-    /// Returns every direct access of the closure, in program order within each region.
-    #[inline]
-    pub fn accesses(&self) -> &[ReferenceAccess] {
-        self.accesses.as_slice()
-    }
-
-    /// Returns every access mode performed on `root`, directly or transitively through nested regions, in
-    /// [`ReferenceAccessMode`] declaration order.
-    #[inline]
-    pub fn access_modes(&self, root: ReferenceRoot) -> impl Iterator<Item = ReferenceAccessMode> + '_ {
-        self.roots.get(&root).into_iter().flat_map(|record| record.modes.iter().copied())
-    }
-
-    /// Returns whether any statically reachable access writes, swaps, or accumulates into `root`. This is deliberately
-    /// conservative across structured control flow: a write in either branch of a condition or in a loop body counts
-    /// even when execution may never take that path.
-    #[inline]
-    pub fn is_mutated(&self, root: ReferenceRoot) -> bool {
-        self.access_modes(root).any(|mode| {
-            matches!(
-                mode,
-                ReferenceAccessMode::Write | ReferenceAccessMode::ReadWrite | ReferenceAccessMode::Accumulate
-            )
-        })
-    }
-
-    /// Returns the alias edge defining `value` from another reference-typed value, or [`None`] when `value` is a root
-    /// handle, a capture constant, a forwarded region output, or not a reference-typed value of the closure.
-    #[inline]
-    pub fn alias(&self, value: ValueId) -> Option<ReferenceAliasEdge> {
-        self.values.get(&value).and_then(|record| record.alias)
-    }
-
-    /// Returns whether `value` is a derived view of its root (i.e., whether its alias chain contains a
-    /// [`ReferenceAliasKind::View`] edge). Root handles and unknown values are not views.
-    #[inline]
-    pub fn is_view(&self, value: ValueId) -> bool {
-        self.values.get(&value).is_some_and(|record| record.narrows)
-    }
-
-    /// Returns every attached-region input binding of the closure, in program order of the attaching instructions.
-    #[inline]
-    pub fn region_input_bindings(&self) -> &[ReferenceRegionInputBinding] {
-        self.region_input_bindings.as_slice()
-    }
-
-    /// Returns the transitive access summary of `instruction`, or [`None`] when the instruction accesses no root,
-    /// directly or through its attached regions.
-    #[inline]
-    pub fn transitive_access(&self, instruction: InstructionId) -> Option<&ReferenceTransitiveAccess> {
-        self.transitive_accesses.get(&instruction)
-    }
-
-    /// Returns the instruction that consumed `root`, or [`None`] when `root` is never consumed.
-    #[inline]
-    pub fn consumer(&self, root: ReferenceRoot) -> Option<InstructionId> {
-        self.roots.get(&root).and_then(|record| record.consumer)
-    }
-
-    /// Returns the root denoted by each output of the analyzed region, with [`None`] for value outputs. The analysis
-    /// does not judge these outputs: a kernel boundary rejects every reference output, while a program boundary may
-    /// forward entering roots, so each consumer applies its own rule.
-    #[inline]
-    pub fn output_roots(&self) -> &[Option<ReferenceRoot>] {
-        self.output_roots.as_slice()
-    }
 }
+
+// TODO(eaplatanios): Review from this point onwards.
 
 impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     /// Returns the [`ReferenceAnalysis`] of this [`Region`]'s closure, retained in the region's transform cache so
@@ -1087,15 +1097,12 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
 
 /// Per-root record of a [`ReferenceAnalysis`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-struct RootRecord {
+struct ReferenceRootRecord {
     /// Logical external source, present only for inputs of the analyzed region.
     source: Option<ReferenceSource>,
 
     /// Direct and transitive access modes performed on the root.
-    modes: BTreeSet<ReferenceAccessMode>,
-
-    /// Instruction that consumed the root, if any.
-    consumer: Option<InstructionId>,
+    access_modes: BTreeSet<ReferenceAccessMode>,
 }
 
 /// Resolution of one reference-typed value.
@@ -1115,7 +1122,7 @@ struct ValueRecord {
 /// analysis uses the region's own namespace and retains this result; boundary analysis uses caller identities and
 /// derives a fresh result for each attachment.
 #[derive(Clone, Debug)]
-pub(crate) struct RegionSummary {
+pub(super) struct RegionSummary {
     /// Capture scope the region was analyzed under: the root bound at each capture position, or [`None`] for a
     /// non-reference value.
     scope: Rc<[Option<ReferenceRoot>]>,
@@ -1207,7 +1214,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                 region: region.id(),
                 roots: BTreeMap::new(),
                 values: BTreeMap::new(),
-                accesses: Vec::new(),
+                access_modes: Vec::new(),
                 region_input_bindings: Vec::new(),
                 transitive_accesses: BTreeMap::new(),
                 output_roots: Vec::new(),
@@ -1290,7 +1297,10 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
             });
             let source = is_entry.then(|| ReferenceSource::from_flat_input_index(input_index, self.capture_count));
             let alias = boundary[input_index];
-            self.analysis.roots.entry(root).or_insert_with(|| RootRecord { source, ..RootRecord::default() });
+            self.analysis
+                .roots
+                .entry(root)
+                .or_insert_with(|| ReferenceRootRecord { source, ..ReferenceRootRecord::default() });
             self.analysis.values.insert(value_id(input), ValueRecord { root, narrows: alias.is_some(), alias });
         }
 
@@ -1407,11 +1417,45 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                             root,
                         });
                     }
-                    self.validate_consumption(name, id, region_id, root)?;
+                    // Consumption is restricted to the region that owns the reference. Entry inputs are
+                    // borrowed unless ownership was explicitly transferred; captures always remain borrowed.
+                    match root {
+                        ReferenceRoot::Allocation { instruction: allocation, .. }
+                            if allocation.region() == region_id => {}
+                        // Ownership transferred at the entry boundary permits consumption only in the entry
+                        // region itself, not in an attached region that receives the reference.
+                        ReferenceRoot::RegionInput { region: root_region, input_index }
+                            if root_region == self.entry.id()
+                                && region_id == root_region
+                                && input_index >= self.capture_count
+                                && self.consumable_inputs.contains(&input_index) => {}
+                        ReferenceRoot::RegionInput { region: root_region, input_index }
+                            if root_region == self.entry.id() =>
+                        {
+                            return Err(ReferenceAnalysisError::ExternalReferenceConsumption {
+                                operation: name,
+                                instruction: id,
+                                root,
+                                external_source: ReferenceSource::from_flat_input_index(
+                                    input_index,
+                                    self.capture_count,
+                                ),
+                            });
+                        }
+                        // Other roots belong to another region or an external constant, so this region has
+                        // no authority to consume them.
+                        _ => {
+                            return Err(ReferenceAnalysisError::ConsumptionOutsideCreationScope {
+                                operation: name,
+                                instruction: id,
+                                region: region_id,
+                                root,
+                            });
+                        }
+                    }
                     consumed.insert(root, id);
-                    self.analysis.roots.entry(root).or_default().consumer = Some(id);
                 }
-                self.analysis.accesses.push(ReferenceAccess { instruction: id, input_index, root, mode });
+                self.analysis.access_modes.push(ReferenceAccess { instruction: id, input_index, root, mode });
                 self.record_mode(id, root, mode, &mut summary);
             }
 
@@ -1434,7 +1478,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
             for output_index in effects.allocation_output_indices() {
                 let atom = classified_output(output_index)?;
                 let root = ReferenceRoot::Allocation { instruction: id, output_index };
-                self.analysis.roots.insert(root, RootRecord::default());
+                self.analysis.roots.insert(root, ReferenceRootRecord::default());
                 self.analysis.values.insert(value_id(atom), ValueRecord { root, narrows: false, alias: None });
             }
             for alias in effects.reference_aliases() {
@@ -1723,9 +1767,18 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
         Ok(summary)
     }
 
-    /// Returns the resolution of the reference-typed `value`, or the [`ReferenceAnalysisError::UnresolvedReference`]
-    /// naming the instruction input that expected a reference.
-    #[inline]
+    // TODO(eaplatanios): Review up to here.
+
+    /// Looks up the reference root, view status, and alias information already recorded for `value` by this traversal.
+    /// If no record exists, returns [`ReferenceAnalysisError::UnresolvedReference`] identifying the instruction input
+    /// that requires the reference. This function does not analyze or create a record for the value.
+    ///
+    /// # Parameters
+    ///
+    ///   - `value`: Identifier of the value whose reference information is needed.
+    ///   - `operation`: Name of the operation requiring the reference, used in the error diagnostic.
+    ///   - `instruction`: Instruction containing the input that requires the reference.
+    ///   - `input_index`: Position of that input in the instruction's input list.
     fn resolve(
         &self,
         value: ValueId,
@@ -1740,39 +1793,6 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
         })
     }
 
-    /// Rejects consumption outside an allocation's creation region, unless the entry boundary explicitly transfers
-    /// ownership of that input to the entry region. This exception does not transfer ownership to attached regions.
-    fn validate_consumption(
-        &self,
-        operation: &'static str,
-        instruction: InstructionId,
-        region: RegionId,
-        root: ReferenceRoot,
-    ) -> Result<(), ReferenceAnalysisError> {
-        match root {
-            ReferenceRoot::Allocation { instruction: allocation, .. } if allocation.region() == region => Ok(()),
-            ReferenceRoot::RegionInput { region: root_region, input_index }
-                if root_region == self.entry.id()
-                    && region == root_region
-                    && input_index >= self.capture_count
-                    && self.consumable_inputs.contains(&input_index) =>
-            {
-                Ok(())
-            }
-            ReferenceRoot::RegionInput { region: root_region, input_index } if root_region == self.entry.id() => {
-                Err(ReferenceAnalysisError::ExternalReferenceConsumption {
-                    operation,
-                    instruction,
-                    root,
-                    external_source: ReferenceSource::from_flat_input_index(input_index, self.capture_count),
-                })
-            }
-            _ => Err(ReferenceAnalysisError::ConsumptionOutsideCreationScope { operation, instruction, region, root }),
-        }
-    }
-
-    // TODO(eaplatanios): Review up to here.
-
     /// Records that `instruction` performs accesses `root` in `mode` [`ReferenceAccessMode`], directly or transitively.
     fn record_mode(
         &mut self,
@@ -1781,7 +1801,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
         mode: ReferenceAccessMode,
         summary: &mut RegionSummary,
     ) {
-        self.analysis.roots.entry(root).or_default().modes.insert(mode);
+        self.analysis.roots.entry(root).or_default().access_modes.insert(mode);
         self.analysis
             .transitive_accesses
             .entry(instruction)
@@ -2525,7 +2545,7 @@ mod tests {
         assert_eq!(analysis.region(), RegionId::new(1));
         assert_eq!(analysis.roots().collect::<Vec<_>>(), vec![k, a, b, c]);
         assert_eq!(
-            analysis.accesses(),
+            analysis.access_modes(),
             &[
                 ReferenceAccess::new(id(1, 3), 0, a, ReferenceAccessMode::Read),
                 ReferenceAccess::new(id(1, 4), 0, b, ReferenceAccessMode::Write),
@@ -2549,7 +2569,7 @@ mod tests {
         let program = build(builder, vec![input]);
         let analysis = ReferenceAnalysis::new(program.entry_region_ref(), Some(0), false, &[]).unwrap();
         assert_eq!(analysis.roots().count(), 0);
-        assert_eq!(analysis.accesses(), &[]);
+        assert_eq!(analysis.access_modes(), &[]);
         assert_eq!(analysis.output_roots(), &[None]);
     }
 
@@ -2627,7 +2647,7 @@ mod tests {
             &[ReferenceRegionInputBinding::new(id(1, 0), 0, value(0, 0), a, false)]
         );
         assert_eq!(
-            analysis.accesses(),
+            analysis.access_modes(),
             &[
                 ReferenceAccess::new(id(0, 0), 0, k, ReferenceAccessMode::Write),
                 ReferenceAccess::new(id(0, 1), 0, k, ReferenceAccessMode::Read),
@@ -2638,7 +2658,7 @@ mod tests {
             &BTreeMap::from([(a, BTreeSet::from([ReferenceAccessMode::Read, ReferenceAccessMode::Write]))]),
         );
         assert_eq!(
-            analysis.access_modes(a).collect::<Vec<_>>(),
+            analysis.access_modes_for(a).collect::<Vec<_>>(),
             vec![ReferenceAccessMode::Read, ReferenceAccessMode::Write]
         );
     }
@@ -2783,9 +2803,8 @@ mod tests {
         let analysis = program.reference_analysis(0).unwrap();
         let local = allocation_root(0, 0, 0);
         assert_eq!(analysis.roots().collect::<Vec<_>>(), vec![local]);
-        assert_eq!(analysis.consumer(local), Some(id(0, 2)));
         assert_eq!(
-            analysis.access_modes(local).collect::<Vec<_>>(),
+            analysis.access_modes_for(local).collect::<Vec<_>>(),
             vec![ReferenceAccessMode::Write, ReferenceAccessMode::Consume]
         );
         assert_eq!(analysis.transitive_access(id(1, 0)), None);
@@ -2815,7 +2834,7 @@ mod tests {
         let analysis = program.reference_analysis(0).unwrap();
         let a = input_root(1, 1);
         assert_eq!(
-            analysis.accesses(),
+            analysis.access_modes(),
             &[ReferenceAccess::new(id(0, 0), 0, input_root(0, 0), ReferenceAccessMode::Read)]
         );
         assert_eq!(
@@ -2857,15 +2876,15 @@ mod tests {
             ],
         );
         assert_eq!(
-            analysis.accesses(),
+            analysis.access_modes(),
             &[ReferenceAccess::new(id(0, 0), 0, input_root(0, 1), ReferenceAccessMode::Read)],
         );
         assert_eq!(
             analysis.transitive_access(id(1, 0)).unwrap().access_modes(),
             &BTreeMap::from([(b, BTreeSet::from([ReferenceAccessMode::Read]))]),
         );
-        assert_eq!(analysis.access_modes(b).collect::<Vec<_>>(), vec![ReferenceAccessMode::Read]);
-        assert!(analysis.access_modes(a).next().is_none());
+        assert_eq!(analysis.access_modes_for(b).collect::<Vec<_>>(), vec![ReferenceAccessMode::Read]);
+        assert!(analysis.access_modes_for(a).next().is_none());
         assert_eq!(analysis.output_roots(), &[Some(a)]);
     }
 
@@ -3568,7 +3587,7 @@ mod tests {
         assert_eq!(analysis.root_of(value(2, 7)), Some(external));
         assert_eq!(analysis.alias(value(2, 7)), None);
         assert_eq!(
-            analysis.accesses(),
+            analysis.access_modes(),
             &[
                 ReferenceAccess::new(id(2, 2), 0, captured, ReferenceAccessMode::Read),
                 ReferenceAccess::new(id(2, 3), 0, external, ReferenceAccessMode::Write),
@@ -4000,7 +4019,7 @@ mod tests {
     fn test_reference_analysis_accesses() {
         let (a, b, c, k) = (input_root(1, 0), input_root(1, 1), allocation_root(1, 0, 0), input_root(0, 0));
         assert_eq!(
-            fixture_analysis().accesses(),
+            fixture_analysis().access_modes(),
             &[
                 ReferenceAccess::new(id(1, 3), 0, a, ReferenceAccessMode::Read),
                 ReferenceAccess::new(id(1, 4), 0, b, ReferenceAccessMode::Write),
@@ -4019,20 +4038,20 @@ mod tests {
         // Modes are transitive: `B` gains the callee's read through its binding, while the callee's own input root
         // records only what the callee does directly.
         let analysis = fixture_analysis();
-        assert_eq!(analysis.access_modes(input_root(1, 0)).collect::<Vec<_>>(), vec![ReferenceAccessMode::Read]);
+        assert_eq!(analysis.access_modes_for(input_root(1, 0)).collect::<Vec<_>>(), vec![ReferenceAccessMode::Read]);
         assert_eq!(
-            analysis.access_modes(input_root(1, 1)).collect::<Vec<_>>(),
+            analysis.access_modes_for(input_root(1, 1)).collect::<Vec<_>>(),
             vec![ReferenceAccessMode::Read, ReferenceAccessMode::Write],
         );
         assert_eq!(
-            analysis.access_modes(allocation_root(1, 0, 0)).collect::<Vec<_>>(),
+            analysis.access_modes_for(allocation_root(1, 0, 0)).collect::<Vec<_>>(),
             vec![ReferenceAccessMode::ReadWrite, ReferenceAccessMode::Accumulate, ReferenceAccessMode::Consume],
         );
         assert_eq!(
-            analysis.access_modes(input_root(0, 0)).collect::<Vec<_>>(),
+            analysis.access_modes_for(input_root(0, 0)).collect::<Vec<_>>(),
             vec![ReferenceAccessMode::Read, ReferenceAccessMode::Write],
         );
-        assert_eq!(analysis.access_modes(input_root(1, 2)).count(), 0);
+        assert_eq!(analysis.access_modes_for(input_root(1, 2)).count(), 0);
     }
 
     #[test]
@@ -4125,15 +4144,6 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_analysis_consumer() {
-        let analysis = fixture_analysis();
-        assert_eq!(analysis.consumer(allocation_root(1, 0, 0)), Some(id(1, 8)));
-        assert_eq!(analysis.consumer(input_root(1, 0)), None);
-        assert_eq!(analysis.consumer(input_root(1, 1)), None);
-        assert_eq!(analysis.consumer(input_root(1, 2)), None);
-    }
-
-    #[test]
     fn test_reference_analysis_output_roots() {
         assert_eq!(fixture_analysis().output_roots(), &[None, Some(input_root(1, 1)), None]);
     }
@@ -4144,7 +4154,7 @@ mod tests {
         let analysis = program.reference_analysis(1).unwrap();
         let direct = ReferenceAnalysis::new(program.entry_region_ref(), Some(1), false, &[]).unwrap();
         assert_eq!(analysis.roots().collect::<Vec<_>>(), direct.roots().collect::<Vec<_>>());
-        assert_eq!(analysis.accesses(), direct.accesses());
+        assert_eq!(analysis.access_modes(), direct.access_modes());
         assert_eq!(analysis.region_input_bindings(), direct.region_input_bindings());
         assert_eq!(analysis.output_roots(), direct.output_roots());
         assert_eq!(analysis.external_source(input_root(1, 0)), Some(ReferenceSource::Capture { index: 0 }));
@@ -4198,7 +4208,7 @@ mod tests {
         let retained = program.reference_analysis(0).unwrap();
         assert!(Arc::ptr_eq(&retained, &program.reference_analysis(0).unwrap()));
         assert_eq!(retained.roots().collect::<Vec<_>>(), vec![root]);
-        assert_eq!(retained.access_modes(root).collect::<Vec<_>>(), vec![ReferenceAccessMode::Read]);
+        assert_eq!(retained.access_modes_for(root).collect::<Vec<_>>(), vec![ReferenceAccessMode::Read]);
     }
 
     #[test]
@@ -4434,7 +4444,6 @@ mod tests {
         let program = build(builder, vec![output]);
         let region = program.entry_region_ref();
         let analysis = region.reference_analysis_with_consumable_inputs(0, vec![0]).unwrap();
-        assert_eq!(analysis.consumer(input_root(0, 0)), Some(id(0, 0)));
         assert!(Arc::ptr_eq(&analysis, &region.reference_analysis_with_consumable_inputs(0, vec![0]).unwrap()));
 
         // An ownership-aware cache entry must not satisfy a borrowed-input or capture-boundary request.
