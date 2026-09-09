@@ -1012,7 +1012,7 @@ where
             inputs,
             &deferred_instructions,
             None,
-            Some(region.reference_analysis_with_constants()?.as_ref()),
+            Some(region.reference_analysis_with_configuration(None, true, &[])?.as_ref()),
         )
     }
 
@@ -1057,7 +1057,7 @@ where
             inputs,
             &deferred_instructions,
             None,
-            Some(region.reference_analysis_with_constants()?.as_ref()),
+            Some(region.reference_analysis_with_configuration(None, true, &[])?.as_ref()),
         )?;
 
         // Finalize the residual program and report how its inputs and outputs relate to the original computation.
@@ -2486,7 +2486,8 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
     {
         let input_types = self.input_types();
         check_count!("input", input_known, input_types.len(), ProgramError);
-        let reference_analysis = repeated_residual.then(|| self.reference_analysis_with_constants()).transpose()?;
+        let reference_analysis =
+            repeated_residual.then(|| self.reference_analysis_with_configuration(None, true, &[])).transpose()?;
         let residual_instructions = RefCell::new(Vec::new());
         let mut deferred_instructions = HashSet::new();
         let mut required_known_outputs = required_known_outputs.map(<[usize]>::to_vec);
@@ -2609,7 +2610,7 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
                 })
             {
                 for (index, program) in programs.into_iter().enumerate() {
-                    let analysis = program.entry_region_ref().reference_analysis_with_constants()?;
+                    let analysis = program.entry_region_ref().reference_analysis_with_configuration(None, true, &[])?;
                     let roots = analysis.roots().filter_map(|root| match root {
                         ReferenceRoot::RegionInput { region, input_index } if region == analysis.region() => {
                             if index == 0 {
@@ -3797,7 +3798,7 @@ mod tests {
     fn test_partial_evaluation_context_inline_region_observation_with_reference_analysis() {
         let program = reference_ordering_program();
         let region = program.entry_region_ref();
-        let analysis = region.reference_analysis_with_constants().unwrap();
+        let analysis = region.reference_analysis_with_configuration(None, true, &[]).unwrap();
         let observations = RefCell::new(Vec::new());
         let (known, residual) = replay_reference_ordering_program(region, None, Some(analysis.as_ref()));
         let (observed_known, observed_residual) =
@@ -3815,7 +3816,7 @@ mod tests {
     fn test_partial_evaluation_context_inline_region_observation_preserves_validation() {
         let program = reference_ordering_program();
         let region = program.entry_region_ref();
-        let analysis = region.reference_analysis_with_constants().unwrap();
+        let analysis = region.reference_analysis_with_configuration(None, true, &[]).unwrap();
         let observations = RefCell::new(Vec::new());
         let context = PartialEvaluationContext::new(TracingContext::<TestValue, TestOperation>::new());
 

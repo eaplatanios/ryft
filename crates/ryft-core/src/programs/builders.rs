@@ -209,8 +209,11 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
 
             // Interpret captures using this attachment's explicit capture prefix, rather than assuming that every
             // capture index refers to the caller's inherited table.
-            let analysis = region
-                .reference_analysis_with_capture_scope(operation.region_capture_input_count(output.region_index))?;
+            let analysis = region.reference_analysis_with_configuration(
+                operation.region_capture_input_count(output.region_index),
+                true,
+                &[],
+            )?;
             let resolved = match analysis.output_roots().get(output.output_index).copied().flatten() {
                 Some(ReferenceRoot::RegionInput { region: owner, input_index }) if owner == region.id() => {
                     // Map the region input back to its caller operand. Views preserve allocation identity even

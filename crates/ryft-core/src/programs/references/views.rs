@@ -615,7 +615,7 @@ impl<View> ReferenceViewAnalysis<View> {
         // Implied by `O::View`'s bounds, but the trait solver does not carry them through the projection equality.
         View: ReferenceView,
     {
-        let analysis = region.reference_analysis_with_arguments(arguments)?;
+        let analysis = region.reference_analysis_impl(arguments)?;
         let mut paths = BTreeMap::new();
         analysis.values().try_for_each(|value| Self::derive_path(region, &analysis, &mut paths, value))?;
         // A shared region has one path per input, but each attachment supplies its own view description and

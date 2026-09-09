@@ -633,7 +633,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
         consumable_input_indices: Vec<usize>,
     ) -> Result<Self, ProgramError> {
         let analysis = if region.contains_references_in_closure() {
-            Some(region.reference_analysis_with_consumable_inputs(0, consumable_input_indices)?)
+            Some(region.reference_analysis_with_configuration(Some(0), false, &consumable_input_indices)?)
         } else {
             None
         };

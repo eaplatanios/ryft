@@ -1764,7 +1764,7 @@ impl<V: Value<Type: DifferentiableType>, O: Operation<Type = V::Type>> RegionRef
         let has_reference_outputs =
             self.output_ids().iter().any(|output| self.atoms()[output.index()].r#type().is_reference());
         let analysis = has_reference_outputs
-            .then(|| self.reference_analysis_with_constants())
+            .then(|| self.reference_analysis_with_configuration(None, true, &[]))
             .transpose()
             .map_err(ProgramError::from)?;
         self.output_ids()
@@ -2442,7 +2442,7 @@ where
         if !self.output_ids().iter().any(|output| self.atoms()[output.index()].r#type().is_reference()) {
             return Ok(());
         }
-        let analysis = self.reference_analysis_with_constants().map_err(ProgramError::from)?;
+        let analysis = self.reference_analysis_with_configuration(None, true, &[]).map_err(ProgramError::from)?;
         for (output_index, output_atom) in self.output_ids().iter().copied().enumerate() {
             if analysis.is_view(ValueId::new(self.id(), output_atom)) {
                 return Err(ProgramError::UnsupportedOperation {

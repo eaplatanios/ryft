@@ -43,7 +43,7 @@
 //! establishes a fresh scope from its first `n` inputs. A reference-typed constant resolves to the root bound
 //! at its capture position, so a capture root is the same root in every region that inherits the scope.
 //!
-//! [`RegionRef::reference_analysis_with_constants`] analyzes an open region before its inherited captures are lifted.
+//! [`RegionRef::reference_analysis_with_configuration`] analyzes an open region before its inherited captures are lifted.
 //! It assigns external constant roots to unresolved inherited capture indices and concrete reference allocations.
 //! Explicitly rebound capture scopes remain strict, including an empty prefix. The cache separates this mode from
 //! strict capture-lifted analysis so a successful open region analysis cannot hide a missing capture in a closed one.
@@ -387,7 +387,7 @@ impl From<ReferenceAnalysisError> for ProgramError {
 
 /// Canonical reference root that a reference-typed value denotes that can be a [`Region`] input, an
 /// [`Instruction`](crate::Instruction)'s fresh allocation, or an external constant when analyzing an open region
-/// with [`RegionRef::reference_analysis_with_constants`]. [`ReferenceRoot`]s are region-relative meaning that their
+/// with [`RegionRef::reference_analysis_with_configuration`]. [`ReferenceRoot`]s are region-relative meaning that their
 /// namespace is the region containing their defining input, instruction, or constant. The derived ordering (i.e.,
 /// region inputs, allocations, then constants, each by region and position) is deterministic and independent of any
 /// hash map iteration order.
@@ -858,7 +858,7 @@ impl ReferenceAnalysis {
             })
             .collect::<Rc<[Option<ReferenceRoot>]>>();
         let constant_scope = (resolve_constants && capture_scope.is_none()).then(|| Rc::clone(&scope));
-        let traversal = Traversal::new(region, capture_count, consumable_inputs, constant_scope, resolve_constants);
+        let traversal = Traversal::new(region, capture_count, constant_scope, resolve_constants, consumable_inputs);
         let (analysis, _) = traversal.analyze(scope, None)?;
         Ok(analysis)
     }
@@ -982,7 +982,7 @@ impl ReferenceAnalysis {
         captures: &[Option<ReferenceRoot>],
         capture_count: usize,
     ) -> Result<RegionSummary, ReferenceAnalysisError> {
-        let traversal = Traversal::new(region, capture_count, &[], None, false);
+        let traversal = Traversal::new(region, capture_count, None, false, &[]);
         let (_, summary) = traversal.analyze(captures.into(), Some(inputs))?;
         Ok(summary)
     }
@@ -991,9 +991,9 @@ impl ReferenceAnalysis {
 // TODO(eaplatanios): Review from this point onwards.
 
 impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
-    /// Returns the [`ReferenceAnalysis`] of this [`Region`]'s closure, retained in the region's transform cache so
-    /// that kernel validation and transform rules consulting the same closure share one analysis. Discharge shares
-    /// the traversal through a separate uncached entry point that supplies its boundary identities.
+    /// Returns the [`ReferenceAnalysis`] of this [`Region`]'s closure, retained in the region's transform cache so that
+    /// kernel validation and transform rules consulting the same closure share one analysis. Discharge shares the
+    /// traversal through a separate uncached entry point that supplies its boundary identities.
     /// The analysis is a pure structural function of the closure and `capture_count`, because reference-typed capture
     /// constants resolve through [`Value::capture_index`], and it is keyed by the closure's region identifiers as
     /// well, so a topology-preserving import that renumbers regions derives its own entry instead of being served
@@ -1008,57 +1008,55 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     /// Returns the [`ReferenceAnalysisError`] naming the first violated rule in program order. A failed analysis is
     /// not retained.
     pub fn reference_analysis(self, capture_count: usize) -> Result<Arc<ReferenceAnalysis>, ReferenceAnalysisError> {
-        self.reference_analysis_with_arguments(&ReferenceAnalysisTransformArguments::new(
-            self,
-            Vec::new(),
-            Some(capture_count),
-            false,
-        ))
+        self.reference_analysis_with_configuration(Some(capture_count), false, &[])
     }
 
-    /// Analyzes an open computation region whose inherited captures have not been lifted into an input prefix.
-    /// Uses the canonical traversal, preserving view, lifetime, and nested-boundary validation. External constants
-    /// remain distinguishable from explicit inputs, which lets transforms propagate input activity correctly.
-    /// Concrete allocations and inherited capture indices are canonicalized independently. Explicit capture scopes
-    /// declared by nested operations still bind only their declared input prefix, including an explicitly empty scope.
+    /// Returns the cached [`ReferenceAnalysis`] of this region's computation closure using the specified capture,
+    /// constant, and ownership rules. All three settings participate in the cache key, so analyses with different
+    /// boundary contracts cannot reuse one another's results. Refer to [`Self::reference_analysis`] for the remaining
+    /// cache semantics and to [`ReferenceAnalysis`] for the validation rules.
+    ///
+    /// For example, `(None, true, &[])` analyzes an open region before inherited captures are lifted into inputs.
+    /// Unbound inherited captures and concrete reference allocations become external constant roots, distinct from
+    /// explicit inputs. `(Some(0), false, &[0])` instead analyzes a region without captures whose caller transfers
+    /// ownership of input zero, allowing that reference to be consumed in this region.
+    ///
+    /// # Parameters
+    ///
+    ///   - `capture_scope`: Number of leading region inputs that bind lifted captures, or `None` for inherited
+    ///     captures. `Some(0)` declares an explicitly empty scope; it does not permit unresolved capture indices.
+    ///   - `resolve_constants`: Whether concrete reference constants may become external roots. When `capture_scope`
+    ///     is `None`, unbound inherited capture constants may also become external roots. Concrete allocations and
+    ///     capture indices are canonicalized independently. Explicit scopes declared by nested operations remain
+    ///     strict, including an explicitly empty scope.
+    ///   - `consumable_input_indices`: Positions in this region's full input list whose reference ownership the caller
+    ///     transfers to the region. These references may be consumed directly here, but not through a view or inside
+    ///     an attached region. Captures remain borrowed even when their indices are listed.
     ///
     /// # Errors
     ///
-    /// Returns the first reference-analysis error in program order. Unbound inherited captures are represented as
-    /// [`ReferenceRoot::Constant`], while an invalid capture index inside an explicitly rebound scope remains an error.
-    pub fn reference_analysis_with_constants(self) -> Result<Arc<ReferenceAnalysis>, ReferenceAnalysisError> {
-        self.reference_analysis_with_capture_scope(None)
-    }
-
-    /// Runs constant-aware analysis with the explicit capture prefix declared by an attaching operation, or with
-    /// inherited captures when the operation declares no prefix. Concrete reference constants remain external roots.
-    pub(crate) fn reference_analysis_with_capture_scope(
+    /// Returns the first [`ReferenceAnalysisError`] in program order. Failed analyses are not retained.
+    pub fn reference_analysis_with_configuration(
         self,
         capture_scope: Option<usize>,
+        resolve_constants: bool,
+        consumable_input_indices: &[usize],
     ) -> Result<Arc<ReferenceAnalysis>, ReferenceAnalysisError> {
-        let arguments = ReferenceAnalysisTransformArguments::new(self, Vec::new(), capture_scope, true);
-        self.reference_analysis_with_arguments(&arguments)
-    }
-
-    /// Analyzes a region whose caller transfers ownership of the listed input references to it. Those inputs may
-    /// be consumed directly in this region; consumption through a view or inside an attached region remains invalid.
-    /// Captures remain borrowed even if listed in `consumable_inputs`. The ownership list participates in the cache
-    /// key so this analysis cannot bypass validation for callers using the default borrowed-input contract.
-    pub(crate) fn reference_analysis_with_consumable_inputs(
-        self,
-        capture_count: usize,
-        consumable_inputs: Vec<usize>,
-    ) -> Result<Arc<ReferenceAnalysis>, ReferenceAnalysisError> {
-        let arguments = ReferenceAnalysisTransformArguments::new(self, consumable_inputs, Some(capture_count), false);
-        self.reference_analysis_with_arguments(&arguments)
+        let arguments = ReferenceAnalysisTransformArguments::new(
+            self,
+            consumable_input_indices.to_vec(),
+            capture_scope,
+            resolve_constants,
+        );
+        self.reference_analysis_impl(&arguments)
     }
 
     /// Returns the [`ReferenceAnalysis`] of this [`Region`]'s closure under the already-derived cache key `arguments`.
     /// Refer to the documentation of [`reference_analysis`](Self::reference_analysis) for the analysis and its cache
-    /// identity. Overlays derived from the analysis under the same key (e.g., the retained
+    /// identity. Analyses derived from these facts under the same key (e.g., the retained
     /// [`ReferenceViewAnalysis`](crate::programs::references::ReferenceViewAnalysis)) call this so that the closure is
     /// walked once per derivation rather than once more to rebuild the key.
-    pub(crate) fn reference_analysis_with_arguments(
+    pub(super) fn reference_analysis_impl(
         self,
         arguments: &ReferenceAnalysisTransformArguments,
     ) -> Result<Arc<ReferenceAnalysis>, ReferenceAnalysisError> {
@@ -1080,6 +1078,8 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     }
 }
 
+// TODO(eaplatanios): Review up to here.
+
 impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Parameterized<V>>
     Program<V, O, Input, Output>
 {
@@ -1095,7 +1095,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     }
 }
 
-/// Per-root record of a [`ReferenceAnalysis`].
+/// Per-[`ReferenceRoot`] record of a [`ReferenceAnalysis`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct ReferenceRootRecord {
     /// Logical external source, present only for inputs of the analyzed region.
@@ -1118,98 +1118,95 @@ struct ValueRecord {
     alias: Option<ReferenceAliasEdge>,
 }
 
-/// Result of analyzing one region, with nested accesses and materialization requirements included. Structural
-/// analysis uses the region's own namespace and retains this result; boundary analysis uses caller identities and
-/// derives a fresh result for each attachment.
+/// Result of analyzing one region, with nested accesses and materialization requirements included. Structural analysis
+/// uses the region's own namespace and retains this result. Boundary analysis uses caller identities and derives a
+/// fresh result for each attachment.
 #[derive(Clone, Debug)]
 pub(super) struct RegionSummary {
-    /// Capture scope the region was analyzed under: the root bound at each capture position, or [`None`] for a
-    /// non-reference value.
-    scope: Rc<[Option<ReferenceRoot>]>,
+    /// Capture scope the region was analyzed under which is set to the root bound at each capture position,
+    /// or [`None`] for a non-reference value.
+    pub(super) scope: Rc<[Option<ReferenceRoot>]>,
 
     /// Alias edge for each region input that the attaching instruction creates as a view, or [`None`] for a
-    /// non-reference value or a forwarded complete-value handle. Only their shape (i.e., which inputs are views) is
+    /// non-reference value or a forwarded complete value handle. Only their shape (i.e., which inputs are views) is
     /// independent of the attaching instruction, so that is what later attachments of a shared region are checked
     /// against.
-    boundary: Rc<[Option<ReferenceAliasEdge>]>,
+    pub(super) boundary: Rc<[Option<ReferenceAliasEdge>]>,
 
     /// Direct and transitive access modes per root, including the region's local allocations.
     pub(super) accesses: BTreeMap<ReferenceRoot, BTreeSet<ReferenceAccessMode>>,
 
-    /// Roots needed when replay materializes instruction inputs or region outputs, including inherited captures.
-    /// Collected only for boundary summaries; cached structural analysis does not use this set. Materialization
-    /// alone is not a semantic reference access.
+    /// Reference roots needed when replay materializes instruction inputs or region outputs, including inherited
+    /// captures. Collected only for boundary summaries; cached structural analysis does not use this set.
+    /// Materialization alone is not a semantic reference access.
     pub(super) reached: BTreeSet<ReferenceRoot>,
 
     /// Root and narrowing of each region output, or [`None`] for value outputs.
     pub(super) outputs: Vec<Option<(ReferenceRoot, bool)>>,
 }
 
-/// One attachment of a nested region, as seen from the attaching instruction.
-struct AttachedRegion {
-    /// Attached region.
-    id: RegionId,
-
-    /// Caller root entering through each region input, or [`None`] for value inputs.
-    entering: Vec<Option<ReferenceRoot>>,
-
-    /// Root and narrowing of each region output, in the nested namespace.
-    outputs: Vec<Option<(ReferenceRoot, bool)>>,
-}
-
-/// Mutable state of one [`ReferenceAnalysis::new`] traversal.
+/// Mutable state backing a single [`ReferenceAnalysis::new`] traversal.
 struct Traversal<'r, V: Value, O: Operation<Type = V::Type>> {
-    /// Analyzed region, whose inputs are the external roots.
+    /// Borrowed analyzed region, whose inputs are the external roots.
     entry: RegionRef<'r, V, O>,
 
-    /// Number of leading analyzed-region inputs that originate in a lifted capture table.
+    /// Number of leading analyzed region inputs that originate in a lifted capture table.
     capture_count: usize,
 
-    /// Entry input indices that may be consumed directly in the entry region, excluding lifted captures.
-    consumable_inputs: Vec<usize>,
-
-    /// Original inherited scope when constants can be resolved before capture lifting.
+    /// Capture scope in which unbound capture constants may become external reference roots. Present only when
+    /// analyzing an open region with constant resolution enabled and no explicit capture bindings. Nested regions that
+    /// inherit this scope share its [`Rc`] identity and retain that permission. Regions declaring their own capture
+    /// bindings receive a different scope and must resolve captures through those bindings, even when both scopes
+    /// contain the same roots. [`None`] disables this exception for unbound captures.
     constant_scope: Option<Rc<[Option<ReferenceRoot>]>>,
 
     /// Whether concrete reference constants can be resolved regardless of the active capture scope.
     resolve_constants: bool,
 
-    /// Canonical representatives for inherited capture indices and concrete allocation identities.
-    constant_roots: HashMap<(Option<usize>, Option<ReferenceId>), ReferenceRoot>,
+    /// Entry input indices that may be consumed directly in the entry region, excluding lifted captures.
+    consumable_inputs: Vec<usize>,
 
-    /// Analysis being accumulated.
+    /// [`ReferenceAnalysis`] that is being constructed/accumulated.
     analysis: ReferenceAnalysis,
+
+    /// Maps external references encountered as constants to the first [`ReferenceRoot::Constant`] recorded for them.
+    /// An unbound capture uses `(Some(capture_index), None)` within the inherited scope identified by `constant_scope`.
+    /// A concrete reference without a capture index uses `(None, Some(reference_id))`. Constants resolved through
+    /// active capture bindings already have roots and do not need entries here. Reusing the first root makes distinct
+    /// constant atoms that name the same capture slot or concrete reference share a root, including across nested
+    /// regions. For example, two constants naming inherited capture slot `2` must not be analyzed as independent
+    /// references merely because they have different atom identifiers.
+    constant_roots: HashMap<(Option<usize>, Option<ReferenceId>), ReferenceRoot>,
 
     /// Summaries of the regions analyzed so far, so shared regions are analyzed once.
     summaries: HashMap<RegionId, RegionSummary>,
 }
 
 impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
-    /// Creates an empty traversal. Entry input ownership is independent of whether boundary bindings are supplied.
+    /// Creates a new empty [`Traversal`].
     ///
     /// # Parameters
     ///
     ///   - `region`: Entry region whose computation closure will be analyzed.
     ///   - `capture_count`: Number of leading entry inputs originating in a lifted capture table.
-    ///   - `consumable_inputs`: Entry input indices whose reference ownership is transferred to the region.
     ///   - `constant_scope`: Original inherited capture scope when resolving constants before capture lifting.
     ///     This must share its [`Rc`] identity with the scope supplied to the initial traversal, so nested scopes
     ///     with equal contents can still be distinguished from the inherited scope. Use [`None`] otherwise.
     ///   - `resolve_constants`: Whether concrete reference constants may resolve independently of capture bindings.
+    ///   - `consumable_inputs`: Entry input indices whose reference ownership is transferred to the region.
     fn new(
         region: RegionRef<'r, V, O>,
         capture_count: usize,
-        consumable_inputs: &[usize],
         constant_scope: Option<Rc<[Option<ReferenceRoot>]>>,
         resolve_constants: bool,
+        consumable_inputs: &[usize],
     ) -> Self {
         Self {
             entry: region,
             capture_count,
-            consumable_inputs: consumable_inputs.to_vec(),
             constant_scope,
             resolve_constants,
-            constant_roots: HashMap::new(),
+            consumable_inputs: consumable_inputs.to_vec(),
             analysis: ReferenceAnalysis {
                 region: region.id(),
                 roots: BTreeMap::new(),
@@ -1219,11 +1216,10 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                 transitive_accesses: BTreeMap::new(),
                 output_roots: Vec::new(),
             },
+            constant_roots: HashMap::new(),
             summaries: HashMap::new(),
         }
     }
-
-    // TODO(eaplatanios): Review up to here.
 
     /// Consumes this traversal, starting [`visit_region`](Self::visit_region) from the entry region supplied at
     /// construction. Returns the accumulated [`ReferenceAnalysis`] and the entry region's [`RegionSummary`].
@@ -1863,6 +1859,18 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
             .insert(mode);
         summary.accesses.entry(root).or_default().insert(mode);
     }
+}
+
+/// One attachment of a nested region, as seen from the attaching instruction.
+struct AttachedRegion {
+    /// Attached region.
+    id: RegionId,
+
+    /// Caller root entering through each region input, or [`None`] for value inputs.
+    entering: Vec<Option<ReferenceRoot>>,
+
+    /// Root and narrowing of each region output, in the nested namespace.
+    outputs: Vec<Option<(ReferenceRoot, bool)>>,
 }
 
 /// [`Region`] [`Transform`] marker for retained [`ReferenceAnalysis`] artifacts.
@@ -4304,19 +4312,19 @@ mod tests {
         assert!(Arc::ptr_eq(&source.entry_region_ref().reference_analysis(0).unwrap(), &retained));
     }
     #[test]
-    fn test_region_ref_reference_analysis_with_constants() {
+    fn test_region_ref_reference_analysis_with_configuration() {
         let mut builder = TestBuilder::new();
         let captured = builder.add_constant(capture(4, 0));
         let repeated = builder.add_constant(capture(4, 0));
         let view = builder.add_instruction(TestOperation::View, Vec::new(), vec![captured], None).unwrap()[0];
         let program = build(builder, vec![view]);
         let region = program.entry_region_ref();
-        let analysis = region.reference_analysis_with_constants().unwrap();
+        let analysis = region.reference_analysis_with_configuration(None, true, &[]).unwrap();
         let root = ReferenceRoot::Constant { value: ValueId::new(region.id(), captured) };
         assert_eq!(analysis.root_of(ValueId::new(region.id(), repeated)), Some(root));
         assert_eq!(analysis.output_roots(), &[Some(root)]);
         assert!(analysis.is_view(ValueId::new(region.id(), view)));
-        assert!(Arc::ptr_eq(&analysis, &region.reference_analysis_with_constants().unwrap()));
+        assert!(Arc::ptr_eq(&analysis, &region.reference_analysis_with_configuration(None, true, &[]).unwrap()));
         assert!(matches!(
             region.reference_analysis(0),
             Err(ReferenceAnalysisError::InvalidReferenceCapture { capture_index: 4, capture_count: 0, .. })
@@ -4324,7 +4332,7 @@ mod tests {
     }
 
     #[test]
-    fn test_region_ref_reference_analysis_with_constants_preserves_nested_view_validation() {
+    fn test_region_ref_reference_analysis_with_configuration_preserves_nested_view_validation() {
         let mut child_builder = TestBuilder::new();
         let captured = child_builder.add_constant(capture(7, 0));
         let view = child_builder.add_instruction(TestOperation::View, Vec::new(), vec![captured], None).unwrap()[0];
@@ -4337,7 +4345,7 @@ mod tests {
         let program = build(builder, vec![output]);
         let region = program.entry_region_ref();
         assert_eq!(
-            region.reference_analysis_with_constants(),
+            region.reference_analysis_with_configuration(None, true, &[]),
             Err(ReferenceAnalysisError::ViewCrossesRegionBoundary {
                 operation: "test.call",
                 instruction: InstructionId::new(region.id(), 0),
@@ -4349,7 +4357,7 @@ mod tests {
     }
 
     #[test]
-    fn test_region_ref_reference_analysis_with_constants_keeps_explicit_capture_scopes_strict() {
+    fn test_region_ref_reference_analysis_with_configuration_keeps_explicit_capture_scopes_strict() {
         let mut child_builder = TestBuilder::new();
         child_builder.add_input(value_type(0));
         let captured = child_builder.add_constant(capture(0, 0));
@@ -4364,7 +4372,7 @@ mod tests {
             .unwrap()[0];
         let program = build(builder, vec![output]);
         assert_eq!(
-            program.entry_region_ref().reference_analysis_with_constants(),
+            program.entry_region_ref().reference_analysis_with_configuration(None, true, &[]),
             Err(ReferenceAnalysisError::InvalidReferenceCapture {
                 region: child,
                 atom: AtomId::new(1),
@@ -4374,7 +4382,7 @@ mod tests {
         );
         let child_region = program.region_ref(child).unwrap();
         assert_eq!(
-            child_region.reference_analysis_with_capture_scope(Some(1)),
+            child_region.reference_analysis_with_configuration(Some(1), true, &[]),
             Err(ReferenceAnalysisError::InvalidReferenceCapture {
                 region: child,
                 atom: AtomId::new(1),
@@ -4382,7 +4390,7 @@ mod tests {
                 capture_count: 1
             })
         );
-        let analysis = child_region.reference_analysis_with_constants().unwrap();
+        let analysis = child_region.reference_analysis_with_configuration(None, true, &[]).unwrap();
         assert_eq!(
             analysis.root_of(ValueId::new(child, AtomId::new(1))),
             Some(ReferenceRoot::Constant { value: ValueId::new(child, AtomId::new(1)) })
@@ -4390,7 +4398,7 @@ mod tests {
     }
 
     #[test]
-    fn test_region_ref_reference_analysis_with_constants_distinguishes_open_and_empty_capture_scopes() {
+    fn test_region_ref_reference_analysis_with_configuration_distinguishes_open_and_empty_capture_scopes() {
         let mut child = TestBuilder::new();
         let captured = child.add_constant(capture(0, 0));
         let output = child.add_instruction(TestOperation::Read, Vec::new(), vec![captured], None).unwrap()[0];
@@ -4404,7 +4412,7 @@ mod tests {
         // An inherited open scope accepts unresolved captures; an explicitly empty capture boundary forbids them.
         // Reusing the first attachment's analysis for the second would erase that distinction.
         assert_eq!(
-            program.entry_region_ref().reference_analysis_with_constants(),
+            program.entry_region_ref().reference_analysis_with_configuration(None, true, &[]),
             Err(ReferenceAnalysisError::InvalidCaptureScope {
                 region: child,
                 message: "shared region is reached under two different capture scopes".to_string(),
@@ -4413,21 +4421,21 @@ mod tests {
     }
 
     #[test]
-    fn test_region_ref_reference_analysis_with_constants_has_separate_cache_entries() {
+    fn test_region_ref_reference_analysis_with_configuration_has_separate_cache_entries() {
         let mut builder = TestBuilder::new();
         let input = builder.add_input(reference_type(0));
         let program = build(builder, vec![input]);
         let region = program.entry_region_ref();
         let strict = region.reference_analysis(0).unwrap();
-        let open = region.reference_analysis_with_constants().unwrap();
+        let open = region.reference_analysis_with_configuration(None, true, &[]).unwrap();
         assert_eq!(strict, open);
         assert!(!Arc::ptr_eq(&strict, &open));
         assert!(Arc::ptr_eq(&strict, &region.reference_analysis(0).unwrap()));
-        assert!(Arc::ptr_eq(&open, &region.reference_analysis_with_constants().unwrap()));
+        assert!(Arc::ptr_eq(&open, &region.reference_analysis_with_configuration(None, true, &[]).unwrap()));
     }
 
     #[test]
-    fn test_region_ref_reference_analysis_with_constants_unifies_concrete_allocations() {
+    fn test_region_ref_reference_analysis_with_configuration_unifies_concrete_allocations() {
         // Unlike the array IR, this third-party constant family admits concrete reference handles. The canonical
         // analysis must therefore unify its runtime allocations independently of inherited capture indices.
         /// Concrete reference constant family used to test runtime allocation canonicalization.
@@ -4477,25 +4485,25 @@ mod tests {
             )
             .unwrap();
         let region = program.entry_region_ref();
-        let analysis = region.reference_analysis_with_constants().unwrap();
+        let analysis = region.reference_analysis_with_configuration(None, true, &[]).unwrap();
         let root = ReferenceRoot::Constant { value: ValueId::new(region.id(), first) };
         assert_eq!(analysis.output_roots(), &[Some(root), Some(root)]);
         assert_eq!(analysis.roots().collect::<Vec<_>>(), vec![root]);
         assert_eq!(
-            region.reference_analysis_with_capture_scope(Some(0)).unwrap().output_roots(),
+            region.reference_analysis_with_configuration(Some(0), true, &[]).unwrap().output_roots(),
             &[Some(root), Some(root)],
         );
     }
 
     #[test]
-    fn test_region_ref_reference_analysis_with_consumable_inputs() {
+    fn test_region_ref_reference_analysis_with_configuration_transfers_input_ownership() {
         let mut builder = TestBuilder::new();
         let reference = builder.add_input(reference_type(0));
         let output = builder.add_instruction(TestOperation::Consume, Vec::new(), vec![reference], None).unwrap()[0];
         let program = build(builder, vec![output]);
         let region = program.entry_region_ref();
-        let analysis = region.reference_analysis_with_consumable_inputs(0, vec![0]).unwrap();
-        assert!(Arc::ptr_eq(&analysis, &region.reference_analysis_with_consumable_inputs(0, vec![0]).unwrap()));
+        let analysis = region.reference_analysis_with_configuration(Some(0), false, &[0]).unwrap();
+        assert!(Arc::ptr_eq(&analysis, &region.reference_analysis_with_configuration(Some(0), false, &[0]).unwrap()));
 
         // An ownership-aware cache entry must not satisfy a borrowed-input or capture-boundary request.
         assert!(matches!(
@@ -4506,7 +4514,7 @@ mod tests {
             })
         ));
         assert!(matches!(
-            region.reference_analysis_with_consumable_inputs(1, vec![0]),
+            region.reference_analysis_with_configuration(Some(1), false, &[0]),
             Err(ReferenceAnalysisError::ExternalReferenceConsumption {
                 external_source: ReferenceSource::Capture { index: 0 },
                 ..
@@ -4520,8 +4528,25 @@ mod tests {
         let output = builder.add_instruction(TestOperation::Call, vec![callee], vec![reference], None).unwrap()[0];
         let program = build(builder, vec![output]);
         assert!(matches!(
-            program.entry_region_ref().reference_analysis_with_consumable_inputs(0, vec![0]),
+            program.entry_region_ref().reference_analysis_with_configuration(Some(0), false, &[0]),
             Err(ReferenceAnalysisError::ConsumptionOutsideCreationScope { operation: "test.consume", .. })
         ));
+    }
+
+    #[test]
+    fn test_region_ref_reference_analysis_with_configuration_combines_constants_and_input_ownership() {
+        let mut builder = TestBuilder::new();
+        let reference = builder.add_input(reference_type(0));
+        let captured = builder.add_constant(capture(4, 0));
+        let read = builder.add_instruction(TestOperation::Read, Vec::new(), vec![captured], None).unwrap()[0];
+        let consumed = builder.add_instruction(TestOperation::Consume, Vec::new(), vec![reference], None).unwrap()[0];
+        let program = build(builder, vec![read, consumed]);
+        let region = program.entry_region_ref();
+        let analysis = region.reference_analysis_with_configuration(None, true, &[0]).unwrap();
+        let captured_root = ReferenceRoot::Constant { value: ValueId::new(region.id(), captured) };
+        assert_eq!(analysis.root_of(ValueId::new(region.id(), captured)), Some(captured_root));
+        assert_eq!(analysis.access_modes_for(captured_root).collect::<Vec<_>>(), vec![ReferenceAccessMode::Read]);
+        assert_eq!(analysis.access_modes_for(input_root(0, 0)).collect::<Vec<_>>(), vec![ReferenceAccessMode::Consume],);
+        assert_eq!(analysis.output_roots(), &[None, None]);
     }
 }
