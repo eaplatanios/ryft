@@ -8,9 +8,7 @@ pub mod encoding;
 pub mod ir;
 pub mod macros;
 pub mod operations;
-pub mod reference_analysis;
-pub mod reference_discharge;
-pub mod reference_views;
+pub mod references;
 pub mod sharding;
 pub mod types;
 
@@ -37,10 +35,9 @@ pub use operations::{
     REFERENCE_INDEX_OPERATION_NAME, REFERENCE_SLICE_OPERATION_NAME, ReferenceIndex, ReferenceIndexOperation,
     ReferenceSlice, ReferenceSliceOperation, reapply_array_reference_view, validate_array_reference_view,
 };
-pub use reference_analysis::{ArrayReferenceAnalysis, ArrayReferenceAnalysisError};
-pub use reference_discharge::ArrayReferenceDischarge;
-pub use reference_views::{
-    ArrayReference, ArrayReferenceView, ArrayReferenceViewError, ArrayReferenceViewTransform, ViewIndex,
+pub use references::{
+    ArrayReference, ArrayReferenceAnalysis, ArrayReferenceAnalysisError, ArrayReferenceDischarge, ArrayReferenceView,
+    ArrayReferenceViewError, ArrayReferenceViewTransform, ViewIndex,
 };
 pub use sharding::{
     Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProcessIndex, Sharding, ShardingDimension,

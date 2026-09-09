@@ -2788,6 +2788,7 @@ mod tests {
         DimensionType, DimensionValue, DimensionVariable, Shape, ShardingDimension,
     };
     use crate::batching::batch;
+    use crate::captures::ClosedProgram;
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::{
         Differentiate, ForwardModeDifferentiate, LinearizationTracer, ReverseModeDifferentiate, differentiate_at,
@@ -2803,9 +2804,13 @@ mod tests {
     use crate::operations::math::sub::{SUB_OPERATION_NAME, SubOperation};
     use crate::operations::references::{
         ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
+        ReferenceWriteOperation,
     };
     use crate::parameters::Parameter;
-    use crate::programs::{EffectClasses, Provenance, ProvenanceScope, ReferenceType};
+    use crate::programs::{
+        EffectClasses, ExternalReferenceBinding, InstructionId, Provenance, ProvenanceScope, ReferenceAnalysisError,
+        ReferenceRoot, ReferenceSource, ReferenceType,
+    };
     use crate::tests::CountingBatchingDriver;
     use crate::tracing::DomainTracingContext;
 
@@ -2887,6 +2892,37 @@ mod tests {
             .to_vec();
         builder
             .build::<Vec<Array>, Vec<Array>>(outputs, vec![Placeholder; 4], vec![Placeholder; 4])
+            .unwrap()
+    }
+
+    /// Captured array payload in the reference discharge fixtures.
+    type DischargeArrayCapture = CaptureReference<ArrayType>;
+    /// Captured composite value in the reference discharge fixtures.
+    type DischargeCapture = CaptureReference<ArrayIrType>;
+    /// Operation family used by captured array discharge programs.
+    type DischargeCaptureOperation = ArrayIrOperation<DischargeArrayCapture>;
+
+    /// Builds a while condition that increments reference state before comparing it with `limit`.
+    fn incrementing_condition(limit: f32) -> Program<TestIrValue, TestIrOperation, Vec<TestIrValue>, Vec<TestIrValue>> {
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let reference = builder.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
+        let update = builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(1.0)));
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let counter =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let limit = builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(limit)));
+        let predicate = builder
+            .add_instruction(
+                ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::LessThan)),
+                Vec::new(),
+                vec![counter, limit],
+                None,
+            )
+            .unwrap()[0];
+        builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder], vec![Placeholder])
             .unwrap()
     }
 
@@ -3452,6 +3488,1098 @@ mod tests {
         assert_eq!(
             discharged.program().interpret(vec![TestIrValue::Array(Array::scalar(5.0f32))]),
             Ok(vec![TestIrValue::Array(Array::scalar(6.0f32)), TestIrValue::Array(Array::scalar(6.0f32))]),
+        );
+    }
+
+    #[test]
+    fn test_while_reference_discharge_threads_a_preserved_carry_through_a_loop() {
+        // A loop's boundaries stay symmetric with a preserved carry in them: the carry occupies its declared position
+        // in the operand list, in both region boundaries, and in the output list, carrying a reference rather than
+        // state, and the loop publishes no successor for it.
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let counter = condition_builder.add_input(reference_type.clone().into());
+        condition_builder.add_input(reference_type.clone().into());
+        let observed = condition_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![counter], None)
+            .unwrap()[0];
+        let limit = condition_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(3.0)));
+        let predicate = condition_builder
+            .add_instruction(
+                ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::LessThan)),
+                Vec::new(),
+                vec![observed, limit],
+                None,
+            )
+            .unwrap()[0];
+        let condition = condition_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let counter = body_builder.add_input(reference_type.clone().into());
+        let step = body_builder.add_input(reference_type.clone().into());
+        let increment =
+            body_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![step], None).unwrap()[0];
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![counter, increment], None)
+            .unwrap();
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![counter, step],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let condition = builder.import_region(condition.entry_region_ref());
+        let body = builder.import_region(body.entry_region_ref());
+        let counter_initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let step_initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let counter = builder
+            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![counter_initial], None)
+            .unwrap()[0];
+        let step =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![step_initial], None).unwrap()[0];
+        let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(Some(8)).unwrap();
+        let carried = builder.add_instruction(operation, vec![condition, body], vec![counter, step], None).unwrap();
+        let (carried_counter, carried_step) = (carried[0], carried[1]);
+        let total = builder
+            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![carried_counter], None)
+            .unwrap()[0];
+        let remaining = builder
+            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![carried_step], None)
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![total, remaining],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let targets = source.reference_discharge_targets(0).unwrap();
+        let discharged = source.clone().partially_discharge_references(0, &targets[..1]).unwrap();
+        assert_eq!(discharged.output_count(), 2);
+        assert_eq!(discharged.external_reference_bindings(), &[]);
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[] .
+                let %2:ref<f32[]> = reference_new %1
+                    %3:f32[], %4:ref<f32[]> = while [iteration_bound=8] %0 %2 [
+                        condition={
+                            lambda %0:f32[], %1:ref<f32[]> .
+                            let %2:f32[] = const 3.0
+                                %3:bool[] = compare [direction=LessThan] %0 %2
+                            in (%3)
+                        },
+                        body={
+                            lambda %0:f32[], %1:ref<f32[]> .
+                            let %2:f32[] = reference_read %1
+                                %3:f32[] = add %0 %2
+                            in (%3, %1)
+                        },
+                    ]
+                    %5:f32[] = reference_freeze %2
+                in (%3, %5)"},
+        );
+
+        // The eager interpreter carries a reference through the loop by selecting the handle wholesale under the
+        // discharge_scalar predicate, so the mixed program runs exactly like the source it came from: the counter
+        // accumulates `0 + 2 + 2` before the condition fails, and the untouched step still holds its initial value.
+        let inputs = vec![TestIrValue::Array(Array::scalar::<f32>(0.0)), TestIrValue::Array(Array::scalar::<f32>(2.0))];
+        let expected =
+            Ok(vec![TestIrValue::Array(Array::scalar::<f32>(4.0)), TestIrValue::Array(Array::scalar::<f32>(2.0))]);
+        assert_eq!(source.interpret(inputs.clone()), expected);
+        assert_eq!(discharged.program().interpret(inputs), expected);
+    }
+
+    #[test]
+    fn test_while_reference_discharge_nested_condition_keeps_local_state_inside_its_creation_scope() {
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let reference = condition_builder.add_input(reference_type.clone().into());
+        condition_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap();
+        let predicate = condition_builder.add_constant(TestIrValue::Array(Array::scalar(true)));
+        let loop_condition = condition_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let reference = body_builder.add_input(reference_type.into());
+        let update = body_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(1.0)));
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let loop_body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut true_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let loop_condition = true_builder.import_region(loop_condition.entry_region_ref());
+        let loop_body = true_builder.import_region(loop_body.entry_region_ref());
+        let initial = true_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let reference =
+            true_builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(2).unwrap();
+        let reference = true_builder
+            .add_instruction(operation, vec![loop_condition, loop_body], vec![reference], None)
+            .unwrap()[0];
+        let value = true_builder
+            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        let true_branch = true_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![value], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut false_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let value = false_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let false_branch = false_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![value], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let true_branch = builder.import_region(true_branch.entry_region_ref());
+        let false_branch = builder.import_region(false_branch.entry_region_ref());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let value = builder
+            .add_instruction(
+                ConditionOperation::<TestIrValue>::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, initial],
+                None,
+            )
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![value], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        // The allocation is allocated and frozen inside the true branch, so no state crosses the entry boundary even
+        // though a nested loop mutates it; the false branch never sees the allocation at all.
+        let discharged = source.discharge_references(0).unwrap();
+        assert_eq!(discharged.external_reference_bindings(), &[]);
+        assert_eq!(
+            discharged.program().interpret(vec![
+                TestIrValue::Array(Array::scalar(true)),
+                TestIrValue::Array(Array::scalar::<f32>(3.0))
+            ]),
+            Ok(vec![TestIrValue::Array(Array::scalar::<f32>(5.0))])
+        );
+        assert_eq!(
+            discharged.program().interpret(vec![
+                TestIrValue::Array(Array::scalar(false)),
+                TestIrValue::Array(Array::scalar::<f32>(3.0))
+            ]),
+            Ok(vec![TestIrValue::Array(Array::scalar::<f32>(3.0))])
+        );
+    }
+
+    #[test]
+    fn test_while_reference_discharge_preserves_zero_iteration_and_threads_mutated_state() {
+        let build = |condition_value: bool, iteration_bound: Option<usize>| {
+            let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+            let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+            let reference = condition_builder.add_input(reference_type.clone().into());
+            condition_builder
+                .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+                .unwrap();
+            let condition = condition_builder.add_constant(TestIrValue::Array(Array::scalar(condition_value)));
+            let condition = condition_builder
+                .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![condition], vec![Placeholder], vec![Placeholder])
+                .unwrap();
+
+            let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+            let reference = body_builder.add_input(reference_type.clone().into());
+            let update = body_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(1.0)));
+            body_builder
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+                .unwrap();
+            let body = body_builder
+                .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
+                .unwrap();
+
+            let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+            let condition = builder.import_region(condition.entry_region_ref());
+            let body = builder.import_region(body.entry_region_ref());
+            let reference = builder.add_input(reference_type.into());
+            let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(iteration_bound).unwrap();
+            let reference =
+                builder.add_instruction(operation, vec![condition, body], vec![reference], None).unwrap()[0];
+            let value =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder
+                .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![value], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+
+        // A predicate that is immediately false leaves the entering state untouched in both the public read and the
+        // appended final state.
+        let zero_iteration = build(false, None).discharge_references(0).unwrap();
+        assert_eq!(
+            zero_iteration.program().interpret(vec![TestIrValue::Array(Array::scalar::<f32>(2.0))]),
+            Ok(vec![TestIrValue::Array(Array::scalar::<f32>(2.0)), TestIrValue::Array(Array::scalar::<f32>(2.0))])
+        );
+
+        // The reference carry becomes an ordinary array carry: the condition region observes the state without
+        // returning it, while the body returns the accumulated state in the carry position.
+        let three_iterations = build(true, Some(3)).discharge_references(0).unwrap();
+        assert_eq!(
+            three_iterations.program().to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = while [iteration_bound=3] %0 [
+                    condition={
+                        lambda %0:f32[] .
+                        let %1:bool[] = const true
+                        in (%1)
+                    },
+                    body={
+                        lambda %0:f32[] .
+                        let %1:f32[] = const 1.0
+                            %2:f32[] = add %0 %1
+                        in (%2)
+                    },
+                ]
+                in (%1, %1)"},
+        );
+        assert_eq!(
+            three_iterations.program().interpret(vec![TestIrValue::Array(Array::scalar::<f32>(2.0))]),
+            Ok(vec![TestIrValue::Array(Array::scalar::<f32>(5.0)), TestIrValue::Array(Array::scalar::<f32>(5.0))])
+        );
+    }
+
+    #[test]
+    fn test_while_reference_discharge_accepts_the_same_allocation_at_repeated_carry_positions() {
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let first_reference = condition_builder.add_input(reference_type.clone().into());
+        let second_reference = condition_builder.add_input(reference_type.clone().into());
+        condition_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![first_reference], None)
+            .unwrap();
+        condition_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![second_reference], None)
+            .unwrap();
+        let condition = condition_builder.add_constant(TestIrValue::Array(Array::scalar(true)));
+        let condition = condition_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![condition], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let first_reference = body_builder.add_input(reference_type.clone().into());
+        let second_reference = body_builder.add_input(reference_type.clone().into());
+        let update = body_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(1.0)));
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![second_reference, update], None)
+            .unwrap();
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![first_reference, second_reference],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let condition = builder.import_region(condition.entry_region_ref());
+        let body = builder.import_region(body.entry_region_ref());
+        let reference = builder.add_input(reference_type.into());
+        let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(Some(1)).unwrap();
+        let outputs =
+            builder.add_instruction(operation, vec![condition, body], vec![reference, reference], None).unwrap();
+        let first_reference = outputs[0];
+        let second_reference = outputs[1];
+        let first_value = builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![first_reference], None)
+            .unwrap()[0];
+        let second_value = builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![second_reference], None)
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![first_value, second_value],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        // Each declared carry position still exists in the rebuilt loop even though both source operands name one
+        // allocation. The allocation has one canonical state, so either carry observes the same update and only one
+        // hidden final state is published.
+        let discharged = source.discharge_references(0).unwrap();
+        assert_eq!(discharged.external_reference_bindings().len(), 1);
+        assert_eq!(
+            discharged.program().interpret(vec![TestIrValue::Array(Array::scalar::<f32>(2.0))]),
+            Ok(vec![
+                TestIrValue::Array(Array::scalar::<f32>(3.0)),
+                TestIrValue::Array(Array::scalar::<f32>(3.0)),
+                TestIrValue::Array(Array::scalar::<f32>(3.0))
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_while_reference_discharge_rotates_an_initially_false_mutating_condition() {
+        // The condition increments the counter and compares it against zero, so from a non-negative start it is false
+        // on its very first evaluation. Rotation discharges that evaluation once before the loop, threads its predicate
+        // as a trailing carry, and runs the body followed by the condition inside the rebuilt body, so the condition's
+        // instructions appear exactly twice and its increment happens exactly once when the body never runs.
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let reference = body_builder.add_input(reference_type.clone().into());
+        let update = body_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(10.0)));
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let condition = builder.import_region(incrementing_condition(0.0).entry_region_ref());
+        let body = builder.import_region(body.entry_region_ref());
+        let reference = builder.add_input(reference_type.into());
+        let reference = builder
+            .add_instruction(WhileOperation::<ArrayIrType>::new(), vec![condition, body], vec![reference], None)
+            .unwrap()[0];
+        let value =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![value], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let discharged = source.discharge_references(0).unwrap();
+        assert!(discharged.external_reference_bindings()[0].is_mutated());
+        assert_eq!(discharged.external_reference_bindings()[0].output_index(), Some(1));
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = const 1.0
+                    %2:f32[] = const 0.0
+                    %3:f32[] = add %0 %1
+                    %4:bool[] = compare [direction=LessThan] %3 %2
+                    %5:f32[], %6:bool[] = while %3 %4 [
+                        condition={
+                            lambda %0:f32[], %1:bool[] .
+                            in (%1)
+                        },
+                        body={
+                            lambda %0:f32[], %1:bool[] .
+                            let %2:f32[] = const 10.0
+                                %3:f32[] = add %0 %2
+                                %4:f32[] = const 1.0
+                                %5:f32[] = const 0.0
+                                %6:f32[] = add %3 %4
+                                %7:bool[] = compare [direction=LessThan] %6 %5
+                            in (%6, %7)
+                        },
+                    ]
+                in (%5, %5)"},
+        );
+
+        // Zero body iterations still keep the single increment; a negative start runs the body once, after which the
+        // second condition evaluation increments again and exits.
+        assert_eq!(
+            discharged.program().interpret(vec![TestIrValue::Array(Array::scalar::<f32>(0.0))]),
+            Ok(vec![TestIrValue::Array(Array::scalar::<f32>(1.0)), TestIrValue::Array(Array::scalar::<f32>(1.0))])
+        );
+        assert_eq!(
+            discharged.program().interpret(vec![TestIrValue::Array(Array::scalar::<f32>(-5.0))]),
+            Ok(vec![TestIrValue::Array(Array::scalar::<f32>(7.0)), TestIrValue::Array(Array::scalar::<f32>(7.0))])
+        );
+    }
+
+    #[test]
+    fn test_while_reference_discharge_matches_hand_rotated_do_while_for_a_condition_only_mutation() {
+        // Only the condition mutates the counter reference, while the body doubles an ordinary value carry. The oracle
+        // is the reference-free do-while loop written by hand: the condition evaluated once up front, the predicate
+        // carried, and the body followed by the condition inside the loop.
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let reference = body_builder.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
+        let accumulator = body_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let doubled = body_builder
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![accumulator, accumulator], None)
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![reference, doubled],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let reference = condition_builder.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
+        condition_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let condition = condition_builder.splice_program(&incrementing_condition(5.0), &[reference]).unwrap();
+        let condition = condition_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(condition, vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let condition = builder.import_region(condition.entry_region_ref());
+        let body = builder.import_region(body.entry_region_ref());
+        let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let accumulator = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let outputs = builder
+            .add_instruction(
+                WhileOperation::<ArrayIrType>::new(),
+                vec![condition, body],
+                vec![reference, accumulator],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let frozen = builder
+            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![outputs[0]], None)
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![frozen, outputs[1]],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let mut oracle_condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        oracle_condition_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        oracle_condition_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let predicate = oracle_condition_builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let oracle_condition = oracle_condition_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+        let mut oracle_body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let counter = oracle_body_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let accumulator = oracle_body_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        oracle_body_builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let doubled = oracle_body_builder
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![accumulator, accumulator], None)
+            .unwrap()[0];
+        let step = oracle_body_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(1.0)));
+        let counter = oracle_body_builder
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![counter, step], None)
+            .unwrap()[0];
+        let limit = oracle_body_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(5.0)));
+        let predicate = oracle_body_builder
+            .add_instruction(
+                ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::LessThan)),
+                Vec::new(),
+                vec![counter, limit],
+                None,
+            )
+            .unwrap()[0];
+        let oracle_body = oracle_body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![counter, doubled, predicate],
+                vec![Placeholder; 3],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+        let mut oracle_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let oracle_condition = oracle_builder.import_region(oracle_condition.entry_region_ref());
+        let oracle_body = oracle_builder.import_region(oracle_body.entry_region_ref());
+        let initial = oracle_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let accumulator = oracle_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let step = oracle_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(1.0)));
+        let counter = oracle_builder
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![initial, step], None)
+            .unwrap()[0];
+        let limit = oracle_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(5.0)));
+        let predicate = oracle_builder
+            .add_instruction(
+                ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::LessThan)),
+                Vec::new(),
+                vec![counter, limit],
+                None,
+            )
+            .unwrap()[0];
+        let outputs = oracle_builder
+            .add_instruction(
+                WhileOperation::<ArrayIrType>::new(),
+                vec![oracle_condition, oracle_body],
+                vec![counter, accumulator, predicate],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let oracle = oracle_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![outputs[0], outputs[1]],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let discharged = source.discharge_references(0).unwrap();
+        assert_eq!(discharged.external_reference_bindings(), &[]);
+        assert_eq!(discharged.program().to_string().matches("compare [direction=LessThan]").count(), 2);
+        for initial in [0.0f32, 3.0, 4.0, 7.0, -2.0] {
+            let expected = oracle
+                .clone()
+                .interpret(vec![
+                    TestIrValue::Array(Array::scalar::<f32>(initial)),
+                    TestIrValue::Array(Array::scalar::<f32>(1.0)),
+                ])
+                .unwrap();
+            assert_eq!(
+                discharged.program().interpret(vec![
+                    TestIrValue::Array(Array::scalar::<f32>(initial)),
+                    TestIrValue::Array(Array::scalar::<f32>(1.0))
+                ]),
+                Ok(expected)
+            );
+        }
+        assert_eq!(
+            discharged.program().interpret(vec![
+                TestIrValue::Array(Array::scalar::<f32>(0.0)),
+                TestIrValue::Array(Array::scalar::<f32>(1.0))
+            ]),
+            Ok(vec![TestIrValue::Array(Array::scalar::<f32>(5.0)), TestIrValue::Array(Array::scalar::<f32>(16.0))])
+        );
+        assert_eq!(
+            discharged.program().interpret(vec![
+                TestIrValue::Array(Array::scalar::<f32>(7.0)),
+                TestIrValue::Array(Array::scalar::<f32>(1.0))
+            ]),
+            Ok(vec![TestIrValue::Array(Array::scalar::<f32>(8.0)), TestIrValue::Array(Array::scalar::<f32>(1.0))])
+        );
+    }
+
+    #[test]
+    fn test_while_reference_discharge_rotates_a_root_written_by_both_condition_and_body() {
+        // The body doubles the carried counter and the condition increments it, so the rotation's fixed body-then-
+        // condition order is observable in the final value. The oracle is the hand-rotated reference-free loop.
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let reference = body_builder.add_input(reference_type.clone().into());
+        let counter = body_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        let doubled = body_builder
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![counter, counter], None)
+            .unwrap()[0];
+        body_builder
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, doubled], None)
+            .unwrap();
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let condition = builder.import_region(incrementing_condition(10.0).entry_region_ref());
+        let body = builder.import_region(body.entry_region_ref());
+        let reference = builder.add_input(reference_type.into());
+        let reference = builder
+            .add_instruction(WhileOperation::<ArrayIrType>::new(), vec![condition, body], vec![reference], None)
+            .unwrap()[0];
+        let value =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![value], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut oracle_condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        oracle_condition_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let predicate = oracle_condition_builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let oracle_condition = oracle_condition_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let mut oracle_body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let counter = oracle_body_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        oracle_body_builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let doubled = oracle_body_builder
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![counter, counter], None)
+            .unwrap()[0];
+        let step = oracle_body_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(1.0)));
+        let counter = oracle_body_builder
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![doubled, step], None)
+            .unwrap()[0];
+        let limit = oracle_body_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(10.0)));
+        let predicate = oracle_body_builder
+            .add_instruction(
+                ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::LessThan)),
+                Vec::new(),
+                vec![counter, limit],
+                None,
+            )
+            .unwrap()[0];
+        let oracle_body = oracle_body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![counter, predicate],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let mut oracle_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let oracle_condition = oracle_builder.import_region(oracle_condition.entry_region_ref());
+        let oracle_body = oracle_builder.import_region(oracle_body.entry_region_ref());
+        let initial = oracle_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let step = oracle_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(1.0)));
+        let counter = oracle_builder
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![initial, step], None)
+            .unwrap()[0];
+        let limit = oracle_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(10.0)));
+        let predicate = oracle_builder
+            .add_instruction(
+                ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::LessThan)),
+                Vec::new(),
+                vec![counter, limit],
+                None,
+            )
+            .unwrap()[0];
+        let counter = oracle_builder
+            .add_instruction(
+                WhileOperation::<ArrayIrType>::new(),
+                vec![oracle_condition, oracle_body],
+                vec![counter, predicate],
+                None,
+            )
+            .unwrap()[0];
+        let oracle = oracle_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![counter, counter],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let discharged = source.discharge_references(0).unwrap();
+        assert!(discharged.external_reference_bindings()[0].is_mutated());
+        assert_eq!(discharged.program().to_string().matches("compare [direction=LessThan]").count(), 2);
+        for initial in [0.0f32, 4.0, 9.0, 20.0] {
+            let expected = oracle.clone().interpret(vec![TestIrValue::Array(Array::scalar::<f32>(initial))]).unwrap();
+            assert_eq!(
+                discharged.program().interpret(vec![TestIrValue::Array(Array::scalar::<f32>(initial))]),
+                Ok(expected)
+            );
+        }
+        assert_eq!(
+            discharged.program().interpret(vec![TestIrValue::Array(Array::scalar::<f32>(0.0))]),
+            Ok(vec![TestIrValue::Array(Array::scalar::<f32>(15.0)), TestIrValue::Array(Array::scalar::<f32>(15.0))])
+        );
+    }
+
+    #[test]
+    fn test_while_reference_discharge_rotates_a_mutated_reference_capture_inside_the_condition() {
+        // A capture the condition accumulates into reaches the loop only through a synthesized carry. Rotation
+        // discharges the condition once in the parent, where the capture's state is updated in place, and again at the
+        // tail of the body, where the published state replaces the carried one. The capture value family carries no
+        // data, so the rendered program pins the state flow.
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut condition_builder = ProgramBuilder::<DischargeCapture, DischargeCaptureOperation>::new();
+        let reference = condition_builder.add_constant(DischargeCapture::new(0, reference_type.into()));
+        let update = condition_builder.add_constant(DischargeCapture::new(1, ArrayType::scalar(DataType::F32).into()));
+        condition_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let predicate =
+            condition_builder.add_constant(DischargeCapture::new(2, ArrayType::scalar(DataType::Boolean).into()));
+        let condition = condition_builder
+            .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(vec![predicate], Vec::new(), vec![Placeholder])
+            .unwrap();
+        let body = ProgramBuilder::<DischargeCapture, DischargeCaptureOperation>::new()
+            .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(Vec::new(), Vec::new(), Vec::new())
+            .unwrap();
+        let mut builder = ProgramBuilder::<DischargeCapture, DischargeCaptureOperation>::new();
+        let condition = builder.import_region(condition.entry_region_ref());
+        let body = builder.import_region(body.entry_region_ref());
+        builder
+            .add_instruction(WhileOperation::<ArrayIrType>::new(), vec![condition, body], Vec::new(), None)
+            .unwrap();
+        let while_program = builder
+            .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(Vec::new(), Vec::new(), Vec::new())
+            .unwrap();
+        let closed = ClosedProgram::new(
+            while_program,
+            vec![
+                ArrayIrValue::Reference(ArrayReference::new(Array::scalar(4.0f32))),
+                TestIrValue::Array(Array::scalar::<f32>(1.0)),
+                TestIrValue::Array(Array::scalar(false)),
+            ],
+        )
+        .unwrap();
+
+        let discharged = closed.discharge_references().unwrap();
+        assert_eq!(discharged.output_count(), 0);
+        assert_eq!(discharged.external_reference_bindings().len(), 1);
+        assert_eq!(discharged.external_reference_bindings()[0].source(), ReferenceSource::Capture { index: 0 });
+        assert!(discharged.external_reference_bindings()[0].is_mutated());
+        assert_eq!(discharged.external_reference_bindings()[0].output_index(), Some(0));
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[], %2:bool[] .
+                let %3:f32[] = const capture#1:f32[]
+                    %4:bool[] = const capture#2:bool[]
+                    %5:f32[] = add %0 %3
+                    %6:f32[], %7:bool[] = while %5 %4 [
+                        condition={
+                            lambda %0:f32[], %1:bool[] .
+                            in (%1)
+                        },
+                        body={
+                            lambda %0:f32[], %1:bool[] .
+                            let %2:f32[] = const capture#1:f32[]
+                                %3:bool[] = const capture#2:bool[]
+                                %4:f32[] = add %0 %2
+                            in (%4, %3)
+                        },
+                    ]
+                in (%6)"},
+        );
+    }
+
+    #[test]
+    fn test_while_reference_discharge_rotates_an_aliased_root_mutated_inside_the_condition() {
+        // Both carry positions name one allocation. The condition increments it through the first position and tests it
+        // through the second, so the rotation must keep the two positions in agreement after every evaluation.
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let first_reference = condition_builder.add_input(reference_type.clone().into());
+        let second_reference = condition_builder.add_input(reference_type.clone().into());
+        let update = condition_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(1.0)));
+        condition_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![first_reference, update], None)
+            .unwrap();
+        let counter = condition_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![second_reference], None)
+            .unwrap()[0];
+        let limit = condition_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(3.0)));
+        let predicate = condition_builder
+            .add_instruction(
+                ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::LessThan)),
+                Vec::new(),
+                vec![counter, limit],
+                None,
+            )
+            .unwrap()[0];
+        let condition = condition_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let first_reference = body_builder.add_input(reference_type.clone().into());
+        let second_reference = body_builder.add_input(reference_type.clone().into());
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![first_reference, second_reference],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let condition = builder.import_region(condition.entry_region_ref());
+        let body = builder.import_region(body.entry_region_ref());
+        let reference = builder.add_input(reference_type.into());
+        let outputs = builder
+            .add_instruction(
+                WhileOperation::<ArrayIrType>::new(),
+                vec![condition, body],
+                vec![reference, reference],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let first_value =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![outputs[0]], None).unwrap()[0];
+        let second_value =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![outputs[1]], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![first_value, second_value],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let discharged = source.discharge_references(0).unwrap();
+        assert_eq!(discharged.external_reference_bindings().len(), 1);
+        assert!(discharged.external_reference_bindings()[0].is_mutated());
+        assert_eq!(discharged.program().to_string().matches("compare [direction=LessThan]").count(), 2);
+        assert_eq!(
+            discharged.program().interpret(vec![TestIrValue::Array(Array::scalar::<f32>(0.0))]),
+            Ok(vec![
+                TestIrValue::Array(Array::scalar::<f32>(3.0)),
+                TestIrValue::Array(Array::scalar::<f32>(3.0)),
+                TestIrValue::Array(Array::scalar::<f32>(3.0))
+            ])
+        );
+        assert_eq!(
+            discharged.program().interpret(vec![TestIrValue::Array(Array::scalar::<f32>(7.0))]),
+            Ok(vec![
+                TestIrValue::Array(Array::scalar::<f32>(8.0)),
+                TestIrValue::Array(Array::scalar::<f32>(8.0)),
+                TestIrValue::Array(Array::scalar::<f32>(8.0))
+            ])
+        );
+    }
+
+    #[test]
+    fn test_while_reference_discharge_rejects_a_consuming_condition_and_a_bounded_mutating_condition() {
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let reference = body_builder.add_input(reference_type.clone().into());
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let build = |condition: Program<TestIrValue, TestIrOperation, Vec<TestIrValue>, Vec<TestIrValue>>,
+                     iteration_bound: Option<usize>| {
+            let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+            let condition = builder.import_region(condition.entry_region_ref());
+            let body = builder.import_region(body.entry_region_ref());
+            let reference = builder.add_input(reference_type.clone().into());
+            let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(iteration_bound).unwrap();
+            let reference =
+                builder.add_instruction(operation, vec![condition, body], vec![reference], None).unwrap()[0];
+            let value =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder
+                .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![value], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+
+        // A condition borrows its entering reference and cannot consume it. The shared analysis reports the source
+        // instruction and input identity, so the diagnostic no longer depends on a discharge environment identifier.
+        let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let reference = condition_builder.add_input(reference_type.clone().into());
+        condition_builder
+            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap();
+        let predicate = condition_builder.add_constant(TestIrValue::Array(Array::scalar(true)));
+        let consuming_condition = condition_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let source = build(consuming_condition, None);
+        let condition = source.entry_region_ref().instructions()[0].regions()[0];
+        assert_eq!(
+            source.discharge_references(0).unwrap_err(),
+            ReferenceAnalysisError::ExternalReferenceConsumption {
+                operation: "reference_freeze",
+                instruction: InstructionId::new(condition, 0),
+                root: ReferenceRoot::RegionInput { region: condition, input_index: 0 },
+                external_source: ReferenceSource::Input { index: 0 },
+            }
+            .into(),
+        );
+
+        // A bounded loop evaluates its condition exactly `bound` times when the bound truncates it, whereas the rotated
+        // body would evaluate it once more, so a bounded loop with a mutating condition cannot be rotated.
+        assert!(matches!(
+            build(incrementing_condition(3.0), Some(2)).discharge_references(0),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message.starts_with(
+                        "`while` loop with iteration bound 2 and a condition that mutates reference allocation ",
+                    )
+                    && message.ends_with(
+                        " cannot be discharged, because rotating it into do-while form would evaluate the condition \
+                         one more time than the bound allows",
+                    ),
+        ));
+
+        // The same condition discharges once the bound is dropped.
+        let discharged = build(incrementing_condition(3.0), None).discharge_references(0).unwrap();
+        assert_eq!(
+            discharged.program().interpret(vec![TestIrValue::Array(Array::scalar::<f32>(0.0))]),
+            Ok(vec![TestIrValue::Array(Array::scalar::<f32>(3.0)), TestIrValue::Array(Array::scalar::<f32>(3.0))])
+        );
+    }
+
+    #[test]
+    fn test_while_reference_discharge_read_only_adds_no_final_state_output() {
+        // A loop's boundaries stay symmetric — a carry position exists in the condition's and the body's boundaries or
+        // in neither — but symmetry is a property of those boundaries, not a claim that the loop wrote what it carried.
+        // Nothing here writes the external allocation, so it enters as state, rides the carry, and publishes no hidden
+        // final state, which is what keeps its caller from publishing an unchanged value back to the reference.
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let counter = condition_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let reference = condition_builder.add_input(reference_type.clone().into());
+        let limit = condition_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        let predicate = condition_builder
+            .add_instruction(
+                ArrayOperation::Compare(CompareOperation::new(ComparisonDirection::LessThan)),
+                Vec::new(),
+                vec![counter, limit],
+                None,
+            )
+            .unwrap()[0];
+        let condition = condition_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let counter = body_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let reference = body_builder.add_input(reference_type.clone().into());
+        let step = body_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(1.0)));
+        let next = body_builder
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![counter, step], None)
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![next, reference],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let condition = builder.import_program(condition);
+        let body = builder.import_program(body);
+        let external = builder.add_input(reference_type.into());
+        let counter = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let total = builder
+            .add_instruction(WhileOperation::<ArrayIrType>::new(), vec![condition, body], vec![counter, external], None)
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![total], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let discharged = source.discharge_references(0).unwrap();
+        assert_eq!(discharged.output_count(), 1);
+        assert_eq!(discharged.program().output_types().len(), 1);
+        assert_eq!(
+            discharged.external_reference_bindings(),
+            &[ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, None)],
+        );
+        assert_eq!(
+            discharged.program().interpret(vec![
+                TestIrValue::Array(Array::scalar::<f32>(3.0)),
+                TestIrValue::Array(Array::scalar::<f32>(0.0))
+            ]),
+            Ok(vec![TestIrValue::Array(Array::scalar::<f32>(3.0))])
+        );
+    }
+
+    #[test]
+    fn test_while_reference_discharge_threads_reference_captures_through_while() {
+        // A capture read only by the loop condition still needs a synthesized state input on both while regions, but no
+        // final-state output because nothing writes it.
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut condition_builder = ProgramBuilder::<DischargeCapture, DischargeCaptureOperation>::new();
+        let reference = condition_builder.add_constant(DischargeCapture::new(0, reference_type.into()));
+        condition_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap();
+        let predicate =
+            condition_builder.add_constant(DischargeCapture::new(1, ArrayType::scalar(DataType::Boolean).into()));
+        let condition = condition_builder
+            .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(vec![predicate], Vec::new(), vec![Placeholder])
+            .unwrap();
+        let body = ProgramBuilder::<DischargeCapture, DischargeCaptureOperation>::new()
+            .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(Vec::new(), Vec::new(), Vec::new())
+            .unwrap();
+        let mut builder = ProgramBuilder::<DischargeCapture, DischargeCaptureOperation>::new();
+        let condition = builder.import_region(condition.entry_region_ref());
+        let body = builder.import_region(body.entry_region_ref());
+        builder
+            .add_instruction(WhileOperation::<ArrayIrType>::new(), vec![condition, body], Vec::new(), None)
+            .unwrap();
+        let while_program = builder
+            .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(Vec::new(), Vec::new(), Vec::new())
+            .unwrap();
+        let concrete_reference = ArrayReference::new(Array::scalar(4.0f32));
+        let closed = ClosedProgram::new(
+            while_program,
+            vec![ArrayIrValue::Reference(concrete_reference), TestIrValue::Array(Array::scalar(false))],
+        )
+        .unwrap();
+        let discharged = closed.discharge_references().unwrap();
+        assert!(!discharged.external_reference_bindings()[0].is_mutated());
+        assert_eq!(discharged.external_reference_bindings()[0].output_index(), None);
+        assert!(matches!(
+            discharged.program().entry_region_ref().instructions()[0].operation(),
+            DischargeCaptureOperation::While(_),
+        ));
+    }
+
+    #[test]
+    fn test_while_reference_discharge_matches_hand_written_immutable_state_passing_loop() {
+        // Eager interpretation cannot execute a reference-carrying `while` at all, because masked predicate selection
+        // has no meaning for reference carries, so the oracle here is a hand-written immutable loop that threads the
+        // same state through an ordinary array carry instead of an eager run of the reference program.
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let reference = condition_builder.add_input(reference_type.clone().into());
+        condition_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap();
+        let predicate = condition_builder.add_constant(TestIrValue::Array(Array::scalar(true)));
+        let condition = condition_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let reference = body_builder.add_input(reference_type.into());
+        let update = body_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(2.0)));
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let condition = builder.import_region(condition.entry_region_ref());
+        let body = builder.import_region(body.entry_region_ref());
+        let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(3).unwrap();
+        let reference = builder.add_instruction(operation, vec![condition, body], vec![reference], None).unwrap()[0];
+        let frozen =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut oracle_condition_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        oracle_condition_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let predicate = oracle_condition_builder.add_constant(TestIrValue::Array(Array::scalar(true)));
+        let oracle_condition = oracle_condition_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![predicate], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut oracle_body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let state = oracle_body_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let update = oracle_body_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(2.0)));
+        let updated = oracle_body_builder
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![state, update], None)
+            .unwrap()[0];
+        let oracle_body = oracle_body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![updated], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut oracle_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let oracle_condition = oracle_builder.import_region(oracle_condition.entry_region_ref());
+        let oracle_body = oracle_builder.import_region(oracle_body.entry_region_ref());
+        let state = oracle_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let operation = WhileOperation::<ArrayIrType>::new().with_iteration_bound(3).unwrap();
+        let final_state = oracle_builder
+            .add_instruction(operation, vec![oracle_condition, oracle_body], vec![state], None)
+            .unwrap()[0];
+        let oracle = oracle_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![final_state], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        // The condition region observes the carried state while the body accumulates into it, so the discharged loop
+        // must reproduce the immutable loop for every initial state.
+        let discharged = source.discharge_references(0).unwrap();
+        assert_eq!(discharged.external_reference_bindings(), &[]);
+        for initial in [0.0f32, 1.0, -4.5] {
+            let expected = oracle.clone().interpret(vec![TestIrValue::Array(Array::scalar::<f32>(initial))]).unwrap();
+            assert_eq!(
+                discharged.program().interpret(vec![TestIrValue::Array(Array::scalar::<f32>(initial))]),
+                Ok(expected)
+            );
+        }
+        assert_eq!(
+            discharged.program().interpret(vec![TestIrValue::Array(Array::scalar::<f32>(1.0))]),
+            Ok(vec![TestIrValue::Array(Array::scalar::<f32>(7.0))])
         );
     }
 

@@ -1669,20 +1669,20 @@ where
 
 #[cfg(test)]
 mod tests {
-    use indoc::indoc;
-    use pretty_assertions::assert_eq;
-
     use std::borrow::Cow;
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
+
     use crate::arrays::{
         Array, ArrayBatch, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrValue, ArrayOperation,
         ArrayReference, DataType, Dimension, DimensionBounds, DimensionType, DimensionValue, DimensionVariable,
-        LogicalMesh, MeshAxis, MeshAxisType, Shape, Sharding, ShardingDimension,
+        LogicalMesh, MeshAxis, MeshAxisType, ReferenceIndexOperation, Shape, Sharding, ShardingDimension,
     };
     use crate::batching::{BatchAxis, BatchingContext, BatchingTracer, batch};
-    use crate::captures::CaptureReference;
+    use crate::captures::{CaptureReference, ClosedProgram};
     use crate::contexts::{EagerContext, StagingContext};
     use crate::differentiation::reverse::tests::transposition_statistics;
     use crate::differentiation::{Differentiate, ReverseModeDifferentiate, differentiate_at};
@@ -1694,10 +1694,13 @@ mod tests {
     use crate::operations::math::sin::SinOperation;
     use crate::operations::references::{
         ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
-        ReferenceSwapOperation,
+        ReferenceSwapOperation, ReferenceWriteOperation,
     };
     use crate::parameters::Placeholder;
-    use crate::programs::{EffectClasses, ProgramBuilder, ReferenceType, TypeError};
+    use crate::programs::{
+        EffectClasses, ExternalReferenceBinding, ProgramBuilder, ReferenceDischargeResult, ReferenceSource,
+        ReferenceType, TypeError,
+    };
     use crate::tests::{CountingBatchingDriver, test_condition_program};
     use crate::tracing::{DomainTracingContext, Trace, TracingContext};
 
@@ -1808,6 +1811,13 @@ mod tests {
         )?;
         Ok(outputs.remove(0))
     }
+
+    /// Captured composite value in the reference discharge fixtures.
+    type DischargeCapture = CaptureReference<ArrayIrType>;
+    /// Captured array payload in the reference discharge fixtures.
+    type DischargeArrayCapture = CaptureReference<ArrayType>;
+    /// Operation family used by captured array discharge programs.
+    type DischargeCaptureOperation = ArrayIrOperation<DischargeArrayCapture>;
 
     #[test]
     fn test_condition_composite_type_contract() {
@@ -2280,6 +2290,875 @@ mod tests {
         assert_eq!(
             discharged.program().interpret(inputs),
             Ok(vec![TestValue::Array(Array::scalar(20.0f32)), TestValue::Array(Array::scalar(20.0f32))]),
+        );
+    }
+
+    #[test]
+    fn test_condition_reference_discharge_threads_a_preserved_allocation_through_condition_branches() {
+        // A condition's shared state boundary carries both kinds of allocation: the selected one crosses as immutable
+        // state and is widened with a published successor, while the preserved one crosses as the reference it already
+        // is, at its own declared operand position, and is read inside each branch exactly as the source read it.
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let branch = |accumulates: bool| {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let pipeline = builder.add_input(reference_type.clone().into());
+            let kernel = builder.add_input(reference_type.clone().into());
+            let observed =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![kernel], None).unwrap()[0];
+            if accumulates {
+                builder
+                    .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![pipeline, observed], None)
+                    .unwrap();
+            }
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![observed], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let true_branch = branch(true);
+        let false_branch = branch(false);
+
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let true_branch = builder.import_region(true_branch.entry_region_ref());
+        let false_branch = builder.import_region(false_branch.entry_region_ref());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let pipeline_initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let kernel_initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let pipeline = builder
+            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![pipeline_initial], None)
+            .unwrap()[0];
+        let kernel = builder
+            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![kernel_initial], None)
+            .unwrap()[0];
+        let observed = builder
+            .add_instruction(
+                ConditionOperation::<TestValue>::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, pipeline, kernel],
+                None,
+            )
+            .unwrap()[0];
+        let pipeline_final =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![pipeline], None).unwrap()[0];
+        let kernel_final =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![kernel], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(
+                vec![observed, pipeline_final, kernel_final],
+                vec![Placeholder; 3],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+
+        let targets = source.reference_discharge_targets(0).unwrap();
+        let discharged = source.clone().partially_discharge_references(0, &targets[..1]).unwrap();
+        assert_eq!(discharged.output_count(), 3);
+        assert_eq!(discharged.external_reference_bindings(), &[]);
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f32[], %2:f32[] .
+                let %3:ref<f32[]> = reference_new %2
+                    %4:f32[], %5:f32[] = condition %0 %1 %3 [
+                        true={
+                            lambda %0:f32[], %1:ref<f32[]> .
+                            let %2:f32[] = reference_read %1
+                                %3:f32[] = add %0 %2
+                            in (%2, %3)
+                        },
+                        false={
+                            lambda %0:f32[], %1:ref<f32[]> .
+                            let %2:f32[] = reference_read %1
+                            in (%2, %0)
+                        },
+                    ]
+                    %6:f32[] = reference_freeze %3
+                in (%4, %5, %6)"},
+        );
+
+        // Eager reference semantics stay the oracle on both sides of the rewrite.
+        for (predicate, expected) in [(true, 13.0_f32), (false, 10.0)] {
+            let inputs = vec![
+                TestValue::Array(Array::scalar(predicate)),
+                TestValue::Array(Array::scalar::<f32>(10.0)),
+                TestValue::Array(Array::scalar::<f32>(3.0)),
+            ];
+            let outputs = vec![
+                TestValue::Array(Array::scalar::<f32>(3.0)),
+                TestValue::Array(Array::scalar::<f32>(expected)),
+                TestValue::Array(Array::scalar::<f32>(3.0)),
+            ];
+            assert_eq!(source.clone().interpret(inputs.clone()), Ok(outputs.clone()));
+            assert_eq!(discharged.program().interpret(inputs), Ok(outputs));
+        }
+    }
+
+    #[test]
+    fn test_condition_reference_discharge_threads_a_preserved_allocation_through_nested_structured_boundaries() {
+        // A rebuilt region is discharged against its own isolated environment, so a preserved reference crossing two
+        // boundaries is bound as a preserved reference of the outer fork and then threaded again into the inner one.
+        // The reference therefore reaches the innermost access as the caller's own, and the discharged reference beside
+        // it is widened independently at each level.
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let inner = |accumulates: bool| {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let pipeline = builder.add_input(reference_type.clone().into());
+            let kernel = builder.add_input(reference_type.clone().into());
+            let observed =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![kernel], None).unwrap()[0];
+            if accumulates {
+                builder
+                    .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![pipeline, observed], None)
+                    .unwrap();
+            }
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![observed], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap()
+        };
+        let inner_true = inner(true);
+        let inner_false = inner(false);
+
+        let mut outer_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let inner_true = outer_builder.import_region(inner_true.entry_region_ref());
+        let inner_false = outer_builder.import_region(inner_false.entry_region_ref());
+        let predicate = outer_builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let pipeline = outer_builder.add_input(reference_type.clone().into());
+        let kernel = outer_builder.add_input(reference_type.clone().into());
+        let observed = outer_builder
+            .add_instruction(
+                ConditionOperation::<TestValue>::new(),
+                vec![inner_true, inner_false],
+                vec![predicate, pipeline, kernel],
+                None,
+            )
+            .unwrap()[0];
+        let outer = outer_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![observed], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let outer_true = builder.import_region(outer.entry_region_ref());
+        let outer_false = builder.import_region(outer.entry_region_ref());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let pipeline_initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let kernel_initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let pipeline = builder
+            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![pipeline_initial], None)
+            .unwrap()[0];
+        let kernel = builder
+            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![kernel_initial], None)
+            .unwrap()[0];
+        let observed = builder
+            .add_instruction(
+                ConditionOperation::<TestValue>::new(),
+                vec![outer_true, outer_false],
+                vec![predicate, predicate, pipeline, kernel],
+                None,
+            )
+            .unwrap()[0];
+        let pipeline_final =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![pipeline], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(
+                vec![observed, pipeline_final],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let targets = source.reference_discharge_targets(0).unwrap();
+        let discharged = source.clone().partially_discharge_references(0, &targets[..1]).unwrap();
+        assert_eq!(discharged.output_count(), 2);
+        assert_eq!(discharged.external_reference_bindings(), &[]);
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f32[], %2:f32[] .
+                let %3:ref<f32[]> = reference_new %2
+                    %4:f32[], %5:f32[] = condition %0 %0 %1 %3 [
+                        true={
+                            lambda %0:bool[], %1:f32[], %2:ref<f32[]> .
+                            let %3:f32[], %4:f32[] = condition %0 %1 %2 [
+                                true={
+                                    lambda %0:f32[], %1:ref<f32[]> .
+                                    let %2:f32[] = reference_read %1
+                                        %3:f32[] = add %0 %2
+                                    in (%2, %3)
+                                },
+                                false={
+                                    lambda %0:f32[], %1:ref<f32[]> .
+                                    let %2:f32[] = reference_read %1
+                                    in (%2, %0)
+                                },
+                            ]
+                            in (%3, %4)
+                        },
+                        false={
+                            lambda %0:bool[], %1:f32[], %2:ref<f32[]> .
+                            let %3:f32[], %4:f32[] = condition %0 %1 %2 [
+                                true={
+                                    lambda %0:f32[], %1:ref<f32[]> .
+                                    let %2:f32[] = reference_read %1
+                                        %3:f32[] = add %0 %2
+                                    in (%2, %3)
+                                },
+                                false={
+                                    lambda %0:f32[], %1:ref<f32[]> .
+                                    let %2:f32[] = reference_read %1
+                                    in (%2, %0)
+                                },
+                            ]
+                            in (%3, %4)
+                        },
+                    ]
+                in (%4, %5)"},
+        );
+
+        let inputs = vec![
+            TestValue::Array(Array::scalar(true)),
+            TestValue::Array(Array::scalar::<f32>(10.0)),
+            TestValue::Array(Array::scalar::<f32>(3.0)),
+        ];
+        let outputs = vec![TestValue::Array(Array::scalar::<f32>(3.0)), TestValue::Array(Array::scalar::<f32>(13.0))];
+        assert_eq!(source.interpret(inputs.clone()), Ok(outputs.clone()));
+        assert_eq!(discharged.program().interpret(inputs), Ok(outputs));
+    }
+
+    #[test]
+    fn test_condition_reference_discharge_selecting_nothing_is_the_identity_on_a_structured_program() {
+        // Preserving every allocation is the opposite extreme from full discharge, and it must be the identity: every
+        // access, every view, and every structured boundary replays exactly as the source declared it. This is the
+        // sharpest statement of what "preserved" means, and it holds through a condition's attached regions.
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut branch_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = branch_builder.add_input(reference_type.clone().into());
+        let replacement = branch_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let previous = branch_builder
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement], None)
+            .unwrap()[0];
+        let branch = branch_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![previous], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let true_branch = builder.import_region(branch.entry_region_ref());
+        let false_branch = builder.import_region(branch.entry_region_ref());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let replacement = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let allocation =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let previous = builder
+            .add_instruction(
+                ConditionOperation::<TestValue>::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, allocation, replacement],
+                None,
+            )
+            .unwrap()[0];
+        let frozen = builder
+            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![allocation], None)
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![previous, frozen], vec![Placeholder; 3], vec![Placeholder; 2])
+            .unwrap();
+
+        let preserved = source.clone().partially_discharge_references(0, &[]).unwrap();
+        assert_eq!(preserved.output_count(), 2);
+        assert_eq!(preserved.external_reference_bindings(), &[]);
+        assert_eq!(preserved.program().to_string(), source.to_string());
+
+        // Selecting the one target instead is full discharge, which is the other extreme of the same rewrite.
+        let targets = source.reference_discharge_targets(0).unwrap();
+        let discharged = ReferenceDischargeResult::try_from(
+            source.clone().partially_discharge_references(0, targets.as_slice()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(discharged.program().to_string(), source.discharge_references(0).unwrap().program().to_string());
+    }
+
+    #[test]
+    fn test_condition_reference_discharge_threads_identical_state_through_unequal_branch_accesses() {
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut true_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = true_builder.add_input(reference_type.clone().into());
+        let replacement = true_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        true_builder
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, replacement], None)
+            .unwrap();
+        let snapshot = true_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        let true_branch = true_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let mut false_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = false_builder.add_input(reference_type.clone().into());
+        false_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let snapshot = false_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        let false_branch = false_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let true_branch = builder.import_region(true_branch.entry_region_ref());
+        let false_branch = builder.import_region(false_branch.entry_region_ref());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let reference = builder.add_input(reference_type.into());
+        let replacement = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let snapshot = builder
+            .add_instruction(
+                ConditionOperation::<TestValue>::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, reference, replacement],
+                None,
+            )
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder; 3], vec![Placeholder])
+            .unwrap();
+
+        // Both branches receive the entering state and return their own final state after the source output, so the
+        // writing branch returns its replacement while the reading branch returns the state unchanged.
+        let discharged = source.discharge_references(0).unwrap();
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f32[], %2:f32[] .
+                let %3:f32[], %4:f32[] = condition %0 %1 %2 [
+                    true={
+                        lambda %0:f32[], %1:f32[] .
+                        in (%1, %1)
+                    },
+                    false={
+                        lambda %0:f32[], %1:f32[] .
+                        in (%0, %0)
+                    },
+                ]
+                in (%3, %4)"},
+        );
+        assert_eq!(discharged.output_count(), 1);
+        assert_eq!(discharged.external_reference_bindings()[0].output_index(), Some(1));
+
+        // The true branch writes and then reads, so both the public snapshot and final state are the replacement.
+        assert_eq!(
+            discharged.program().interpret(vec![
+                TestValue::Array(Array::scalar(true)),
+                TestValue::Array(Array::scalar::<f32>(10.0)),
+                TestValue::Array(Array::scalar::<f32>(7.0))
+            ]),
+            Ok(vec![TestValue::Array(Array::scalar::<f32>(7.0)), TestValue::Array(Array::scalar::<f32>(7.0))]),
+        );
+
+        // The false branch only reads, so the entering state is both the snapshot and the final state.
+        assert_eq!(
+            discharged.program().interpret(vec![
+                TestValue::Array(Array::scalar(false)),
+                TestValue::Array(Array::scalar::<f32>(10.0)),
+                TestValue::Array(Array::scalar::<f32>(7.0))
+            ]),
+            Ok(vec![TestValue::Array(Array::scalar::<f32>(10.0)), TestValue::Array(Array::scalar::<f32>(10.0))]),
+        );
+    }
+
+    #[test]
+    fn test_condition_reference_discharge_orders_multiple_allocations_by_parent_boundary() {
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut true_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let first = true_builder.add_input(reference_type.clone().into());
+        let second = true_builder.add_input(reference_type.clone().into());
+        true_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let second_replacement = true_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let first_snapshot =
+            true_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![first], None).unwrap()[0];
+        let second_snapshot = true_builder
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![second, second_replacement], None)
+            .unwrap()[0];
+        let true_branch = true_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(
+                vec![first_snapshot, second_snapshot],
+                vec![Placeholder; 4],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let mut false_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let first = false_builder.add_input(reference_type.clone().into());
+        let second = false_builder.add_input(reference_type.clone().into());
+        let first_replacement = false_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        false_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let first_snapshot = false_builder
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![first, first_replacement], None)
+            .unwrap()[0];
+        let second_snapshot = false_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![second], None)
+            .unwrap()[0];
+        let false_branch = false_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(
+                vec![first_snapshot, second_snapshot],
+                vec![Placeholder; 4],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let true_branch = builder.import_region(true_branch.entry_region_ref());
+        let false_branch = builder.import_region(false_branch.entry_region_ref());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let first = builder.add_input(reference_type.clone().into());
+        let second = builder.add_input(reference_type.into());
+        let first_replacement = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let second_replacement = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let outputs = builder
+            .add_instruction(
+                ConditionOperation::<TestValue>::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, first, second, first_replacement, second_replacement],
+                None,
+            )
+            .unwrap()
+            .to_vec();
+        let source = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(outputs, vec![Placeholder; 5], vec![Placeholder; 2])
+            .unwrap();
+
+        // Both branches write a different allocation, so both allocations cross the boundary; the appended final-state
+        // outputs follow parent entry-boundary order rather than the order in which either branch happens to access
+        // them.
+        let discharged = source.discharge_references(0).unwrap();
+        assert_eq!(discharged.output_count(), 2);
+        assert_eq!(discharged.external_reference_bindings().len(), 2);
+        assert_eq!(discharged.external_reference_bindings()[0].source(), ReferenceSource::Input { index: 1 });
+        assert_eq!(discharged.external_reference_bindings()[0].output_index(), Some(2));
+        assert_eq!(discharged.external_reference_bindings()[1].source(), ReferenceSource::Input { index: 2 });
+        assert_eq!(discharged.external_reference_bindings()[1].output_index(), Some(3));
+
+        // The true branch swaps only the second allocation, leaving the first allocation's final state at its entering
+        // value.
+        let inputs = vec![
+            TestValue::Array(Array::scalar(true)),
+            TestValue::Array(Array::scalar::<f32>(10.0)),
+            TestValue::Array(Array::scalar::<f32>(20.0)),
+            TestValue::Array(Array::scalar::<f32>(11.0)),
+            TestValue::Array(Array::scalar::<f32>(22.0)),
+        ];
+        assert_eq!(
+            discharged.program().interpret(inputs),
+            Ok(vec![
+                TestValue::Array(Array::scalar::<f32>(10.0)),
+                TestValue::Array(Array::scalar::<f32>(20.0)),
+                TestValue::Array(Array::scalar::<f32>(10.0)),
+                TestValue::Array(Array::scalar::<f32>(22.0))
+            ]),
+        );
+
+        // The false branch swaps only the first allocation, which mirrors the same contract on the other position.
+        let inputs = vec![
+            TestValue::Array(Array::scalar(false)),
+            TestValue::Array(Array::scalar::<f32>(10.0)),
+            TestValue::Array(Array::scalar::<f32>(20.0)),
+            TestValue::Array(Array::scalar::<f32>(11.0)),
+            TestValue::Array(Array::scalar::<f32>(22.0)),
+        ];
+        assert_eq!(
+            discharged.program().interpret(inputs),
+            Ok(vec![
+                TestValue::Array(Array::scalar::<f32>(10.0)),
+                TestValue::Array(Array::scalar::<f32>(20.0)),
+                TestValue::Array(Array::scalar::<f32>(11.0)),
+                TestValue::Array(Array::scalar::<f32>(20.0))
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_condition_reference_discharge_isolates_its_branches() {
+        // Both branches accumulate a different amount into the same allocation and return the state they observe. If
+        // either branch's staging leaked into the other's, the second branch would start from the first's successor
+        // state.
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let branch = |amount: f32| {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let reference = builder.add_input(reference_type.clone().into());
+            let update = builder.add_constant(TestValue::Array(Array::scalar::<f32>(amount)));
+            builder
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+                .unwrap();
+            let snapshot =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let true_branch = builder.import_program(branch(1.0));
+        let false_branch = builder.import_program(branch(10.0));
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let allocation =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let snapshot = builder
+            .add_instruction(
+                ConditionOperation::<TestValue>::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, allocation],
+                None,
+            )
+            .unwrap()[0];
+
+        // The condition's outputs are bound in the *parent*, so a later parent instruction consumes them directly. A
+        // value stamped with a branch's own destination builder would be rejected here instead of staged.
+        let doubled = builder
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![snapshot, snapshot], None)
+            .unwrap()[0];
+        let frozen = builder
+            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![allocation], None)
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![doubled, frozen], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        let discharged = source.clone().discharge_references(0).unwrap();
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f32[] .
+                let %2:f32[], %3:f32[] = condition %0 %1 [
+                    true={
+                        lambda %0:f32[] .
+                        let %1:f32[] = const 1.0
+                            %2:f32[] = add %0 %1
+                        in (%2, %2)
+                    },
+                    false={
+                        lambda %0:f32[] .
+                        let %1:f32[] = const 10.0
+                            %2:f32[] = add %0 %1
+                        in (%2, %2)
+                    },
+                ]
+                    %4:f32[] = add %2 %2
+                in (%4, %3)"},
+        );
+        for (predicate, expected) in [
+            (true, vec![TestValue::Array(Array::scalar::<f32>(6.0)), TestValue::Array(Array::scalar::<f32>(3.0))]),
+            (false, vec![TestValue::Array(Array::scalar::<f32>(24.0)), TestValue::Array(Array::scalar::<f32>(12.0))]),
+        ] {
+            let inputs = vec![TestValue::Array(Array::scalar(predicate)), TestValue::Array(Array::scalar::<f32>(2.0))];
+            assert_eq!(source.clone().interpret(inputs.clone()), Ok(expected.clone()));
+            assert_eq!(discharged.program().interpret(inputs), Ok(expected));
+        }
+    }
+
+    #[test]
+    fn test_condition_reference_discharge_rejects_a_branch_local_allocation_that_escapes() {
+        // Both branches allocate an allocation of their own and return it, so the condition's output denotes a
+        // reference its caller never threaded in. Merging that output would hand the caller a handle into an
+        // environment that no longer exists, so the rewrite rejects it instead.
+        let branch = || {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+            let allocation =
+                builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![allocation], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let true_branch = builder.import_program(branch());
+        let false_branch = builder.import_program(branch());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let escaped = builder
+            .add_instruction(
+                ConditionOperation::<TestValue>::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, initial],
+                None,
+            )
+            .unwrap()[0];
+        let frozen =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![escaped], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![frozen], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        assert!(matches!(
+            source.discharge_references(0),
+            Err(ProgramError::MalformedProgram(message))
+                if message.ends_with("whose caller did not thread that allocation"),
+        ));
+    }
+
+    #[test]
+    fn test_condition_reference_discharge_read_only_adds_no_final_state_output() {
+        // A closure that only reads an external allocation needs the state to enter both branches, but the allocation's
+        // value never changes, so no branch gains a final-state result and the parent condition keeps exactly its
+        // public outputs instead of carrying a dead state output.
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let make_branch = || {
+            let mut branch_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let reference = branch_builder.add_input(reference_type.clone().into());
+            let snapshot = branch_builder
+                .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+                .unwrap()[0];
+            branch_builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let true_branch = builder.import_region(make_branch().entry_region_ref());
+        let false_branch = builder.import_region(make_branch().entry_region_ref());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let reference = builder.add_input(reference_type.into());
+        let snapshot = builder
+            .add_instruction(
+                ConditionOperation::<TestValue>::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, reference],
+                None,
+            )
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let discharged = source.discharge_references(0).unwrap();
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f32[] .
+                let %2:f32[] = condition %0 %1 [
+                    true={
+                        lambda %0:f32[] .
+                        in (%0)
+                    },
+                    false={
+                        lambda %0:f32[] .
+                        in (%0)
+                    },
+                ]
+                in (%2)"},
+        );
+        assert_eq!(discharged.output_count(), 1);
+        assert_eq!(discharged.program().output_types().len(), 1);
+        assert_eq!(discharged.external_reference_bindings().len(), 1);
+        assert!(!discharged.external_reference_bindings()[0].is_mutated());
+        assert_eq!(discharged.external_reference_bindings()[0].output_index(), None);
+        assert_eq!(
+            discharged
+                .program()
+                .interpret(vec![TestValue::Array(Array::scalar(true)), TestValue::Array(Array::scalar::<f32>(4.0))]),
+            Ok(vec![TestValue::Array(Array::scalar::<f32>(4.0))])
+        );
+        assert_eq!(
+            discharged
+                .program()
+                .interpret(vec![TestValue::Array(Array::scalar(false)), TestValue::Array(Array::scalar::<f32>(4.0))]),
+            Ok(vec![TestValue::Array(Array::scalar::<f32>(4.0))])
+        );
+    }
+
+    #[test]
+    fn test_condition_reference_discharge_resolves_reference_captures_inside_condition_regions() {
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut branch_builder = ProgramBuilder::<DischargeCapture, DischargeCaptureOperation>::new();
+        let reference = branch_builder.add_constant(DischargeCapture::new(0, reference_type.into()));
+        let value = branch_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        let branch = branch_builder
+            .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(vec![value], Vec::new(), vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<DischargeCapture, DischargeCaptureOperation>::new();
+        let branch = builder.import_region(branch.entry_region_ref());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let value = builder
+            .add_instruction(
+                ConditionOperation::<ArrayIrValue<DischargeArrayCapture>>::new(),
+                vec![branch, branch],
+                vec![predicate],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(vec![value], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        let reference = ArrayReference::new(Array::scalar(4.0f32));
+        let closed = ClosedProgram::new(program, vec![ArrayIrValue::Reference(reference)]).unwrap();
+
+        let discharged = closed.discharge_references().unwrap();
+        assert_eq!(discharged.output_count(), 1);
+        assert_eq!(
+            discharged.external_reference_bindings(),
+            &[ExternalReferenceBinding::new(ReferenceSource::Capture { index: 0 }, None)],
+        );
+        assert_eq!(
+            serde_json::to_string(discharged.external_reference_bindings()).unwrap(),
+            r#"[{"source":{"capture":{"index":0}},"output_index":null}]"#,
+        );
+        assert_eq!(
+            discharged.program().input_types(),
+            vec![ArrayType::scalar(DataType::F32).into(), ArrayType::scalar(DataType::Boolean).into()],
+        );
+    }
+
+    #[test]
+    fn test_condition_reference_discharge_matches_eager_reference_execution() {
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut true_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = true_builder.add_input(reference_type.clone().into());
+        let update = true_builder.add_constant(TestValue::Array(Array::scalar::<f32>(1.0)));
+        true_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let snapshot = true_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        let true_branch = true_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut false_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let reference = false_builder.add_input(reference_type.clone().into());
+        let replacement = false_builder.add_constant(TestValue::Array(Array::scalar::<f32>(9.0)));
+        let snapshot = false_builder
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement], None)
+            .unwrap()[0];
+        let false_branch = false_builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let true_branch = builder.import_region(true_branch.entry_region_ref());
+        let false_branch = builder.import_region(false_branch.entry_region_ref());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let snapshot = builder
+            .add_instruction(
+                ConditionOperation::<TestValue>::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, reference],
+                None,
+            )
+            .unwrap()[0];
+        let frozen =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![snapshot, frozen], vec![Placeholder; 2], vec![Placeholder; 2])
+            .unwrap();
+
+        // Each branch mutates the shared allocation differently, so the eager reference interpreter and the discharged
+        // program must agree on the branch snapshot as well as on the state observed after the condition.
+        let discharged = source.clone().discharge_references(0).unwrap();
+        assert_eq!(discharged.external_reference_bindings(), &[]);
+        for (predicate, expected) in [
+            (true, vec![TestValue::Array(Array::scalar::<f32>(5.0)), TestValue::Array(Array::scalar::<f32>(5.0))]),
+            (false, vec![TestValue::Array(Array::scalar::<f32>(4.0)), TestValue::Array(Array::scalar::<f32>(9.0))]),
+        ] {
+            let inputs = vec![TestValue::Array(Array::scalar(predicate)), TestValue::Array(Array::scalar::<f32>(4.0))];
+            let eager = source.clone().interpret(inputs.clone()).unwrap();
+            assert_eq!(eager, expected);
+            assert_eq!(discharged.program().interpret(inputs), Ok(eager));
+        }
+    }
+
+    #[test]
+    fn test_condition_reference_discharge_recreates_view_inside_region() {
+        let vector_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));
+        let reference_type = ReferenceType::new(vector_type.clone());
+        let true_branch = {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let reference = builder.add_input(reference_type.clone().into());
+            let view = builder
+                .add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![reference], None)
+                .unwrap()[0];
+            let update = builder.add_constant(TestValue::Array(Array::scalar::<f32>(1.0)));
+            builder
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![view, update], None)
+                .unwrap();
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+        let false_branch = {
+            let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let reference = builder.add_input(reference_type.into());
+            builder
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
+                .unwrap()
+        };
+
+        let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        let true_branch = builder.import_region(true_branch.entry_region_ref());
+        let false_branch = builder.import_region(false_branch.entry_region_ref());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let initial = builder.add_input(vector_type.into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let reference = builder
+            .add_instruction(
+                ConditionOperation::<TestValue>::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, reference],
+                None,
+            )
+            .unwrap()[0];
+        let output =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![output], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let true_inputs =
+            vec![TestValue::Array(Array::scalar(true)), TestValue::Array(Array::vector::<f32>(vec![1.0, 2.0, 3.0]))];
+        let false_inputs =
+            vec![TestValue::Array(Array::scalar(false)), TestValue::Array(Array::vector::<f32>(vec![1.0, 2.0, 3.0]))];
+        assert_eq!(
+            source.clone().interpret(true_inputs.clone()),
+            Ok(vec![TestValue::Array(Array::vector::<f32>(vec![1.0, 3.0, 3.0]))])
+        );
+        assert_eq!(
+            source.clone().interpret(false_inputs.clone()),
+            Ok(vec![TestValue::Array(Array::vector::<f32>(vec![1.0, 2.0, 3.0]))])
+        );
+
+        let discharged = source.discharge_references(0).unwrap();
+        assert_eq!(
+            discharged.program().interpret(true_inputs),
+            Ok(vec![TestValue::Array(Array::vector::<f32>(vec![1.0, 3.0, 3.0]))])
+        );
+        assert_eq!(
+            discharged.program().interpret(false_inputs),
+            Ok(vec![TestValue::Array(Array::vector::<f32>(vec![1.0, 2.0, 3.0]))])
+        );
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f32[3] .
+                let %2:f32[3] = condition %0 %1 [
+                    true={
+                        lambda %0:f32[3] .
+                        let %1:f32[] = const 1.0
+                            %2:f32[1] = slice [start_indices=[1], limit_indices=[2]] %0
+                            %3:f32[] = reshape [shape=[]] %2
+                            %4:f32[] = add %3 %1
+                            %5:f32[1] = reshape [shape=[1]] %4
+                            %6:f32[3] = update_slice [start_indices=[1]] %0 %5
+                        in (%6)
+                    },
+                    false={
+                        lambda %0:f32[3] .
+                        in (%0)
+                    },
+                ]
+                in (%2)"},
         );
     }
 

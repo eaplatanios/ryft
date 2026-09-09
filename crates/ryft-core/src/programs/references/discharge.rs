@@ -4384,10 +4384,19 @@ mod tests {
     use indoc::indoc;
     use pretty_assertions::assert_eq;
 
+    use crate::arrays::{
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReference, ArrayReferenceViewOperation,
+        ArrayReferenceViewTransform, ArrayType, DataType, ReferenceIndexOperation, ReferenceSliceOperation,
+        reapply_array_reference_view,
+    };
     use crate::captures::CaptureReference;
     use crate::contexts::EagerContext;
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
-    use crate::operations::Add;
+    use crate::operations::{
+        Add, AddOperation, ConditionOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation,
+        ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation,
+        ReshapeOperation, SliceOperation, UpdateSliceOperation,
+    };
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::ProgramError;
     use crate::programs::atoms::AtomId;
@@ -4402,6 +4411,7 @@ mod tests {
     use crate::programs::provenance::{Provenance, ProvenanceScope};
     use crate::programs::references::analysis::ReferenceAnalysisError;
     use crate::programs::references::types::ReferenceType;
+    use crate::programs::references::views::{ReferenceViewOperation, ReferenceViewValidationError};
     use crate::programs::regions::{
         EmptyRegionDriver, InputRegionProvenance, OutputRegionProvenance, RegionId, RegionInterface, RegionSlot,
     };
@@ -5224,6 +5234,17 @@ mod tests {
         let summary = context.region_summary(&ListOperation::Call, 0, region.entry_region_ref(), &inputs).unwrap();
         (context, allocations, summary)
     }
+
+    /// Array IR values used to exercise immutable state reconstruction.
+    type DischargeValue = ArrayIrValue<Array>;
+    /// Array IR operations used by the discharge integration fixtures.
+    type DischargeOperation = ArrayIrOperation<Array>;
+    /// Captured composite value in the reference discharge fixtures.
+    type DischargeCapture = CaptureReference<ArrayIrType>;
+    /// Captured array payload in the reference discharge fixtures.
+    type DischargeArrayCapture = CaptureReference<ArrayType>;
+    /// Operation family used by captured array discharge programs.
+    type DischargeCaptureOperation = ArrayIrOperation<DischargeArrayCapture>;
 
     #[test]
     fn test_reference_discharge_target_ordering_hashing_and_rendering() {
@@ -8761,6 +8782,549 @@ mod tests {
     }
 
     #[test]
+    fn test_program_discharge_references_omits_a_dead_constant() {
+        // A program that touches references is replayed into a fresh trace through the shared program replay path,
+        // which lifts only the constants something still consumes, so a constant nothing reads does not survive the
+        // rewrite. That is what every other transform already does, and it is why the reference-free fast path above
+        // exists: a program with nothing to rewrite keeps its atoms exactly.
+        let mut builder = ProgramBuilder::<DischargeValue, DischargeOperation>::new();
+        let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let update = builder.add_constant(DischargeValue::Array(Array::scalar::<f32>(2.0)));
+        let unused = builder.add_constant(DischargeValue::Array(Array::scalar::<f32>(5.0)));
+        let allocation =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![allocation, update], None)
+            .unwrap();
+        let frozen = builder
+            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![allocation], None)
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<DischargeValue>, Vec<DischargeValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_ne!(unused, update);
+
+        let discharged = source.discharge_references(0).unwrap();
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[] = const 2.0
+                    %2:f32[] = add %0 %1
+                in (%2)"},
+        );
+        assert_eq!(discharged.output_count(), 1);
+        assert_eq!(discharged.external_reference_bindings(), &[]);
+        assert_eq!(
+            discharged.program().interpret(vec![DischargeValue::Array(Array::scalar::<f32>(1.0))]),
+            Ok(vec![DischargeValue::Array(Array::scalar::<f32>(3.0))])
+        );
+    }
+
+    #[test]
+    fn test_program_discharge_references_stages_immutable_array_state() {
+        let mut builder = ProgramBuilder::<DischargeValue, DischargeOperation>::new();
+        let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let replacement = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let update = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let first_snapshot =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        builder
+            .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, replacement], None)
+            .unwrap();
+        let swapped_snapshot = builder
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, replacement], None)
+            .unwrap()[0];
+        assert!(
+            builder
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+                .unwrap()
+                .is_empty(),
+        );
+        let final_snapshot =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<DischargeValue>, Vec<DischargeValue>>(
+                vec![first_snapshot, swapped_snapshot, final_snapshot],
+                vec![Placeholder; 3],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+
+        // Allocation and every reference access disappear: the initializer becomes entering state, the read forwards
+        // it, the write installs the replacement without producing a value, the swap forwards that replacement, and
+        // only accumulation stages real work.
+        let discharged = source.discharge_references(0).unwrap();
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[], %2:f32[] .
+                let %3:f32[] = add %1 %2
+                in (%0, %1, %3)"},
+        );
+        assert_eq!(discharged.output_count(), 3);
+        assert_eq!(discharged.external_reference_bindings(), &[]);
+        assert_eq!(discharged.program().effects().classes(), EffectClasses::NONE);
+    }
+
+    #[test]
+    fn test_program_discharge_references_generated_short_state_programs_match_eager_and_immutable_oracles() {
+        /// One operation in a bounded generated state program.
+        #[derive(Copy, Clone)]
+        enum Step {
+            /// Observe the current state.
+            Read,
+
+            /// Replace the current state without observing it.
+            Write,
+
+            /// Replace the current state with the shared replacement input.
+            Swap,
+
+            /// Add the shared update input to the current state.
+            AddUpdate,
+        }
+
+        // Every bounded read/write/swap/accumulate sequence must agree with both an independent discharge_scalar oracle
+        // and the eager reference interpreter, which pins the state-threading rewrite over all short primitive
+        // orderings.
+        for length in 0usize..=3 {
+            for code in 0..4usize.pow(length as u32) {
+                let mut remainder = code;
+                let steps = (0..length)
+                    .map(|_| {
+                        let step = match remainder % 4 {
+                            0 => Step::Read,
+                            1 => Step::Write,
+                            2 => Step::Swap,
+                            3 => Step::AddUpdate,
+                            _ => unreachable!(),
+                        };
+                        remainder /= 4;
+                        step
+                    })
+                    .collect::<Vec<_>>();
+                let mut builder = ProgramBuilder::<DischargeValue, DischargeOperation>::new();
+                let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+                let replacement = builder.add_input(ArrayType::scalar(DataType::F32).into());
+                let update = builder.add_input(ArrayType::scalar(DataType::F32).into());
+                let reference =
+                    builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+                let mut outputs = Vec::new();
+                let mut oracle_state = 2.0f32;
+                let mut oracle_outputs = Vec::new();
+                for step in steps {
+                    match step {
+                        Step::Read => {
+                            outputs.push(
+                                builder
+                                    .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+                                    .unwrap()[0],
+                            );
+                            oracle_outputs.push(DischargeValue::Array(Array::scalar::<f32>(oracle_state)));
+                        }
+                        Step::Write => {
+                            builder
+                                .add_instruction(
+                                    ReferenceWriteOperation::new(),
+                                    Vec::new(),
+                                    vec![reference, replacement],
+                                    None,
+                                )
+                                .unwrap();
+                            oracle_state = 7.0;
+                        }
+                        Step::Swap => {
+                            outputs.push(
+                                builder
+                                    .add_instruction(
+                                        ReferenceSwapOperation::new(),
+                                        Vec::new(),
+                                        vec![reference, replacement],
+                                        None,
+                                    )
+                                    .unwrap()[0],
+                            );
+                            oracle_outputs.push(DischargeValue::Array(Array::scalar::<f32>(oracle_state)));
+                            oracle_state = 7.0;
+                        }
+                        Step::AddUpdate => {
+                            builder
+                                .add_instruction(
+                                    ReferenceAddUpdateOperation::new(),
+                                    Vec::new(),
+                                    vec![reference, update],
+                                    None,
+                                )
+                                .unwrap();
+                            oracle_state += 3.0;
+                        }
+                    }
+                }
+                outputs.push(
+                    builder
+                        .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None)
+                        .unwrap()[0],
+                );
+                oracle_outputs.push(DischargeValue::Array(Array::scalar::<f32>(oracle_state)));
+                let output_count = outputs.len();
+                let source = builder
+                    .build::<Vec<DischargeValue>, Vec<DischargeValue>>(
+                        outputs,
+                        vec![Placeholder; 3],
+                        vec![Placeholder; output_count],
+                    )
+                    .unwrap();
+                let inputs = vec![
+                    DischargeValue::Array(Array::scalar::<f32>(2.0)),
+                    DischargeValue::Array(Array::scalar::<f32>(7.0)),
+                    DischargeValue::Array(Array::scalar::<f32>(3.0)),
+                ];
+                let eager = source.clone().interpret(inputs.clone()).unwrap();
+
+                // Every generated program is discharged and then checked against the eager and hand-written immutable
+                // oracles.
+                let discharged = source.discharge_references(0).unwrap();
+                let functional = discharged.program().interpret(inputs).unwrap();
+                assert_eq!(eager, oracle_outputs);
+                assert_eq!(functional, oracle_outputs);
+            }
+        }
+    }
+
+    #[test]
+    fn test_program_discharge_references_orders_external_state_by_input() {
+        let mut builder = ProgramBuilder::<DischargeValue, DischargeOperation>::new();
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let first = builder.add_input(reference_type.clone().into());
+        let second = builder.add_input(reference_type.into());
+        let replacement = builder.add_input(ArrayType::scalar(DataType::F32).into());
+
+        // Access the second allocation first so metadata order cannot accidentally follow access order.
+        let second_snapshot =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![second], None).unwrap()[0];
+        let first_snapshot = builder
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![first, replacement], None)
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<DischargeValue>, Vec<DischargeValue>>(
+                vec![second_snapshot, first_snapshot],
+                vec![Placeholder; 3],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        // Discharge is deterministic: two independent runs over the same source agree on the rewritten program and on
+        // the complete external-reference binding metadata, including its serialized form.
+        let repeated = source.clone().discharge_references(0).unwrap();
+        let discharged = source.discharge_references(0).unwrap();
+        assert_eq!(discharged.program().to_string(), repeated.program().to_string());
+        assert_eq!(discharged.external_reference_bindings(), repeated.external_reference_bindings());
+        assert_eq!(
+            serde_json::to_string(discharged.external_reference_bindings()).unwrap(),
+            serde_json::to_string(repeated.external_reference_bindings()).unwrap(),
+        );
+        assert_eq!(discharged.output_count(), 2);
+
+        // Metadata follows entry-boundary order rather than access order, and only the swapped first allocation
+        // receives a hidden final-state output after the public prefix.
+        assert_eq!(
+            discharged.external_reference_bindings(),
+            &[
+                ExternalReferenceBinding::new(ReferenceSource::Input { index: 0 }, Some(2)),
+                ExternalReferenceBinding::new(ReferenceSource::Input { index: 1 }, None),
+            ],
+        );
+        assert_eq!(
+            serde_json::to_string(discharged.external_reference_bindings()).unwrap(),
+            concat!(
+                r#"[{"source":{"input":{"index":0}},"output_index":2},"#,
+                r#"{"source":{"input":{"index":1}},"output_index":null}]"#,
+            ),
+        );
+        assert_eq!(
+            format!("{:?}", discharged.external_reference_bindings()),
+            concat!(
+                "[ExternalReferenceBinding { source: Input { index: 0 }, output_index: Some(2) }, ",
+                "ExternalReferenceBinding { source: Input { index: 1 }, output_index: None }]",
+            ),
+        );
+        assert_eq!(
+            discharged.program().interpret(vec![
+                DischargeValue::Array(Array::scalar::<f32>(10.0)),
+                DischargeValue::Array(Array::scalar::<f32>(20.0)),
+                DischargeValue::Array(Array::scalar::<f32>(7.0))
+            ]),
+            Ok(vec![
+                DischargeValue::Array(Array::scalar::<f32>(20.0)),
+                DischargeValue::Array(Array::scalar::<f32>(10.0)),
+                DischargeValue::Array(Array::scalar::<f32>(7.0))
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_program_discharge_references_widens_positional_callee() {
+        /// Array-IR family extended with one positional call, mirroring how a backend attaches a compiled callee
+        /// region, forwards its operands positionally, and reports its outputs positionally.
+        #[derive(Clone, Debug)]
+        enum CallingOperation {
+            /// Native array-IR operation.
+            Native(DischargeOperation),
+
+            /// Positional call of one attached callee region.
+            Call,
+        }
+
+        impl Operation for CallingOperation {
+            type Type = ArrayIrType;
+
+            fn name(&self) -> &'static str {
+                match self {
+                    Self::Native(operation) => operation.name(),
+                    Self::Call => "test_call",
+                }
+            }
+
+            fn infer_output_types(
+                &self,
+                input_types: &[ArrayIrType],
+                region_interfaces: &[RegionInterface<ArrayIrType>],
+            ) -> Result<Vec<ArrayIrType>, TypeError> {
+                match self {
+                    Self::Native(operation) => operation.infer_output_types(input_types, region_interfaces),
+                    Self::Call => Ok(region_interfaces[0].output_types().to_vec()),
+                }
+            }
+
+            fn region_slots(&self) -> &'static [RegionSlot] {
+                match self {
+                    Self::Native(operation) => operation.region_slots(),
+                    Self::Call => const { &[RegionSlot::computation("callee")] },
+                }
+            }
+
+            fn input_region_provenance(
+                &self,
+                region_index: usize,
+                input_index: usize,
+            ) -> Option<InputRegionProvenance> {
+                match self {
+                    Self::Native(operation) => operation.input_region_provenance(region_index, input_index),
+                    Self::Call => Some(InputRegionProvenance::Forwarded { input_index }),
+                }
+            }
+
+            fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
+                match self {
+                    Self::Native(operation) => operation.output_region_provenance(output_index),
+                    Self::Call => vec![OutputRegionProvenance { region_index: 0, output_index }],
+                }
+            }
+
+            fn effects(&self) -> Cow<'_, Effects> {
+                match self {
+                    Self::Native(operation) => operation.effects(),
+                    Self::Call => Cow::Borrowed(Effects::empty()),
+                }
+            }
+
+            fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+                match self {
+                    Self::Native(operation) => operation.render(formatter, indentation),
+                    Self::Call => formatter.write_str(self.name()),
+                }
+            }
+        }
+
+        // A third-party call-shaped family participates in structured discharge by reaching the shared positional
+        // rewrite, exactly as the backend `jit_call` does, with no companion declaration surface beyond the generic
+        // provenance hooks it already implements. Its reference primitives delegate to the universe-generic rules the
+        // primitives own, and every other native payload replays as the enclosing enum, which is the same split a
+        // dispatch derive generates.
+        impl<C, P> ReferenceDischargeableOperation<C, P> for CallingOperation
+        where
+            C: Context<Type = ArrayIrType, Operation = CallingOperation>,
+            P: ReferenceAccumulationPolicy<C, Referent = ArrayType>,
+        {
+            fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
+                &self,
+                context: &ReferenceDischargeContext<C, P>,
+                driver: &D,
+                inputs: &[ReferenceDischargeValue<C, P>],
+            ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+                match self {
+                    Self::Native(ArrayIrOperation::ReferenceNew(operation)) => {
+                        operation.discharge_references(context, driver, inputs)
+                    }
+                    Self::Native(ArrayIrOperation::ReferenceRead(operation)) => {
+                        operation.discharge_references(context, driver, inputs)
+                    }
+                    Self::Native(ArrayIrOperation::ReferenceWrite(operation)) => {
+                        operation.discharge_references(context, driver, inputs)
+                    }
+                    Self::Native(ArrayIrOperation::ReferenceSwap(operation)) => {
+                        operation.discharge_references(context, driver, inputs)
+                    }
+                    Self::Native(ArrayIrOperation::ReferenceAddUpdate(operation)) => {
+                        operation.discharge_references(context, driver, inputs)
+                    }
+                    Self::Native(ArrayIrOperation::ReferenceFreeze(operation)) => {
+                        operation.discharge_references(context, driver, inputs)
+                    }
+                    Self::Native(_) => discharge_reference_free_operation(self, context, driver, inputs),
+                    Self::Call => discharge_positional_region_operation(self, context, driver, inputs, 0),
+                }
+            }
+        }
+
+        impl From<ReferenceIndexOperation> for CallingOperation {
+            fn from(operation: ReferenceIndexOperation) -> Self {
+                Self::Native(operation.into())
+            }
+        }
+
+        impl From<ReferenceSliceOperation> for CallingOperation {
+            fn from(operation: ReferenceSliceOperation) -> Self {
+                Self::Native(operation.into())
+            }
+        }
+
+        impl ReferenceViewOperation for CallingOperation {
+            type View = ArrayReferenceViewTransform;
+
+            fn reference_view(&self, output_index: usize) -> Option<ArrayReferenceViewTransform> {
+                match self {
+                    Self::Native(operation) => operation.reference_view(output_index),
+                    Self::Call => None,
+                }
+            }
+
+            fn validate_view(
+                view: &ArrayReferenceViewTransform,
+                source: &ArrayIrType,
+                output: &ArrayIrType,
+            ) -> Result<(), ReferenceViewValidationError> {
+                DischargeOperation::validate_view(view, source, output)
+            }
+
+            fn reapply_view<C: Context<Type = ArrayIrType, Operation = Self>>(
+                context: &C,
+                view: &ArrayReferenceViewTransform,
+                source: C::Value,
+                symbols: &[C::Value],
+            ) -> Result<C::Value, ProgramError> {
+                reapply_array_reference_view(context, view, source, symbols)
+            }
+        }
+
+        impl ArrayReferenceViewOperation for CallingOperation {
+            fn from_reference_reshape(operation: ReshapeOperation) -> Self {
+                Self::Native(DischargeOperation::from_reference_reshape(operation))
+            }
+
+            fn from_reference_slice(operation: SliceOperation) -> Self {
+                Self::Native(DischargeOperation::from_reference_slice(operation))
+            }
+
+            fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self {
+                Self::Native(DischargeOperation::from_reference_update_slice(operation))
+            }
+        }
+
+        impl From<AddOperation<ArrayIrType>> for CallingOperation {
+            fn from(operation: AddOperation<ArrayIrType>) -> Self {
+                Self::Native(operation.into())
+            }
+        }
+
+        macro_rules! impl_calling_operation_from_reference_primitive {
+            // Lifts one reference primitive into the calling family, which is the conversion seam a primitive rule
+            // spends when it replays an access to a preserved reference. A dispatch derive generates the same seam.
+            ($payload:ident) => {
+                impl From<$payload<ArrayType, ArrayIrType>> for CallingOperation {
+                    fn from(operation: $payload<ArrayType, ArrayIrType>) -> Self {
+                        Self::Native(operation.into())
+                    }
+                }
+            };
+        }
+
+        impl_calling_operation_from_reference_primitive!(ReferenceNewOperation);
+        impl_calling_operation_from_reference_primitive!(ReferenceReadOperation);
+        impl_calling_operation_from_reference_primitive!(ReferenceWriteOperation);
+        impl_calling_operation_from_reference_primitive!(ReferenceSwapOperation);
+        impl_calling_operation_from_reference_primitive!(ReferenceAddUpdateOperation);
+        impl_calling_operation_from_reference_primitive!(ReferenceFreezeOperation);
+
+        // The callee mutates the allocation it receives and returns only the old snapshot, so its declared boundary
+        // hides the final state that the call target needs after discharge.
+        let mut callee_builder = ProgramBuilder::<DischargeValue, CallingOperation>::new();
+        let reference = callee_builder.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
+        let replacement = callee_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let old = callee_builder
+            .add_instruction(
+                CallingOperation::Native(ReferenceSwapOperation::new().into()),
+                Vec::new(),
+                vec![reference, replacement],
+                None,
+            )
+            .unwrap()[0];
+        let callee = callee_builder
+            .build::<Vec<DischargeValue>, Vec<DischargeValue>>(vec![old], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<DischargeValue, CallingOperation>::new();
+        let callee = builder.import_region(callee.entry_region_ref());
+        let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let replacement = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let allocation = builder
+            .add_instruction(
+                CallingOperation::Native(ReferenceNewOperation::new().into()),
+                Vec::new(),
+                vec![initial],
+                None,
+            )
+            .unwrap()[0];
+        let old = builder
+            .add_instruction(CallingOperation::Call, vec![callee], vec![allocation, replacement], None)
+            .unwrap()[0];
+        let final_snapshot = builder
+            .add_instruction(
+                CallingOperation::Native(ReferenceFreezeOperation::new().into()),
+                Vec::new(),
+                vec![allocation],
+                None,
+            )
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<DischargeValue>, Vec<DischargeValue>>(
+                vec![old, final_snapshot],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        // Discharge appends the callee's final state to its outputs and threads that result into the freeze, leaving
+        // the call itself in place with its positional operand and output contract intact.
+        let discharged = source.discharge_references(0).unwrap();
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[] .
+                let %2:f32[], %3:f32[] = test_call %0 %1 [
+                    callee={
+                        lambda %0:f32[], %1:f32[] .
+                        in (%0, %1)
+                    },
+                ]
+                in (%2, %3)"},
+        );
+    }
+
+    #[test]
     fn test_program_discharge_references_returns_a_reference_free_program_unchanged() {
         // A program that touches no reference is its own discharge and is returned without being replayed, so its
         // rendering, including its instruction numbering, is unchanged.
@@ -8914,6 +9478,204 @@ mod tests {
                     .to_string(),
             ),
         );
+    }
+
+    #[test]
+    fn test_program_partially_discharge_references_keeps_kernel_references_beside_discharged_pipeline_state() {
+        // The shape the kernel pipeline needs: the pipeline's own allocation is normalized into explicit array state
+        // while the allocation a kernel body addresses stays a reference, including its view and the accesses through
+        // that view.
+        let mut builder = ProgramBuilder::<DischargeValue, DischargeOperation>::new();
+        let pipeline_initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let kernel_initial = builder.add_input(ArrayType::new_static(DataType::F32, [3]).into());
+        let step = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let pipeline = builder
+            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![pipeline_initial], None)
+            .unwrap()[0];
+        let kernel = builder
+            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![kernel_initial], None)
+            .unwrap()[0];
+        builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![pipeline, step], None)
+            .unwrap();
+        let element =
+            builder.add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![kernel], None).unwrap()[0];
+        let previous = builder
+            .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![element, step], None)
+            .unwrap()[0];
+        let pipeline_final =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![pipeline], None).unwrap()[0];
+        let kernel_final =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![kernel], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<DischargeValue>, Vec<DischargeValue>>(
+                vec![previous, pipeline_final, kernel_final],
+                vec![Placeholder; 3],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+
+        // Both allocations are selectable in their own right, and the pipeline's is the only one selected.
+        let entry = source.entry_region_ref().id();
+        let targets = source.reference_discharge_targets(0).unwrap();
+        assert_eq!(
+            targets,
+            vec![
+                ReferenceDischargeTarget::Internal { instruction: InstructionId::new(entry, 0), output_index: 0 },
+                ReferenceDischargeTarget::Internal { instruction: InstructionId::new(entry, 1), output_index: 0 },
+            ],
+        );
+        let discharged = source.clone().partially_discharge_references(0, &targets[..1]).unwrap();
+
+        // The selected allocation disappeared into threaded array state, while the unselected one, its view, its swap,
+        // and its freeze all survive as the reference operations the source performed. Neither allocation is
+        // caller-owned, so the mixed program reports no external-reference bindings and keeps exactly its source
+        // boundary.
+        assert_eq!(discharged.output_count(), 3);
+        assert_eq!(discharged.external_reference_bindings(), &[]);
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[3], %2:f32[] .
+                let %3:ref<f32[3]> = reference_new %1
+                    %4:f32[] = add %0 %2
+                    %5:ref<f32[]> = reference_index [axis=0, index=1] %3
+                    %6:f32[] = reference_swap %5 %2
+                    %7:f32[3] = reference_freeze %3
+                in (%6, %4, %7)"},
+        );
+
+        // Eager reference semantics stay the oracle: the mixed program computes exactly what the source program does.
+        let inputs = vec![
+            DischargeValue::Array(Array::scalar::<f32>(10.0)),
+            DischargeValue::Array(Array::vector::<f32>(vec![1.0, 2.0, 3.0])),
+            DischargeValue::Array(Array::scalar::<f32>(7.0)),
+        ];
+        let expected = vec![
+            DischargeValue::Array(Array::scalar::<f32>(2.0)),
+            DischargeValue::Array(Array::scalar::<f32>(17.0)),
+            DischargeValue::Array(Array::vector::<f32>(vec![1.0, 7.0, 3.0])),
+        ];
+        assert_eq!(source.clone().interpret(inputs.clone()), Ok(expected.clone()));
+        assert_eq!(discharged.program().interpret(inputs), Ok(expected));
+
+        // The mixed program proves nothing about reference freedom, and asking for the proof reports the surviving
+        // references instead of converting.
+        assert_eq!(
+            ReferenceDischargeResult::try_from(discharged).unwrap_err(),
+            ProgramError::MalformedProgram(
+                "reference discharge program still contains a reference-typed value and cannot form a full discharge"
+                    .to_string(),
+            ),
+        );
+
+        // Selecting both allocations is the everything-selected case, so it must agree with full discharge exactly.
+        let selected = ReferenceDischargeResult::try_from(
+            source.clone().partially_discharge_references(0, targets.as_slice()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(selected.program().to_string(), source.discharge_references(0).unwrap().program().to_string());
+    }
+
+    #[test]
+    fn test_program_partially_discharge_references_widens_nothing_for_a_preserved_allocation_a_region_writes() {
+        // Read-only pruning and preservation meet here: the discharged reference is only read, so it gains no appended
+        // output, and the preserved reference is *written* inside a branch, which still gains it nothing, because the
+        // write replayed into the rebuilt branch as the operation the source performed. The condition therefore keeps
+        // its source boundary exactly.
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let branch = |writes: bool| {
+            let mut builder = ProgramBuilder::<DischargeValue, DischargeOperation>::new();
+            let pipeline = builder.add_input(reference_type.clone().into());
+            let kernel = builder.add_input(reference_type.clone().into());
+            let observed =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![pipeline], None).unwrap()[0];
+            if writes {
+                builder
+                    .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![kernel, observed], None)
+                    .unwrap();
+            }
+            builder
+                .build::<Vec<DischargeValue>, Vec<DischargeValue>>(
+                    vec![observed],
+                    vec![Placeholder; 2],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        let true_branch = branch(true);
+        let false_branch = branch(false);
+
+        let mut builder = ProgramBuilder::<DischargeValue, DischargeOperation>::new();
+        let true_branch = builder.import_region(true_branch.entry_region_ref());
+        let false_branch = builder.import_region(false_branch.entry_region_ref());
+        let predicate = builder.add_input(ArrayType::scalar(DataType::Boolean).into());
+        let pipeline_initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let kernel_initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let pipeline = builder
+            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![pipeline_initial], None)
+            .unwrap()[0];
+        let kernel = builder
+            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![kernel_initial], None)
+            .unwrap()[0];
+        let observed = builder
+            .add_instruction(
+                ConditionOperation::<DischargeValue>::new(),
+                vec![true_branch, false_branch],
+                vec![predicate, pipeline, kernel],
+                None,
+            )
+            .unwrap()[0];
+        let pipeline_final =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![pipeline], None).unwrap()[0];
+        let kernel_final =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![kernel], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<DischargeValue>, Vec<DischargeValue>>(
+                vec![observed, pipeline_final, kernel_final],
+                vec![Placeholder; 3],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+
+        let targets = source.reference_discharge_targets(0).unwrap();
+        let discharged = source.clone().partially_discharge_references(0, &targets[..1]).unwrap();
+        assert_eq!(discharged.output_count(), 3);
+        assert_eq!(discharged.external_reference_bindings(), &[]);
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:bool[], %1:f32[], %2:f32[] .
+                let %3:ref<f32[]> = reference_new %2
+                    %4:f32[] = condition %0 %1 %3 [
+                        true={
+                            lambda %0:f32[], %1:ref<f32[]> .
+                            let reference_write %1 %0
+                            in (%0)
+                        },
+                        false={
+                            lambda %0:f32[], %1:ref<f32[]> .
+                            in (%0)
+                        },
+                    ]
+                    %5:f32[] = reference_freeze %3
+                in (%4, %1, %5)"},
+        );
+
+        for (predicate, kernel_final) in [(true, 10.0_f32), (false, 3.0)] {
+            let inputs = vec![
+                DischargeValue::Array(Array::scalar(predicate)),
+                DischargeValue::Array(Array::scalar::<f32>(10.0)),
+                DischargeValue::Array(Array::scalar::<f32>(3.0)),
+            ];
+            let outputs = vec![
+                DischargeValue::Array(Array::scalar::<f32>(10.0)),
+                DischargeValue::Array(Array::scalar::<f32>(10.0)),
+                DischargeValue::Array(Array::scalar::<f32>(kernel_final)),
+            ];
+            assert_eq!(source.clone().interpret(inputs.clone()), Ok(outputs.clone()));
+            assert_eq!(discharged.program().interpret(inputs), Ok(outputs));
+        }
     }
 
     #[test]
@@ -9173,6 +9935,62 @@ mod tests {
                 ]
                 in (%1)"},
         );
+    }
+
+    #[test]
+    fn test_closed_program_discharge_references_resolves_transitively_nested_reference_captures() {
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let predicate_type = ArrayType::scalar(DataType::Boolean);
+        let mut leaf_builder = ProgramBuilder::<DischargeCapture, DischargeCaptureOperation>::new();
+        let reference = leaf_builder.add_constant(DischargeCapture::new(0, reference_type.into()));
+        let value = leaf_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        let leaf = leaf_builder
+            .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(vec![value], Vec::new(), vec![Placeholder])
+            .unwrap();
+
+        let mut middle_builder = ProgramBuilder::<DischargeCapture, DischargeCaptureOperation>::new();
+        let leaf = middle_builder.import_region(leaf.entry_region_ref());
+        let predicate = middle_builder.add_constant(DischargeCapture::new(1, predicate_type.clone().into()));
+        let value = middle_builder
+            .add_instruction(
+                ConditionOperation::<ArrayIrValue<DischargeArrayCapture>>::new(),
+                vec![leaf, leaf],
+                vec![predicate],
+                None,
+            )
+            .unwrap()[0];
+        let middle = middle_builder
+            .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(vec![value], Vec::new(), vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<DischargeCapture, DischargeCaptureOperation>::new();
+        let middle = builder.import_region(middle.entry_region_ref());
+        let predicate = builder.add_constant(DischargeCapture::new(1, predicate_type.into()));
+        let value = builder
+            .add_instruction(
+                ConditionOperation::<ArrayIrValue<DischargeArrayCapture>>::new(),
+                vec![middle, middle],
+                vec![predicate],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(vec![value], Vec::new(), vec![Placeholder])
+            .unwrap();
+        let reference = ArrayReference::new(Array::scalar(4.0f32));
+        let closed = ClosedProgram::new(
+            program,
+            vec![ArrayIrValue::Reference(reference), DischargeValue::Array(Array::scalar(true))],
+        )
+        .unwrap();
+
+        let discharged = closed.discharge_references().unwrap();
+        assert_eq!(discharged.output_count(), 1);
+        assert_eq!(discharged.external_reference_bindings().len(), 1);
+        assert_eq!(discharged.external_reference_bindings()[0].source(), ReferenceSource::Capture { index: 0 });
+        assert!(!discharged.external_reference_bindings()[0].is_mutated());
     }
 
     #[test]

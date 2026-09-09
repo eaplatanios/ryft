@@ -3617,11 +3617,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use indoc::indoc;
-    use pretty_assertions::assert_eq;
-
     use std::sync::Arc;
     use std::time::{Duration, Instant};
+
+    use indoc::indoc;
+    use pretty_assertions::assert_eq;
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrValue, ArrayOperation, ArrayReference, DataType, DimensionBounds,
@@ -3648,7 +3648,8 @@ mod tests {
     };
     use crate::parameters::Placeholder;
     use crate::programs::{
-        EffectClasses, Program, ProgramBuilder, ReferenceAliasKind, ReferenceAliasPosition, ReferenceType,
+        EffectClasses, Program, ProgramBuilder, ReferenceAliasKind, ReferenceAliasPosition, ReferenceSource,
+        ReferenceType,
     };
     use crate::tests::CountingBatchingDriver;
     use crate::tracing::{DomainTracingContext, Trace};
@@ -3771,6 +3772,13 @@ mod tests {
             builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![stack], None).unwrap()[0];
         builder.build(vec![final_carry, frozen], vec![Placeholder; 2], vec![Placeholder; 2]).unwrap()
     }
+
+    /// Captured composite value in the reference discharge fixtures.
+    type DischargeCapture = CaptureReference<ArrayIrType>;
+    /// Captured array payload in the reference discharge fixtures.
+    type DischargeArrayCapture = CaptureReference<ArrayType>;
+    /// Operation family used by captured array discharge programs.
+    type DischargeCaptureOperation = ArrayIrOperation<DischargeArrayCapture>;
 
     #[test]
     fn test_scan_composite_type_contract() {
@@ -4949,6 +4957,634 @@ mod tests {
         assert_eq!(discharged.output_count(), 3);
         assert_eq!(discharged.external_reference_bindings(), &[]);
         assert_eq!(discharged.program().interpret(inputs), Ok(expected));
+    }
+
+    #[test]
+    fn test_scan_reference_discharge_threads_a_preserved_carry_through_a_scan() {
+        // A scan inserts its synthesized state carries immediately after the declared carry prefix, and a preserved
+        // carry stays a declared carry: it keeps its position and its reference type on both boundaries.
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let total = body_builder.add_input(reference_type.clone().into());
+        let step = body_builder.add_input(reference_type.clone().into());
+        let increment =
+            body_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![step], None).unwrap()[0];
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![total, increment], None)
+            .unwrap();
+        let observed =
+            body_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![total], None).unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![total, step, observed],
+                vec![Placeholder; 2],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let total_initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let step_initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let total = builder
+            .add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![total_initial], None)
+            .unwrap()[0];
+        let step =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![step_initial], None).unwrap()[0];
+        let outputs = builder
+            .add_instruction(ScanOperation::<TestIrValue>::new(2, 3), vec![body], vec![total, step], None)
+            .unwrap();
+        let (carried_total, carried_step, stacked) = (outputs[0], outputs[1], outputs[2]);
+        let final_total = builder
+            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![carried_total], None)
+            .unwrap()[0];
+        let final_step = builder
+            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![carried_step], None)
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![final_total, stacked, final_step],
+                vec![Placeholder; 2],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+
+        let targets = source.reference_discharge_targets(0).unwrap();
+        let discharged = source.clone().partially_discharge_references(0, &targets[..1]).unwrap();
+        assert_eq!(discharged.output_count(), 3);
+        assert_eq!(discharged.external_reference_bindings(), &[]);
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[] .
+                let %2:ref<f32[]> = reference_new %1
+                    %3:f32[], %4:ref<f32[]>, %5:f32[3] = scan [carry_count=2, length=3, reverse=false] %0 %2 [
+                        body={
+                            lambda %0:f32[], %1:ref<f32[]> .
+                            let %2:f32[] = reference_read %1
+                                %3:f32[] = add %0 %2
+                            in (%3, %1, %3)
+                        },
+                    ]
+                    %6:f32[] = reference_freeze %2
+                in (%3, %5, %6)"},
+        );
+
+        let inputs = vec![TestIrValue::Array(Array::scalar::<f32>(0.0)), TestIrValue::Array(Array::scalar::<f32>(2.0))];
+        let outputs = vec![
+            TestIrValue::Array(Array::scalar::<f32>(6.0)),
+            TestIrValue::Array(Array::vector::<f32>(vec![2.0, 4.0, 6.0])),
+            TestIrValue::Array(Array::scalar::<f32>(2.0)),
+        ];
+        assert_eq!(source.interpret(inputs.clone()), Ok(outputs.clone()));
+        assert_eq!(discharged.program().interpret(inputs), Ok(outputs));
+    }
+
+    #[test]
+    fn test_scan_reference_discharge_keeps_state_carries_separate_from_stacked_outputs() {
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let reference = body_builder.add_input(reference_type.clone().into());
+        let update = body_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(1.0)));
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let value = body_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![reference, value],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let reference = builder.add_input(reference_type.into());
+        let operation = ScanOperation::<TestIrValue>::new(1, 3).with_reverse(true).with_unroll(3).unwrap();
+        let outputs = builder.add_instruction(operation, vec![body], vec![reference], None).unwrap();
+        let final_reference = outputs[0];
+        let stacked_values = outputs[1];
+        let final_value = builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![final_reference], None)
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![final_value, stacked_values],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        // The synthesized state joins the declared carry prefix on both boundaries instead of being appended after the
+        // stacked outputs, and every unrelated scan attribute survives the rewrite unchanged.
+        let discharged = source.discharge_references(0).unwrap();
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:f32[] .
+                let %1:f32[], %2:f32[3] = scan [carry_count=1, length=3, reverse=true, unroll=3] %0 [
+                    body={
+                        lambda %0:f32[] .
+                        let %1:f32[] = const 1.0
+                            %2:f32[] = add %0 %1
+                        in (%2, %2)
+                    },
+                ]
+                in (%1, %2, %1)"},
+        );
+        assert_eq!(discharged.output_count(), 2);
+        assert_eq!(discharged.external_reference_bindings()[0].output_index(), Some(2));
+        let scan = discharged.program().entry_region_ref().instructions()[0].operation();
+        let TestIrOperation::Scan(scan) = scan else {
+            panic!("expected discharged scan operation");
+        };
+        assert_eq!(scan.carry_count(), 1);
+        assert_eq!(scan.length(), &Dimension::Static(3));
+        assert!(scan.reverse());
+        assert_eq!(scan.unroll(), 3);
+        assert_eq!(
+            discharged.program().interpret(vec![TestIrValue::Array(Array::scalar::<f32>(2.0))]),
+            Ok(vec![
+                TestIrValue::Array(Array::scalar::<f32>(5.0)),
+                TestIrValue::Array(Array::vector::<f32>(vec![5.0, 4.0, 3.0])),
+                TestIrValue::Array(Array::scalar::<f32>(5.0))
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_scan_reference_discharge_composes_with_partial_evaluation() {
+        let array_type = ArrayType::scalar(DataType::F32);
+        let reference_type = ReferenceType::new(array_type.clone());
+        let mut body_builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let reference = body_builder.add_input(reference_type.clone().into());
+        let update = body_builder.add_constant(ArrayIrValue::Array(Array::scalar(1.0_f32)));
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let body = body_builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![reference],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(array_type.clone().into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let body = builder.import_region(body.entry_region_ref());
+        let reference = builder
+            .add_instruction(ScanOperation::<ArrayIrValue<Array>>::new(1, 3), vec![body], vec![reference], None)
+            .unwrap()[0];
+        let output =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        // Discharge turns the scan's mutated reference into an ordinary carry before partial evaluation runs, so an
+        // unknown boundary residualizes the whole three-iteration loop as a pure reference-free program.
+        let evaluation = source
+            .discharge_references(0)
+            .unwrap()
+            .into_program_without_external_references()
+            .unwrap()
+            .partially_evaluate(&[PartialValue::Unknown(array_type.into())])
+            .unwrap();
+        assert!(evaluation.program().effects().classes().is_empty());
+        assert!(!evaluation.program().entry_region_ref().contains_atom_type_in_closure(Type::is_reference));
+        assert_eq!(
+            evaluation.program().interpret(vec![ArrayIrValue::Array(Array::scalar(3.0_f32))]),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(6.0_f32))]),
+        );
+    }
+
+    #[test]
+    fn test_scan_reference_discharge_appends_the_synthesized_carry_after_the_declared_carry_prefix() {
+        // A scan that already declares an ordinary carry pins the synthesized-state placement exactly: the state
+        // operand joins the carry prefix behind every declared carry and ahead of the trailing stacked inputs, on the
+        // parent operand list, the body boundary, and the rewritten carry count alike.
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut body_builder = ProgramBuilder::<DischargeCapture, DischargeCaptureOperation>::new();
+        let carry = body_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let element = body_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let reference = body_builder.add_constant(DischargeCapture::new(0, reference_type.into()));
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, element], None)
+            .unwrap();
+        let next_carry = body_builder
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, element], None)
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(
+                vec![next_carry],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<DischargeCapture, DischargeCaptureOperation>::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let elements = builder.add_input(ArrayType::new_static(DataType::F32, [3]).into());
+        let final_carry = builder
+            .add_instruction(
+                ScanOperation::<ArrayIrValue<DischargeArrayCapture>>::new(1, 3),
+                vec![body],
+                vec![initial, elements],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(
+                vec![final_carry],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let closed =
+            ClosedProgram::new(program, vec![ArrayIrValue::Reference(ArrayReference::new(Array::scalar(0.0f32)))])
+                .unwrap();
+
+        let discharged = closed.discharge_references().unwrap();
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[], %2:f32[3] .
+                let %3:f32[], %4:f32[] = scan [carry_count=2, length=3, reverse=false] %1 %0 %2 [
+                    body={
+                        lambda %0:f32[], %1:f32[], %2:f32[] .
+                        let %3:f32[] = add %1 %2
+                            %4:f32[] = add %0 %2
+                        in (%4, %3)
+                    },
+                ]
+                in (%3, %4)"},
+        );
+        assert_eq!(discharged.output_count(), 1);
+        assert_eq!(discharged.external_reference_bindings()[0].source(), ReferenceSource::Capture { index: 0 });
+        assert_eq!(
+            discharged.external_reference_bindings()[0].source().flat_input_index(discharged.capture_count()),
+            Ok(0)
+        );
+        assert_eq!(discharged.external_reference_bindings()[0].output_index(), Some(1));
+        let DischargeCaptureOperation::Scan(scan) =
+            discharged.program().entry_region_ref().instructions()[0].operation()
+        else {
+            panic!("expected discharged scan operation");
+        };
+        assert_eq!(scan.carry_count(), 2);
+        assert_eq!(scan.length(), &Dimension::Static(3));
+    }
+
+    #[test]
+    fn test_scan_reference_discharge_preserves_zero_length_state_identity() {
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let reference = body_builder.add_input(reference_type.clone().into());
+        let update = body_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(1.0)));
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let value = body_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![reference, value],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let reference = builder.add_input(reference_type.into());
+        let outputs = builder
+            .add_instruction(ScanOperation::<TestIrValue>::new(1, 0), vec![body], vec![reference], None)
+            .unwrap();
+        let final_reference = outputs[0];
+        let stacked_values = outputs[1];
+        let final_value = builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![final_reference], None)
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![final_value, stacked_values],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let discharged = source.discharge_references(0).unwrap();
+        assert_eq!(discharged.external_reference_bindings()[0].output_index(), Some(2));
+        assert_eq!(
+            discharged.program().interpret(vec![TestIrValue::Array(Array::scalar::<f32>(2.0))]),
+            Ok(vec![
+                TestIrValue::Array(Array::scalar::<f32>(2.0)),
+                TestIrValue::Array(Array::vector::<f32>(Vec::new())),
+                TestIrValue::Array(Array::scalar::<f32>(2.0))
+            ]),
+        );
+    }
+
+    #[test]
+    fn test_scan_reference_discharge_threads_reference_captures_through_scan() {
+        // A capture read by a scan body becomes a synthesized carry appended after the declared carry prefix, which
+        // raises the rewritten scan's carry count without disturbing its length, direction, or unroll factor.
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let concrete_reference = ArrayReference::new(Array::scalar(4.0f32));
+        let mut body_builder = ProgramBuilder::<DischargeCapture, DischargeCaptureOperation>::new();
+        let reference = body_builder.add_constant(DischargeCapture::new(0, reference_type.into()));
+        let value = body_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(vec![value], Vec::new(), vec![Placeholder])
+            .unwrap();
+        let mut builder = ProgramBuilder::<DischargeCapture, DischargeCaptureOperation>::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let values = builder
+            .add_instruction(
+                ScanOperation::<ArrayIrValue<DischargeArrayCapture>>::new(0, 2),
+                vec![body],
+                Vec::new(),
+                None,
+            )
+            .unwrap()[0];
+        let scan_program = builder
+            .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(vec![values], Vec::new(), vec![Placeholder])
+            .unwrap();
+        let closed = ClosedProgram::new(scan_program, vec![ArrayIrValue::Reference(concrete_reference)]).unwrap();
+        let discharged = closed.discharge_references().unwrap();
+        assert!(!discharged.external_reference_bindings()[0].is_mutated());
+        assert_eq!(discharged.external_reference_bindings()[0].output_index(), None);
+        assert_eq!(
+            discharged.program().output_types(),
+            vec![TestIrValue::Array(Array::vector::<f32>(vec![0.0, 0.0])).r#type().into_owned()]
+        );
+        let scan = discharged.program().entry_region_ref().instructions()[0].operation();
+        let DischargeCaptureOperation::Scan(scan) = scan else {
+            panic!("expected discharged scan operation");
+        };
+        assert_eq!(scan.carry_count(), 1);
+        assert_eq!(scan.length(), &Dimension::Static(2));
+        assert!(!scan.reverse());
+        assert_eq!(scan.unroll(), 1);
+    }
+
+    #[test]
+    fn test_scan_reference_discharge_threads_mutated_reference_capture_through_scan() {
+        // A capture that a scan body accumulates into reaches that body only through a synthesized carry, which is the
+        // most involved discharge path: the state enters the scan appended after the declared carry prefix, is updated
+        // inside the body, leaves through the matching synthesized carry output, and reaches the hidden entry
+        // final-state output after the public prefix. The capture value family carries no data, so the rendered program
+        // rather than an interpretation pins the resulting state flow.
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut body_builder = ProgramBuilder::<DischargeCapture, DischargeCaptureOperation>::new();
+        let reference = body_builder.add_constant(DischargeCapture::new(0, reference_type.into()));
+        let update = body_builder.add_constant(DischargeCapture::new(1, ArrayType::scalar(DataType::F32).into()));
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let value = body_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(vec![value], Vec::new(), vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<DischargeCapture, DischargeCaptureOperation>::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let values = builder
+            .add_instruction(
+                ScanOperation::<ArrayIrValue<DischargeArrayCapture>>::new(0, 3),
+                vec![body],
+                Vec::new(),
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<DischargeCapture>, Vec<DischargeCapture>>(vec![values], Vec::new(), vec![Placeholder])
+            .unwrap();
+        let closed = ClosedProgram::new(
+            program,
+            vec![
+                ArrayIrValue::Reference(ArrayReference::new(Array::scalar(2.0f32))),
+                TestIrValue::Array(Array::scalar::<f32>(1.0)),
+            ],
+        )
+        .unwrap();
+
+        let discharged = closed.discharge_references().unwrap();
+        assert_eq!(discharged.output_count(), 1);
+        assert_eq!(discharged.external_reference_bindings().len(), 1);
+        assert_eq!(discharged.external_reference_bindings()[0].source(), ReferenceSource::Capture { index: 0 });
+        assert_eq!(
+            discharged.external_reference_bindings()[0].source().flat_input_index(discharged.capture_count()),
+            Ok(0)
+        );
+        assert!(discharged.external_reference_bindings()[0].is_mutated());
+        assert_eq!(discharged.external_reference_bindings()[0].output_index(), Some(1));
+        assert_eq!(
+            discharged.program().to_string(),
+            indoc! {"
+                lambda %0:f32[], %1:f32[] .
+                let %2:f32[], %3:f32[3] = scan [carry_count=1, length=3, reverse=false] %0 [
+                    body={
+                        lambda %0:f32[] .
+                        let %1:f32[] = const capture#1:f32[]
+                            %2:f32[] = add %0 %1
+                        in (%2, %2)
+                    },
+                ]
+                in (%3, %2)"},
+        );
+    }
+
+    #[test]
+    fn test_scan_reference_discharge_matches_eager_reference_execution() {
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let reference = body_builder.add_input(reference_type.into());
+        let update = body_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(3.0)));
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let value = body_builder
+            .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![reference, value],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let outputs = builder
+            .add_instruction(ScanOperation::<TestIrValue>::new(1, 4), vec![body], vec![reference], None)
+            .unwrap();
+        let final_reference = outputs[0];
+        let stacked_values = outputs[1];
+        let frozen = builder
+            .add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![final_reference], None)
+            .unwrap()[0];
+        let source = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![frozen, stacked_values],
+                vec![Placeholder],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        // The declared reference carry and the accumulating body must agree with eager execution on both the stacked
+        // per-iteration snapshots and the state observed after the scan.
+        let eager = source.clone().interpret(vec![TestIrValue::Array(Array::scalar::<f32>(0.0))]).unwrap();
+        assert_eq!(
+            eager,
+            vec![
+                TestIrValue::Array(Array::scalar::<f32>(12.0)),
+                TestIrValue::Array(Array::vector::<f32>(vec![3.0, 6.0, 9.0, 12.0]))
+            ]
+        );
+        let discharged = source.discharge_references(0).unwrap();
+        assert_eq!(discharged.external_reference_bindings(), &[]);
+        assert_eq!(discharged.program().interpret(vec![TestIrValue::Array(Array::scalar::<f32>(0.0))]), Ok(eager));
+    }
+
+    #[test]
+    fn test_scan_reference_discharge_matches_eager_reference_execution_for_stacked_reference() {
+        // The per-iteration slice of a stacked reference operand is the one boundary view that crosses into a scan
+        // body. The discharged form must agree with eager execution on the carry, on the stacked value output, and on
+        // the allocation's state observed after the scan, which the rewrite publishes through an extra stacked output.
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let carry = body_builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let slice = body_builder.add_input(ReferenceType::new(ArrayType::scalar(DataType::F32)).into());
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![slice, carry], None)
+            .unwrap();
+        let current =
+            body_builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![slice], None).unwrap()[0];
+        let doubled = body_builder
+            .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![current, current], None)
+            .unwrap()[0];
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![current, doubled],
+                vec![Placeholder; 2],
+                vec![Placeholder; 2],
+            )
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let elements = builder.add_input(ArrayType::new_static(DataType::F32, [4]).into());
+        let stack = builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![elements], None).unwrap()[0];
+        let outputs = builder
+            .add_instruction(ScanOperation::<TestIrValue>::new(1, 4), vec![body], vec![initial, stack], None)
+            .unwrap();
+        let (final_carry, doubled) = (outputs[0], outputs[1]);
+        let frozen =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![stack], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(
+                vec![final_carry, doubled, frozen],
+                vec![Placeholder; 2],
+                vec![Placeholder; 3],
+            )
+            .unwrap();
+
+        let inputs = vec![
+            TestIrValue::Array(Array::scalar::<f32>(1.0)),
+            TestIrValue::Array(Array::vector::<f32>(vec![1.0, 2.0, 3.0, 4.0])),
+        ];
+        let eager = source.clone().interpret(inputs.clone()).unwrap();
+        assert_eq!(
+            eager,
+            vec![
+                TestIrValue::Array(Array::scalar::<f32>(11.0)),
+                TestIrValue::Array(Array::vector::<f32>(vec![4.0, 8.0, 14.0, 22.0])),
+                TestIrValue::Array(Array::vector::<f32>(vec![2.0, 4.0, 7.0, 11.0]))
+            ]
+        );
+        let discharged = source.discharge_references(0).unwrap();
+        assert_eq!(discharged.external_reference_bindings(), &[]);
+        assert_eq!(
+            discharged.program().output_types(),
+            vec![
+                ArrayType::scalar(DataType::F32).into(),
+                ArrayType::new_static(DataType::F32, [4]).into(),
+                ArrayType::new_static(DataType::F32, [4]).into(),
+            ],
+        );
+        assert_eq!(discharged.program().interpret(inputs), Ok(eager));
+    }
+
+    #[test]
+    fn test_scan_reference_discharge_dynamic_length_accepts_the_trailing_runtime_length_operand() {
+        // A dynamic-length scan carries one runtime-length operand after the body's inputs, so the scan discharge
+        // rule's arity validation must accept the one-past-body parent arity instead of rejecting the canonical dynamic
+        // form.
+        let length = DimensionVariable::new("length", DimensionBounds::positive(Some(9)).unwrap());
+        let reference_type = ReferenceType::new(ArrayType::scalar(DataType::F32));
+        let mut body_builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let reference = body_builder.add_input(reference_type.into());
+        let update = body_builder.add_constant(TestIrValue::Array(Array::scalar::<f32>(3.0)));
+        body_builder
+            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
+            .unwrap();
+        let body = body_builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![reference], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+
+        let mut builder = ProgramBuilder::<TestIrValue, TestIrOperation>::new();
+        let body = builder.import_region(body.entry_region_ref());
+        let initial = builder.add_input(ArrayType::scalar(DataType::F32).into());
+        let runtime_length = builder.add_input(DimensionType::new(length.clone()).into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
+        let scanned = builder
+            .add_instruction(
+                ScanOperation::<TestIrValue>::new(1, Dimension::Dynamic(length.clone())),
+                vec![body],
+                vec![reference, runtime_length],
+                None,
+            )
+            .unwrap()[0];
+        let frozen =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![scanned], None).unwrap()[0];
+        let source = builder
+            .build::<Vec<TestIrValue>, Vec<TestIrValue>>(vec![frozen], vec![Placeholder; 2], vec![Placeholder])
+            .unwrap();
+
+        let runtime_length = ArrayIrValue::Dimension(DimensionValue::new(DimensionType::new(length), 4).unwrap());
+        let eager = source
+            .clone()
+            .interpret(vec![TestIrValue::Array(Array::scalar::<f32>(0.0)), runtime_length.clone()])
+            .unwrap();
+        assert_eq!(eager, vec![TestIrValue::Array(Array::scalar::<f32>(12.0))]);
+        let discharged = source.discharge_references(0).unwrap();
+        assert_eq!(discharged.external_reference_bindings(), &[]);
+        assert_eq!(
+            discharged.program().interpret(vec![TestIrValue::Array(Array::scalar::<f32>(0.0)), runtime_length]),
+            Ok(eager)
+        );
     }
 
     /// The known-ness split keeps *time-varying* known work known under an eager context too: a known stacked input

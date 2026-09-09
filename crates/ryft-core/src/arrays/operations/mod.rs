@@ -13,7 +13,7 @@ use ryft_macros::Operation;
 use crate::arrays::arrays::Array;
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::ir::ArrayIrValue;
-use crate::arrays::reference_views::{ArrayReferenceViewTransform, ViewIndex};
+use crate::arrays::references::{ArrayReferenceViewTransform, ViewIndex};
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::{Dimension, DimensionType};
 use crate::arrays::types::ir::ArrayIrType;

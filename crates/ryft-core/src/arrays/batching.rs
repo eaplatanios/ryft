@@ -3991,7 +3991,7 @@ mod tests {
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, DimensionOperation};
-    use crate::arrays::reference_views::ArrayReference;
+    use crate::arrays::references::ArrayReference;
     use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxis, MeshAxisType};
     use crate::arrays::sharding::shardings::ShardingDimension;
     use crate::arrays::types::data::DataType;

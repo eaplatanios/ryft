@@ -434,7 +434,7 @@ mod tests {
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
-    use crate::arrays::reference_views::{ArrayReference, ArrayReferenceViewTransform, ViewIndex};
+    use crate::arrays::references::{ArrayReference, ArrayReferenceViewTransform, ViewIndex};
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};

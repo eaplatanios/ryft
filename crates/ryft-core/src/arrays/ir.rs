@@ -5,7 +5,7 @@ use ryft_macros::Parameter;
 
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::operations::ArrayIrOperation;
-use crate::arrays::reference_views::ArrayReference;
+use crate::arrays::references::ArrayReference;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::DimensionType;
 use crate::arrays::types::ir::ArrayIrType;
@@ -261,7 +261,7 @@ mod tests {
 
     use crate::arrays::arrays::Array;
     use crate::arrays::operations::ArrayIrOperation;
-    use crate::arrays::reference_views::ArrayReferenceViewError;
+    use crate::arrays::references::ArrayReferenceViewError;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionVariable, Shape};
     use crate::captures::CaptureReference;

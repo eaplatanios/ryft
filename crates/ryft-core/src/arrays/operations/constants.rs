@@ -246,7 +246,7 @@ mod tests {
     use crate::arrays::encoding::{i4, u4};
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
-    use crate::arrays::reference_views::ArrayReference;
+    use crate::arrays::references::ArrayReference;
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};

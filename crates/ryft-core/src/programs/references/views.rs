@@ -1071,9 +1071,9 @@ mod tests {
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::{
-        ConditionOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-        ReferenceWriteOperation, ReshapeOperation, SCAN_OPERATION_NAME, ScanOperation, SliceOperation,
-        UpdateSliceOperation, WhileOperation,
+        ConditionOperation, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
+        ReferenceReadOperation, ReferenceWriteOperation, ReshapeOperation, SCAN_OPERATION_NAME, ScanOperation,
+        SliceOperation, UpdateSliceOperation, WhileOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::atoms::AtomId;
@@ -1082,6 +1082,7 @@ mod tests {
     use crate::programs::instructions::Instruction;
     use crate::programs::programs::Program;
     use crate::programs::references::analysis::{ReferenceAliasEdge, ReferenceAliasPosition};
+    use crate::programs::references::discharge::ReferenceSource;
     use crate::programs::references::types::ReferenceType;
     use crate::programs::regions::{
         InputRegionProvenance, OutputRegionProvenance, RegionId, RegionInterface, RegionSlot,
@@ -1743,8 +1744,56 @@ mod tests {
     }
 
     #[test]
+    fn test_reference_view_analysis_new_rejects_invalid_view_compositions() {
+        // Bypass instruction inference so the view analysis must report the invalid array transform itself. Axis 2
+        // does not exist on this rank-2 referent, regardless of the declared output type.
+        let mut builder = TestBuilder::new();
+        let matrix = builder.add_input(reference_type([2, 3]));
+        let view = builder.add_variable(reference_type([2, 3]));
+        builder.add_instruction_unchecked(Instruction::new(
+            ArrayIrOperation::ReferenceIndex(ReferenceIndexOperation::new(2, 0)),
+            vec![matrix],
+            vec![view],
+            Vec::new(),
+        ));
+        let program =
+            builder.build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
+        assert_eq!(
+            ReferenceViewAnalysis::new(program.entry_region_ref(), 0).err(),
+            Some(ReferenceViewAnalysisError::InvalidViewComposition {
+                operation: REFERENCE_INDEX_OPERATION_NAME,
+                instruction: id(0, 0),
+                message: "reference index axis 2 is out of bounds for rank 2".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_reference_view_analysis_new_propagates_analysis_errors() {
+        // Consuming an entry reference input fails structural analysis before any view is derived. The view analysis
+        // preserves the typed error and its input ownership diagnostic.
+        let mut builder = TestBuilder::new();
+        let reference = builder.add_input(reference_type([2]));
+        let frozen =
+            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![frozen], vec![Placeholder], vec![Placeholder])
+            .unwrap();
+        assert_eq!(
+            ReferenceViewAnalysis::new(program.entry_region_ref(), 0).err(),
+            Some(ReferenceViewAnalysisError::Analysis(ReferenceAnalysisError::ExternalReferenceConsumption {
+                operation: "reference_freeze",
+                instruction: id(0, 0),
+                root: ReferenceRoot::RegionInput { region: RegionId::new(0), input_index: 0 },
+                external_source: ReferenceSource::Input { index: 0 },
+            })),
+        );
+    }
+
+    #[test]
     fn test_reference_view_analysis_new_rejects_missing_views() {
         /// Array-IR family extended with one operation that declares a view alias but describes no view for it.
+        #[allow(clippy::large_enum_variant)]
         #[derive(Clone, Debug)]
         enum UndescribedViewOperation {
             Native(TestOperation),

@@ -19,7 +19,7 @@ use ryft_macros::Parameter;
 
 use crate::arrays::addressing::ArraySliceAxis;
 use crate::arrays::ir::ArrayIrValue;
-use crate::arrays::reference_views::{ArrayReference, ArrayReferenceView, ArrayReferenceViewTransform, ViewIndex};
+use crate::arrays::references::{ArrayReference, ArrayReferenceView, ArrayReferenceViewTransform, ViewIndex};
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::ir::ArrayIrType;
@@ -956,8 +956,7 @@ mod tests {
     use crate::arrays::batching::{ArrayIrBatch, ArrayIrBatchingPolicy};
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
-    use crate::arrays::reference_discharge::ArrayReferenceDischarge;
-    use crate::arrays::reference_views::ArrayReferenceViewError;
+    use crate::arrays::references::{ArrayReferenceDischarge, ArrayReferenceViewError};
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
     use crate::axes::Axis;
@@ -1067,10 +1066,10 @@ mod tests {
         assert_eq!(
             indexed.alias(),
             &ArrayReferenceView::root()
-                .with_transform_unchecked(ArrayReferenceViewTransform::Slice {
+                .with_view(ArrayReferenceViewTransform::Slice {
                     axes: vec![ArraySliceAxis::new(1, 2, 1), ArraySliceAxis::new(0, 2, 1)],
                 })
-                .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) }),
+                .with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) }),
         );
         assert_eq!(context.read(&indexed), Ok(TestValue::Array(Array::vector(vec![7.0_f32, 8.0]))));
 
@@ -1129,7 +1128,7 @@ mod tests {
         assert_eq!(
             view.alias(),
             &ArrayReferenceView::root()
-                .with_transform_unchecked(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(0) }),
+                .with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(0) }),
         );
         assert_eq!(
             view.preserved().map(|value| value.r#type().into_owned()),
