@@ -713,8 +713,8 @@ mod tests {
         assert!(matches!(
             source.discharge_references(0),
             Err(ProgramError::MalformedProgram(message)) if message.ends_with(
-                "across a region boundary, which carries the complete stored value `ref<f32[4]>`; create the view inside the \
-                 region instead",
+                "cannot cross a region boundary, which requires the complete stored value `ref<f32[4]>`; create the view \
+                 inside the region instead",
             ),
         ));
 

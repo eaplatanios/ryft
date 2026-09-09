@@ -855,8 +855,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayType, DataType,
-        Dimension, Shape, ShardingDimension,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference, ArrayReferenceDischarge,
+        ArrayType, DataType, Dimension, Shape, ShardingDimension,
     };
     use crate::batching::{Batch, BatchAxis, ProgramBatchingOutputAxesPolicy};
     use crate::contexts::{Context, EagerContext};
@@ -864,6 +864,7 @@ mod tests {
         CotangentDestination, CotangentSeed, Differentiate, ForwardModeDifferentiate, LinearizationTracer,
         ReverseModeDifferentiate, differentiate_at,
     };
+    use crate::operations::control_flow::condition::ConditionOperation;
     use crate::operations::differentiation::tests::{
         ReferenceRuleDifferentiationDriver, array_ir_identity_program, nested_custom_derivative_state_program,
     };
@@ -1011,6 +1012,77 @@ mod tests {
             linearization.pullback().unwrap().interpret(cotangents),
             Ok(vec![ArrayIrValue::Array(Array::scalar(3.0_f32))])
         );
+    }
+
+    #[test]
+    fn test_custom_vjp_discharge_rejects_reference_inputs_inside_a_condition() {
+        // A custom VJP call threads a plumbing reference into its dormant forward and backward rules, whose
+        // reference-typed inputs are bound by the transform that instantiates them and therefore declare no input
+        // provenance. Summarizing a condition branch containing such a call skips those rules exactly as the reference
+        // analysis does, so discharging the program reaches the call's own discharge rule, which reports that a
+        // caller reference cannot cross the custom VJP boundary, instead of failing on undeclared provenance.
+        let reference_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32)));
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let identity = |input_types: Vec<ArrayIrType>, output_positions: Vec<usize>| {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let inputs = input_types.iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
+            let outputs = output_positions.iter().map(|position| inputs[*position]).collect::<Vec<_>>();
+            builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    outputs,
+                    vec![Placeholder; input_types.len()],
+                    vec![Placeholder; output_positions.len()],
+                )
+                .unwrap()
+        };
+        let rules = [
+            identity(vec![reference_type.clone(), scalar_type.clone()], vec![1]),
+            identity(vec![reference_type.clone(), scalar_type.clone()], vec![1, 0]),
+            identity(vec![reference_type.clone(), reference_type.clone(), scalar_type.clone()], vec![2]),
+        ];
+        let branch = {
+            let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let regions = rules.iter().map(|rule| builder.import_region(rule.entry_region_ref())).collect();
+            let stash = builder.add_input(reference_type.clone());
+            let x = builder.add_input(scalar_type.clone());
+            let operation = CustomVjpOperation::<ArrayIrType>::new().with_non_differentiated_count(1);
+            let output = builder
+                .add_instruction(ArrayIrOperation::CustomVjp(operation), regions, vec![stash, x], None)
+                .unwrap()[0];
+            builder
+                .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                    vec![output],
+                    vec![Placeholder; 2],
+                    vec![Placeholder],
+                )
+                .unwrap()
+        };
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let branch = builder.import_region(branch.entry_region_ref());
+        let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
+        let stash = builder.add_input(reference_type);
+        let x = builder.add_input(scalar_type);
+        let output = builder
+            .add_instruction(
+                ArrayIrOperation::Condition(ConditionOperation::new()),
+                vec![branch, branch],
+                vec![predicate, stash, x],
+                None,
+            )
+            .unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 3],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(matches!(
+            program.discharge_references::<ArrayReferenceDischarge>(0),
+            Err(ProgramError::UnsupportedOperation { message })
+                if message == "`custom_vjp` does not thread external references through discharge, but operand 0 is a \
+                    reference; pass reference-free operands or discharge external references first",
+        ));
     }
 
     #[test]
