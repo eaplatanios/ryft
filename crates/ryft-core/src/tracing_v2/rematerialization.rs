@@ -1763,7 +1763,7 @@ impl PrimalReferenceAccesses {
             let mut accesses_external_root = false;
             // Transitive accesses use the entry namespace, including accesses inside attached computation regions.
             if let Some(access) = analysis.and_then(|analysis| analysis.transitive_access(instruction)) {
-                for (root, modes) in access.accesses() {
+                for (root, modes) in access.access_modes() {
                     let Some(slot) = slots.get(root).copied() else {
                         accesses_external_root = true;
                         continue;

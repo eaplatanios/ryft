@@ -599,12 +599,15 @@ impl<View> ReferenceViewAnalysis<View> {
         // Implied by `O::View`'s bounds, but the trait solver does not carry them through the projection equality.
         View: ReferenceView,
     {
-        Self::new_with_arguments(region, &ReferenceAnalysisTransformArguments::new(region, capture_count))
+        Self::new_with_arguments(
+            region,
+            &ReferenceAnalysisTransformArguments::new(region, Vec::new(), Some(capture_count), false),
+        )
     }
 
     /// Derives the view analysis exactly like [`new`](Self::new), obtaining the structural analysis under the
     /// already-derived cache key `arguments` so that the closure is walked once per derivation.
-    pub(crate) fn new_with_arguments<V: Value, O: ReferenceViewOperation<Type = V::Type, View = View>>(
+    fn new_with_arguments<V: Value, O: ReferenceViewOperation<Type = V::Type, View = View>>(
         region: RegionRef<'_, V, O>,
         arguments: &ReferenceAnalysisTransformArguments,
     ) -> Result<Self, ReferenceViewAnalysisError>
@@ -872,7 +875,7 @@ impl<'r, V: Value, O: ReferenceViewOperation<Type = V::Type>> RegionRef<'r, V, O
         self,
         capture_count: usize,
     ) -> Result<Arc<ReferenceViewAnalysis<O::View>>, ReferenceViewAnalysisError> {
-        let arguments = ReferenceAnalysisTransformArguments::new(self, capture_count);
+        let arguments = ReferenceAnalysisTransformArguments::new(self, Vec::new(), Some(capture_count), false);
         let artifact = self.transform::<ReferenceViewAnalysisTransform, _, ReferenceViewAnalysisError>(
             arguments,
             |region, arguments| {
@@ -1045,13 +1048,13 @@ where
 }
 
 /// [`Region`] [`Transform`] marker for retained [`ReferenceViewAnalysis`] artifacts.
-pub(crate) struct ReferenceViewAnalysisTransform;
+struct ReferenceViewAnalysisTransform;
 
 impl<V: Value, O: ReferenceViewOperation<Type = V::Type>> Transform<Region<V, O>> for ReferenceViewAnalysisTransform {
     type Arguments = ReferenceAnalysisTransformArguments;
     type Artifact = TransformArtifact<V, O, Arc<ReferenceViewAnalysis<O::View>>>;
 
-    const DEFAULT_CACHE_CAPACITY: usize = 2;
+    const DEFAULT_CACHE_CAPACITY: usize = 8;
 }
 
 #[cfg(test)]

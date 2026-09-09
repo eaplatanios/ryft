@@ -2688,7 +2688,7 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionRef<'_, V, O> {
                             && instruction.region() == self.id()
                         {
                             if required_roots.as_ref().unwrap().contains(&root) {
-                                if access.modes(root).any(|mode| mode != ReferenceAccessMode::Read) {
+                                if access.access_modes_for(root).any(|mode| mode != ReferenceAccessMode::Read) {
                                     return Err(ProgramError::MalformedProgram(
                                         "local reference allocation contributes to both \
                                          required known outputs and deferred state"

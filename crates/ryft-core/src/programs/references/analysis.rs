@@ -1625,24 +1625,10 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                     continue;
                 }
                 let provenance = operation.output_region_provenance(output_index);
-                let record = match operation.reference_output_identity_input(output_index) {
+                let mut record = match operation.reference_output_identity_input(output_index) {
                     Some(input_index) => {
                         let atom = input_atom(input_index, "identity-preserved")?;
                         let source = self.resolve(value_id(atom), name, id, input_index)?;
-                        for origin in provenance {
-                            let actual = forwarded_root(name, id, output_index, origin, &attached)?;
-                            if actual != source.root {
-                                return Err(ReferenceAnalysisError::ReferenceRootMismatch {
-                                    operation: name,
-                                    instruction: id,
-                                    output_index,
-                                    region_index: origin.region_index,
-                                    region_output_index: origin.output_index,
-                                    expected: source.root,
-                                    actual,
-                                });
-                            }
-                        }
                         let alias = ReferenceAliasEdge {
                             instruction: id,
                             position: ReferenceAliasPosition::Output(output_index),
@@ -1650,36 +1636,33 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                             kind: ReferenceAliasKind::Identity,
                             narrows: source.narrows,
                         };
-                        ValueRecord { root: source.root, narrows: source.narrows, alias: Some(alias) }
+                        Some(ValueRecord { root: source.root, narrows: source.narrows, alias: Some(alias) })
                     }
-                    None => {
-                        let mut forwarded = None;
-                        for origin in provenance {
-                            let root = forwarded_root(name, id, output_index, origin, &attached)?;
-                            match forwarded {
-                                None => forwarded = Some(root),
-                                Some(first) if first != root => {
-                                    return Err(ReferenceAnalysisError::ReferenceRootMismatch {
-                                        operation: name,
-                                        instruction: id,
-                                        output_index,
-                                        region_index: origin.region_index,
-                                        region_output_index: origin.output_index,
-                                        expected: first,
-                                        actual: root,
-                                    });
-                                }
-                                Some(_) => {}
-                            }
+                    None => None,
+                };
+                for origin in provenance {
+                    let root = forwarded_root(name, id, output_index, origin, &attached)?;
+                    match record {
+                        None => record = Some(ValueRecord { root, narrows: false, alias: None }),
+                        Some(source) if source.root != root => {
+                            return Err(ReferenceAnalysisError::ReferenceRootMismatch {
+                                operation: name,
+                                instruction: id,
+                                output_index,
+                                region_index: origin.region_index,
+                                region_output_index: origin.output_index,
+                                expected: source.root,
+                                actual: root,
+                            });
                         }
-                        let Some(root) = forwarded else {
-                            return Err(malformed(format!(
-                                "reference output {output_index} has no declared allocation, alias, input identity, \
-                                 or forwarded region output",
-                            )));
-                        };
-                        ValueRecord { root, narrows: false, alias: None }
+                        Some(_) => {}
                     }
+                }
+                let Some(record) = record else {
+                    return Err(malformed(format!(
+                        "reference output {output_index} has no declared allocation, alias, input identity, \
+                         or forwarded region output",
+                    )));
                 };
                 self.analysis.values.insert(value_id(output), record);
             }

@@ -1005,7 +1005,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
                         // it is safe.
                         let needs_reference = self.cotangent_accumulator_reference(root).is_some()
                             || self.reference_analysis.as_ref().unwrap().transitive_access(id).is_some_and(|access| {
-                                access.modes(root).any(|mode| {
+                                access.access_modes_for(root).any(|mode| {
                                     matches!(
                                         mode,
                                         ReferenceAccessMode::Read
