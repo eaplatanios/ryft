@@ -103,9 +103,7 @@ use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::references::discharge::ReferenceSource;
 use crate::programs::references::values::ReferenceId;
-use crate::programs::regions::{
-    InputRegionProvenance, OutputRegionProvenance, Region, RegionId, RegionRef, RegionRole,
-};
+use crate::programs::regions::{InputRegionProvenance, Region, RegionId, RegionRef, RegionRole};
 use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::{Value, ValueId};
@@ -431,6 +429,33 @@ impl ReferenceRoot {
             Self::Constant { value } => value.region(),
         }
     }
+
+    /// Translates this [`ReferenceRoot`] through an attached [`Region`]'s input bindings. The region's own inputs
+    /// resolve to caller roots, while roots captured from enclosing scopes pass through unchanged. Allocations created
+    /// inside the attached region are reported as local so callers can prevent them from escaping through region
+    /// outputs. A boundary view input is bound to the complete root of the value it views, so accesses through the view
+    /// are attributed to that whole root. This is conservative; consumers that need the viewed coordinates use the view
+    /// descriptions instead.
+    ///
+    /// # Parameters
+    ///
+    ///   - `attached`: [`RegionId`] of the attached [`Region`] whose input bindings are being substituted.
+    ///   - `entering`: Caller [`ReferenceRoot`] for each reference input of the attached region, or [`None`] for
+    ///     non-reference inputs. A [`Traversal`] must have validated these bindings before calling this function.
+    fn substitute(self, attached: RegionId, entering: &[Option<ReferenceRoot>]) -> ReferenceSubstitution {
+        match self {
+            // Every reference-typed input of the attached region is bound before the region is analyzed, so the
+            // binding exists by construction.
+            Self::RegionInput { region, input_index } if region == attached => {
+                ReferenceSubstitution::Caller(entering[input_index].unwrap())
+            }
+            Self::RegionInput { .. } | Self::Constant { .. } => ReferenceSubstitution::Caller(self),
+            Self::Allocation { instruction, .. } if instruction.region() == attached => {
+                ReferenceSubstitution::Local(instruction)
+            }
+            Self::Allocation { .. } => ReferenceSubstitution::Caller(self),
+        }
+    }
 }
 
 impl Display for ReferenceRoot {
@@ -444,6 +469,17 @@ impl Display for ReferenceRoot {
             }
         }
     }
+}
+
+/// Result of substituting an attached [`Region`]'s input bindings into a [`ReferenceRoot`].
+enum ReferenceSubstitution {
+    /// [`ReferenceRoot`] visible to the attaching [`Instruction`](crate::Instruction), either supplied through
+    /// a [`Region`] input or captured from an enclosing scope.
+    Caller(ReferenceRoot),
+
+    /// Allocation created inside the attached [`Region`] by the given [`Instruction`](crate::Instruction),
+    /// which cannot escape through a region output.
+    Local(InstructionId),
 }
 
 /// A reference access performed directly by an [`Instruction`](crate::Instruction), resolved to the canonical
@@ -1132,90 +1168,6 @@ struct AttachedRegion {
     outputs: Vec<Option<(ReferenceRoot, bool)>>,
 }
 
-/// Nested-namespace root translated into the attaching instruction's namespace.
-enum Substituted {
-    /// The root denotes a caller root.
-    Caller(ReferenceRoot),
-
-    /// The root is an allocation local to the attached region, performed by the given instruction.
-    Local(InstructionId),
-}
-
-/// Translates a root of an attached region's namespace into the attaching instruction's namespace: the attached
-/// region's own inputs resolve through their bindings, capture roots of enclosing scopes pass through unchanged, and
-/// allocations created by the attached region are local. An allocation inherited from an enclosing capture scope
-/// remains a caller root; descendants cannot export fresh allocations through their own boundaries. A boundary view
-/// input is bound to the complete root of the operand it was created from, so accesses through the view are attributed
-/// to that whole root;
-/// this is conservative, and consumers that reason about the viewed coordinates do so through the view descriptions.
-fn substitute(root: ReferenceRoot, attached: RegionId, entering: &[Option<ReferenceRoot>]) -> Substituted {
-    match root {
-        // Every reference-typed input of the attached region is bound before the region is analyzed, so the binding
-        // exists by construction.
-        ReferenceRoot::RegionInput { region, input_index } if region == attached => {
-            Substituted::Caller(entering[input_index].unwrap())
-        }
-        ReferenceRoot::RegionInput { .. } | ReferenceRoot::Constant { .. } => Substituted::Caller(root),
-        ReferenceRoot::Allocation { instruction, .. } if instruction.region() == attached => {
-            Substituted::Local(instruction)
-        }
-        ReferenceRoot::Allocation { .. } => Substituted::Caller(root),
-    }
-}
-
-/// Resolves the caller root that provenance `origin` supplies to `output_index` of the attaching instruction.
-fn forwarded_root(
-    operation: &'static str,
-    instruction: InstructionId,
-    output_index: usize,
-    origin: OutputRegionProvenance,
-    attached: &[AttachedRegion],
-) -> Result<ReferenceRoot, ReferenceAnalysisError> {
-    let malformed =
-        |message: String| ReferenceAnalysisError::InvalidReferenceDeclaration { operation, instruction, message };
-    let region = attached.get(origin.region_index).ok_or_else(|| {
-        malformed(format!(
-            "output {output_index} forwards region {} output {}, but the application attaches {} regions",
-            origin.region_index,
-            origin.output_index,
-            attached.len(),
-        ))
-    })?;
-    let forwarded = region.outputs.get(origin.output_index).ok_or_else(|| {
-        malformed(format!(
-            "output {output_index} forwards region {} output {}, but that region has {} outputs",
-            origin.region_index,
-            origin.output_index,
-            region.outputs.len(),
-        ))
-    })?;
-    let Some((root, narrows)) = *forwarded else {
-        return Err(malformed(format!(
-            "output {output_index} forwards region {} output {}, which is not a reference",
-            origin.region_index, origin.output_index,
-        )));
-    };
-    if narrows {
-        return Err(ReferenceAnalysisError::ViewCrossesRegionBoundary {
-            operation,
-            instruction,
-            region_index: origin.region_index,
-            boundary: "output",
-            index: origin.output_index,
-        });
-    }
-    match substitute(root, region.id, &region.entering) {
-        Substituted::Caller(root) => Ok(root),
-        Substituted::Local(allocation) => Err(ReferenceAnalysisError::EscapingLocalAllocation {
-            operation,
-            instruction,
-            output_index,
-            region_index: origin.region_index,
-            allocation,
-        }),
-    }
-}
-
 /// Mutable state of one [`ReferenceAnalysis::new`] traversal.
 struct Traversal<'r, V: Value, O: Operation<Type = V::Type>> {
     /// Analyzed region, whose inputs are the external roots.
@@ -1589,12 +1541,12 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                     inputs.is_some().then_some(entering.as_slice()),
                 )?;
                 for root in &nested_summary.reached {
-                    if let Substituted::Caller(root) = substitute(*root, attached_id, &entering) {
+                    if let ReferenceSubstitution::Caller(root) = root.substitute(attached_id, &entering) {
                         summary.reached.insert(root);
                     }
                 }
                 for (nested_root, modes) in &nested_summary.accesses {
-                    let Substituted::Caller(root) = substitute(*nested_root, attached_id, &entering) else {
+                    let ReferenceSubstitution::Caller(root) = nested_root.substitute(attached_id, &entering) else {
                         continue;
                     };
                     for mode in modes.iter().copied() {
@@ -1641,7 +1593,59 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                     None => None,
                 };
                 for origin in provenance {
-                    let root = forwarded_root(name, id, output_index, origin, &attached)?;
+                    // Validate the declared region and output indices before inspecting the forwarded reference.
+                    let region = attached.get(origin.region_index).ok_or_else(|| {
+                        malformed(format!(
+                            "output {} forwards region {} output {}, but the application attaches {} regions",
+                            output_index,
+                            origin.region_index,
+                            origin.output_index,
+                            attached.len(),
+                        ))
+                    })?;
+                    let forwarded = region.outputs.get(origin.output_index).ok_or_else(|| {
+                        malformed(format!(
+                            "output {} forwards region {} output {}, but that region has {} outputs",
+                            output_index,
+                            origin.region_index,
+                            origin.output_index,
+                            region.outputs.len(),
+                        ))
+                    })?;
+                    let Some((root, narrows)) = *forwarded else {
+                        return Err(malformed(format!(
+                            "output {} forwards region {} output {}, which is not a reference",
+                            output_index, origin.region_index, origin.output_index,
+                        )));
+                    };
+
+                    // A forwarded view cannot cross the region boundary: its root alone does not describe
+                    // which coordinates the output references.
+                    if narrows {
+                        return Err(ReferenceAnalysisError::ViewCrossesRegionBoundary {
+                            operation: name,
+                            instruction: id,
+                            region_index: origin.region_index,
+                            boundary: "output",
+                            index: origin.output_index,
+                        });
+                    }
+
+                    // Resolve region inputs to their caller roots. An allocation created inside the attached
+                    // region cannot escape through an output, but an enclosing allocation can be forwarded.
+                    let root = match root.substitute(region.id, &region.entering) {
+                        ReferenceSubstitution::Caller(root) => root,
+                        ReferenceSubstitution::Local(allocation) => {
+                            return Err(ReferenceAnalysisError::EscapingLocalAllocation {
+                                operation: name,
+                                instruction: id,
+                                output_index,
+                                region_index: origin.region_index,
+                                allocation,
+                            });
+                        }
+                    };
+
                     match record {
                         None => record = Some(ValueRecord { root, narrows: false, alias: None }),
                         Some(source) if source.root != root => {
@@ -1687,9 +1691,11 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                 })
             })
             .collect();
+
         if inputs.is_none() {
             self.summaries.insert(region_id, summary.clone());
         }
+
         Ok(summary)
     }
 
