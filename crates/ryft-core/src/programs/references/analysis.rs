@@ -794,43 +794,30 @@ pub struct ReferenceAnalysis {
 }
 
 impl ReferenceAnalysis {
-    /// Analyzes the complete closure of `region` in program order and returns the resulting [`ReferenceAnalysis`].
+    /// Analyzes the computation closure of `region` in program order and returns its
+    /// [`ReferenceAnalysis`]. Reference-typed inputs become [`ReferenceRoot::RegionInput`] roots, classified by
+    /// [`ReferenceSource::from_flat_input_index`] relative to the capture prefix in `capture_scope`. Reference-typed
+    /// constants resolve to capture positions through [`Value::capture_index`]. `resolve_constants` additionally
+    /// permits concrete constants and unbound inherited captures to become external roots. Explicit nested capture
+    /// scopes remain checked against their declared input prefixes.
     ///
-    /// Reference-typed inputs of `region` become [`ReferenceRoot::RegionInput`] roots classified by
-    /// [`ReferenceSource::from_flat_input_index`] relative to `capture_count`, and the first `capture_count` inputs
-    /// form the capture scope through which reference-typed constants of `region` and of every region inheriting that
-    /// scope are resolved. Attached [`RegionRole::Computation`] regions are analyzed recursively, shared regions
-    /// exactly once; dormant [`RegionRole::Rule`] regions are skipped, as described in the module documentation.
-    ///
-    /// # Parameters
-    ///
-    ///   - `region`: Region whose closure is analyzed.
-    ///   - `capture_count`: Number of leading inputs of `region` that originate in a lifted capture table.
-    ///     Reference-typed constants are resolved to capture positions through [`Value::capture_index`].
-    ///
-    /// # Errors
-    ///
-    /// Returns the [`ReferenceAnalysisError`] naming the first violated rule in program order.
-    pub fn new<V: Value, O: Operation<Type = V::Type>>(
-        region: RegionRef<'_, V, O>,
-        capture_count: usize,
-    ) -> Result<Self, ReferenceAnalysisError> {
-        Self::new_with_constants(region, Some(capture_count), false, &[])
-    }
-
-    /// Runs the same traversal with optional resolution of constants inherited by an open region. Explicit nested
-    /// capture scopes remain checked against their declared input prefixes.
+    /// Attached [`RegionRole::Computation`] regions are analyzed recursively and shared regions are analyzed exactly
+    /// once. Dormant [`RegionRole::Rule`] regions are skipped.
     ///
     /// # Parameters
     ///
-    ///   - `region`: Region whose computation closure is analyzed.
+    ///   - `region`: [`Region`] whose computation closure is analyzed.
     ///   - `capture_scope`: Number of leading inputs binding lifted captures, or `None` when the region inherits
     ///     captures from an unknown outer scope. An explicit zero keeps capture lookup strict.
     ///   - `resolve_constants`: Whether concrete reference constants can become external roots. Unbound inherited
     ///     capture constants may also become external roots when `capture_scope` is `None`.
     ///   - `consumable_inputs`: Entry input indices whose reference ownership is transferred to the analyzed region.
     ///     Captures remain borrowed even if their indices occur in this list.
-    fn new_with_constants<V: Value, O: Operation<Type = V::Type>>(
+    ///
+    /// # Errors
+    ///
+    /// Returns the [`ReferenceAnalysisError`] naming the first violated rule in program order.
+    fn new<V: Value, O: Operation<Type = V::Type>>(
         region: RegionRef<'_, V, O>,
         capture_scope: Option<usize>,
         resolve_constants: bool,
@@ -842,7 +829,8 @@ impl ReferenceAnalysis {
             return Err(ReferenceAnalysisError::InvalidCaptureScope {
                 region: region.id(),
                 message: format!(
-                    "the capture prefix of {capture_count} inputs exceeds the region's {} inputs",
+                    "the capture prefix of {} inputs exceeds the region's {} inputs",
+                    capture_count,
                     input_ids.len(),
                 ),
             });
@@ -856,7 +844,7 @@ impl ReferenceAnalysis {
                     .is_reference()
                     .then_some(ReferenceRoot::RegionInput { region: region.id(), input_index })
             })
-            .collect::<CaptureScope>();
+            .collect::<Rc<[Option<ReferenceRoot>]>>();
         let mut traversal = Traversal::new(region, capture_count, consumable_inputs);
         traversal.constant_scope = (resolve_constants && capture_scope.is_none()).then(|| Rc::clone(&scope));
         traversal.resolve_constants = resolve_constants;
@@ -1000,8 +988,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     /// The analysis is a pure structural function of the closure and `capture_count`, because reference-typed capture
     /// constants resolve through [`Value::capture_index`], and it is keyed by the closure's region identifiers as
     /// well, so a topology-preserving import that renumbers regions derives its own entry instead of being served
-    /// identifiers from another arena. Refer to the documentation of [`ReferenceAnalysis::new`] for the analysis
-    /// itself; that function remains the uncached path.
+    /// identifiers from another arena. Refer to [`ReferenceAnalysis`] for the analysis semantics and validation rules.
     ///
     /// # Parameters
     ///
@@ -1069,7 +1056,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
         let artifact = self.transform::<ReferenceAnalysisTransform, _, ReferenceAnalysisError>(
             arguments.clone(),
             |region, arguments| {
-                let analysis = ReferenceAnalysis::new_with_constants(
+                let analysis = ReferenceAnalysis::new(
                     region,
                     arguments.capture_scope,
                     arguments.resolve_constants,
@@ -1125,24 +1112,20 @@ struct ValueRecord {
     alias: Option<ReferenceAliasEdge>,
 }
 
-/// Active capture scope: the root bound at each capture position, or [`None`] where the position carries a value.
-type CaptureScope = Rc<[Option<ReferenceRoot>]>;
-
-/// Boundary views the attaching instruction creates for the inputs of an attached region: the alias edge seeding each
-/// input the operation creates as a view, or [`None`] where the input is a value or a forwarded complete-value handle.
-type BoundaryViews = Rc<[Option<ReferenceAliasEdge>]>;
-
 /// Result of analyzing one region, with nested accesses and materialization requirements included. Structural
 /// analysis uses the region's own namespace and retains this result; boundary analysis uses caller identities and
 /// derives a fresh result for each attachment.
 #[derive(Clone, Debug)]
 pub(crate) struct RegionSummary {
-    /// Capture scope the region was analyzed under.
-    scope: CaptureScope,
+    /// Capture scope the region was analyzed under: the root bound at each capture position, or [`None`] for a
+    /// non-reference value.
+    scope: Rc<[Option<ReferenceRoot>]>,
 
-    /// Boundary views the region was analyzed under. Only their shape (i.e., which inputs are views) is independent of
-    /// the attaching instruction, so that is what later attachments of a shared region are checked against.
-    boundary: BoundaryViews,
+    /// Alias edge for each region input that the attaching instruction creates as a view, or [`None`] for a
+    /// non-reference value or a forwarded complete-value handle. Only their shape (i.e., which inputs are views) is
+    /// independent of the attaching instruction, so that is what later attachments of a shared region are checked
+    /// against.
+    boundary: Rc<[Option<ReferenceAliasEdge>]>,
 
     /// Direct and transitive access modes per root, including the region's local allocations.
     pub(super) accesses: BTreeMap<ReferenceRoot, BTreeSet<ReferenceAccessMode>>,
@@ -1180,7 +1163,7 @@ struct Traversal<'r, V: Value, O: Operation<Type = V::Type>> {
     consumable_inputs: Vec<usize>,
 
     /// Original inherited scope when constants can be resolved before capture lifting.
-    constant_scope: Option<CaptureScope>,
+    constant_scope: Option<Rc<[Option<ReferenceRoot>]>>,
 
     /// Whether concrete reference constants can be resolved regardless of the active capture scope.
     resolve_constants: bool,
@@ -1224,8 +1207,8 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
     fn analyze_region(
         &mut self,
         region: RegionRef<'r, V, O>,
-        scope: CaptureScope,
-        boundary: BoundaryViews,
+        scope: Rc<[Option<ReferenceRoot>]>,
+        boundary: Rc<[Option<ReferenceAliasEdge>]>,
         inputs: Option<&[Option<ReferenceRoot>]>,
     ) -> Result<RegionSummary, ReferenceAnalysisError> {
         let region_id = region.id();
@@ -2496,7 +2479,7 @@ mod tests {
     #[test]
     fn test_reference_analysis_new() {
         let program = fixture();
-        let analysis = ReferenceAnalysis::new(program.entry_region_ref(), 1).unwrap();
+        let analysis = ReferenceAnalysis::new(program.entry_region_ref(), Some(1), false, &[]).unwrap();
         let (a, b, c, k) = (input_root(1, 0), input_root(1, 1), allocation_root(1, 0, 0), input_root(0, 0));
         assert_eq!(analysis.region(), RegionId::new(1));
         assert_eq!(analysis.roots().collect::<Vec<_>>(), vec![k, a, b, c]);
@@ -2523,7 +2506,7 @@ mod tests {
         let mut builder = TestBuilder::new();
         let input = builder.add_input(value_type(0));
         let program = build(builder, vec![input]);
-        let analysis = ReferenceAnalysis::new(program.entry_region_ref(), 0).unwrap();
+        let analysis = ReferenceAnalysis::new(program.entry_region_ref(), Some(0), false, &[]).unwrap();
         assert_eq!(analysis.roots().count(), 0);
         assert_eq!(analysis.accesses(), &[]);
         assert_eq!(analysis.output_roots(), &[None]);
@@ -3061,7 +3044,7 @@ mod tests {
         builder.add_instruction(TestOperation::Read, Vec::new(), vec![captured], None).unwrap();
         let program = build(builder, Vec::new());
         assert!(matches!(
-            ReferenceAnalysis::new(program.entry_region_ref(), 0),
+            ReferenceAnalysis::new(program.entry_region_ref(), Some(0), false, &[]),
             Err(ReferenceAnalysisError::InvalidReferenceCapture { region, atom, capture_index: 0, capture_count: 0 })
                 if region == RegionId::new(0) && atom == AtomId::new(0),
         ));
@@ -3513,7 +3496,7 @@ mod tests {
             )
             .unwrap();
 
-        let analysis = ReferenceAnalysis::new(program.entry_region_ref(), 1).unwrap();
+        let analysis = ReferenceAnalysis::new(program.entry_region_ref(), Some(1), false, &[]).unwrap();
         let (captured, external) = (input_root(2, 0), input_root(2, 1));
         assert_eq!(analysis.roots().collect::<Vec<_>>(), vec![input_root(0, 0), input_root(1, 0), captured, external]);
         assert_eq!(analysis.external_source(captured), Some(ReferenceSource::Capture { index: 0 }));
@@ -3640,7 +3623,7 @@ mod tests {
 
         // A read-only condition and an accumulating body are accepted, and the carried reference keeps its identity.
         let program = make_loop(make_condition(false));
-        let analysis = ReferenceAnalysis::new(program.entry_region_ref(), 0).unwrap();
+        let analysis = ReferenceAnalysis::new(program.entry_region_ref(), Some(0), false, &[]).unwrap();
         let reference = input_root(2, 1);
         assert_eq!(analysis.root_of(value(2, 3)), Some(reference));
         assert_eq!(
@@ -3666,7 +3649,7 @@ mod tests {
         // such a loop into do-while form, so the analysis succeeds and reports the write on the carried root beside the
         // body's accumulation.
         let program = make_loop(make_condition(true));
-        let analysis = ReferenceAnalysis::new(program.entry_region_ref(), 0).unwrap();
+        let analysis = ReferenceAnalysis::new(program.entry_region_ref(), Some(0), false, &[]).unwrap();
         assert_eq!(analysis.root_of(value(2, 3)), Some(reference));
         assert_eq!(
             analysis.transitive_access(id(2, 0)).unwrap().access_modes(),
@@ -3707,7 +3690,7 @@ mod tests {
             .build::<Vec<TestArrayValue>, Vec<TestArrayValue>>(Vec::new(), vec![Placeholder; 2], Vec::new())
             .unwrap();
         assert!(matches!(
-            ReferenceAnalysis::new(program.entry_region_ref(), 0),
+            ReferenceAnalysis::new(program.entry_region_ref(), Some(0), false, &[]),
             Err(ReferenceAnalysisError::ReferenceRootMismatch {
                 operation: "while",
                 instruction,
@@ -4118,7 +4101,7 @@ mod tests {
     fn test_program_reference_analysis() {
         let program = fixture();
         let analysis = program.reference_analysis(1).unwrap();
-        let direct = ReferenceAnalysis::new(program.entry_region_ref(), 1).unwrap();
+        let direct = ReferenceAnalysis::new(program.entry_region_ref(), Some(1), false, &[]).unwrap();
         assert_eq!(analysis.roots().collect::<Vec<_>>(), direct.roots().collect::<Vec<_>>());
         assert_eq!(analysis.accesses(), direct.accesses());
         assert_eq!(analysis.region_input_bindings(), direct.region_input_bindings());
@@ -4136,7 +4119,7 @@ mod tests {
     fn test_region_ref_reference_analysis() {
         let program = fixture();
         let retained = program.entry_region_ref().reference_analysis(1).unwrap();
-        assert_eq!(*retained, ReferenceAnalysis::new(program.entry_region_ref(), 1).unwrap());
+        assert_eq!(*retained, ReferenceAnalysis::new(program.entry_region_ref(), Some(1), false, &[]).unwrap());
 
         // Repeated requests, including through the program-level accessor and through a clone that shares the region
         // arena, are served the retained artifact (under `debug_assertions` each hit also re-derives and compares the
@@ -4209,7 +4192,10 @@ mod tests {
         let derived = wrapper.region_ref(renumbered).unwrap().reference_analysis(0).unwrap();
         assert!(!Arc::ptr_eq(&derived, &retained));
         assert_eq!(derived.region(), renumbered);
-        assert_eq!(*derived, ReferenceAnalysis::new(wrapper.region_ref(renumbered).unwrap(), 0).unwrap());
+        assert_eq!(
+            *derived,
+            ReferenceAnalysis::new(wrapper.region_ref(renumbered).unwrap(), Some(0), false, &[]).unwrap()
+        );
         assert_ne!(derived.roots().collect::<Vec<_>>(), retained.roots().collect::<Vec<_>>());
 
         // The source program keeps its own retained artifact, because only the copies were imported.
