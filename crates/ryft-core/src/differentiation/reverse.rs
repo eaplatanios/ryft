@@ -538,19 +538,19 @@ impl<V: Value, O: Operation<Type = V::Type>> Typed for CotangentStorage<V, O> {
 /// # Reference Views
 ///
 /// A rule accessing a primal reference view receives the corresponding view of its root's cotangent buffer. For
-/// example, a primal slice `r[i..i + k]` needs a slice of the cotangent buffer using the same coordinates. The context
+/// example, a primal slice `r[i..i + k]` needs a slice of the cotangent buffer using the same indices. The context
 /// obtains the view path from the region's [`ReferenceViewAnalysis`](crate::ReferenceViewAnalysis) and reapplies its
 /// steps through [`ReferenceViewOperation::reapply_view`]. The root buffer is allocated if needed, and reconstruction
 /// validates the resulting view's type. An unavailable view path is rejected rather than treated as the whole root.
 ///
-/// The reverse sweep materializes known primal coordinates into the transposed program before a rule needs them.
-/// The context retains these coordinates separately from the generated cotangent views: two slices may share the
-/// same dynamic index while requiring distinct views. Generated views are cached by the primal view's [`ValueId`]
-/// so repeated accesses reuse staged operations; consuming a root accumulator removes its cached views.
+/// The reverse sweep materializes known primal values into the transposed program before a rule needs them. The context
+/// retains these values separately from the generated cotangent views: two slices may share the same dynamic index
+/// while requiring distinct views. Generated views are cached by the primal view's [`ValueId`] so repeated accesses
+/// reuse staged operations; consuming a root accumulator removes its cached views.
 ///
-/// Generic view reconstruction requires known coordinate values. It rejects a view bound to a linear coordinate or a
-/// coordinate supplied locally by a nested region. An enclosing operation's transpose rule must handle these views when
-/// supporting that case; the context cannot reconstruct them from the region's non-reference operands alone.
+/// Generic view reconstruction requires known values for the view's symbols. It rejects a symbol bound to a linear
+/// value or a value supplied locally by a nested region. An enclosing operation's transpose rule must handle these
+/// views when supporting that case; the context cannot reconstruct them from the region's non-reference operands alone.
 ///
 /// # Nested Regions
 ///
@@ -582,18 +582,18 @@ pub struct TranspositionContext<V: Value, O: Operation<Type = V::Type>> {
 
     /// Generated cotangent reference views, keyed by the primal view's [`ValueId`]. Repeated accesses to one primal
     /// view reuse the same staged cotangent view. For example, a primal slice `r[i..i + k]` maps to the corresponding
-    /// slice of `r`'s cotangent buffer. [`Self::cotangent_view_coordinates`] supplies the preserved primal coordinates
-    /// needed to construct that slice; this map retains the resulting reference, not those coordinates. Entries are
-    /// removed when the root accumulator is consumed. Refer to [`Self::cotangent_reference_view`] for information
-    /// on view reconstruction.
+    /// slice of `r`'s cotangent buffer. [`Self::cotangent_view_coordinates`] supplies the preserved primal values
+    /// needed to construct that slice; this map retains the resulting reference, not those values. Entries are removed
+    /// when the root accumulator is consumed. Refer to [`Self::cotangent_reference_view`] for information on view
+    /// reconstruction.
     cotangent_views: BTreeMap<ValueId, Tracer<TracingContext<V, O>>>,
 
-    /// Known primal coordinate values materialized in the transposed program, keyed by each coordinate's primal
+    /// Known primal values used by view symbols, materialized in the transposed program and keyed by their primal
     /// [`ValueId`]. These are the original indices used to reconstruct cotangent views, not derivatives of the indices.
     /// For example, two primal slices that use the same dynamic index `i` share its entry here, while each slice has
-    /// its own entry in [`Self::cotangent_views`]. A single view can also require several coordinates. The maps thus
-    /// have different keys and are not paired entry by entry. This map supplies coordinates during reconstruction,
-    /// and [`Self::cotangent_views`] caches the resulting references.
+    /// its own entry in [`Self::cotangent_views`]. A single view can also require several values. The maps thus have
+    /// different keys and are not paired entry by entry. This map supplies values during reconstruction, and
+    /// [`Self::cotangent_views`] caches the resulting references.
     cotangent_view_coordinates: BTreeMap<ValueId, Tracer<TracingContext<V, O>>>,
 
     /// Values supplying runtime dimensions, returned by [`Self::dimension_sources`].
@@ -732,8 +732,8 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     ///
     /// For example, constructing a zero buffer of type `f32[n]` requires the runtime value of `n`, which the type alone
     /// does not supply. An available array of type `f64[n]` can supply that dimension even though its element type is
-    /// different. A slice's length does not necessarily supply the length of its root buffer, so view coordinates
-    /// alone are insufficient. Zero materialization searches these values for the dimension identities it needs.
+    /// different. A slice's length does not necessarily supply the length of its root buffer, so view indices alone
+    /// are insufficient. Zero materialization searches these values for the dimension identities it needs.
     ///
     /// A transpose rule can chain its known operands after these sources and pass the resulting iterator to
     /// [`ResidualZeroProvider::materialize_zero_from_residual_sources`] when it needs a concrete zero, for example
@@ -905,10 +905,9 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
             })?;
 
             view = path.steps().iter().try_fold(view, |view, step| {
-                // The overlay bound each symbolic coordinate to a known primal operand of the view-creating
-                // instruction, whose transposed program value the reverse sweep materialized before this rule
-                // ran. A region-local boundary coordinate has no such value: the transpose rule of the attaching
-                // operation re-creates it.
+                // The overlay bound each symbol to a known primal operand of the view-creating instruction, whose
+                // transposed program value the reverse sweep materialized before this rule ran. A region-local
+                // boundary symbol has no such value: the transpose rule of the attaching operation re-creates it.
                 let symbols = step
                     .bindings()
                     .iter()
@@ -2726,27 +2725,26 @@ impl<
                 );
             }
 
-            // Walk each operand's alias chain to find the coordinates needed to reconstruct its cotangent view.
-            // The view descriptions bind coordinates to non-reference inputs of the view-creating instructions.
+            // Walk each operand's alias chain to find the values needed to reconstruct its cotangent view.
+            // The view descriptions bind symbols to non-reference inputs of the view-creating instructions.
             if let Some(analysis) = &analysis {
                 for operand in instruction.inputs() {
                     let mut value = ValueId::new(self.id(), *operand);
                     while let Some(edge) = analysis.alias(value) {
-                        // Views created outside this region have no local coordinate operands. The enclosing
-                        // operation's transpose rule must handle those boundary views, including ones with
-                        // region-local coordinates.
+                        // Views created outside this region have no local symbol operands. The enclosing operation's
+                        // transpose rule must handle those boundary views, including ones with region-local values.
                         if edge.kind() == ReferenceAliasKind::View && edge.instruction().region() == self.id() {
                             for coordinate in self.instructions()[edge.instruction().index()].inputs() {
                                 let id = ValueId::new(self.id(), *coordinate);
                                 let r#type = self.atoms()[coordinate.index()].r#type();
 
-                                // Several views can share a coordinate. Reuse its staged value, and exclude the
-                                // source reference itself from the candidate coordinates.
+                                // Several views can share a symbol. Reuse its staged value, and exclude the
+                                // source reference itself from the candidate values.
                                 if r#type.is_reference() || context.cotangent_view_coordinates.contains_key(&id) {
                                     continue;
                                 }
 
-                                // Only known primal values can supply coordinates. Skip linear values here;
+                                // View symbols must resolve to known primal values. Skip linear values here;
                                 // view reconstruction rejects them if a view actually requires them.
                                 if *linear
                                     .get(coordinate.index())

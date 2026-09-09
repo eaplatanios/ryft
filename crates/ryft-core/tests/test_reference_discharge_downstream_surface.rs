@@ -746,7 +746,7 @@ impl Operation for RegisterOperation {
                 )
                 .unwrap(),
             ),
-            // The bit is a narrowing view of the reference operand; the index input is a coordinate, not a reference.
+            // The bit is a narrowing view of the reference operand; its index input must be a non-reference value.
             Self::Bit => Cow::Owned(
                 Effects::new(
                     EffectClasses::NONE,
@@ -908,15 +908,15 @@ enum RegisterView {
 
     /// One bit of a register, selected by `register.bit` at the index the symbol names:
     /// [`ReferenceViewSymbol::Input`] of the index input for an instruction output, or
-    /// [`ReferenceViewSymbol::RegionLocal`] for a coordinate supplied by a region-carrying operation.
+    /// [`ReferenceViewSymbol::RegionLocal`] for an index supplied by a region-carrying operation.
     Bit(ReferenceViewSymbol),
 }
 
-// A half is a static description while a bit depends on the one coordinate its symbol names. Registers have no axes,
+// A half is a static description while a bit depends on the one index its symbol names. Registers have no axes,
 // so a replicated batch axis passes through either description unchanged and a mapped one is rejected. Paths are
-// compared step by step: two static halves are disjoint as soon as they differ, two bits are the same coordinate iff
-// their bindings are equal and may otherwise overlap, a bit and a half may overlap, and paths that agree on every
-// shared step are the same when they have the same length and otherwise one is a strict prefix that contains the other.
+// compared step by step: two static halves are disjoint as soon as they differ, two bits are the same index iff their
+// bindings are equal and may otherwise overlap, a bit and a half may overlap, and paths that agree on every shared step
+// are the same when they have the same length and otherwise one is a strict prefix that contains the other.
 impl ReferenceView for RegisterView {
     type Type = RegisterIrType;
 
@@ -1173,7 +1173,7 @@ impl<C: Context<Type = RegisterIrType, Operation = RegisterOperation> + Zero<C::
                 Ok(Vec::new())
             }
             // The tangent of a bit view is the same bit of the tangent reference, selected by the primal index (the
-            // index is a coordinate, so its tangent is dropped); a plumbing reference yields a plumbing view.
+            // index selects the bit, so its tangent is dropped); a plumbing reference yields a plumbing view.
             Self::Bit => {
                 check_count!("input", inputs, 2, ProgramError);
                 let primal = bind_register_output(context.primal(), self.clone(), &primals)?;
@@ -1801,10 +1801,10 @@ fn test_downstream_structured_rule_discharges_through_the_region_boundary_api() 
 
 #[test]
 fn test_downstream_partial_targets_reach_an_internal_allocation_inside_a_structured_region() {
-    // The allocation target sits inside the callee region, so whether it discharges is decided by the replay coordinate
-    // the downstream rule's driver hands to `selects_internal` inside the fork. An empty target list must preserve
-    // the allocation inside the rebuilt region, and selecting the enumerated target must discharge it completely —
-    // which is exactly the behavior a driver without a real `source_instruction_id()` would silently break.
+    // The allocation target sits inside the callee region, so whether it discharges is decided by the replay location
+    // the downstream rule's driver hands to `selects_internal` inside the fork. An empty target list must preserve the
+    // allocation inside the rebuilt region, and selecting the enumerated target must discharge it completely — which is
+    // exactly the behavior a driver without a real `source_instruction_id()` would silently break.
     let mut callee = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
     let initial = callee.add_input(RegisterIrType::Register(RegisterType));
     let local = callee
@@ -1979,9 +1979,9 @@ where
 
 #[test]
 fn test_downstream_view_description_overlap_and_batch() {
-    // The family's overlap rule compares paths step by step: the two halves are disjoint, a path is the same as
-    // itself, the complete root or a shorter prefix contains what it narrows to, two bits are the same coordinate
-    // exactly when their bindings agree and may otherwise overlap, and a bit may overlap with a half.
+    // The family's overlap rule compares paths step by step: the two halves are disjoint, a path is the same as itself,
+    // the complete root or a shorter prefix contains what it narrows to, two bits are the same index exactly when their
+    // bindings agree and may otherwise overlap, and a bit may overlap with a half.
     let root = RegisterIrType::Reference(ReferenceType::new(RegisterType));
     let value = |atom: usize| ValueId::new(RegionId::new(0), AtomId::new(atom));
     let empty = ReferenceViewPath::<RegisterView>::root();
@@ -2116,9 +2116,9 @@ fn test_downstream_dynamic_view_analysis_closes_the_index_input() {
 
 #[test]
 fn test_downstream_reference_view_path_region_local_coordinates() {
-    // A downstream operation can supply more than one coordinate without adding a core symbol variant. Their
-    // declaration names distinguish unrelated operation contracts, while indices distinguish coordinates belonging
-    // to one contract. The region identity confines each closed coordinate to the region that supplies it.
+    // A downstream operation can declare multiple symbols without adding a core variant. Family names distinguish
+    // unrelated operation contracts, while symbol indices distinguish symbols in one family. The region identity
+    // confines each binding to the region that supplies its value.
     let root = RegisterIrType::Reference(ReferenceType::new(RegisterType));
     let first_symbol = ReferenceViewSymbol::RegionLocal { name: "register.window.bit", index: 0 };
     let second_symbol = ReferenceViewSymbol::RegionLocal { name: "register.window.bit", index: 1 };
@@ -2147,7 +2147,7 @@ fn test_downstream_reference_view_path_region_local_coordinates() {
 #[test]
 fn test_downstream_dynamic_view_reapplies_with_its_index() {
     // Reapplication binds the view over another source with the supplied index value, here eagerly into a bit handle,
-    // and rejects a symbol count that disagrees with the description or a coordinate supplied only within an attached
+    // and rejects a symbol count that disagrees with the description or an index supplied only within an attached
     // region.
     let context = RegisterDestination::new();
     let reference = Reference::new(RegisterValue::Register(6)).unwrap();
@@ -2493,8 +2493,7 @@ fn test_downstream_reference_universe_batch_through_the_public_boundary() {
 #[test]
 fn test_downstream_dynamic_view_jvp_reapplies_the_view_to_the_tangent_reference() {
     // Forward mode views the tangent reference at the primal index: the primal writes bit 2 of `r = 0b001`, the tangent
-    // writes bit 2 of `ṫ = 0b1000`, and each read returns its own bit. The index tangent is a coordinate tangent and is
-    // dropped.
+    // writes bit 2 of `ṫ = 0b1000`, and each read returns its own bit. The tangent of the bit index is dropped.
     let reference = Reference::new(RegisterValue::Register(1)).unwrap();
     let tangent_reference = Reference::new(RegisterValue::Register(8)).unwrap();
     assert_eq!(

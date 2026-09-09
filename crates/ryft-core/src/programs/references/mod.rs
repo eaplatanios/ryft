@@ -77,7 +77,7 @@
 //!   own region inputs), lifetime validation, and per-instruction transitive access summaries. It is kernel-owned
 //!   validation infrastructure invoked explicitly by its consumers rather than a standing lint on every program.
 //! - `views.rs` defines the value-family-generic view contract [`ReferenceViewOperation`] (owned per-edge view
-//!   descriptions with static or symbolic coordinates, their type-level validation, their reapplication to a
+//!   descriptions with static selections or symbolic values, their type-level validation, their reapplication to a
 //!   transformed reference, their batching, and their overlap query) and the retained [`ReferenceViewAnalysis`]
 //!   overlay that composes those descriptions into one [`ReferenceViewPath`] per reference-typed value of a closure.
 //! - [`crate::operations::references`] defines the six generic primitives in separate modules together with their

@@ -59,9 +59,9 @@ use crate::tracing::{Tracer, TracingContext};
 /// Canonical operation name for [`ScanOperation`].
 pub const SCAN_OPERATION_NAME: &str = "scan";
 
-/// Region-local reference-view coordinate selecting the current slice of a [`ScanOperation`]'s stacked input.
+/// Region-local reference-view symbol for the index selecting the current slice of a [`ScanOperation`]'s stacked input.
 /// Its value is the selected slice index, so a reverse scan visits values from `length - 1` to `0` rather than
-/// counting upward in execution order. The scan rule binds and reconstructs this coordinate inside its body.
+/// counting upward in execution order. The scan rule supplies this symbol's value inside its body.
 pub const SCAN_ITERATION_SYMBOL: ReferenceViewSymbol =
     ReferenceViewSymbol::RegionLocal { name: concat!(module_path!(), "::iteration"), index: 0 };
 
@@ -429,7 +429,7 @@ where
         let summary = context.region_summary(self, 0, body, body_allocations.as_slice())?;
 
         // A per-iteration view is region-local state inside the rebuilt body, so it must be the only handle of its
-        // allocation there: another view of the same allocation must select provably different coordinates on every
+        // allocation there: another view of the same allocation must select provably different indices on every
         // iteration, while a carry is a complete handle that always overlaps. The paths compared are the ones the
         // reference view analysis derives for the body's inputs, namely the empty path for a carry and the boundary
         // view closed over the body region for a stacked operand. Rebuilding resolves captures in the isolated region
@@ -5904,7 +5904,7 @@ mod tests {
     fn test_scan_reference_discharge_rejects_aliased_stacked_reference() {
         // A per-iteration view is region-local state inside the rebuilt body, so every other handle of its allocation
         // reaching the body is rejected: a carry is a complete handle that always overlaps the view, another stacked
-        // operand of the same allocation selects the same coordinates on every iteration, and a capture is a complete
+        // operand of the same allocation selects the same indices on every iteration, and a capture is a complete
         // handle the body reaches without any boundary position.
         let scalar_type = ArrayType::scalar(DataType::F32);
         let stacked_type = ArrayType::new_static(DataType::F32, [3]);

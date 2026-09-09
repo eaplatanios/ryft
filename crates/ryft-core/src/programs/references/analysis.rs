@@ -434,8 +434,8 @@ impl ReferenceRoot {
     /// resolve to caller roots, while roots captured from enclosing scopes pass through unchanged. Allocations created
     /// inside the attached region are reported as local so callers can prevent them from escaping through region
     /// outputs. A boundary view input is bound to the complete root of the value it views, so accesses through the view
-    /// are attributed to that whole root. This is conservative; consumers that need the viewed coordinates use the view
-    /// descriptions instead.
+    /// are attributed to that whole root. This is conservative; consumers that need the selected part of the root use
+    /// the view descriptions instead.
     ///
     /// # Parameters
     ///

@@ -145,13 +145,13 @@ fn infer_view_output_types(
     Ok(vec![ReferenceType::new(transform.output_type(reference.referent())?).into()])
 }
 
-/// Pure reference-to-reference operation selecting one coordinate and removing its axis.
+/// Pure reference-to-reference operation selecting one element by index and removing its axis.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct ReferenceIndexOperation {
     /// Axis selected in the input reference view.
     axis: usize,
 
-    /// Coordinate selected on `axis`.
+    /// Index selected on `axis`.
     index: usize,
 }
 
@@ -334,20 +334,20 @@ impl<C: Domain<Type = ArrayIrType, Value: ReferenceSlice<C::Value>>> Interpretab
 /// # Parameters
 ///
 ///   - `operation`: View operation being discharged, replayed verbatim on a preserved allocation.
-///   - `transform`: Coordinate transform this view operation applies to its operand's view.
+///   - `transform`: Index transform this view operation applies to its operand's view.
 ///   - `context`: Active discharge context owning the allocation environment.
 ///   - `inputs`: Carriers supplied as the view operation's operands, in operation-defined order.
 ///
 /// # Errors
 ///
-/// Returns [`ProgramError::InvalidInputCount`] for an application that does not supply exactly one operand per
-/// symbol beyond the reference, [`ProgramError::MalformedProgram`] when the first operand is a value rather than a
-/// reference handle, when a symbol operand is a reference rather than a value, or when a symbol names the reference
-/// operand or an operand outside the application, [`ProgramError::UnsupportedOperation`] for a
-/// [`ReferenceViewSymbol::RegionLocal`] coordinate, and [`ProgramError::InvalidOutputCount`] when replaying the view on a
-/// preserved allocation does not produce exactly one value. Propagates the view algebra's own [`TypeError`] when
-/// `transform` does not compose onto the incoming handle's referent, and the discharge context's own
-/// [`ProgramError::MalformedProgram`] when the replayed reference does not carry the composed type.
+/// Returns [`ProgramError::InvalidInputCount`] for an application that does not supply exactly one operand per symbol
+/// beyond the reference, [`ProgramError::MalformedProgram`] when the first operand is a value rather than a reference
+/// handle, when a symbol operand is a reference rather than a value, or when a symbol names the reference operand or an
+/// operand outside the application, [`ProgramError::UnsupportedOperation`] for a [`ReferenceViewSymbol::RegionLocal`]
+/// symbol, and [`ProgramError::InvalidOutputCount`] when replaying the view on a preserved allocation does not produce
+/// exactly one value. Propagates the view algebra's own [`TypeError`] when `transform` does not compose onto the
+/// incoming handle's referent, and the discharge context's own [`ProgramError::MalformedProgram`] when the replayed
+/// reference does not carry the composed type.
 fn discharge_reference_view<C, P, O>(
     operation: &O,
     transform: ArrayReferenceViewTransform,
@@ -1039,7 +1039,7 @@ mod tests {
     #[test]
     fn test_array_reference_view_operation_reference_discharge() {
         // Both view rules create a narrower reference to the same allocation by composing their transform onto the
-        // incoming alias, and bind nothing: a view's coordinates are materialized at each access instead.
+        // incoming alias, and bind nothing: a view's indices are materialized at each access instead.
         let context = ReferenceDischargeContext::<TestDestination, ArrayReferenceDischarge>::new(EagerContext::new());
         let allocation_type = ArrayType::new_static(DataType::F32, [3, 3]);
         let allocated = ReferenceDischargeValue::from(
@@ -1140,7 +1140,7 @@ mod tests {
             Some(ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])))),
         );
 
-        // The replayed view denotes the coordinates the source named, which the eager destination proves by reading
+        // The replayed view denotes the indices the source named, which the eager destination proves by reading
         // through the view: the first row of the preserved allocation rather than the allocation itself.
         assert_eq!(
             view.preserved().map(ReferenceRead::read),
@@ -1161,7 +1161,7 @@ mod tests {
                 .unwrap();
 
         // An active reference's view is applied to its tangent reference with the same alias, so both views select the
-        // same coordinates of their respective allocations.
+        // same indices of their respective allocations.
         let active = DifferentiationTracer::new(
             DifferentiationDual::new(reference.clone(), tangent_reference.clone()).unwrap(),
             context.clone(),
@@ -1873,7 +1873,7 @@ mod tests {
         type TestContext = TracingContext<TestValue, TestOperation>;
 
         // Reapplication receives exactly one value per symbol of the description, and no array operation can stage a
-        // symbolic index yet, even when its coordinate value is supplied.
+        // symbolic index yet, even when its value is supplied.
         let root_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])));
         let coordinate_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let error = TestContext::trace(

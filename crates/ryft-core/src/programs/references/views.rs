@@ -1,10 +1,10 @@
 //! Contains machinery for representing and working with _reference views_ and paths layered on the structural
 //! [`ReferenceAnalysis`]. The generic analysis records _that_ a reference-typed value is a narrowing view of its
 //! [`ReferenceRoot`], through [`ReferenceAliasEdge`](crate::ReferenceAliasEdge)s of kind [`ReferenceAliasKind::View`],
-//! but leaves the selected coordinates to the value family (e.g., an array view is an index or slice, while a
-//! downstream family may split a register into halves). [`ReferenceViewOperation`] describes these selections for an
-//! operation family, and [`ReferenceViewAnalysis`] composes the per-edge descriptions into a [`ReferenceViewPath`] for
-//! every reference-typed value. Transforms that rebuild references (e.g., for tangent, cotangent, and residual
+//! but leaves the selection itself to the value family (e.g., an array view is an index or slice, while a downstream
+//! family may split a register into halves). [`ReferenceViewOperation`] describes these selections for an operation
+//! family, and [`ReferenceViewAnalysis`] composes the per-edge descriptions into a [`ReferenceViewPath`] for every
+//! reference-typed value. Transforms that rebuild references (e.g., for tangent, cotangent, and residual
 //! reconstruction) consult the view analysis and reapply descriptions through the same contract, so no transform ever
 //! matches view operations by name, and downstream operations such as the array family's `reference_index` and
 //! `reference_slice` operations are not special-cased anywhere.
@@ -15,15 +15,15 @@
 //!
 //! # Symbols And Bindings
 //!
-//! A view description is a value of the family's [`ReferenceView`] type and may depend on coordinates that are not part
-//! of the description itself, such as a traced input of the describing instruction or a coordinate that its operation
-//! supplies at a region boundary. Such coordinates are _symbolic_ in the description and named relative to the
-//! describing operation by [`ReferenceViewSymbol`]s, in the order that [`ReferenceView::symbols`] reports them.
-//! The view analysis _closes_ every description over the instruction that created it. Each symbol becomes a
-//! [`ReferenceViewSymbolBinding`]: either the input value's program identity or the coordinate's namespaced role and
-//! index together with its region. The description together with its bindings forms one [`ReferenceViewStep`] of a
-//! [`ReferenceViewPath`]. Static descriptions report no symbols and carry empty bindings, so equality of
-//! static paths is equality of their description sequences.
+//! A view description is a value of the family's [`ReferenceView`] type and may depend on values that are not part of
+//! the description itself, such as a traced input of the describing instruction or a value that its operation supplies
+//! at a region boundary. Such values are _symbolic_ in the description and named relative to the describing operation
+//! by [`ReferenceViewSymbol`]s, in the order that [`ReferenceView::symbols`] reports them. The view analysis _closes_
+//! every description over the instruction that created it. Each symbol becomes a [`ReferenceViewSymbolBinding`]: either
+//! the input value's program identity or the symbol's namespaced role and index together with its region. The
+//! description together with its bindings forms one [`ReferenceViewStep`] of a [`ReferenceViewPath`]. Static
+//! descriptions report no symbols and carry empty bindings, so equality of static paths is equality of their
+//! description sequences.
 //!
 //! The binding type is a parameter of the path because the same path shape serves consumers that close symbols
 //! differently: the view analysis binds program identities, an eager handle carries only static steps and uses
@@ -43,23 +43,23 @@
 //! inserts an axis into the packed root, and a primal description reapplied unchanged to a batched root would index or
 //! slice the wrong axis. The contract therefore splits the two concerns. [`ReferenceView::batch`] is pure axis
 //! arithmetic on the description (i.e., given the packed source type and the source's batch axis, it returns the
-//! description that selects the same per-item coordinates of the packed source together with the batch axis of the
+//! description that selects the same part of each item of the packed source together with the batch axis of the
 //! derived reference). The shared rule [`batch_reference_view_operation`] then binds that batched description through
 //! [`reapply_view`](ReferenceViewOperation::reapply_view) on the parent context, so every view operation of every
 //! family batches through one rule and no operation carries the axis arithmetic itself.
 //!
 //! # Overlap Queries
 //!
-//! Two paths of one root may select the same coordinates, provably different coordinates, or coordinates whose relation
-//! is not decidable statically. [`ReferenceView::overlap`] answers that question for two closed paths of one root as a
+//! Two paths of one root may select the same part, provably disjoint parts, or parts whose overlap is not decidable
+//! statically. [`ReferenceView::overlap`] answers that question for two closed paths of one root as a
 //! [`ReferenceViewOverlap`]; [`ReferenceViewPath::overlap`] and [`ReferenceViewAnalysis::overlap`] expose it on paths
-//! and on analyzed values. Two symbolic coordinates are the same coordinate exactly when their bindings are equal, so
-//! a path that selects a slot by one instruction's input and a path that selects a slot by the same input agree, while
-//! two different inputs, or an input against a static coordinate, may overlap. The query is what lets a transform admit
-//! two handles of one root side by side only when they are provably disjoint (e.g., a stacked reference input of a
-//! `scan` operation viewed per iteration next to a carry of the same root). The `scan` operation discharge rule is an
-//! example consumer as it rejects any other handle of the stack's allocation inside the body unless the query proves
-//! it disjoint from the per-iteration view. Dynamic indexing will use the same query as its "may-alias" oracle.
+//! and on analyzed values. Equal symbol bindings identify the same value, so a path that selects a slot by one
+//! instruction's input and a path that selects a slot by the same input agree, while two different inputs, or an input
+//! against a static index, may overlap. The query is what lets a transform admit two handles of one root side by side
+//! only when they are provably disjoint (e.g., a stacked reference input of a `scan` operation viewed per iteration
+//! next to a carry of the same root). The `scan` operation discharge rule is an example consumer as it rejects any
+//! other handle of the stack's allocation inside the body unless the query proves it disjoint from the per-iteration
+//! view. Dynamic indexing will use the same query as its "may-alias" oracle.
 //!
 //! # Boundary Views
 //!
@@ -70,11 +70,11 @@
 //! the source input with [`InputRegionProvenance::View`] through [`Operation::input_region_provenance`] and describes
 //! the view through [`ReferenceViewOperation::region_input_view`]. The analysis records the nested input as a view of
 //! that input (refer to the "Boundaries" section of the [`analysis`](super::analysis) module documentation) and closes
-//! each [`RegionLocal`](ReferenceViewSymbol::RegionLocal) coordinate over the _attached region_ rather than over the
+//! each [`RegionLocal`](ReferenceViewSymbol::RegionLocal) symbol over the _attached region_ rather than over the
 //! attaching instruction, so a shared region attached by several instructions has one path per nested input. The
-//! defining operation supplies the coordinate's namespaced identity and meaning; core analysis only checks its scope
-//! and requires shared attachments to agree on that identity. Boundary views are created by their operation and never
-//! reapplied. [`reapply_view`](ReferenceViewOperation::reapply_view) rejects region-local coordinates, and a transform
+//! defining operation supplies the symbol's namespaced identity and meaning; core analysis only checks its scope and
+//! requires shared attachments to agree on that identity. Boundary views are created by their operation and never
+//! reapplied. [`reapply_view`](ReferenceViewOperation::reapply_view) rejects region-local symbols, and a transform
 //! that restates the operation also restates its boundary views.
 
 use std::collections::BTreeMap;
@@ -167,8 +167,8 @@ pub enum ReferenceViewAnalysisError {
         source: ReferenceViewValidationError,
     },
 
-    /// A symbolic coordinate cannot be bound at the position whose view it describes. Input symbols must name
-    /// existing non-reference inputs, and region-local symbols may describe only attached region inputs.
+    /// A symbol cannot be bound at the position whose view it describes. Input symbols must name existing non-reference
+    /// inputs, and region-local symbols may describe only attached region inputs.
     #[error("operation `{operation}` at {instruction} describes a view at {position} through {symbol}, but {message}")]
     InvalidViewSymbol {
         /// Name of the operation.
@@ -180,16 +180,16 @@ pub enum ReferenceViewAnalysisError {
         /// Output or attached region input whose view uses the invalid symbol.
         position: ReferenceAliasPosition,
 
-        /// Coordinate symbol that cannot be bound at this position.
+        /// Symbol that cannot be bound at this position.
         symbol: ReferenceViewSymbol,
 
-        /// Explanation of why the symbol cannot identify a coordinate here.
+        /// Explanation of why the symbol cannot be bound here.
         message: String,
     },
 
-    /// Attachments of one shared region describe different views or bind their coordinates to different values.
-    /// Structural analysis already checked which inputs are views; this failure compares their actual descriptions
-    /// and bindings, which must agree because the analysis stores one path for each shared region input.
+    /// Attachments of one shared region describe different views or bind their symbols to different values. Structural
+    /// analysis already checked which inputs are views; this failure compares their actual descriptions and bindings,
+    /// which must agree because the analysis stores one path for each shared region input.
     #[error(
         "operation `{operation}` at {instruction} creates a boundary view for input {input_index} of region \
          {region_index} that differs from another attachment of the shared region"
@@ -219,31 +219,31 @@ impl From<ReferenceViewAnalysisError> for ProgramError {
     }
 }
 
-/// Coordinate that a reference view description depends on but does not contain, named relative to the [`Operation`]
-/// that describes the view. A description lists its symbols through [`ReferenceView::symbols`], and every consumer that
-/// must resolve them receives one value or binding per symbol in that order: the [`ReferenceViewAnalysis`] closes them
-/// into [`ReferenceViewSymbolBinding`]s, and [`ReferenceViewOperation::reapply_view`] receives their values.
+/// Symbol identifying a value that a reference view description depends on but does not contain, relative to the
+/// [`Operation`] that describes the view. A description lists its symbols through [`ReferenceView::symbols`], and
+/// every consumer that must resolve them receives one value or binding per symbol in that order:
+/// the [`ReferenceViewAnalysis`] closes them into [`ReferenceViewSymbolBinding`]s,
+/// and [`ReferenceViewOperation::reapply_view`] receives their values.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum ReferenceViewSymbol {
-    /// Input `index` of the describing [`Instruction`](crate::Instruction), which must be a non-reference value
-    /// (i.e., a traced coordinate).
+    /// Input `index` of the describing [`Instruction`](crate::Instruction), which must be a non-reference value.
     Input(usize),
 
-    /// Coordinate supplied by the operation when entering an attached [`Region`]. It can describe a region-input view,
-    /// but never an instruction-output view: the operation creates that view at the boundary, and generic replay has
-    /// no value for the coordinate. For example, a scan can use one coordinate for its iteration counter, while a
-    /// tiling operation can use one coordinate per axis.
+    /// Symbol for a value supplied by the operation when entering an attached [`Region`]. It can describe a region
+    /// input view, but never an instruction output view: the operation creates that view at the boundary, and generic
+    /// replay has no value for the symbol. For example, a scan can use one symbol for its iteration index, while a
+    /// tiling operation can use one symbol per axis.
     ///
-    /// `name` identifies the coordinate's semantic role and must include an operation- or crate-owned namespace to
-    /// avoid collisions with downstream operations. `index` distinguishes coordinates with that role, such as the
-    /// axes of a tile. Reusing the same name and index asserts that the coordinates have the same meaning within one
-    /// attached region, even when different operations attach that region. Names must therefore distinguish roles
-    /// whose meanings differ; the analysis checks identities and scope, not the operation's coordinate computation.
+    /// `name` identifies a symbol family and must include an operation- or crate-owned namespace to avoid collisions
+    /// with downstream operations. `index` distinguishes symbols within that family, such as the axes of a tile.
+    /// Reusing the same name and index asserts that the symbols have the same meaning within one attached region, even
+    /// when different operations attach that region. Names must therefore distinguish roles whose meanings differ; the
+    /// analysis checks identities and scope, not how the operation computes the values.
     RegionLocal {
-        /// Namespaced semantic role of the coordinate, owned by its defining operation or crate.
+        /// Namespaced symbol family, owned by its defining operation or crate.
         name: &'static str,
 
-        /// Coordinate within that role, such as an axis of a tile.
+        /// Identifies a symbol within the family named by `name`, rather than the value represented by that symbol.
         index: usize,
     },
 }
@@ -253,36 +253,36 @@ impl Display for ReferenceViewSymbol {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Input(index) => write!(formatter, "input {index}"),
-            Self::RegionLocal { name, index } => write!(formatter, "region-local coordinate `{name}`[{index}]"),
+            Self::RegionLocal { name, index } => write!(formatter, "region-local symbol `{name}`[{index}]"),
         }
     }
 }
 
 // TODO(eaplatanios): Review from here onwards.
 
-/// Program identity that a [`ReferenceViewSymbol`] is bound to once the [`ReferenceViewAnalysis`] closes a description
-/// over the instruction that created it.
-///
-/// A [`RegionLocal`](ReferenceViewSymbol::RegionLocal) symbol binds to the region whose inputs the view describes
-/// rather than to the instruction that attaches that region. Its namespaced role and coordinate index remain part of
-/// the binding, so matching attachments share one path per nested input, while distinct coordinate roles or indices
-/// cannot silently compare equal.
+/// [`Program`](crate::Program) identity that a [`ReferenceViewSymbol`] is bound to once the
+/// [`ReferenceViewAnalysis`] closes a description over the [`Instruction`](crate::Instruction) that created it. A
+/// [`RegionLocal`](ReferenceViewSymbol::RegionLocal) symbol binds to the region whose inputs the view describes rather
+/// than to the instruction that attaches that [`Region`]. Its family name and symbol index remain part of the binding,
+/// so matching attachments share one path per nested input, while distinct symbol names or indices cannot silently
+/// compare equal.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum ReferenceViewSymbolBinding {
-    /// The input value named by an [`Input`](ReferenceViewSymbol::Input) symbol.
+    /// [`ValueId`] of the input value named by an [`Input`](ReferenceViewSymbol::Input) symbol.
     Value(ValueId),
 
-    /// Coordinate supplied at the boundary of `region`, with the semantic role `name` and coordinate `index` declared
-    /// by its [`RegionLocal`](ReferenceViewSymbol::RegionLocal) symbol. The same role and index in different regions
-    /// identify distinct coordinates; different attachments of the same region agree only when both also match.
+    /// Symbol for a value supplied at the boundary of `region`, with the family `name` and symbol `index` declared
+    /// by its [`RegionLocal`](ReferenceViewSymbol::RegionLocal) symbol. The same family name and index in different
+    /// regions identify distinct symbols; different attachments of the same region agree only when both also match.
     RegionLocal {
-        /// Region whose boundary supplies the coordinate, independent of which instruction attaches it.
+        /// [`RegionId`] of the [`Region`] whose boundary supplies the symbol's value, independent of which
+        /// [`Instruction`](crate::Instruction) attaches it.
         region: RegionId,
 
-        /// Namespaced semantic role declared by the operation's symbol.
+        /// Namespaced family declared by the [`Operation`]'s symbol.
         name: &'static str,
 
-        /// Coordinate within the role named by `name`.
+        /// Identifies a symbol within the family named by `name`, rather than the value represented by that symbol.
         index: usize,
     },
 }
@@ -293,18 +293,18 @@ pub enum ReferenceViewSymbolBinding {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum NoReferenceViewBinding {}
 
-/// Coordinate-level relation between two closed root-relative paths of one reference root, as decided statically by
+/// Overlap between the parts selected by two closed root-relative paths of one reference root, as decided statically by
 /// [`ReferenceView::overlap`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ReferenceViewOverlap {
-    /// The two paths provably select no common coordinate of the root.
+    /// The two paths provably select disjoint parts of the root.
     Disjoint,
 
-    /// The two paths provably select exactly the same coordinates of the root.
+    /// The two paths provably select exactly the same part of the root.
     Same,
 
-    /// The two paths may share coordinates: they select different but intersecting static coordinates, or at least
-    /// one coordinate is symbolic and not provably equal to (or different from) its counterpart.
+    /// The two paths may overlap: their static selections intersect, or a selection depends on a symbol whose
+    /// binding cannot prove the paths identical or disjoint.
     MayOverlap,
 }
 
@@ -312,8 +312,8 @@ pub enum ReferenceViewOverlap {
 ///
 /// The bounds are what the retained [`ReferenceViewAnalysis`] needs to live in a region's transform cache and to be
 /// revalidated against a fresh derivation, plus hashing so that paths of descriptions can key eager handles. A
-/// description may depend on coordinates outside itself, which it names through [`symbols`](Self::symbols); refer to
-/// the module documentation for how the view analysis closes them.
+/// description may depend on values outside itself, which it names through [`symbols`](Self::symbols); refer to the
+/// module documentation for how the view analysis closes them.
 pub trait ReferenceView: 'static + Clone + Debug + PartialEq + Eq + Hash + Send + Sync {
     /// Reference type family the description addresses.
     type Type: Type;
@@ -323,10 +323,10 @@ pub trait ReferenceView: 'static + Clone + Debug + PartialEq + Eq + Hash + Send 
     fn symbols(&self) -> Vec<ReferenceViewSymbol>;
 
     /// Moves the batch axis of a source reference through this mapping. The batch axis of a reference is an axis of
-    /// its packed referent that the per-item view never sees, so the batched description must select the same
-    /// per-item coordinates of the packed source that this description selects of the unbatched one, and the derived
-    /// reference has its own batch axis. This is pure axis arithmetic: the symbols of the description are untouched,
-    /// and a replicated `batch_axis` returns the description unchanged and replicated.
+    /// its packed referent that the per-item view never sees, so the batched description must select the same part of
+    /// each item of the packed source that this description selects of the unbatched one, and the derived reference has
+    /// its own batch axis. This is pure axis arithmetic: the symbols of the description are untouched, and a replicated
+    /// `batch_axis` returns the description unchanged and replicated.
     ///
     /// # Parameters
     ///
@@ -339,12 +339,12 @@ pub trait ReferenceView: 'static + Clone + Debug + PartialEq + Eq + Hash + Send 
     /// without axes rejects every mapped axis, and a static array slice cannot span a dynamically sized batch axis).
     fn batch(&self, source: &Self::Type, batch_axis: BatchAxis) -> Result<(Self, BatchAxis), BatchingError>;
 
-    /// Returns the relation between the coordinates that two closed root-relative paths `a` and `b` select of one root
-    /// of type `root`. Two symbolic coordinates are the same coordinate iff their bindings are equal; a symbolic and a
-    /// static coordinate on one axis, or two symbolic coordinates with different bindings, may overlap. The empty path
-    /// denotes the complete root, so it is [`Same`](ReferenceViewOverlap::Same) as itself and may overlap with any
-    /// narrowing path. Paths are validated when they are derived, so implementations may treat a malformed path
-    /// conservatively as [`MayOverlap`](ReferenceViewOverlap::MayOverlap) instead of failing.
+    /// Returns the overlap between the parts that two closed root-relative paths `a` and `b` select of one root of
+    /// type `root`. Equal symbol bindings identify the same value. Different bindings do not prove disjointness: for
+    /// example, different input values may supply equal array indices. The empty path denotes the complete root, so it
+    /// is [`Same`](ReferenceViewOverlap::Same) as itself and may overlap with any narrowing path. Paths are validated
+    /// when they are derived, so implementations may treat a malformed path conservatively as
+    /// [`MayOverlap`](ReferenceViewOverlap::MayOverlap) instead of failing.
     fn overlap(root: &Self::Type, a: &[ReferenceViewStep<Self>], b: &[ReferenceViewStep<Self>])
     -> ReferenceViewOverlap;
 }
@@ -377,7 +377,7 @@ pub trait ReferenceViewOperation: Operation {
     /// [`Operation::input_region_provenance`] must return
     /// [`InputRegionProvenance::View`](crate::InputRegionProvenance::View), whose `input_index` names the source in the
     /// operation's input list. Such a view is created by the operation at the region boundary, so its description may
-    /// name [`ReferenceViewSymbol::RegionLocal`] coordinates supplied by the operation. Returns [`None`] when the region
+    /// name [`ReferenceViewSymbol::RegionLocal`] symbols supplied by the operation. Returns [`None`] when the region
     /// input is forwarded unchanged or is not reference-typed; the default describes no boundary views.
     fn region_input_view(&self, region_index: usize, input_index: usize) -> Option<Self::View> {
         let _ = (region_index, input_index);
@@ -410,7 +410,7 @@ pub trait ReferenceViewOperation: Operation {
     ///   - `source`: Reference the view is applied to.
     ///   - `symbols`: One value per entry of [`view.symbols()`](ReferenceView::symbols), in that order. An
     ///     [`RegionLocal`](ReferenceViewSymbol::RegionLocal) symbol has no value here: its operation supplies the
-    ///     coordinate when it creates the boundary view, so generic replay rejects a description naming one.
+    ///     value when it creates the boundary view, so generic replay rejects a description naming one.
     ///
     /// # Errors
     ///
@@ -516,7 +516,7 @@ impl<View, Binding> ReferenceViewPath<View, Binding> {
 }
 
 impl<View: ReferenceView> ReferenceViewPath<View> {
-    /// Returns the relation between the coordinates this path and `other` select of one root of type `root`, through
+    /// Returns the overlap between the parts this path and `other` select of one root of type `root`, through
     /// [`ReferenceView::overlap`]. Both paths must be root-relative paths of the same root; callers that compare
     /// analyzed values of one region use [`ReferenceViewAnalysis::overlap`], which checks the roots first, while this
     /// function serves callers that resolve roots across namespaces themselves.
@@ -545,10 +545,10 @@ impl<View, Binding> Default for ReferenceViewPath<View, Binding> {
 /// input the attaching operation creates as a boundary view (declared through the `View` variant returned by
 /// [`Operation::input_region_provenance`]) carries the single step that operation reports through
 /// [`ReferenceViewOperation::region_input_view`], closed over the attached region, so its
-/// [`RegionLocal`](ReferenceViewSymbol::RegionLocal) coordinates bind to that region and retain their namespaced roles
-/// and indices. Every attachment is validated, and its description and coordinate bindings must agree
-/// with that shared path. The structural root still names the nested input, but the boundary step starts from the
-/// caller's source reference type before selecting the nested input's portion.
+/// [`RegionLocal`](ReferenceViewSymbol::RegionLocal) symbols bind to that region and retain their namespaced roles and
+/// indices. Every attachment is validated, and its description and symbol bindings must agree with that shared path.
+/// The structural root still names the nested input, but the boundary step starts from the caller's source reference
+/// type before selecting the nested input's portion.
 ///
 /// The view analysis is retained in the region's transform cache under exactly the cache identity of the structural
 /// analysis (refer to the documentation of [`RegionRef::reference_view_analysis`]) and shares that analysis through an
@@ -604,9 +604,9 @@ impl<View> ReferenceViewAnalysis<View> {
         let analysis = region.reference_analysis_impl(arguments)?;
         let mut paths = BTreeMap::new();
         analysis.values().try_for_each(|value| Self::derive_path(region, &analysis, &mut paths, value))?;
-        // A shared region has one path per input, but each attachment supplies its own view description and
-        // coordinate inputs. Validate every attachment, including ones structural analysis reused, and require
-        // their closed steps to agree before publishing a path that all callers will share.
+        // A shared region has one path per input, but each attachment supplies its own view description and inputs
+        // named by symbols. Validate every attachment, including ones structural analysis reused, and require their
+        // closed steps to agree before publishing a path that all callers will share.
         for binding in analysis.region_input_bindings().iter().filter(|binding| binding.is_view()) {
             let value = binding.input();
             let id = binding.instruction();
@@ -647,7 +647,7 @@ impl<View> ReferenceViewAnalysis<View> {
         &self.analysis
     }
 
-    /// Returns the [`ReferenceViewPath`] from the root of the reference-typed `value` to the coordinates it selects,
+    /// Returns the [`ReferenceViewPath`] from the root of the reference-typed `value` to the part it selects,
     /// or [`None`] when `value` is not a reference-typed value of the closure. Root handles carry the empty path, and
     /// so does a nested region input forwarded as a complete handle, while a nested region input created as a boundary
     /// view by its attaching operation carries that operation's step closed over the attached region.
@@ -663,7 +663,7 @@ impl<View> ReferenceViewAnalysis<View> {
         self.paths.iter().map(|(value, path)| (*value, path))
     }
 
-    /// Returns the [`ReferenceViewOverlap`] between the coordinates that the reference-typed values `a` and `b` of one
+    /// Returns the [`ReferenceViewOverlap`] between the parts that the reference-typed values `a` and `b` of one
     /// region select, or [`None`] when either is not a reference-typed value of the closure or the two values belong to
     /// different regions. Roots are region-relative (a nested region input is a root of its own namespace even when it
     /// carries a caller root), so only values of one region have comparable roots: values of different roots are
@@ -755,8 +755,8 @@ impl<View> ReferenceViewAnalysis<View> {
         Ok(())
     }
 
-    /// Validates one view description against its source and result reference types, then binds each symbolic
-    /// coordinate to the describing instruction's input or to an operation-defined coordinate in the attached region.
+    /// Validates one view description against its source and result reference types, then binds each symbol to the
+    /// describing instruction's input or to an operation-defined value in the attached region.
     fn derive_view_step<V: Value, O: ReferenceViewOperation<Type = V::Type, View = View>>(
         region: RegionRef<'_, V, O>,
         id: InstructionId,
@@ -786,10 +786,10 @@ impl<View> ReferenceViewAnalysis<View> {
         O::validate_view(&view, source_type.as_ref(), output_type.as_ref()).map_err(|source| {
             ReferenceViewAnalysisError::InvalidView { operation: name, instruction: id, position, source }
         })?;
-        // Input symbols name non-reference coordinate values in this instruction. Region-local symbols instead
-        // name coordinates supplied at the attached region's boundary. Keep their roles and indices in the binding
-        // so matching attachments share a path without conflating different coordinates. Such coordinates are not
-        // available for instruction outputs.
+        // Input symbols name non-reference values in this instruction. Region-local symbols instead name values
+        // supplied at the attached region's boundary. Keep the family name and symbol index in the binding so matching
+        // attachments share a path without conflating different symbols. Region-local symbols cannot describe
+        // instruction outputs.
         let inputs = instruction.inputs();
         let mut bindings = Vec::new();
         for symbol in view.symbols() {
@@ -877,14 +877,13 @@ impl<'r, V: Value, O: ReferenceViewOperation<Type = V::Type>> RegionRef<'r, V, O
 /// [`BatchableOperation`](crate::batching::BatchableOperation) rule of every operation whose effects declare only
 /// [`View`](ReferenceAliasKind::View) aliases of one source input.
 ///
-/// The rule reads the operation's [`effects`](Operation::effects) to find the single source
-/// input and the view outputs, requires every other input (the coordinate inputs named by the views' symbols) to
-/// be replicated, and then, for each view output in output order, moves the source's batch axis through the description
-/// with [`ReferenceView::batch`] and binds the batched description over the packed source through
-/// [`ReferenceViewOperation::reapply_view`] on the parent context, supplying the packed value of each input a symbol
-/// names. Each reapplication binds one operation on the parent, so an operation with several view outputs (e.g., a
-/// family that splits a register into two halves) is bound once per output, each time keeping the output the
-/// description denotes.
+/// The rule reads the operation's [`effects`](Operation::effects) to find the single source input and the view outputs,
+/// requires every other input (the inputs named by the views' symbols) to be replicated, and then, for each view output
+/// in output order, moves the source's batch axis through the description with [`ReferenceView::batch`] and binds the
+/// batched description over the packed source through [`ReferenceViewOperation::reapply_view`] on the parent context,
+/// supplying the packed value of each input a symbol names. Each reapplication binds one operation on the parent, so an
+/// operation with several view outputs (e.g., a family that splits a register into two halves) is bound once per
+/// output, each time keeping the output the description denotes.
 ///
 /// # Parameters
 ///
@@ -896,10 +895,10 @@ impl<'r, V: Value, O: ReferenceViewOperation<Type = V::Type>> RegionRef<'r, V, O
 /// # Errors
 ///
 /// Returns [`BatchingError::UnsupportedOperation`] when the operation derives no view, views more than one source
-/// input, has outputs other than its views, has observable effects or attached regions, has a mapped non-source
-/// input (batching a view through a mapped coordinate is not supported), or describes a view through a region-local
-/// coordinate, which only describes region inputs. Propagates the [`BatchingError`] of [`ReferenceView::batch`] and the
-/// errors of the parent context's binding.
+/// input, has outputs other than its views, has observable effects or attached regions, has a mapped non-source input
+/// (batching a view through a mapped symbol is not supported), or describes a view through a region-local symbol, which
+/// only describes region inputs. Propagates the [`BatchingError`] of [`ReferenceView::batch`] and the errors of the
+/// parent context's binding.
 pub fn batch_reference_view_operation<C, P, O>(
     operation: &O,
     context: &BatchingContext<C, P>,
@@ -1101,7 +1100,7 @@ mod tests {
         ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, dimensions)))
     }
 
-    /// Returns a static index view for the given axis and coordinate.
+    /// Returns a static index view for the given axis and index.
     fn index(axis: usize, index: usize) -> ArrayReferenceViewTransform {
         ArrayReferenceViewTransform::Index { axis, index: ArrayReferenceViewIndex::Static(index) }
     }
@@ -1112,7 +1111,7 @@ mod tests {
         ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(SCAN_ITERATION_SYMBOL) }
     }
 
-    /// Returns the scan's operation-owned coordinate bound to `region`.
+    /// Returns the scan's operation-owned symbol bound to `region`.
     fn iteration_binding(region: RegionId) -> ReferenceViewSymbolBinding {
         let ReferenceViewSymbol::RegionLocal { name, index } = SCAN_ITERATION_SYMBOL else {
             panic!("the scan iteration coordinate must be region-local");
@@ -1159,10 +1158,10 @@ mod tests {
         builder.build(vec![snapshot], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
-    /// Array-IR family extended with one two-input view operation whose description selects coordinate `symbol` on
-    /// axis 0 of its reference input, `symbolic_view(reference: ref<f32[n]>, coordinate: f32) -> ref<f32[]>`, and
-    /// with region-carrying operations that reuse scan's structural interface while omitting or replacing its boundary
-    /// view descriptions. The configurable descriptions isolate coordinate identity from scan's iteration semantics.
+    /// Array-IR family extended with one two-input view operation whose description selects index `symbol` on
+    /// axis 0 of its reference input, `symbolic_view(reference: ref<f32[n]>, index: f32) -> ref<f32[]>`, and with
+    /// region-carrying operations that reuse scan's structural interface while omitting or replacing its boundary view
+    /// descriptions. The configurable descriptions isolate symbol identity from scan's iteration semantics.
     #[derive(Clone, Debug)]
     enum SymbolicViewOperation {
         Native(TestOperation),
@@ -1173,7 +1172,7 @@ mod tests {
     }
 
     impl SymbolicViewOperation {
-        /// Independent coordinates supplied by the custom boundary operation for its two reference inputs.
+        /// Independent symbols declared by the custom boundary operation for its two reference inputs.
         const COORDINATES: [ReferenceViewSymbol; 2] = [
             ReferenceViewSymbol::RegionLocal { name: "test.tile.coordinate", index: 0 },
             ReferenceViewSymbol::RegionLocal { name: "test.tile.coordinate", index: 1 },
@@ -1360,8 +1359,8 @@ mod tests {
         }
     }
 
-    /// Builds `f(vector: ref<f32[2]>, coordinate: f32) = read(symbolic_view(vector, coordinate))`, whose view
-    /// describes its coordinate through `symbol`.
+    /// Builds `f(vector: ref<f32[2]>, index: f32) = read(symbolic_view(vector, index))`, whose view
+    /// describes its index through `symbol`.
     fn symbolic_view_program(
         symbol: ReferenceViewSymbol,
     ) -> Program<TestValue, SymbolicViewOperation, Vec<TestValue>, Vec<TestValue>> {
@@ -1383,7 +1382,7 @@ mod tests {
     }
 
     /// Builds two attachments of one region with two boundary views. The first attachment uses the custom
-    /// operation's coordinate pair; the second describes those views through `second_symbols`.
+    /// operation's symbol pair; the second describes those views through `second_symbols`.
     fn shared_coordinate_program(
         second_symbols: [ReferenceViewSymbol; 2],
     ) -> Program<TestValue, SymbolicViewOperation, Vec<TestValue>, Vec<TestValue>> {
@@ -1512,7 +1511,7 @@ mod tests {
                 message: "a region-local symbol only describes region inputs".to_string(),
             }
             .to_string(),
-            "operation `symbolic_view` at ^0[2] describes a view at output 0 through region-local coordinate \
+            "operation `symbolic_view` at ^0[2] describes a view at output 0 through region-local symbol \
              `test.tile.coordinate`[0], but a region-local symbol only describes region inputs",
         );
         assert_eq!(
@@ -1576,8 +1575,8 @@ mod tests {
     fn test_reference_view_symbol() {
         assert_eq!(ReferenceViewSymbol::Input(2).to_string(), "input 2");
         let [first, second] = SymbolicViewOperation::COORDINATES;
-        assert_eq!(first.to_string(), "region-local coordinate `test.tile.coordinate`[0]");
-        assert_eq!(second.to_string(), "region-local coordinate `test.tile.coordinate`[1]");
+        assert_eq!(first.to_string(), "region-local symbol `test.tile.coordinate`[0]");
+        assert_eq!(second.to_string(), "region-local symbol `test.tile.coordinate`[1]");
         let other_role = ReferenceViewSymbol::RegionLocal { name: "test.partition.coordinate", index: 0 };
         let symbols = HashMap::from([(first, "first"), (second, "second"), (other_role, "other role")]);
         assert_eq!(symbols.len(), 3);
@@ -1588,7 +1587,7 @@ mod tests {
 
     #[test]
     fn test_reference_view_symbol_binding() {
-        // Identity includes the region, coordinate role, and index. None of those components can be discarded when
+        // Identity includes the region, symbol family, and symbol index. None of those components can be discarded when
         // comparing paths, even if two descriptions happen to have the same shape.
         let coordinate = ReferenceViewSymbolBinding::RegionLocal {
             region: RegionId::new(0),
@@ -1670,7 +1669,7 @@ mod tests {
         assert_eq!(bound.steps()[1].bindings(), &[ReferenceViewSymbolBinding::Value(value(0, 3))]);
         assert_eq!(row.views().collect::<Vec<_>>(), vec![&index(0, 1)]);
 
-        // Equal descriptions can select different coordinates when their source bindings differ.
+        // Equal descriptions can select different indices when their source bindings differ.
         assert_eq!(bound, row.with_step(symbolic.clone(), vec![ReferenceViewSymbolBinding::Value(value(0, 3))]));
         assert_ne!(bound, row.with_step(symbolic.clone(), vec![ReferenceViewSymbolBinding::Value(value(0, 4))]));
         assert_ne!(bound, row.with_step(symbolic, vec![iteration_binding(RegionId::new(1))]));
@@ -2064,8 +2063,8 @@ mod tests {
 
     #[test]
     fn test_reference_view_analysis_new_binds_input_symbols() {
-        // The view analysis closes the description over the describing instruction: its input symbol binds to the
-        // coordinate input's identity, and the static read output has no path.
+        // The view analysis closes the description over the describing instruction: its input symbol binds to the index
+        // input's identity, and the static read output has no path.
         let program = symbolic_view_program(ReferenceViewSymbol::Input(1));
         let analysis = ReferenceViewAnalysis::new(program.entry_region_ref(), 0).unwrap();
         let view = SymbolicViewOperation::view(ReferenceViewSymbol::Input(1));
@@ -2093,7 +2092,7 @@ mod tests {
             }),
         );
 
-        // The named input must be a coordinate value, not the viewed reference itself.
+        // The named input must be a non-reference value, not the viewed reference itself.
         let program = symbolic_view_program(ReferenceViewSymbol::Input(0));
         assert_eq!(
             ReferenceViewAnalysis::new(program.entry_region_ref(), 0).err(),
@@ -2225,8 +2224,8 @@ mod tests {
 
     #[test]
     fn test_reference_view_analysis_new_binds_multiple_region_local_coordinates() {
-        // One operation supplies independent coordinates to two boundary inputs. Both attachments agree, so each
-        // region input has one path whose coordinate identity does not depend on the attaching instruction.
+        // One operation declares independent symbols for two boundary inputs. Both attachments agree, so each region
+        // input has one path whose symbol identity does not depend on the attaching instruction.
         let program = shared_coordinate_program(SymbolicViewOperation::COORDINATES);
         let analysis = ReferenceViewAnalysis::new(program.entry_region_ref(), 0).unwrap();
         assert_eq!(
@@ -2256,8 +2255,8 @@ mod tests {
 
     #[test]
     fn test_reference_view_analysis_new_rejects_inconsistent_region_local_coordinates() {
-        // Shape-compatible boundary views cannot exchange either coordinate indices or semantic roles between
-        // attachments of a shared region. The first boundary input still agrees in both cases.
+        // Shape-compatible boundary views cannot exchange either symbol indices or family names between attachments of
+        // a shared region. The first boundary input still agrees in both cases.
         let different_index =
             shared_coordinate_program([SymbolicViewOperation::COORDINATES[0], SymbolicViewOperation::COORDINATES[0]]);
         assert_eq!(
@@ -2408,8 +2407,8 @@ mod tests {
 
     #[test]
     fn test_reference_view_analysis_overlap() {
-        // Within one root both paths fold to root coordinates: the row slice may overlap with the complete root, and
-        // indexing the single row of that slice selects exactly the slice's coordinates again. Values that are not
+        // Within one root both paths fold to root indices: the row slice may overlap with the complete root, and
+        // indexing the single row of that slice selects exactly the slice's indices again. Values that are not
         // references, or that live in different regions, have no answer.
         let program = chain_program();
         let region = program.entry_region_ref();
@@ -2448,8 +2447,8 @@ mod tests {
         assert_eq!(analysis.overlap(region, value(0, 0), value(0, 2)), Some(ReferenceViewOverlap::MayOverlap));
         assert_eq!(analysis.overlap(region, value(0, 2), value(0, 2)), Some(ReferenceViewOverlap::Same));
 
-        // Symbolic coordinates compare by their bindings: two views through the same coordinate input select the
-        // same slot, while views through different inputs, or against a static coordinate or the root, may overlap.
+        // Symbolic indices compare by their bindings: two views through the same index input select the
+        // same slot, while views through different inputs, or against a static index or the root, may overlap.
         let mut builder = ProgramBuilder::<TestValue, SymbolicViewOperation>::new();
         let vector = builder.add_input(reference_type([2]));
         let coordinate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));

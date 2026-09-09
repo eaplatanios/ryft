@@ -975,9 +975,9 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeReference<C, P
     /// Returns the alias that a [`ReferenceDischargePolicy`] can use to access the portion selected by this
     /// [`ReferenceDischargeReference`]. The alias always applies directly to the allocation's complete stored value.
     /// When this reference is created from another view, the alias therefore describes the portion selected by the new
-    /// reference relative to the complete stored value, rather than relative only to the input view. A view step whose
-    /// coordinates are symbolic is closed over the destination values of the operands it names when the alias is
-    /// created, so the policy resolves it from the alias alone, without an environment lookup.
+    /// reference relative to the complete stored value, rather than relative only to the input view. A view step with
+    /// symbols is closed over the destination values of the operands they name when the alias is created, so the policy
+    /// resolves it from the alias alone, without an environment lookup.
     pub const fn alias(&self) -> &P::Alias {
         &self.alias
     }
@@ -2867,8 +2867,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     /// and exposed [`ReferenceType`]. This function creates another handle rather than binding a new allocation. The
     /// returned reference keeps the input reference's allocation identity, cannot denote the allocation's complete
     /// value, and carries `alias` as its authoritative complete view chain rather than merely its newest view step.
-    /// Any symbolic view coordinates in `alias` must already be bound to their corresponding values in the destination
-    /// context.
+    /// Any view symbols in `alias` must already be bound to their corresponding values in the destination context.
     ///
     /// For a discharged allocation, later accesses apply that chain to the allocation's immutable state and
     /// `replay_preserved_view_fn` is never called. For a preserved allocation, `replay_preserved_view_fn` must replay
@@ -2880,8 +2879,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     /// # Parameters
     ///
     ///   - `reference`: Reference value being aliased.
-    ///   - `alias`: Complete composed view chain, including destination-context values for all symbolic view
-    ///     coordinates.
+    ///   - `alias`: Complete composed view chain, including destination-context values for all view symbols.
     ///   - `r#type`: Reference type the alias exposes.
     ///   - `replay_preserved_view_fn`: Function that replays the source view operation against the parent destination
     ///     reference and returns its single reference result. It is called exactly once for a preserved allocation and
