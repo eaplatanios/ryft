@@ -859,7 +859,7 @@ mod tests {
         fn transpose_program(
             &self,
             _region: RegionRef<'_, Array, ArrayOperation<Array>>,
-            _input_linearity: &[bool],
+            _input_indices: &[usize],
             _destination_kinds: &[CotangentDestinationKind],
         ) -> Result<Arc<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>, DifferentiationError> {
             Err(ProgramError::UnsupportedOperation {
@@ -1650,7 +1650,7 @@ mod tests {
             fn transpose_program(
                 &self,
                 _region: RegionRef<'_, Array, ArrayOperation<Array>>,
-                _input_linearity: &[bool],
+                _input_indices: &[usize],
                 _destination_kinds: &[CotangentDestinationKind],
             ) -> Result<Arc<Program<Array, ArrayOperation<Array>, Vec<Array>, Vec<Array>>>, DifferentiationError>
             {

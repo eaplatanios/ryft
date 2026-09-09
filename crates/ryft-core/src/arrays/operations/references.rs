@@ -1778,7 +1778,7 @@ mod tests {
                 &accumulators,
             ),
             Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
-                if message == "operand 0 has no reference root in a transposition context that is not scoped to a \
+                if message == "input 0 has no reference root in a transposition context that is not scoped to a \
                     reference-carrying instruction",
         ));
         let context = TracingContext::<TestValue, TestOperation>::new();
@@ -1794,7 +1794,7 @@ mod tests {
                 &accumulators,
             ),
             Err(DifferentiationError::Program(ProgramError::MalformedProgram(message)))
-                if message == "operand 0 has no reference root in a transposition context that is not scoped to a \
+                if message == "input 0 has no reference root in a transposition context that is not scoped to a \
                     reference-carrying instruction",
         ));
     }

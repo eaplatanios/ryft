@@ -3091,7 +3091,7 @@ where
     // when no ordinary output cotangent does.
     if outputs.iter().all(MaybeZero::is_zero)
         && !cotangents.has_reference_state_destinations()
-        && !driver.region(0)?.has_observable_transpose_effects()
+        && !driver.region(0)?.has_observable_effects_in_closure()
     {
         return inputs.iter().map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?))).collect();
     }
@@ -3104,13 +3104,13 @@ where
     check_count!("input", inputs, body.input_types().len() + runtime_length_count, ProgramError);
     let (body_inputs, runtime_length_inputs) = inputs.split_at(body.input_types().len());
     // The body is transposed through its region's retained transform cache, so a body shared by several programs is
-    // transposed once per linearity mask and repeated attachments of the result intern by `Arc` identity. Captured
-    // linear scans return every cotangent as a value, so a reference-typed body input is rejected by the transposition
+    // transposed once per selection of linear inputs and repeated attachments of the result intern by `Arc` identity.
+    // Captured linear scans return every cotangent as a value, so a reference-typed body input is rejected by the transposition
     // itself.
     let body_input_count = body.input_ids().len();
     let transposed_body = driver.transpose_program(
         body,
-        &vec![true; body_input_count],
+        &(0..body_input_count).collect::<Vec<_>>(),
         &vec![CotangentDestinationKind::Return; body_input_count],
     )?;
     let transposed = ScanOperation::<F>::new(operation.carry_count(), operation.length())
@@ -3234,7 +3234,7 @@ where
     check_count!("input", cotangents.kinds(), inputs.len(), ProgramError);
     if outputs.iter().all(MaybeZero::is_zero)
         && !cotangents.has_reference_state_destinations()
-        && !driver.region(0)?.has_observable_transpose_effects()
+        && !driver.region(0)?.has_observable_effects_in_closure()
     {
         return inputs
             .iter()
@@ -3292,10 +3292,16 @@ where
     // `[carry_output_cotangent..., y_slice_cotangent..., cotangent_reference..., known_input_value...] ->
     // [linear_input_cotangent...]`, in body order on each side.
     // The body is transposed through its region's retained transform cache, so a body shared by several programs is
-    // transposed once per linearity mask and repeated attachments of the result intern by `Arc` identity.
+    // transposed once per selection of linear inputs and repeated attachments of the result intern by `Arc` identity.
+    let (input_indices, selected_destination_kinds): (Vec<_>, Vec<_>) = operand_linear
+        .iter()
+        .zip(destination_kinds)
+        .enumerate()
+        .filter_map(|(index, (&linear, &kind))| linear.then_some((index, kind)))
+        .unzip();
     let mut transposed_body =
         driver
-            .transpose_program(body, operand_linear.as_slice(), destination_kinds)
+            .transpose_program(body, &input_indices, &selected_destination_kinds)
             .map_err(|error| match error {
                 crate::differentiation::DifferentiationError::Program(error) => error,
                 error => ProgramError::UnsupportedOperation { message: error.to_string() },
@@ -7122,7 +7128,13 @@ mod tests {
                 let start = Instant::now();
                 linearization
                     .tangent()
-                    .transpose_with_trailing_residuals(linearization.residual_count(), &[])
+                    .entry_region_ref()
+                    .transpose(
+                        &(0..linearization.tangent().input_ids().len() - linearization.residual_count())
+                            .collect::<Vec<_>>(),
+                        &[],
+                        &[],
+                    )
                     .unwrap();
                 rows.push((linearized, start.elapsed()));
             }
@@ -7393,8 +7405,11 @@ mod tests {
 
         // Transposing the tangent program twice transposes its scan body once: the second pass is served from the
         // body region's retained transposition and produces the identical pullback.
-        let pullback = first.tangent().transpose_with_trailing_residuals(first.residual_count(), &[]).unwrap();
-        let repeated = first.tangent().transpose_with_trailing_residuals(first.residual_count(), &[]).unwrap();
+        // Build a fresh outer transpose on both calls so each reaches the nested region's cache. These static
+        // tangent types need no residual dimension mappings for zeros; trailing residual inputs remain known.
+        let tangent_input_indices = (0..first.tangent().input_ids().len() - first.residual_count()).collect::<Vec<_>>();
+        let pullback = first.tangent().entry_region_ref().transpose(&tangent_input_indices, &[], &[]).unwrap();
+        let repeated = first.tangent().entry_region_ref().transpose(&tangent_input_indices, &[], &[]).unwrap();
         assert_eq!(pullback.to_string(), repeated.to_string());
         let tangent_scan = first
             .tangent()
@@ -7409,7 +7424,12 @@ mod tests {
             pullback.to_string(),
             uncached
                 .tangent()
-                .transpose_with_trailing_residuals(uncached.residual_count(), &[])
+                .entry_region_ref()
+                .transpose(
+                    &(0..uncached.tangent().input_ids().len() - uncached.residual_count()).collect::<Vec<_>>(),
+                    &[],
+                    &[],
+                )
                 .unwrap()
                 .to_string(),
         );

@@ -997,15 +997,33 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
             .any(|(_, instruction)| instruction.operation().effects().has_accesses())
     }
 
-    /// Returns whether `predicate` holds for any [`Region`] in this root's complete attached region closure, applying
-    /// it at most once to each visited region and short-circuiting at the first match.
-    fn any_region_in_closure<F: FnMut(Self) -> bool>(self, mut predicate: F) -> bool {
+    /// Returns whether this [`Region`] or any region in its complete attached region closure has effects observable
+    /// even when its outputs are unused. This includes reference accesses and explicitly declared effect classes;
+    /// reference allocations and aliases alone do not make the result `true`.
+    ///
+    /// Unlike [`effects`](Self::effects), this query includes dormant rule regions regardless of [`RegionRole`].
+    /// A positive result therefore does not imply that executing this region itself performs those effects: an
+    /// attached rule may only execute when invoked by a transform. Shared descendants are visited at most once,
+    /// and an attachment that cannot be resolved conservatively produces `true`.
+    #[inline]
+    pub fn has_observable_effects_in_closure(self) -> bool {
+        self.any_region_in_closure(|region| region.effects().has_observable_effects_when_unused())
+    }
+
+    /// Returns whether `predicate` holds for this [`Region`] or any region in its complete attached region closure.
+    /// Traversal includes every attached region regardless of [`RegionRole`], including dormant transformation rules.
+    /// The predicate is applied at most once to each region, and traversal stops at the first match. Traversal order
+    /// is unspecified. If an attachment cannot be resolved, this function conservatively returns `true`.
+    ///
+    /// # Parameters
+    ///
+    ///   - `predicate`: Condition to check on each visited region. Returning `true` ends the traversal immediately.
+    pub fn any_region_in_closure<F: FnMut(Self) -> bool>(self, mut predicate: F) -> bool {
         // Attachments form a Directed Acyclic Graph (DAG) in which one shared region can be reachable through many
         // paths, so this is an iterative worklist with an arena-indexed visited set: a naive recursion would revisit
         // shared regions once per path (exponentially in the worst case) and could overflow the stack on deeply
-        // nested closures. The sealed per-region fold already covers each region's instructions and its transitive
-        // _computation_ closure, so a hit there answers immediately and the walk only needs to keep descending into
-        // attached regions of every role to reach the rule regions the sealed fold deliberately drops.
+        // nested closures. Include attachments of every role so predicates can inspect dormant rules as well as
+        // executable computations.
         let mut visited = vec![false; self.arena.len()];
         let mut pending = vec![self.id];
         while let Some(id) = pending.pop() {
@@ -2441,6 +2459,69 @@ mod tests {
         assert!(matches!(occurrences[0].operation(), TestRegionOperation::Effectful(EffectClass::OrderedIo)));
         assert!(matches!(occurrences[1].operation(), TestRegionOperation::Effectful(EffectClass::OrderedIo)));
         assert_eq!(top.effect_occurrences_in_closure(EffectClass::OrderedState).count(), 0);
+    }
+
+    #[test]
+    fn test_region_ref_has_observable_effects_in_closure() {
+        let pure = identity_program(ArrayType::scalar(DataType::F64));
+        assert!(!pure.entry_region_ref().has_observable_effects_in_closure());
+
+        // A dormant rule's effects are absent from execution summaries but remain visible to the closure query.
+        let arena = RegionArena::from_regions(vec![
+            Region::<Array, TestRegionOperation>::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![Instruction::new(
+                    TestRegionOperation::Effectful(EffectClass::OrderedIo),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )],
+            ),
+            Region::new(
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                vec![Instruction::new(
+                    TestRegionOperation::WithRegions(const { &[RegionSlot::rule("backward")] }),
+                    Vec::new(),
+                    Vec::new(),
+                    vec![RegionId::new(0)],
+                )],
+            ),
+        ])
+        .unwrap();
+        let leaf = RegionRef::new(&arena, RegionId::new(0)).unwrap();
+        let root = RegionRef::new(&arena, RegionId::new(1)).unwrap();
+        assert!(leaf.has_observable_effects_in_closure());
+        assert!(!root.effects().has_observable_effects_when_unused());
+        assert!(root.has_observable_effects_in_closure());
+
+        // Allocation alone is discardable, whereas accessing the allocated reference is observable when unused.
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let input = builder.add_input(ArrayType::scalar(DataType::F64).into());
+        let reference =
+            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+        let allocation = builder
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![reference],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(!allocation.entry_region_ref().has_observable_effects_in_closure());
+        let output =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let access = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder],
+                vec![Placeholder],
+            )
+            .unwrap();
+        assert!(access.entry_region_ref().has_observable_effects_in_closure());
     }
 
     #[test]

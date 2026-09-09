@@ -1538,8 +1538,8 @@ where
     check_count!("input", cotangents.kinds(), inputs.len(), ProgramError);
     if outputs.iter().all(MaybeZero::is_zero)
         && !cotangents.has_reference_state_destinations()
-        && !driver.region(0)?.has_observable_transpose_effects()
-        && !driver.region(1)?.has_observable_transpose_effects()
+        && !driver.region(0)?.has_observable_effects_in_closure()
+        && !driver.region(1)?.has_observable_effects_in_closure()
     {
         return inputs
             .iter()
@@ -1594,17 +1594,16 @@ where
 
     // Transpose each branch with the branch tangents marked linear and the residual inputs marked known, through each
     // branch region's retained transform cache so that a branch shared by several programs is transposed once per
-    // linearity mask. A live reference-typed branch tangent is transposed with a `Reference` destination and a dead
-    // one with an `Ignore` destination, so each transposed branch maps
+    // selection of linear inputs. A live reference-typed branch tangent is transposed with a `Reference` destination
+    // and a dead one with an `Ignore` destination, so each transposed branch maps
     // `[branch_output_cotangents..., branch_cotangent_references..., residuals...]` to
     // `[branch_tangent_cotangents...]`, where a live reference tangent's cotangent is its cotangent reference itself
     // and a dead reference tangent has no cotangent slot at all.
-    let mut branch_linear = vec![true; branch_tangent_count];
-    branch_linear.extend(std::iter::repeat_n(false, residual_count));
-    let branch_destination_kinds = &cotangents.kinds()[1..];
+    let branch_input_indices = (0..branch_tangent_count).collect::<Vec<_>>();
+    let branch_destination_kinds = &cotangents.kinds()[1..1 + branch_tangent_count];
     let transposed_branches = [
-        driver.transpose_program(driver.region(0)?, branch_linear.as_slice(), branch_destination_kinds)?,
-        driver.transpose_program(driver.region(1)?, branch_linear.as_slice(), branch_destination_kinds)?,
+        driver.transpose_program(driver.region(0)?, &branch_input_indices, branch_destination_kinds)?,
+        driver.transpose_program(driver.region(1)?, &branch_input_indices, branch_destination_kinds)?,
     ];
     let transposed_condition = ConditionOperation::new();
 
@@ -3524,7 +3523,13 @@ mod tests {
                 let start = Instant::now();
                 linearization
                     .tangent()
-                    .transpose_with_trailing_residuals(linearization.residual_count(), &[])
+                    .entry_region_ref()
+                    .transpose(
+                        &(0..linearization.tangent().input_ids().len() - linearization.residual_count())
+                            .collect::<Vec<_>>(),
+                        &[],
+                        &[],
+                    )
                     .unwrap();
                 rows.push((linearized, start.elapsed()));
             }
@@ -3615,8 +3620,11 @@ mod tests {
 
         // Transposing the tangent program twice transposes its condition's branches once: the second pass is served
         // from the branch regions' retained transpositions and produces the identical pullback.
-        let pullback = first.tangent().transpose_with_trailing_residuals(first.residual_count(), &[]).unwrap();
-        let repeated = first.tangent().transpose_with_trailing_residuals(first.residual_count(), &[]).unwrap();
+        // Build a fresh outer transpose on both calls so each reaches the nested region's cache. These static
+        // tangent types need no residual dimension mappings for zeros; trailing residual inputs remain known.
+        let tangent_input_indices = (0..first.tangent().input_ids().len() - first.residual_count()).collect::<Vec<_>>();
+        let pullback = first.tangent().entry_region_ref().transpose(&tangent_input_indices, &[], &[]).unwrap();
+        let repeated = first.tangent().entry_region_ref().transpose(&tangent_input_indices, &[], &[]).unwrap();
         assert_eq!(pullback.to_string(), repeated.to_string());
         let tangent_condition = first
             .tangent()
@@ -3632,7 +3640,12 @@ mod tests {
             pullback.to_string(),
             uncached
                 .tangent()
-                .transpose_with_trailing_residuals(uncached.residual_count(), &[])
+                .entry_region_ref()
+                .transpose(
+                    &(0..uncached.tangent().input_ids().len() - uncached.residual_count()).collect::<Vec<_>>(),
+                    &[],
+                    &[],
+                )
                 .unwrap()
                 .to_string(),
         );
