@@ -771,10 +771,11 @@ impl ReferenceTransitiveAccess {
 /// in program order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ReferenceAnalysis {
-    /// Analyzed region returned by [`Self::region`].
+    /// [`RegionId`] of the [`Region`] that was analyzed to produce this [`ReferenceAnalysis`].
     region: RegionId,
 
-    /// Roots returned by [`Self::roots`], with their external sources, transitive access modes, and consumers.
+    /// Contains every [`ReferenceRoot`] of the [`Region`] closure that was analyzed, including roots of nested regions,
+    /// in canonical root order.
     roots: BTreeMap<ReferenceRoot, RootRecord>,
 
     /// Values returned by [`Self::values`], with their roots, view status, and aliases.
@@ -845,13 +846,10 @@ impl ReferenceAnalysis {
                     .then_some(ReferenceRoot::RegionInput { region: region.id(), input_index })
             })
             .collect::<Rc<[Option<ReferenceRoot>]>>();
-        let mut traversal = Traversal::new(region, capture_count, consumable_inputs);
-        traversal.constant_scope = (resolve_constants && capture_scope.is_none()).then(|| Rc::clone(&scope));
-        traversal.resolve_constants = resolve_constants;
-        let summary = traversal.analyze_region(region, scope, vec![None; input_ids.len()].into(), None)?;
-        traversal.analysis.output_roots =
-            summary.outputs.into_iter().map(|output| output.map(|(root, _)| root)).collect();
-        Ok(traversal.analysis)
+        let constant_scope = (resolve_constants && capture_scope.is_none()).then(|| Rc::clone(&scope));
+        let traversal = Traversal::new(region, capture_count, consumable_inputs, constant_scope, resolve_constants);
+        let (analysis, _) = traversal.analyze(scope, None)?;
+        Ok(analysis)
     }
 
     /// Summarizes a region under supplied reference identities instead of assuming distinct formal inputs.
@@ -876,8 +874,9 @@ impl ReferenceAnalysis {
         captures: &[Option<ReferenceRoot>],
         capture_count: usize,
     ) -> Result<RegionSummary, ReferenceAnalysisError> {
-        let mut traversal = Traversal::new(region, capture_count, &[]);
-        traversal.analyze_region(region, captures.into(), vec![None; inputs.len()].into(), Some(inputs))
+        let traversal = Traversal::new(region, capture_count, &[], None, false);
+        let (_, summary) = traversal.analyze(captures.into(), Some(inputs))?;
+        Ok(summary)
     }
 
     /// Returns the [`RegionId`] of the analyzed region.
@@ -1180,13 +1179,29 @@ struct Traversal<'r, V: Value, O: Operation<Type = V::Type>> {
 
 impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
     /// Creates an empty traversal. Entry input ownership is independent of whether boundary bindings are supplied.
-    fn new(region: RegionRef<'r, V, O>, capture_count: usize, consumable_inputs: &[usize]) -> Self {
+    ///
+    /// # Parameters
+    ///
+    ///   - `region`: Entry region whose computation closure will be analyzed.
+    ///   - `capture_count`: Number of leading entry inputs originating in a lifted capture table.
+    ///   - `consumable_inputs`: Entry input indices whose reference ownership is transferred to the region.
+    ///   - `constant_scope`: Original inherited capture scope when resolving constants before capture lifting.
+    ///     This must share its [`Rc`] identity with the scope supplied to the initial traversal, so nested scopes
+    ///     with equal contents can still be distinguished from the inherited scope. Use [`None`] otherwise.
+    ///   - `resolve_constants`: Whether concrete reference constants may resolve independently of capture bindings.
+    fn new(
+        region: RegionRef<'r, V, O>,
+        capture_count: usize,
+        consumable_inputs: &[usize],
+        constant_scope: Option<Rc<[Option<ReferenceRoot>]>>,
+        resolve_constants: bool,
+    ) -> Self {
         Self {
             entry: region,
             capture_count,
             consumable_inputs: consumable_inputs.to_vec(),
-            constant_scope: None,
-            resolve_constants: false,
+            constant_scope,
+            resolve_constants,
             constant_roots: HashMap::new(),
             analysis: ReferenceAnalysis {
                 region: region.id(),
@@ -1201,10 +1216,30 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
         }
     }
 
-    /// Analyzes `region` under `scope` with the boundary views in `boundary` (one entry per region input). Structural
+    /// Consumes this traversal to analyze its entry region's computation closure. Returns the accumulated analysis
+    /// and the entry region's summary; structural analysis uses the former, while boundary summarization uses the
+    /// latter. Entry inputs have no boundary views because only attaching instructions introduce those views.
+    ///
+    /// # Parameters
+    ///
+    ///   - `scope`: Reference root at each inherited capture position, or [`None`] for a non-reference capture.
+    ///   - `inputs`: Caller roots for entry inputs when summarizing a boundary, with [`None`] entries for
+    ///     non-reference inputs. The caller must validate their count and types. Passing [`None`] instead analyzes
+    ///     the closure structurally, treating reference inputs as distinct roots.
+    fn analyze(
+        mut self,
+        scope: Rc<[Option<ReferenceRoot>]>,
+        inputs: Option<&[Option<ReferenceRoot>]>,
+    ) -> Result<(ReferenceAnalysis, RegionSummary), ReferenceAnalysisError> {
+        let boundary = vec![None; self.entry.input_ids().len()].into();
+        let summary = self.visit_region(self.entry, scope, boundary, inputs)?;
+        Ok((self.analysis, summary))
+    }
+
+    /// Visits `region` under `scope` with the boundary views in `boundary` (one entry per region input). Structural
     /// analysis reuses a memoized summary; boundary analysis supplies `inputs` and visits every attachment separately
     /// because its caller identities and capture bindings may differ.
-    fn analyze_region(
+    fn visit_region(
         &mut self,
         region: RegionRef<'r, V, O>,
         scope: Rc<[Option<ReferenceRoot>]>,
@@ -1517,7 +1552,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                             .collect()
                     }
                 };
-                let nested_summary = self.analyze_region(
+                let nested_summary = self.visit_region(
                     nested,
                     nested_scope,
                     boundary.into(),
@@ -1676,6 +1711,12 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
             .collect();
 
         if inputs.is_none() {
+            // The complete analysis exposes only the entry region's outputs. Nested outputs remain in their
+            // region summaries, and boundary summarization returns its summary directly instead.
+            if is_entry {
+                self.analysis.output_roots =
+                    summary.outputs.iter().map(|output| output.map(|(root, _)| root)).collect();
+            }
             self.summaries.insert(region_id, summary.clone());
         }
 
@@ -1730,7 +1771,9 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
         }
     }
 
-    /// Records that `instruction` performs `mode` on `root`, directly or transitively.
+    // TODO(eaplatanios): Review up to here.
+
+    /// Records that `instruction` performs accesses `root` in `mode` [`ReferenceAccessMode`], directly or transitively.
     fn record_mode(
         &mut self,
         instruction: InstructionId,
@@ -1750,8 +1793,6 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
         summary.accesses.entry(root).or_default().insert(mode);
     }
 }
-
-// TODO(eaplatanios): Review up to here.
 
 /// [`Region`] [`Transform`] marker for retained [`ReferenceAnalysis`] artifacts.
 struct ReferenceAnalysisTransform;
