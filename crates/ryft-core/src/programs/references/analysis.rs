@@ -96,7 +96,7 @@ use thiserror::Error;
 
 use crate::parameters::Parameterized;
 use crate::programs::ProgramError;
-use crate::programs::atoms::{Atom, AtomId};
+use crate::programs::atoms::AtomId;
 use crate::programs::effects::{ReferenceAccessMode, ReferenceAliasKind};
 use crate::programs::instructions::InstructionId;
 use crate::programs::operations::Operation;
@@ -1243,9 +1243,31 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
         Ok((self.analysis, summary))
     }
 
-    /// Visits `region` under `scope` with the boundary views in `boundary` (one entry per region input). Structural
-    /// analysis reuses a memoized summary; boundary analysis supplies `inputs` and visits every attachment separately
-    /// because its caller identities and capture bindings may differ.
+    // TODO(eaplatanios): Review up to here.
+
+    /// Analyzes references in `region` and its attached computation regions, updating this traversal's records and
+    /// returning a [`RegionSummary`] of reference accesses and outputs. Dormant rule regions are skipped. The initial
+    /// call visits the entry region; recursive calls visit attached regions.
+    ///
+    /// With `inputs` set to [`None`], each reference input defines a distinct root in its region. A shared region's
+    /// summary is reused after checking that its capture bindings and the positions of its view inputs agree with
+    /// the earlier visit. Incompatible bindings are rejected rather than analyzed as a second configuration.
+    ///
+    /// With `inputs` set to [`Some`], reference inputs use the supplied caller roots, which may alias one another.
+    /// Each attachment is analyzed separately because those roots and capture bindings can differ between callers.
+    /// This mode also records roots needed to materialize values and ignores unused constants for reference discharge.
+    ///
+    /// # Parameters
+    ///
+    ///   - `region`: Entry or attached region to visit within this traversal's computation closure.
+    ///   - `scope`: Root bound at each active capture position, or [`None`] for a non-reference capture.
+    ///     These bindings resolve capture constants in this region and in attached regions that inherit the scope.
+    ///   - `boundary`: Alias edge for each input that the attaching operation creates as a view, or [`None`] for an
+    ///     input without such a view. Contains one entry per region input; all entries are [`None`] for the entry
+    ///     region.
+    ///   - `inputs`: Caller root for each reference input, or [`None`] for a non-reference input, when analyzing
+    ///     supplied boundary identities. The caller must validate the slice's length and types. Pass [`None`] instead
+    ///     to analyze reference inputs as distinct roots and reuse shared-region summaries.
     fn visit_region(
         &mut self,
         region: RegionRef<'r, V, O>,
@@ -1279,30 +1301,30 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
             }
             return Ok(summary.clone());
         }
+
         let is_entry = region_id == self.entry.id();
         let atoms = region.atoms();
         let is_reference = |atom: AtomId| atoms[atom.index()].r#type().is_reference();
         let value_id = |atom: AtomId| ValueId::new(region_id, atom);
 
-        // Reference-typed inputs seed the region's own roots. Only the analyzed region's inputs are external, and an
+        // Reference-typed inputs seed the region's own roots. Only the analyzed region's inputs are external and an
         // input the attaching operation creates as a boundary view is a narrowing view alias of the operand it was
         // created from, so nothing inside the region can consume it or forward it out.
-        for (input_index, input) in region.input_ids().iter().copied().enumerate() {
-            if !is_reference(input) {
-                continue;
-            }
-            let root = inputs.map_or(ReferenceRoot::RegionInput { region: region_id, input_index }, |inputs| {
-                // Input bindings have been validated by the entry adapter or the attaching instruction.
-                inputs[input_index].unwrap()
-            });
-            let source = is_entry.then(|| ReferenceSource::from_flat_input_index(input_index, self.capture_count));
-            let alias = boundary[input_index];
-            self.analysis
-                .roots
-                .entry(root)
-                .or_insert_with(|| ReferenceRootRecord { source, ..ReferenceRootRecord::default() });
-            self.analysis.values.insert(value_id(input), ValueRecord { root, narrows: alias.is_some(), alias });
-        }
+        region.input_ids().iter().copied().enumerate().filter(|(_, input)| is_reference(*input)).for_each(
+            |(input_index, input)| {
+                let root = inputs.map_or(ReferenceRoot::RegionInput { region: region_id, input_index }, |inputs| {
+                    // Input bindings have been validated by the entry adapter or the attaching instruction.
+                    inputs[input_index].unwrap()
+                });
+                let source = is_entry.then(|| ReferenceSource::from_flat_input_index(input_index, self.capture_count));
+                let alias = boundary[input_index];
+                self.analysis
+                    .roots
+                    .entry(root)
+                    .or_insert_with(|| ReferenceRootRecord { source, ..ReferenceRootRecord::default() });
+                self.analysis.values.insert(value_id(input), ValueRecord { root, narrows: alias.is_some(), alias });
+            },
+        );
 
         // Boundary summaries follow replay, which lifts constants only when an instruction input or a region output
         // uses them. Materialization is distinct from access effects: even an ignored argument has to be supplied.
@@ -1319,17 +1341,14 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
         };
 
         // Reference-typed constants resolve through the active capture scope. Materializing one is not an access.
-        for (index, atom) in atoms.iter().enumerate() {
-            let Atom::Constant(constant) = atom else {
-                continue;
-            };
-            if !constant.r#type().is_reference() {
-                continue;
-            }
-            let atom_id = AtomId::new(index);
-            if inputs.is_some() && !materialized.contains(&atom_id) {
-                continue;
-            }
+        for (atom_id, constant) in atoms
+            .iter()
+            .enumerate()
+            .filter_map(|(index, atom)| atom.as_constant().map(|constant| (AtomId::new(index), constant)))
+            .filter(|(atom_id, constant)| {
+                constant.r#type().is_reference() && (inputs.is_none() || materialized.contains(atom_id))
+            })
+        {
             let capture_index = constant.capture_index();
             let root = match capture_index.and_then(|index| scope.get(index).copied().flatten()) {
                 Some(root) => root,
@@ -1372,6 +1391,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
             reached: BTreeSet::new(),
             outputs: Vec::new(),
         };
+
         let mut consumed = BTreeMap::<ReferenceRoot, InstructionId>::new();
         for (index, instruction) in region.instructions().iter().enumerate() {
             let id = InstructionId::new(region_id, index);
@@ -1382,14 +1402,18 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                 instruction: id,
                 message,
             };
+
             let input_atom = |input_index: usize, role: &str| {
                 instruction.inputs().get(input_index).copied().ok_or_else(|| {
                     malformed(format!(
-                        "{role} input {input_index} is out of range for an application with {} inputs",
+                        "{} input {} is out of range for an application with {} inputs",
+                        role,
+                        input_index,
                         instruction.inputs().len(),
                     ))
                 })
             };
+
             let use_after_consume =
                 |root: ReferenceRoot, consumer: InstructionId| ReferenceAnalysisError::UseAfterConsume {
                     operation: name,
@@ -1408,6 +1432,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                 if let Some(consumer) = consumed.get(&root) {
                     return Err(use_after_consume(root, *consumer));
                 }
+
                 if mode.is_consuming() {
                     if record.narrows {
                         return Err(ReferenceAnalysisError::ConsumptionThroughView {
@@ -1417,18 +1442,21 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                             root,
                         });
                     }
+
                     // Consumption is restricted to the region that owns the reference. Entry inputs are
                     // borrowed unless ownership was explicitly transferred; captures always remain borrowed.
                     match root {
                         ReferenceRoot::Allocation { instruction: allocation, .. }
                             if allocation.region() == region_id => {}
-                        // Ownership transferred at the entry boundary permits consumption only in the entry
-                        // region itself, not in an attached region that receives the reference.
                         ReferenceRoot::RegionInput { region: root_region, input_index }
                             if root_region == self.entry.id()
                                 && region_id == root_region
                                 && input_index >= self.capture_count
-                                && self.consumable_inputs.contains(&input_index) => {}
+                                && self.consumable_inputs.contains(&input_index) =>
+                        {
+                            // Ownership transferred at the entry boundary permits consumption only in the entry
+                            // region itself, not in an attached region that receives the reference.
+                        }
                         ReferenceRoot::RegionInput { region: root_region, input_index }
                             if root_region == self.entry.id() =>
                         {
@@ -1442,9 +1470,9 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                                 ),
                             });
                         }
-                        // Other roots belong to another region or an external constant, so this region has
-                        // no authority to consume them.
                         _ => {
+                            // Other roots belong to another region or an external constant, so this region has
+                            // no authority to consume them.
                             return Err(ReferenceAnalysisError::ConsumptionOutsideCreationScope {
                                 operation: name,
                                 instruction: id,
@@ -1455,6 +1483,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                     }
                     consumed.insert(root, id);
                 }
+
                 self.analysis.access_modes.push(ReferenceAccess { instruction: id, input_index, root, mode });
                 self.record_mode(id, root, mode, &mut summary);
             }
@@ -1463,24 +1492,28 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
             let classified_output = |output_index: usize| -> Result<AtomId, ReferenceAnalysisError> {
                 let atom = instruction.outputs().get(output_index).copied().ok_or_else(|| {
                     malformed(format!(
-                        "classified output {output_index} is out of range for an application with {} outputs",
+                        "classified output {} is out of range for an application with {} outputs",
+                        output_index,
                         instruction.outputs().len(),
                     ))
                 })?;
                 if !is_reference(atom) {
                     return Err(malformed(format!(
-                        "classified output {output_index} has non-reference type `{}`",
+                        "classified output {} has non-reference type `{}`",
+                        output_index,
                         atoms[atom.index()].r#type(),
                     )));
                 }
                 Ok(atom)
             };
+
             for output_index in effects.allocation_output_indices() {
                 let atom = classified_output(output_index)?;
                 let root = ReferenceRoot::Allocation { instruction: id, output_index };
                 self.analysis.roots.insert(root, ReferenceRootRecord::default());
                 self.analysis.values.insert(value_id(atom), ValueRecord { root, narrows: false, alias: None });
             }
+
             for alias in effects.reference_aliases() {
                 let (output_index, input_index, kind) = (alias.output_index(), alias.input_index(), alias.kind());
                 let atom = classified_output(output_index)?;
@@ -1499,10 +1532,10 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                     .insert(value_id(atom), ValueRecord { root: source.root, narrows, alias: Some(alias) });
             }
 
-            // Attached regions are entered through their declared input provenance and analyzed in their own
-            // namespace. Their transitive accesses are then substituted into this region's namespace, validated
-            // against the operation's region access policy and against earlier consumption, and folded into this
-            // instruction's summary.
+            // Attached regions are entered through their declared input provenance and analyzed in their own namespace.
+            // Their transitive accesses are then substituted into this region's namespace, validated against the
+            // operation's region access policy and against earlier consumption, and folded into this instruction's
+            // summary.
             let mut attached = Vec::with_capacity(instruction.regions().len());
             for (region_index, attached_id) in instruction.regions().iter().copied().enumerate() {
                 // Dormant rule regions are inputs to later transforms rather than executed children of this
@@ -1514,6 +1547,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                     attached.push(AttachedRegion { id: attached_id, entering: Vec::new(), outputs: Vec::new() });
                     continue;
                 }
+
                 let nested = region
                     .with_id(attached_id)
                     .map_err(|error| malformed(format!("attached region {attached_id} cannot be resolved: {error}")))?;
@@ -1529,8 +1563,8 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                     }
 
                     // A reference-typed region input is either a forwarded complete-value handle or a view the
-                    // operation creates at the boundary from one of its operands. Either way the operand itself must
-                    // be a complete-value handle, and the region input is bound to its root.
+                    // operation creates at the boundary from one of its operands. Either way the operand itself
+                    // must be a complete-value handle, and the region input is bound to its root.
                     let (supplying_index, view) = match operation.input_region_provenance(region_index, input_index) {
                         None => {
                             return Err(malformed(format!(
@@ -1541,6 +1575,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                         Some(InputRegionProvenance::Forwarded { input_index }) => (input_index, false),
                         Some(InputRegionProvenance::View { input_index }) => (input_index, true),
                     };
+
                     let atom = input_atom(supplying_index, "region-supplying")?;
                     let record = self.resolve(value_id(atom), name, id, supplying_index)?;
                     if record.narrows {
@@ -1552,6 +1587,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                             index: input_index,
                         });
                     }
+
                     self.analysis.region_input_bindings.push(ReferenceRegionInputBinding {
                         instruction: id,
                         region_index,
@@ -1559,6 +1595,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                         root: record.root,
                         is_view: view,
                     });
+
                     entering.push(Some(record.root));
                     boundary.push(view.then(|| ReferenceAliasEdge {
                         instruction: id,
@@ -1568,6 +1605,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                         narrows: true,
                     }));
                 }
+
                 let nested_scope = match operation.region_capture_input_count(region_index) {
                     None => Rc::clone(&scope),
                     Some(count) => {
@@ -1575,12 +1613,16 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                             return Err(ReferenceAnalysisError::InvalidCaptureScope {
                                 region: attached_id,
                                 message: format!(
-                                    "operation `{name}` at {id} declares a capture prefix of {count} inputs but the \
+                                    "operation `{}` at {} declares a capture prefix of {} inputs but the \
                                      region has {} inputs",
+                                    name,
+                                    id,
+                                    count,
                                     nested_inputs.len(),
                                 ),
                             });
                         }
+
                         nested_inputs[..count]
                             .iter()
                             .enumerate()
@@ -1596,21 +1638,26 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                             .collect()
                     }
                 };
+
                 let nested_summary = self.visit_region(
                     nested,
                     nested_scope,
                     boundary.into(),
                     inputs.is_some().then_some(entering.as_slice()),
                 )?;
-                for root in &nested_summary.reached {
-                    if let ReferenceSubstitution::Caller(root) = root.substitute(attached_id, &entering) {
-                        summary.reached.insert(root);
+
+                summary.reached.extend(nested_summary.reached.iter().filter_map(|root| {
+                    match root.substitute(attached_id, &entering) {
+                        ReferenceSubstitution::Caller(root) => Some(root),
+                        ReferenceSubstitution::Local(_) => None,
                     }
-                }
+                }));
+
                 for (nested_root, modes) in &nested_summary.accesses {
                     let ReferenceSubstitution::Caller(root) = nested_root.substitute(attached_id, &entering) else {
                         continue;
                     };
+
                     for mode in modes.iter().copied() {
                         if !operation.allows_reference_access_through_region_input(region_index, mode) {
                             return Err(ReferenceAnalysisError::DisallowedRegionAccess {
@@ -1627,17 +1674,19 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                         self.record_mode(id, root, mode, &mut summary);
                     }
                 }
+
                 attached.push(AttachedRegion { id: attached_id, entering, outputs: nested_summary.outputs });
             }
 
-            // A reference-typed output that the operation did not classify preserves a root rather than defining
-            // one. It resolves through the declared input identity when there is one, in which case every provenance
-            // origin must return exactly that root, and otherwise through the region outputs it forwards, which must
-            // all agree.
+            // A reference-typed output that the operation did not classify preserves a root rather than defining one.
+            // It resolves through the declared input identity when there is one, in which case every provenance origin
+            // must return exactly that root, and otherwise through the region outputs it forwards, which must all
+            // agree.
             for (output_index, output) in instruction.outputs().iter().copied().enumerate() {
                 if !is_reference(output) || self.analysis.values.contains_key(&value_id(output)) {
                     continue;
                 }
+
                 let provenance = operation.output_region_provenance(output_index);
                 let mut record = match operation.reference_output_identity_input(output_index) {
                     Some(input_index) => {
@@ -1654,6 +1703,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                     }
                     None => None,
                 };
+
                 for origin in provenance {
                     // Validate the declared region and output indices before inspecting the forwarded reference.
                     let region = attached.get(origin.region_index).ok_or_else(|| {
@@ -1724,12 +1774,14 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                         Some(_) => {}
                     }
                 }
+
                 let Some(record) = record else {
                     return Err(malformed(format!(
                         "reference output {output_index} has no declared allocation, alias, input identity, \
                          or forwarded region output",
                     )));
                 };
+
                 self.analysis.values.insert(value_id(output), record);
             }
         }
@@ -1740,8 +1792,8 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                 .filter_map(|atom| self.analysis.values.get(&value_id(atom)).map(|record| record.root)),
         );
 
-        // Every reference-typed atom of a sealed region is an input, a constant, or an instruction output, each of
-        // which the traversal above either bound or rejected, so the lookup cannot fail here.
+        // Every reference-typed atom of a sealed region is an input, a constant, or an instruction output,
+        // each of which the traversal above either bound or rejected, so the lookup cannot fail here.
         summary.outputs = region
             .output_ids()
             .iter()
@@ -1761,13 +1813,12 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                 self.analysis.output_roots =
                     summary.outputs.iter().map(|output| output.map(|(root, _)| root)).collect();
             }
+
             self.summaries.insert(region_id, summary.clone());
         }
 
         Ok(summary)
     }
-
-    // TODO(eaplatanios): Review up to here.
 
     /// Looks up the reference root, view status, and alias information already recorded for `value` by this traversal.
     /// If no record exists, returns [`ReferenceAnalysisError::UnresolvedReference`] identifying the instruction input

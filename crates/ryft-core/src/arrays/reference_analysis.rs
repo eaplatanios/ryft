@@ -582,7 +582,7 @@ mod tests {
         let root = ReferenceRoot::RegionInput { region: RegionId::new(0), input_index: 0 };
         assert_eq!(analysis.analysis().region(), RegionId::new(0));
         assert_eq!(analysis.analysis().roots().collect::<Vec<_>>(), vec![root]);
-        assert_eq!(analysis.analysis().access_modes(root).collect::<Vec<_>>(), vec![ReferenceAccessMode::Read]);
+        assert_eq!(analysis.analysis().access_modes_for(root).collect::<Vec<_>>(), vec![ReferenceAccessMode::Read]);
     }
 
     #[test]

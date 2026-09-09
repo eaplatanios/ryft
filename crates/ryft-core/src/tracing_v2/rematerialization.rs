@@ -2211,7 +2211,7 @@ fn validate_rematerialized_body<V: Value, O: Operation<Type = V::Type>>(
         let Some(source) = analysis.external_source(root) else {
             continue;
         };
-        if analysis.access_modes(root).any(|mode| mode != ReferenceAccessMode::Read) {
+        if analysis.access_modes_for(root).any(|mode| mode != ReferenceAccessMode::Read) {
             return Err(ProgramError::UnsupportedOperation {
                 message: format!(
                     "rematerialization cannot recompute a body that mutates external reference {source}; mutate it \

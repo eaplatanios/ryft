@@ -578,7 +578,7 @@ where
         let false_analysis = false_region.reference_analysis(0).map_err(ProgramError::from)?;
         for analysis in [&true_analysis, &false_analysis] {
             let allocates = analysis.roots().any(|root| matches!(root, ReferenceRoot::Allocation { .. }));
-            if !analysis.accesses().is_empty() || allocates {
+            if !analysis.access_modes().is_empty() || allocates {
                 return Err(BatchingError::UnsupportedOperation {
                     message: format!(
                         "cannot batch a `{CONDITION_OPERATION_NAME}` with a batch-varying predicate whose branches \

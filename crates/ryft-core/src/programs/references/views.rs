@@ -582,7 +582,7 @@ impl<View> ReferenceViewAnalysis<View> {
     /// in it. The structural analysis is obtained through [`RegionRef::reference_analysis`], so it is shared with every
     /// other consumer of the same closure; this function itself is the uncached derivation of the view analysis, and
     /// [`RegionRef::reference_view_analysis`] is its retained counterpart. Refer to the documentation of
-    /// [`ReferenceAnalysis::new`] for the meaning of `capture_count`.
+    /// [`RegionRef::reference_analysis`] for the meaning of `capture_count`.
     ///
     /// # Errors
     ///
