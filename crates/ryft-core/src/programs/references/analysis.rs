@@ -2332,7 +2332,7 @@ mod tests {
             assert_eq!(error.to_string(), expected);
             assert_eq!(
                 ProgramError::from(error.clone()),
-                ProgramError::Reference(crate::programs::references::ReferenceError::Analysis(error.clone())),
+                ProgramError::Reference(crate::programs::references::ReferenceError::Analysis(Box::new(error.clone()))),
             );
             assert_eq!(error.clone(), error);
         }

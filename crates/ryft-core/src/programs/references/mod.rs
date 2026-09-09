@@ -255,17 +255,33 @@ pub enum ReferenceError {
         reason: String,
     },
 
-    /// A program violates the reference rules checked by [`ReferenceAnalysis`].
+    /// A program violates the reference rules checked by [`ReferenceAnalysis`]. Note that the underlying
+    /// [`ReferenceAnalysisError`] is boxed in order to not unnecessarily increase the size of [`ReferenceError`].
     #[error(transparent)]
-    Analysis(#[from] ReferenceAnalysisError),
+    Analysis(#[from] Box<ReferenceAnalysisError>),
 
     /// A reference view description is invalid for its source or declared output type.
     #[error(transparent)]
     ViewValidation(#[from] ReferenceViewValidationError),
 
-    /// Reference view analysis rejects a program's view descriptions or paths.
+    /// Reference view analysis rejects a program's view descriptions or paths. Note that the underlying
+    /// [`ReferenceViewAnalysisError`] is boxed in order to not unnecessarily increase the size of [`ReferenceError`].
     #[error(transparent)]
-    ViewAnalysis(#[from] ReferenceViewAnalysisError),
+    ViewAnalysis(#[from] Box<ReferenceViewAnalysisError>),
+}
+
+impl From<ReferenceAnalysisError> for ReferenceError {
+    #[inline]
+    fn from(error: ReferenceAnalysisError) -> Self {
+        Self::Analysis(Box::new(error))
+    }
+}
+
+impl From<ReferenceViewAnalysisError> for ReferenceError {
+    #[inline]
+    fn from(error: ReferenceViewAnalysisError) -> Self {
+        Self::ViewAnalysis(Box::new(error))
+    }
 }
 
 mod analysis;
@@ -352,7 +368,7 @@ mod tests {
             input_index: 0,
         };
         let error = ReferenceError::from(analysis_error.clone());
-        assert_eq!(error, ReferenceError::Analysis(analysis_error.clone()));
+        assert_eq!(error, ReferenceError::Analysis(Box::new(analysis_error.clone())));
         assert_eq!(
             error.to_string(),
             "operation `reference_read` at ^0[1] uses input 0 as a reference but it resolves to no reference root",
@@ -379,7 +395,7 @@ mod tests {
             instruction: InstructionId::new(RegionId::new(0), 1),
         };
         let error = ReferenceError::from(analysis_error.clone());
-        assert_eq!(error, ReferenceError::ViewAnalysis(analysis_error));
+        assert_eq!(error, ReferenceError::ViewAnalysis(Box::new(analysis_error)));
         assert_eq!(
             error.to_string(),
             "operation `view` at ^0[1] derives a reference view but exposes no view transform",

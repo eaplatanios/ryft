@@ -1476,9 +1476,9 @@ mod tests {
         );
         assert_eq!(
             ProgramError::from(ReferenceViewAnalysisError::MissingView { operation: "view", instruction: id(0, 2) }),
-            ProgramError::Reference(crate::programs::references::ReferenceError::ViewAnalysis(
-                ReferenceViewAnalysisError::MissingView { operation: "view", instruction: id(0, 2) },
-            )),
+            ProgramError::Reference(crate::programs::references::ReferenceError::ViewAnalysis(Box::new(
+                ReferenceViewAnalysisError::MissingView { operation: "view", instruction: id(0, 2) }
+            ),)),
         );
     }
 

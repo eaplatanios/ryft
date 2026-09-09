@@ -1451,15 +1451,14 @@ pub struct ReferenceDischargeRegionSummary {
 }
 
 impl ReferenceDischargeRegionSummary {
-    // TODO(eaplatanios): Review this.
     /// Creates a new [`ReferenceDischargeRegionSummary`] summarizing the caller allocations that `region` reaches,
-    /// accesses, and returns, including its nested computation [`Region`](crate::Region)s. The region is attached to
-    /// `operation` at `region_index`.
+    /// accesses, and returns, including its nested computation [`Region`](crate::Region)s. The region is attached
+    /// to `operation` at `region_index`.
     ///
-    /// Structured discharge rules use this summary to decide which references or immutable allocation states must
-    /// cross the rewritten boundary and which final states must be returned. A captured reference that is merely
-    /// passed to another operation is reachable without being read or written. Such a reference still needs a
-    /// boundary binding, but contributes no semantic access mode.
+    /// Structured discharge rules use this summary to decide which references or immutable allocation states must cross
+    /// the rewritten boundary and which final states must be returned. A captured reference that is merely passed to
+    /// another operation is reachable without being read or written. Such a reference still needs a boundary binding,
+    /// but contributes no semantic access mode.
     ///
     /// The traversal uses [`Operation::effects`], [`Operation::input_region_provenance`], and
     /// [`Operation::output_region_provenance`] to follow allocations and aliases. An output constrained by
@@ -1470,8 +1469,8 @@ impl ReferenceDischargeRegionSummary {
     /// consume its own allocation, but cannot consume a reference supplied by its parent or return a nested region's
     /// fresh allocation through that region's boundary.
     ///
-    /// Only [`RegionRole::Computation`] regions contribute to the summary. Dormant [`RegionRole::Rule`] regions are
-    /// inputs to later transforms; those transforms bind and validate their reference inputs separately.
+    /// Only [`RegionRole::Computation`] regions contribute to the summary. Dormant [`RegionRole::Rule`] regions
+    /// are inputs to later transforms. Those transforms bind and validate their reference inputs separately.
     /// [`Operation::region_capture_input_count`] determines whether the region inherits `captures` or binds a fresh
     /// scope from its leading inputs. Reference constants used by an instruction or region output resolve through
     /// that scope. Unused constants contribute no reachability, matching [`RegionRef::interpret_with`].
@@ -1482,7 +1481,7 @@ impl ReferenceDischargeRegionSummary {
     ///   - `region_index`: Position of the region among that operation's attached regions.
     ///   - `region`: [`Region`](crate::Region) whose computation closure is summarized.
     ///   - `inputs`: Caller allocation for every reference-typed region input, in input order. Non-reference inputs
-    ///     must have [`None`]; reference inputs must have [`Some`] allocation identity.
+    ///     must have [`None`]. Reference inputs must have [`Some`] allocation identity.
     ///   - `captures`: Capture scope of the region in which `operation` is applied.
     ///
     /// # Errors
@@ -1498,17 +1497,19 @@ impl ReferenceDischargeRegionSummary {
         captures: &ReferenceDischargeCaptureScope,
     ) -> Result<Self, ProgramError> {
         check_count!("input", inputs, region.input_ids().len(), ProgramError);
-        // Public boundaries supply caller identities; source-local identities exist only during traversal. Reject a
-        // missing reference binding rather than treating it as a locally allocated reference.
+
+        // Public boundaries supply caller identities; source-local identities exist only during traversal.
+        // Reject a missing reference binding rather than treating it as a locally allocated reference.
         for (index, (input, allocation)) in region.input_ids().iter().zip(inputs).enumerate() {
             if region.atoms()[input.index()].r#type().is_reference() != allocation.is_some() {
                 return Err(ProgramError::MalformedProgram(format!(
-                    "reference discharge allocation binding for region `{}` input {index} does not match its \
-                     reference type",
+                    "reference discharge allocation binding for region `{}` input {} does not match its reference type",
                     region.id(),
+                    index,
                 )));
             }
         }
+
         let inputs = inputs.iter().map(|allocation| allocation.map(ReferenceDischargeRoot::Caller)).collect::<Vec<_>>();
         let captures = captures
             .allocations()
@@ -1516,6 +1517,7 @@ impl ReferenceDischargeRegionSummary {
             .map(|allocation| allocation.map(ReferenceDischargeRoot::Caller))
             .collect::<Vec<_>>();
         let summary = ReferenceDischargeSummaryState::new(operation, region_index, region, &inputs, &captures)?;
+
         // Local allocations have served their validation role. They do not identify caller state, including when
         // returned by this region, so the public summary exposes only the supplied discharge allocation identities.
         Ok(Self {
@@ -1546,37 +1548,35 @@ impl ReferenceDischargeRegionSummary {
         })
     }
 
-    // TODO(eaplatanios): Review this.
-    /// Returns every caller allocation the closure must be able to resolve while replaying, whether or not it is
-    /// semantically accessed, in canonical allocation order.
+    /// Returns the [`ReferenceDischargeAllocationId`] of every caller allocation the closure must be able to resolve
+    /// while replaying, whether or not it is semantically accessed, in canonical allocation order.
     #[inline]
-    pub fn reached_allocations(&self) -> impl Iterator<Item = ReferenceDischargeAllocationId> + '_ {
+    pub fn reached_allocations(&self) -> impl '_ + Iterator<Item = ReferenceDischargeAllocationId> {
         self.reached_allocations.iter().copied()
     }
 
-    // TODO(eaplatanios): Review this.
-    /// Returns every caller allocation the closure accesses, in canonical allocation order.
+    /// Returns the [`ReferenceDischargeAllocationId`] of every caller allocation the closure accesses,
+    /// in canonical allocation order.
     #[inline]
-    pub fn accessed_allocations(&self) -> impl Iterator<Item = ReferenceDischargeAllocationId> + '_ {
+    pub fn accessed_allocations(&self) -> impl '_ + Iterator<Item = ReferenceDischargeAllocationId> {
         self.accessed_allocations.keys().copied()
     }
 
-    // TODO(eaplatanios): Review this.
-    /// Returns the exact access modes recorded for `allocation`, in [`ReferenceAccessMode`] declaration order.
-    /// Returns an empty iterator when the closure does not access that allocation.
+    /// Returns the exact [`ReferenceAccessMode`] recorded for `allocation`, in [`ReferenceAccessMode`] declaration
+    /// order. Returns an empty iterator when the closure does not access that allocation.
     #[inline]
     pub fn access_modes(
         &self,
         allocation: ReferenceDischargeAllocationId,
-    ) -> impl Iterator<Item = ReferenceAccessMode> + '_ {
+    ) -> impl '_ + Iterator<Item = ReferenceAccessMode> {
         self.accessed_allocations.get(&allocation).into_iter().flatten().copied()
     }
 
-    // TODO(eaplatanios): Review this.
-    /// Returns the caller allocation each declared region output denotes, in output order. [`None`] represents
-    /// either a non-reference value or a reference allocated inside the summarized closure: neither denotes caller
-    /// state. A declared output returning a discharged caller allocation already publishes its final state, so the
-    /// rule need not add another output for that allocation. A preserved reference remains a reference output.
+    /// Returns the [`ReferenceDischargeAllocationId`] of the caller allocation each declared region output denotes,
+    /// in output order. [`None`] represents either a non-reference value or a reference allocated inside the summarized
+    /// closure. Neither denotes caller state. A declared output returning a discharged caller allocation already
+    /// publishes its final state, so the rule need not add another output for that allocation. A preserved reference
+    /// remains a reference output.
     #[inline]
     pub fn output_allocations(&self) -> &[Option<ReferenceDischargeAllocationId>] {
         self.output_allocations.as_slice()
