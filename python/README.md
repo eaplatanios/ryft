@@ -44,6 +44,28 @@ their StableHLO (collective family, ordered groups, and axis attributes). It als
 differences: the bounded data-dependent prefix case must execute eagerly in both frameworks, stage in Ryft, and fail
 JAX staging with concretization. Use `--list` to show the case registry and repeat `--case CASE_ID` to run a subset.
 
+To investigate local reference state inside custom JVP rules, run:
+
+```bash
+uv run python scripts/compare_reference_linearization_with_jax.py
+```
+
+This probe reports direct JVPs, repeated linearized calls, gradients, and pushforward Jaxprs for equivalent square
+functions, including pure and reference-based controls. Its JSON output records the installed JAX version and backend;
+it does not assume that a particular JAX version must fail. The matching Ryft regression is
+`test_custom_jvp_linearization_keeps_tangent_state_fresh_and_hoists_coefficients` in `custom_jvp.rs`.
+
+To check loop-carried dependencies and reference ordering, run:
+
+```bash
+uv run python scripts/compare_loop_carries_with_jax.py
+```
+
+This probe checks scan and while results, zero-iteration loops, repeated pushforward calls, and reconstruction from
+known and residual programs. It also reports whether explicit reference carries and dynamic-while reverse mode are
+supported, separately from numerical correctness. The partition checks use the pinned JAX internal partial evaluator;
+the execution checks use public APIs. Corresponding Ryft carry-chain regressions live in `scan.rs` and `while.rs`.
+
 Run the following command to compare backend-neutral structural program statistics between Ryft and JAX for the
 shared traced workload registry:
 

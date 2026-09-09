@@ -81,6 +81,9 @@ update this file so that they do not need to remind you again in the future.
 
 - Prioritize correctness and clarity first. Optimize performance only when needed and explicit.
 - Prefer extending existing modules over creating new small files.
+- Order inherent functions as constructors, field accessors, mutators, extraction or consuming functions, then private
+  helpers. Keep private constructors with constructors, merge adjacent inherent impl blocks with identical bounds,
+  and order the corresponding tests by the public functions while keeping edge cases together.
 - Keep unsafe boundaries explicit and small.
 - Prefer explicit ownership and lifetime modeling over implicit behavior.
 - For small `Copy` types, prefer passing values directly to functions instead of borrowing them unnecessarily.

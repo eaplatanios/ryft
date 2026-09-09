@@ -36,6 +36,14 @@ http_archive(
     ],
 )
 
+# Some JAX BUILD files load this generated repository even when the wheel-only ROCm test dependencies are unused.
+# Define the repository with an empty dependency set so those packages can be consumed from this embedding workspace.
+load("@jax//third_party/external_deps:workspace.bzl", "external_deps_repository")
+
+external_deps_repository(name = "rocm_external_test_deps")
+
+external_deps_repository(name = "rocm_prebuilt_test_deps")
+
 http_archive(
     name = "rules_ml_toolchain",
     sha256 = "6b1b294cbecb98a08bcfe59641461f72e113db30fa91b44fcc49d98099b5ba65",
