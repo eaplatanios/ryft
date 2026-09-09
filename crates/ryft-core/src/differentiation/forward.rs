@@ -3292,12 +3292,15 @@ mod tests {
     use crate::operations::differentiation::tests::custom_jvp_regions_with_reference_state;
     use crate::operations::{
         ConditionOperation, CosOperation, CustomJvpOperation, Dot, DotDimensionNumbers, MulOperation,
-        ParallelReduceOperation, ParallelReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
-        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
-        ReferenceWriteOperation, Sin, SinOperation, StopGradient, StopGradientOperation, ZeroOperation,
+        ParallelReduceOperation, ParallelReductionKind, PrintOperation, ReferenceAddUpdate,
+        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
+        ReferenceReadOperation, ReferenceWriteOperation, Sin, SinOperation, StopGradient, StopGradientOperation,
+        ZeroOperation,
     };
     use crate::parameters::{ParameterError, Placeholder};
-    use crate::programs::{Concretizable, Operation, OperationProvider, ProgramBuilder, ReferenceType, RegionId};
+    use crate::programs::{
+        Concretizable, Operation, OperationProvider, ProgramBuilder, ReferenceError, ReferenceType, RegionId,
+    };
     use crate::tracing::{NestedTracingContext, Trace};
 
     #[cfg(debug_assertions)]
@@ -5359,6 +5362,65 @@ mod tests {
         );
         assert_eq!(linearization.primal().interpret(vec![inputs[0].clone()]), Ok(vec![expected[0].clone()]));
         assert_eq!(linearization.tangent().interpret(vec![inputs[1].clone()]), Ok(vec![expected[1].clone()]));
+    }
+
+    #[test]
+    fn test_program_linearize_dynamic_reference_preserves_access_order() {
+        let extent = DimensionVariable::new("extent", DimensionBounds::new(2, Some(8)).unwrap());
+        let reference_type =
+            ReferenceType::new(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)])));
+        let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let reference = builder.add_input(reference_type.into());
+        let value = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
+
+        // An unused reference can already be frozen. Saving dimensions must not introduce an access to it.
+        let unused = builder
+            .clone()
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![value],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let frozen = ArrayReference::new(Array::vector(vec![3.0_f32, 5.0, 7.0]));
+        frozen.freeze().unwrap();
+        assert_eq!(
+            unused
+                .linearize()
+                .unwrap()
+                .primal()
+                .interpret(
+                    vec![ArrayIrValue::Reference(frozen.clone()), ArrayIrValue::Array(Array::scalar(11.0_f32)),]
+                ),
+            Ok(vec![ArrayIrValue::Array(Array::scalar(11.0_f32))]),
+        );
+
+        // I/O preceding a failing original access must still happen first. No dimension read may move ahead of it.
+        builder
+            .add_instruction(ArrayOperation::from(PrintOperation::new("before_read")), Vec::new(), vec![value], None)
+            .unwrap();
+        let output =
+            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+        let program = builder
+            .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                vec![output],
+                vec![Placeholder; 2],
+                vec![Placeholder],
+            )
+            .unwrap();
+        let linearization = program.linearize().unwrap();
+        let context = EagerContext::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+        let mut events = Vec::new();
+        let result = linearization.primal().interpret_with(
+            vec![ArrayIrValue::Reference(frozen), ArrayIrValue::Array(Array::scalar(11.0_f32))],
+            |_, value| Ok(value.clone()),
+            |instruction, inputs| {
+                events.push(instruction.operation().name());
+                context.bind(instruction.operation().clone(), Vec::new(), inputs)
+            },
+        );
+        assert_eq!(result.unwrap_err().downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
+        assert_eq!(events, vec!["print", "reference_read"]);
     }
 
     #[test]
