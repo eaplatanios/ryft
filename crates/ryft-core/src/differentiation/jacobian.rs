@@ -9,10 +9,10 @@ use crate::differentiation::types::{DenseDifferentiableType, DifferentiableType}
 use crate::differentiation::zeros::ResidualZeroProvider;
 use crate::differentiation::{DerivativeTransform, DifferentiationError, DifferentiationParameterRole};
 use crate::macros::check_count;
-use crate::operations::AddOperation;
+use crate::operations::{AddOperation, ReferenceAddUpdateOperation, ReferenceNewOperation};
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartialValue, PartiallyEvaluatableOperation};
-use crate::programs::{ProgramError, Type, Typed};
+use crate::programs::{OperationProvider, ProgramError, Type, Typed};
 use crate::tracing::TracingContext;
 
 /// Jacobian of a function, represented as the Cartesian product of its output and input [`Parameter`] leaves. `I` and
@@ -192,12 +192,7 @@ impl<'o, T: Type, V> Clone for JacobianBlock<'o, T, V> {
 ///   - `capture`: Structured runtime value held fixed while differentiating the input.
 ///   - `holomorphic`: Whether to validate all differentiated leaves under a holomorphy promise.
 pub(crate) fn jacobian_forward_in_context<
-    C: Context<
-            Type: DenseDifferentiableType<C>,
-            Operation: PartiallyEvaluatableOperation<C>
-                           + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-                           + ResidualZeroProvider<C::Type>,
-        >,
+    C: Context,
     I: Parameterized<
             C::Value,
             To<C::Value> = I,
@@ -219,7 +214,13 @@ pub(crate) fn jacobian_forward_in_context<
 ) -> Result<
     (Jacobian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, AuxiliaryOutput::To<C::Value>),
     DifferentiationError,
-> {
+>
+where
+    C::Type: DenseDifferentiableType<C>,
+    C::Operation: PartiallyEvaluatableOperation<C>
+        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+        + ResidualZeroProvider<C::Type>,
+{
     // Preserve the input tree while deriving an isomorphic tree of input types. Validate differentiability and the
     // ordinary-versus-holomorphic complex-type contract before tracing the derivative program.
     let input_structure = primal.parameter_structure();
@@ -285,7 +286,7 @@ pub(crate) fn jacobian_forward_in_context<
 
     // A pushforward program consumes one tangent per input parameter followed by the closed-over primal residuals.
     // Verify that the derived program still satisfies this contract before constructing its packed inputs.
-    let (program, residuals) = pushforward.into_parts();
+    let (_, program, residuals, _, _, _) = pushforward.into_parts();
     let program_input_types = program.input_types();
     let tangent_input_count = program_input_types.len().checked_sub(residuals.len()).ok_or_else(|| {
         ProgramError::MalformedProgram(format!(
@@ -387,16 +388,9 @@ pub(crate) fn jacobian_forward_in_context<
 ///   - `primal`: Structured input value specifying the linearization point.
 ///   - `capture`: Structured runtime value held fixed while differentiating the input.
 ///   - `holomorphic`: Whether to validate all differentiated leaves under a holomorphy promise.
+#[allow(clippy::type_complexity)]
 pub(crate) fn jacobian_reverse_in_context<
-    C: Context<
-            Type: DenseDifferentiableType<C>,
-            Operation: PartiallyEvaluatableOperation<C>
-                           + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-                           + DifferentiableOperation<PartialEvaluationContext<C>>
-                           + TransposableOperation<C::Constant, C::Operation>
-                           + ResidualZeroProvider<C::Type>
-                           + From<AddOperation<C::Type>>,
-        >,
+    C: Context,
     I: Parameterized<
             C::Value,
             To<C::Value> = I,
@@ -418,7 +412,18 @@ pub(crate) fn jacobian_reverse_in_context<
 ) -> Result<
     (Jacobian<C::Type, C::Value, I::To<C::Type>, O::To<C::Type>>, AuxiliaryOutput::To<C::Value>),
     DifferentiationError,
-> {
+>
+where
+    C::Type: DenseDifferentiableType<C>,
+    C::Operation: PartiallyEvaluatableOperation<C>
+        + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
+        + DifferentiableOperation<PartialEvaluationContext<C>>
+        + TransposableOperation<C::Constant, C::Operation>
+        + ResidualZeroProvider<C::Type>
+        + OperationProvider<C::Type, ReferenceNewOperation<C::Type, C::Type>, Operation = C::Operation>
+        + OperationProvider<C::Type, ReferenceAddUpdateOperation<C::Type, C::Type>, Operation = C::Operation>
+        + From<AddOperation<C::Type>>,
+{
     // Preserve the input tree while deriving and validating its isomorphic type tree. Reverse mode permits complex
     // inputs in the ordinary case, but still requires each input parameter to have a nonzero cotangent space.
     let input_structure = primal.parameter_structure();
@@ -476,7 +481,9 @@ pub(crate) fn jacobian_reverse_in_context<
 
     // A pullback program consumes one cotangent per output parameter followed by its closed-over primal residuals.
     // Verify that the derived program exposes that input contract before constructing the packed cotangents.
-    let (program, residuals) = pullback.into_parts();
+    // The reverse Jacobian materializes returned cotangents only, so it takes the reference-free, all-`Return`
+    // transposition of the retained linear program.
+    let (program, residuals) = pullback.into_transposed_parts()?;
     let program_input_types = program.input_types();
     let cotangent_input_count = program_input_types.len().checked_sub(residuals.len()).ok_or_else(|| {
         ProgramError::MalformedProgram(format!(

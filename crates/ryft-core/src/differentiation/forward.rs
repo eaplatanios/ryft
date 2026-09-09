@@ -445,13 +445,17 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
     /// sub-programs. Rather than re-keying each bilinear operation of the tangent sub-program into a closed captured
     /// factor (e.g., folding a scalar `Mul` against a known operand into a multiply-by-a-captured-constant) by folding
     /// the consuming residual value, this function leaves the tangent sub-program in the primal operation family `O`
-    /// and transposes it through [`Program::transpose_with_respect_to`]. The tangent sub-program's inputs are `(ẋ, r)`,
-    /// and so it is transposed with respect to the leading tangent inputs `ẋ` while the trailing
-    /// [`residual_count`](Self::residual_count) residual inputs are held as known parameters. Partition-aware
-    /// transposition then threads each known residual through to the pullback as a pullback input (consumed by the
-    /// adjoint operation that the bilinear operation's transpose rule stages), rather than folding it into a captured
-    /// factor, so the returned pullback program stays over the primal operation family `O` and produces the cotangents
-    /// of the linear tangent inputs only, in the selected input order used to construct this linearization.
+    /// and transposes it through [`RegionRef::transpose_shared`], including the saved dimension mappings needed for
+    /// disconnected cotangent zeros. The tangent sub-program's inputs are `(ẋ, r)`, so it is transposed with respect
+    /// to the leading tangent inputs `ẋ` while the trailing [`residual_count`](Self::residual_count) residual inputs
+    /// are held as known parameters. Partition-aware transposition then threads each known residual through to the
+    /// pullback as a pullback input (consumed by the adjoint operation that the bilinear operation's transpose rule
+    /// stages), rather than folding it into a captured factor, so the returned pullback program stays over the primal
+    /// operation family `O` and produces the cotangents of the linear tangent inputs only, in the selected input order
+    /// used to construct this linearization.
+    ///
+    /// Transposition is served from the tangent region's retained transform cache. This function clones the cached
+    /// program to return an owned value; repeated calls reuse the transposition but still clone its program.
     #[inline]
     pub fn pullback(&self) -> Result<Program<V, O, Vec<V>, Vec<V>>, DifferentiationError>
     where
@@ -468,7 +472,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
         // the tangent program consumes at least `residual_count` inputs. The default cotangent destination kinds apply,
         // and so a reference-typed tangent input exposes a cotangent reference input in the pullback (refer to the
         // documentation of `Program::transpose_with_respect_to` for more information).
-        self.tangent.transpose_with_trailing_residuals(self.residual_count, &[])
+        Ok(self.tangent.transpose_with_trailing_residuals_shared(self.residual_count, &[])?.as_ref().clone())
     }
 }
 

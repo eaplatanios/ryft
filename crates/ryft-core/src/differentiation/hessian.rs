@@ -4,15 +4,15 @@ use ryft_macros::Parameterized;
 
 use crate::contexts::Context;
 use crate::differentiation::DifferentiationError;
-use crate::differentiation::forward::{DifferentiableOperation, DifferentiationContext, LinearizationTracer};
+use crate::differentiation::forward::{DifferentiableOperation, LinearizationContext, LinearizationTracer};
 use crate::differentiation::jacobian::{jacobian_forward_in_context, jacobian_reverse_in_context};
 use crate::differentiation::reverse::TransposableOperation;
 use crate::differentiation::types::DenseDifferentiableType;
 use crate::differentiation::zeros::ResidualZeroProvider;
-use crate::operations::AddOperation;
+use crate::operations::{AddOperation, ReferenceAddUpdateOperation, ReferenceNewOperation};
 use crate::parameters::{Parameter, ParameterPath, Parameterized, ParameterizedFamily};
 use crate::partial::{PartialEvaluationContext, PartiallyEvaluatableOperation};
-use crate::programs::{ProgramError, Type, Typed, Value};
+use crate::programs::{OperationProvider, ProgramError, Type, Typed, Value};
 use crate::tracing::TracingContext;
 
 /// Hessian of a function, represented as the Cartesian product of its output, first input, and second input
@@ -249,19 +249,22 @@ pub(crate) fn hessian_in_context<C, Input, Capture, Output, AuxiliaryOutput, F>(
 >
 where
     C: Context<
-            Type: DenseDifferentiableType<C>
-                      + DenseDifferentiableType<DifferentiationContext<PartialEvaluationContext<C>>>,
+            Type: DenseDifferentiableType<C> + DenseDifferentiableType<LinearizationContext<C>>,
             Operation: PartiallyEvaluatableOperation<C>
-                           + PartiallyEvaluatableOperation<DifferentiationContext<PartialEvaluationContext<C>>>
+                           + PartiallyEvaluatableOperation<LinearizationContext<C>>
                            + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
                            + DifferentiableOperation<PartialEvaluationContext<C>>
                            + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
                            + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
-                           + DifferentiableOperation<
-                PartialEvaluationContext<DifferentiationContext<PartialEvaluationContext<C>>>,
-            > + TransposableOperation<C::Constant, C::Operation>
+                           + DifferentiableOperation<PartialEvaluationContext<LinearizationContext<C>>>
+                           + TransposableOperation<C::Constant, C::Operation>
                            + ResidualZeroProvider<C::Type>
-                           + From<AddOperation<C::Type>>,
+                           + OperationProvider<C::Type, ReferenceNewOperation<C::Type, C::Type>, Operation = C::Operation>
+                           + OperationProvider<
+                C::Type,
+                ReferenceAddUpdateOperation<C::Type, C::Type>,
+                Operation = C::Operation,
+            > + From<AddOperation<C::Type>>,
         >,
     Input: Parameterized<
             C::Value,
@@ -270,14 +273,14 @@ where
             To<LinearizationTracer<C>>: Parameterized<
                 LinearizationTracer<C>,
                 To<LinearizationTracer<C>> = Input::To<LinearizationTracer<C>>,
-                To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>> = Input::To<
-                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>,
+                To<LinearizationTracer<LinearizationContext<C>>> = Input::To<
+                    LinearizationTracer<LinearizationContext<C>>,
                 >,
                 To<C::Type> = Input::To<C::Type>,
             >,
             Family: ParameterizedFamily<C::Type>
                         + ParameterizedFamily<LinearizationTracer<C>>
-                        + ParameterizedFamily<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>>,
+                        + ParameterizedFamily<LinearizationTracer<LinearizationContext<C>>>,
         >,
     Capture: Parameterized<
             C::Value,
@@ -285,20 +288,20 @@ where
             To<LinearizationTracer<C>>: Parameterized<
                 LinearizationTracer<C>,
                 To<LinearizationTracer<C>> = Capture::To<LinearizationTracer<C>>,
-                To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>> = Capture::To<
-                    LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>,
+                To<LinearizationTracer<LinearizationContext<C>>> = Capture::To<
+                    LinearizationTracer<LinearizationContext<C>>,
                 >,
             >,
             Family: ParameterizedFamily<LinearizationTracer<C>>
-                        + ParameterizedFamily<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>>,
+                        + ParameterizedFamily<LinearizationTracer<LinearizationContext<C>>>,
         >,
     Output: Parameterized<
-            LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>,
+            LinearizationTracer<LinearizationContext<C>>,
             To<C::Type>: Clone,
             Family: ParameterizedFamily<C::Type> + ParameterizedFamily<LinearizationTracer<C>>,
         >,
     AuxiliaryOutput: Parameterized<
-            LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>,
+            LinearizationTracer<LinearizationContext<C>>,
             To<LinearizationTracer<C>>: Parameterized<
                 LinearizationTracer<C>,
                 To<C::Value> = AuxiliaryOutput::To<C::Value>,
@@ -306,8 +309,8 @@ where
             Family: ParameterizedFamily<LinearizationTracer<C>> + ParameterizedFamily<C::Value>,
         >,
     F: FnOnce(
-        Input::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>>,
-        Capture::To<LinearizationTracer<DifferentiationContext<PartialEvaluationContext<C>>>>,
+        Input::To<LinearizationTracer<LinearizationContext<C>>>,
+        Capture::To<LinearizationTracer<LinearizationContext<C>>>,
     ) -> Result<(Output, AuxiliaryOutput), ProgramError>,
 {
     let (outer, auxiliary) = jacobian_forward_in_context(

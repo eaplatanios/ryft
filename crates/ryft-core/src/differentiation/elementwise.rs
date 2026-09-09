@@ -10,14 +10,15 @@
 //! operand types and the common type inferred for an implicitly broadcasting result.
 
 use crate::arrays::{ArrayType, DataType, Dimension};
+use crate::contexts::Context;
 use crate::differentiation::DifferentiationError;
-use crate::differentiation::forward::DifferentiationDual;
+use crate::differentiation::forward::{DifferentiationContext, DifferentiationDual, DifferentiationPolicy};
 use crate::differentiation::types::DifferentiableType;
 use crate::macros::check_count;
 use crate::operations::{
     Add, Broadcast, ConvertElementType, Reduce, ReductionKind, Reshape, Reshard, Transpose, ZeroLike,
 };
-use crate::programs::{MaybeZero, Operation, ProgramError, TypeError, Value};
+use crate::programs::{MaybeZero, Operation, ProgramError, TypeError, Typed, Value};
 
 /// [`Value`] whose derivative contributions can be _aligned_ with the common [`Type`](crate::Type) inferred for an
 /// implicitly broadcasting elementwise result and _unaligned_ back to an operand type. The two methods form an adjoint
@@ -270,35 +271,40 @@ where
 /// Represents operands handed to the tangent term of a unary elementwise JVP rule by [`unary_elementwise_jvp`]. The
 /// input accessors convert and broadcast lazily to the output tangent [`Type`](crate::Type), while the output primal
 /// stays at its own (possibly narrower) type so terms can reuse it when no widening is required.
-pub struct UnaryElementwiseJvpOperands<'o, T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>, F> {
+pub struct UnaryElementwiseJvpOperands<'o, C: Context, F> {
+    /// Context used when re-evaluating a widened primal coefficient for the tangent computation.
+    tangent_context: &'o C,
+
     /// Input primal [`Value`] at its original [`Type`](crate::Type).
-    input_primal: &'o V,
+    input_primal: &'o C::Value,
 
     /// Input tangent [`Value`] at its original [`Type`](crate::Type).
-    input_tangent: &'o V,
+    input_tangent: &'o C::Value,
 
     /// Primal output [`Value`] of the operation, at its own [`Type`](crate::Type).
-    output_primal: &'o V,
+    output_primal: &'o C::Value,
 
     /// Tangent target [`Type`](crate::Type) of the primal output [`Value`].
-    output_tangent_type: &'o T,
+    output_tangent_type: &'o C::Type,
 
     /// Function that evaluates the operation's primal output from its input primal.
     evaluate_primal: &'o F,
 }
 
-impl<T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>, F: Fn(&V) -> Result<V, ProgramError>>
-    UnaryElementwiseJvpOperands<'_, T, V, F>
+impl<
+    C: Context<Type: DifferentiableType, Value: ElementwiseDerivativeAlignment<C::Type>>,
+    F: Fn(&C, &C::Value) -> Result<C::Value, ProgramError>,
+> UnaryElementwiseJvpOperands<'_, C, F>
 {
     /// Returns the input primal [`Value`] converted and broadcast to the output tangent [`Type`](crate::Type).
     #[inline]
-    pub fn input_primal(&self) -> Result<V, DifferentiationError> {
+    pub fn input_primal(&self) -> Result<C::Value, DifferentiationError> {
         self.input_primal.align_tangent(self.output_tangent_type, self.output_primal)
     }
 
     /// Returns the input tangent [`Value`] converted and broadcast to the output tangent [`Type`](crate::Type).
     #[inline]
-    pub fn input_tangent(&self) -> Result<V, DifferentiationError> {
+    pub fn input_tangent(&self) -> Result<C::Value, DifferentiationError> {
         self.input_tangent.align_tangent(self.output_tangent_type, self.output_primal)
     }
 
@@ -307,11 +313,11 @@ impl<T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>, F: Fn(&V) -> R
     /// from the converted input primal so that nonlinear rounding at the narrower primal type does not affect the
     /// tangent computation.
     #[inline]
-    pub fn output_primal_at_tangent_type(&self) -> Result<V, DifferentiationError> {
+    pub fn output_primal_at_tangent_type(&self) -> Result<C::Value, DifferentiationError> {
         if self.output_primal.r#type().as_ref() == self.output_tangent_type {
             Ok(self.output_primal.clone())
         } else {
-            Ok((self.evaluate_primal)(&self.input_primal()?)?)
+            Ok((self.evaluate_primal)(self.tangent_context, &self.input_primal()?)?)
         }
     }
 }
@@ -325,17 +331,21 @@ impl<T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>, F: Fn(&V) -> R
 ///
 /// # Parameters
 ///
+///   - `context`: [`Context`] that computes primal results and transfers coefficients to the tangent computation.
 ///   - `operation`: [`Operation`] whose JVP rule is being evaluated.
 ///   - `inputs`: Input [`DifferentiationDual`]s passed to the JVP rule.
-///   - `primal_fn`: Function that computes the primal output from the operand primal.
+///   - `primal_fn`: Function that computes the primal output in the supplied context from the operand primal.
 ///   - `tangent_fn`: Function that computes the output tangent from the prepared [`UnaryElementwiseJvpOperands`].
 pub fn unary_elementwise_jvp<
     T: DifferentiableType,
     V: ElementwiseDerivativeAlignment<T>,
     O: Operation<Type = T>,
-    PrimalFn: Fn(&V) -> Result<V, ProgramError>,
-    TangentFn: FnOnce(UnaryElementwiseJvpOperands<'_, T, V, PrimalFn>) -> Result<V, DifferentiationError>,
+    C: Context<Type = T, Value = V>,
+    P: DifferentiationPolicy<C>,
+    PrimalFn: Fn(&C, &V) -> Result<V, ProgramError>,
+    TangentFn: FnOnce(UnaryElementwiseJvpOperands<'_, C, PrimalFn>) -> Result<V, DifferentiationError>,
 >(
+    context: &DifferentiationContext<C, P>,
     operation: &O,
     inputs: &[DifferentiationDual<V>],
     primal_fn: PrimalFn,
@@ -343,7 +353,7 @@ pub fn unary_elementwise_jvp<
 ) -> Result<Vec<DifferentiationDual<V>>, DifferentiationError> {
     check_count!("input", inputs, 1, ProgramError);
     let input = &inputs[0];
-    let output_primal = primal_fn(input.primal())?;
+    let output_primal = primal_fn(context.primal(), input.primal())?;
     let target = output_primal.r#type().tangent()?;
     let output_tangent = match input.tangent() {
         MaybeZero::Zero(_) => MaybeZero::Zero(target),
@@ -354,10 +364,13 @@ pub fn unary_elementwise_jvp<
             .into());
         }
         MaybeZero::Value(input_tangent) => {
+            let input_primal = context.primal_to_tangent(input.primal().clone())?;
+            let tangent_output_primal = context.primal_to_tangent(output_primal.clone())?;
             let operands = UnaryElementwiseJvpOperands {
-                input_primal: input.primal(),
+                tangent_context: context.tangent(),
+                input_primal: &input_primal,
                 input_tangent,
-                output_primal: &output_primal,
+                output_primal: &tangent_output_primal,
                 output_tangent_type: &target,
                 evaluate_primal: &primal_fn,
             };
@@ -405,9 +418,10 @@ impl<T: DifferentiableType, V: ElementwiseDerivativeAlignment<T>> BinaryElementw
 ///
 /// # Parameters
 ///
+///   - `context`: [`Context`] that computes primal results and transfers coefficients to the tangent computation.
 ///   - `operation`: [`Operation`] whose JVP rule is being evaluated.
 ///   - `inputs`: Input [`DifferentiationDual`]s passed to the JVP rule.
-///   - `primal_fn`: Function that computes the primal output from the left and right operand primals.
+///   - `primal_fn`: Function that computes the primal output in the supplied context from both operand primals.
 ///   - `left_tangent_term_fn`: Function that computes the left operand's tangent contribution from the prepared
 ///     [`BinaryElementwiseJvpOperands`] and the left operand's live tangent (already converted and broadcast to the
 ///     tangent target type).
@@ -418,10 +432,13 @@ pub fn binary_elementwise_jvp<
     T: DifferentiableType,
     V: std::ops::Add<Output = V> + ElementwiseDerivativeAlignment<T>,
     O: Operation<Type = T>,
-    PrimalFn: FnOnce(&V, &V) -> Result<V, ProgramError>,
+    C: Context<Type = T, Value = V>,
+    P: DifferentiationPolicy<C>,
+    PrimalFn: FnOnce(&C, &V, &V) -> Result<V, ProgramError>,
     LeftTangentTermFn: FnOnce(&BinaryElementwiseJvpOperands<'_, T, V>, V) -> Result<V, DifferentiationError>,
     RightTangentTermFn: FnOnce(&BinaryElementwiseJvpOperands<'_, T, V>, V) -> Result<V, DifferentiationError>,
 >(
+    context: &DifferentiationContext<C, P>,
     operation: &O,
     inputs: &[DifferentiationDual<V>],
     primal_fn: PrimalFn,
@@ -431,32 +448,35 @@ pub fn binary_elementwise_jvp<
     check_count!("input", inputs, 2, ProgramError);
     let left = &inputs[0];
     let right = &inputs[1];
-    let primal = primal_fn(left.primal(), right.primal())?;
+    let primal = primal_fn(context.primal(), left.primal(), right.primal())?;
     let target = primal.r#type().tangent()?;
-    if target.is_zero_space() {
-        if left.tangent().as_value().is_some() || right.tangent().as_value().is_some() {
-            return Err(ProgramError::UnsupportedOperation {
-                message: format!("`{}` output type {} has no tangent space", operation.name(), primal.r#type()),
-            }
-            .into());
-        }
+    if left.tangent().is_zero() && right.tangent().is_zero() {
         return Ok(vec![DifferentiationDual::new(primal, MaybeZero::Zero(target))?]);
     }
+    if target.is_zero_space() {
+        return Err(ProgramError::UnsupportedOperation {
+            message: format!("`{}` output type {} has no tangent space", operation.name(), primal.r#type()),
+        }
+        .into());
+    }
+    let left_primal = context.primal_to_tangent(left.primal().clone())?;
+    let right_primal = context.primal_to_tangent(right.primal().clone())?;
+    let tangent_primal = context.primal_to_tangent(primal.clone())?;
     let operands = BinaryElementwiseJvpOperands {
-        left_primal: left.primal(),
-        right_primal: right.primal(),
-        output_primal: &primal,
+        left_primal: &left_primal,
+        right_primal: &right_primal,
+        output_primal: &tangent_primal,
         output_tangent_type: &target,
     };
     let left_contribution = left
         .tangent()
         .as_value()
-        .map(|tangent| left_tangent_term_fn(&operands, tangent.align_tangent(&target, &primal)?))
+        .map(|tangent| left_tangent_term_fn(&operands, tangent.align_tangent(&target, &tangent_primal)?))
         .transpose()?;
     let right_contribution = right
         .tangent()
         .as_value()
-        .map(|tangent| right_tangent_term_fn(&operands, tangent.align_tangent(&target, &primal)?))
+        .map(|tangent| right_tangent_term_fn(&operands, tangent.align_tangent(&target, &tangent_primal)?))
         .transpose()?;
     let output_tangent = match (left_contribution, right_contribution) {
         (Some(left), Some(right)) => MaybeZero::Value(left + right),
@@ -484,7 +504,7 @@ mod tests {
         SinOperation, TanhOperation,
     };
     use crate::parameters::Placeholder;
-    use crate::programs::{MaybeZero, ProgramBuilder, Typed};
+    use crate::programs::{MaybeZero, ProgramBuilder};
 
     use super::*;
 
@@ -656,11 +676,13 @@ mod tests {
             }
         }
 
+        let context = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new());
         let tangent_calls = Cell::new(0);
         let outputs = unary_elementwise_jvp(
+            &context,
             &SinOperation::<ArrayType>::new(),
             &[DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0f64)).unwrap()],
-            |input| Ok(input.clone()),
+            |_, input| Ok(input.clone()),
             |_| {
                 tangent_calls.set(tangent_calls.get() + 1);
                 Ok(Array::scalar(1.0f64))
@@ -673,9 +695,10 @@ mod tests {
 
         let primal_evaluations = Cell::new(0);
         let outputs = unary_elementwise_jvp(
+            &context,
             &SinOperation::<ArrayType>::new(),
             &[DifferentiationDual::new(Array::scalar(2.0f64), Array::scalar(3.0f64)).unwrap()],
-            |input| {
+            |_, input| {
                 primal_evaluations.set(primal_evaluations.get() + 1);
                 Ok(input.clone())
             },
@@ -693,9 +716,10 @@ mod tests {
         let primal_evaluations = Cell::new(0);
         let input_primal = Array::scalar(2.0f32).convert_element_type(DataType::F8E8M0FNU).unwrap();
         let outputs = unary_elementwise_jvp(
+            &context,
             &SinOperation::<ArrayType>::new(),
             &[DifferentiationDual::new(input_primal.clone(), Array::scalar(3.0f32)).unwrap()],
-            |input| {
+            |_, input| {
                 primal_evaluations.set(primal_evaluations.get() + 1);
                 Ok(input.clone())
             },
@@ -707,9 +731,10 @@ mod tests {
         assert_eq!(primal_evaluations.get(), 2);
 
         let outputs = unary_elementwise_jvp(
+            &context,
             &BooleanOutputOperation,
             &[DifferentiationDual::new_with_zero_tangent(Array::scalar(2.0f64)).unwrap()],
-            |_| Ok(Array::scalar(true)),
+            |_, _| Ok(Array::scalar(true)),
             |_| -> Result<Array, DifferentiationError> {
                 panic!("zero-space output invoked its tangent function for a structural-zero input tangent")
             },
@@ -722,9 +747,10 @@ mod tests {
 
         assert!(matches!(
             unary_elementwise_jvp(
+                &context,
                 &BooleanOutputOperation,
                 &[DifferentiationDual::new(Array::scalar(2.0f64), Array::scalar(3.0f64)).unwrap()],
-                |_| Ok(Array::scalar(true)),
+                |_, _| Ok(Array::scalar(true)),
                 |_| -> Result<Array, DifferentiationError> { panic!("zero-space output invoked its tangent function") },
             ),
             Err(DifferentiationError::Program(ProgramError::UnsupportedOperation { message }))
@@ -732,9 +758,10 @@ mod tests {
         ));
         assert!(matches!(
             unary_elementwise_jvp(
+                &context,
                 &SinOperation::<ArrayType>::new(),
                 &[],
-                |input: &Array| Ok(input.clone()),
+                |_, input: &Array| Ok(input.clone()),
                 |_| Ok(Array::scalar(1.0f64)),
             ),
             Err(DifferentiationError::Program(ProgramError::InvalidInputCount { expected: 1, actual: 0 })),
@@ -743,6 +770,7 @@ mod tests {
 
     #[test]
     fn test_binary_elementwise_jvp() {
+        let context = DifferentiationContext::fused(EagerContext::<Array, ArrayOperation<Array>>::new());
         let left_calls = Cell::new(0);
         let right_calls = Cell::new(0);
         let left_primal = Array::scalar(2.0f64);
@@ -750,12 +778,13 @@ mod tests {
         let compare = CompareOperation::<ArrayType>::new(ComparisonDirection::LessThan);
 
         let outputs = binary_elementwise_jvp(
+            &context,
             &AddOperation::<ArrayType>::new(),
             &[
                 DifferentiationDual::new_with_zero_tangent(left_primal.clone()).unwrap(),
                 DifferentiationDual::new_with_zero_tangent(right_primal.clone()).unwrap(),
             ],
-            |left, right| Ok(left.clone() + right.clone()),
+            |_, left, right| Ok(left.clone() + right.clone()),
             |_, tangent| {
                 left_calls.set(left_calls.get() + 1);
                 Ok(tangent)
@@ -771,12 +800,13 @@ mod tests {
         assert_eq!((left_calls.get(), right_calls.get()), (0, 0));
 
         let outputs = binary_elementwise_jvp(
+            &context,
             &compare,
             &[
                 DifferentiationDual::new_with_zero_tangent(left_primal.clone()).unwrap(),
                 DifferentiationDual::new_with_zero_tangent(right_primal.clone()).unwrap(),
             ],
-            |left, right| Ok(Array::scalar(left.to_f64s()[0] < right.to_f64s()[0])),
+            |_, left, right| Ok(Array::scalar(left.to_f64s()[0] < right.to_f64s()[0])),
             |_, _| -> Result<Array, DifferentiationError> {
                 panic!("zero-space output invoked its left tangent term function for structural-zero input tangents")
             },
@@ -791,12 +821,13 @@ mod tests {
         );
 
         let outputs = binary_elementwise_jvp(
+            &context,
             &AddOperation::<ArrayType>::new(),
             &[
                 DifferentiationDual::new(left_primal.clone(), Array::scalar(3.0f64)).unwrap(),
                 DifferentiationDual::new_with_zero_tangent(right_primal.clone()).unwrap(),
             ],
-            |left, right| Ok(left.clone() + right.clone()),
+            |_, left, right| Ok(left.clone() + right.clone()),
             |_, tangent| {
                 left_calls.set(left_calls.get() + 1);
                 Ok(tangent)
@@ -811,12 +842,13 @@ mod tests {
         assert_eq!((left_calls.get(), right_calls.get()), (1, 0));
 
         let outputs = binary_elementwise_jvp(
+            &context,
             &AddOperation::<ArrayType>::new(),
             &[
                 DifferentiationDual::new_with_zero_tangent(left_primal.clone()).unwrap(),
                 DifferentiationDual::new(right_primal.clone(), Array::scalar(4.0f64)).unwrap(),
             ],
-            |left, right| Ok(left.clone() + right.clone()),
+            |_, left, right| Ok(left.clone() + right.clone()),
             |_, tangent| {
                 left_calls.set(left_calls.get() + 1);
                 Ok(tangent)
@@ -831,12 +863,13 @@ mod tests {
         assert_eq!((left_calls.get(), right_calls.get()), (1, 1));
 
         let outputs = binary_elementwise_jvp(
+            &context,
             &AddOperation::<ArrayType>::new(),
             &[
                 DifferentiationDual::new(left_primal.clone(), Array::scalar(3.0f64)).unwrap(),
                 DifferentiationDual::new(right_primal.clone(), Array::scalar(4.0f64)).unwrap(),
             ],
-            |left, right| Ok(left.clone() + right.clone()),
+            |_, left, right| Ok(left.clone() + right.clone()),
             |operands, tangent| {
                 left_calls.set(left_calls.get() + 1);
                 Ok(operands.right_primal()? * tangent)
@@ -852,12 +885,13 @@ mod tests {
 
         assert!(matches!(
             binary_elementwise_jvp(
+                &context,
                 &compare,
                 &[
                     DifferentiationDual::new(left_primal.clone(), Array::scalar(3.0f64)).unwrap(),
                     DifferentiationDual::new_with_zero_tangent(right_primal.clone()).unwrap(),
                 ],
-                |left, right| Ok(Array::scalar(left.to_f64s()[0] < right.to_f64s()[0])),
+                |_, left, right| Ok(Array::scalar(left.to_f64s()[0] < right.to_f64s()[0])),
                 |_, _| -> Result<Array, DifferentiationError> {
                     panic!("zero-space output invoked its left tangent term function")
                 },
@@ -870,9 +904,10 @@ mod tests {
         ));
         assert!(matches!(
             binary_elementwise_jvp(
+                &context,
                 &AddOperation::<ArrayType>::new(),
                 &[DifferentiationDual::new_with_zero_tangent(left_primal).unwrap()],
-                |left, right| Ok(left.clone() + right.clone()),
+                |_, left, right| Ok(left.clone() + right.clone()),
                 |_, tangent| Ok(tangent),
                 |_, tangent| Ok(tangent),
             ),
@@ -897,7 +932,14 @@ mod tests {
             ))
             .vjp(|(left, right)| Ok(left + right))
             .unwrap();
-        assert!(pullback.program().to_string().contains("reshard"));
+        assert!(
+            pullback
+                .linear_program()
+                .transpose_with_trailing_residuals_shared(pullback.residuals().len(), &[])
+                .unwrap()
+                .to_string()
+                .contains("reshard")
+        );
         let (left, right) = pullback.apply(Array::from_f64s(output.r#type().into_owned(), vec![1.0, 1.0])).unwrap();
         assert_eq!(left.r#type().as_ref(), &sharded_type);
         assert_eq!(right.r#type().as_ref(), &replicated_type);
