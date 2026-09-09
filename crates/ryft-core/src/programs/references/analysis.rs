@@ -1,94 +1,89 @@
-//! Generic program-level reference analysis.
+//! Contains machinery for generic [`Program`]-level reference analysis.
 //!
-//! [`ReferenceAnalysis`] resolves every reference-typed value in a [`Region`](crate::Region) closure to exactly one
-//! canonical [`ReferenceRoot`], records the alias edges and accesses that connect values to roots, and validates the
-//! lifetime, capture, and region-boundary rules of the reference model. It relies only on the generic
-//! [`Operation`] hooks ([`Operation::effects`], [`Operation::input_region_provenance`],
-//! [`Operation::output_region_provenance`], [`Operation::region_capture_input_count`],
-//! [`Operation::reference_output_identity_input`], and
-//! [`Operation::allows_reference_access_through_region_input`]) and on [`Type::is_reference`], so it knows nothing
-//! about arrays, view descriptions, or any particular value family.
+//! [`ReferenceAnalysis`] resolves every reference-typed value in a [`Region`] closure to exactly one canonical
+//! [`ReferenceRoot`], records the alias edges and accesses that connect values to roots, and validates the lifetime,
+//! capture, and region-boundary rules of the reference model. It relies only on generic [`Operation`] hooks (i.e.,
+//! [`Operation::effects`], [`Operation::input_region_provenance`], [`Operation::output_region_provenance`],
+//! [`Operation::region_capture_input_count`], [`Operation::reference_output_identity_input`], and
+//! [`Operation::allows_reference_access_through_region_input`]) and on [`Type::is_reference`], and
+//! so it knows nothing about arrays, view descriptions, or any particular [`Value`] family.
 //!
-//! This analysis is the shared fact source for everything that reasons about references structurally: reference
-//! discharge, kernel-boundary validation, diagnostics, lowering, and every transform rule that must know which root an
-//! operand denotes, how it is accessed, and whether it is a derived view. Consumers obtain it through
-//! [`RegionRef::reference_analysis`], which retains one analysis per region closure in the region's transform cache so
-//! that all of them share a single derivation. Instruction construction uses the incremental alias and
-//! lifetime tracking in [`ProgramBuilder`](crate::ProgramBuilder); canonical builder identity queries consult the
-//! retained analysis when a reference is forwarded through a nested region. The eager [`Reference`](crate::Reference)
-//! runtime enforces concrete lifetimes independently.
+//! This analysis is the shared fact source for everything that reasons about references structurally such as reference
+//! discharge, kernel boundary validation, diagnostics, lowering, and every transform rule that must know which root
+//! an input/operand denotes, how it is accessed, and whether it is a derived view. Consumers obtain it through
+//! [`RegionRef::reference_analysis`], which retains one analysis per region closure in the region's transform cache
+//! so that all of them share a single derivation. [`Instruction`](crate::Instruction) construction uses the incremental
+//! alias and lifetime tracking in [`ProgramBuilder`](crate::ProgramBuilder); canonical builder identity queries consult
+//! the retained analysis when a reference is forwarded through a nested region. The eager
+//! [`Reference`](crate::Reference) runtime enforces concrete lifetimes independently.
 //!
 //! # Roots and Namespaces
 //!
-//! A root is a reference-typed input ([`ReferenceRoot::RegionInput`]), an instruction's fresh allocation
-//! ([`ReferenceRoot::Allocation`]), or an external constant in an open-region analysis ([`ReferenceRoot::Constant`]).
-//! Every region's values resolve to roots in that region's own
-//! *namespace*: its own inputs, its own allocations, and the capture roots it inherits from an enclosing scope. The
-//! analysis never rewrites a nested region's records into its parent's namespace. Instead, each attachment of a nested
-//! region records one [`ReferenceRegionInputBinding`] per reference-typed region input, mapping that formal input to
-//! the caller root it denotes, and the attaching instruction's [`ReferenceTransitiveAccess`] summary is expressed in
-//! the caller's namespace after substituting those bindings and dropping the nested region's local allocations. Only
-//! [`RegionRole::Computation`] regions are entered: a dormant [`RegionRole::Rule`] region (e.g., a derived
-//! rematerialization or custom-derivative rule) is an input to a later transform rather than an executed child of the
+//! A root is a reference-typed input (i.e., [`ReferenceRoot::RegionInput`]), an [`Instruction`](crate::Instruction)'s
+//! fresh allocation (i.e., [`ReferenceRoot::Allocation`]), or an external constant in an open region analysis (i.e.,
+//! [`ReferenceRoot::Constant`]). Every region's values resolve to roots in that region's own _namespace_ (i.e., its own
+//! inputs, its own allocations, and the capture roots it inherits from an enclosing scope). The analysis never rewrites
+//! a nested region's records into its parent's namespace. Instead, each attachment of a nested region records one
+//! [`ReferenceRegionInputBinding`] per reference-typed region input, mapping that formal input to the caller root
+//! it denotes, and the attaching instruction's [`ReferenceTransitiveAccess`] summary is expressed in the caller's
+//! namespace after substituting those bindings and dropping the nested region's local allocations. Only
+//! [`RegionRole::Computation`] regions are entered as a dormant [`RegionRole::Rule`] region (e.g., a derived
+//! rematerialization or custom derivative rule) is an input to a later transform rather than an executed child of the
 //! attaching instruction, its reference-typed inputs are bound by that transform rather than by the instruction's
 //! operands, and the transform validates it separately, so the analysis neither enters it nor attributes its accesses
-//! to the instruction — the same rule by which effects exclude rule regions.
+//! to the instruction (i.e., the same rule by which [`Effects`](crate::Effects) exclude [`RegionRole::Rule`] regions).
 //!
 //! # Capture Scopes
 //!
-//! A capture-lifted program names its captures through constants whose capture index refers to the *active capture
-//! scope*. At the analyzed region, the scope is its first `capture_count` inputs. A nested region either inherits the
+//! A capture-lifted program names its captures through constants whose capture index refers to the _active capture
+//! scope_. At the analyzed region, the scope is its first `capture_count` inputs. A nested region either inherits the
 //! scope of the instruction attaching it or, when [`Operation::region_capture_input_count`] returns `Some(n)`,
-//! establishes a fresh scope from its first `n` inputs. A reference-typed constant resolves to the root bound at its
-//! capture position, so a capture root is the same root in every region that inherits the scope.
+//! establishes a fresh scope from its first `n` inputs. A reference-typed constant resolves to the root bound
+//! at its capture position, so a capture root is the same root in every region that inherits the scope.
 //!
 //! [`RegionRef::reference_analysis_with_constants`] analyzes an open region before its inherited captures are lifted.
 //! It assigns external constant roots to unresolved inherited capture indices and concrete reference allocations.
 //! Explicitly rebound capture scopes remain strict, including an empty prefix. The cache separates this mode from
-//! strict capture-lifted analysis so a successful open-region analysis cannot hide a missing capture in a closed one.
+//! strict capture-lifted analysis so a successful open region analysis cannot hide a missing capture in a closed one.
 //!
 //! # Boundaries
 //!
-//! Complete-value handles cross a region boundary freely: a nested region input with
-//! [`InputRegionProvenance::Forwarded`](crate::InputRegionProvenance::Forwarded) provenance denotes the caller root of
-//! the named operation input, and a forwarded region output denotes the root it carried in. A derived view (any alias
-//! chain containing a
-//! [`ReferenceAliasKind::View`] edge) crosses only when the attaching operation declares `View` provenance for that
-//! region input through [`Operation::input_region_provenance`]. The named operation input must be a complete-value
-//! handle, and the region input is recorded as a view of it through a [`ReferenceAliasEdge`] of origin
-//! [`ReferenceAliasOrigin::RegionInput`], whose description comes from the value family's
-//! [`region_input_view`](crate::programs::references::ReferenceViewOperation::region_input_view) hook.
-//! Such an input may be accessed inside the region, where its accesses are attributed to the whole caller root, but it
-//! can neither be consumed there nor be forwarded out. The view edge records only attachment-independent facts (which
-//! region input is a view, and of which operand position), because a region is analyzed once and shared by every
-//! instruction attaching it; the caller-side source root lives on the per-attachment
-//! [`ReferenceRegionInputBinding`], and a shared region reached with a different boundary shape (an input that is a
-//! view under one attachment and a complete handle under another) is rejected with
-//! [`ReferenceAnalysisError::InvalidBoundaryShape`]. No other view enters or leaves an attached region; a region
-//! that needs one recreates it from the carried root. Reference-typed outputs of region-carrying operations resolve
-//! through [`Operation::reference_output_identity_input`] (every provenance origin must return exactly the constrained
-//! root) or through [`Operation::output_region_provenance`] (all origins must agree). An origin rooted in an allocation
-//! local to the attached region is an escaping allocation and is rejected.
+//! Complete-value handles cross region boundaries freely: a nested region input with
+//! [`InputRegionProvenance::Forwarded`] provenance denotes the caller root of the named operation input,
+//! and a forwarded region output denotes the root it carried in. A derived view (i.e., any alias chain
+//! containing a [`ReferenceAliasKind::View`] edge) crosses only when the attaching operation declares
+//! [`InputRegionProvenance::View`] provenance for that region input through [`Operation::input_region_provenance`].
+//! The named operation input must be a complete-value handle, and the region input is recorded as a view of it through
+//! a [`ReferenceAliasEdge`] of origin [`ReferenceAliasOrigin::RegionInput`], whose description comes from the value
+//! family's [`region_input_view`](crate::ReferenceViewOperation::region_input_view) hook. Such an input may be accessed
+//! inside the region, where its accesses are attributed to the whole caller root, but it can neither be consumed there
+//! nor be forwarded out. The view edge records only attachment-independent facts (which region input is a view, and of
+//! which operand position), because a region is analyzed once and shared by every instruction attaching it; the
+//! caller-side source root lives on the per-attachment [`ReferenceRegionInputBinding`], and a shared region reached
+//! with a different boundary shape (an input that is a view under one attachment and a complete handle under another)
+//! is rejected with [`ReferenceAnalysisError::InvalidBoundaryShape`]. No other view enters or leaves an attached
+//! region; a region that needs one recreates it from the carried root. Reference-typed outputs of region-carrying
+//! operations resolve through [`Operation::reference_output_identity_input`] (every provenance origin must return
+//! exactly the constrained root) or through [`Operation::output_region_provenance`] (all origins must agree).
+//! An origin rooted in an allocation local to the attached region is an escaping allocation and is rejected.
 //!
 //! # Lifetime Rules
 //!
-//! Consumption is a complete-value lifetime event: it must go through a complete-value handle, it is legal only in the
+//! Consumption is a complete-value lifetime event that must go through a complete-value handle, is legal only in the
 //! region that allocated the root, and no access may follow it in program order, including accesses through aliases or
-//! through nested regions of later instructions. Entry-region inputs and captures are borrowed from the caller by
+//! through nested regions of later instructions. Entry region inputs and captures are borrowed from the caller by
 //! default and cannot be consumed. Internal callers may explicitly transfer ownership of selected non-capture entry
-//! inputs so they can be consumed in that region; attached regions still cannot consume them. For example:
+//! inputs so they can be consumed in that region. Attached regions still cannot consume them. For example:
 //!
 //! ```text
-//! lambda %0:ref<f32[]> .                 external root: region input 0 (source input 0)
-//! let %1:f32[] = reference_read %0       read of region input 0
-//!     %2:ref<f32[]> = reference_new %1   local root: allocation at instruction 1
-//!     %3:ref<f32[]> = reference_index %2 view alias of the allocation
-//!     reference_write %3 %1              write reaching the allocation through the view
-//!     %4:f32[] = reference_freeze %2     consumes the allocation; consuming %3 instead would be rejected
+//! lambda %0:ref<f32[]> .                   external root: region input 0 (source input 0)
+//! let %1:f32[] = reference_read %0         read of region input 0
+//!     %2:ref<f32[]> = reference_new %1     local root: allocation at instruction 1
+//!     %3:ref<f32[]> = reference_index %2   view alias of the allocation
+//!     reference_write %3 %1                write reaching the allocation through the view
+//!     %4:f32[] = reference_freeze %2       consumes the allocation; consuming %3 instead would be rejected
 //! in (%4)
 //! ```
-
-// TODO(eaplatanios): Review this module.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Display;
@@ -113,14 +108,13 @@ use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::{Value, ValueId};
 
-/// Error produced by [`ReferenceAnalysis`] when a [`Region`](crate::Region) closure violates the reference model.
-/// Every variant names the operation and instruction (or region and atom) at fault together with the violated rule,
-/// so consumers can surface it without re-deriving context.
+/// Error produced by [`ReferenceAnalysis`] when a [`Region`] closure violates the reference model. Every variant names
+/// the [`Operation`] and [`Instruction`](crate::Instruction) (or [`Region`] and [`Atom`]) at fault together with the
+/// violated rule, so that consumers can surface it without re-deriving it.
 #[derive(Clone, Debug, PartialEq, Eq, Error)]
 pub enum ReferenceAnalysisError {
-    /// An operation's declared [`Effects`](crate::programs::effects::Effects) or region hooks name
-    /// inputs, outputs, or regions that the application does not have, or classify a non-reference output as a
-    /// reference.
+    /// An operation's declared [`Effects`](crate::Effects) or region hooks name inputs, outputs, or regions that the
+    /// application does not have, or classify a non-reference output as a reference.
     #[error("operation `{operation}` at {instruction} declares malformed effects: {message}")]
     MalformedEffects {
         /// Name of the operation.
@@ -136,7 +130,7 @@ pub enum ReferenceAnalysisError {
     /// An operation uses an input as a reference, but that input resolves to no reference root.
     #[error(
         "operation `{operation}` at {instruction} uses input {input_index} as a reference but it resolves to no \
-             reference root"
+         reference root"
     )]
     UnresolvedReference {
         /// Name of the operation.
@@ -152,7 +146,7 @@ pub enum ReferenceAnalysisError {
     /// A region stores a reference-typed constant that names no capture.
     #[error(
         "region {region} stores reference-typed constant {atom} that names no capture; references enter a program \
-             only through inputs and captures"
+         only through inputs and captures"
     )]
     ReferenceConstant {
         /// Region storing the constant.
@@ -166,7 +160,7 @@ pub enum ReferenceAnalysisError {
     /// reference.
     #[error(
         "reference-typed constant {atom} in region {region} names capture {capture_index}, which the active capture \
-             scope of {capture_count} captures does not bind to a reference"
+         scope of {capture_count} captures does not bind to a reference"
     )]
     CaptureOutOfScope {
         /// Region storing the constant.
@@ -207,7 +201,7 @@ pub enum ReferenceAnalysisError {
     /// An operation passes a reference into an attached region input without declaring which input supplies it.
     #[error(
         "operation `{operation}` at {instruction} passes a reference into region {region_index} input {input_index} \
-             without declaring which input supplies it"
+         without declaring which input supplies it"
     )]
     UndeclaredRegionInputProvenance {
         /// Name of the operation.
@@ -226,7 +220,7 @@ pub enum ReferenceAnalysisError {
     /// An operation produces a reference-typed output that it neither classifies, constrains, nor forwards.
     #[error(
         "operation `{operation}` at {instruction} produces a reference at output {output_index} without declaring \
-             whether it allocates, aliases, preserves an input identity, or forwards a region output"
+         whether it allocates, aliases, preserves an input identity, or forwards a region output"
     )]
     UndeclaredReferenceOutput {
         /// Name of the operation.
@@ -242,7 +236,7 @@ pub enum ReferenceAnalysisError {
     /// An operation forwards an output from region outputs that denote different reference roots.
     #[error(
         "operation `{operation}` at {instruction} forwards output {output_index} from region outputs that denote \
-             different reference roots, {first} and {other}"
+         different reference roots, {first} and {other}"
     )]
     InconsistentForwardedRoots {
         /// Name of the operation.
@@ -264,7 +258,7 @@ pub enum ReferenceAnalysisError {
     /// An attached region returns a root other than the one an identity-constrained output must preserve.
     #[error(
         "operation `{operation}` at {instruction} constrains output {output_index} to preserve {expected}, but \
-             region {region_index} returns {actual} at output {region_output_index}"
+         region {region_index} returns {actual} at output {region_output_index}"
     )]
     FixedPointRootMismatch {
         /// Name of the operation.
@@ -314,7 +308,7 @@ pub enum ReferenceAnalysisError {
     /// A derived reference view enters or leaves an attached region.
     #[error(
         "operation `{operation}` at {instruction} moves a derived reference view across region {region_index} \
-             {boundary} {index}; only complete-value handles cross region boundaries"
+         {boundary} {index}; only complete-value handles cross region boundaries"
     )]
     ViewCrossesRegionBoundary {
         /// Name of the operation.
@@ -336,7 +330,7 @@ pub enum ReferenceAnalysisError {
     /// An attached region performs an access on an entering root that its operation does not permit.
     #[error(
         "operation `{operation}` at {instruction} does not allow region {region_index} to access {root}, which \
-             enters the region from its parent, with mode `{mode}`"
+         enters the region from its parent, with mode `{mode}`"
     )]
     DisallowedRegionAccess {
         /// Name of the operation.
@@ -358,7 +352,7 @@ pub enum ReferenceAnalysisError {
     /// A reference is consumed through a derived view rather than through a complete-value handle.
     #[error(
         "operation `{operation}` at {instruction} consumes a derived view of {root} through input {input_index}, but \
-             consumption invalidates the complete alias family; consume the root handle instead"
+         consumption invalidates the complete alias family; consume the root handle instead"
     )]
     ConsumeThroughView {
         /// Name of the operation.
@@ -377,7 +371,7 @@ pub enum ReferenceAnalysisError {
     /// An external reference (i.e., an entry input or capture) is consumed.
     #[error(
         "operation `{operation}` at {instruction} consumes external reference {root} ({external_source}), which \
-             its caller owns"
+         its caller owns"
     )]
     ConsumeExternal {
         /// Name of the operation.
@@ -397,7 +391,7 @@ pub enum ReferenceAnalysisError {
     /// A reference that entered a region from its parent is consumed inside that region.
     #[error(
         "operation `{operation}` at {instruction} consumes {root}, which entered region {region} from its parent; a \
-             reference may only be consumed in the region that allocated it"
+         reference may only be consumed in the region that allocated it"
     )]
     ConsumeOutsideCreationScope {
         /// Name of the operation.
@@ -416,7 +410,7 @@ pub enum ReferenceAnalysisError {
     /// A reference is accessed, directly or through a nested region, after being consumed.
     #[error(
         "operation `{operation}` at {instruction} accesses {root} after `{consumer_operation}` at {consumer} \
-             consumed it"
+         consumed it"
     )]
     UseAfterConsume {
         /// Name of the accessing operation.
@@ -442,6 +436,8 @@ impl From<ReferenceAnalysisError> for ProgramError {
         ProgramError::MalformedProgram(error.to_string())
     }
 }
+
+// TODO(eaplatanios): Review from this point onwards.
 
 /// Canonical reference root that a reference-typed value denotes: a region input, an instruction's fresh allocation,
 /// or an external constant when analyzing an open region with [`RegionRef::reference_analysis_with_constants`].
