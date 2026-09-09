@@ -32,23 +32,14 @@ use crate::programs::{
 };
 use crate::tracing::{Tracer, TracingContext};
 
-// TODO(eaplatanios): The term "ordinary" appears in docstrings and code comments in this module but it feels like
-//  unnecessary terminology. Can we rephrase the relevant bits so that we do not need it?
-// TODO(eaplatanios): Review this whole module for correctness and redundancies / unnecessary complexity
-//  and fix all findings.
-// TODO(eaplatanios): Use functional operators over iterators instead of for-loops and if-statements wherever it makes
-//  sense in this module (and especially so for cases where we have for-loops over iterator statements that may
-//  potentially chain multiple function calls).
-
 /// Cotangent seed for one flattened primal output leaf of a [`Pullback`] application, aligned leaf-for-leaf with
-/// the differentiated closure's output structure. Ordinary (i.e., non-reference) output leaves are seeded with a
-/// [`Value`](Self::Value) of their cotangent type, while reference-typed output leaves carry
-/// [`NoCotangent`](Self::NoCotangent) since a reference output forwards an input root, and the cotangent of that root's
-/// state lives in the input's [`CotangentDestination`] rather than in a seed. [`Pullback::apply_with_destinations`]
-/// rejects every other pairing.
+/// the differentiated closure's output structure. Non-reference output leaves are seeded with a [`Value`](Self::Value)
+/// of their cotangent type, while reference-typed output leaves carry [`NoCotangent`](Self::NoCotangent) since a
+/// reference output forwards an input root, and the cotangent of that root's state lives in the input's
+/// [`CotangentDestination`] rather than in a seed. [`Pullback::apply_with_destinations`] rejects every other pairing.
 #[derive(Clone, Debug, PartialEq, Eq, Parameter)]
 pub enum CotangentSeed<V> {
-    /// Cotangent value of an ordinary primal output leaf, typed with that leaf's cotangent type.
+    /// Cotangent value of a non-reference primal output leaf, typed with that leaf's cotangent type.
     Value(V),
 
     /// No cotangent, for a reference-typed primal output leaf whose state cotangent is owned by an input destination.
@@ -56,18 +47,18 @@ pub enum CotangentSeed<V> {
 }
 
 /// Cotangent _destination_ for one flattened primal input leaf of a [`Pullback`] application, aligned leaf-for-leaf
-/// with the differentiated closure's input structure. An ordinary (i.e., non-reference) input leaf either
-/// [`returns`](Self::Return) its cotangent, accumulates it into a caller-owned [`Reference`](Self::Reference), or
-/// [`ignores`](Self::Ignore) it. A reference-typed input leaf uses a caller-owned cotangent reference or ignores its
-/// state cotangent. [`Pullback::apply_with_destinations`] rejects every other pairing. The
-/// [`CotangentDestinationKind`]s form the structural mask that selects the retained transposition.
-/// Refer to the documentation of [`CotangentDestinationKind`] for more information.
+/// with the differentiated closure's input structure. A non-reference input leaf either [`returns`](Self::Return) its
+/// cotangent, accumulates it into a caller-owned [`Reference`](Self::Reference), or [`ignores`](Self::Ignore) it. A
+/// reference-typed input leaf uses a caller-owned cotangent reference or ignores its state cotangent.
+/// [`Pullback::apply_with_destinations`] rejects every other pairing. The [`CotangentDestinationKind`]s form the
+/// structural mask that selects the retained transposition. Refer to the documentation of [`CotangentDestinationKind`]
+/// for more information.
 #[derive(Clone, Debug, PartialEq, Eq, Parameter)]
 pub enum CotangentDestination<V> {
-    /// Returns the input cotangent as an ordinary value in the pullback's output structure.
+    /// Returns the input cotangent as a non-reference value in the pullback's output structure.
     Return,
 
-    /// The input cotangent is stored in a caller-owned reference. For an ordinary input of type `T`, it has type
+    /// The input cotangent is stored in a caller-owned reference. For a non-reference input of type `T`, it has type
     /// `ref<cotangent(T)>` and the computed cotangent is added to its existing contents. For a primal input of type
     /// `ref<T>`, it has the same referent cotangent type and carries the state adjoint through the reverse computation.
     /// It holds the cotangent of the reference's post-execution state when the pullback starts. The transposes of the
@@ -95,48 +86,48 @@ impl<V> CotangentDestination<V> {
     }
 }
 
-/// Structural kind of a [`CotangentDestination`], without the runtime reference value. For ordinary inputs this selects
-/// whether the pullback returns a cotangent value, adds contributions directly into a caller-provided reference, or
-/// omits the cotangent. Reference-typed primal inputs have separate state-adjoint semantics: a caller-provided
-/// reference carries the state cotangent backward through reads and writes, while an ignored state cotangent uses
-/// internal storage whenever intermediate state still contributes to another input's gradient.
+/// Structural kind of a [`CotangentDestination`], without the runtime reference value. For non-reference inputs
+/// this selects whether the pullback returns a cotangent value, adds contributions directly into a caller-provided
+/// reference, or omits the cotangent. Reference-typed primal inputs have separate state-adjoint semantics: a
+/// caller-provided reference carries the state cotangent backward through reads and writes, while an ignored state
+/// cotangent uses internal storage whenever intermediate state still contributes to another input's gradient.
 ///
 /// These kinds participate in the retained transposition's cache key. Applications with the same kinds reuse a
 /// program even when they supply different buffers. Changing a kind selects a different program boundary.
 /// Refer to [`Program::transpose_with_respect_to`] for information on the input and output ordering.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CotangentDestinationKind {
-    /// Returns an ordinary input's cotangent value. This is the default for ordinary inputs and is invalid for
-    /// reference-typed primal inputs, whose state cotangents require reference storage.
+    /// Returns a non-reference input's cotangent value. This is the default for non-reference inputs and is invalid
+    /// for reference-typed primal inputs, whose state cotangents require reference storage.
     Return,
 
-    /// Accepts a caller-owned cotangent reference as a pullback input. Ordinary contributions are added into it and
+    /// Accepts a caller-owned cotangent reference as a pullback input. Value contributions are added into it and
     /// produce no cotangent output. For a reference-typed primal input, the buffer carries its state adjoint and is
     /// also returned by identity. This is the default for reference-typed primal inputs.
     Reference,
 
-    /// Omits the input cotangent from the boundary. Ordinary inputs need no accumulation. Reference-typed primal
+    /// Omits the input cotangent from the boundary. Non-reference inputs need no accumulation. Reference-typed primal
     /// inputs may still need an internal state accumulator to compute other input cotangents that is discarded
     /// after use.
     Ignore,
 }
 
 /// Information about the cotangent destinations of an [`Instruction`] whose [`Region`] inputs mirror its operands.
-/// Ordinary operands follow their accumulation handles: requested values use [`CotangentDestinationKind::Return`],
+/// Non-reference operands follow their accumulation handles: requested values use [`CotangentDestinationKind::Return`],
 /// supplied buffers use [`CotangentDestinationKind::Reference`], and unrequested gradients use
 /// [`CotangentDestinationKind::Ignore`]. Known operands remain as [`CotangentDestinationKind::Return`]
 /// placeholders and are not transposed.
 ///
 /// Reference-state operands have a different contract. A live state cotangent passes its reference into the nested
 /// region and returns that reference by identity. An unused state cotangent uses [`CotangentDestinationKind::Ignore`],
-/// allowing the nested region to allocate temporary state only if needed. An ordinary gradient buffer is updated
-/// without producing an output. [`returns_cotangent`](Self::returns_cotangent) records this distinction for
+/// allowing the nested region to allocate temporary state only if needed. An gradient buffer for a non-reference input
+/// is updated without producing an output. [`returns_cotangent`](Self::returns_cotangent) records this distinction for
 /// reconstruction of the nested results.
 ///
 /// [`kinds`](Self::kinds) and [`references`](Self::references) both follow operand order. For example, for the
 /// `condition` operation, the known predicate is omitted when selecting the branch boundary and the remaining operands
-/// keep that order. Reference-state liveness can require a nested transpose even when every ordinary output cotangent
-/// is zero.
+/// keep that order. Reference-state liveness can require a nested transpose even when every non-reference output
+/// cotangent is zero.
 #[derive(Clone, Debug)]
 pub struct CotangentDestinations<V> {
     /// [`CotangentDestinationKind`] of every operand, in operand order.
@@ -145,8 +136,8 @@ pub struct CotangentDestinations<V> {
     /// Cotangent references of the [`Reference`](CotangentDestinationKind::Reference)-kind operands, in operand order.
     references: Vec<V>,
 
-    /// Contains a boolean value for each operand specifying whether it carries reference state, rather than an ordinary
-    /// gradient that may use a buffer.
+    /// Contains a boolean value for each operand specifying whether it carries reference state,
+    /// rather than a non-reference gradient that may use a buffer.
     reference_inputs: Vec<bool>,
 }
 
@@ -159,15 +150,16 @@ impl<V> CotangentDestinations<V> {
     ///
     ///   - `kinds`: Destination kind of every operand.
     ///   - `references`: Cotangent references for the `Reference`-kind operands.
-    ///   - `reference_inputs`: Whether each operand carries reference state rather than an ordinary value.
+    ///   - `reference_inputs`: Whether each operand carries reference state rather than a non-reference value.
     fn new(kinds: Vec<CotangentDestinationKind>, references: Vec<V>, reference_inputs: Vec<bool>) -> Self {
         Self { kinds, references, reference_inputs }
     }
 
     /// Creates a [`CotangentDestinations`] instance for a reference-free boundary, using
-    /// [`CotangentDestinationKind::Return`] for requested ordinary gradients and [`CotangentDestinationKind::Ignore`]
-    /// for the others. The mask iterator follows operand order. An all-`true` iterator requests the conservative
-    /// value-returning boundary used for `scan` operation carries and scanned inputs.
+    /// [`CotangentDestinationKind::Return`] for requested gradients for non-reference inputs and
+    /// [`CotangentDestinationKind::Ignore`] for the others. The mask iterator follows operand order. An all-`true`
+    /// iterator requests the conservative value-returning boundary used for `scan` operation carries and scanned
+    /// inputs.
     ///
     /// # Parameters
     ///
@@ -206,18 +198,18 @@ impl<V> CotangentDestinations<V> {
     }
 
     /// Returns whether the operand at `index` carries reference state whose cotangent is handled by the transpose.
-    /// Known reference operands and ordinary values whose gradients use reference buffers return `false`.
+    /// Known reference operands and non-reference values whose gradients use reference buffers return `false`.
     #[inline]
     pub fn is_reference_input(&self, index: usize) -> bool {
         self.reference_inputs[index]
     }
 
-    /// Returns whether the operand at `index` has a corresponding output in the nested transposed program.
-    /// A [`Return`](CotangentDestinationKind::Return) destination produces the gradient value. A reference-state input
+    /// Returns whether the operand at `index` has a corresponding output in the nested transposed program. A
+    /// [`Return`](CotangentDestinationKind::Return) destination produces the gradient value. A reference-state input
     /// with a [`Reference`](CotangentDestinationKind::Reference) destination returns the same accumulator reference it
-    /// received, so the enclosing operation can pass that state onward. An ordinary value with a `Reference`
-    /// destination instead adds its gradient into the supplied buffer without returning an output.
-    /// An [`Ignore`](CotangentDestinationKind::Ignore) destination produces no output.
+    /// received, so the enclosing operation can pass that state onward. A non-reference value with a `Reference`
+    /// destination instead adds its gradient into the supplied buffer without returning an output. An
+    /// [`Ignore`](CotangentDestinationKind::Ignore) destination produces no output.
     ///
     /// Callers use this when matching the nested program's outputs back to the operands being transposed. Known
     /// operands are excluded separately as their `Return` entries are placeholders and not requests for gradients.
@@ -227,10 +219,10 @@ impl<V> CotangentDestinations<V> {
             || (self.is_reference_input(index) && self.kind(index) == CotangentDestinationKind::Reference)
     }
 
-    /// Returns whether any reference-state input has a [`Reference`](CotangentDestinationKind::Reference)
-    /// destination. Such a destination passes a state cotangent through the nested transposed program, so that
-    /// program may still need to run even when every ordinary output cotangent is zero. This checks the destination
-    /// kind, not whether the buffer's contents are nonzero. Ordinary gradient buffers and reference-state inputs
+    /// Returns whether any reference-state input has a [`Reference`](CotangentDestinationKind::Reference) destination.
+    /// Such a destination passes a state cotangent through the nested transposed program, so that program may still
+    /// need to run even when every non-reference output cotangent is zero. This checks the destination kind, not
+    /// whether the buffer's contents are nonzero. Gradient buffers for non-reference inputs and reference-state inputs
     /// with an [`Ignore`](CotangentDestinationKind::Ignore) destination do not satisfy this check.
     #[inline]
     pub fn has_reference_state_destinations(&self) -> bool {
@@ -352,7 +344,7 @@ impl<V: Typed> Typed for CotangentReferenceAccumulator<V> {
     }
 }
 
-/// Handle to one ordinary input's cotangent storage in a [`TranspositionContext`]. Cloning a handle keeps the same
+/// Handle to one non-reference input's cotangent storage in a [`TranspositionContext`]. Cloning a handle keeps the same
 /// underlying storage, so repeated operands can each contribute to one gradient value. Handles are valid only in their
 /// [`TranspositionContext`]s that created them; reference-state adjoints use the context's separate reference
 /// operations instead.
@@ -365,28 +357,27 @@ pub struct CotangentAccumulator {
     /// preventing an old handle from accidentally identifying a new context whose allocation reuses the same address.
     context_identity: Rc<()>,
 
-    /// Index into the owning context's ordinary cotangent storage.
+    /// Index into the owning context's value cotangent storage.
     storage_index: usize,
 
-    /// Whether an ordinary cotangent is requested for this input.
+    /// Whether a value cotangent is requested for this input.
     needed: bool,
 }
 
 impl CotangentAccumulator {
-    /// Returns whether this [`CotangentAccumulator`] needs an ordinary cotangent. Rules can check this before
-    /// constructing an expensive contribution. Known operands and reference-state operands do not request ordinary
-    /// cotangents.
+    /// Returns whether this [`CotangentAccumulator`] needs a value cotangent. Rules can check this before constructing
+    /// an expensive contribution. Known operands and reference-state operands do not request non-reference cotangents.
     #[inline]
     pub fn is_needed(&self) -> bool {
         self.needed
     }
 
-    /// Returns the underlying caller-provided ordinary gradient buffer, if this accumulator has one. Value accumulators
-    /// never allocate a reference merely because this function is called. Using another context's handle returns an
-    /// error. A rule using this buffer must preserve the existing cotangent and add a contribution independent of the
-    /// buffer's contents. It must not consume the reference or discard earlier contributions. A read-modify-write
-    /// sequence is valid when it implements that addition without intervening mutations. Views can restrict the update
-    /// to the entries affected by the rule.
+    /// Returns the underlying caller-provided gradient buffer for a non-reference input, if this accumulator has one.
+    /// Value accumulators never allocate a reference merely because this function is called. Using another context's
+    /// handle returns an error. A rule using this buffer must preserve the existing cotangent and add a contribution
+    /// independent of the buffer's contents. It must not consume the reference or discard earlier contributions. A
+    /// read-modify-write sequence is valid when it implements that addition without intervening mutations. Views can
+    /// restrict the update to the entries affected by the rule.
     #[inline]
     pub fn reference<V: Value, O: Operation<Type = V::Type>>(
         &self,
@@ -422,12 +413,12 @@ impl CotangentAccumulator {
         }
 
         // A correctly typed symbolic zero needs no operation. Concrete contributions must belong to this trace;
-        // reference-state updates use the context's separate reference functions rather than ordinary addition.
+        // reference-state updates use the context's separate reference functions rather than value addition.
         let MaybeZero::Value(contribution) = contribution else { return Ok(()) };
         check_builders!(context.builder(), contribution.builder())?;
         if storage.r#type().is_reference() {
             return Err(ProgramError::InvalidArgument {
-                message: "reference-state cotangents cannot be contributed to an ordinary accumulator".into(),
+                message: "reference-state cotangents cannot be contributed to a value cotangent accumulator".into(),
             }
             .into());
         }
@@ -476,10 +467,10 @@ impl CotangentAccumulator {
     }
 }
 
-/// Ordinary cotangent storage, holding either a running value sum or a caller-supplied buffer. Its [`Typed`]
-/// implementation describes the expected contribution type, including when no contributions have arrived; it does
-/// not describe the reference used to store those contributions. Both variants accept only additive updates, unlike
-/// reference-state accumulators, whose contents may also be taken or replaced by reference transpose rules.
+/// Cotangent storage for non-reference inputs, holding either a running value sum or a caller-supplied buffer. Its
+/// [`Typed`] implementation describes the expected contribution type, including when no contributions have arrived; it
+/// does not describe the reference used to store those contributions. Both variants accept only additive updates,
+/// unlike reference-state accumulators, whose contents may also be taken or replaced by reference transpose rules.
 enum CotangentStorage<V: Value, O: Operation<Type = V::Type>> {
     /// Contributions are summed as they arrive, allowing earlier values to be released during execution.
     Value {
@@ -498,8 +489,8 @@ enum CotangentStorage<V: Value, O: Operation<Type = V::Type>> {
         /// Reference receiving the accumulated contributions.
         reference: Tracer<TracingContext<V, O>>,
 
-        /// Selected [`ReferenceAddUpdateOperation`] instance. Retaining it preserves operation-family dispatch
-        /// without adding reference-operation provider bounds to every ordinary transpose rule.
+        /// Selected [`ReferenceAddUpdateOperation`] instance. Retaining it preserves operation-family dispatch without
+        /// adding reference-operation provider bounds to every transpose rule for non-reference values.
         operation: O,
     },
 }
@@ -520,28 +511,28 @@ impl<V: Value, O: Operation<Type = V::Type>> Typed for CotangentStorage<V, O> {
 /// parent so rules can stage operations directly. Each rule receives [`CotangentAccumulator`] handles aligned with
 /// its operands and accesses reference-state cotangents through this context's reference functions.
 ///
-/// [`Self::new`] supports direct ordinary rule invocations, including projected member rules, without reference
-/// analysis. During program transposition, the engine also installs the source region's [`ReferenceAnalysis`] and
-/// reference-state accumulators. The [`TranspositionDriver`] supplies the source region and current instruction and
-/// this context retains the analysis and generated values needed across rule invocations, without borrowing the
-/// source region or storing a current instruction index.
+/// [`Self::new`] supports direct rule invocations for non-reference values, including projected member rules, without
+/// reference analysis. During program transposition, the engine also installs the source region's [`ReferenceAnalysis`]
+/// and reference-state accumulators. The [`TranspositionDriver`] supplies the source region and current instruction and
+/// this context retains the analysis and generated values needed across rule invocations, without borrowing the source
+/// region or storing a current instruction index.
 ///
 /// # Cotangent Storage
 ///
-/// Ordinary cotangents and reference-state cotangents use separate storage. An ordinary accumulator maintains a
+/// Value cotangents and reference-state cotangents use separate storage. A value cotangent accumulator maintains a
 /// running value sum, adds contributions directly into a caller-supplied gradient buffer, or discards contributions
 /// when no cotangent is requested. Its updates are always additive. Handles identify the context that owns their
-/// storage: two contexts may share a parent trace while owning unrelated slots, so sharing a parent does not make
-/// their handles interchangeable.
+/// storage: two contexts may share a parent trace while owning unrelated slots, so sharing a parent does not make their
+/// handles interchangeable.
 ///
 /// Reference-state cotangents use [`CotangentReferenceAccumulator`]s keyed by the canonical [`ReferenceRoot`] assigned
 /// by reference analysis, so aliases share the same state. Reference rules can also take or replace that state, as
 /// required when transposing writes. They use the reference functions instead of submitting reference values through
-/// ordinary accumulator handles; such contributions are rejected.
+/// value cotangent accumulator handles; such contributions are rejected.
 ///
 /// Reference-state buffers are allocated lazily when needed. [`Self::dimension_sources`] retains values from which
 /// their runtime dimensions can be obtained, including known primal values and previously encountered cotangents.
-/// These sources remain available after ordinary cotangents are extracted, so a later rule can still construct a
+/// These sources remain available after value cotangents are extracted, so a later rule can still construct a
 /// correctly shaped zero even when its type alone does not supply the required dimensions.
 ///
 /// # Reference Views
@@ -557,16 +548,16 @@ impl<V: Value, O: Operation<Type = V::Type>> Typed for CotangentStorage<V, O> {
 /// same dynamic index while requiring distinct views. Generated views are cached by the primal view's [`ValueId`]
 /// so repeated accesses reuse staged operations; consuming a root accumulator removes its cached views.
 ///
-/// Generic view reconstruction requires known coordinate values. It rejects a view bound to a linear coordinate or
-/// a nested region's iteration counter. An enclosing operation's transpose rule must handle iteration-bound views
-/// when supporting that case; the context cannot reconstruct them from the region's ordinary operands alone.
+/// Generic view reconstruction requires known coordinate values. It rejects a view bound to a linear coordinate or a
+/// nested region's iteration counter. An enclosing operation's transpose rule must handle iteration-bound views when
+/// supporting that case; the context cannot reconstruct them from the region's non-reference operands alone.
 ///
 /// # Nested Regions
 ///
 /// A nested [`Region`] is transposed in its own context. Inputs with [`CotangentDestinationKind::Reference`] receive
-/// buffers from the enclosing rule. Reference state inputs return the same references so control flow rules can
-/// thread state through nested regions; ordinary gradient buffers receive additive updates and produce no output.
-/// A root whose state cotangent does not need to cross the region boundary can use
+/// buffers from the enclosing rule. Reference state inputs return the same references so control flow rules can thread
+/// state through nested regions; gradient buffers for non-reference inputs receive additive updates and produce no
+/// output. A root whose state cotangent does not need to cross the region boundary can use
 /// [`CotangentDestinationKind::Ignore`], allowing the nested region to allocate and discard its own accumulator
 /// if needed. State cotangents needed by the enclosing computation must instead use its accumulators.
 pub struct TranspositionContext<V: Value, O: Operation<Type = V::Type>> {
@@ -612,8 +603,8 @@ pub struct TranspositionContext<V: Value, O: Operation<Type = V::Type>> {
 
 impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     /// Creates a new [`TranspositionContext`] over `parent` with empty cotangent storage and no reference analysis.
-    /// Rules staged through it can use every [`TracingContext`] capability and ordinary cotangent accumulators.
-    /// Reference-state queries require the analysis installed by the program transposition engine.
+    /// Rules staged through it can use every [`TracingContext`] capability and cotangent accumulators for non-reference
+    /// inputs. Reference-state queries require the analysis installed by the program transposition engine.
     #[inline]
     pub fn new(parent: TracingContext<V, O>) -> Self {
         Self {
@@ -649,8 +640,8 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
         Ok(Self { reference_analysis: analysis, ..Self::new(parent) })
     }
 
-    /// Creates empty ordinary [`CotangentStorage`] and returns its [`CotangentAccumulator`] handle. Each call
-    /// creates an independent storage, even if the provided type is identical. Clone the returned handle when several
+    /// Creates empty cotangent storage and returns its [`CotangentAccumulator`] handle. Each call creates an
+    /// independent storage, even if the provided type is identical. Clone the returned handle when several
     /// contributions should share the same running sum. Creating the handle stages no operations; contributions are
     /// submitted through [`CotangentAccumulator::accumulate`] and values are extracted through
     /// [`Self::take_cotangents`].
@@ -663,7 +654,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     ///
     ///   - `cotangent_type`: Expected type of each contribution, already derived from the primal type. It is retained
     ///     even before any contributions arrive, so extracting an empty accumulator returns a zero of this type.
-    ///     Concrete reference-typed contributions are rejected by the ordinary accumulation API.
+    ///     Concrete reference-typed contributions are rejected by the value accumulation API.
     ///   - `needed`: Whether this accumulator should retain contributions. With `false`, contributions are discarded
     ///     after validation and extraction returns a structural zero. With `true`, contributions are summed as they
     ///     arrive; this requests a cotangent but does not imply that its value is nonzero.
@@ -673,19 +664,19 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
         CotangentAccumulator { context_identity: self.context_identity.clone(), storage_index, needed }
     }
 
-    /// Creates new ordinary [`CotangentStorage`] and returns [`CotangentAccumulator`] handles aligned with `inputs` for
-    /// a direct transposition rule invocation. Each call creates independent storage. Clone a returned handle when two
-    /// operand positions must share their contributions.
+    /// Creates new cotangent storage and returns [`CotangentAccumulator`] handles aligned with `inputs` for a direct
+    /// transposition rule invocation. Each call creates independent storage. Clone a returned handle when two operand
+    /// positions must share their contributions.
     ///
     /// # Parameters
     ///
     ///   - `inputs`: The rule's operands in operand order, each carrying either a known primal value or the type of
     ///     an unknown value. One handle is returned per operand, including operands whose cotangent is not requested.
     ///     Known values must belong to this context's parent trace.
-    ///   - `cotangent_mask`: Whether an ordinary cotangent is needed for each input, in the same order as `inputs`.
+    ///   - `cotangent_mask`: Whether a value cotangent is needed for each input, in the same order as `inputs`.
     ///     An empty slice requests cotangents for all eligible inputs. Otherwise, it must have exactly one flag per
     ///     input. For example, `[true, false, true]` requests cotangents for the first and third inputs if they are
-    ///     unknown ordinary values. Known inputs and reference-state inputs never receive ordinary contributions,
+    ///     unknown non-reference values. Known inputs and reference-state inputs never receive value contributions,
     ///     even with a `true` flag. Their handles report [`CotangentAccumulator::is_needed`] as `false`, as do handles
     ///     selected by a `false` flag, and discard contributions after validating them. These flags describe which
     ///     cotangents are needed, not whether they are nonzero: a requested cotangent can still be zero.
@@ -737,7 +728,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     /// Returns retained values from which the runtime dimensions needed to construct reference state zeros can be
     /// obtained. A source can be an array whose dimensions can be queried or an explicit dimension value; these are
     /// candidate sources and not a list of already extracted dimensions. They include known primal values and
-    /// cotangents encountered during transposition, and remain available after ordinary cotangent storage is drained.
+    /// cotangents encountered during transposition, and remain available after value cotangent storage is drained.
     ///
     /// For example, constructing a zero buffer of type `f32[n]` requires the runtime value of `n`, which the type alone
     /// does not supply. An available array of type `f64[n]` can supply that dimension even though its element type is
@@ -782,7 +773,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     {
         let (_, value, root) = self.reference_input(driver, input_index)?;
         let root_reference = {
-            // `reference_operand` established that the root has an accumulator.
+            // `reference_input` established that the root has an accumulator.
             let accumulator = self.reference_accumulators.get_mut(&root).unwrap();
             accumulator.allocate_in(&self.parent, &self.dimension_sources)?.clone()
         };
@@ -897,7 +888,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
             return Ok(viewed.clone());
         }
 
-        // `reference_operand` established that the driver supplies a source instruction and the context has reference
+        // `reference_input` established that the driver supplies a source instruction and the context has reference
         // analysis. The driver's source scope stays fixed throughout this invocation. A root skips the view overlay.
         let (region, _, _) = driver.scope()?.unwrap();
         let is_view = self.reference_analysis.as_ref().unwrap().is_view(value);
@@ -913,7 +904,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
                 ))
             })?;
 
-            for step in path.steps() {
+            view = path.steps().iter().try_fold(view, |view, step| {
                 // The overlay bound each symbolic coordinate to a known primal operand of the view-creating
                 // instruction, whose transposed program value the reverse sweep materialized before this rule
                 // ran. An iteration-bound boundary view has no such value: the transpose rule of the attaching
@@ -939,8 +930,8 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
                         }),
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                view = O::reapply_view(&self.parent, step.view(), view, symbols.as_slice())?;
-            }
+                O::reapply_view(&self.parent, step.view(), view, symbols.as_slice())
+            })?;
         }
 
         // The final type is checked against the operand's cotangent type for roots and views alike, so that a view
@@ -969,7 +960,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     /// obtained through [`Self::cotangent_reference`], allocating it if needed. Other linear reference operands receive
     /// [`CotangentDestinationKind::Ignore`], avoiding an allocation when the instruction only writes into a root whose
     /// state cotangent is zero. Structured operations such as `scan` and `condition` use these destinations to pass
-    /// buffers and ordinary cotangents into their transposed regions in operand order.
+    /// buffers and value cotangents into their transposed regions in operand order.
     ///
     /// # Parameters
     ///
@@ -977,7 +968,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     ///     Reference operands require a source region consistent with this context's reference analysis.
     ///   - `inputs`: The [`Instruction`]'s inputs/operands in order. Each entry contains either a known primal value
     ///     or the type of an unknown value whose cotangent is being propagated.
-    ///   - `accumulators`: [`CotangentAccumulator`]s in input/operand order. Empty requests returned ordinary
+    ///   - `accumulators`: [`CotangentAccumulator`]s in input/operand order. Empty requests returned non-reference
     ///     cotangents (i.e., cotangents of non-reference values), used when a nested recurrence must compute carry
     ///     gradients independently of the outer requested outputs.
     pub fn cotangent_destinations<D: TranspositionDriver<V, O>>(
@@ -995,54 +986,56 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
         if !accumulators.is_empty() {
             check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
             // Validate every handle, including ignored and known operands, before resolving any reference state.
-            for accumulator in accumulators {
-                self.cotangent_storage(accumulator)?;
-            }
+            accumulators.iter().try_for_each(|accumulator| self.cotangent_storage(accumulator).map(|_| ()))?;
         }
 
-        let mut kinds = Vec::with_capacity(inputs.len());
         let mut references = Vec::new();
-        for (operand_index, input) in inputs.iter().enumerate() {
-            kinds.push(match input {
-                PartialValue::Unknown(r#type) if r#type.is_reference() => {
-                    let (id, _, root) = self.reference_input(driver, operand_index)?;
-                    // An existing buffer carries state cotangents from later instructions; even a write operation must
-                    // receive it. Otherwise, reads, swaps, or consumes in this instruction or its nested regions can
-                    // introduce a state cotangent, so they also need a shared buffer. Pure writes into a root with zero
-                    // state cotangent need no buffer passed from the enclosing region. Note that `reference_input`
-                    // above already checked that reference analysis is available, so unwrapping it is safe.
-                    let needs_reference = self.cotangent_accumulator_reference(root).is_some()
-                        || self.reference_analysis.as_ref().unwrap().transitive_access(id).is_some_and(|access| {
-                            access.modes(root).any(|mode| {
-                                matches!(
-                                    mode,
-                                    ReferenceAccessMode::Read
-                                        | ReferenceAccessMode::ReadWrite
-                                        | ReferenceAccessMode::Consume
-                                )
-                            })
-                        });
-                    if needs_reference {
-                        references.push(self.cotangent_reference(driver, operand_index)?);
-                        CotangentDestinationKind::Reference
-                    } else {
-                        CotangentDestinationKind::Ignore
+        let kinds = inputs
+            .iter()
+            .enumerate()
+            .map(|(operand_index, input)| {
+                Ok(match input {
+                    PartialValue::Unknown(r#type) if r#type.is_reference() => {
+                        let (id, _, root) = self.reference_input(driver, operand_index)?;
+                        // An existing buffer carries state cotangents from later instructions; even a write operation
+                        // must receive it. Otherwise, reads, swaps, or consumes in this instruction or its nested
+                        // regions can introduce a state cotangent, so they also need a shared buffer. Pure writes into
+                        // a root with zero state cotangent need no buffer passed from the enclosing region. Note that
+                        // `reference_input` above already checked that reference analysis is available, so unwrapping
+                        // it is safe.
+                        let needs_reference = self.cotangent_accumulator_reference(root).is_some()
+                            || self.reference_analysis.as_ref().unwrap().transitive_access(id).is_some_and(|access| {
+                                access.modes(root).any(|mode| {
+                                    matches!(
+                                        mode,
+                                        ReferenceAccessMode::Read
+                                            | ReferenceAccessMode::ReadWrite
+                                            | ReferenceAccessMode::Consume
+                                    )
+                                })
+                            });
+                        if needs_reference {
+                            references.push(self.cotangent_reference(driver, operand_index)?);
+                            CotangentDestinationKind::Reference
+                        } else {
+                            CotangentDestinationKind::Ignore
+                        }
                     }
-                }
-                PartialValue::Unknown(_) if !accumulators.is_empty() => {
-                    let accumulator = &accumulators[operand_index];
-                    if !accumulator.is_needed() {
-                        CotangentDestinationKind::Ignore
-                    } else if let Some(reference) = accumulator.reference(self)? {
-                        references.push(reference);
-                        CotangentDestinationKind::Reference
-                    } else {
-                        CotangentDestinationKind::Return
+                    PartialValue::Unknown(_) if !accumulators.is_empty() => {
+                        let accumulator = &accumulators[operand_index];
+                        if !accumulator.is_needed() {
+                            CotangentDestinationKind::Ignore
+                        } else if let Some(reference) = accumulator.reference(self)? {
+                            references.push(reference);
+                            CotangentDestinationKind::Reference
+                        } else {
+                            CotangentDestinationKind::Return
+                        }
                     }
-                }
-                PartialValue::Unknown(_) | PartialValue::Known(_) => CotangentDestinationKind::Return,
-            });
-        }
+                    PartialValue::Unknown(_) | PartialValue::Known(_) => CotangentDestinationKind::Return,
+                })
+            })
+            .collect::<Result<Vec<_>, DifferentiationError>>()?;
 
         let reference_inputs = inputs.iter().map(|input| input.is_unknown() && input.r#type().is_reference()).collect();
         Ok(CotangentDestinations::new(kinds, references, reference_inputs))
@@ -1080,20 +1073,22 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
         accumulators.iter().try_for_each(|accumulator| self.cotangent_storage(accumulator).map(|_| ()))?;
         let mut extracted = BTreeMap::new();
-        for accumulator in accumulators {
-            if extracted.contains_key(&accumulator.storage_index) {
-                continue;
-            }
-            let slot = &mut self.cotangent_storage[accumulator.storage_index];
-            let value = match slot {
-                CotangentStorage::Value { cotangent_type, value } => value
-                    .take()
-                    .map_or_else(|| MaybeZero::Zero(cotangent_type.clone()), |(value, _)| MaybeZero::Value(value)),
-                CotangentStorage::Buffer { cotangent_type, .. } => MaybeZero::Zero(cotangent_type.clone()),
-            };
-            extracted.insert(accumulator.storage_index, value);
-        }
-        Ok(accumulators.iter().map(|accumulator| extracted[&accumulator.storage_index].clone()).collect())
+        Ok(accumulators
+            .iter()
+            .map(|accumulator| {
+                // Extract a shared slot once; repeated handles reuse the value already taken from it.
+                extracted
+                    .entry(accumulator.storage_index)
+                    .or_insert_with(|| match &mut self.cotangent_storage[accumulator.storage_index] {
+                        CotangentStorage::Value { cotangent_type, value } => value.take().map_or_else(
+                            || MaybeZero::Zero(cotangent_type.clone()),
+                            |(value, _)| MaybeZero::Value(value),
+                        ),
+                        CotangentStorage::Buffer { cotangent_type, .. } => MaybeZero::Zero(cotangent_type.clone()),
+                    })
+                    .clone()
+            })
+            .collect())
     }
 
     /// Removes the [`CotangentReferenceAccumulator`] for the reference allocated by the `output_index`-th output of the
@@ -1101,11 +1096,10 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     /// has already been removed. Cached cotangent views of that reference are removed as well. This function stages no
     /// operations and does not freeze or read the returned buffer.
     ///
-    /// This extracts reference state storage, independently of the ordinary value sums extracted by
-    /// [`Self::take_cotangents`]. For example, when transposing `r = reference_new(x)`, the rule takes `r`'s
-    /// cotangent buffer here, freezes it into a value, and contributes that value to `x`'s ordinary accumulator.
-    /// That contribution can then be extracted through [`Self::take_cotangents`]. If no buffer was allocated,
-    /// the contribution is zero.
+    /// This extracts reference state storage, independently of the value sums extracted by [`Self::take_cotangents`].
+    /// For example, when transposing `r = reference_new(x)`, the rule takes `r`'s cotangent buffer here, freezes it
+    /// into a value, and contributes that value to `x`'s value cotangent accumulator. That contribution can then be
+    /// extracted through [`Self::take_cotangents`]. If no buffer was allocated, the contribution is zero.
     ///
     /// Taking the buffer marks the end of the reverse sweep for this allocation: its allocation precedes every use
     /// in forward order, so all of those uses have already been transposed. The context no longer retains the root's
@@ -1116,7 +1110,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     ///   - `driver`: [`TranspositionDriver`] identifying the current source instruction. It must identify the
     ///     instruction that allocated the reference and not a later instruction that reads, updates, or views it.
     ///   - `output_index`: Position of the allocating output among that instruction's outputs. This identifies a
-    ///     reference allocation, not an ordinary cotangent handle or an operand index.
+    ///     reference allocation, not a value cotangent handle or an operand index.
     ///
     /// # Errors
     ///
@@ -1152,10 +1146,10 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
         })
     }
 
-    /// Returns the ordinary [`CotangentStorage`] for `accumulator` after checking its context identity. This storage
-    /// receives additive contributions and is separate from reference state accumulators, whose transpose rules can
-    /// also take or replace the state cotangent. Retained identity tokens prevent an old context's storage index from
-    /// accidentally becoming valid when a new context is allocated at the same address.
+    /// Returns the [`CotangentStorage`] for `accumulator` after checking its context identity. This storage receives
+    /// additive contributions and is separate from reference state accumulators, whose transpose rules can also take or
+    /// replace the state cotangent. Retained identity tokens prevent an old context's storage index from accidentally
+    /// becoming valid when a new context is allocated at the same address.
     fn cotangent_storage(
         &self,
         accumulator: &CotangentAccumulator,
@@ -1200,12 +1194,12 @@ impl<V: Value, O: Operation<Type = V::Type>> DerefMut for TranspositionContext<V
 ///
 /// # Why the Pushforward Program Is Retained
 ///
-/// The requested destinations determine the backward program's inputs, outputs, and accumulation operations. They
-/// are supplied at application time, so the pullback retains the pushforward and transposes it for that destination
-/// pattern when needed. One pullback can therefore serve different patterns without retracing or differentiating the
-/// original function again. A fixed backward program that returned values could be followed by additions into buffers
-/// for non-reference inputs, but it would miss opportunities to accumulate directly. For example, a slice transpose
-/// can update a slice of the caller's buffer instead of constructing a full-sized intermediate gradient.
+/// The requested destinations determine the backward program's inputs, outputs, and accumulation operations. They are
+/// supplied at application time, so the pullback retains the pushforward and transposes it for that destination pattern
+/// when needed. One pullback can therefore serve different patterns without retracing or differentiating the original
+/// function again. A fixed backward program that returned values could be followed by additions into buffers for
+/// non-reference inputs, but it would miss opportunities to accumulate directly. For example, a slice transpose can
+/// update a slice of the caller's buffer instead of constructing a full-sized intermediate gradient.
 ///
 /// Derived backward programs are retained in the [`Region`] transform cache, with the destination kinds included
 /// in the cache key. The first application of a pattern derives its program unless it is already cached; subsequent
@@ -1237,7 +1231,7 @@ pub struct Pullback<C: Context, Input: Parameterized<C::Value>, Output> {
     context: C,
 
     /// Linear pushforward [`Program`] `(live(ẋ), r) ↦ live(ẏ)` over the primal operation family in the context's
-    /// staged [`Constant`](Domain::Constant) space, whose trailing inputs consume the residuals. It is transposed on
+    /// staged [`Constant`](Context::Constant) space, whose trailing inputs consume the residuals. It is transposed on
     /// application and its literal constants are lifted through the context's [`lift`](Context::lift) when the
     /// transposed program is replayed.
     linear_program: Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>,
@@ -1326,9 +1320,9 @@ impl<
         &self.linear_program
     }
 
-    /// Returns the transposition of [`linear_program`](Self::linear_program) under the destination kinds of its
-    /// tangent inputs, served from the linear program's retained transform cache. An empty `destination_kinds`
-    /// selects the default kinds (i.e., [`Return`](CotangentDestinationKind::Return) for ordinary inputs and
+    /// Returns the transposition of [`linear_program`](Self::linear_program) under the destination kinds of its tangent
+    /// inputs, served from the linear program's retained transform cache. An empty `destination_kinds` selects the
+    /// default kinds (i.e., [`Return`](CotangentDestinationKind::Return) for non-reference inputs and
     /// [`Reference`](CotangentDestinationKind::Reference) for reference inputs).
     #[allow(clippy::type_complexity)]
     #[inline]
@@ -1438,28 +1432,28 @@ impl<
     /// positions. Seeds and destinations are aligned leaf for leaf with the closure's output and input structures and
     /// are validated against this matrix:
     ///
-    /// | Primal Boundary Leaf | Legal Seed or Destination                                                       |
-    /// |----------------------|---------------------------------------------------------------------------------|
-    /// | Ordinary Output      | [`CotangentSeed::Value`]                                                        |
-    /// | Reference Output     | [`CotangentSeed::NoCotangent`]                                                  |
-    /// | Ordinary Input       | `Return`, `Ignore`, or `Reference` storing the input's cotangent type           |
-    /// | Reference Input      | [`CotangentDestination::Reference`] with `r: ref<cotangent(T)>`, or `Ignore`    |
+    /// | Primal Boundary Leaf | Legal Seed or Destination                                                    |
+    /// |----------------------|------------------------------------------------------------------------------|
+    /// | Non-Reference Output | [`CotangentSeed::Value`]                                                     |
+    /// | Reference Output     | [`CotangentSeed::NoCotangent`]                                               |
+    /// | Non-Reference Input  | `Return`, `Ignore`, or `Reference` storing the input's cotangent type        |
+    /// | Reference Input      | [`CotangentDestination::Reference`] with `r: ref<cotangent(T)>`, or `Ignore` |
     ///
     /// Every destination reference must resolve to an allocation in the originating context, must not alias a reference
     /// bound at the primal boundary of the differentiated closure (an input or a capture), and must not alias another
     /// destination of the same application; aliasing is compared by allocation identity, never by state generation.
     /// Destination kinds form the structural mask under which the linear program is transposed (refer to
-    /// [`CotangentDestinationKind`]). Ordinary reference destinations receive contributions during replay and ignored
-    /// cotangents need not be computed. The first application with a given mask pays for transposition, and later
-    /// applications with the same mask hit the region transform cache. The transposed program is interpreted at
-    /// `[live output cotangents, destination references, residuals]` in the context that this pullback was built in.
-    /// For an ordinary input, a [`Reference`](CotangentDestination::Reference) destination adds the computed value
-    /// cotangent to the destination's existing contents. For a reference input, the destination holds the cotangent
-    /// of the reference's post-execution state on entry and the cotangent of its pre-execution state on return. An
-    /// [`Ignore`](CotangentDestination::Ignore) reference destination accumulates through an internal cotangent
-    /// reference whose final contents are discarded. A reference-primal destination is threaded through the raw
-    /// transposed program by identity. Ordinary reference destinations and all ignored inputs have no program output.
-    /// The returned structure carries [`None`] at every non-`Return` position.
+    /// [`CotangentDestinationKind`]). Reference destinations for non-reference inputs receive contributions
+    /// during replay and ignored cotangents need not be computed. The first application with a given mask pays for
+    /// transposition, and later applications with the same mask hit the region transform cache. The transposed program
+    /// is interpreted at `[live output cotangents, destination references, residuals]` in the context that this
+    /// pullback was built in. For a non-reference input, a [`Reference`](CotangentDestination::Reference) destination
+    /// adds the computed value cotangent to the destination's existing contents. For a reference input, the destination
+    /// holds the cotangent of the reference's post-execution state on entry and the cotangent of its pre-execution
+    /// state on return. An [`Ignore`](CotangentDestination::Ignore) reference destination accumulates through an
+    /// internal cotangent reference whose final contents are discarded. A reference-primal destination is threaded
+    /// through the raw transposed program by identity. Reference destinations for non-reference inputs and all ignored
+    /// inputs have no program output. The returned structure carries [`None`] at every non-`Return` position.
     ///
     /// # Parameters
     ///
@@ -1491,9 +1485,10 @@ impl<
         Ok(Input::To::<Option<C::Value>>::from_parameters(self.input_structure.clone(), cotangents)?)
     }
 
-    /// Replays a scalar gradient pullback and returns ordinary values at every input position. Reference destinations
-    /// were initialized to zero before primal execution; freezing them after replay extracts the derivative with
-    /// respect to the initial state and prevents the internal accumulators from escaping through the result.
+    /// Replays a scalar gradient pullback and returns non-reference values at every input position. Reference
+    /// destinations were initialized to zero before primal execution; freezing them after replay extracts the
+    /// derivative with respect to the initial state and prevents the internal accumulators from escaping through
+    /// the result.
     fn apply_gradient(
         &self,
         seeds: Vec<CotangentSeed<C::Value>>,
@@ -1538,7 +1533,7 @@ impl<
     }
 
     /// Validates and replays the provided flattened seeds and [`CotangentDestination`].
-    /// Only ordinary [`Return`](CotangentDestination::Return) inputs produce values here;
+    /// Only non-reference [`Return`](CotangentDestination::Return) inputs produce values here;
     /// [`Reference`](CotangentDestination::Reference) destinations are updated during replay,
     /// and [`Ignore`](CotangentDestination::Ignore) inputs expose no result.
     fn apply_impl(
@@ -1683,9 +1678,10 @@ impl<
         program_inputs.extend(self.residuals.iter().cloned());
         let mut program_input_cotangents = program.interpret_in_context(&self.context, program_inputs)?.into_iter();
 
-        // Reconstruct the public input boundary. Ordinary `Return` leaves consume one result or materialize their
-        // typed zero. Ordinary `Reference`/`Ignore` leaves consume nothing. Reference-primal `Reference` leaves consume
-        // their identity output but expose `None` to the caller. Reference-primal `Ignored` leaves consume nothing.
+        // Reconstruct the public input boundary. Non-reference `Return` leaves consume one result or materialize their
+        // typed zero. Non-reference `Reference`/`Ignore` leaves consume nothing. Reference-primal `Reference` leaves
+        // consumetheir identity output but expose `None` to the caller. Reference-primal `Ignored` leaves consume
+        // nothing.
         let materialize_zeros = destinations
             .iter()
             .map(|destination| matches!(destination, CotangentDestination::Return))
@@ -1894,7 +1890,7 @@ impl<
 /// a gradient reference, or ignores that gradient.
 ///
 /// Accumulating through a handle does not inherently stage a reference mutation. For a returned gradient, the context
-/// adds each ordinary value contribution to a running sum as it arrives. The generated computation can therefore remain
+/// adds each value contribution to a running sum as it arrives. The generated computation can therefore remain
 /// functional, and value-only operation families do not need reference capabilities merely to submit contributions.
 /// For a caller-provided gradient reference, accumulation instead stages an additive update that preserves the buffer's
 /// existing contents. The handle itself exists during program construction; it is not a new runtime value type or a
@@ -1912,9 +1908,9 @@ impl<
 /// caller only wants a value. Handles keep that choice in the context and expose reference access only when a buffer is
 /// available in the rule's value family. They do not make an enclosing composite family's reference representable in a
 /// homogeneous array family: projected rules use value contributions when they cannot represent the buffer, and direct
-/// indexed updates require a reference-capable implementation. Ordinary additive gradient storage also remains distinct
-/// from reference-state adjoints, whose transpose rules may need to read, replace, or clear state through the context's
-/// separate reference operations.
+/// indexed updates require a reference-capable implementation. Additive gradient storage for non-reference inputs also
+/// remains distinct from reference-state adjoints, whose transpose rules may need to read, replace, or clear state
+/// through the context's separate reference operations.
 ///
 /// # Deriving Transposable Operation Enums
 ///
@@ -1992,11 +1988,11 @@ pub trait TransposableOperation<V: Value, O: Operation<Type = V::Type>>: Operati
     ///
     ///   - `context`: Active [`TranspositionContext`], which dereferences to the [`TracingContext`] in which rules
     ///     stage additional linear operations. Reference-state rules access the instruction's reference operands
-    ///     through this context; their state updates do not use the ordinary `accumulators` handles.
+    ///     through this context; their state updates do not use the `accumulators` handles.
     ///   - `driver`: Call-scoped nested-region [`TranspositionDriver`] for the current instruction.
     ///   - `inputs`: Per-input [`PartialValue`] knowledge, in operation input order. A [`PartialValue::Unknown`]
     ///     entry marks an input that is linear in the transposed program and therefore receives a cotangent
-    ///     contribution of that type. The type also recovers cotangent shapes that are not derivable from the operation
+    ///     contribution of its cotangent type. The type also recovers cotangent shapes not derivable from the operation
     ///     payload alone (e.g., a broadcast operation's pre-broadcast shape). A [`Known`](PartialValue::Known) entry
     ///     marks an input whose runtime value rides in the pullback function as a tracer: bilinear rules such as the
     ///     one for `Mul` read it directly to scale the output cotangent into the linear input's contribution, and the
@@ -2041,8 +2037,8 @@ pub trait MemberTransposableOperation<V: Value, O: Operation<Type = V::Type>>:
     ///
     ///   - `context`: Active [`TranspositionContext`] for the enclosing operation family, which dereferences to the
     ///     [`TracingContext`] in which rules stage additional linear operations. Reference-state rules access the
-    ///     instruction's reference operands through this context; their state updates do not use the ordinary
-    ///     `accumulators` handles.
+    ///     instruction's reference operands through this context; their state updates do not use the `accumulators`
+    ///     handles.
     ///   - `driver`: Call-scoped nested-region [`TranspositionDriver`] for the current instruction, exposing attached
     ///     regions in the enclosing operation family.
     ///   - `inputs`: Per-input [`PartialValue`] knowledge, in operation input order, expressed using the enclosing
@@ -2091,9 +2087,9 @@ impl<
     ///     disconnected cotangent zeros, or empty when no mappings are needed. For example, a dynamically shaped
     ///     input can need a residual dimension to construct its zero gradient. Linearization appends these dimension
     ///     residuals to its tangent program. A nonempty slice must have one entry per selected input.
-    ///   - `destination_kinds`: One kind per selected input, or empty to use `Return` for ordinary inputs and
-    ///     `Reference` for reference inputs. Ordinary inputs also accept `Reference` and `Ignore`; reference inputs
-    ///     accept `Reference` and `Ignore` but cannot return their state cotangent as a value.
+    ///   - `destination_kinds`: One kind per selected input, or empty to use `Return` for non-reference inputs and
+    ///     `Reference` for reference inputs. Non-reference inputs also accept `Reference` and `Ignore`; reference
+    ///     inputs accept `Reference` and `Ignore` but cannot return their state cotangent as a value.
     #[inline]
     pub fn transpose(
         &self,
@@ -2140,7 +2136,6 @@ impl<
         Ok(program)
     }
 
-    // TODO(eaplatanios): Is this implementation correct? Can this implementation be simplified? Are there redundancies?
     /// Constructs the pullback for validated input indices and resolved destination kinds. Both public entry points
     /// use this implementation, so cache misses and debug cache checks do not repeat argument normalization.
     fn transpose_impl(
@@ -2154,12 +2149,10 @@ impl<
         // Index the validated selection and its destination kinds by program input for linearity propagation and
         // pullback boundary construction below.
         let input_count = self.input_ids().len();
-        let mut input_linearity = vec![false; input_count];
         let mut kind_by_input = vec![None; input_count];
-        for (&index, &kind) in input_indices.iter().zip(destination_kinds) {
-            input_linearity[index] = true;
+        input_indices.iter().zip(destination_kinds).for_each(|(&index, &kind)| {
             kind_by_input[index] = Some(kind);
-        }
+        });
 
         /// Helper internal enum for the [`materialize_known`] implementation.
         #[derive(Copy, Clone, PartialEq, Eq)]
@@ -2312,20 +2305,21 @@ impl<
                 .ok_or_else(|| ProgramError::MalformedProgram("known producer output was not remapped".into()))
         }
 
-        // Propagate operand linearity forward over the primal atoms. A program-input atom takes its linearity from
-        // `input_linearity`, a constant atom is always known (non-linear), and an instruction result is linear when
-        // any of its operands is linear. Because instructions are stored in evaluation order, a single forward pass
-        // suffices: every operand atom of an instruction is defined before that instruction. Known-only producers
+        // Propagate operand linearity forward over the primal atoms. A program-input atom is linear when it has a
+        // selected destination kind, a constant atom is always known (non-linear), and an instruction result is linear
+        // when any of its operands is linear. Because instructions are stored in evaluation order, a single forward
+        // pass suffices: every operand atom of an instruction is defined before that instruction. Known-only producers
         // remain primal computations whose outputs may supply coefficients to transpose rules. A reference allocated
         // inside the linear program is linear regardless of its initial value: it is mutable state of the linear map
         // whose contents are linear values (a tangent reference allocated from a materialized zero tangent is the
-        // common case), so its root receives a cotangent accumulator and the stores into it transpose into ordinary
+        // common case), so its root receives a cotangent accumulator and the stores into it transpose into on-reference
         // cotangents. Hand-built linear programs that allocate a reference holding known (non-linear) contents are
         // therefore not supported by the direct entry points (such an allocation is treated as linear state as well).
         let mut linear = vec![false; self.atoms().len()];
-        for (input, &input_is_linear) in self.input_ids().iter().copied().zip(input_linearity.iter()) {
-            *linear.get_mut(input.index()).ok_or(ProgramError::UnboundAtomId { id: input })? = input_is_linear;
-        }
+        self.input_ids().iter().zip(&kind_by_input).try_for_each(|(&input, kind)| {
+            *linear.get_mut(input.index()).ok_or(ProgramError::UnboundAtomId { id: input })? = kind.is_some();
+            Ok::<_, ProgramError>(())
+        })?;
         for instruction in self.instructions().iter() {
             let mut output_is_linear = false;
             for input in instruction.inputs().iter().copied() {
@@ -2352,10 +2346,10 @@ impl<
         let consumable_inputs = self
             .input_ids()
             .iter()
-            .zip(input_linearity.iter())
+            .zip(&kind_by_input)
             .enumerate()
-            .filter_map(|(index, (input, &linear))| {
-                (linear && self.atoms()[input.index()].r#type().is_reference()).then_some(index)
+            .filter_map(|(index, (input, kind))| {
+                (kind.is_some() && self.atoms()[input.index()].r#type().is_reference()).then_some(index)
             })
             .collect();
         let mut context = TranspositionContext::for_region(TracingContext::<V, O>::new(), *self, consumable_inputs)?;
@@ -2406,24 +2400,22 @@ impl<
         // sharding axes for arrays). A non-differentiable output, such as a Boolean, integer, or token, uses the
         // first-class zero-space type, which keeps the numbering of the boundary stable. A reference-typed output gets
         // no slot: it forwards an input root whose state cotangent is the accumulator of that input. The adjoint table
-        // is indexed by source atoms. Ordinary slots maintain a running sum in submission order until their producer is
-        // visited; supplied gradient buffers receive updates directly. Propagate the cotangent mask forward from
-        // requested inputs independently of primal linearity. Until nested regions use specialized masks, keep state
-        // and region-bearing paths conservative so backward effects remain live.
+        // is indexed by source atoms. Value cotangent slots maintain a running sum in submission order until their
+        // producer is visited; supplied gradient buffers receive updates directly. Propagate the cotangent mask forward
+        // from requested inputs independently of primal linearity. Until nested regions use specialized masks, keep
+        // state and region-bearing paths conservative so backward effects remain live.
         let conservative_cotangent_mask =
             analysis.is_some() || self.instructions().iter().any(|instruction| !instruction.regions().is_empty());
         let mut cotangent_mask =
             if conservative_cotangent_mask { linear.clone() } else { vec![false; self.atoms().len()] };
-        for (&index, &kind) in input_indices.iter().zip(destination_kinds) {
+        input_indices.iter().zip(destination_kinds).for_each(|(&index, &kind)| {
             let input = self.input_ids()[index];
             cotangent_mask[input.index()] = kind != CotangentDestinationKind::Ignore;
-        }
+        });
         if !conservative_cotangent_mask {
             for instruction in self.instructions() {
                 let needed = instruction.inputs().iter().any(|input| cotangent_mask[input.index()]);
-                for output in instruction.outputs() {
-                    cotangent_mask[output.index()] = needed;
-                }
+                instruction.outputs().iter().for_each(|output| cotangent_mask[output.index()] = needed);
             }
         }
         let atom_accumulators = self
@@ -2457,9 +2449,9 @@ impl<
         self.input_ids()
             .iter()
             .copied()
-            .zip(input_linearity.iter())
+            .zip(&kind_by_input)
             .enumerate()
-            .filter(|(_, (_, input_is_linear))| **input_is_linear)
+            .filter(|(_, (_, kind))| kind.is_some())
             .try_for_each(|(index, (input, _))| -> Result<(), DifferentiationError> {
                 let input_type =
                     self.atoms().get(input.index()).ok_or(ProgramError::UnboundAtomId { id: input })?.r#type();
@@ -2510,23 +2502,23 @@ impl<
 
         // Submit seeds only after caller-provided destinations are installed. An identity output can refer directly
         // to an input, and repeated outputs must update its buffer without first constructing a separate value sum.
-        for (output, cotangent_input) in cotangent_inputs {
+        cotangent_inputs.into_iter().try_for_each(|(output, cotangent_input)| {
             let contribution = MaybeZero::Value(context.tracer(cotangent_input, None));
-            atom_accumulators[output.index()].accumulate(&mut context, contribution)?;
-        }
+            atom_accumulators[output.index()].accumulate(&mut context, contribution)
+        })?;
 
-        // Add a pullback input carrying the runtime value of each known program input, after the cotangent inputs so
-        // the all-`true` mask leaves the pullback input numbering unchanged. Known inputs are exposed to transpose
-        // rules as ordinary operand values, typed with the known input's own type (a runtime value, not a cotangent),
-        // and recorded in `known_map` indexed by the primal atom so a rule can read the known operand's pullback atom.
+        // Add a pullback input carrying the runtime value of each unselected program input, after the output cotangents
+        // and supplied destination buffers. These known values retain their source types and program-input order.
+        // Record them in `known_map` by source atom so transpose rules can read their pullback values.
         let mut known_map = vec![None; self.atoms().len()];
-        for (input, &input_is_linear) in self.input_ids().iter().copied().zip(input_linearity.iter()) {
-            if !input_is_linear {
+        self.input_ids().iter().zip(&kind_by_input).filter(|(_, kind)| kind.is_none()).try_for_each(
+            |(&input, _)| {
                 let input_atom = self.atoms().get(input.index()).ok_or(ProgramError::UnboundAtomId { id: input })?;
                 let known_input = builder.borrow_mut().add_input(input_atom.r#type().into_owned());
                 known_map[input.index()] = Some(known_input);
-            }
-        }
+                Ok::<_, ProgramError>(())
+            },
+        )?;
 
         // Retain known primal values that can supply runtime dimensions for reference-state zeros. Static types
         // need no dimension source, and reference values cannot supply dimensions through this protocol.
@@ -2569,7 +2561,7 @@ impl<
         let region_mappings = RegionReplayMappings::new();
         let mut materialization_state = vec![MaterializationState::Unseen; self.instructions().len()];
 
-        // Walk the primal program backward. Ordinary output cotangents and live reference-state accumulators
+        // Walk the primal program backward. Value output cotangents and live reference-state accumulators
         // determine which rules must run; known factors are materialized only when a rule needs them.
         for (instruction_index, instruction) in self.instructions().iter().enumerate().rev() {
             // Validate effects before omitting dead reverse work. Instructions with linear outputs, and sinks that
@@ -2611,10 +2603,10 @@ impl<
             // reference roots it mutates (directly or inside its regions) or allocates has an allocated accumulator,
             // the instruction cannot contribute to any input cotangent. Reads and consumes are driven by their output
             // adjoints alone, while stores, swaps, accumulations, and allocations are driven by the state of their
-            // root's accumulator, because their transposes produce ordinary cotangents from the accumulator even
-            // though they have no Single Static Assignment (SSA) outputs. This is the only operand-side guard. A
-            // livetranspose rule may read non-linear operands; pure known producer subgraphs are materialized lazily
-            // below, while effectful known producers are rejected rather than duplicated or reordered in the pullback.
+            // root's accumulator, because their transposes produce value cotangents from the accumulator even though
+            // they have no Single Static Assignment (SSA) outputs. This is the only operand-side guard. A live
+            // transpose rule may read non-linear operands; pure known producer subgraphs are materialized lazily below,
+            // while effectful known producers are rejected rather than duplicated or reordered in the pullback.
             let mut has_output_adjoint = false;
             for output in instruction.outputs().iter().copied() {
                 if matches!(
@@ -2655,7 +2647,7 @@ impl<
             };
 
             if !has_output_adjoint && !has_live_state {
-                // Backward rule effects are absent from ordinary instruction summaries. Keeping the rule live here
+                // Backward rule effects are absent from execution effect summaries. Keeping the rule live here
                 // lets it preserve those effects without treating a dormant region as an executed forward region.
                 let has_rule_effects = instruction
                     .regions()
@@ -2715,8 +2707,8 @@ impl<
                 .collect::<Result<Vec<_>, ProgramError>>()?;
             let transposition_driver = RecursiveTranspositionDriver::new(*self, instruction_index)?;
 
-            // Retain concrete cotangents with runtime dimensions before the rule consumes them. Later reference
-            // rules may need these dimensions to construct zeros after ordinary cotangent storage has been drained.
+            // Retain concrete cotangents with runtime dimensions before the rule consumes them. Later reference rules
+            // may need these dimensions to construct zeros after value cotangent storage has been drained.
             if context.reference_analysis.is_some() {
                 context.dimension_sources.extend(
                     instruction_output_cotangents
@@ -2801,8 +2793,9 @@ impl<
         // `input_indices` order. Known inputs receive no cotangent output. A reference input transposed with the
         // `Reference` kind returns its caller-owned cotangent reference by identity (so that structured rules can
         // thread it positionally as a carry), one transposed with the `Ignore` kind returns nothing, and a disconnected
-        // ordinary selected input is materialized through the operation family's canonical zero representation, using
-        // any mapped residual inputs needed to provide runtime dimensions that its cotangent type does not contain.
+        // non-reference selected input is materialized through the operation family's canonical zero representation,
+        // using any mapped residual inputs needed to provide runtime dimensions that its cotangent type does not
+        // contain.
         let mut outputs = Vec::with_capacity(input_indices.len());
         for (output_index, &index) in input_indices.iter().enumerate() {
             let input = self.input_ids()[index];
@@ -2862,15 +2855,13 @@ impl<
             }
         }
 
-        // Drop the throwaway context so its builder reference is released; with every staged `Tracer` already dropped,
-        // the cloned `builder` handle is now the sole owner and can be unwrapped to finalize the pullback.
-        drop(atom_accumulators);
+        // Release the context and the staged tracers it retains so the cloned `builder` handle can be unwrapped.
+        // Accumulator handles retain only the separate context identity token, so they do not keep the builder alive.
         drop(context);
 
-        // Build the pullback from the context's builder. The pullback inputs (i.e., cotangents per primal output, then
-        // known-input values) and outputs (i.e., cotangents for the linear inputs) are flat, and so they are built with
-        // flat `Vec` structures. The fully linear callers recover the structured form by reattaching the program's
-        // input and output structures.
+        // Build a flat pullback boundary: output cotangents, supplied destination buffers, then known input values.
+        // Results follow the selected input order and destination kinds. Fully linear callers recover their structured
+        // boundary by reattaching the source program's input and output structures.
         let pullback_input_count = builder.borrow().input_ids().len();
         let pullback_output_count = outputs.len();
         let builder = match Rc::try_unwrap(builder) {
@@ -2972,8 +2963,8 @@ where
     /// rejected before dead edge elimination. Known program inputs are always exposed as pullback inputs, while
     /// literal constants are copied lazily under the same demand-driven policy.
     ///
-    /// The pullback is staged into a fresh internal [`TracingContext`]: transposition records one cotangent input
-    /// per non-reference program output, walks this program in reverse instruction order applying each [`Operation`]'s
+    /// The pullback is staged into a fresh internal [`TracingContext`]: transposition records one cotangent input per
+    /// non-reference program output, walks this program in reverse instruction order applying each [`Operation`]'s
     /// [`transpose`](TransposableOperation::transpose) rule, and accumulates the per-input cotangent contributions
     /// (summing repeated contributions with staged adds). Nested subprograms are transposed directly through their
     /// borrowed [`RegionRef`]s in their own fresh contexts.
@@ -2983,10 +2974,10 @@ where
     /// `destination_kinds` controls how the cotangents of the selected inputs cross the pullback boundary. An empty
     /// slice selects each input's default kind. Otherwise, provide one kind per input in `input_indices` order.
     ///
-    ///   - An ordinary selected input defaults to [`Return`](CotangentDestinationKind::Return), exposing its cotangent
-    ///     as a pullback output. [`Reference`](CotangentDestinationKind::Reference) instead accepts a caller-owned
-    ///     `ref<cotangent(T)>` buffer and adds contributions into its existing contents during replay, with no output
-    ///     for that input. [`Ignore`](CotangentDestinationKind::Ignore) omits its cotangent entirely.
+    ///   - A non-reference selected input defaults to [`Return`](CotangentDestinationKind::Return), exposing its
+    ///     cotangent as a pullback output. [`Reference`](CotangentDestinationKind::Reference) instead accepts a
+    ///     caller-owned `ref<cotangent(T)>` buffer and adds contributions into its existing contents during replay,
+    ///     with no output for that input. [`Ignore`](CotangentDestinationKind::Ignore) omits its cotangent entirely.
     ///   - A reference-typed selected input of type `ref<T>` with kind
     ///     [`Reference`](CotangentDestinationKind::Reference) (i.e., its default) exposes one caller-owned cotangent
     ///     reference input of type `ref<cotangent(T)>` in the pullback and returns that same reference, by identity,
@@ -3000,16 +2991,16 @@ where
     ///
     /// The pullback's inputs are the cotangents of non-reference outputs, followed by the destinations for selected
     /// [`Reference`](CotangentDestinationKind::Reference) inputs in program-input order, followed by the known inputs.
-    /// Its outputs follow `input_indices` order, including ordinary [`Return`](CotangentDestinationKind::Return) values
-    /// and reference-primal [`Reference`](CotangentDestinationKind::Reference) identities, and omitting ordinary
-    /// [`Reference`](CotangentDestinationKind::Reference) inputs and every [`Ignore`](CotangentDestinationKind::Ignore)
-    /// input. A reference-typed output that forwards an input root shares that input's accumulator and has no cotangent
-    /// input, while a reference-typed output that escapes a local allocation is rejected because its later uses are
-    /// unknown to the program. Reference operations take an explicit reference path through transposition. Other
-    /// effects follow the restrictions described above. Nested regions are transposed with
-    /// [`Reference`](CotangentDestinationKind::Reference) kinds and their enclosing rules thread the accumulators
-    /// positionally, so a staged unbounded `while` operation remains rejected while the `scan`, bounded `while`, and
-    /// `condition` operation transpose through their reference carries.
+    /// Its outputs follow `input_indices` order, including non-reference [`Return`](CotangentDestinationKind::Return)
+    /// values and reference-primal [`Reference`](CotangentDestinationKind::Reference) identities, and omitting
+    /// non-reference [`Reference`](CotangentDestinationKind::Reference) inputs and every
+    /// [`Ignore`](CotangentDestinationKind::Ignore) input. A reference-typed output that forwards an input root shares
+    /// that input's accumulator and has no cotangent input, while a reference-typed output that escapes a local
+    /// allocation is rejected because its later uses are unknown to the program. Reference operations take an explicit
+    /// reference path through transposition. Other effects follow the restrictions described above. Nested regions are
+    /// transposed with [`Reference`](CotangentDestinationKind::Reference) kinds and their enclosing rules thread the
+    /// accumulators positionally, so a staged unbounded `while` operation remains rejected while the `scan`, bounded
+    /// `while`, and `condition` operation transpose through their reference carries.
     ///
     /// The source may consume a selected reference input directly in its entry region. Transposing that consumption
     /// transfers the returned value's cotangent into the input accumulator and leaves the cotangent destination live.
@@ -3025,11 +3016,11 @@ where
     ///
     ///   - `input_indices`: Indices of the program inputs the program is transposed with respect to. Each index
     ///     must be in range and appear at most once, otherwise this returns [`ProgramError::InvalidArgument`].
-    ///     The order of the indices defines the order of the pullback's cotangent outputs. Only ordinary
+    ///     The order of the indices defines the order of the pullback's cotangent outputs. Only non-reference
     ///     [`Return`](CotangentDestinationKind::Return) inputs and reference-primal
     ///     [`Reference`](CotangentDestinationKind::Reference) inputs produce outputs.
     ///   - `destination_kinds`: One kind per selected input, aligned with `input_indices`, or empty to select
-    ///     every input's default kind ([`Return`](CotangentDestinationKind::Return) for ordinary inputs and
+    ///     every input's default kind ([`Return`](CotangentDestinationKind::Return) for non-reference inputs and
     ///     [`Reference`](CotangentDestinationKind::Reference) for reference inputs). A nonempty slice of the wrong
     ///     length or a kind that is inadmissible for its input's type returns [`ProgramError::InvalidArgument`].
     #[inline]
@@ -3107,26 +3098,34 @@ where
     }
 }
 
-/// Extension trait carrying the primitive value-level reverse-mode transform on every [`Context`]. Reverse mode is
-/// implemented as forward linearization followed by transposition. This trait is blanket-implemented for every
+/// Extension trait carrying the primitive value-level reverse-mode transform on every [`Context`]. Reverse mode
+/// is implemented as forward linearization followed by transposition. This trait is blanket-implemented for every
 /// [`ForwardModeDifferentiate`] context whose operation family supports the required partial-evaluation and
-/// transposition machinery. Cotangents are ordinary values in the same universe as the primals and flow through the
-/// same context.
+/// transposition machinery. Value cotangents flow through the same context as the primals while reference-state
+/// cotangents are carried by cotangent references.
 ///
 /// User-facing scalar gradients, auxiliary outputs, and holomorphic validation are composed through
 /// [`DifferentiationBuilder`](crate::DifferentiationBuilder). Keeping those orthogonal choices in builder type state
 /// leaves this trait with the reusable reverse-mode engine [`vjp`](Self::vjp) and the low-level scalar cotangent-seed
 /// primitive [`gradient_seed`](Self::gradient_seed), instead of a method for every option combination.
-pub trait ReverseModeDifferentiate: ForwardModeDifferentiate + Context
-where
-    Self::Operation: PartiallyEvaluatableOperation<Self>
-        + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
-        + DifferentiableOperation<PartialEvaluationContext<Self>>
-        + TransposableOperation<Self::Constant, Self::Operation>
-        + ResidualZeroProvider<Self::Type>
-        + OperationProvider<Self::Type, ReferenceNewOperation<Self::Type, Self::Type>, Operation = Self::Operation>
-        + OperationProvider<Self::Type, ReferenceAddUpdateOperation<Self::Type, Self::Type>, Operation = Self::Operation>
-        + From<AddOperation<Self::Type>>,
+pub trait ReverseModeDifferentiate:
+    ForwardModeDifferentiate
+    + Context<
+        Operation: PartiallyEvaluatableOperation<Self>
+                       + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
+                       + DifferentiableOperation<PartialEvaluationContext<Self>>
+                       + TransposableOperation<Self::Constant, Self::Operation>
+                       + ResidualZeroProvider<Self::Type>
+                       + OperationProvider<
+            Self::Type,
+            ReferenceNewOperation<Self::Type, Self::Type>,
+            Operation = Self::Operation,
+        > + OperationProvider<
+            Self::Type,
+            ReferenceAddUpdateOperation<Self::Type, Self::Type>,
+            Operation = Self::Operation,
+        > + From<AddOperation<Self::Type>>,
+    >
 {
     /// Reverse-mode-differentiates `function` at `primals`, returning the primal output and a reusable [`Pullback`],
     /// with this [`Context`] executing (or staging) the primal-side operations. Refer to the documentation of
@@ -3213,7 +3212,7 @@ impl<C: ForwardModeDifferentiate + Context> ReverseModeDifferentiate for C where
 }
 
 /// Computes a value and its gradient in `context` capturing `capture` as a non-differentiated `function` input
-/// and selecting ordinary or holomorphic output validation.
+/// and selecting real or holomorphic complex output validation.
 pub(crate) fn value_and_gradient_in_context<
     C: ReverseModeDifferentiate + Zero<C::Value>,
     F: FnOnce(Input::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Output,
@@ -3240,8 +3239,8 @@ where
 }
 
 /// Computes a value, auxiliary outputs, and a gradient in `context` capturing `capture` as a non-differentiated
-/// `function` input and selecting ordinary or holomorphic output validation. Only the scalar value is differentiated.
-/// Auxiliary leaves receive zero cotangent seeds.
+/// `function` input and selecting real or holomorphic complex output validation. Only the scalar value is
+/// differentiated. Auxiliary leaves receive zero cotangent seeds.
 pub(crate) fn value_and_gradient_auxiliary_in_context<
     C: ReverseModeDifferentiate + Zero<C::Value>,
     F: FnOnce(Input::To<LinearizationTracer<C>>, Capture::To<LinearizationTracer<C>>) -> Output,
@@ -3274,18 +3273,17 @@ where
     let ((output, auxiliary), pullback): ((C::Value, AuxiliaryOutput), _) =
         context.vjp(|input, capture| function(input, capture).into_result(), primals, capture)?;
 
-    // Each ordinary auxiliary leaf supplies the runtime shape of its zero cotangent. Cotangent types preserve shapes
-    // even when their element representation differs, so the leaf supplies every required dynamic extent. Reference
-    // auxiliary outputs remain outside the scalar gradient convenience contract.
+    // Each non-reference auxiliary leaf supplies the runtime shape of its zero cotangent. Cotangent types preserve
+    // shapes even when their element representation differs, so the leaf supplies every required dynamic extent.
+    // Reference auxiliary outputs remain outside the scalar gradient convenience contract.
     let auxiliary_cotangents = auxiliary
         .parameters()
         .map(|value| {
             if value.r#type().is_reference() {
                 return Err(ProgramError::InvalidArgument {
-                    message:
-                        "gradient auxiliary outputs must be ordinary values; use `Pullback::apply_with_destinations` \
-                        for reference outputs"
-                            .to_string(),
+                    message: "gradient auxiliary outputs must be non-reference values; \
+                              use `Pullback::apply_with_destinations` for reference outputs"
+                        .to_string(),
                 });
             }
             C::Operation::materialize_zero_from_residual_sources(
@@ -3324,7 +3322,7 @@ where
 ///   - `operation`: Region-free linear operation expressed in the projected member operation family.
 ///   - `inputs`: Per-operand primal knowledge, preserving whether each primal is known or is a linear unknown.
 ///   - `outputs`: Composite output cotangents, represented as live traced values or structural zeros.
-///   - `accumulators`: Enclosing ordinary cotangent handles, aligned with `inputs` and owned by `context`.
+///   - `accumulators`: Enclosing value cotangent handles, aligned with `inputs` and owned by `context`.
 pub fn transpose_projected_operation<
     T: DifferentiableType,
     P: Operation<Type = T> + TransposableOperation<<V as ValueProjection<T>>::Projected, P>,
@@ -3352,9 +3350,7 @@ where
     }
 
     check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
-    for accumulator in accumulators {
-        context.cotangent_storage(accumulator)?;
-    }
+    accumulators.iter().try_for_each(|accumulator| context.cotangent_storage(accumulator).map(|_| ()))?;
 
     // Stage the native member rule in an isolated member-typed trace. The completed rule program is converted back to
     // the composite type before it is attached to `context`, so primitive transpose rules never need composite types.
@@ -3407,16 +3403,15 @@ where
 
     // Export each accumulated member cotangent. Its additions are part of the member program, while reference
     // updates remain the responsibility of the enclosing context.
-    let mut contribution_inputs = Vec::new();
-    let mut output_ids = Vec::new();
-    for (index, accumulator) in rule_accumulators.iter().enumerate() {
-        if let CotangentStorage::Value { value: Some((value, provenance)), .. } =
-            &rule_context.cotangent_storage[accumulator.storage_index]
-        {
-            contribution_inputs.push((index, provenance.clone()));
-            output_ids.push(value.atom_id()?);
-        }
-    }
+    let (contribution_inputs, output_ids): (Vec<_>, Vec<_>) = rule_accumulators
+        .iter()
+        .enumerate()
+        .filter_map(|(index, accumulator)| match &rule_context.cotangent_storage[accumulator.storage_index] {
+            CotangentStorage::Value { value: Some((value, provenance)), .. } => Some((index, value, provenance)),
+            _ => None,
+        })
+        .map(|(index, value, provenance)| Ok(((index, provenance.clone()), value.atom_id()?)))
+        .collect::<Result<_, DifferentiationError>>()?;
 
     // Convert the complete member program into the composite universe, then splice it with the source atoms collected
     // in precisely the same order as the temporary member-program inputs.
@@ -3432,14 +3427,13 @@ where
         .into_unprojected::<V, O>()?;
     let splice_outputs = context.builder().borrow_mut().splice_program(&rule_program, splice_inputs.as_slice())?;
     check_count!("output", splice_outputs, contribution_inputs.len(), ProgramError);
-    for ((input, provenance), output) in contribution_inputs.into_iter().zip(splice_outputs) {
+    contribution_inputs.into_iter().zip(splice_outputs).try_for_each(|((input, provenance), output)| {
         // Preserve scopes entered inside the member rule when outer storage later combines its contributions.
         let contribution = MaybeZero::Value(context.tracer(output, None));
         (**context)
             .clone()
-            .invoke_with_provenance_origin(provenance, || accumulators[input].accumulate(context, contribution))?;
-    }
-    Ok(())
+            .invoke_with_provenance_origin(provenance, || accumulators[input].accumulate(context, contribution))
+    })
 }
 
 /// Applies a member operation's transpose rule to an instruction whose parent boundary is _mixed_, meaning that the
@@ -3450,12 +3444,12 @@ where
 ///
 /// Each operand is classified individually rather than by position. An operand whose type projects into `T` is a _data_
 /// operand and every other operand is a parent-universe shape operand. The data operands, in operand order, are
-/// delegated to the payload's ordinary homogeneous [`TransposableOperation`] rule through
-/// [`transpose_projected_operation`], together with their corresponding accumulator handles. Shape operands only
-/// select the result shape and carry no differential contribution, so they receive no contribution. This classification
-/// makes the helper independent of how the two operand kinds are arranged, so it handles interleaved signatures exactly
-/// like the "data-operands-first" arrangement every current payload uses. A payload with no data operands at all (i.e.,
-/// a dynamic constructor whose operands are all extents) is a constant linear map, so no member rule runs.
+/// delegated to the payload's homogeneous [`TransposableOperation`] rule through [`transpose_projected_operation`],
+/// together with their corresponding accumulator handles. Shape operands only select the result shape and carry no
+/// differential contribution, so they receive no contribution. This classification makes the helper independent of how
+/// the two operand kinds are arranged, so it handles interleaved signatures exactly like the "data-operands-first"
+/// arrangement every current payload uses. A payload with no data operands at all (i.e., a dynamic constructor whose
+/// operands are all extents) is a constant linear map, so no member rule runs.
 ///
 /// Delegating reconstructs the member instruction from type metadata alone, so a mixed instruction whose operands carry
 /// runtime (i.e., [`Reference`](TypeIdentityPosition::Reference)-position) identities is rejected. Recovering that
@@ -3469,7 +3463,7 @@ where
 ///     rule sees exactly the data operands, in the order they appear in the mixed instruction.
 ///   - `inputs`: Per-operand primal knowledge in the mixed instruction's operand order.
 ///   - `outputs`: Composite output cotangents, represented as live traced values or structural zeros.
-///   - `accumulators`: Enclosing ordinary cotangent handles, aligned with `inputs` and owned by `context`.
+///   - `accumulators`: Enclosing value cotangent handles, aligned with `inputs` and owned by `context`.
 pub fn transpose_mixed_operation<
     T: DifferentiableType,
     P: Operation<Type = T>,
@@ -3488,20 +3482,17 @@ where
     for<'t> &'t T: TryFrom<&'t V::Type, Error = TypeError>,
 {
     check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
-    for accumulator in accumulators {
-        context.cotangent_storage(accumulator)?;
-    }
+    accumulators.iter().try_for_each(|accumulator| context.cotangent_storage(accumulator).map(|_| ()))?;
 
     // Classify each operand by whether its type projects into the member universe. Data operands keep their operand
-    // order so the delegated member rule sees the same boundary it would see in a homogeneous instruction.
-    let is_data_operand =
-        inputs.iter().map(|input| <&T>::try_from(input.r#type().as_ref()).is_ok()).collect::<Vec<_>>();
-    let data_inputs = inputs
+    // order so the delegated member rule sees the same boundary it would see in a homogeneous instruction. Filter
+    // handles alongside inputs to preserve the association between each operand and its enclosing storage.
+    let (data_inputs, data_accumulators): (Vec<_>, Vec<_>) = inputs
         .iter()
-        .zip(is_data_operand.iter())
-        .filter(|(_, is_data_operand)| **is_data_operand)
-        .map(|(input, _)| input.clone())
-        .collect::<Vec<_>>();
+        .zip(accumulators)
+        .filter(|(input, _)| <&T>::try_from(input.r#type().as_ref()).is_ok())
+        .map(|(input, accumulator)| (input.clone(), accumulator.clone()))
+        .unzip();
 
     // A mixed instruction with no member-typed operands stages a value that does not depend on any of them, so every
     // operand receives a structural zero and the member rule is never consulted.
@@ -3526,12 +3517,6 @@ where
         .into());
     }
 
-    // Filter handles alongside inputs so member operand positions continue to name the correct outer storage.
-    let data_accumulators = accumulators
-        .iter()
-        .zip(is_data_operand)
-        .filter_map(|(accumulator, is_data)| is_data.then(|| accumulator.clone()))
-        .collect::<Vec<_>>();
     let member_operation = <O as OperationProjection<T>>::Projected::from(operation.clone());
     transpose_projected_operation(context, &member_operation, &data_inputs, outputs, &data_accumulators)
 }
@@ -3653,10 +3638,11 @@ impl TranspositionTransformArguments {
     }
 }
 
-/// Prepares the [`CotangentDestination`]s for a scalar gradient before the primal function runs. Ordinary inputs return
-/// their cotangents. Reference inputs receive fresh zero state cotangents, so only the scalar result contributes to the
-/// derivative. Preparing the zeros now captures runtime dimensions while every primal reference is still live, even
-/// when the function later consumes it. The pullback validates the resulting destinations against its primal boundary.
+/// Prepares the [`CotangentDestination`]s for a scalar gradient before the primal function runs. Non-reference inputs
+/// return their cotangents. Reference inputs receive fresh zero state cotangents, so only the scalar result contributes
+/// to the derivative. Preparing the zeros now captures runtime dimensions while every primal reference is still live,
+/// even when the function later consumes it. The pullback validates the resulting destinations against its primal
+/// boundary.
 fn gradient_destinations<C: Context + Zero<C::Value>, Input: Parameterized<C::Value>>(
     context: &C,
     primals: &Input,
@@ -3694,9 +3680,6 @@ where
         .collect()
 }
 
-// TODO(eaplatanios): Review and clean up the tests in this module. You may need to entirely rewrite them or even write
-//  new tests. The goal is to strictly comply with our conventions around unit tests including naming, ordering &
-//  placement (and alignment of that ordering with production code), coverage, code comments, etc.
 #[cfg(test)]
 pub(crate) mod tests {
     use std::cell::Cell;
@@ -3720,18 +3703,18 @@ pub(crate) mod tests {
     use crate::differentiation::{Differentiate, differentiate_at};
     use crate::macros::{check_count, check_gradient, check_types};
     use crate::operations::{
-        AddOperation, ConditionOperation, Constant, CumulativeSum, Dot, DotDimensionNumbers, MulOperation,
-        PrintOperation, Reduce, ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
-        ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
-        ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation,
-        ScanOperation, Sin, ZeroOperation,
+        AddOperation, ConditionOperation, Constant, CumulativeSum, Dot, DotDimensionNumbers, MulOperation, Reduce,
+        ReduceOperation, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze,
+        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
+        ReferenceSwap, ReferenceSwapOperation, ReferenceWrite, ReferenceWriteOperation, ScanOperation, Sin,
+        ZeroOperation,
     };
     use crate::parameters::Placeholder;
     use crate::partial::PartialValue;
     use crate::programs::{
-        Atom, AtomId, Concretizable, EffectClass, EffectClasses, Effects, Instruction, MaybeZero, Operation, Program,
-        ProgramBuilder, ProgramError, ProvenanceScope, ReferenceError, ReferenceType, Region, RegionId,
-        RegionInterface, RegionSlot, TypeError, Typed, Value,
+        AtomId, Concretizable, EffectClass, EffectClasses, Effects, MaybeZero, Operation, Program, ProgramBuilder,
+        ProgramError, ProvenanceScope, ReferenceError, ReferenceType, RegionInterface, RegionSlot, TypeError, Typed,
+        Value,
     };
     use crate::specialization::SpecializationCacheStatistics;
     use crate::tracing::{DomainTracer, DomainTracingContext, Trace, Tracer, TracingContext};
@@ -4005,16 +3988,6 @@ pub(crate) mod tests {
     type ReferenceTestProgram =
         Program<ReferenceTestValue, ReferenceTestOperation, Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>;
 
-    /// Returns the composite scalar `f32` type used by the reference transposition tests.
-    fn reference_test_scalar_type() -> ArrayIrType {
-        ArrayIrType::Array(ArrayType::scalar(DataType::F32))
-    }
-
-    /// Returns the composite `ref<f32[]>` type used by the reference transposition tests.
-    fn reference_test_reference_type() -> ArrayIrType {
-        ReferenceType::new(ArrayType::scalar(DataType::F32)).into()
-    }
-
     /// Wraps a scalar `f32` array into the composite value used by the reference transposition tests.
     fn reference_test_scalar(value: f32) -> ReferenceTestValue {
         ArrayIrValue::Array(Array::scalar(value))
@@ -4117,21 +4090,105 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_cotangent_reference_accumulator() {
+    fn test_cotangent_destinations_kind() {
+        let destinations = CotangentDestinations::<Array>::without_references([true, false]);
+        assert_eq!(destinations.kind(0), CotangentDestinationKind::Return);
+        assert_eq!(destinations.kind(1), CotangentDestinationKind::Ignore);
+    }
+
+    #[test]
+    fn test_cotangent_destinations_kinds() {
+        let destinations = CotangentDestinations::<Array>::without_references([false, true, false]);
+        assert_eq!(
+            destinations.kinds(),
+            &[CotangentDestinationKind::Ignore, CotangentDestinationKind::Return, CotangentDestinationKind::Ignore,]
+        );
+    }
+
+    #[test]
+    fn test_cotangent_destinations_references() {
+        let first = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(1.0_f32)));
+        let second = ArrayIrValue::Reference(ArrayReference::new(Array::scalar(2.0_f32)));
+        let destinations = CotangentDestinations::new(
+            vec![
+                CotangentDestinationKind::Reference,
+                CotangentDestinationKind::Return,
+                CotangentDestinationKind::Reference,
+            ],
+            vec![first.clone(), second.clone()],
+            vec![false, false, true],
+        );
+        assert_eq!(destinations.references(), &[first, second]);
+    }
+
+    #[test]
+    fn test_cotangent_destinations_is_reference_input() {
+        // A supplied gradient buffer does not turn its non-reference primal input into reference state.
+        let destinations = CotangentDestinations::new(
+            vec![CotangentDestinationKind::Reference; 2],
+            vec![ArrayIrValue::Reference(ArrayReference::new(Array::scalar(0.0_f32))); 2],
+            vec![false, true],
+        );
+        assert!(!destinations.is_reference_input(0));
+        assert!(destinations.is_reference_input(1));
+    }
+
+    #[test]
+    fn test_cotangent_destinations_returns_cotangent() {
+        let destinations = CotangentDestinations::new(
+            vec![
+                CotangentDestinationKind::Return,
+                CotangentDestinationKind::Reference,
+                CotangentDestinationKind::Reference,
+                CotangentDestinationKind::Ignore,
+            ],
+            vec![ArrayIrValue::Reference(ArrayReference::new(Array::scalar(0.0_f32))); 2],
+            vec![false, false, true, true],
+        );
+        assert!(destinations.returns_cotangent(0));
+        assert!(!destinations.returns_cotangent(1));
+        assert!(destinations.returns_cotangent(2));
+        assert!(!destinations.returns_cotangent(3));
+    }
+
+    #[test]
+    fn test_cotangent_destinations_has_reference_state_destinations() {
+        let references = vec![ArrayIrValue::Reference(ArrayReference::new(Array::scalar(0.0_f32)))];
+        let buffer =
+            CotangentDestinations::new(vec![CotangentDestinationKind::Reference], references.clone(), vec![false]);
+        assert!(!buffer.has_reference_state_destinations());
+        let state = CotangentDestinations::new(vec![CotangentDestinationKind::Reference], references, vec![true]);
+        assert!(state.has_reference_state_destinations());
+        let ignored = CotangentDestinations::<ArrayIrValue<Array>>::new(
+            vec![CotangentDestinationKind::Ignore],
+            Vec::new(),
+            vec![true],
+        );
+        assert!(!ignored.has_reference_state_destinations());
+    }
+
+    #[test]
+    fn test_cotangent_reference_accumulator_allocate_in() {
         let context = TracingContext::<ReferenceTestValue, ReferenceTestOperation>::new();
         let unallocated = CotangentReferenceAccumulator::<Tracer<TracingContext<ReferenceTestValue, _>>>::Unallocated {
-            cotangent_type: reference_test_reference_type(),
+            cotangent_type: ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))),
         };
         assert!(!unallocated.is_allocated());
         assert!(unallocated.reference().is_none());
-        assert_eq!(unallocated.r#type().as_ref(), &reference_test_reference_type());
+        assert_eq!(
+            unallocated.r#type().as_ref(),
+            &ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32)))
+        );
 
         // Allocation stages exactly one zero and one `reference_new`, and the allocated accumulator reports them.
         let mut accumulator = unallocated;
         let reference = accumulator.allocate_in(&context, &[]).unwrap().clone();
         assert!(accumulator.is_allocated());
         assert_eq!(accumulator.reference().map(Tracer::atom_id), Some(reference.atom_id()));
-        assert_eq!(accumulator.r#type().as_ref(), &reference_test_reference_type());
+        assert_eq!(
+            accumulator.r#type().as_ref(),
+            &ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32)))
+        );
         let names = context
             .builder()
             .borrow()
@@ -4149,7 +4206,7 @@ pub(crate) mod tests {
         // A type that does not project onto a referent cannot be allocated.
         let mut accumulator =
             CotangentReferenceAccumulator::<Tracer<TracingContext<ReferenceTestValue, _>>>::Unallocated {
-                cotangent_type: reference_test_scalar_type(),
+                cotangent_type: ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
             };
         assert!(matches!(
             accumulator.allocate_in(&context, &[]),
@@ -4160,7 +4217,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_cotangent_reference_accumulator_allocate_in_requires_dynamic_geometry() {
+    fn test_cotangent_reference_accumulator_allocate_in_requires_dynamic_dimensions() {
         let context = TracingContext::<ReferenceTestValue, ReferenceTestOperation>::new();
         let extent = DimensionVariable::new("extent", DimensionBounds::new(2, Some(8)).unwrap());
         let mut accumulator = CotangentReferenceAccumulator::Unallocated {
@@ -4186,8 +4243,9 @@ pub(crate) mod tests {
     fn test_cotangent_accumulator_is_needed() {
         let mut context =
             TranspositionContext::new(TracingContext::<ReferenceTestValue, ReferenceTestOperation>::new());
-        let known = context.input(reference_test_scalar_type());
-        let inputs = [PartialValue::Unknown(reference_test_scalar_type()), PartialValue::Known(known)];
+        let known = context.input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
+        let inputs =
+            [PartialValue::Unknown(ArrayIrType::Array(ArrayType::scalar(DataType::F32))), PartialValue::Known(known)];
         let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
         assert!(accumulators[0].is_needed());
         assert!(!accumulators[1].is_needed());
@@ -4200,7 +4258,7 @@ pub(crate) mod tests {
         let mut context =
             TranspositionContext::new(TracingContext::<ReferenceTestValue, ReferenceTestOperation>::new());
         let accumulator = context
-            .cotangent_accumulators(&[PartialValue::Unknown(reference_test_scalar_type())], &[])
+            .cotangent_accumulators(&[PartialValue::Unknown(ArrayIrType::Array(ArrayType::scalar(DataType::F32)))], &[])
             .unwrap()
             .remove(0);
         assert!(accumulator.reference(&context).unwrap().is_none());
@@ -4215,12 +4273,12 @@ pub(crate) mod tests {
         let mut context =
             TranspositionContext::new(TracingContext::<ReferenceTestValue, ReferenceTestOperation>::new());
         let accumulator = context
-            .cotangent_accumulators(&[PartialValue::Unknown(reference_test_scalar_type())], &[])
+            .cotangent_accumulators(&[PartialValue::Unknown(ArrayIrType::Array(ArrayType::scalar(DataType::F32)))], &[])
             .unwrap()
             .remove(0);
-        let first = context.input(reference_test_scalar_type());
-        let second = context.input(reference_test_scalar_type());
-        let third = context.input(reference_test_scalar_type());
+        let first = context.input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
+        let second = context.input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
+        let third = context.input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
         accumulator.accumulate(&mut context, MaybeZero::Value(first.clone())).unwrap();
         assert!(context.builder().borrow().instructions().is_empty());
         accumulator.clone().accumulate(&mut context, MaybeZero::Value(second.clone())).unwrap();
@@ -4247,14 +4305,33 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_cotangent_accumulator_accumulate_validates_ignored_contributions() {
+        let mut context = TranspositionContext::new(TracingContext::<Array, ArrayOperation<Array>>::new());
+        let ignored = context.cotangent_accumulator(ArrayType::scalar(DataType::F32), false);
+        // Ignoring a gradient does not make malformed rule output acceptable, including a mistyped symbolic zero.
+        assert_eq!(
+            ignored.accumulate(&mut context, MaybeZero::Zero(ArrayType::scalar(DataType::F64))),
+            Err(TypeError::invalid("cotangent contribution has type f64[] but its accumulator expects f32[]").into()),
+        );
+        let foreign = TracingContext::<Array, ArrayOperation<Array>>::new();
+        assert!(matches!(
+            ignored.accumulate(&mut context, MaybeZero::Value(foreign.input(ArrayType::scalar(DataType::F32)))),
+            Err(DifferentiationError::Program(ProgramError::MismatchedProgramBuilders)),
+        ));
+        assert_eq!(ignored.accumulate(&mut context, MaybeZero::Zero(ArrayType::scalar(DataType::F32))), Ok(()));
+        assert!(context.builder().borrow().instructions().is_empty());
+        assert!(context.take_cotangents(&[ignored]).unwrap()[0].is_zero());
+    }
+
+    #[test]
     fn test_cotangent_accumulator_accumulate_reference() {
         let mut context =
             TranspositionContext::new(TracingContext::<ReferenceTestValue, ReferenceTestOperation>::new());
-        let reference = context.input(reference_test_reference_type());
-        let contribution = context.input(reference_test_scalar_type());
-        let accumulator = context.cotangent_accumulator(reference_test_scalar_type(), true);
+        let reference = context.input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+        let contribution = context.input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
+        let accumulator = context.cotangent_accumulator(ArrayIrType::Array(ArrayType::scalar(DataType::F32)), true);
         context.cotangent_storage[accumulator.storage_index] = CotangentStorage::Buffer {
-            cotangent_type: reference_test_scalar_type(),
+            cotangent_type: ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
             reference: reference.clone(),
             operation: ReferenceAddUpdateOperation::new().into(),
         };
@@ -4268,18 +4345,21 @@ pub(crate) mod tests {
     fn test_cotangent_accumulator_accumulate_rejects_reference_state() {
         let mut context =
             TranspositionContext::new(TracingContext::<ReferenceTestValue, ReferenceTestOperation>::new());
-        let reference = context.input(reference_test_reference_type());
+        let reference = context.input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
         let accumulator = context
-            .cotangent_accumulators(&[PartialValue::Unknown(reference_test_reference_type())], &[])
+            .cotangent_accumulators(
+                &[PartialValue::Unknown(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))))],
+                &[],
+            )
             .unwrap()
             .remove(0);
         assert!(matches!(accumulator.accumulate(&mut context, MaybeZero::Value(reference)),
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
-                if message == "reference-state cotangents cannot be contributed to an ordinary accumulator"));
+                if message == "reference-state cotangents cannot be contributed to a value cotangent accumulator"));
     }
 
     #[test]
-    fn test_transposition_context() {
+    fn test_transposition_context_new() {
         // A driver without a source instruction cannot identify reference operands or allocating outputs.
         let driver = EmptyRegionDriver;
         let mut context =
@@ -4303,9 +4383,9 @@ pub(crate) mod tests {
                     a reference-carrying instruction",
         ));
 
-        // The context dereferences to its tracing context, so ordinary staging goes through unchanged and the staged
+        // The context dereferences to its tracing context, so non-reference staging goes through unchanged and the staged
         // value belongs to the wrapped context's builder.
-        let input = context.input(reference_test_scalar_type());
+        let input = context.input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
         assert_eq!(input.atom_id(), Ok(AtomId::new(0)));
         assert!(Rc::ptr_eq(input.builder(), (*context).builder()));
     }
@@ -4314,7 +4394,7 @@ pub(crate) mod tests {
     fn test_transposition_context_cotangent_accumulator() {
         let mut context =
             TranspositionContext::new(TracingContext::<ReferenceTestValue, ReferenceTestOperation>::new());
-        let scalar_type = reference_test_scalar_type();
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let first = context.cotangent_accumulator(scalar_type.clone(), true);
         let second = context.cotangent_accumulator(scalar_type.clone(), true);
         let ignored = context.cotangent_accumulator(scalar_type.clone(), false);
@@ -4340,11 +4420,11 @@ pub(crate) mod tests {
     fn test_transposition_context_cotangent_accumulators() {
         let mut context =
             TranspositionContext::new(TracingContext::<ReferenceTestValue, ReferenceTestOperation>::new());
-        let known = context.input(reference_test_scalar_type());
+        let known = context.input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
         let inputs = [
-            PartialValue::Unknown(reference_test_scalar_type()),
+            PartialValue::Unknown(ArrayIrType::Array(ArrayType::scalar(DataType::F32))),
             PartialValue::Known(known),
-            PartialValue::Unknown(reference_test_reference_type()),
+            PartialValue::Unknown(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32)))),
         ];
         let accumulators = context.cotangent_accumulators(&inputs, &[]).unwrap();
         assert_eq!(
@@ -4358,8 +4438,8 @@ pub(crate) mod tests {
         // A valid first input must not install a slot before a later foreign input fails validation.
         let foreign = TracingContext::<ReferenceTestValue, ReferenceTestOperation>::new();
         let inputs = [
-            PartialValue::Unknown(reference_test_scalar_type()),
-            PartialValue::Known(foreign.input(reference_test_scalar_type())),
+            PartialValue::Unknown(ArrayIrType::Array(ArrayType::scalar(DataType::F32))),
+            PartialValue::Known(foreign.input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)))),
         ];
         let slot_count = context.cotangent_storage.len();
         assert!(matches!(
@@ -4372,8 +4452,8 @@ pub(crate) mod tests {
     #[test]
     fn test_transposition_context_cotangent_reference_source_instructions() {
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let first = builder.add_input(reference_test_reference_type());
-        let second = builder.add_input(reference_test_reference_type());
+        let first = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+        let second = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
         let first_output =
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![first], None).unwrap()[0];
         let second_output =
@@ -4392,8 +4472,8 @@ pub(crate) mod tests {
             Vec::new(),
         )
         .unwrap();
-        let first_destination = context.input(reference_test_reference_type());
-        let second_destination = context.input(reference_test_reference_type());
+        let first_destination = context.input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+        let second_destination = context.input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
         context.reference_accumulators.insert(
             ReferenceRoot::RegionInput { region: region.id(), input_index: 0 },
             CotangentReferenceAccumulator::Allocated { reference: first_destination.clone() },
@@ -4416,11 +4496,11 @@ pub(crate) mod tests {
     #[test]
     fn test_transposition_context_cotangent_destinations() {
         // `condition(p, r, x)` whose branches only store into `r` (through `write` and `add_update`) and return `x`.
-        let scalar_type = reference_test_scalar_type();
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let predicate_type = ArrayIrType::Array(ArrayType::scalar(DataType::Boolean));
         let storing_branch = |accumulate: bool| {
             let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-            let reference = builder.add_input(reference_test_reference_type());
+            let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
             let value = builder.add_input(scalar_type.clone());
             if accumulate {
                 builder
@@ -4443,7 +4523,7 @@ pub(crate) mod tests {
         let true_branch = builder.import_region(storing_branch(false).entry_region_ref());
         let false_branch = builder.import_region(storing_branch(true).entry_region_ref());
         let predicate = builder.add_input(predicate_type.clone());
-        let reference = builder.add_input(reference_test_reference_type());
+        let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
         let value = builder.add_input(scalar_type.clone());
         let output = builder
             .add_instruction(
@@ -4471,7 +4551,7 @@ pub(crate) mod tests {
         let driver = RecursiveTranspositionDriver::new(region, 0).unwrap();
         let inputs = [
             PartialValue::Known(context.input(predicate_type.clone())),
-            PartialValue::Unknown(reference_test_reference_type()),
+            PartialValue::Unknown(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32)))),
             PartialValue::Unknown(scalar_type.clone()),
         ];
 
@@ -4479,7 +4559,9 @@ pub(crate) mod tests {
         // is provably zero: it resolves to the `Ignore` kind and nothing is allocated.
         context.reference_accumulators.insert(
             root,
-            CotangentReferenceAccumulator::Unallocated { cotangent_type: reference_test_reference_type() },
+            CotangentReferenceAccumulator::Unallocated {
+                cotangent_type: ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))),
+            },
         );
         let cotangents = context.cotangent_destinations(&driver, &inputs, &[]).unwrap();
         assert_eq!(
@@ -4495,7 +4577,7 @@ pub(crate) mod tests {
         assert!(context.builder().borrow().instructions().is_empty());
 
         // An accumulator that a later instruction already allocated is live and is handed out as the destination.
-        let destination = context.input(reference_test_reference_type());
+        let destination = context.input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
         context
             .reference_accumulators
             .insert(root, CotangentReferenceAccumulator::Allocated { reference: destination.clone() });
@@ -4511,7 +4593,7 @@ pub(crate) mod tests {
         // A branch that reads the reference makes its state cotangent live even when nothing accumulated into it yet,
         // so the accumulator is allocated on the spot.
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let reference = builder.add_input(reference_test_reference_type());
+        let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
         builder.add_input(scalar_type.clone());
         let current =
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
@@ -4526,7 +4608,7 @@ pub(crate) mod tests {
         let true_branch = builder.import_region(reading_branch.entry_region_ref());
         let false_branch = builder.import_region(storing_branch(true).entry_region_ref());
         let predicate = builder.add_input(predicate_type.clone());
-        let reference = builder.add_input(reference_test_reference_type());
+        let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
         let value = builder.add_input(scalar_type.clone());
         let output = builder
             .add_instruction(
@@ -4554,11 +4636,13 @@ pub(crate) mod tests {
         let driver = RecursiveTranspositionDriver::new(region, 0).unwrap();
         context.reference_accumulators.insert(
             root,
-            CotangentReferenceAccumulator::Unallocated { cotangent_type: reference_test_reference_type() },
+            CotangentReferenceAccumulator::Unallocated {
+                cotangent_type: ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))),
+            },
         );
         let inputs = [
             PartialValue::Known(context.input(predicate_type)),
-            PartialValue::Unknown(reference_test_reference_type()),
+            PartialValue::Unknown(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32)))),
             PartialValue::Unknown(scalar_type),
         ];
         let cotangents = context.cotangent_destinations(&driver, &inputs, &[]).unwrap();
@@ -4578,11 +4662,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_transposition_context_cotangent_destinations_ordinary_destinations() {
+    fn test_transposition_context_cotangent_destinations_non_reference_destinations() {
         let mut context =
             TranspositionContext::new(TracingContext::<ReferenceTestValue, ReferenceTestOperation>::new());
-        let scalar_type = reference_test_scalar_type();
-        let destination = context.input(reference_test_reference_type());
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let destination = context.input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
         let accumulators = [
             context.cotangent_accumulator(scalar_type.clone(), true),
             context.cotangent_accumulator(scalar_type.clone(), true),
@@ -4608,7 +4692,7 @@ pub(crate) mod tests {
         assert!(cotangents.returns_cotangent(0));
         assert!(!cotangents.returns_cotangent(1));
         assert!(!cotangents.returns_cotangent(2));
-        // An ordinary gradient buffer does not carry reference state or keep a zero-seeded transpose live.
+        // A non-reference gradient buffer does not carry reference state or keep a zero-seeded transpose live.
         assert!(!cotangents.is_reference_input(1));
         assert!(!cotangents.has_reference_state_destinations());
     }
@@ -4617,10 +4701,10 @@ pub(crate) mod tests {
     fn test_transposition_context_take_cotangents() {
         let tracing_context = TracingContext::<ReferenceTestValue, ReferenceTestOperation>::new();
         let mut context = TranspositionContext::new(tracing_context.clone());
-        let inputs = [PartialValue::Unknown(reference_test_scalar_type())];
+        let inputs = [PartialValue::Unknown(ArrayIrType::Array(ArrayType::scalar(DataType::F32)))];
         let accumulator = context.cotangent_accumulators(&inputs, &[]).unwrap().remove(0);
-        let first = context.input(reference_test_scalar_type());
-        let second = context.input(reference_test_scalar_type());
+        let first = context.input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
+        let second = context.input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
         accumulator.accumulate(&mut context, MaybeZero::Value(first.clone())).unwrap();
         accumulator.accumulate(&mut context, MaybeZero::Value(second.clone())).unwrap();
 
@@ -4658,8 +4742,8 @@ pub(crate) mod tests {
         // `r = reference_new(x); add_update(r, y)`: the allocation's accumulator is consumed by the lookup that its
         // transpose performs, so the table entry is gone afterwards whether or not anything accumulated into it.
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let initial = builder.add_input(reference_test_scalar_type());
-        let update = builder.add_input(reference_test_scalar_type());
+        let initial = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
+        let update = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
         let reference =
             builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         builder
@@ -4693,14 +4777,16 @@ pub(crate) mod tests {
         let driver = RecursiveTranspositionDriver::new(region, 0).unwrap();
         context.reference_accumulators.insert(
             root,
-            CotangentReferenceAccumulator::Unallocated { cotangent_type: reference_test_reference_type() },
+            CotangentReferenceAccumulator::Unallocated {
+                cotangent_type: ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))),
+            },
         );
         assert!(context.take_reference_cotangent(&driver, 0).unwrap().is_none());
         assert!(context.cotangent_accumulator_reference(root).is_none());
         assert!(context.builder().borrow().instructions().is_empty());
 
         // An allocated accumulator hands out its cotangent reference exactly once.
-        let destination = context.input(reference_test_reference_type());
+        let destination = context.input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
         context
             .reference_accumulators
             .insert(root, CotangentReferenceAccumulator::Allocated { reference: destination.clone() });
@@ -4712,23 +4798,20 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_pullback_linear_program_accessors() {
-        // The pullback retains the linear program (`ẋ ↦ 2 · ẋ` at `x = 1` for `f(x) = x²`) and derives its transpose
-        // on demand through the reference-free all-`Return` path.
+    fn test_pullback_linear_program() {
         let (_, pullback) = differentiate_at(Array::scalar(1.0)).vjp(|x| Ok(x.clone() * x)).unwrap();
         assert_eq!(pullback.linear_program().input_types().len(), 1 + pullback.residuals().len());
         assert_eq!(pullback.linear_program().output_types(), vec![ArrayType::scalar(DataType::F64)]);
-        let (transposed, residuals) = pullback.into_transposed_parts().unwrap();
-        assert_eq!(transposed.input_types().len(), 1 + residuals.len());
-        let mut inputs = vec![Array::scalar(3.0)];
-        inputs.extend(residuals);
-        assert_eq!(transposed.interpret(inputs), Ok(vec![Array::scalar(6.0)]));
+    }
 
-        let (_, pullback) = differentiate_at(Array::scalar(1.0)).vjp(|x| Ok(x.clone() * x)).unwrap();
-        let (linear, residuals) = pullback.into_linear_parts();
+    #[test]
+    fn test_pullback_transposed_program() {
+        let (_, pullback) = differentiate_at(Array::scalar(2.0)).vjp(|x| Ok(x.clone() * x)).unwrap();
+        let transposed = pullback.transposed_program(&[]).unwrap();
         let mut inputs = vec![Array::scalar(3.0)];
-        inputs.extend(residuals);
-        assert_eq!(linear.interpret(inputs), Ok(vec![Array::scalar(6.0)]));
+        inputs.extend_from_slice(pullback.residuals());
+        assert_eq!(transposed.interpret(inputs), Ok(vec![Array::scalar(12.0)]));
+        assert!(Arc::ptr_eq(&transposed, &pullback.transposed_program(&[]).unwrap()));
     }
 
     #[test]
@@ -4759,7 +4842,34 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_pullback_apply_preserves_non_copy_structured_cotangents() {
+    fn test_pullback_residuals() {
+        // Identity needs no saved primal values to evaluate its pullback.
+        let (_, pullback) = differentiate_at(Array::scalar(2.0)).vjp(Ok).unwrap();
+        assert_eq!(pullback.residuals(), &[]);
+    }
+
+    #[test]
+    fn test_pullback_into_linear_parts() {
+        // At x = 2, the retained pushforward maps a tangent to four times its value.
+        let (_, pullback) = differentiate_at(Array::scalar(2.0)).vjp(|x| Ok(x.clone() * x)).unwrap();
+        let (linear, residuals) = pullback.into_linear_parts();
+        let mut inputs = vec![Array::scalar(3.0)];
+        inputs.extend(residuals);
+        assert_eq!(linear.interpret(inputs), Ok(vec![Array::scalar(12.0)]));
+    }
+
+    #[test]
+    fn test_pullback_into_transposed_parts() {
+        let (_, pullback) = differentiate_at(Array::scalar(2.0)).vjp(|x| Ok(x.clone() * x)).unwrap();
+        let (transposed, residuals) = pullback.into_transposed_parts().unwrap();
+        assert_eq!(transposed.input_types().len(), 1 + residuals.len());
+        let mut inputs = vec![Array::scalar(3.0)];
+        inputs.extend(residuals);
+        assert_eq!(transposed.interpret(inputs), Ok(vec![Array::scalar(12.0)]));
+    }
+
+    #[test]
+    fn test_pullback_apply() {
         let function = |(left, right): (
             LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>,
             LinearizationTracer<EagerContext<Array, ArrayOperation<Array>>>,
@@ -4941,7 +5051,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_pullback_apply_with_destinations_ordinary_input_reference() {
+    fn test_pullback_apply_with_destinations_non_reference_input_reference() {
         let (_, pullback) = differentiate_at(reference_test_scalar(3.0))
             .vjp(|value| {
                 Ok(value
@@ -4974,7 +5084,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_pullback_apply_with_destinations_ordinary_input_reference_batching() {
+    fn test_pullback_apply_with_destinations_non_reference_input_reference_batching() {
         // Each batch member adds its own 2x contribution to pre-populated storage without resetting another member.
         let destination = ArrayReference::new(Array::vector(vec![5.0_f32, 7.0]));
         let result = batch(
@@ -4997,7 +5107,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_pullback_apply_with_destinations_ordinary_input_reference_higher_order() {
+    fn test_pullback_apply_with_destinations_non_reference_input_reference_higher_order() {
         // The inner pullback adds 2x to an independently allocated buffer initialized to 5. Differentiating its
         // contents checks that accumulation preserves the derivative while the nonzero initial contents stay constant.
         let result = differentiate_at(reference_test_scalar(3.0)).value_and_gradient(|value: ReferenceTestTracer| {
@@ -5172,8 +5282,8 @@ pub(crate) mod tests {
         // `r̄ = length`.
         let body = {
             let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-            let carry = builder.add_input(reference_test_reference_type());
-            let element = builder.add_input(reference_test_scalar_type());
+            let carry = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+            let element = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
             builder
                 .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![carry, element], None)
                 .unwrap();
@@ -5457,8 +5567,8 @@ pub(crate) mod tests {
     #[test]
     fn test_region_transpose_shared_specializes_by_destination_kinds() {
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let reference = builder.add_input(reference_test_reference_type());
-        let value = builder.add_input(reference_test_scalar_type());
+        let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+        let value = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
         builder
             .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, value], None)
             .unwrap();
@@ -5513,7 +5623,10 @@ pub(crate) mod tests {
             "}
             .trim_end(),
         );
+    }
 
+    #[test]
+    fn test_program_transpose_cotangent_representation() {
         // A primal representation may use a different cotangent representation. E8M0 cannot represent zero or
         // negative values, so both pullback boundaries use F32 while the source program remains E8M0-typed.
         let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
@@ -5524,7 +5637,10 @@ pub(crate) mod tests {
         assert_eq!(transposed.input_types(), vec![ArrayType::scalar(DataType::F32)]);
         assert_eq!(transposed.output_types(), vec![ArrayType::scalar(DataType::F32)]);
         assert!(transposed.instructions().is_empty());
+    }
 
+    #[test]
+    fn test_program_transpose_zero_space() {
         // Zero-space cotangent boundary leaves preserve the primal leaf structure, but can never carry live adjoints.
         // Transposing identity programs over non-differentiable types therefore returns the zero-space value.
         for data_type in
@@ -5539,7 +5655,10 @@ pub(crate) mod tests {
             let zero = Array::from_logical_bytes(ArrayType::scalar(DataType::Zero), &[]).unwrap();
             assert_eq!(transposed.interpret(zero.clone()), Ok(zero));
         }
+    }
 
+    #[test]
+    fn test_program_transpose_repeated_operands() {
         // Test that repeated uses of one input accumulate their cotangent contributions through a staged `add`.
         let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -5562,7 +5681,10 @@ pub(crate) mod tests {
             "}
             .trim_end(),
         );
+    }
 
+    #[test]
+    fn test_program_transpose_unused_outputs() {
         // Test that unused instruction outputs are passed to transpose rules as structural zero cotangents (the
         // `TwoOutputs` rule asserts that its second output cotangent is a structural zero).
         let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
@@ -5585,7 +5707,10 @@ pub(crate) mod tests {
             "}
             .trim_end(),
         );
+    }
 
+    #[test]
+    fn test_program_transpose_disconnected_input() {
         // Test that a disconnected primal input's cotangent is emitted as an input-free `ZeroOperation` instruction,
         // which is materialized at interpretation time rather than at transpose time.
         let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
@@ -5610,7 +5735,10 @@ pub(crate) mod tests {
             "}
             .trim_end(),
         );
+    }
 
+    #[test]
+    fn test_program_transpose_skips_dead_rules() {
         // Test that instructions whose outputs carry no adjoint are skipped in the reverse walk, with the dead input
         // still receiving a zero cotangent output.
         let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
@@ -5644,7 +5772,10 @@ pub(crate) mod tests {
             "}
             .trim_end(),
         );
+    }
 
+    #[test]
+    fn test_program_transpose_preserves_outer_trace() {
         // Test that transposing a program whose values are tracers of an outer trace stays self-contained: the
         // disconnected input's zero is emitted as an instruction in the pullback and nothing is staged into the
         // outer tracing context.
@@ -5682,7 +5813,10 @@ pub(crate) mod tests {
         );
         assert!(outer_builder.borrow().atoms().is_empty());
         assert!(outer_builder.borrow().instructions().is_empty());
+    }
 
+    #[test]
+    fn test_program_transpose_staged_zero_contribution() {
         // Test that a transpose-rule-staged structural zero contribution stays an input-free `ZeroOperation`
         // instruction in the pullback, again leaving the outer tracing context untouched.
         let tracing_context = DomainTracingContext::<EagerContext<Array, ArrayOperation<Array>>>::new();
@@ -5715,7 +5849,10 @@ pub(crate) mod tests {
         );
         assert!(outer_builder.borrow().atoms().is_empty());
         assert!(outer_builder.borrow().instructions().is_empty());
+    }
 
+    #[test]
+    fn test_program_transpose_omitted_contribution() {
         // A rule may omit a zero contribution entirely; the boundary still materializes the requested zero output.
         let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
         let input = builder.add_input(ArrayType::scalar(DataType::F64));
@@ -5725,7 +5862,10 @@ pub(crate) mod tests {
         let transposed = program.transpose().unwrap();
         assert_eq!(transposed.instructions().len(), 1);
         assert!(matches!(transposed.instructions()[0].operation(), TestLinearOperation::Zero(_)));
+    }
 
+    #[test]
+    fn test_program_transpose_rejects_foreign_contribution() {
         // Test that a cotangent contribution staged in a foreign builder is rejected before its atom ID can alias an
         // unrelated atom in the destination pullback.
         let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
@@ -5737,38 +5877,6 @@ pub(crate) mod tests {
         assert!(matches!(
             program.transpose(),
             Err(DifferentiationError::Program(ProgramError::MismatchedProgramBuilders)),
-        ));
-
-        // Test that an unbound program input atom is reported.
-        let input = AtomId::new(0);
-        let program = Program::<Array, TestLinearOperation, Array, ()>::new(
-            Placeholder,
-            (),
-            vec![Region::new(Vec::new(), vec![input], Vec::new(), Vec::new())],
-            RegionId::new(0),
-        );
-        assert!(matches!(
-            program,
-            Err(ProgramError::UnboundAtomId { id }) if id == input,
-        ));
-
-        // Test that an unbound instruction output atom is reported.
-        let input = AtomId::new(0);
-        let missing_output = AtomId::new(1);
-        let program = Program::<Array, TestLinearOperation, Array, Array>::new(
-            Placeholder,
-            Placeholder,
-            vec![Region::new(
-                vec![Atom::Variable(ArrayType::scalar(DataType::F64))],
-                vec![input],
-                vec![input],
-                vec![Instruction::new(TestLinearOperation::Identity, vec![input], vec![missing_output], Vec::new())],
-            )],
-            RegionId::new(0),
-        );
-        assert!(matches!(
-            program,
-            Err(ProgramError::UnboundAtomId { id }) if id == missing_output,
         ));
     }
 
@@ -5851,17 +5959,18 @@ pub(crate) mod tests {
 
     #[test]
     fn test_program_transpose_with_respect_to() {
-        let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
+        let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
         let left = builder.add_input(ArrayType::scalar(DataType::F64));
         let right = builder.add_input(ArrayType::scalar(DataType::F64));
-        let output = builder.add_instruction(TestLinearOperation::Add, Vec::new(), vec![left, right], None).unwrap()[0];
         let program = builder
-            .build::<(Array, Array), Array>(vec![output], (Placeholder, Placeholder), Placeholder)
+            .build::<(Array, Array), (Array, Array)>(
+                vec![left, right],
+                (Placeholder, Placeholder),
+                (Placeholder, Placeholder),
+            )
             .unwrap();
 
-        // Test that the pullback's cotangent outputs follow the requested index order rather than program-input
-        // order: both inputs of the `add` receive the seeded output cotangent, so the two orders are distinguishable
-        // only through the output ordering.
+        // Distinct output seeds make selection order observable in both the program interface and its values.
         let forward = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
         let reversed = program.transpose_with_respect_to(&[1, 0], &[]).unwrap();
         assert_eq!(forward.output_ids().len(), 2);
@@ -5872,7 +5981,12 @@ pub(crate) mod tests {
             "requested index order must permute the pullback outputs",
         );
 
-        // Test that out-of-range and duplicate input indices are rejected.
+        assert_eq!(
+            reversed.interpret(vec![Array::scalar(3.0), Array::scalar(7.0)]),
+            Ok(vec![Array::scalar(7.0), Array::scalar(3.0)]),
+        );
+
+        // Out-of-range and duplicate input indices are rejected.
         assert!(matches!(
             program.transpose_with_respect_to(&[2], &[]),
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
@@ -5883,7 +5997,10 @@ pub(crate) mod tests {
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
                 if message == "transposition input index 1 appears more than once",
         ));
+    }
 
+    #[test]
+    fn test_program_transpose_with_respect_to_replays_known_intermediate() {
         // A live transpose rule may need a pure value produced entirely from known inputs. For `f(a, x) = (a², a²x)`,
         // transposing only with respect to `x` must replay `a²` in the pullback, ignore the cotangent supplied for the
         // non-linear `a²` output, and produce `d_x = d_product · a²`.
@@ -5904,7 +6021,10 @@ pub(crate) mod tests {
         let pullback = program.transpose_with_respect_to(&[1], &[]).unwrap();
         let outputs = pullback.interpret(vec![Array::scalar(100.0), Array::scalar(2.0), Array::scalar(3.0)]).unwrap();
         assert_eq!(outputs, vec![Array::scalar(18.0)]);
+    }
 
+    #[test]
+    fn test_program_transpose_with_respect_to_shares_known_producer() {
         // Two live transpose rules that demand the same pure known intermediate must share one rematerialized producer.
         // The pullback contains one `identity`, not one copy per `add` consumer, and both linear inputs still receive
         // their corresponding output cotangents.
@@ -5942,7 +6062,10 @@ pub(crate) mod tests {
             &pullback.input_ids()[..2],
             "each linear input must receive its corresponding output cotangent",
         );
+    }
 
+    #[test]
+    fn test_program_transpose_with_respect_to_shares_attached_regions() {
         // Region-bearing known producers retain their attached closure when replayed, and two producers that attach
         // the same source region reuse one imported destination region rather than cloning equivalent closures.
         let mut region_builder = ProgramBuilder::<Array, TestLinearOperation>::new();
@@ -5983,7 +6106,10 @@ pub(crate) mod tests {
         assert_eq!(replayed_region_ids.len(), 2);
         assert_eq!(replayed_region_ids[0], replayed_region_ids[1]);
         assert_eq!(pullback.regions().len(), 2, "the shared nested region must be imported only once");
+    }
 
+    #[test]
+    fn test_program_transpose_with_respect_to_rejects_effectful_known_producer() {
         // Replaying a known producer with observable effects in the pullback could duplicate or reorder that effect,
         // so the partition-aware transpose must require partial evaluation to residualize the value instead.
         let mut builder = ProgramBuilder::<Array, TestLinearOperation>::new();
@@ -6004,7 +6130,10 @@ pub(crate) mod tests {
                 if message == "partition-aware transpose cannot replay effectful known intermediate producer \
                     `effectful_identity`; partial-evaluate it into a residual input first",
         ));
+    }
 
+    #[test]
+    fn test_program_transpose_with_respect_to_rejects_effectful_linear_instruction() {
         // An effectful instruction whose *output is linear* is rejected outright, even when its adjoint is dead:
         // skipping it would silently drop the effect from the pullback, and transposing it would replay the effect
         // in the reversed program.
@@ -6021,7 +6150,10 @@ pub(crate) mod tests {
                     == "partition-aware transpose cannot transpose effectful linear instruction \
                         `effectful_identity`; transposition cannot replay observable effects",
         ));
+    }
 
+    #[test]
+    fn test_program_transpose_with_respect_to_drops_effectful_sink() {
         // An effectful *sink* over a linear operand (e.g., an I/O sink over a tangent) has no linear output and touches
         // no reference state, so it contributes no cotangent: the dead-edge skip drops it from the pullback instead of
         // the effect gate rejecting it, and the surrounding linear program stays transposable.
@@ -6033,7 +6165,10 @@ pub(crate) mod tests {
         let pullback = program.transpose_with_respect_to(&[0], &[]).unwrap();
         assert!(pullback.instructions().is_empty());
         assert_eq!(pullback.output_ids(), pullback.input_ids());
+    }
 
+    #[test]
+    fn test_program_transpose_with_respect_to_rejects_nested_effectful_known_producer() {
         // EffectClasses nested inside a known producer's attached region are equally observable. The outer operation is
         // intrinsically pure, so this specifically verifies recursive effect accounting through the region closure.
         let mut region_builder = ProgramBuilder::<Array, TestLinearOperation>::new();
@@ -6064,12 +6199,12 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_program_transpose_with_respect_to_ordinary_destinations() {
+    fn test_program_transpose_with_respect_to_non_reference_destinations() {
         // A repeated operand submits both contributions to the same buffer. Destination arguments retain primal
         // input order even when the selection is reversed; returned cotangents follow the selection order instead.
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let first = builder.add_input(reference_test_scalar_type());
-        let second = builder.add_input(reference_test_scalar_type());
+        let first = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
+        let second = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
         let doubled = builder
             .add_instruction(
                 ArrayOperation::from(AddOperation::<ArrayType>::new()),
@@ -6091,10 +6226,10 @@ pub(crate) mod tests {
         assert_eq!(
             accumulated.input_types(),
             vec![
-                reference_test_scalar_type(),
-                reference_test_scalar_type(),
-                reference_test_reference_type(),
-                reference_test_reference_type(),
+                ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+                ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+                ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))),
+                ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))),
             ]
         );
         let first_buffer = ArrayReference::new(Array::scalar(10.0_f32));
@@ -6117,7 +6252,7 @@ pub(crate) mod tests {
             Ok(vec![reference_test_scalar(5.0), reference_test_scalar(6.0)])
         );
 
-        // Ignoring every ordinary input removes the arithmetic without changing the seed boundary.
+        // Ignoring every non-reference input removes the arithmetic without changing the seed boundary.
         let ignored = program.transpose_with_respect_to(&[1, 0], &[CotangentDestinationKind::Ignore; 2]).unwrap();
         assert!(ignored.instructions().is_empty());
         assert!(ignored.output_ids().is_empty());
@@ -6129,7 +6264,7 @@ pub(crate) mod tests {
         // A program can return an input more than once without running a rule. Its seeds must still accumulate into
         // the supplied buffer instead of being lost when the engine installs the buffer-backed storage.
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let input = builder.add_input(reference_test_scalar_type());
+        let input = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
         let program = builder
             .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
                 vec![input, input],
@@ -6158,7 +6293,7 @@ pub(crate) mod tests {
     fn test_program_transpose_with_respect_to_reference_read() {
         // `y = read(r)` is the identity from the state to `y`, so its transpose accumulates `ȳ` into the destination.
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let reference = builder.add_input(reference_test_reference_type());
+        let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
         let output =
             builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
         let program = builder
@@ -6169,8 +6304,17 @@ pub(crate) mod tests {
             )
             .unwrap();
         let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
-        assert_eq!(transposed.input_types(), vec![reference_test_scalar_type(), reference_test_reference_type()]);
-        assert_eq!(transposed.output_types(), vec![reference_test_reference_type()]);
+        assert_eq!(
+            transposed.input_types(),
+            vec![
+                ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+                ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32)))
+            ]
+        );
+        assert_eq!(
+            transposed.output_types(),
+            vec![ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32)))]
+        );
         assert_eq!(transposed.output_ids(), &[AtomId::new(1)]);
         assert_eq!(
             transposed
@@ -6193,12 +6337,12 @@ pub(crate) mod tests {
 
     #[test]
     fn test_program_transpose_with_respect_to_reference_write() {
-        // `write(r, x)` has no outputs, so the ordinary adjoint walk would never reach it; the state-driven walk runs
+        // `write(r, x)` has no outputs, so the non-reference adjoint walk would never reach it; the state-driven walk runs
         // it because the destination accumulator is allocated, swaps a zero into the destination (the pre-execution
         // state no longer flows anywhere), and hands the previous contents to `x̄`.
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let reference = builder.add_input(reference_test_reference_type());
-        let value = builder.add_input(reference_test_scalar_type());
+        let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+        let value = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
         builder
             .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, value], None)
             .unwrap();
@@ -6210,8 +6354,17 @@ pub(crate) mod tests {
             )
             .unwrap();
         let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
-        assert_eq!(transposed.input_types(), vec![reference_test_reference_type()]);
-        assert_eq!(transposed.output_types(), vec![reference_test_reference_type(), reference_test_scalar_type()]);
+        assert_eq!(
+            transposed.input_types(),
+            vec![ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32)))]
+        );
+        assert_eq!(
+            transposed.output_types(),
+            vec![
+                ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))),
+                ArrayIrType::Array(ArrayType::scalar(DataType::F32))
+            ]
+        );
         assert_eq!(
             transposed
                 .instructions()
@@ -6231,8 +6384,8 @@ pub(crate) mod tests {
         // `y = swap(r, x)` maps `(state, x) ↦ (x, state)`: `ȳ` is swapped into the destination and the previous
         // contents (the post-state cotangent) become `x̄`.
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let reference = builder.add_input(reference_test_reference_type());
-        let value = builder.add_input(reference_test_scalar_type());
+        let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+        let value = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
         let output = builder
             .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, value], None)
             .unwrap()[0];
@@ -6244,8 +6397,20 @@ pub(crate) mod tests {
             )
             .unwrap();
         let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
-        assert_eq!(transposed.input_types(), vec![reference_test_scalar_type(), reference_test_reference_type()]);
-        assert_eq!(transposed.output_types(), vec![reference_test_reference_type(), reference_test_scalar_type()]);
+        assert_eq!(
+            transposed.input_types(),
+            vec![
+                ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+                ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32)))
+            ]
+        );
+        assert_eq!(
+            transposed.output_types(),
+            vec![
+                ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))),
+                ArrayIrType::Array(ArrayType::scalar(DataType::F32))
+            ]
+        );
         assert_eq!(
             transposed
                 .instructions()
@@ -6266,8 +6431,8 @@ pub(crate) mod tests {
 
         // A dead swap result with an unallocated accumulator stages nothing: the stored value's cotangent is zero.
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let reference = builder.add_input(reference_test_reference_type());
-        let value = builder.add_input(reference_test_scalar_type());
+        let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+        let value = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
         builder
             .add_instruction(ReferenceSwapOperation::new(), Vec::new(), vec![reference, value], None)
             .unwrap();
@@ -6282,7 +6447,7 @@ pub(crate) mod tests {
             .transpose_with_respect_to(&[0, 1], &[CotangentDestinationKind::Ignore, CotangentDestinationKind::Return])
             .unwrap();
         assert!(transposed.input_types().is_empty());
-        assert_eq!(transposed.output_types(), vec![reference_test_scalar_type()]);
+        assert_eq!(transposed.output_types(), vec![ArrayIrType::Array(ArrayType::scalar(DataType::F32))]);
         assert_eq!(
             transposed
                 .instructions()
@@ -6298,8 +6463,8 @@ pub(crate) mod tests {
         // `add_update(r, x)` maps `(state, x) ↦ state + x`, so `x̄` reads the destination and the destination is left
         // unchanged for the earlier accesses.
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let reference = builder.add_input(reference_test_reference_type());
-        let value = builder.add_input(reference_test_scalar_type());
+        let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+        let value = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
         builder
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, value], None)
             .unwrap();
@@ -6311,8 +6476,17 @@ pub(crate) mod tests {
             )
             .unwrap();
         let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
-        assert_eq!(transposed.input_types(), vec![reference_test_reference_type()]);
-        assert_eq!(transposed.output_types(), vec![reference_test_reference_type(), reference_test_scalar_type()]);
+        assert_eq!(
+            transposed.input_types(),
+            vec![ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32)))]
+        );
+        assert_eq!(
+            transposed.output_types(),
+            vec![
+                ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))),
+                ArrayIrType::Array(ArrayType::scalar(DataType::F32))
+            ]
+        );
         assert_eq!(
             transposed
                 .instructions()
@@ -6333,7 +6507,7 @@ pub(crate) mod tests {
         // consumed), so the freeze's transpose accumulates `ȳ` exactly like a read and the allocation's transpose then
         // freezes the accumulator into `v̄ = ȳ`.
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let initial = builder.add_input(reference_test_scalar_type());
+        let initial = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
         let reference =
             builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let output =
@@ -6346,8 +6520,8 @@ pub(crate) mod tests {
             )
             .unwrap();
         let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
-        assert_eq!(transposed.input_types(), vec![reference_test_scalar_type()]);
-        assert_eq!(transposed.output_types(), vec![reference_test_scalar_type()]);
+        assert_eq!(transposed.input_types(), vec![ArrayIrType::Array(ArrayType::scalar(DataType::F32))]);
+        assert_eq!(transposed.output_types(), vec![ArrayIrType::Array(ArrayType::scalar(DataType::F32))]);
         assert_eq!(
             transposed
                 .instructions()
@@ -6364,7 +6538,7 @@ pub(crate) mod tests {
         // `r = new(v); y = read(r)` allocates the accumulator lazily when the read accumulates `ȳ` and freezes it into
         // `v̄` when the sweep reaches the allocation, so the transposed program allocates exactly once.
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let initial = builder.add_input(reference_test_scalar_type());
+        let initial = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
         let reference =
             builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let output =
@@ -6377,8 +6551,8 @@ pub(crate) mod tests {
             )
             .unwrap();
         let transposed = program.transpose_with_respect_to(&[0], &[]).unwrap();
-        assert_eq!(transposed.input_types(), vec![reference_test_scalar_type()]);
-        assert_eq!(transposed.output_types(), vec![reference_test_scalar_type()]);
+        assert_eq!(transposed.input_types(), vec![ArrayIrType::Array(ArrayType::scalar(DataType::F32))]);
+        assert_eq!(transposed.output_types(), vec![ArrayIrType::Array(ArrayType::scalar(DataType::F32))]);
         assert_eq!(
             transposed
                 .instructions()
@@ -6392,8 +6566,8 @@ pub(crate) mod tests {
         // An allocation that nothing accumulates into yields a symbolic zero for its initial value and stages neither
         // `reference_new` nor `reference_freeze`.
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let initial = builder.add_input(reference_test_scalar_type());
-        let value = builder.add_input(reference_test_scalar_type());
+        let initial = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
+        let value = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
         builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap();
         let program = builder
             .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
@@ -6487,8 +6661,8 @@ pub(crate) mod tests {
         // the accumulator lazily, the write's transpose reads it back out as `x̄ = ȳ`, and the accumulator is allocated
         // exactly once even though both accesses touch it.
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let reference = builder.add_input(reference_test_reference_type());
-        let value = builder.add_input(reference_test_scalar_type());
+        let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+        let value = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
         builder
             .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, value], None)
             .unwrap();
@@ -6504,8 +6678,8 @@ pub(crate) mod tests {
         let ignored = program
             .transpose_with_respect_to(&[0, 1], &[CotangentDestinationKind::Ignore, CotangentDestinationKind::Return])
             .unwrap();
-        assert_eq!(ignored.input_types(), vec![reference_test_scalar_type()]);
-        assert_eq!(ignored.output_types(), vec![reference_test_scalar_type()]);
+        assert_eq!(ignored.input_types(), vec![ArrayIrType::Array(ArrayType::scalar(DataType::F32))]);
+        assert_eq!(ignored.output_types(), vec![ArrayIrType::Array(ArrayType::scalar(DataType::F32))]);
         assert_eq!(
             ignored.instructions().iter().map(|instruction| instruction.operation().name()).collect::<Vec<_>>(),
             vec!["zero", "reference_new", "reference_add_update", "zero", "reference_swap"],
@@ -6515,8 +6689,20 @@ pub(crate) mod tests {
         // Under a `Reference` destination whose initial contents are a nonzero post-state cotangent, that cotangent
         // joins `ȳ` in `x̄` and the destination is left holding the zero pre-state cotangent.
         let referenced = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
-        assert_eq!(referenced.input_types(), vec![reference_test_scalar_type(), reference_test_reference_type()]);
-        assert_eq!(referenced.output_types(), vec![reference_test_reference_type(), reference_test_scalar_type()]);
+        assert_eq!(
+            referenced.input_types(),
+            vec![
+                ArrayIrType::Array(ArrayType::scalar(DataType::F32)),
+                ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32)))
+            ]
+        );
+        assert_eq!(
+            referenced.output_types(),
+            vec![
+                ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))),
+                ArrayIrType::Array(ArrayType::scalar(DataType::F32))
+            ]
+        );
         assert!(
             !referenced
                 .instructions()
@@ -6537,8 +6723,8 @@ pub(crate) mod tests {
     #[test]
     fn test_program_transpose_with_respect_to_unused_ignored_reference_allocates_nothing() {
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        builder.add_input(reference_test_reference_type());
-        let value = builder.add_input(reference_test_scalar_type());
+        builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+        let value = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
         let program = builder
             .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
                 vec![value],
@@ -6549,16 +6735,16 @@ pub(crate) mod tests {
         let transposed = program
             .transpose_with_respect_to(&[0, 1], &[CotangentDestinationKind::Ignore, CotangentDestinationKind::Return])
             .unwrap();
-        assert_eq!(transposed.input_types(), vec![reference_test_scalar_type()]);
-        assert_eq!(transposed.output_types(), vec![reference_test_scalar_type()]);
+        assert_eq!(transposed.input_types(), vec![ArrayIrType::Array(ArrayType::scalar(DataType::F32))]);
+        assert_eq!(transposed.output_types(), vec![ArrayIrType::Array(ArrayType::scalar(DataType::F32))]);
         assert!(transposed.instructions().is_empty());
     }
 
     #[test]
     fn test_program_transpose_with_respect_to_rejects_inadmissible_kinds_and_escaping_allocations() {
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let reference = builder.add_input(reference_test_reference_type());
-        let value = builder.add_input(reference_test_scalar_type());
+        let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+        let value = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
         builder
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, value], None)
             .unwrap();
@@ -6577,8 +6763,14 @@ pub(crate) mod tests {
         ));
         let accumulated =
             program.transpose_with_respect_to(&[0, 1], &[CotangentDestinationKind::Reference; 2]).unwrap();
-        assert_eq!(accumulated.input_types(), vec![reference_test_reference_type(); 2]);
-        assert_eq!(accumulated.output_types(), vec![reference_test_reference_type()]);
+        assert_eq!(
+            accumulated.input_types(),
+            vec![ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))); 2]
+        );
+        assert_eq!(
+            accumulated.output_types(),
+            vec![ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32)))]
+        );
         assert!(matches!(
             program.transpose_with_respect_to(&[0, 1], &[CotangentDestinationKind::Reference]),
             Err(DifferentiationError::Program(ProgramError::InvalidArgument { message }))
@@ -6587,7 +6779,7 @@ pub(crate) mod tests {
 
         // An escaping local allocation cannot be pulled back because its later uses are unknown to the program.
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let initial = builder.add_input(reference_test_scalar_type());
+        let initial = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
         let reference =
             builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![initial], None).unwrap()[0];
         let program = builder
@@ -6612,7 +6804,7 @@ pub(crate) mod tests {
         let vector_reference_type: ArrayIrType = ReferenceType::new(ArrayType::new_static(DataType::F32, [2])).into();
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
         let reference = builder.add_input(vector_reference_type.clone());
-        let value = builder.add_input(reference_test_scalar_type());
+        let value = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
         let view = builder
             .add_instruction(ReferenceIndexOperation::new(0, 1), Vec::new(), vec![reference], None)
             .unwrap()[0];
@@ -6628,7 +6820,10 @@ pub(crate) mod tests {
             .unwrap();
         let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
         assert_eq!(transposed.input_types(), vec![vector_reference_type.clone()]);
-        assert_eq!(transposed.output_types(), vec![vector_reference_type, reference_test_scalar_type()]);
+        assert_eq!(
+            transposed.output_types(),
+            vec![vector_reference_type, ArrayIrType::Array(ArrayType::scalar(DataType::F32))]
+        );
         assert_eq!(
             transposed
                 .instructions()
@@ -6648,9 +6843,9 @@ pub(crate) mod tests {
         // `scan { add_update(r, x_i); y_i = read(r) }` over a reference carry: `y_i = r + Σ_{j ≤ i} x_j`, so with unit
         // output cotangents `x̄_j = length - j` and the destination ends holding `Σ ȳ_i = length`. The reference carry
         // is threaded through the reversed scan positionally and the body's view of it accumulates in place.
-        let scalar_type = reference_test_scalar_type();
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let mut body_builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let carry = body_builder.add_input(reference_test_reference_type());
+        let carry = body_builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
         let element = body_builder.add_input(scalar_type.clone());
         body_builder
             .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![carry, element], None)
@@ -6666,7 +6861,7 @@ pub(crate) mod tests {
             .unwrap();
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
         let body = builder.import_region(body.entry_region_ref());
-        let reference = builder.add_input(reference_test_reference_type());
+        let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
         let elements = builder.add_input(ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3])));
         let outputs = builder
             .add_instruction(
@@ -6690,11 +6885,17 @@ pub(crate) mod tests {
         let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
         assert_eq!(
             transposed.input_types(),
-            vec![ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3])), reference_test_reference_type()],
+            vec![
+                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3])),
+                ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32)))
+            ],
         );
         assert_eq!(
             transposed.output_types(),
-            vec![reference_test_reference_type(), ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3]))],
+            vec![
+                ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))),
+                ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3]))
+            ],
         );
         let scan = transposed
             .instructions()
@@ -6765,10 +6966,10 @@ pub(crate) mod tests {
         // cotangent is provably zero: the body is transposed with an `Ignore` destination as well, the dead carry is
         // dropped from the reversed scan, and the pullback stages no cotangent reference at all instead of allocating,
         // zeroing, and freezing a dead accumulator around the reversed scan.
-        let scalar_type = reference_test_scalar_type();
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let stack_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3]));
         let mut body_builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let carry = body_builder.add_input(reference_test_reference_type());
+        let carry = body_builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
         let element = body_builder.add_input(scalar_type.clone());
         body_builder
             .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![carry, element], None)
@@ -6782,7 +6983,7 @@ pub(crate) mod tests {
             .unwrap();
         let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
         let body = builder.import_region(body.entry_region_ref());
-        let reference = builder.add_input(reference_test_reference_type());
+        let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
         let elements = builder.add_input(stack_type.clone());
         let outputs = builder
             .add_instruction(
@@ -6823,8 +7024,14 @@ pub(crate) mod tests {
         // Under a `Reference` destination the carry's state cotangent is live, so the cotangent reference is threaded
         // through the reversed scan as a carry and the body's store transposes against it.
         let transposed = program.transpose_with_respect_to(&[0, 1], &[]).unwrap();
-        assert_eq!(transposed.input_types(), vec![stack_type.clone(), reference_test_reference_type()]);
-        assert_eq!(transposed.output_types(), vec![reference_test_reference_type(), stack_type]);
+        assert_eq!(
+            transposed.input_types(),
+            vec![stack_type.clone(), ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32)))]
+        );
+        assert_eq!(
+            transposed.output_types(),
+            vec![ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))), stack_type]
+        );
         let names = transposed
             .entry_region_ref()
             .instructions_in_closure()
@@ -6851,10 +7058,10 @@ pub(crate) mod tests {
     fn test_program_transpose_with_respect_to_condition_reference_operand() {
         // Both branches receive the cotangent reference of the reference operand: the taken branch's transpose acts on
         // it in place (`add_update` reads the destination into `x̄`, `write` swaps a zero into it).
-        let scalar_type = reference_test_scalar_type();
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let true_branch = {
             let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-            let reference = builder.add_input(reference_test_reference_type());
+            let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
             let value = builder.add_input(scalar_type.clone());
             builder
                 .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, value], None)
@@ -6865,7 +7072,7 @@ pub(crate) mod tests {
         };
         let false_branch = {
             let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-            let reference = builder.add_input(reference_test_reference_type());
+            let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
             let value = builder.add_input(scalar_type.clone());
             builder
                 .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, value], None)
@@ -6878,7 +7085,7 @@ pub(crate) mod tests {
         let true_branch = builder.import_region(true_branch.entry_region_ref());
         let false_branch = builder.import_region(false_branch.entry_region_ref());
         let predicate = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::Boolean)));
-        let reference = builder.add_input(reference_test_reference_type());
+        let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
         let value = builder.add_input(scalar_type.clone());
         builder
             .add_instruction(
@@ -6900,9 +7107,15 @@ pub(crate) mod tests {
         let transposed = program.transpose_with_respect_to(&[1, 2], &[]).unwrap();
         assert_eq!(
             transposed.input_types(),
-            vec![reference_test_reference_type(), ArrayIrType::Array(ArrayType::scalar(DataType::Boolean))],
+            vec![
+                ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))),
+                ArrayIrType::Array(ArrayType::scalar(DataType::Boolean))
+            ],
         );
-        assert_eq!(transposed.output_types(), vec![reference_test_reference_type(), scalar_type]);
+        assert_eq!(
+            transposed.output_types(),
+            vec![ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))), scalar_type]
+        );
         assert_eq!(
             run_transposed_with_destinations(
                 &transposed,
@@ -6930,11 +7143,11 @@ pub(crate) mod tests {
         // into its root and neither branch reads it, so its state cotangent is provably zero: the branches are
         // transposed with an `Ignore` destination as well and the pullback stages no cotangent reference at all
         // instead of allocating, zeroing, and freezing a dead accumulator around the transposed condition.
-        let scalar_type = reference_test_scalar_type();
+        let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let predicate_type = ArrayIrType::Array(ArrayType::scalar(DataType::Boolean));
         let true_branch = {
             let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-            let reference = builder.add_input(reference_test_reference_type());
+            let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
             let value = builder.add_input(scalar_type.clone());
             builder
                 .add_instruction(ReferenceWriteOperation::new(), Vec::new(), vec![reference, value], None)
@@ -6949,7 +7162,7 @@ pub(crate) mod tests {
         };
         let false_branch = {
             let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-            let reference = builder.add_input(reference_test_reference_type());
+            let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
             let value = builder.add_input(scalar_type.clone());
             builder
                 .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, value], None)
@@ -6966,7 +7179,7 @@ pub(crate) mod tests {
         let true_branch = builder.import_region(true_branch.entry_region_ref());
         let false_branch = builder.import_region(false_branch.entry_region_ref());
         let predicate = builder.add_input(predicate_type.clone());
-        let reference = builder.add_input(reference_test_reference_type());
+        let reference = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
         let value = builder.add_input(scalar_type.clone());
         let output = builder
             .add_instruction(
@@ -7009,9 +7222,16 @@ pub(crate) mod tests {
         let transposed = program.transpose_with_respect_to(&[1, 2], &[]).unwrap();
         assert_eq!(
             transposed.input_types(),
-            vec![scalar_type.clone(), reference_test_reference_type(), predicate_type],
+            vec![
+                scalar_type.clone(),
+                ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))),
+                predicate_type
+            ],
         );
-        assert_eq!(transposed.output_types(), vec![reference_test_reference_type(), scalar_type]);
+        assert_eq!(
+            transposed.output_types(),
+            vec![ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))), scalar_type]
+        );
         let names = transposed
             .entry_region_ref()
             .instructions_in_closure()
@@ -7118,63 +7338,6 @@ pub(crate) mod tests {
             linearization.pullback().unwrap().interpret(pullback_inputs),
             Ok(vec![ReferenceTestValue::Array(Array::vector(vec![5.0_f32, 5.0, 5.0]))]),
         );
-    }
-
-    #[test]
-    fn test_program_linearize_dynamic_reference_preserves_access_order() {
-        let extent = DimensionVariable::new("extent", DimensionBounds::new(2, Some(8)).unwrap());
-        let reference_type =
-            ReferenceType::new(ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(extent)])));
-        let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let reference = builder.add_input(reference_type.into());
-        let value = builder.add_input(reference_test_scalar_type());
-
-        // An unused reference can already be frozen. Saving dimensions must not introduce an access to it.
-        let unused = builder
-            .clone()
-            .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
-                vec![value],
-                vec![Placeholder; 2],
-                vec![Placeholder],
-            )
-            .unwrap();
-        let frozen = ArrayReference::new(Array::vector(vec![3.0_f32, 5.0, 7.0]));
-        frozen.freeze().unwrap();
-        assert_eq!(
-            unused
-                .linearize()
-                .unwrap()
-                .primal()
-                .interpret(vec![ReferenceTestValue::Reference(frozen.clone()), reference_test_scalar(11.0),]),
-            Ok(vec![reference_test_scalar(11.0)]),
-        );
-
-        // I/O preceding a failing original access must still happen first. No dimension read may move ahead of it.
-        builder
-            .add_instruction(ArrayOperation::from(PrintOperation::new("before_read")), Vec::new(), vec![value], None)
-            .unwrap();
-        let output =
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-        let program = builder
-            .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
-                vec![output],
-                vec![Placeholder; 2],
-                vec![Placeholder],
-            )
-            .unwrap();
-        let linearization = program.linearize().unwrap();
-        let context = EagerContext::<ReferenceTestValue, ReferenceTestOperation>::new();
-        let mut events = Vec::new();
-        let result = linearization.primal().interpret_with(
-            vec![ReferenceTestValue::Reference(frozen), reference_test_scalar(11.0)],
-            |_, value| Ok(value.clone()),
-            |instruction, inputs| {
-                events.push(instruction.operation().name());
-                context.bind(instruction.operation().clone(), Vec::new(), inputs)
-            },
-        );
-        assert_eq!(result.unwrap_err().downcast_custom::<ReferenceError>(), Some(&ReferenceError::Frozen));
-        assert_eq!(events, vec!["print", "reference_read"]);
     }
 
     #[test]
@@ -7325,7 +7488,9 @@ pub(crate) mod tests {
         let (value, (predicate_gradient, gradient)) = EagerContext::<Array, ArrayOperation<Array>>::new()
             .differentiate_at((Array::scalar(true), Array::scalar(3.0)))
             .value_and_gradient(
-                |(predicate, x)| if predicate.concretize().unwrap() { x.clone() * x } else { x.sin().unwrap() },
+                |(predicate, x)| {
+                    if predicate.concretize().unwrap() { x.clone() * x } else { x.sin().unwrap() }
+                },
             )
             .unwrap();
         assert_abs_diff_eq!(value.to_f64s()[0], 9.0, epsilon = 1e-9);
@@ -7495,7 +7660,7 @@ pub(crate) mod tests {
         );
         assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32)));
 
-        // A zero-space referent still needs a reference identity while replaying, then becomes an ordinary zero.
+        // A zero-space referent still needs a reference identity while replaying, then becomes a non-reference zero.
         let reference = ArrayReference::new(Array::scalar(3_i32));
         let (_, (gradient, _)) = differentiate_at((ArrayIrValue::Reference(reference), reference_test_scalar(5.0)))
             .value_and_gradient(|(_, value): (ReferenceTestTracer, ReferenceTestTracer)| Ok::<_, ProgramError>(value))
@@ -7528,7 +7693,7 @@ pub(crate) mod tests {
         )
         .unwrap();
 
-        // The zero's extent must be captured before the primal freeze. Only ordinary gradients leave the trace,
+        // The zero's extent must be captured before the primal freeze. Only non-reference gradients leave the trace,
         // and its one internal accumulator is allocated afresh by each interpretation.
         assert!(program.output_types().iter().all(|r#type| !r#type.is_reference()));
         assert_eq!(
@@ -7591,7 +7756,7 @@ pub(crate) mod tests {
 
     #[test]
     fn test_value_and_gradient_reference_inputs_higher_order() {
-        // The inner gradient is 2x; differentiating the returned ordinary value agrees with d²(x²)/dx² = 2.
+        // The inner gradient is 2x; differentiating the returned non-reference value agrees with d²(x²)/dx² = 2.
         assert_eq!(
             differentiate_at(reference_test_scalar(3.0)).value_and_gradient(|value: ReferenceTestTracer| {
                 differentiate_at(value.reference_new()?)
@@ -7673,24 +7838,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn test_builder_gradient_in_holomorphic_mode() {
-        // The holomorphic builder gradient computes `∂sin(z)/∂z = cos(z)` at a genuinely complex point.
-        let z = Complex::new(0.7f64, -0.3f64);
-        let method_gradient = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .differentiate_at(Array::scalar(z))
-            .holomorphic()
-            .gradient(|x| x.sin().unwrap())
-            .unwrap();
-        assert_eq!(method_gradient, Array::scalar(z.cos()));
-
-        // The builder recovers the eager domain from the concrete primal and agrees.
-        let free_gradient = differentiate_at(Array::scalar(z)).holomorphic().gradient(|x| x.sin().unwrap()).unwrap();
-        assert_eq!(free_gradient, Array::scalar(z.cos()));
-    }
-
-    #[test]
     fn test_builder_value_and_gradient_with_auxiliary_output() {
-        // An explicitly selected builder context returns auxiliary outputs as ordinary primal values seeded with zero
+        // An explicitly selected builder context returns auxiliary outputs as non-reference primal values seeded with zero
         // cotangents, so they do not contribute to the gradient.
         let ((value, aux), gradient): ((Array, Array), (Array, Array)) =
             EagerContext::<Array, ArrayOperation<Array>>::new()
@@ -7773,45 +7922,12 @@ pub(crate) mod tests {
                 )
                 )),
             Err(DifferentiationError::Program(ProgramError::InvalidArgument {
-                message: "gradient auxiliary outputs must be ordinary values; use `Pullback::apply_with_destinations` \
+                message:
+                    "gradient auxiliary outputs must be non-reference values; use `Pullback::apply_with_destinations` \
                         for reference outputs"
-                    .to_string(),
+                        .to_string(),
             })),
         );
-    }
-
-    #[test]
-    fn test_builder_gradient_with_auxiliary_output() {
-        // The auxiliary builder's `gradient` terminal returns `(gradient, auxiliary)`.
-        let (method_gradient, aux): ((Array, Array), Array) = EagerContext::<Array, ArrayOperation<Array>>::new()
-            .differentiate_at((Array::scalar(2.0), Array::scalar(3.0)))
-            .with_auxiliary_output()
-            .gradient(|(x, y)| (x.clone() * y.clone(), x + y))
-            .unwrap();
-        assert_eq!(method_gradient, (Array::scalar(3.0), Array::scalar(2.0)));
-        assert_abs_diff_eq!(aux.to_f64s()[0], 5.0, epsilon = 1e-9);
-
-        // The builder recovers the eager domain from the concrete primals and agrees.
-        let (free_gradient, aux): ((Array, Array), Array) = differentiate_at((Array::scalar(2.0), Array::scalar(3.0)))
-            .with_auxiliary_output()
-            .gradient(|(x, y)| (x.clone() * y.clone(), x + y))
-            .unwrap();
-        assert_eq!(free_gradient, (Array::scalar(3.0), Array::scalar(2.0)));
-        assert_abs_diff_eq!(aux.to_f64s()[0], 5.0, epsilon = 1e-9);
-    }
-
-    #[test]
-    fn test_builder_gradient_with_auxiliary_output_reference_inputs() {
-        let reference = ArrayReference::new(Array::scalar(3.0_f32));
-        assert_eq!(
-            differentiate_at(ArrayIrValue::Reference(reference.clone())).with_auxiliary_output().gradient(
-                |reference: ReferenceTestTracer| {
-                    Ok::<_, ProgramError>((reference_test_square(reference.read()?)?, reference.read()?))
-                }
-            ),
-            Ok((reference_test_scalar(6.0), reference_test_scalar(3.0))),
-        );
-        assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32)));
     }
 
     #[test]
@@ -7867,6 +7983,56 @@ pub(crate) mod tests {
         assert_eq!(*aux.r#type(), ArrayType::scalar(DataType::C64));
         assert_eq!(gradient.len(), 1);
         assert_eq!(*gradient[0].r#type(), ArrayType::scalar(DataType::C64));
+    }
+
+    #[test]
+    fn test_builder_gradient_in_holomorphic_mode() {
+        // The holomorphic builder gradient computes `∂sin(z)/∂z = cos(z)` at a genuinely complex point.
+        let z = Complex::new(0.7f64, -0.3f64);
+        let method_gradient = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .differentiate_at(Array::scalar(z))
+            .holomorphic()
+            .gradient(|x| x.sin().unwrap())
+            .unwrap();
+        assert_eq!(method_gradient, Array::scalar(z.cos()));
+
+        // The builder recovers the eager domain from the concrete primal and agrees.
+        let free_gradient = differentiate_at(Array::scalar(z)).holomorphic().gradient(|x| x.sin().unwrap()).unwrap();
+        assert_eq!(free_gradient, Array::scalar(z.cos()));
+    }
+
+    #[test]
+    fn test_builder_gradient_with_auxiliary_output() {
+        // The auxiliary builder's `gradient` terminal returns `(gradient, auxiliary)`.
+        let (method_gradient, aux): ((Array, Array), Array) = EagerContext::<Array, ArrayOperation<Array>>::new()
+            .differentiate_at((Array::scalar(2.0), Array::scalar(3.0)))
+            .with_auxiliary_output()
+            .gradient(|(x, y)| (x.clone() * y.clone(), x + y))
+            .unwrap();
+        assert_eq!(method_gradient, (Array::scalar(3.0), Array::scalar(2.0)));
+        assert_abs_diff_eq!(aux.to_f64s()[0], 5.0, epsilon = 1e-9);
+
+        // The builder recovers the eager domain from the concrete primals and agrees.
+        let (free_gradient, aux): ((Array, Array), Array) = differentiate_at((Array::scalar(2.0), Array::scalar(3.0)))
+            .with_auxiliary_output()
+            .gradient(|(x, y)| (x.clone() * y.clone(), x + y))
+            .unwrap();
+        assert_eq!(free_gradient, (Array::scalar(3.0), Array::scalar(2.0)));
+        assert_abs_diff_eq!(aux.to_f64s()[0], 5.0, epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_builder_gradient_with_auxiliary_output_reference_inputs() {
+        let reference = ArrayReference::new(Array::scalar(3.0_f32));
+        assert_eq!(
+            differentiate_at(ArrayIrValue::Reference(reference.clone())).with_auxiliary_output().gradient(
+                |reference: ReferenceTestTracer| {
+                    Ok::<_, ProgramError>((reference_test_square(reference.read()?)?, reference.read()?))
+                }
+            ),
+            Ok((reference_test_scalar(6.0), reference_test_scalar(3.0))),
+        );
+        assert_eq!(reference.read(), Ok(Array::scalar(3.0_f32)));
     }
 
     #[test]
@@ -8307,14 +8473,14 @@ pub(crate) mod tests {
         // Data operands at positions 0 and 2 are delegated to the member rule in that order, and the shape operands
         // between and after them receive structural zeros in their own member universe.
         let data_type = ProjectedProgramType::Third(ProjectedMemberType::<2>);
-        let geometry_type = ProjectedProgramType::First(ProjectedMemberType::<0>);
+        let shape_type = ProjectedProgramType::First(ProjectedMemberType::<0>);
         let mut context = TranspositionContext::new(Context::new());
         let output_cotangent = context.input(data_type.clone());
         let inputs = &[
             PartialValue::Unknown(data_type.clone()),
-            PartialValue::Unknown(geometry_type.clone()),
+            PartialValue::Unknown(shape_type.clone()),
             PartialValue::Unknown(data_type.clone()),
-            PartialValue::Unknown(geometry_type.clone()),
+            PartialValue::Unknown(shape_type.clone()),
         ];
         let accumulators = context.cotangent_accumulators(inputs, &[]).unwrap();
         transpose_mixed_operation(
@@ -8337,15 +8503,15 @@ pub(crate) mod tests {
         };
         assert_eq!(first_cotangent.atom_id(), output_cotangent.atom_id());
         assert_eq!(third_cotangent.atom_id(), output_cotangent.atom_id());
-        assert_eq!(second_cotangent_type, &geometry_type);
-        assert_eq!(fourth_cotangent_type, &geometry_type);
+        assert_eq!(second_cotangent_type, &shape_type);
+        assert_eq!(fourth_cotangent_type, &shape_type);
 
         // Interleaved known data operands stay known operands of the member rule, so their structural zeros are the
         // member rule's own and remain at their operand positions.
         let known_data = context.input(data_type.clone());
         let inputs = &[
             PartialValue::Known(known_data),
-            PartialValue::Unknown(geometry_type.clone()),
+            PartialValue::Unknown(shape_type.clone()),
             PartialValue::Unknown(data_type.clone()),
         ];
         let accumulators = context.cotangent_accumulators(inputs, &[]).unwrap();
@@ -8372,7 +8538,7 @@ pub(crate) mod tests {
         let inputs = &[
             PartialValue::Unknown(data_type.clone()),
             PartialValue::Unknown(data_type),
-            PartialValue::Unknown(geometry_type.clone()),
+            PartialValue::Unknown(shape_type.clone()),
         ];
         let accumulators = context.cotangent_accumulators(inputs, &[]).unwrap();
         transpose_mixed_operation(
@@ -8384,13 +8550,13 @@ pub(crate) mod tests {
         )
         .unwrap();
         let cotangents = context.take_cotangents(&accumulators).unwrap();
-        let [MaybeZero::Value(first_cotangent), MaybeZero::Value(second_cotangent), MaybeZero::Zero(geometry)] =
+        let [MaybeZero::Value(first_cotangent), MaybeZero::Value(second_cotangent), MaybeZero::Zero(shape)] =
             cotangents.as_slice()
         else {
             panic!("prefix-arranged mixed transposition must keep its previous result: {cotangents:?}");
         };
         assert_eq!(first_cotangent.atom_id(), output_cotangent.atom_id());
         assert_eq!(second_cotangent.atom_id(), output_cotangent.atom_id());
-        assert_eq!(geometry, &geometry_type);
+        assert_eq!(shape, &shape_type);
     }
 }

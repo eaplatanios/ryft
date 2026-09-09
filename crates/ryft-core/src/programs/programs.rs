@@ -2311,6 +2311,41 @@ mod tests {
     }
 
     #[test]
+    fn test_program_new_rejects_unbound_atoms() {
+        // Test that an unbound program input atom is reported.
+        let input = AtomId::new(0);
+        let program = Program::<Array, ArrayOperation<Array>, Array, ()>::new(
+            Placeholder,
+            (),
+            vec![Region::new(Vec::new(), vec![input], Vec::new(), Vec::new())],
+            RegionId::new(0),
+        );
+        assert!(matches!(
+            program,
+            Err(ProgramError::UnboundAtomId { id }) if id == input,
+        ));
+
+        // Test that an unbound instruction output atom is reported.
+        let input = AtomId::new(0);
+        let missing_output = AtomId::new(1);
+        let program = Program::<Array, ArrayOperation<Array>, Array, Array>::new(
+            Placeholder,
+            Placeholder,
+            vec![Region::new(
+                vec![Atom::Variable(ArrayType::scalar(DataType::F64))],
+                vec![input],
+                vec![input],
+                vec![Instruction::new(NegOperation::new().into(), vec![input], vec![missing_output], Vec::new())],
+            )],
+            RegionId::new(0),
+        );
+        assert!(matches!(
+            program,
+            Err(ProgramError::UnboundAtomId { id }) if id == missing_output,
+        ));
+    }
+
+    #[test]
     fn test_program_new_rejects_orphan_variable_outputs() {
         let output = AtomId::new(0);
         let region =
