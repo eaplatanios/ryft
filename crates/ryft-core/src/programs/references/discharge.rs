@@ -1450,8 +1450,8 @@ pub struct ReferenceDischargeRegionSummary {
     output_allocations: Vec<Option<ReferenceDischargeAllocationId>>,
 }
 
-// TODO(eaplatanios): Review this.
 impl ReferenceDischargeRegionSummary {
+    // TODO(eaplatanios): Review this.
     /// Creates a new [`ReferenceDischargeRegionSummary`] summarizing the caller allocations that `region` reaches,
     /// accesses, and returns, including its nested computation [`Region`](crate::Region)s. The region is attached to
     /// `operation` at `region_index`.
@@ -1546,6 +1546,7 @@ impl ReferenceDischargeRegionSummary {
         })
     }
 
+    // TODO(eaplatanios): Review this.
     /// Returns every caller allocation the closure must be able to resolve while replaying, whether or not it is
     /// semantically accessed, in canonical allocation order.
     #[inline]
@@ -1553,12 +1554,14 @@ impl ReferenceDischargeRegionSummary {
         self.reached_allocations.iter().copied()
     }
 
+    // TODO(eaplatanios): Review this.
     /// Returns every caller allocation the closure accesses, in canonical allocation order.
     #[inline]
     pub fn accessed_allocations(&self) -> impl Iterator<Item = ReferenceDischargeAllocationId> + '_ {
         self.accessed_allocations.keys().copied()
     }
 
+    // TODO(eaplatanios): Review this.
     /// Returns the exact access modes recorded for `allocation`, in [`ReferenceAccessMode`] declaration order.
     /// Returns an empty iterator when the closure does not access that allocation.
     #[inline]
@@ -1569,6 +1572,7 @@ impl ReferenceDischargeRegionSummary {
         self.accessed_allocations.get(&allocation).into_iter().flatten().copied()
     }
 
+    // TODO(eaplatanios): Review this.
     /// Returns the caller allocation each declared region output denotes, in output order. [`None`] represents
     /// either a non-reference value or a reference allocated inside the summarized closure: neither denotes caller
     /// state. A declared output returning a discharged caller allocation already publishes its final state, so the
@@ -1578,15 +1582,14 @@ impl ReferenceDischargeRegionSummary {
         self.output_allocations.as_slice()
     }
 
-    /// Returns whether any statically reachable path through the closure writes or accumulates into `allocation`. An
-    /// allocation the closure only reads is not mutated, which is the fact read-only pruning consults.
-    ///
-    /// This classification is intentionally conservative across structured control flow: a write in either branch or
-    /// in a loop body marks the allocation as mutated even when one execution takes the other branch or performs zero
-    /// iterations. When discharge represents such an allocation as immutable state, its final state must be
-    /// published through a declared or added output. Preserved references need no added state output. The state is
-    /// unchanged at runtime when the mutating path does not execute. An allocation absent from the access summary
-    /// returns `false`.
+    /// Returns whether any statically reachable path through the closure writes or accumulates into `allocation`.
+    /// An allocation the closure only reads is not mutated, which is the fact read-only pruning consults. This
+    /// classification is intentionally conservative across structured control flow: a write operation in either branch
+    /// of a conditional or in a loop body marks the allocation as mutated even when one execution takes the other
+    /// branch or performs zero iterations. When discharge represents such an allocation as immutable state, its final
+    /// state must be published through a declared or added output. Preserved references need no added state output.
+    /// The state is unchanged at runtime when the mutating path does not execute. An allocation absent from the access
+    /// summary returns `false`.
     #[inline]
     pub fn is_mutated(&self, allocation: ReferenceDischargeAllocationId) -> bool {
         self.access_modes(allocation).any(|mode| {
@@ -1597,13 +1600,15 @@ impl ReferenceDischargeRegionSummary {
         })
     }
 
-    /// Adds the reached allocations and access modes from `other` to this summary, without duplicating either.
-    /// Structured rules use the union to construct a boundary that supports every attached computation region.
-    /// Reachability alone does not imply an immutable state carry: preserved allocations cross as references.
+    /// Adds the reached allocations and [`ReferenceAccessMode`]s from `other` to this
+    /// [`ReferenceDischargeRegionSummary`], without duplicating either. Structured rules use the union to construct a
+    /// boundary that supports every attached computation region. Reachability alone does not imply an immutable state
+    /// carry: preserved allocations cross as references.
     ///
     /// This summary's declared output allocations remain unchanged because they describe its own region's output
     /// positions. For example, merging two condition branches combines their accesses but retains the first branch's
     /// output list; the rule must separately validate that the other rebuilt branch has compatible output allocations.
+    #[inline]
     pub fn merge(&mut self, other: &Self) {
         self.reached_allocations.extend(other.reached_allocations.iter().copied());
         for (allocation, modes) in &other.accessed_allocations {
