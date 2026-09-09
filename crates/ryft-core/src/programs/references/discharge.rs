@@ -1,6 +1,5 @@
-// TODO(eaplatanios): Review this docstring.
-//! Reference discharge, which rewrites a [`Program`] so that the mutable state behind its references becomes explicit
-//! immutable dataflow.
+//! Contains machinery related to _reference discharge_, which rewrites a [`Program`] so that the mutable state behind
+//! its references becomes explicit immutable dataflow.
 //!
 //! A program that uses references is not purely functional dataflow. A read depends on the latest write to the same
 //! allocation, but that dependency travels through a reference handle rather than through an operand that carries the
@@ -36,7 +35,7 @@
 //! implementation detail of the source program, and no reference survives in the result.
 //!
 //! A reference that enters the program from outside, through a public input or a lifted capture, follows the same
-//! rewrite but its state crosses the program boundary. Its reference-typed input becomes a value input carrying the
+//! rewrite, but its state crosses the program boundary. Its reference-typed input becomes a value input carrying the
 //! entering state. If the program mutates it, its final state is appended after the public outputs as a hidden output,
 //! and an [`ExternalReferenceBinding`] records which input owns that state and which hidden output must replace the
 //! caller's reference afterwards. A read-only external reference has no hidden output. Discharge only rewrites the
@@ -45,58 +44,57 @@
 //!
 //! # Entry Points
 //!
-//! - [`Program::discharge_references`](crate::Program::discharge_references) removes every reference and returns a
-//!   [`ReferenceDischargeResult`], whose program is proven reference-free.
-//! - [`Program::partially_discharge_references`](crate::Program::partially_discharge_references) discharges only the
-//!   allocations selected through [`ReferenceDischargeTarget`]s and leaves the others as references. It returns a
-//!   [`PartialReferenceDischargeResult`], which describes only the discharged references and can be converted into a
-//!   full result once no reference remains. Partial discharge is how a pipeline normalizes its internal state while
-//!   keeping the references that a kernel will later lower to target memory operations.
-//! - [`ClosedProgram::discharge_references`](crate::ClosedProgram::discharge_references) first lifts the captures of a
-//!   closed program into leading inputs and then discharges the result, so that captured references are treated as
-//!   external references.
-//! - [`ReferenceDischargeResult::into_program_without_external_references`] yields a bare program when the caller has
-//!   proven that no external reference bindings exist.
+//!   - [`Program::discharge_references`](crate::Program::discharge_references) removes every reference and returns
+//!     a [`ReferenceDischargeResult`], whose program is proven reference-free.
+//!   - [`Program::partially_discharge_references`](crate::Program::partially_discharge_references) discharges only the
+//!     allocations selected through [`ReferenceDischargeTarget`]s and leaves the others as references. It returns a
+//!     [`PartialReferenceDischargeResult`], which describes only the discharged references and can be converted into a
+//!     full result once no reference remains. Partial discharge is how a pipeline normalizes its internal state while
+//!     keeping the references that a kernel will later lower to target memory operations.
+//!   - [`ClosedProgram::discharge_references`] first lifts the captures of a closed program into leading inputs and
+//!     then discharges the result, so that captured references are treated as external references.
+//!   - [`ReferenceDischargeResult::into_program_without_external_references`] yields a bare program when the caller
+//!     has proven that no external reference bindings exist.
 //!
 //! # Participating Types and Operations
 //!
 //! Discharge is generic over the reference type family and over the operations of a program:
 //!
-//! - A reference type family implements [`ReferenceDischargePolicy`], which names its referent type, the alias
-//!   metadata that a reference handle carries, and how to read and replace the part of a complete value that a
-//!   reference denotes. It selects that policy through [`ReferenceDischargeableType`] and may additionally implement
-//!   [`ReferenceAccumulationPolicy`] when it supports ordered additive updates.
-//! - Every operation implements [`ReferenceDischargeableOperation`], the rule that rewrites one application of that
-//!   operation. Reference primitives rewrite their own accesses, region-carrying operations decide how state is added
-//!   to their region boundaries, and everything else replays unchanged. Three shared rule bodies cover the common cases:
-//!   [`discharge_reference_free_operation`] for operations that touch no reference,
-//!   [`discharge_local_reference_operation`] for operations whose reference state stays within individual regions, and
-//!   [`discharge_positional_region_operation`] for region-carrying operations that forward their operands to their
-//!   regions positionally, such as a condition or a call. Loop-shaped operations such as `while` and `scan` write their
-//!   own rules on top of the same machinery.
+//!    - A reference type family implements [`ReferenceDischargePolicy`], which names its referent type, the alias
+//!      metadata that a reference handle carries, and how to read and replace the part of a complete value that a
+//!      reference denotes. It selects that policy through [`ReferenceDischargeableType`] and may additionally
+//!      implement [`ReferenceAccumulationPolicy`] when it supports ordered additive updates.
+//!    - Every operation implements [`ReferenceDischargeableOperation`], the rule that rewrites one application of that
+//!      operation. Reference primitives rewrite their own accesses, region-carrying operations decide how state is
+//!      added to their region boundaries, and everything else replays unchanged. Three shared rule bodies cover the
+//!      common cases: [`discharge_reference_free_operation`] for operations that touch no reference,
+//!      [`discharge_local_reference_operation`] for operations whose reference state stays within individual regions,
+//!      and [`discharge_positional_region_operation`] for region-carrying operations that forward their operands to
+//!      their regions positionally, such as a condition or a call. Loop-shaped operations such as `while` and `scan`
+//!      write their own rules on top of the same machinery.
 //!
 //! # How the Transform Works
 //!
-//! - [`ReferenceDischargeContext`] owns the allocation environment for one discharge. Every allocation is either
-//!   discharged, in which case the environment holds its current immutable state and whether it has been mutated, or
-//!   preserved, in which case it holds the reference value that survives in the destination program. Rules read and
-//!   update allocations through the context and emit the rewritten work through its parent [`Context`].
-//! - [`ReferenceDischargeValue`] is the value type that flows between rules. It is either a destination value or a
-//!   [`ReferenceDischargeReference`], a handle that names an allocation together with the alias it denotes.
-//! - [`ReferenceDischargeDriver`] gives a rule access to the source instruction being rewritten and to its attached
-//!   regions. A rule can replay a region directly through the live environment with
-//!   [`inline_region`](ReferenceDischargeDriver::inline_region), or rebuild it in an isolated environment with
-//!   [`rebuild_region`](ReferenceDischargeDriver::rebuild_region) and attach the resulting
-//!   [`ReferenceDischargeRegionResult`] to the rewritten operation.
-//! - A region-carrying rule first computes a [`ReferenceDischargeRegionSummary`] through
-//!   [`region_summary`](ReferenceDischargeContext::region_summary), which reports every allocation the region's
-//!   closure can reach, how it accesses them, and which allocations its outputs denote. From that summary,
-//!   [`boundary_widening`](ReferenceDischargeContext::boundary_widening) decides which allocations cross the boundary
-//!   as state, which need added inputs, and which need added outputs for their final states. The rule describes the
-//!   resulting boundary with a [`ReferenceDischargeRegionBoundary`], rebuilds the region, checks the result against
-//!   the prediction, and merges the returned final states back into its own environment.
-//! - Accesses to preserved references never reach a rule. The replay path replays a region-free operation that only
-//!   accesses preserved references verbatim, so rules only ever see discharged allocations.
+//!    - [`ReferenceDischargeContext`] owns the allocation environment for one discharge. Every allocation is either
+//!      discharged, in which case the environment holds its current immutable state and whether it has been mutated, or
+//!      preserved, in which case it holds the reference value that survives in the destination program. Rules read and
+//!      update allocations through the context and emit the rewritten work through its parent [`Context`].
+//!    - [`ReferenceDischargeValue`] is the value type that flows between rules. It is either a destination value
+//!      or a [`ReferenceDischargeReference`], a handle that names an allocation together with the alias it denotes.
+//!    - [`ReferenceDischargeDriver`] gives a rule access to the source instruction being rewritten and to its attached
+//!      regions. A rule can replay a region directly through the live environment with
+//!      [`inline_region`](ReferenceDischargeDriver::inline_region), or rebuild it in an isolated environment
+//!      with [`rebuild_region`](ReferenceDischargeDriver::rebuild_region) and attach the resulting
+//!      [`ReferenceDischargeRegionResult`] to the rewritten operation.
+//!    - A region-carrying rule first computes a [`ReferenceDischargeRegionSummary`] through
+//!      [`region_summary`](ReferenceDischargeContext::region_summary), which reports every allocation the region's
+//!      closure can reach, how it accesses them, and which allocations its outputs denote. From that summary,
+//!      [`boundary_widening`](ReferenceDischargeContext::boundary_widening) decides which allocations cross the
+//!      boundary as state, which need added inputs, and which need added outputs for their final states. The rule
+//!      describes the resulting boundary with a [`ReferenceDischargeRegionBoundary`], rebuilds the region, checks
+//!      the result against the prediction, and merges the returned final states back into its own environment.
+//!    - Accesses to preserved references never reach a rule. The replay path replays a region-free operation that
+//!      only accesses preserved references verbatim, so rules only ever see discharged allocations.
 //!
 //! Allocations are identified in two different ways. A [`ReferenceDischargeTarget`] names a location in the source
 //! program, an external input through [`ReferenceSource`] or an internal allocation site, and is what callers use to
@@ -112,30 +110,31 @@
 //!
 //! # Relation to Transforms
 //!
-//! Discharge is the lowering and normalization route. Backend lowering requires it, because a stateless backend cannot
-//! represent a reference, and callers invoke it when they want the explicit state-passing form of a program; the
-//! transforms themselves do not. Forward mode, linearization, reverse mode (with per-input cotangent destinations),
-//! batching, partial evaluation (with global ordered-effect ordering), rematerialization, the custom-derivative
-//! operations, and `jit_call` operate on references directly, reading structural facts from the
-//! [`ReferenceAnalysis`](super::ReferenceAnalysis) cached on the region and validating runtime aliasing at their public
-//! boundaries with [`validate_reference_boundary`](super::validate_reference_boundary). The discharged program is the
-//! oracle those transforms are tested against: transforming it must agree with transforming the reference program
-//! directly. Reference-typed carries and outputs of structured operations are supported when the operation states
-//! their identity, partial discharge may preserve internal allocations, and a `while` operation whose condition mutates
-//! references is rotated into "do-while form" (i.e., the condition runs once before the loop and again at the tail of
-//! the body) unless the loop declares an iteration bound. Array views with dynamic index operands, gathered views,
-//! and uninitialized references remain unsupported.
+//! Discharge is the lowering and normalization route. Backend lowering may require it, because a stateless backend
+//! cannot represent a reference, and callers invoke it when they want the explicit state-passing form of a program;
+//! the transforms themselves do not. Forward mode differentiation, linearization, reverse mode differentiation (with
+//! per-input [`CotangentDestination`](crate::CotangentDestination)s), batching, partial evaluation (with global
+//! ordered effect ordering), rematerialization, the custom derivative operations, and Just-In-Time (JIT) compilation
+//! operate on references directly, reading structural facts from the [`ReferenceAnalysis`] cached on the region and
+//! validating runtime aliasing at their public boundaries with
+//! [`validate_reference_boundary`](super::validate_reference_boundary). The discharged program is the oracle those
+//! transforms are tested against: transforming it must agree with transforming the reference program directly.
+//! Reference-typed carries and outputs of structured operations are supported when the operation states their identity,
+//! partial discharge may preserve internal allocations, and a `while` operation whose condition mutates references is
+//! rotated into "do-while form" (i.e., the condition runs once before the loop and again at the tail of the body)
+//! unless the loop declares an iteration bound. Array views with dynamic index operands, gathered views, and
+//! uninitialized references remain unsupported.
 //!
 //! # End-to-End Flow
 //!
-//! 1. The entry point validates the selected targets and binds each external reference in a new
-//!    [`ReferenceDischargeContext`], either as discharged state or as a preserved reference.
-//! 2. The context replays each instruction. A region-free access to preserved references is replayed unchanged, and
-//!    every other application dispatches to its [`ReferenceDischargeableOperation`] rule.
-//! 3. A rule reads or updates the environment. A region-carrying rule summarizes its regions, widens their boundaries,
-//!    rebuilds them in isolation, and merges the returned state into its caller.
-//! 4. The transform reconstructs the public outputs, appends one hidden final-state output per mutated external
-//!    allocation, validates the complete boundary, and returns the result.
+//!   1. The entry point validates the selected targets and binds each external reference in a new
+//!      [`ReferenceDischargeContext`], either as discharged state or as a preserved reference.
+//!   2. The context replays each instruction. A region-free access to preserved references is replayed unchanged,
+//!      and every other application dispatches to its [`ReferenceDischargeableOperation`] rule.
+//!   3. A rule reads or updates the environment. A region-carrying rule summarizes its regions, widens their
+//!      boundaries, rebuilds them in isolation, and merges the returned state into its caller.
+//!   4. The transform reconstructs the public outputs, appends one hidden final-state output per mutated external
+//!      allocation, validates the complete boundary, and returns the result.
 
 use std::borrow::Cow;
 use std::cell::{Ref, RefCell};
