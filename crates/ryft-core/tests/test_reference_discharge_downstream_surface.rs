@@ -834,7 +834,7 @@ where
                 check_count!("input", region.input_ids(), inputs.len(), ProgramError);
                 let mut declared = Vec::with_capacity(inputs.len());
                 for input in inputs {
-                    declared.push(context.input_allocation(input)?);
+                    declared.push(context.boundary_allocation(input)?);
                 }
                 let summary = context.region_summary(self, 0, region, declared.as_slice())?;
                 if summary.output_allocations().iter().any(Option::is_some) {
@@ -868,7 +868,7 @@ where
 
                 let mut operands = Vec::with_capacity(inputs.len() + entering.len());
                 for input in inputs {
-                    operands.push(context.input_value(input)?);
+                    operands.push(context.boundary_value(input)?);
                 }
                 for allocation in &entering {
                     operands.push(context.discharged_state(*allocation)?);

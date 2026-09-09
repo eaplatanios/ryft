@@ -1175,7 +1175,7 @@ impl ReferenceDischargeRegionBoundary {
     ///     declares the [`Region`](crate::Region)'s own leading capture prefix.
     ///   - `region_index`: Position of the [`Region`](crate::Region) among that [`Operation`]'s attached regions.
     ///   - `declared_inputs`: Specifies what enters at each declared input position. Allocations must come from
-    ///     [`ReferenceDischargeContext::input_allocation`], which validates that each input carries the complete
+    ///     [`ReferenceDischargeContext::boundary_allocation`], which validates that each input carries the complete
     ///     stored value rather than a view. A [`View`](ReferenceDischargeRegionInput::View) position names the
     ///     allocation the operation itself views at the boundary. The length must equal the source region's input
     ///     count, because every declared position is rebuilt.
@@ -2489,7 +2489,13 @@ where
                                 *allocation
                             }
                         };
-                        output_ids.push(region_context.allocation_value(region_allocation)?.atom_id()?);
+                        output_ids.push(
+                            region_context
+                                .boundary_value(&ReferenceDischargeValue::Reference(
+                                    region_context.allocation_reference(region_allocation)?,
+                                ))?
+                                .atom_id()?,
+                        );
                     }
                 }
                 let Some(output) = outputs.get(position) else {
@@ -3283,28 +3289,27 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         Ok(ReferenceDischargeBoundaryWidening { threaded, entering, published })
     }
 
-    /// Returns the [`ReferenceDischargeAllocationId`] of the allocation one input of a structured operation denotes,
-    /// or [`None`] when the input is a value. A view is rejected rather than resolved to its allocation because a state
-    /// boundary carries the allocation's complete stored value. The view must instead be created inside the region. A
-    /// preserved allocation is resolved like any other. It crosses the boundary as the reference it already is, at its
-    /// own declared input position, so it needs no state carry at all, which is exactly what
-    /// [`boundary_widening`](Self::boundary_widening) leaves it out of.
+    /// Returns the [`ReferenceDischargeAllocationId`] denoted by `value`, or [`None`] when it is a non-reference value.
+    /// A view is rejected rather than resolved to its allocation because a state boundary carries the allocation's
+    /// complete stored value. The view must instead be created inside the region. A preserved allocation is resolved
+    /// like any other: it crosses the boundary as its existing reference at its declared position and needs no added
+    /// state carry, so [`boundary_widening`](Self::boundary_widening) excludes it from the threaded allocations.
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::MalformedProgram`] when the input is a view or its allocation is no longer live.
-    pub fn input_allocation(
+    /// Returns [`ProgramError::MalformedProgram`] when `value` is a view or its allocation is no longer live.
+    pub fn boundary_allocation(
         &self,
-        input: &ReferenceDischargeValue<C, P>,
+        value: &ReferenceDischargeValue<C, P>,
     ) -> Result<Option<ReferenceDischargeAllocationId>, ProgramError> {
-        let ReferenceDischargeValue::Reference(reference) = input else {
+        let ReferenceDischargeValue::Reference(reference) = value else {
             return Ok(None);
         };
         let allocation = reference.allocation_id();
         let entry = self.allocation_entry(allocation)?;
         if reference.is_view() {
             return Err(ProgramError::MalformedProgram(format!(
-                "input references view `{}` of {}, but a region boundary requires the complete stored \
+                "reference view `{}` of {} cannot cross a region boundary, which requires the complete stored \
                  value `{}`; create the view inside the region instead",
                 reference.r#type(),
                 allocation,
@@ -3314,15 +3319,20 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         Ok(Some(allocation))
     }
 
-    /// Returns the destination value one input of a structured operation contributes to the rewritten application of
-    /// that operation which is the current immutable state of a discharged reference, the destination reference of a
-    /// preserved one, or the input's own value.
+    /// Returns the value used at a rewritten region boundary which is either the current immutable state of a
+    /// discharged allocation, the destination reference of a preserved allocation, or the supplied non-reference value
+    /// itself. This applies both to inputs passed into a rebuilt operation and to outputs publishing an allocation's
+    /// final state.
+    ///
+    /// This function does not read through reference views: a discharged reference contributes its complete allocation
+    /// state. Use [`boundary_allocation`](Self::boundary_allocation) to validate that a reference value denotes a
+    /// complete allocation before constructing its boundary representation.
     ///
     /// # Errors
     ///
-    /// Returns [`ProgramError::MalformedProgram`] when the input's allocation is not live.
-    pub fn input_value(&self, input: &ReferenceDischargeValue<C, P>) -> Result<C::Value, ProgramError> {
-        let reference = match input {
+    /// Returns [`ProgramError::MalformedProgram`] when the value's allocation is not live.
+    pub fn boundary_value(&self, value: &ReferenceDischargeValue<C, P>) -> Result<C::Value, ProgramError> {
+        let reference = match value {
             ReferenceDischargeValue::Reference(reference) => reference,
             ReferenceDischargeValue::Value(value) => return Ok(value.clone()),
         };
@@ -3337,19 +3347,6 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         }
     }
 
-    // TODO(eaplatanios): Review this.
-    /// Returns the destination value one live allocation contributes to a rewritten boundary: its current immutable
-    /// state when discharged, or its destination reference when preserved.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`ProgramError::MalformedProgram`] when `allocation` is not live in this environment.
-    #[inline]
-    pub fn allocation_value(&self, allocation: ReferenceDischargeAllocationId) -> Result<C::Value, ProgramError> {
-        self.input_value(&ReferenceDischargeValue::from(self.allocation_reference(allocation)?))
-    }
-
-    // TODO(eaplatanios): Review this.
     /// Merges the boundary output that a rebuilt region returned for `allocation` back into that allocation. An
     /// allocation the widening threads as state receives `output` as its successor state, marked as mutated exactly
     /// when the summary reports a mutation. An allocation outside the threaded set survived as a reference and returned
@@ -3357,14 +3354,17 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     ///
     /// # Parameters
     ///
-    ///   - `summary`: Summary of the region closures, which states whether `allocation` is mutated.
-    ///   - `widening`: Widening computed from `summary`, which states whether `allocation` is threaded as state.
-    ///   - `allocation`: Caller allocation that the boundary output denotes.
+    ///   - `summary`: [`ReferenceDischargeRegionSummary`] of the region closures, which states whether
+    ///     `allocation` is mutated.
+    ///   - `widening`: [`ReferenceDischargeBoundaryWidening`] computed from `summary`, which states whether
+    ///     `allocation` is threaded as state.
+    ///   - `allocation`: [`ReferenceDischargeAllocationId`] of the caller allocation that the boundary output denotes.
     ///   - `output`: Destination value the rebuilt operation returned at that boundary position.
     ///
     /// # Errors
     ///
-    /// Propagates the liveness and type failures of [`set_discharged_state`](Self::set_discharged_state).
+    /// Propagates the liveness and type failures of [`set_discharged_state`](Self::set_discharged_state) that is
+    /// invoked internally by this function.
     #[inline]
     pub fn merge_boundary_state(
         &self,
@@ -4363,7 +4363,7 @@ pub fn discharge_local_reference_operation<
         result.validate_predicted_mutations(&[], name)?;
         regions.push(result.into_program());
     }
-    let operands = inputs.iter().map(|input| context.input_value(input)).collect::<Result<Vec<_>, _>>()?;
+    let operands = inputs.iter().map(|input| context.boundary_value(input)).collect::<Result<Vec<_>, _>>()?;
     let outputs = context.parent().bind(operation.clone(), regions, operands.as_slice())?;
     Ok(outputs.into_iter().map(ReferenceDischargeValue::Value).collect())
 }
@@ -4436,7 +4436,7 @@ pub fn discharge_positional_region_operation<
         input.try_as_value(&format!("a value leading input {index} of `{name}`"))?;
     }
     let forwarded_allocations =
-        forwarded.iter().map(|input| context.input_allocation(input)).collect::<Result<Vec<_>, _>>()?;
+        forwarded.iter().map(|input| context.boundary_allocation(input)).collect::<Result<Vec<_>, _>>()?;
 
     // Every region forwards the same inputs, so one summary of all of them decides one shared boundary. It is seeded
     // from the first region rather than from an empty summary, because merging keeps the receiver's declared output
@@ -4493,10 +4493,12 @@ pub fn discharge_positional_region_operation<
 
     let mut operands = Vec::with_capacity(inputs.len() + entering.len());
     for input in inputs {
-        operands.push(context.input_value(input)?);
+        operands.push(context.boundary_value(input)?);
     }
     for allocation in entering {
-        operands.push(context.allocation_value(*allocation)?);
+        operands.push(
+            context.boundary_value(&ReferenceDischargeValue::Reference(context.allocation_reference(*allocation)?))?,
+        );
     }
     let outputs = context.parent().bind(operation.clone(), regions, operands.as_slice())?;
     check_count!("output", outputs, source_output_count + leaving.len(), ProgramError);
@@ -7785,7 +7787,7 @@ mod tests {
         assert_eq!(context.is_allocation_discharged(allocation), Ok(false));
         assert_eq!(context.allocation_reference(allocation).map(ReferenceDischargeValue::from), Ok(bound.clone()));
         assert_eq!(
-            context.input_value(&ReferenceDischargeValue::Reference(reference.clone())),
+            context.boundary_value(&ReferenceDischargeValue::Reference(reference.clone())),
             Ok(destination_reference.clone()),
         );
 
@@ -8093,26 +8095,26 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_discharge_context_input_allocation() {
+    fn test_reference_discharge_context_boundary_allocation() {
         let context = ListDischargeContext::new(ListDestination::new());
         let reference_type = ReferenceType::new(ListType { length: 2 });
 
         // A value input denotes no allocation, while discharged and preserved references denote theirs alike.
         let value = ReferenceDischargeValue::Value(ListIrValue::List(vec![1, 2]));
-        assert_eq!(context.input_allocation(&value), Ok(None));
+        assert_eq!(context.boundary_allocation(&value), Ok(None));
         let discharged = ReferenceDischargeValue::from(
             context.bind_discharged(reference_type.clone(), ListIrValue::List(vec![1, 2])).unwrap(),
         );
         let discharged_reference = discharged.try_as_reference("the discharged allocation").unwrap();
         let discharged_allocation = discharged_reference.allocation_id();
-        assert_eq!(context.input_allocation(&discharged), Ok(Some(discharged_allocation)));
+        assert_eq!(context.boundary_allocation(&discharged), Ok(Some(discharged_allocation)));
         let preserved = ReferenceDischargeValue::from(
             context
                 .bind_preserved(reference_type.clone(), ListIrValue::Reference(reference_type.clone()))
                 .unwrap(),
         );
         let preserved_allocation = preserved.try_as_reference("the preserved allocation").unwrap().allocation_id();
-        assert_eq!(context.input_allocation(&preserved), Ok(Some(preserved_allocation)));
+        assert_eq!(context.boundary_allocation(&preserved), Ok(Some(preserved_allocation)));
 
         // A view cannot cross a region boundary, because the boundary carries the complete stored value.
         let view = ReferenceDischargeValue::from(
@@ -8126,9 +8128,9 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(
-            context.input_allocation(&view),
+            context.boundary_allocation(&view),
             Err(ProgramError::MalformedProgram(format!(
-                "input references view `ref<list<1>>` of {discharged_allocation}, but a region boundary requires \
+                "reference view `ref<list<1>>` of {discharged_allocation} cannot cross a region boundary, which requires \
                  the complete stored value `ref<list<2>>`; create the view inside the region instead",
             ))),
         );
@@ -8136,7 +8138,7 @@ mod tests {
         // A consumed allocation is no longer live.
         context.consume(discharged_reference).unwrap();
         assert_eq!(
-            context.input_allocation(&discharged),
+            context.boundary_allocation(&discharged),
             Err(ProgramError::MalformedProgram(format!(
                 "reference discharge accessed consumed {discharged_allocation}"
             ))),
@@ -8144,35 +8146,35 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_discharge_context_input_value() {
+    fn test_reference_discharge_context_boundary_value() {
         let context = ListDischargeContext::new(ListDestination::new());
         let reference_type = ReferenceType::new(ListType { length: 2 });
 
         // A value input contributes itself.
         let value = ReferenceDischargeValue::Value(ListIrValue::List(vec![7, 8]));
-        assert_eq!(context.input_value(&value), Ok(ListIrValue::List(vec![7, 8])));
+        assert_eq!(context.boundary_value(&value), Ok(ListIrValue::List(vec![7, 8])));
 
         // A discharged reference contributes its current state, so a write is observed.
         let discharged = ReferenceDischargeValue::from(
             context.bind_discharged(reference_type.clone(), ListIrValue::List(vec![1, 2])).unwrap(),
         );
         let discharged_reference = discharged.try_as_reference("the discharged allocation").unwrap();
-        assert_eq!(context.input_value(&discharged), Ok(ListIrValue::List(vec![1, 2])));
+        assert_eq!(context.boundary_value(&discharged), Ok(ListIrValue::List(vec![1, 2])));
         context.write(discharged_reference, ListIrValue::List(vec![3, 4])).unwrap();
-        assert_eq!(context.input_value(&discharged), Ok(ListIrValue::List(vec![3, 4])));
+        assert_eq!(context.boundary_value(&discharged), Ok(ListIrValue::List(vec![3, 4])));
 
         // A preserved reference contributes its destination reference.
         let destination_reference = ListIrValue::Reference(reference_type.clone());
         let preserved = ReferenceDischargeValue::from(
             context.bind_preserved(reference_type, destination_reference.clone()).unwrap(),
         );
-        assert_eq!(context.input_value(&preserved), Ok(destination_reference));
+        assert_eq!(context.boundary_value(&preserved), Ok(destination_reference));
 
         // A consumed allocation is rejected.
         let discharged_allocation = discharged_reference.allocation_id();
         context.consume(discharged_reference).unwrap();
         assert_eq!(
-            context.input_value(&discharged),
+            context.boundary_value(&discharged),
             Err(ProgramError::MalformedProgram(format!(
                 "reference discharge accessed consumed {discharged_allocation}"
             ))),
@@ -8180,7 +8182,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_discharge_context_allocation_value() {
+    fn test_reference_discharge_context_boundary_value_from_allocation() {
         let context = ListDischargeContext::new(ListDestination::new());
         let reference_type = ReferenceType::new(ListType { length: 2 });
 
@@ -8190,18 +8192,30 @@ mod tests {
         );
         let discharged_reference = discharged.try_as_reference("the discharged allocation").unwrap();
         let discharged_allocation = discharged_reference.allocation_id();
-        assert_eq!(context.allocation_value(discharged_allocation), Ok(ListIrValue::List(vec![1, 2])));
+        assert_eq!(
+            context
+                .allocation_reference(discharged_allocation)
+                .and_then(|reference| context.boundary_value(&ReferenceDischargeValue::Reference(reference))),
+            Ok(ListIrValue::List(vec![1, 2])),
+        );
         let destination_reference = ListIrValue::Reference(reference_type.clone());
         let preserved = ReferenceDischargeValue::from(
             context.bind_preserved(reference_type, destination_reference.clone()).unwrap(),
         );
         let preserved_allocation = preserved.try_as_reference("the preserved allocation").unwrap().allocation_id();
-        assert_eq!(context.allocation_value(preserved_allocation), Ok(destination_reference));
+        assert_eq!(
+            context
+                .allocation_reference(preserved_allocation)
+                .and_then(|reference| context.boundary_value(&ReferenceDischargeValue::Reference(reference))),
+            Ok(destination_reference),
+        );
 
         // A consumed allocation is rejected.
         context.consume(discharged_reference).unwrap();
         assert_eq!(
-            context.allocation_value(discharged_allocation),
+            context
+                .allocation_reference(discharged_allocation)
+                .and_then(|reference| context.boundary_value(&ReferenceDischargeValue::Reference(reference))),
             Err(ProgramError::MalformedProgram(format!(
                 "reference discharge accessed consumed {discharged_allocation}"
             ))),
@@ -9285,7 +9299,7 @@ mod tests {
         let returned = results[0].try_as_reference("the returned preserved capture-scoped allocation").unwrap();
         assert_eq!(returned.allocation_id(), allocation);
         assert_eq!(returned.preserved(), Some(&destination_reference));
-        assert_eq!(context.input_value(&results[0]), Ok(destination_reference));
+        assert_eq!(context.boundary_value(&results[0]), Ok(destination_reference));
     }
 
     #[test]
