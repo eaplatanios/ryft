@@ -753,7 +753,7 @@ impl<View> ReferenceViewAnalysis<View> {
                         path.steps.push(Self::derive_view_step(
                             region,
                             edge.instruction(),
-                            edge.origin(),
+                            edge.position(),
                             edge.source(),
                             value,
                         )?);
@@ -771,7 +771,7 @@ impl<View> ReferenceViewAnalysis<View> {
     fn derive_view_step<V: Value, O: ReferenceViewOperation<Type = V::Type, View = View>>(
         region: RegionRef<'_, V, O>,
         id: InstructionId,
-        origin: ReferenceAliasPosition,
+        position: ReferenceAliasPosition,
         source: ValueId,
         value: ValueId,
     ) -> Result<ReferenceViewStep<View>, ReferenceViewAnalysisError>
@@ -784,7 +784,7 @@ impl<View> ReferenceViewAnalysis<View> {
         let instruction = &current.instructions()[id.index()];
         let operation = instruction.operation();
         let name = operation.name();
-        let view = match origin {
+        let view = match position {
             ReferenceAliasPosition::Output(output_index) => operation
                 .reference_view(output_index)
                 .ok_or(ReferenceViewAnalysisError::MissingView { operation: name, instruction: id })?,
@@ -834,7 +834,7 @@ impl<View> ReferenceViewAnalysis<View> {
                     }
                     bindings.push(ViewSymbolBinding::Value(ValueId::new(id.region(), *atom)));
                 }
-                ViewSymbol::Iteration => match origin {
+                ViewSymbol::Iteration => match position {
                     ReferenceAliasPosition::Output(output_index) => {
                         return Err(ReferenceViewAnalysisError::IterationSymbolAtOutput {
                             operation: name,

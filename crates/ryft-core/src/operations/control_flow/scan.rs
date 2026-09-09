@@ -5434,7 +5434,7 @@ mod tests {
         assert!(bindings[0].is_view());
         assert!(analysis.is_view(bindings[0].input()));
         let alias = analysis.alias(bindings[0].input()).unwrap();
-        assert_eq!(alias.origin(), ReferenceAliasPosition::RegionInput { region_index: 0, input_index: 1 });
+        assert_eq!(alias.position(), ReferenceAliasPosition::RegionInput { region_index: 0, input_index: 1 });
         assert_eq!(alias.kind(), ReferenceAliasKind::View);
         assert!(alias.narrows());
 

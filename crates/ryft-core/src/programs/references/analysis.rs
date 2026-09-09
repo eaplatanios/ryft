@@ -56,7 +56,7 @@
 //! containing a [`ReferenceAliasKind::View`] edge) crosses only when the attaching operation declares
 //! [`InputRegionProvenance::View`] provenance for that region input through [`Operation::input_region_provenance`].
 //! The named operation input must be a complete-value handle, and the region input is recorded as a view of it through
-//! a [`ReferenceAliasEdge`] of origin [`ReferenceAliasPosition::RegionInput`], whose description comes from the value
+//! a [`ReferenceAliasEdge`] at position [`ReferenceAliasPosition::RegionInput`], whose description comes from the value
 //! family's [`region_input_view`](crate::ReferenceViewOperation::region_input_view) hook. Such an input may be accessed
 //! inside the region, where its accesses are attributed to the whole caller root, but it can neither be consumed there
 //! nor be forwarded out. The view edge records only attachment-independent facts (which region input is a view, and of
@@ -517,179 +517,146 @@ pub enum ReferenceAliasPosition {
     },
 }
 
-// TODO(eaplatanios): Review from this point onwards.
-
-/// Alias edge that defines one reference-typed value from another reference-typed value. Edges are recorded for
-/// [`ReferenceAlias`](crate::programs::effects::ReferenceAlias) outputs and for outputs constrained by
-/// [`Operation::reference_output_identity_input`],
-/// which are identity edges from the constrained input, both of which connect values of the same region, and for
-/// region inputs that the attaching operation creates as boundary views ([`ReferenceAliasPosition::RegionInput`]), which
-/// connect a nested region input to an operand of the attaching instruction in the parent region. Narrowing is
-/// transitive: an identity alias of a derived view still represents only that view, so [`narrows`](Self::narrows)
-/// describes the complete chain from the root to the aliasing value rather than only this edge's own kind.
+/// Reference alias edge that defines one reference-typed value from another reference-typed value (i.e., that defines
+/// a view). Edges are recorded for [`ReferenceAlias`](crate::ReferenceAlias) outputs and for outputs constrained by
+/// [`Operation::reference_output_identity_input`], which are identity edges from the constrained input, both of which
+/// connect values of the same [`Region`], and for region inputs that the attaching operation creates as boundary views
+/// (i.e., [`ReferenceAliasPosition::RegionInput`]), which connect a nested region input to an operand of the attaching
+/// [`Instruction`](crate::Instruction) in the parent region. Narrowing is _transitive_ meaning that an identity alias
+/// of a derived view still represents only that view, and so [`narrows`](Self::narrows) describes the complete chain
+/// from the root to the aliasing value rather than only this edge's own kind.
 ///
 /// A shared region is analyzed once, so the edge of a boundary view is attachment-independent in every respect except
 /// its [`instruction`](Self::instruction) and [`source`](Self::source), which name the attaching instruction and its
 /// operand of the attachment that first reached the region; the analysis rejects a shared region whose attachments
 /// disagree on which inputs are boundary views. Consumers that need per-attachment data use
-/// [`ReferenceAnalysis::region_input_bindings`], which record every attachment.
+/// [`ReferenceAnalysis::region_input_bindings`], which records every attachment.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReferenceAliasEdge {
-    /// Refer to [`Self::instruction`].
+    /// [`Instruction`](crate::Instruction) defining the aliasing value.
     instruction: InstructionId,
 
-    /// Refer to [`Self::origin`].
-    origin: ReferenceAliasPosition,
+    /// [`ReferenceAliasPosition`] at which the defining [`Instruction`](crate::Instruction)
+    /// defines the aliasing value.
+    position: ReferenceAliasPosition,
 
-    /// Refer to [`Self::source`].
+    /// [`ValueId`] of the reference-typed value the alias that this [`ReferenceAliasEdge`]
+    /// corresponds to is derived from.
     source: ValueId,
 
-    /// Refer to [`Self::kind`].
+    /// [`ReferenceAliasKind`] of this [`ReferenceAliasEdge`].
     kind: ReferenceAliasKind,
 
-    /// Refer to [`Self::narrows`].
+    /// Refer to [`Self::narrows`] for information on this field.
     narrows: bool,
 }
 
 impl ReferenceAliasEdge {
     /// Creates a new [`ReferenceAliasEdge`].
-    ///
-    /// # Parameters
-    ///
-    ///   - `instruction`: Instruction defining the alias or creating the attached-region input view.
-    ///   - `origin`: Output or attached-region input position defining the aliasing value.
-    ///   - `source`: Reference-typed value from which the alias is derived.
-    ///   - `kind`: Whether this edge preserves the complete source value or creates a view of it.
-    ///   - `narrows`: Whether this edge or an earlier edge in the source's alias chain creates a view.
-    ///     An identity edge from an existing view must therefore also set this to `true`.
-    #[inline]
     pub const fn new(
         instruction: InstructionId,
-        origin: ReferenceAliasPosition,
+        position: ReferenceAliasPosition,
         source: ValueId,
         kind: ReferenceAliasKind,
         narrows: bool,
     ) -> Self {
-        Self { instruction, origin, source, kind, narrows }
+        Self { instruction, position, source, kind, narrows }
     }
 
-    /// Returns the instruction defining the aliasing value.
-    #[inline]
+    /// Returns the [`Instruction`](crate::Instruction) defining the aliasing value.
     pub const fn instruction(self) -> InstructionId {
         self.instruction
     }
 
-    /// Returns the position at which the instruction defines the aliasing value.
-    #[inline]
-    pub const fn origin(self) -> ReferenceAliasPosition {
-        self.origin
+    /// Returns the [`ReferenceAliasPosition`] at which the defining [`Instruction`](crate::Instruction)
+    /// defines the aliasing value.
+    pub const fn position(self) -> ReferenceAliasPosition {
+        self.position
     }
 
-    /// Returns the index of the aliasing instruction's output that defines the aliasing value, or [`None`] when the
-    /// aliasing value is a boundary view input of an attached region.
-    #[inline]
-    pub const fn output_index(self) -> Option<usize> {
-        match self.origin {
-            ReferenceAliasPosition::Output(output_index) => Some(output_index),
-            ReferenceAliasPosition::RegionInput { .. } => None,
-        }
-    }
-
-    /// Returns the reference-typed value the alias is derived from.
-    #[inline]
+    /// Returns the [`ValueId`] of the reference-typed value the alias that this [`ReferenceAliasEdge`]
+    /// corresponds to is derived from.
     pub const fn source(self) -> ValueId {
         self.source
     }
 
-    /// Returns the [`ReferenceAliasKind`] of this edge.
-    #[inline]
+    /// Returns the [`ReferenceAliasKind`] of this [`ReferenceAliasEdge`].
     pub const fn kind(self) -> ReferenceAliasKind {
         self.kind
     }
 
-    /// Returns whether the aliasing value is a derived view of its root, through this edge or an earlier one.
-    #[inline]
+    /// Returns whether this [`ReferenceAliasEdge`] or an earlier edge in the source's alias chain creates a view.
+    /// This is `true` for identity edges from existing views, for example.
     pub const fn narrows(self) -> bool {
         self.narrows
     }
 }
 
-/// Binding of one reference-typed input of an attached [`Region`](crate::Region) to the caller root it denotes for one
-/// particular attachment. A shared region attached by several instructions has one binding per attachment, so nested
-/// records stay in the nested region's own namespace and consumers substitute them through these bindings. The binding
-/// also records whether [`Operation::input_region_provenance`] says that the input is a boundary view the attaching
-/// operation creates from its input rather than a complete forwarded value.
+/// Binding of a reference-typed input of an attached [`Region`] to the caller root it denotes for a particular
+/// attachment. A shared region attached by several [`Instruction`](crate::Instruction)s has one binding per attachment,
+/// so nested records stay in the nested region's own namespace, and consumers substitute them through these bindings.
+/// The binding also records whether [`Operation::input_region_provenance`] says that the input is a boundary view the
+/// attaching operation creates from its input rather than a complete forwarded value.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReferenceRegionInputBinding {
-    /// Refer to [`Self::instruction`].
+    /// [`Instruction`](crate::Instruction) attaching the [`Region`].
     instruction: InstructionId,
 
-    /// Refer to [`Self::region_index`].
+    /// Position of the attached [`Region`] among the [`Instruction`](crate::Instruction)'s regions.
     region_index: usize,
 
-    /// Refer to [`Self::input`].
+    /// [`ValueId`] of the reference-typed input value of the attached [`Region`].
     input: ValueId,
 
-    /// Refer to [`Self::root`].
+    /// [`ReferenceRoot`] the input denotes, in the namespace of the [`Region`]
+    /// containing the [`Instruction`](crate::Instruction).
     root: ReferenceRoot,
 
-    /// Refer to [`Self::is_view`].
-    view: bool,
+    /// Refer to [`Self::is_view`] for information on this field.
+    is_view: bool,
 }
 
 impl ReferenceRegionInputBinding {
     /// Creates a new [`ReferenceRegionInputBinding`].
-    ///
-    /// # Parameters
-    ///
-    ///   - `instruction`: Instruction attaching the region.
-    ///   - `region_index`: Position of that region among the instruction's attached regions.
-    ///   - `input`: Reference-typed input value in the attached region.
-    ///   - `root`: Caller root supplied to that input, in the attaching instruction's region.
-    ///   - `view`: Whether the operation creates a boundary view for this input rather than forwarding a
-    ///     complete-value handle.
-    #[inline]
     pub const fn new(
         instruction: InstructionId,
         region_index: usize,
         input: ValueId,
         root: ReferenceRoot,
-        view: bool,
+        is_view: bool,
     ) -> Self {
-        Self { instruction, region_index, input, root, view }
+        Self { instruction, region_index, input, root, is_view }
     }
 
-    /// Returns the instruction attaching the region.
-    #[inline]
+    /// Returns the [`Instruction`](crate::Instruction) attaching the [`Region`].
     pub const fn instruction(self) -> InstructionId {
         self.instruction
     }
 
-    /// Returns the position of the attached region among the instruction's regions.
-    #[inline]
+    /// Returns the position of the attached [`Region`] among the [`Instruction`](crate::Instruction)'s regions.
     pub const fn region_index(self) -> usize {
         self.region_index
     }
 
-    /// Returns the reference-typed input value of the attached region.
-    #[inline]
+    /// Returns the [`ValueId`] of the reference-typed input value of the attached [`Region`].
     pub const fn input(self) -> ValueId {
         self.input
     }
 
-    /// Returns the root the input denotes, in the namespace of the region containing the instruction.
-    #[inline]
+    /// Returns the [`ReferenceRoot`] the input denotes, in the namespace of the [`Region`]
+    /// containing the [`Instruction`](crate::Instruction).
     pub const fn root(self) -> ReferenceRoot {
         self.root
     }
 
     /// Returns whether the input is a boundary view of its root that the attaching operation creates from its operand,
-    /// as opposed to a forwarded complete-value handle of that root.
-    #[inline]
+    /// as opposed to a forwarded complete value handle of that root.
     pub const fn is_view(self) -> bool {
-        self.view
+        self.is_view
     }
 }
+
+// TODO(eaplatanios): Review from this point onwards.
 
 /// Transitive reference accesses of one [`Instruction`](crate::Instruction): the modes it performs on each root,
 /// directly or anywhere inside its attached region closure, expressed in the namespace of the region containing the
@@ -1559,7 +1526,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                 let narrows = kind == ReferenceAliasKind::View || source.narrows;
                 let alias = ReferenceAliasEdge {
                     instruction: id,
-                    origin: ReferenceAliasPosition::Output(output_index),
+                    position: ReferenceAliasPosition::Output(output_index),
                     source: value_id(source_atom),
                     kind,
                     narrows,
@@ -1627,12 +1594,12 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                         region_index,
                         input: ValueId::new(attached_id, input),
                         root: record.root,
-                        view,
+                        is_view: view,
                     });
                     entering.push(Some(record.root));
                     boundary.push(view.then(|| ReferenceAliasEdge {
                         instruction: id,
-                        origin: ReferenceAliasPosition::RegionInput { region_index, input_index },
+                        position: ReferenceAliasPosition::RegionInput { region_index, input_index },
                         source: value_id(atom),
                         kind: ReferenceAliasKind::View,
                         narrows: true,
@@ -1729,7 +1696,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                         }
                         let alias = ReferenceAliasEdge {
                             instruction: id,
-                            origin: ReferenceAliasPosition::Output(output_index),
+                            position: ReferenceAliasPosition::Output(output_index),
                             source: value_id(atom),
                             kind: ReferenceAliasKind::Identity,
                             narrows: source.narrows,
@@ -2461,8 +2428,7 @@ mod tests {
         let output = ReferenceAliasPosition::Output(2);
         let edge = ReferenceAliasEdge::new(id(1, 1), output, value(1, 3), ReferenceAliasKind::View, true);
         assert_eq!(edge.instruction(), id(1, 1));
-        assert_eq!(edge.origin(), output);
-        assert_eq!(edge.output_index(), Some(2));
+        assert_eq!(edge.position(), output);
         assert_eq!(edge.source(), value(1, 3));
         assert_eq!(edge.kind(), ReferenceAliasKind::View);
         assert!(edge.narrows());
@@ -2474,8 +2440,7 @@ mod tests {
         // A boundary view edge is defined at a region input of the attaching instruction rather than at an output.
         let region_input = ReferenceAliasPosition::RegionInput { region_index: 0, input_index: 1 };
         let boundary = ReferenceAliasEdge::new(id(1, 1), region_input, value(1, 3), ReferenceAliasKind::View, true);
-        assert_eq!(boundary.origin(), region_input);
-        assert_eq!(boundary.output_index(), None);
+        assert_eq!(boundary.position(), region_input);
         assert_ne!(edge, boundary);
     }
 
@@ -2833,7 +2798,7 @@ mod tests {
     #[test]
     fn test_reference_analysis_new_binds_boundary_views() {
         // The stacked operand enters the body as a view the scan creates at the boundary: the body input is its own
-        // root in the body's namespace, is recorded as a view alias of the operand with a region-input origin, and the
+        // root in the body's namespace, is recorded as a view alias of the operand at a region-input position, and the
         // body's accesses through it are attributed to the whole caller root.
         let analysis = stacked_scan_program(reading_scan_body(), false).reference_analysis(0).unwrap();
         let (a, b) = (input_root(1, 0), input_root(1, 1));
