@@ -1550,21 +1550,21 @@ impl ReferenceDischargeRegionSummary {
 
         // A reference-typed atom the traversal never bound denotes a reference that entered this region neither
         // through its boundary nor through its capture scope. The environment has no allocation for it, so the
-        // summary reports it here rather than dropping the access and letting the replay fail later for a reason that
-        // no longer names the operation that performed it.
-        let resolve = |allocations: &HashMap<AtomId, Option<ReferenceDischargeAllocationId>>,
-                       atom: AtomId,
-                       operation: &str| {
-            match allocations.get(&atom) {
-                Some(allocation) => Ok(*allocation),
-                None if is_reference(atom) => Err(ProgramError::MalformedProgram(format!(
-                    "operation `{operation}` reaches a reference that entered region `{}` neither through its boundary \
+        // summary reports it here rather than dropping the access and letting the replay fail later for a reason
+        // that no longer names the operation that performed it.
+        let resolve =
+            |allocations: &HashMap<AtomId, Option<ReferenceDischargeAllocationId>>, atom: AtomId, operation: &str| {
+                match allocations.get(&atom) {
+                    Some(allocation) => Ok(*allocation),
+                    None if is_reference(atom) => Err(ProgramError::MalformedProgram(format!(
+                        "operation `{}` reaches a reference that entered region `{}` neither through its boundary \
                          nor through its capture scope",
-                    region.id(),
-                ))),
-                None => Ok(None),
-            }
-        };
+                        operation,
+                        region.id(),
+                    ))),
+                    None => Ok(None),
+                }
+            };
         for instruction in region.instructions() {
             let nested_operation = instruction.operation();
             let effects = nested_operation.effects();
@@ -3244,23 +3244,24 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         ReferenceDischargeRegionSummary::new(operation, region_index, region, inputs, self.captures())
     }
 
-    // TODO(eaplatanios): Review this.
-    /// Computes the symmetric widening facts one structured rule needs from a region summary: the discharged
-    /// allocations threaded as state, every reached allocation gaining an added boundary position because no declared
-    /// position already carries it, and the discharged subset whose successor states the rebuilt regions must publish.
+    /// Computes the symmetric [`ReferenceDischargeBoundaryWidening`] facts one structured rule needs from a
+    /// [`ReferenceDischargeRegionSummary`] which consists of the discharged allocations threaded as state, every
+    /// reached allocation gaining an added boundary position because no declared position already carries it, and the
+    /// discharged subset whose successor states the rebuilt regions must publish.
     ///
-    /// A closure needs an allocation threaded whenever its replay must be able to resolve that allocation, because it
-    /// accesses it, returns it, or merely rematerializes a capture constant that denotes it. The threaded set is
+    /// A closure needs an allocation threaded whenever its replay must be able to resolve that allocation, because
+    /// it accesses it, returns it, or merely rematerializes a capture constant that denotes it. The threaded set is
     /// therefore the summary's reached allocations with the preserved allocations removed. A preserved reference
     /// survives in the destination as a reference value and crosses at its own declared input position, or at an
-    /// added position as the destination reference it already denotes, exactly as the source passed it, so it needs no
-    /// state carry, publishes no successor, and widens nothing.
+    /// added position as the destination reference it already denotes, exactly as the source passed it, so it needs
+    /// no state carry, publishes no successor, and widens nothing.
     ///
     /// # Parameters
     ///
-    ///   - `summary`: Summary of the closures the rewritten operation attaches, in caller-allocation terms.
-    ///   - `declared`: Allocations already crossing at declared boundary positions, which therefore need no added
-    ///     position.
+    ///   - `summary`: [`ReferenceDischargeRegionSummary`] of the closures the rewritten operation attaches,
+    ///     in caller-allocation terms.
+    ///   - `declared`: [`ReferenceDischargeAllocationId`]s of the allocations already crossing at declared boundary
+    ///     positions, which therefore need no added position.
     ///
     /// # Errors
     ///
