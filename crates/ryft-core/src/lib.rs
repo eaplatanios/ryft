@@ -184,7 +184,7 @@ pub use programs::{
     ProgramRenderingMode, ProgramStatistics, ProjectedValue, Provenance, ProvenanceScope, ProvenanceState,
     ReadyOrPendingReferenceGuard, ReadyReferenceGuard, RecursiveReferenceDischargeDriver, Reference, ReferenceAccess,
     ReferenceAccessMode, ReferenceAccumulationPolicy, ReferenceAlias, ReferenceAliasEdge, ReferenceAliasKind,
-    ReferenceAliasOrigin, ReferenceAnalysis, ReferenceAnalysisError, ReferenceBoundary, ReferenceBoundaryError,
+    ReferenceAliasPosition, ReferenceAnalysis, ReferenceAnalysisError, ReferenceBoundary, ReferenceBoundaryError,
     ReferenceBoundaryPosition, ReferenceCompletion, ReferenceCompletionBackend, ReferenceDischargeAllocationId,
     ReferenceDischargeBoundaryWidening, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
     ReferenceDischargeReference, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion,

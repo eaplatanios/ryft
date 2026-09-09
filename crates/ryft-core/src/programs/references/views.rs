@@ -95,7 +95,8 @@ use crate::programs::effects::ReferenceAliasKind;
 use crate::programs::instructions::InstructionId;
 use crate::programs::operations::Operation;
 use crate::programs::references::analysis::{
-    ReferenceAliasOrigin, ReferenceAnalysis, ReferenceAnalysisError, ReferenceAnalysisTransformArguments, ReferenceRoot,
+    ReferenceAliasPosition, ReferenceAnalysis, ReferenceAnalysisError, ReferenceAnalysisTransformArguments,
+    ReferenceRoot,
 };
 use crate::programs::regions::{InputRegionProvenance, Region, RegionId, RegionRef};
 use crate::programs::transforms::{Transform, TransformArtifact};
@@ -635,7 +636,7 @@ impl<View> ReferenceViewAnalysis<View> {
             let step = Self::derive_view_step(
                 region,
                 id,
-                ReferenceAliasOrigin::RegionInput { region_index, input_index },
+                ReferenceAliasPosition::RegionInput { region_index, input_index },
                 source,
                 value,
             )?;
@@ -770,7 +771,7 @@ impl<View> ReferenceViewAnalysis<View> {
     fn derive_view_step<V: Value, O: ReferenceViewOperation<Type = V::Type, View = View>>(
         region: RegionRef<'_, V, O>,
         id: InstructionId,
-        origin: ReferenceAliasOrigin,
+        origin: ReferenceAliasPosition,
         source: ValueId,
         value: ValueId,
     ) -> Result<ReferenceViewStep<View>, ReferenceViewAnalysisError>
@@ -784,10 +785,10 @@ impl<View> ReferenceViewAnalysis<View> {
         let operation = instruction.operation();
         let name = operation.name();
         let view = match origin {
-            ReferenceAliasOrigin::Output(output_index) => operation
+            ReferenceAliasPosition::Output(output_index) => operation
                 .reference_view(output_index)
                 .ok_or(ReferenceViewAnalysisError::MissingView { operation: name, instruction: id })?,
-            ReferenceAliasOrigin::RegionInput { region_index, input_index } => operation
+            ReferenceAliasPosition::RegionInput { region_index, input_index } => operation
                 .region_input_view(region_index, input_index)
                 .ok_or(ReferenceViewAnalysisError::MissingBoundaryView {
                     operation: name,
@@ -834,14 +835,14 @@ impl<View> ReferenceViewAnalysis<View> {
                     bindings.push(ViewSymbolBinding::Value(ValueId::new(id.region(), *atom)));
                 }
                 ViewSymbol::Iteration => match origin {
-                    ReferenceAliasOrigin::Output(output_index) => {
+                    ReferenceAliasPosition::Output(output_index) => {
                         return Err(ReferenceViewAnalysisError::IterationSymbolAtOutput {
                             operation: name,
                             instruction: id,
                             output_index,
                         });
                     }
-                    ReferenceAliasOrigin::RegionInput { .. } => {
+                    ReferenceAliasPosition::RegionInput { .. } => {
                         bindings.push(ViewSymbolBinding::Iteration(value.region()));
                     }
                 },
@@ -1077,7 +1078,7 @@ mod tests {
     use crate::programs::effects::{EffectClasses, Effects, ReferenceAccessMode, ReferenceAlias, ReferenceEffect};
     use crate::programs::instructions::Instruction;
     use crate::programs::programs::Program;
-    use crate::programs::references::analysis::{ReferenceAliasEdge, ReferenceAliasOrigin};
+    use crate::programs::references::analysis::{ReferenceAliasEdge, ReferenceAliasPosition};
     use crate::programs::references::types::ReferenceType;
     use crate::programs::regions::{
         InputRegionProvenance, OutputRegionProvenance, RegionId, RegionInterface, RegionSlot,
@@ -1594,7 +1595,7 @@ mod tests {
             analysis.analysis().alias(value(0, 1)),
             Some(ReferenceAliasEdge::new(
                 id(0, 0),
-                ReferenceAliasOrigin::Output(0),
+                ReferenceAliasPosition::Output(0),
                 value(0, 0),
                 ReferenceAliasKind::View,
                 true,
@@ -1604,7 +1605,7 @@ mod tests {
             analysis.analysis().alias(value(0, 2)),
             Some(ReferenceAliasEdge::new(
                 id(0, 1),
-                ReferenceAliasOrigin::Output(0),
+                ReferenceAliasPosition::Output(0),
                 value(0, 1),
                 ReferenceAliasKind::View,
                 true,
@@ -1694,7 +1695,7 @@ mod tests {
             analysis.analysis().alias(value(2, 3)),
             Some(ReferenceAliasEdge::new(
                 id(2, 0),
-                ReferenceAliasOrigin::Output(1),
+                ReferenceAliasPosition::Output(1),
                 value(2, 1),
                 ReferenceAliasKind::Identity,
                 false,
@@ -1925,7 +1926,7 @@ mod tests {
             analysis.analysis().alias(value(0, 1)),
             Some(ReferenceAliasEdge::new(
                 id(1, 0),
-                ReferenceAliasOrigin::RegionInput { region_index: 0, input_index: 1 },
+                ReferenceAliasPosition::RegionInput { region_index: 0, input_index: 1 },
                 value(1, 1),
                 ReferenceAliasKind::View,
                 true,

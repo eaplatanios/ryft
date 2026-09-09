@@ -291,7 +291,7 @@ mod values;
 mod views;
 
 pub use analysis::{
-    ReferenceAccess, ReferenceAliasEdge, ReferenceAliasOrigin, ReferenceAnalysis, ReferenceAnalysisError,
+    ReferenceAccess, ReferenceAliasEdge, ReferenceAliasPosition, ReferenceAnalysis, ReferenceAnalysisError,
     ReferenceRegionInputBinding, ReferenceRoot, ReferenceTransitiveAccess,
 };
 pub use discharge::{

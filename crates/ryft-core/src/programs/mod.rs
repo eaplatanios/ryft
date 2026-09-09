@@ -153,7 +153,7 @@ pub use provenance::{Provenance, ProvenanceScope, ProvenanceState};
 pub use references::{
     ExternalReferenceBinding, NoBinding, PartialReferenceDischargeResult, PreparedReferenceReplacement,
     ReadyOrPendingReferenceGuard, ReadyReferenceGuard, RecursiveReferenceDischargeDriver, Reference, ReferenceAccess,
-    ReferenceAccumulationPolicy, ReferenceAliasEdge, ReferenceAliasOrigin, ReferenceAnalysis, ReferenceAnalysisError,
+    ReferenceAccumulationPolicy, ReferenceAliasEdge, ReferenceAliasPosition, ReferenceAnalysis, ReferenceAnalysisError,
     ReferenceBoundary, ReferenceBoundaryError, ReferenceBoundaryPosition, ReferenceCompletion,
     ReferenceCompletionBackend, ReferenceDischargeAllocationId, ReferenceDischargeBoundaryWidening,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeReference,

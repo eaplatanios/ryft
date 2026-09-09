@@ -3648,7 +3648,7 @@ mod tests {
     };
     use crate::parameters::Placeholder;
     use crate::programs::{
-        EffectClasses, Program, ProgramBuilder, ReferenceAliasKind, ReferenceAliasOrigin, ReferenceType,
+        EffectClasses, Program, ProgramBuilder, ReferenceAliasKind, ReferenceAliasPosition, ReferenceType,
     };
     use crate::tests::CountingBatchingDriver;
     use crate::tracing::{DomainTracingContext, Trace};
@@ -5434,7 +5434,7 @@ mod tests {
         assert!(bindings[0].is_view());
         assert!(analysis.is_view(bindings[0].input()));
         let alias = analysis.alias(bindings[0].input()).unwrap();
-        assert_eq!(alias.origin(), ReferenceAliasOrigin::RegionInput { region_index: 0, input_index: 1 });
+        assert_eq!(alias.origin(), ReferenceAliasPosition::RegionInput { region_index: 0, input_index: 1 });
         assert_eq!(alias.kind(), ReferenceAliasKind::View);
         assert!(alias.narrows());
 

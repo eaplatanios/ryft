@@ -104,7 +104,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::programs::{
         AtomId, EffectClasses, Effects, Instruction, InstructionId, Operation, ProgramBuilder, ProgramError,
-        ReferenceAccessMode, ReferenceAlias, ReferenceAliasEdge, ReferenceAliasKind, ReferenceAliasOrigin,
+        ReferenceAccessMode, ReferenceAlias, ReferenceAliasEdge, ReferenceAliasKind, ReferenceAliasPosition,
         ReferenceAnalysisError, ReferenceRoot, ReferenceSource, ReferenceType, ReferenceViewOperation,
         ReferenceViewValidationError, RegionId, RegionInterface, TypeError,
     };
@@ -288,7 +288,7 @@ mod tests {
             analysis.analysis().alias(value(2, 3)),
             Some(ReferenceAliasEdge::new(
                 id(2, 0),
-                ReferenceAliasOrigin::Output(1),
+                ReferenceAliasPosition::Output(1),
                 value(2, 1),
                 ReferenceAliasKind::Identity,
                 false,

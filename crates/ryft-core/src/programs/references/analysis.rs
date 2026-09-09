@@ -56,7 +56,7 @@
 //! containing a [`ReferenceAliasKind::View`] edge) crosses only when the attaching operation declares
 //! [`InputRegionProvenance::View`] provenance for that region input through [`Operation::input_region_provenance`].
 //! The named operation input must be a complete-value handle, and the region input is recorded as a view of it through
-//! a [`ReferenceAliasEdge`] of origin [`ReferenceAliasOrigin::RegionInput`], whose description comes from the value
+//! a [`ReferenceAliasEdge`] of origin [`ReferenceAliasPosition::RegionInput`], whose description comes from the value
 //! family's [`region_input_view`](crate::ReferenceViewOperation::region_input_view) hook. Such an input may be accessed
 //! inside the region, where its accesses are attributed to the whole caller root, but it can neither be consumed there
 //! nor be forwarded out. The view edge records only attachment-independent facts (which region input is a view, and of
@@ -387,16 +387,15 @@ impl From<ReferenceAnalysisError> for ProgramError {
     }
 }
 
-// TODO(eaplatanios): Review from this point onwards.
-
-/// Canonical reference root that a reference-typed value denotes: a region input, an instruction's fresh allocation,
-/// or an external constant when analyzing an open region with [`RegionRef::reference_analysis_with_constants`].
-/// Roots are region-relative: their namespace is the region containing their defining input, instruction, or constant.
-/// The derived ordering (region inputs, allocations, then constants, each by region and position) is deterministic and
-/// independent of any hash-map iteration order.
+/// Canonical reference root that a reference-typed value denotes that can be a [`Region`] input, an
+/// [`Instruction`](crate::Instruction)'s fresh allocation, or an external constant when analyzing an open region
+/// with [`RegionRef::reference_analysis_with_constants`]. [`ReferenceRoot`]s are region-relative meaning that their
+/// namespace is the region containing their defining input, instruction, or constant. The derived ordering (i.e.,
+/// region inputs, allocations, then constants, each by region and position) is deterministic and independent of any
+/// hash map iteration order.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReferenceRoot {
-    /// Reference-typed input of a [`Region`](crate::Region).
+    /// Reference-typed input of a [`Region`].
     RegionInput {
         /// Region owning the input.
         region: RegionId,
@@ -423,7 +422,7 @@ pub enum ReferenceRoot {
 }
 
 impl ReferenceRoot {
-    /// Returns the [`RegionId`] of the [`Region`](crate::Region) whose namespace owns this [`ReferenceRoot`].
+    /// Returns the [`RegionId`] of the [`Region`] whose namespace owns this [`ReferenceRoot`].
     #[inline]
     pub fn region(self) -> RegionId {
         match self {
@@ -447,33 +446,25 @@ impl Display for ReferenceRoot {
     }
 }
 
-/// One reference access performed directly by an [`Instruction`](crate::Instruction), resolved to the canonical
-/// [`ReferenceRoot`] in the namespace of the region containing that instruction.
+/// A reference access performed directly by an [`Instruction`](crate::Instruction), resolved to the canonical
+/// [`ReferenceRoot`] in the namespace of the [`Region`] containing that instruction.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReferenceAccess {
-    /// Refer to [`Self::instruction`].
+    /// [`InstructionId`] of the [`Instruction`](crate::Instruction) performing the access.
     instruction: InstructionId,
 
-    /// Refer to [`Self::input_index`].
+    /// Input index in the access [`Instruction`](crate::Instruction) that corresponds to the reference.
     input_index: usize,
 
-    /// Refer to [`Self::root`].
+    /// Canonical [`ReferenceRoot`] reached by this [`ReferenceAccess`].
     root: ReferenceRoot,
 
-    /// Refer to [`Self::mode`].
+    /// [`ReferenceAccessMode`] of this [`ReferenceAccess`].
     mode: ReferenceAccessMode,
 }
 
 impl ReferenceAccess {
     /// Creates a new [`ReferenceAccess`].
-    ///
-    /// # Parameters
-    ///
-    ///   - `instruction`: Instruction performing the access.
-    ///   - `input_index`: Position of the accessed operand in the instruction.
-    ///   - `root`: Canonical reference root reached by that operand, in the instruction's region.
-    ///   - `mode`: Kind of access the instruction performs.
-    #[inline]
     pub const fn new(
         instruction: InstructionId,
         input_index: usize,
@@ -483,44 +474,40 @@ impl ReferenceAccess {
         Self { instruction, input_index, root, mode }
     }
 
-    /// Returns the [`InstructionId`] of the instruction performing the access.
-    #[inline]
+    /// Returns the [`InstructionId`] of the [`Instruction`](crate::Instruction) performing the access.
     pub const fn instruction(self) -> InstructionId {
         self.instruction
     }
 
-    /// Returns the accessed input position of the instruction.
-    #[inline]
+    /// Returns the input index in the access [`Instruction`](crate::Instruction) that corresponds to the reference.
     pub const fn input_index(self) -> usize {
         self.input_index
     }
 
-    /// Returns the canonical [`ReferenceRoot`] reached by the access.
-    #[inline]
+    /// Returns the canonical [`ReferenceRoot`] reached by this [`ReferenceAccess`].
     pub const fn root(self) -> ReferenceRoot {
         self.root
     }
 
-    /// Returns the [`ReferenceAccessMode`] of the access.
-    #[inline]
+    /// Returns the [`ReferenceAccessMode`] of this [`ReferenceAccess`].
     pub const fn mode(self) -> ReferenceAccessMode {
         self.mode
     }
 }
 
-/// Position at which the instruction of a [`ReferenceAliasEdge`] defines the aliasing value.
+/// Position at which the [`Instruction`](crate::Instruction) of a [`ReferenceAliasEdge`] defines the aliasing value.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ReferenceAliasOrigin {
-    /// The aliasing value is the given output of the instruction, whose description a
-    /// [`ReferenceViewOperation`](crate::programs::references::ReferenceViewOperation) reports through
-    /// [`reference_view`](crate::programs::references::ReferenceViewOperation::reference_view).
+pub enum ReferenceAliasPosition {
+    /// The aliasing value is the output of the [`Instruction`](crate::Instruction) at this index,
+    /// whose description a [`ReferenceViewOperation`](crate::ReferenceViewOperation) reports through
+    /// [`reference_view`](crate::ReferenceViewOperation::reference_view).
     Output(usize),
 
-    /// The aliasing value is input `input_index` of the region attached at `region_index` of the instruction: a
-    /// boundary view the instruction's operation creates from the operation input named by the `View` variant of
-    /// [`Operation::input_region_provenance`], whose description a
-    /// [`ReferenceViewOperation`](crate::programs::references::ReferenceViewOperation) reports through
-    /// [`region_input_view`](crate::programs::references::ReferenceViewOperation::region_input_view).
+    /// The aliasing value is input `input_index` of the [`Region`] attached at `region_index` of the
+    /// [`Instruction`](crate::Instruction). A boundary view the instruction's operation creates from the operation
+    /// input named by the `View` variant of [`Operation::input_region_provenance`], whose description
+    /// a [`ReferenceViewOperation`](crate::ReferenceViewOperation) reports through
+    /// [`region_input_view`](crate::ReferenceViewOperation::region_input_view).
     RegionInput {
         /// Position of the attached region among the instruction's regions.
         region_index: usize,
@@ -530,11 +517,13 @@ pub enum ReferenceAliasOrigin {
     },
 }
 
+// TODO(eaplatanios): Review from this point onwards.
+
 /// Alias edge that defines one reference-typed value from another reference-typed value. Edges are recorded for
 /// [`ReferenceAlias`](crate::programs::effects::ReferenceAlias) outputs and for outputs constrained by
 /// [`Operation::reference_output_identity_input`],
 /// which are identity edges from the constrained input, both of which connect values of the same region, and for
-/// region inputs that the attaching operation creates as boundary views ([`ReferenceAliasOrigin::RegionInput`]), which
+/// region inputs that the attaching operation creates as boundary views ([`ReferenceAliasPosition::RegionInput`]), which
 /// connect a nested region input to an operand of the attaching instruction in the parent region. Narrowing is
 /// transitive: an identity alias of a derived view still represents only that view, so [`narrows`](Self::narrows)
 /// describes the complete chain from the root to the aliasing value rather than only this edge's own kind.
@@ -550,7 +539,7 @@ pub struct ReferenceAliasEdge {
     instruction: InstructionId,
 
     /// Refer to [`Self::origin`].
-    origin: ReferenceAliasOrigin,
+    origin: ReferenceAliasPosition,
 
     /// Refer to [`Self::source`].
     source: ValueId,
@@ -576,7 +565,7 @@ impl ReferenceAliasEdge {
     #[inline]
     pub const fn new(
         instruction: InstructionId,
-        origin: ReferenceAliasOrigin,
+        origin: ReferenceAliasPosition,
         source: ValueId,
         kind: ReferenceAliasKind,
         narrows: bool,
@@ -592,7 +581,7 @@ impl ReferenceAliasEdge {
 
     /// Returns the position at which the instruction defines the aliasing value.
     #[inline]
-    pub const fn origin(self) -> ReferenceAliasOrigin {
+    pub const fn origin(self) -> ReferenceAliasPosition {
         self.origin
     }
 
@@ -601,8 +590,8 @@ impl ReferenceAliasEdge {
     #[inline]
     pub const fn output_index(self) -> Option<usize> {
         match self.origin {
-            ReferenceAliasOrigin::Output(output_index) => Some(output_index),
-            ReferenceAliasOrigin::RegionInput { .. } => None,
+            ReferenceAliasPosition::Output(output_index) => Some(output_index),
+            ReferenceAliasPosition::RegionInput { .. } => None,
         }
     }
 
@@ -1570,7 +1559,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                 let narrows = kind == ReferenceAliasKind::View || source.narrows;
                 let alias = ReferenceAliasEdge {
                     instruction: id,
-                    origin: ReferenceAliasOrigin::Output(output_index),
+                    origin: ReferenceAliasPosition::Output(output_index),
                     source: value_id(source_atom),
                     kind,
                     narrows,
@@ -1643,7 +1632,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                     entering.push(Some(record.root));
                     boundary.push(view.then(|| ReferenceAliasEdge {
                         instruction: id,
-                        origin: ReferenceAliasOrigin::RegionInput { region_index, input_index },
+                        origin: ReferenceAliasPosition::RegionInput { region_index, input_index },
                         source: value_id(atom),
                         kind: ReferenceAliasKind::View,
                         narrows: true,
@@ -1740,7 +1729,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                         }
                         let alias = ReferenceAliasEdge {
                             instruction: id,
-                            origin: ReferenceAliasOrigin::Output(output_index),
+                            origin: ReferenceAliasPosition::Output(output_index),
                             source: value_id(atom),
                             kind: ReferenceAliasKind::Identity,
                             narrows: source.narrows,
@@ -2469,7 +2458,7 @@ mod tests {
 
     #[test]
     fn test_reference_alias_edge() {
-        let output = ReferenceAliasOrigin::Output(2);
+        let output = ReferenceAliasPosition::Output(2);
         let edge = ReferenceAliasEdge::new(id(1, 1), output, value(1, 3), ReferenceAliasKind::View, true);
         assert_eq!(edge.instruction(), id(1, 1));
         assert_eq!(edge.origin(), output);
@@ -2478,12 +2467,12 @@ mod tests {
         assert_eq!(edge.kind(), ReferenceAliasKind::View);
         assert!(edge.narrows());
         assert_eq!(edge, ReferenceAliasEdge::new(id(1, 1), output, value(1, 3), ReferenceAliasKind::View, true));
-        let other = ReferenceAliasOrigin::Output(0);
+        let other = ReferenceAliasPosition::Output(0);
         assert_ne!(edge, ReferenceAliasEdge::new(id(1, 1), other, value(1, 3), ReferenceAliasKind::View, true));
         assert_ne!(edge, ReferenceAliasEdge::new(id(1, 1), output, value(1, 3), ReferenceAliasKind::Identity, true));
 
         // A boundary view edge is defined at a region input of the attaching instruction rather than at an output.
-        let region_input = ReferenceAliasOrigin::RegionInput { region_index: 0, input_index: 1 };
+        let region_input = ReferenceAliasPosition::RegionInput { region_index: 0, input_index: 1 };
         let boundary = ReferenceAliasEdge::new(id(1, 1), region_input, value(1, 3), ReferenceAliasKind::View, true);
         assert_eq!(boundary.origin(), region_input);
         assert_eq!(boundary.output_index(), None);
@@ -2668,7 +2657,7 @@ mod tests {
             analysis.alias(value(2, 2)),
             Some(ReferenceAliasEdge::new(
                 id(2, 0),
-                ReferenceAliasOrigin::Output(0),
+                ReferenceAliasPosition::Output(0),
                 value(2, 0),
                 ReferenceAliasKind::Identity,
                 false
@@ -2710,7 +2699,7 @@ mod tests {
             analysis.alias(value(1, 2)),
             Some(ReferenceAliasEdge::new(
                 id(1, 0),
-                ReferenceAliasOrigin::Output(0),
+                ReferenceAliasPosition::Output(0),
                 value(1, 0),
                 ReferenceAliasKind::Identity,
                 false
@@ -2856,7 +2845,7 @@ mod tests {
             analysis.alias(value(0, 1)),
             Some(ReferenceAliasEdge::new(
                 id(1, 0),
-                ReferenceAliasOrigin::RegionInput { region_index: 0, input_index: 1 },
+                ReferenceAliasPosition::RegionInput { region_index: 0, input_index: 1 },
                 value(1, 1),
                 ReferenceAliasKind::View,
                 true,
@@ -2904,7 +2893,7 @@ mod tests {
             analysis.alias(value(0, 1)),
             Some(ReferenceAliasEdge::new(
                 id(1, 0),
-                ReferenceAliasOrigin::RegionInput { region_index: 0, input_index: 1 },
+                ReferenceAliasPosition::RegionInput { region_index: 0, input_index: 1 },
                 value(1, 1),
                 ReferenceAliasKind::View,
                 true,
@@ -3560,7 +3549,7 @@ mod tests {
             analysis.alias(value(2, 4)),
             Some(ReferenceAliasEdge::new(
                 id(2, 0),
-                ReferenceAliasOrigin::Output(0),
+                ReferenceAliasPosition::Output(0),
                 value(2, 0),
                 ReferenceAliasKind::View,
                 true
@@ -3570,7 +3559,7 @@ mod tests {
             analysis.alias(value(2, 5)),
             Some(ReferenceAliasEdge::new(
                 id(2, 1),
-                ReferenceAliasOrigin::Output(0),
+                ReferenceAliasPosition::Output(0),
                 value(2, 4),
                 ReferenceAliasKind::View,
                 true
@@ -3684,7 +3673,7 @@ mod tests {
             analysis.alias(value(2, 3)),
             Some(ReferenceAliasEdge::new(
                 id(2, 0),
-                ReferenceAliasOrigin::Output(1),
+                ReferenceAliasPosition::Output(1),
                 value(2, 1),
                 ReferenceAliasKind::Identity,
                 false
@@ -4065,7 +4054,7 @@ mod tests {
             analysis.alias(value(1, 4)),
             Some(ReferenceAliasEdge::new(
                 id(1, 1),
-                ReferenceAliasOrigin::Output(0),
+                ReferenceAliasPosition::Output(0),
                 value(1, 3),
                 ReferenceAliasKind::View,
                 true
@@ -4075,7 +4064,7 @@ mod tests {
             analysis.alias(value(1, 5)),
             Some(ReferenceAliasEdge::new(
                 id(1, 2),
-                ReferenceAliasOrigin::Output(0),
+                ReferenceAliasPosition::Output(0),
                 value(1, 4),
                 ReferenceAliasKind::Identity,
                 true

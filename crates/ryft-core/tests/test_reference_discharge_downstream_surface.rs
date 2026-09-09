@@ -58,7 +58,7 @@ use ryft_core::{
     Parameter, PartialValue, PartiallyEvaluatableOperation, Placeholder, Program, ProgramBatchingOutputAxesPolicy,
     ProgramBuilder, ProgramError, RecursiveBatchingPolicy, RecursiveReferenceDischargeDriver, Reference,
     ReferenceAccessMode, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAlias, ReferenceAliasEdge,
-    ReferenceAliasKind, ReferenceAliasOrigin, ReferenceBoundary, ReferenceBoundaryError, ReferenceDischargeContext,
+    ReferenceAliasKind, ReferenceAliasPosition, ReferenceBoundary, ReferenceBoundaryError, ReferenceDischargeContext,
     ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary,
     ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeResult, ReferenceDischargeTarget,
     ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceEffect,
@@ -1890,7 +1890,7 @@ fn test_downstream_view_operation_records_output_indices_and_distinct_paths() {
         analysis.analysis().alias(value(1)),
         Some(ReferenceAliasEdge::new(
             halves_instruction,
-            ReferenceAliasOrigin::Output(0),
+            ReferenceAliasPosition::Output(0),
             value(0),
             ReferenceAliasKind::View,
             true,
@@ -1900,7 +1900,7 @@ fn test_downstream_view_operation_records_output_indices_and_distinct_paths() {
         analysis.analysis().alias(value(2)),
         Some(ReferenceAliasEdge::new(
             halves_instruction,
-            ReferenceAliasOrigin::Output(1),
+            ReferenceAliasPosition::Output(1),
             value(0),
             ReferenceAliasKind::View,
             true,
@@ -2081,7 +2081,7 @@ fn test_downstream_dynamic_view_analysis_closes_the_index_operand() {
         analysis.analysis().alias(value(3)),
         Some(ReferenceAliasEdge::new(
             InstructionId::new(RegionId::new(0), 0),
-            ReferenceAliasOrigin::Output(0),
+            ReferenceAliasPosition::Output(0),
             value(0),
             ReferenceAliasKind::View,
             true,
