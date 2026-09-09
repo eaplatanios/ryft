@@ -408,11 +408,11 @@ mod tests {
     use crate::partial::PartialValue;
     use crate::programs::{
         EffectClasses, Effects, ExternalReferenceBinding, InputRegionProvenance, Instruction, InstructionId, Operation,
-        OutputRegionProvenance, Program, ProgramBuilder, ReferenceDischargeContext, ReferenceDischargeDriver,
-        ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation,
-        ReferenceSource, ReferenceType, ReferenceViewOperation, ReferenceViewValidationError, RegionInterface,
-        RegionSlot, Type, TypeError, ViewSymbol, discharge_positional_region_operation,
-        discharge_reference_free_operation,
+        OutputRegionProvenance, Program, ProgramBuilder, ReferenceAnalysisError, ReferenceDischargeContext,
+        ReferenceDischargeDriver, ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue,
+        ReferenceDischargeableOperation, ReferenceRoot, ReferenceSource, ReferenceType, ReferenceViewOperation,
+        ReferenceViewValidationError, RegionInterface, RegionSlot, Type, TypeError, ViewSymbol,
+        discharge_positional_region_operation, discharge_reference_free_operation,
     };
     use crate::tracing::{Trace, Tracer, TracingContext};
 
@@ -2990,9 +2990,8 @@ mod tests {
                 .unwrap()
         };
 
-        // Consumption still has no successor state for any carry to hold, so a condition that freezes the entering
-        // allocation is rejected while the region summary can still name it. The minted allocation identity is
-        // process-local, so the assertion pins the diagnostic up to that coordinate.
+        // A condition borrows its entering reference and cannot consume it. The shared analysis reports the source
+        // instruction and input identity, so the diagnostic no longer depends on a discharge environment identifier.
         let mut condition_builder = ProgramBuilder::<TestValue, TestOperation>::new();
         let reference = condition_builder.add_input(reference_type.clone().into());
         condition_builder
@@ -3002,12 +3001,18 @@ mod tests {
         let consuming_condition = condition_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(vec![predicate], vec![Placeholder], vec![Placeholder])
             .unwrap();
-        assert!(matches!(
-            build(consuming_condition, None).discharge_references(0),
-            Err(ProgramError::MalformedProgram(message))
-                if message.starts_with("reference discharge cannot pass reference allocation ")
-                    && message.ends_with(" into a region that consumes it through `reference_freeze`"),
-        ));
+        let source = build(consuming_condition, None);
+        let condition = source.entry_region_ref().instructions()[0].regions()[0];
+        assert_eq!(
+            source.discharge_references(0).unwrap_err(),
+            ReferenceAnalysisError::ExternalReferenceConsumption {
+                operation: "reference_freeze",
+                instruction: InstructionId::new(condition, 0),
+                root: ReferenceRoot::RegionInput { region: condition, input_index: 0 },
+                external_source: ReferenceSource::Input { index: 0 },
+            }
+            .into(),
+        );
 
         // A bounded loop evaluates its condition exactly `bound` times when the bound truncates it, whereas the rotated
         // body would evaluate it once more, so a bounded loop with a mutating condition cannot be rotated.

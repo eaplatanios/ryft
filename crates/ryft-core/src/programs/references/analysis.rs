@@ -8,14 +8,16 @@
 //! [`Operation::allows_reference_access_through_region_input`]) and on [`Type::is_reference`], and
 //! so it knows nothing about arrays, view descriptions, or any particular [`Value`] family.
 //!
-//! This analysis is the shared fact source for everything that reasons about references structurally such as reference
-//! discharge, kernel boundary validation, diagnostics, lowering, and every transform rule that must know which root
-//! an input/operand denotes, how it is accessed, and whether it is a derived view. Consumers obtain it through
-//! [`RegionRef::reference_analysis`], which retains one analysis per region closure in the region's transform cache
-//! so that all of them share a single derivation. [`Instruction`](crate::Instruction) construction uses the incremental
-//! alias and lifetime tracking in [`ProgramBuilder`](crate::ProgramBuilder); canonical builder identity queries consult
-//! the retained analysis when a reference is forwarded through a nested region. The eager
-//! [`Reference`](crate::Reference) runtime enforces concrete lifetimes independently.
+//! Transform rules, kernel boundary validation, diagnostics, and lowering obtain structural facts through
+//! [`RegionRef::reference_analysis`], which retains the analysis in the region's transform cache. Reference discharge
+//! uses the same traversal with the identities bound at the rewritten boundary: two formal inputs can denote the same
+//! caller allocation, and inherited captures belong to the current discharge environment. Those summaries are computed
+//! per attachment and are not stored in the structural cache. They also track references needed by replay without
+//! inventing an access effect for materialization, and ignore constants replay never materializes.
+//! [`Instruction`](crate::Instruction) construction uses the incremental alias and lifetime tracking in
+//! [`ProgramBuilder`](crate::ProgramBuilder); canonical builder identity queries consult the retained analysis when
+//! a reference is forwarded through a nested region. The eager [`Reference`](crate::Reference) runtime enforces
+//! concrete lifetimes independently.
 //!
 //! # Roots and Namespaces
 //!
@@ -747,10 +749,11 @@ impl ReferenceTransitiveAccess {
     }
 }
 
-/// Reference topology, access, and lifetime analysis of one [`Region`] computation closure. Reference discharge,
-/// transform rules, boundary validation, diagnostics, and lowering share this analysis through
-/// [`RegionRef::reference_analysis`]. The analysis runs when a consumer requests it and is retained in the region's
-/// transform cache; constructing a program does not itself require this full traversal.
+/// Reference topology, access, and lifetime analysis of one [`Region`] computation closure. Transform rules, boundary
+/// validation, diagnostics, and lowering share this analysis through [`RegionRef::reference_analysis`]. It runs when
+/// requested and is retained in the region's transform cache; constructing a program does not require this full
+/// traversal. Reference discharge shares the traversal, but supplies caller identities and computes an uncached
+/// boundary summary instead of treating formal inputs as independent roots.
 ///
 /// The analysis resolves every reference-typed value of the closure to exactly one canonical [`ReferenceRoot`] in the
 /// namespace of the region containing it: the region's own reference-typed inputs, its own allocations, and the
@@ -860,28 +863,39 @@ impl ReferenceAnalysis {
                     .then_some(ReferenceRoot::RegionInput { region: region.id(), input_index })
             })
             .collect::<CaptureScope>();
-        let mut traversal = Traversal {
-            entry: region,
-            capture_count,
-            consumable_inputs: consumable_inputs.to_vec(),
-            analysis: Self {
-                region: region.id(),
-                roots: BTreeMap::new(),
-                values: BTreeMap::new(),
-                accesses: Vec::new(),
-                region_input_bindings: Vec::new(),
-                transitive_accesses: BTreeMap::new(),
-                output_roots: Vec::new(),
-            },
-            summaries: HashMap::new(),
-            constant_scope: (resolve_constants && capture_scope.is_none()).then(|| Rc::clone(&scope)),
-            resolve_constants,
-            constant_roots: HashMap::new(),
-        };
-        let summary = traversal.analyze_region(region, scope, vec![None; input_ids.len()].into())?;
+        let mut traversal = Traversal::new(region, capture_count, consumable_inputs);
+        traversal.constant_scope = (resolve_constants && capture_scope.is_none()).then(|| Rc::clone(&scope));
+        traversal.resolve_constants = resolve_constants;
+        let summary = traversal.analyze_region(region, scope, vec![None; input_ids.len()].into(), None)?;
         traversal.analysis.output_roots =
             summary.outputs.into_iter().map(|output| output.map(|(root, _)| root)).collect();
         Ok(traversal.analysis)
+    }
+
+    /// Summarizes a region under supplied reference identities instead of assuming distinct formal inputs.
+    /// This internal path shares structural validation with cached analysis, but analyzes each attachment separately:
+    /// aliases and capture bindings may differ between callers. Unused constants are ignored, as in region replay.
+    ///
+    /// # Parameters
+    ///
+    ///   - `region`: Region whose computation closure is summarized.
+    ///   - `inputs`: Root bound to each reference input, or `None` for a non-reference input. The caller validates
+    ///     their count and types. Equal roots denote aliases, and all supplied roots represent borrowed references.
+    ///   - `captures`: Active capture scope, already rebound to an explicit input prefix when the owner declares one.
+    ///   - `capture_count`: Number of leading inputs in that explicit prefix, or zero for inherited captures. The
+    ///     caller validates the prefix length. This preserves capture/input positions in borrowing diagnostics.
+    ///
+    /// Supplied roots must be region inputs or constants, never local allocations. Allocation roots are created by
+    /// the traversal so that consumption and escape checks retain their defining region. The result is not cached
+    /// and does not expose the per-value records, which can differ between attachments of a shared region.
+    pub(super) fn summarize_boundary<V: Value, O: Operation<Type = V::Type>>(
+        region: RegionRef<'_, V, O>,
+        inputs: &[Option<ReferenceRoot>],
+        captures: &[Option<ReferenceRoot>],
+        capture_count: usize,
+    ) -> Result<RegionSummary, ReferenceAnalysisError> {
+        let mut traversal = Traversal::new(region, capture_count, &[]);
+        traversal.analyze_region(region, captures.into(), vec![None; inputs.len()].into(), Some(inputs))
     }
 
     /// Returns the [`RegionId`] of the analyzed region.
@@ -1002,7 +1016,8 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
 
 impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     /// Returns the [`ReferenceAnalysis`] of this [`Region`]'s closure, retained in the region's transform cache so
-    /// that discharge, kernel validation, and every transform rule consulting the same closure share one analysis.
+    /// that kernel validation and transform rules consulting the same closure share one analysis. Discharge shares
+    /// the traversal through a separate uncached entry point that supplies its boundary identities.
     /// The analysis is a pure structural function of the closure and `capture_count`, because reference-typed capture
     /// constants resolve through [`Value::capture_index`], and it is keyed by the closure's region identifiers as
     /// well, so a topology-preserving import that renumbers regions derives its own entry instead of being served
@@ -1176,9 +1191,11 @@ type CaptureScope = Rc<[Option<ReferenceRoot>]>;
 /// input the operation creates as a view, or [`None`] where the input is a value or a forwarded complete-value handle.
 type BoundaryViews = Rc<[Option<ReferenceAliasEdge>]>;
 
-/// Result of analyzing one region once, in that region's own namespace.
+/// Result of analyzing one region, with nested accesses and materialization requirements included. Structural
+/// analysis uses the region's own namespace and retains this result; boundary analysis uses caller identities and
+/// derives a fresh result for each attachment.
 #[derive(Clone, Debug)]
-struct RegionSummary {
+pub(super) struct RegionSummary {
     /// Capture scope the region was analyzed under.
     scope: CaptureScope,
 
@@ -1187,10 +1204,15 @@ struct RegionSummary {
     boundary: BoundaryViews,
 
     /// Direct and transitive access modes per root, including the region's local allocations.
-    accesses: BTreeMap<ReferenceRoot, BTreeSet<ReferenceAccessMode>>,
+    pub(super) accesses: BTreeMap<ReferenceRoot, BTreeSet<ReferenceAccessMode>>,
+
+    /// Roots needed when replay materializes instruction inputs or region outputs, including inherited captures.
+    /// Collected only for boundary summaries; cached structural analysis does not use this set. Materialization
+    /// alone is not a semantic reference access.
+    pub(super) reached: BTreeSet<ReferenceRoot>,
 
     /// Root and narrowing of each region output, or [`None`] for value outputs.
-    outputs: Vec<Option<(ReferenceRoot, bool)>>,
+    pub(super) outputs: Vec<Option<(ReferenceRoot, bool)>>,
 }
 
 /// One attachment of a nested region, as seen from the attaching instruction.
@@ -1216,8 +1238,10 @@ enum Substituted {
 
 /// Translates a root of an attached region's namespace into the attaching instruction's namespace: the attached
 /// region's own inputs resolve through their bindings, capture roots of enclosing scopes pass through unchanged, and
-/// allocations are local to the attached region or to one of its descendants. A boundary view input is bound to the
-/// complete root of the operand it was created from, so accesses through the view are attributed to that whole root;
+/// allocations created by the attached region are local. An allocation inherited from an enclosing capture scope
+/// remains a caller root; descendants cannot export fresh allocations through their own boundaries. A boundary view
+/// input is bound to the complete root of the operand it was created from, so accesses through the view are attributed
+/// to that whole root;
 /// this is conservative, and consumers that reason about the viewed coordinates do so through the view descriptions.
 fn substitute(root: ReferenceRoot, attached: RegionId, entering: &[Option<ReferenceRoot>]) -> Substituted {
     match root {
@@ -1227,7 +1251,10 @@ fn substitute(root: ReferenceRoot, attached: RegionId, entering: &[Option<Refere
             Substituted::Caller(entering[input_index].unwrap())
         }
         ReferenceRoot::RegionInput { .. } | ReferenceRoot::Constant { .. } => Substituted::Caller(root),
-        ReferenceRoot::Allocation { instruction, .. } => Substituted::Local(instruction),
+        ReferenceRoot::Allocation { instruction, .. } if instruction.region() == attached => {
+            Substituted::Local(instruction)
+        }
+        ReferenceRoot::Allocation { .. } => Substituted::Caller(root),
     }
 }
 
@@ -1312,16 +1339,42 @@ struct Traversal<'r, V: Value, O: Operation<Type = V::Type>> {
 }
 
 impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
-    /// Analyzes `region` under `scope` with the boundary views in `boundary` (one entry per region input), or returns
-    /// its memoized summary when it was analyzed before.
+    /// Creates an empty traversal. Entry input ownership is independent of whether boundary bindings are supplied.
+    fn new(region: RegionRef<'r, V, O>, capture_count: usize, consumable_inputs: &[usize]) -> Self {
+        Self {
+            entry: region,
+            capture_count,
+            consumable_inputs: consumable_inputs.to_vec(),
+            constant_scope: None,
+            resolve_constants: false,
+            constant_roots: HashMap::new(),
+            analysis: ReferenceAnalysis {
+                region: region.id(),
+                roots: BTreeMap::new(),
+                values: BTreeMap::new(),
+                accesses: Vec::new(),
+                region_input_bindings: Vec::new(),
+                transitive_accesses: BTreeMap::new(),
+                output_roots: Vec::new(),
+            },
+            summaries: HashMap::new(),
+        }
+    }
+
+    /// Analyzes `region` under `scope` with the boundary views in `boundary` (one entry per region input). Structural
+    /// analysis reuses a memoized summary; boundary analysis supplies `inputs` and visits every attachment separately
+    /// because its caller identities and capture bindings may differ.
     fn analyze_region(
         &mut self,
         region: RegionRef<'r, V, O>,
         scope: CaptureScope,
         boundary: BoundaryViews,
+        inputs: Option<&[Option<ReferenceRoot>]>,
     ) -> Result<RegionSummary, ReferenceAnalysisError> {
         let region_id = region.id();
-        if let Some(summary) = self.summaries.get(&region_id) {
+        if inputs.is_none()
+            && let Some(summary) = self.summaries.get(&region_id)
+        {
             // An inherited open scope permits unresolved capture constants, whereas an explicitly rebound scope
             // does not, even when both contain the same roots (for example, two empty scopes). Reusing a summary
             // requires the same bindings and the same permission to resolve those constants as external roots.
@@ -1356,12 +1409,29 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
             if !is_reference(input) {
                 continue;
             }
-            let root = ReferenceRoot::RegionInput { region: region_id, input_index };
+            let root = inputs.map_or(ReferenceRoot::RegionInput { region: region_id, input_index }, |inputs| {
+                // Input bindings have been validated by the entry adapter or the attaching instruction.
+                inputs[input_index].unwrap()
+            });
             let source = is_entry.then(|| ReferenceSource::from_flat_input_index(input_index, self.capture_count));
             let alias = boundary[input_index];
-            self.analysis.roots.insert(root, RootRecord { source, ..RootRecord::default() });
+            self.analysis.roots.entry(root).or_insert_with(|| RootRecord { source, ..RootRecord::default() });
             self.analysis.values.insert(value_id(input), ValueRecord { root, narrows: alias.is_some(), alias });
         }
+
+        // Boundary summaries follow replay, which lifts constants only when an instruction input or a region output
+        // uses them. Materialization is distinct from access effects: even an ignored argument has to be supplied.
+        // Structural analysis validates all constants and needs no materialization scan.
+        let materialized = if inputs.is_some() {
+            region
+                .instructions()
+                .iter()
+                .flat_map(|instruction| instruction.inputs().iter().copied())
+                .chain(region.output_ids().iter().copied())
+                .collect::<BTreeSet<_>>()
+        } else {
+            BTreeSet::new()
+        };
 
         // Reference-typed constants resolve through the active capture scope. Materializing one is not an access.
         for (index, atom) in atoms.iter().enumerate() {
@@ -1372,6 +1442,9 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                 continue;
             }
             let atom_id = AtomId::new(index);
+            if inputs.is_some() && !materialized.contains(&atom_id) {
+                continue;
+            }
             let capture_index = constant.capture_index();
             let root = match capture_index.and_then(|index| scope.get(index).copied().flatten()) {
                 Some(root) => root,
@@ -1411,6 +1484,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
             scope: Rc::clone(&scope),
             boundary: Rc::clone(&boundary),
             accesses: BTreeMap::new(),
+            reached: BTreeSet::new(),
             outputs: Vec::new(),
         };
         let mut consumed = BTreeMap::<ReferenceRoot, InstructionId>::new();
@@ -1526,29 +1600,6 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                     .map_err(|error| malformed(format!("attached region {attached_id} cannot be resolved: {error}")))?;
                 let nested_inputs = nested.input_ids();
                 let nested_is_reference = |input: AtomId| nested.atoms()[input.index()].r#type().is_reference();
-                let nested_scope = match operation.region_capture_input_count(region_index) {
-                    None => Rc::clone(&scope),
-                    Some(count) => {
-                        if count > nested_inputs.len() {
-                            return Err(ReferenceAnalysisError::InvalidCaptureScope {
-                                region: attached_id,
-                                message: format!(
-                                    "operation `{name}` at {id} declares a capture prefix of {count} inputs but the \
-                                     region has {} inputs",
-                                    nested_inputs.len(),
-                                ),
-                            });
-                        }
-                        nested_inputs[..count]
-                            .iter()
-                            .enumerate()
-                            .map(|(input_index, input)| {
-                                nested_is_reference(*input)
-                                    .then_some(ReferenceRoot::RegionInput { region: attached_id, input_index })
-                            })
-                            .collect()
-                    }
-                };
                 let mut entering = Vec::with_capacity(nested_inputs.len());
                 let mut boundary = Vec::with_capacity(nested_inputs.len());
                 for (input_index, input) in nested_inputs.iter().copied().enumerate() {
@@ -1598,7 +1649,45 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                         narrows: true,
                     }));
                 }
-                let nested_summary = self.analyze_region(nested, nested_scope, boundary.into())?;
+                let nested_scope = match operation.region_capture_input_count(region_index) {
+                    None => Rc::clone(&scope),
+                    Some(count) => {
+                        if count > nested_inputs.len() {
+                            return Err(ReferenceAnalysisError::InvalidCaptureScope {
+                                region: attached_id,
+                                message: format!(
+                                    "operation `{name}` at {id} declares a capture prefix of {count} inputs but the \
+                                     region has {} inputs",
+                                    nested_inputs.len(),
+                                ),
+                            });
+                        }
+                        nested_inputs[..count]
+                            .iter()
+                            .enumerate()
+                            .map(|(input_index, input)| {
+                                nested_is_reference(*input).then(|| {
+                                    if inputs.is_some() {
+                                        entering[input_index].unwrap()
+                                    } else {
+                                        ReferenceRoot::RegionInput { region: attached_id, input_index }
+                                    }
+                                })
+                            })
+                            .collect()
+                    }
+                };
+                let nested_summary = self.analyze_region(
+                    nested,
+                    nested_scope,
+                    boundary.into(),
+                    inputs.is_some().then_some(entering.as_slice()),
+                )?;
+                for root in &nested_summary.reached {
+                    if let Substituted::Caller(root) = substitute(*root, attached_id, &entering) {
+                        summary.reached.insert(root);
+                    }
+                }
                 for (nested_root, modes) in &nested_summary.accesses {
                     let Substituted::Caller(root) = substitute(*nested_root, attached_id, &entering) else {
                         continue;
@@ -1691,6 +1780,12 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
             }
         }
 
+        summary.reached.extend(
+            materialized
+                .into_iter()
+                .filter_map(|atom| self.analysis.values.get(&value_id(atom)).map(|record| record.root)),
+        );
+
         // Every reference-typed atom of a sealed region is an input, a constant, or an instruction output, each of
         // which the traversal above either bound or rejected, so the lookup cannot fail here.
         summary.outputs = region
@@ -1704,7 +1799,9 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                 })
             })
             .collect();
-        self.summaries.insert(region_id, summary.clone());
+        if inputs.is_none() {
+            self.summaries.insert(region_id, summary.clone());
+        }
         Ok(summary)
     }
 
@@ -3657,6 +3754,210 @@ mod tests {
                 expected,
                 actual,
             }) if instruction == id(2, 0) && expected == input_root(2, 0) && actual == input_root(2, 1),
+        ));
+    }
+
+    #[test]
+    fn test_reference_analysis_summarize_boundary() {
+        let mut builder = TestBuilder::new();
+        let reference = builder.add_input(reference_type(0));
+        let payload = builder.add_input(value_type(0));
+        let captured = builder.add_constant(capture(0, 0));
+        builder.add_instruction(TestOperation::Write, Vec::new(), vec![reference, payload], None).unwrap();
+        let program = build(builder, vec![captured]);
+        let root = input_root(0, 0);
+        let summary =
+            ReferenceAnalysis::summarize_boundary(program.entry_region_ref(), &[Some(root), None], &[Some(root)], 0)
+                .unwrap();
+
+        // The returned capture and the written input denote one caller allocation. Returning the capture adds no
+        // read effect, but its identity must be available to replay and to output-boundary reconstruction.
+        assert_eq!(summary.reached, BTreeSet::from([root]));
+        assert_eq!(summary.accesses, BTreeMap::from([(root, BTreeSet::from([ReferenceAccessMode::Write]))]));
+        assert_eq!(summary.outputs, vec![Some((root, false))]);
+    }
+
+    #[test]
+    fn test_reference_analysis_summarize_boundary_validates_bound_output_identities() {
+        let mut first_branch = TestBuilder::new();
+        let first = first_branch.add_input(reference_type(0));
+        first_branch.add_input(reference_type(0));
+        let first_branch = build(first_branch, vec![first]);
+        let mut second_branch = TestBuilder::new();
+        second_branch.add_input(reference_type(0));
+        let second = second_branch.add_input(reference_type(0));
+        let second_branch = build(second_branch, vec![second]);
+        let mut builder = TestBuilder::new();
+        let condition = builder.add_input(value_type(0));
+        let first = builder.add_input(reference_type(0));
+        let second = builder.add_input(reference_type(0));
+        let first_branch = builder.import_region(first_branch.entry_region_ref());
+        let second_branch = builder.import_region(second_branch.entry_region_ref());
+        let output = builder
+            .add_instruction(
+                TestOperation::Condition,
+                vec![first_branch, second_branch],
+                vec![condition, first, second],
+                None,
+            )
+            .unwrap()[0];
+        let program = build(builder, vec![output]);
+        let region = program.entry_region_ref();
+        let first = ReferenceRoot::RegionInput { region: region.id(), input_index: 1 };
+        let second = ReferenceRoot::RegionInput { region: region.id(), input_index: 2 };
+
+        // The branches may forward different formal inputs only when the supplied identities agree. The ordinary
+        // cached analysis still validates the program under independent formal inputs.
+        let summary = ReferenceAnalysis::summarize_boundary(region, &[None, Some(first), Some(first)], &[], 0).unwrap();
+        assert_eq!(summary.outputs, vec![Some((first, false))]);
+        assert!(matches!(
+            ReferenceAnalysis::summarize_boundary(region, &[None, Some(first), Some(second)], &[], 0),
+            Err(ReferenceAnalysisError::ReferenceRootMismatch { expected, actual, .. })
+                if expected == first && actual == second,
+        ));
+        assert!(matches!(region.reference_analysis(0), Err(ReferenceAnalysisError::ReferenceRootMismatch { .. })));
+    }
+
+    #[test]
+    fn test_reference_analysis_summarize_boundary_rebinds_shared_regions() {
+        let mut callee = TestBuilder::new();
+        callee.add_input(reference_type(0));
+        let captured = callee.add_constant(capture(0, 0));
+        callee.add_instruction(TestOperation::Read, Vec::new(), vec![captured], None).unwrap();
+        let callee = build(callee, Vec::new());
+        let mut builder = TestBuilder::new();
+        let first = builder.add_input(reference_type(0));
+        let second = builder.add_input(reference_type(0));
+        let callee = builder.import_region(callee.entry_region_ref());
+        builder
+            .add_instruction(TestOperation::CallWithCaptures(1), vec![callee], vec![first], None)
+            .unwrap();
+        builder
+            .add_instruction(TestOperation::CallWithCaptures(1), vec![callee], vec![second], None)
+            .unwrap();
+        let program = build(builder, Vec::new());
+        let region = program.entry_region_ref();
+        let first = ReferenceRoot::RegionInput { region: region.id(), input_index: 0 };
+        let second = ReferenceRoot::RegionInput { region: region.id(), input_index: 1 };
+        let summary = ReferenceAnalysis::summarize_boundary(region, &[Some(first), Some(second)], &[], 0).unwrap();
+
+        // Both attachments execute the same callee with a different capture binding. Neither may reuse facts
+        // specialized for the other attachment, and the enclosing summary must include both reads.
+        assert_eq!(summary.reached, BTreeSet::from([first, second]));
+        assert_eq!(
+            summary.accesses,
+            BTreeMap::from([
+                (first, BTreeSet::from([ReferenceAccessMode::Read])),
+                (second, BTreeSet::from([ReferenceAccessMode::Read])),
+            ])
+        );
+    }
+
+    #[test]
+    fn test_reference_analysis_summarize_boundary_ignores_unused_constants() {
+        let mut builder = TestBuilder::new();
+        builder.add_constant(capture(3, 0));
+        let program = build(builder, Vec::new());
+        let summary = ReferenceAnalysis::summarize_boundary(program.entry_region_ref(), &[], &[], 0).unwrap();
+        assert_eq!(summary.reached, BTreeSet::new());
+        assert_eq!(summary.accesses, BTreeMap::new());
+        assert_eq!(summary.outputs, Vec::new());
+
+        // Boundary analysis follows replay materialization; the existing structural entry point remains strict.
+        assert!(matches!(
+            program.reference_analysis(0),
+            Err(ReferenceAnalysisError::InvalidReferenceCapture { capture_index: 3, capture_count: 0, .. })
+        ));
+        let mut builder = TestBuilder::new();
+        let captured = builder.add_constant(capture(3, 0));
+        let program = build(builder, vec![captured]);
+        assert!(matches!(
+            ReferenceAnalysis::summarize_boundary(program.entry_region_ref(), &[], &[], 0),
+            Err(ReferenceAnalysisError::InvalidReferenceCapture { capture_index: 3, capture_count: 0, .. }),
+        ));
+    }
+
+    #[test]
+    fn test_reference_analysis_summarize_boundary_preserves_local_capture_ownership() {
+        let mut callee = TestBuilder::new();
+        let captured = callee.add_constant(capture(0, 0));
+        let callee = build(callee, vec![captured]);
+        let mut outer = TestBuilder::new();
+        outer.add_input(reference_type(0));
+        let callee = outer.import_region(callee.entry_region_ref());
+        let output = outer.add_instruction(TestOperation::Call, vec![callee], Vec::new(), None).unwrap()[0];
+        let outer = build(outer, vec![output]);
+        let mut builder = TestBuilder::new();
+        let payload = builder.add_input(value_type(0));
+        let local = builder.add_instruction(TestOperation::New, Vec::new(), vec![payload], None).unwrap()[0];
+        let outer = builder.import_region(outer.entry_region_ref());
+        let output =
+            builder.add_instruction(TestOperation::CallWithCaptures(1), vec![outer], vec![local], None).unwrap()[0];
+        let program = build(builder, vec![output]);
+        let region = program.entry_region_ref();
+        let root = ReferenceRoot::Allocation { instruction: InstructionId::new(region.id(), 0), output_index: 0 };
+
+        // Both nested calls return the allocation created by their caller. Capturing it does not turn it into a
+        // fresh allocation of either nested region, so the escape checks must allow both returns.
+        let summary = ReferenceAnalysis::summarize_boundary(region, &[None], &[], 0).unwrap();
+        assert_eq!(summary.outputs, vec![Some((root, false))]);
+        assert_eq!(summary.accesses, BTreeMap::new());
+        assert_eq!(region.reference_analysis(0).unwrap().output_roots(), &[Some(root)]);
+    }
+
+    #[test]
+    fn test_reference_analysis_summarize_boundary_rejects_use_after_consume() {
+        let mut builder = TestBuilder::new();
+        let payload = builder.add_input(value_type(0));
+        let local = builder.add_instruction(TestOperation::New, Vec::new(), vec![payload], None).unwrap()[0];
+        builder.add_instruction(TestOperation::Consume, Vec::new(), vec![local], None).unwrap();
+        let output = builder.add_variable(value_type(0));
+        // Construct an invalid instruction explicitly: the checked builder would already reject this access.
+        builder.add_instruction_unchecked(Instruction::new(TestOperation::Read, vec![local], vec![output], Vec::new()));
+        let program = build(builder, vec![output]);
+        assert!(matches!(
+            ReferenceAnalysis::summarize_boundary(program.entry_region_ref(), &[None], &[], 0),
+            Err(ReferenceAnalysisError::UseAfterConsume {
+                operation: "test.read", instruction, root, consumer, consumer_operation: "test.consume",
+            }) if instruction == id(0, 2) && root == allocation_root(0, 0, 0) && consumer == id(0, 1),
+        ));
+    }
+
+    #[test]
+    fn test_reference_analysis_summarize_boundary_rejects_consumption_through_views() {
+        let mut builder = TestBuilder::new();
+        let payload = builder.add_input(value_type(0));
+        let local = builder.add_instruction(TestOperation::New, Vec::new(), vec![payload], None).unwrap()[0];
+        let view = builder.add_instruction(TestOperation::View, Vec::new(), vec![local], None).unwrap()[0];
+        let output = builder.add_variable(value_type(0));
+        builder.add_instruction_unchecked(Instruction::new(
+            TestOperation::Consume,
+            vec![view],
+            vec![output],
+            Vec::new(),
+        ));
+        let program = build(builder, vec![output]);
+        assert!(matches!(
+            ReferenceAnalysis::summarize_boundary(program.entry_region_ref(), &[None], &[], 0),
+            Err(ReferenceAnalysisError::ConsumptionThroughView {
+                operation: "test.consume", instruction, input_index: 0, root,
+            }) if instruction == id(0, 2) && root == allocation_root(0, 0, 0),
+        ));
+    }
+
+    #[test]
+    fn test_reference_analysis_summarize_boundary_preserves_capture_diagnostics() {
+        let mut builder = TestBuilder::new();
+        let captured = builder.add_input(reference_type(0));
+        let output = builder.add_instruction(TestOperation::Consume, Vec::new(), vec![captured], None).unwrap()[0];
+        let program = build(builder, vec![output]);
+        let root = input_root(0, 0);
+        assert!(matches!(
+            ReferenceAnalysis::summarize_boundary(program.entry_region_ref(), &[Some(root)], &[Some(root)], 1),
+            Err(ReferenceAnalysisError::ExternalReferenceConsumption {
+                operation: "test.consume", instruction, root: actual,
+                external_source: ReferenceSource::Capture { index: 0 },
+            }) if instruction == id(0, 0) && actual == root,
         ));
     }
 

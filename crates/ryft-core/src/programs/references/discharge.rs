@@ -139,7 +139,7 @@
 
 use std::borrow::Cow;
 use std::cell::{Ref, RefCell};
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::{Debug, Display};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -153,13 +153,13 @@ use crate::parameters::{Parameterized, Placeholder};
 use crate::programs::ProgramError;
 use crate::programs::atoms::AtomId;
 use crate::programs::effects::ReferenceAccessMode;
-use crate::programs::instructions::{Instruction, InstructionId};
+use crate::programs::instructions::InstructionId;
 use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
+use crate::programs::references::analysis::{ReferenceAnalysis, ReferenceRoot};
 use crate::programs::references::types::ReferenceType;
 use crate::programs::regions::{
-    EmptyRegionDriver, InputRegionProvenance, RegionDriver, RegionId, RegionRef, RegionReplayMappings, RegionRole,
-    ReplayRegionDriver,
+    EmptyRegionDriver, RegionDriver, RegionId, RegionRef, RegionReplayMappings, ReplayRegionDriver,
 };
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::{Value, ValueId};
@@ -180,10 +180,10 @@ pub enum ReferenceDischargeTarget {
     /// Entry-boundary allocation supplied by the caller as a lifted capture or a public reference argument.
     External(ReferenceSource),
 
-    /// Interior allocation target, identified by the allocating [`Instruction`] and the output position that defines
-    /// the fresh allocation.
+    /// Interior allocation target, identified by the allocating [`Instruction`](crate::Instruction) and the output
+    /// position that defines the fresh allocation.
     Internal {
-        /// Allocating [`Instruction`].
+        /// Allocating [`Instruction`](crate::Instruction).
         instruction: InstructionId,
 
         /// Output position defining the fresh allocation.
@@ -306,7 +306,7 @@ impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Pa
     /// boundary types and the generic [`Operation::effects`] declarations over the attached [`Region`](crate::Region)
     /// closure, so it does not run the discharge rewrite or construct its environments, and callers can enumerate
     /// selectable targets without paying for either. Allocations inside nested regions are included because every
-    /// allocating [`Instruction`] defines a concrete local reference wherever it occurs.
+    /// allocating [`Instruction`](crate::Instruction) defines a concrete local reference wherever it occurs.
     ///
     /// One class of enumerated targets is inert: an allocation inside a closure that no operation ever replays, such
     /// as the dormant derivative rule region of a [`CustomJvpOperation`](crate::CustomJvpOperation). Discharge rejects
@@ -1427,9 +1427,10 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeRegionResult<V, O
 
 /// Transitive reference-access summary of a [`Region`](crate::Region) closure, expressed in the caller allocations
 /// its boundary names. This is the analysis a structured rule needs before it can size its state boundary, and it is
-/// computed entirely from generic hooks (i.e., operation-local [`Operation::effects`], the input- and output-region
-/// provenance hooks, reference-output identity, and recursive summaries of nested regions). Allocations created
-/// inside the closure are deliberately absent as they belong to no caller and cross no boundary.
+/// derived by the shared [`ReferenceAnalysis`] traversal from generic operation effects and region provenance. Unlike
+/// cached structural analysis, it substitutes this caller's allocation bindings before validating reference identities
+/// and analyzes each attachment under its own capture scope. Allocations created inside the closure are deliberately
+/// absent as they belong to no caller and cross no boundary.
 ///
 /// The summary separates reachability from semantic access. The reached set holds every caller allocation the closure's
 /// replay must be able to resolve, including a capture constant that is only rematerialized and passed along, and is
@@ -1460,8 +1461,8 @@ impl ReferenceDischargeRegionSummary {
     /// another operation is reachable without being read or written. Such a reference still needs a boundary binding,
     /// but contributes no semantic access mode.
     ///
-    /// The traversal uses [`Operation::effects`], [`Operation::input_region_provenance`], and
-    /// [`Operation::output_region_provenance`] to follow allocations and aliases. An output constrained by
+    /// The shared [`ReferenceAnalysis`] traversal uses [`Operation::effects`], [`Operation::input_region_provenance`],
+    /// and [`Operation::output_region_provenance`] to follow allocations and aliases. An output constrained by
     /// [`Operation::reference_output_identity_input`] must agree with every region output it forwards. Allocations
     /// created within the closure retain their identities while nested boundaries are checked, then are omitted from
     /// this caller-facing summary. In particular, allocating a reference in an outer region does not exempt its
@@ -1469,11 +1470,12 @@ impl ReferenceDischargeRegionSummary {
     /// consume its own allocation, but cannot consume a reference supplied by its parent or return a nested region's
     /// fresh allocation through that region's boundary.
     ///
-    /// Only [`RegionRole::Computation`] regions contribute to the summary. Dormant [`RegionRole::Rule`] regions
-    /// are inputs to later transforms. Those transforms bind and validate their reference inputs separately.
-    /// [`Operation::region_capture_input_count`] determines whether the region inherits `captures` or binds a fresh
-    /// scope from its leading inputs. Reference constants used by an instruction or region output resolve through
-    /// that scope. Unused constants contribute no reachability, matching [`RegionRef::interpret_with`].
+    /// Only [`RegionRole::Computation`](crate::RegionRole::Computation) regions contribute to the summary. Dormant
+    /// [`RegionRole::Rule`](crate::RegionRole::Rule) regions are inputs to later transforms. Those transforms bind and
+    /// validate their reference inputs separately. [`Operation::region_capture_input_count`] determines whether the
+    /// region inherits `captures` or binds a fresh scope from its leading inputs. Reference constants used by an
+    /// instruction or region output resolve through that scope. Unused constants contribute no reachability,
+    /// matching [`RegionRef::interpret_with`].
     ///
     /// # Parameters
     ///
@@ -1487,8 +1489,10 @@ impl ReferenceDischargeRegionSummary {
     /// # Errors
     ///
     /// Returns [`ProgramError::InvalidInputCount`] when `inputs` has the wrong length, or
-    /// [`ProgramError::MalformedProgram`] for inconsistent input bindings, capture scopes, reference provenance,
-    /// output identities, escaping allocations, consumption across region boundaries, or forbidden access modes.
+    /// [`ProgramError::MalformedProgram`] for inconsistent input bindings, the attaching operation's
+    /// capture prefix, or its access policy. Shared reference validation errors are preserved through
+    /// [`ReferenceError::Analysis`](crate::ReferenceError::Analysis), including invalid nested scopes,
+    /// output identities, views, escaping allocations, and consumption across region boundaries.
     pub fn new<V: Value, O: Operation<Type = V::Type>, Owner: Operation>(
         operation: &Owner,
         region_index: usize,
@@ -1510,40 +1514,82 @@ impl ReferenceDischargeRegionSummary {
             }
         }
 
-        let inputs = inputs.iter().map(|allocation| allocation.map(ReferenceDischargeRoot::Caller)).collect::<Vec<_>>();
-        let captures = captures
-            .allocations()
+        // Give each caller allocation one source-program representative. Repeated inputs and input/capture aliases
+        // must share that representative before the analysis checks output identities, not merely in the final map.
+        let mut roots = BTreeMap::new();
+        let inputs = inputs
             .iter()
-            .map(|allocation| allocation.map(ReferenceDischargeRoot::Caller))
+            .enumerate()
+            .map(|(input_index, allocation)| {
+                allocation.map(|allocation| {
+                    *roots.entry(allocation).or_insert(ReferenceRoot::RegionInput { region: region.id(), input_index })
+                })
+            })
             .collect::<Vec<_>>();
-        let summary = ReferenceDischargeSummaryState::new(operation, region_index, region, &inputs, &captures)?;
+        let capture_count = operation.region_capture_input_count(region_index);
+        let captures = match capture_count {
+            Some(count) => inputs.get(..count).ok_or_else(|| ProgramError::MalformedProgram(format!(
+                "reference discharge cannot establish a capture prefix of {} for region `{}`, which declares {} inputs",
+                count, region.id(), inputs.len(),
+            )))?.to_vec(),
+            None => {
+                // Captures already represented by inputs need no scan. Otherwise, choose source constants for the
+                // remaining caller allocations; the shared traversal determines which captures replay actually uses.
+                if captures.allocations().iter().flatten().any(|allocation| !roots.contains_key(allocation)) {
+                    for nested in region.computation_regions() {
+                        for (index, atom) in nested.atoms().iter().enumerate() {
+                            if let Some(constant) = atom.as_constant()
+                                && constant.r#type().is_reference()
+                                && let Some(allocation) = constant.capture_index()
+                                    .and_then(|index| captures.allocations().get(index).copied().flatten())
+                            {
+                                roots.entry(allocation).or_insert(ReferenceRoot::Constant {
+                                    value: ValueId::new(nested.id(), AtomId::new(index)),
+                                });
+                            }
+                        }
+                    }
+                }
+                captures.allocations().iter()
+                    .map(|allocation| allocation.and_then(|allocation| roots.get(&allocation).copied()))
+                    .collect()
+            }
+        };
+        let summary = ReferenceAnalysis::summarize_boundary(region, &inputs, &captures, capture_count.unwrap_or(0))?;
+        let allocations = roots.into_iter().map(|(allocation, root)| (root, allocation)).collect::<BTreeMap<_, _>>();
 
-        // Local allocations have served their validation role. They do not identify caller state, including when
-        // returned by this region, so the public summary exposes only the supplied discharge allocation identities.
+        // The shared traversal checks nested access policies and local allocation ownership. The attaching operation
+        // is outside that traversal, so check its policy here, only for roots supplied by this caller.
+        let accessed_allocations = summary
+            .accesses
+            .into_iter()
+            .filter_map(|(root, modes)| allocations.get(&root).map(|allocation| (*allocation, modes)))
+            .collect::<BTreeMap<_, _>>();
+        if let Some((allocation, mode)) = accessed_allocations
+            .iter()
+            .flat_map(|(allocation, modes)| modes.iter().copied().map(move |mode| (*allocation, mode)))
+            .find(|(_, mode)| !operation.allows_reference_access_through_region_input(region_index, *mode))
+        {
+            return Err(ProgramError::MalformedProgram(format!(
+                "operation `{}` does not allow region {} to access {} with mode `{}`",
+                operation.name(),
+                region_index,
+                allocation,
+                mode,
+            )));
+        }
+
         Ok(Self {
             reached_allocations: summary
-                .reached_allocations
+                .reached
                 .into_iter()
-                .filter_map(|root| match root {
-                    ReferenceDischargeRoot::Caller(allocation) => Some(allocation),
-                    ReferenceDischargeRoot::Local(_) => None,
-                })
+                .filter_map(|root| allocations.get(&root).copied())
                 .collect(),
-            accessed_allocations: summary
-                .accessed_allocations
-                .into_iter()
-                .filter_map(|(root, modes)| match root {
-                    ReferenceDischargeRoot::Caller(allocation) => Some((allocation, modes)),
-                    ReferenceDischargeRoot::Local(_) => None,
-                })
-                .collect(),
+            accessed_allocations,
             output_allocations: summary
-                .output_allocations
+                .outputs
                 .into_iter()
-                .map(|root| match root {
-                    Some(ReferenceDischargeRoot::Caller(allocation)) => Some(allocation),
-                    _ => None,
-                })
+                .map(|output| output.and_then(|(root, _)| allocations.get(&root).copied()))
                 .collect(),
         })
     }
@@ -1614,392 +1660,6 @@ impl ReferenceDischargeRegionSummary {
         for (allocation, modes) in &other.accessed_allocations {
             self.accessed_allocations.entry(*allocation).or_default().extend(modes.iter().copied());
         }
-    }
-}
-
-/// Reference identity retained while validating a [`ReferenceDischargeRegionSummary`]. Source-local identities must not
-/// be erased until nested regions have checked their incoming references, but never enter a caller-facing summary.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum ReferenceDischargeRoot {
-    /// Allocation already bound by the caller's discharge context.
-    Caller(ReferenceDischargeAllocationId),
-
-    /// Reference allocated inside the summarized closure, identified by its defining source value.
-    Local(ValueId),
-}
-
-impl ReferenceDischargeRoot {
-    /// Returns whether this root was allocated in `region` rather than supplied by its caller.
-    fn is_local_to(self, region: RegionId) -> bool {
-        matches!(self, Self::Local(value) if value.region() == region)
-    }
-}
-
-impl Display for ReferenceDischargeRoot {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Caller(allocation) => Display::fmt(allocation, formatter),
-            Self::Local(value) => {
-                write!(formatter, "local reference `{}` in region `{}`", value.atom(), value.region())
-            }
-        }
-    }
-}
-
-/// Intermediate summary retaining source-local reference identities across nested region boundaries. Each region
-/// removes accesses to its own allocations only after validating its children; output identities remain available
-/// to its parent for forwarding and escape checks.
-#[derive(Default)]
-struct ReferenceDischargeSummaryState {
-    /// Incoming [`ReferenceDischargeRoot`]s whose state or reference must be available during replay,
-    /// even without an access.
-    reached_allocations: BTreeSet<ReferenceDischargeRoot>,
-
-    /// Exact non-consuming [`ReferenceAccessMode`]s performed through incoming [`ReferenceDischargeRoot`]s.
-    accessed_allocations: BTreeMap<ReferenceDischargeRoot, BTreeSet<ReferenceAccessMode>>,
-
-    /// [`ReferenceDischargeRoot`]s denoted by declared outputs, retaining locally created references
-    /// for the parent's escape checks.
-    output_allocations: Vec<Option<ReferenceDischargeRoot>>,
-}
-
-impl ReferenceDischargeSummaryState {
-    /// Summarizes `region` using caller and source-local identities. `inputs` names its declared input roots, while
-    /// `captures` is the enclosing capture scope. `operation` and `region_index` determine the region's capture and
-    /// access rules.
-    fn new<V: Value, O: Operation<Type = V::Type>, Owner: Operation>(
-        operation: &Owner,
-        region_index: usize,
-        region: RegionRef<'_, V, O>,
-        inputs: &[Option<ReferenceDischargeRoot>],
-        captures: &[Option<ReferenceDischargeRoot>],
-    ) -> Result<Self, ProgramError> {
-        // A nested capture prefix binds the same roots as its inputs, including allocations created in an outer
-        // region. Keep those local roots until each nested region has validated its incoming references.
-        let captures = match operation.region_capture_input_count(region_index) {
-            Some(count) => inputs.get(..count).ok_or_else(|| ProgramError::MalformedProgram(format!(
-                "reference discharge cannot establish a capture prefix of {} for region `{}`, which declares {} inputs",
-                count, region.id(), inputs.len(),
-            )))?,
-            None => captures,
-        };
-
-        let mut summary = Self::default();
-        let is_reference = |atom: AtomId| region.atoms()[atom.index()].r#type().is_reference();
-        let mut allocations = region
-            .input_ids()
-            .iter()
-            .copied()
-            .zip(inputs)
-            .filter(|(input, _)| is_reference(*input))
-            .map(|(input, allocation)| {
-                let allocation = allocation.ok_or_else(|| {
-                    ProgramError::MalformedProgram(format!(
-                        "reference input `{}` of region `{}` has no supplying allocation",
-                        input,
-                        region.id(),
-                    ))
-                })?;
-                Ok((input, allocation))
-            })
-            .collect::<Result<HashMap<_, _>, ProgramError>>()?;
-
-        // A capture-scoped constant is seeded exactly like a boundary position. Materializing one makes its allocation
-        // reachable during replay but is not itself a semantic reference read; actual accesses are recorded from
-        // operation effect declarations below. Which constants are materialized must agree with the dead-constant rule
-        // of `RegionRef::interpret_with`, which lifts a constant only when an instruction input or a region output uses
-        // it; diverging would thread too little (the rebuilt region fails to lift) or too much.
-        let materialized_atoms = region
-            .instructions()
-            .iter()
-            .flat_map(|instruction| instruction.inputs().iter().copied())
-            .chain(region.output_ids().iter().copied())
-            .collect::<HashSet<_>>();
-        region
-            .atoms()
-            .iter()
-            .enumerate()
-            .filter_map(|(atom_index, atom)| {
-                let constant = atom.as_constant().filter(|constant| constant.r#type().is_reference())?;
-                let allocation = constant.capture_index().and_then(|index| captures.get(index).copied().flatten())?;
-                Some((AtomId::new(atom_index), allocation))
-            })
-            .for_each(|(atom_id, allocation)| {
-                allocations.insert(atom_id, allocation);
-                if materialized_atoms.contains(&atom_id) {
-                    summary.reached_allocations.insert(allocation);
-                }
-            });
-
-        let input_atom = |instruction: &Instruction<O>, index: usize, role: &str| {
-            instruction.inputs().get(index).copied().ok_or_else(|| {
-                ProgramError::MalformedProgram(format!(
-                    "operation `{}` names {} input {} but the application has {} inputs",
-                    instruction.operation().name(),
-                    role,
-                    index,
-                    instruction.inputs().len(),
-                ))
-            })
-        };
-
-        // A reference-typed atom the traversal never bound denotes a reference that entered this region neither through
-        // its boundary nor through its capture scope. The environment has no allocation for it, so the summary reports
-        // it here rather than dropping the access and letting the replay fail later for a reason that no longer names
-        // the operation that performed it.
-        let resolve =
-            |allocations: &HashMap<AtomId, ReferenceDischargeRoot>, atom: AtomId, operation: &str| match allocations
-                .get(&atom)
-            {
-                Some(allocation) => Ok(Some(*allocation)),
-                None if is_reference(atom) => Err(ProgramError::MalformedProgram(format!(
-                    "operation `{}` reaches a reference that entered region `{}` neither through its boundary \
-                     nor through its capture scope",
-                    operation,
-                    region.id(),
-                ))),
-                None => Ok(None),
-            };
-        for instruction in region.instructions() {
-            let nested_operation = instruction.operation();
-            let effects = nested_operation.effects();
-            for (input_index, mode) in effects.accesses() {
-                let accessed = input_atom(instruction, input_index, "an accessed")?;
-                if let Some(allocation) = resolve(&allocations, accessed, nested_operation.name())? {
-                    // Consumption is valid only for a reference created in this region. In particular, a local
-                    // allocation of an outer region is still borrowed by this region and cannot be consumed here.
-                    if mode.is_consuming() {
-                        if !allocation.is_local_to(region.id()) {
-                            return Err(ProgramError::MalformedProgram(format!(
-                                "reference discharge cannot pass {} into a region that consumes it through `{}`",
-                                allocation,
-                                nested_operation.name(),
-                            )));
-                        }
-                    } else {
-                        summary.reached_allocations.insert(allocation);
-                        summary.accessed_allocations.entry(allocation).or_default().insert(mode);
-                    }
-                }
-            }
-
-            let classified_output = |output_index: usize| {
-                instruction.outputs().get(output_index).copied().ok_or_else(|| {
-                    ProgramError::MalformedProgram(format!(
-                        "operation `{}` classifies output {} but the application has {} outputs",
-                        nested_operation.name(),
-                        output_index,
-                        instruction.outputs().len(),
-                    ))
-                })
-            };
-
-            for output_index in effects.allocation_output_indices() {
-                let output = classified_output(output_index)?;
-                allocations.insert(output, ReferenceDischargeRoot::Local(ValueId::new(region.id(), output)));
-            }
-
-            for alias in effects.reference_aliases() {
-                let defined = classified_output(alias.output_index())?;
-                let allocation = resolve(
-                    &allocations,
-                    input_atom(instruction, alias.input_index(), "an aliased")?,
-                    nested_operation.name(),
-                )?;
-                let allocation = allocation.ok_or_else(|| {
-                    ProgramError::MalformedProgram(format!(
-                        "operation `{}` aliases a non-reference input",
-                        nested_operation.name(),
-                    ))
-                })?;
-                allocations.insert(defined, allocation);
-            }
-
-            let mut attached_output_allocations = Vec::with_capacity(instruction.regions().len());
-            for (nested_region_index, attached) in instruction.regions().iter().copied().enumerate() {
-                // Dormant rule regions are inputs to later transforms rather than executed children of this
-                // instruction, exactly as for effects and for the reference analysis: their reference-typed inputs are
-                // bound by the transform that instantiates them rather than by this instruction's operands, so they
-                // declare no input provenance and are neither entered nor folded into this summary. The placeholder
-                // keeps region indices aligned for output provenance, which may only name computation regions.
-                if nested_operation.region_role(nested_region_index) == Some(RegionRole::Rule) {
-                    attached_output_allocations.push(Vec::new());
-                    continue;
-                }
-
-                let attached = region.with_id(attached)?;
-                let nested = attached
-                    .input_ids()
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .map(|(input_index, input)| {
-                        if !attached.atoms()[input.index()].r#type().is_reference() {
-                            return Ok(None);
-                        }
-                        // A boundary view reads and writes the source input's allocation just like a forwarded handle,
-                        // so this allocation-only summary intentionally ignores the provenance variant.
-                        let Some(provenance) =
-                            nested_operation.input_region_provenance(nested_region_index, input_index)
-                        else {
-                            return Err(ProgramError::MalformedProgram(format!(
-                                "operation `{}` passes a reference into region {nested_region_index} input \
-                                 {input_index} without declaring which input supplies it",
-                                nested_operation.name(),
-                            )));
-                        };
-                        let supplying_index = match provenance {
-                            InputRegionProvenance::Forwarded { input_index }
-                            | InputRegionProvenance::View { input_index } => input_index,
-                        };
-                        let atom = input_atom(instruction, supplying_index, "a region")?;
-                        resolve(&allocations, atom, nested_operation.name())
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-
-                // The nested closure is summarized on its own first, so that an operation restricting what its regions
-                // may do to an entering allocation is held to that restriction here, where the offending region is
-                // still named, rather than only indirectly when a rebuilt region contradicts the widening it was given.
-                let nested_summary =
-                    Self::new(nested_operation, nested_region_index, attached, nested.as_slice(), captures)?;
-                summary.reached_allocations.extend(nested_summary.reached_allocations);
-                nested_summary.accessed_allocations.into_iter().for_each(|(allocation, modes)| {
-                    summary.accessed_allocations.entry(allocation).or_default().extend(modes);
-                });
-                attached_output_allocations.push(nested_summary.output_allocations);
-            }
-
-            // A reference-typed output of a region-carrying operation preserves an allocation rather than classifying
-            // one, so it resolves through the generic hooks that state where it came from: an explicit input identity
-            // when the operation declares one, and otherwise the region output it forwards.
-            for (output_index, output) in instruction.outputs().iter().copied().enumerate() {
-                if !is_reference(output) || allocations.contains_key(&output) {
-                    continue;
-                }
-
-                // An identity declaration constrains every forwarded output; it is not a substitute for checking
-                // the attached regions. Each reference has a root, including references created inside the closure.
-                let identity = nested_operation.reference_output_identity_input(output_index);
-                let mut preserved = identity
-                    .map(|input_index| {
-                        resolve(
-                            &allocations,
-                            input_atom(instruction, input_index, "a preserved")?,
-                            nested_operation.name(),
-                        )
-                    })
-                    .transpose()?
-                    .flatten();
-
-                if identity.is_some() && preserved.is_none() {
-                    return Err(ProgramError::MalformedProgram(format!(
-                        "operation `{}` preserves a non-reference input at reference output {output_index}",
-                        nested_operation.name(),
-                    )));
-                }
-
-                for origin in nested_operation.output_region_provenance(output_index) {
-                    let allocation = attached_output_allocations
-                        .get(origin.region_index)
-                        .and_then(|outputs| outputs.get(origin.output_index))
-                        .copied()
-                        .flatten()
-                        .ok_or_else(|| {
-                            ProgramError::MalformedProgram(format!(
-                                "operation `{}` forwards output {output_index} from region {} output {}, which it does \
-                                 not attach",
-                                nested_operation.name(),
-                                origin.region_index,
-                                origin.output_index,
-                            ))
-                        })?;
-
-                    // A nested region may return an entering reference, but may not export an allocation it created.
-                    if allocation.is_local_to(instruction.regions()[origin.region_index]) {
-                        return Err(ProgramError::MalformedProgram(format!(
-                            "operation `{}` forwards output {} from an allocation created inside its region",
-                            nested_operation.name(),
-                            output_index,
-                        )));
-                    }
-
-                    match preserved {
-                        Some(expected) if expected != allocation => {
-                            return Err(ProgramError::MalformedProgram(if identity.is_some() {
-                                format!(
-                                    "operation `{}` forwards output {} from a region whose allocation \
-                                     differs from its declared input identity",
-                                    nested_operation.name(),
-                                    output_index,
-                                )
-                            } else {
-                                format!(
-                                    "operation `{}` forwards output {} from regions that return different \
-                                     reference allocations",
-                                    nested_operation.name(),
-                                    output_index,
-                                )
-                            }));
-                        }
-                        None => preserved = Some(allocation),
-                        _ => {}
-                    }
-                }
-
-                let preserved = preserved.ok_or_else(|| {
-                    ProgramError::MalformedProgram(format!(
-                        "operation `{}` produces a reference at output {} without declaring which input \
-                         allocation it preserves or which region output it forwards",
-                        nested_operation.name(),
-                        output_index,
-                    ))
-                })?;
-                allocations.insert(output, preserved);
-            }
-        }
-
-        summary.output_allocations = region
-            .output_ids()
-            .iter()
-            .copied()
-            .map(|output| match allocations.get(&output) {
-                Some(allocation) => Ok(Some(*allocation)),
-                None if is_reference(output) => Err(ProgramError::MalformedProgram(format!(
-                    "region `{}` returns a reference that entered it neither through its boundary nor through its \
-                     capture scope",
-                    region.id(),
-                ))),
-                None => Ok(None),
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-
-        summary.reached_allocations.extend(summary.output_allocations.iter().copied().flatten());
-
-        // Nested regions have already validated accesses to these roots. Only now remove this region's own allocations,
-        // which are not incoming references governed by its owner's region-input policy. Output roots remain intact so
-        // the parent can distinguish an entering reference from an escaping fresh allocation.
-        summary.reached_allocations.retain(|root| !root.is_local_to(region.id()));
-        summary.accessed_allocations.retain(|root, _| !root.is_local_to(region.id()));
-
-        // Every exact access mode the closure performs is held to the region access policy that the owning operation
-        // declares for this region.
-        if let Some((allocation, mode)) = summary
-            .accessed_allocations
-            .iter()
-            .flat_map(|(allocation, modes)| modes.iter().copied().map(move |mode| (*allocation, mode)))
-            .find(|(_, mode)| !operation.allows_reference_access_through_region_input(region_index, *mode))
-        {
-            return Err(ProgramError::MalformedProgram(format!(
-                "operation `{}` does not allow region {} to access {} with mode `{}`",
-                operation.name(),
-                region_index,
-                allocation,
-                mode,
-            )));
-        }
-
-        Ok(summary)
     }
 }
 
@@ -2166,8 +1826,8 @@ pub trait ReferenceDischargeDriver<C: Domain, P: ReferenceDischargePolicy<C>>:
     RegionDriver<C::Constant, C::Operation>
 {
     /// Returns the source [`Program`] location of the [`Operation`] application that is being discharged, or [`None`]
-    /// when the application did not come from a replayed [`Instruction`]. An allocation rule needs its own target to
-    /// decide whether the caller selected it for discharge, so replaying a region through
+    /// when the application did not come from a replayed [`Instruction`](crate::Instruction). An allocation rule needs
+    /// its own target to decide whether the caller selected it for discharge, so replaying a region through
     /// [`inline_region`](Self::inline_region) must supply the source program location of every instruction it replays.
     /// Returning [`None`] declares the allocation unnameable by any [`ReferenceDischargeTarget`] and therefore _always
     /// discharged_, silently ignoring the caller's partial discharge targets.
@@ -2281,7 +1941,7 @@ pub struct RecursiveReferenceDischargeDriver<'r, D> {
     driver: &'r D,
 
     /// Source [`Program`] location of the [`Operation`] application, or [`None`] for an application
-    /// that replays no [`Instruction`].
+    /// that replays no [`Instruction`](crate::Instruction).
     source_instruction_id: Option<InstructionId>,
 }
 
@@ -2828,8 +2488,8 @@ pub trait ReferenceDischargeableOperation<C: Domain, P: ReferenceDischargePolicy
 
 /// Active state of a reference discharge transform. Reference discharge interprets a source [`Program`] into a
 /// destination [`Program`], one [`Region`](crate::Region) at a time through a [`ReferenceDischargeDriver`]. Each
-/// replayed [`Instruction`] dispatches to its [`ReferenceDischargeableOperation`] implementation with this context,
-/// and that implementation emits destination work through [`parent`](Self::parent).
+/// replayed [`Instruction`](crate::Instruction) dispatches to its [`ReferenceDischargeableOperation`] implementation
+/// with this context, and that implementation emits destination work through [`parent`](Self::parent).
 ///
 /// Each source reference allocation is bound into this context exactly once. [`bind_discharged`](Self::bind_discharged)
 /// records an allocation as explicit immutable state, while [`bind_preserved`](Self::bind_preserved) records the
@@ -2922,10 +2582,10 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
         &self.targets
     }
 
-    /// Returns whether the allocation an [`Instruction`] performs was selected for discharge, which is what an
-    /// allocation rule asks before deciding between a discharged reference and one that survives in the destination.
-    /// An operation application that did not come from a replayed instruction (i.e., a region-free rule invocation
-    /// through [`EmptyRegionDriver`]) has no source program location and is always discharged as no
+    /// Returns whether the allocation an [`Instruction`](crate::Instruction) performs was selected for discharge,
+    /// which is what an allocation rule asks before deciding between a discharged reference and one that survives in
+    /// the destination. An operation application that did not come from a replayed instruction (i.e., a region-free
+    /// rule invocation through [`EmptyRegionDriver`]) has no source program location and is always discharged as no
     /// [`ReferenceDischargeTarget`] can name it, and so declining it would express nothing about the caller's choice.
     ///
     /// This is the only target query a rule ever makes. Whether an entry boundary allocation was selected is decided
@@ -3607,8 +3267,8 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeContext<C, P> 
     }
 
     /// Discharges a source [`Region`](crate::Region) directly through this context and returns its outputs. The
-    /// rewritten [`Instruction`]s are added to the destination [`Program`] this context owns, and their reference
-    /// accesses observe and update this context's allocation environment.
+    /// rewritten [`Instruction`](crate::Instruction)s are added to the destination [`Program`] this context owns,
+    /// and their reference accesses observe and update this context's allocation environment.
     ///
     /// This is the shared region replay functionality used both by [`ReferenceDischargeDriver::inline_region`] and
     /// while rebuilding a region in an isolated context. Those paths differ in the context they use, but apply the
@@ -4740,10 +4400,13 @@ mod tests {
     use crate::programs::operations::Operation;
     use crate::programs::programs::ProgramRenderingMode;
     use crate::programs::provenance::{Provenance, ProvenanceScope};
+    use crate::programs::references::analysis::ReferenceAnalysisError;
     use crate::programs::references::types::ReferenceType;
-    use crate::programs::regions::{EmptyRegionDriver, OutputRegionProvenance, RegionId, RegionInterface, RegionSlot};
+    use crate::programs::regions::{
+        EmptyRegionDriver, InputRegionProvenance, OutputRegionProvenance, RegionId, RegionInterface, RegionSlot,
+    };
     use crate::programs::types::{Type, TypeError, Typed};
-    use crate::programs::values::{Value, ValueId};
+    use crate::programs::values::Value;
 
     use super::*;
 
@@ -6583,6 +6246,48 @@ mod tests {
     }
 
     #[test]
+    fn test_reference_discharge_region_summary_new_resolves_input_capture_aliases() {
+        let mut builder = ProgramBuilder::<ListCapture, ListOperation>::new();
+        let reference_type = ListIrType::Reference(ReferenceType::new(ListType { length: 2 }));
+        let input = builder.add_input(reference_type.clone());
+        let captured = builder.add_constant(ListCapture::new(0, reference_type));
+        let program = builder
+            .build::<Vec<ListCapture>, Vec<ListCapture>>(vec![input, captured], vec![Placeholder], vec![Placeholder; 2])
+            .unwrap();
+        let context = ListDischargeContext::new(ListDestination::new());
+        let first = context
+            .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![1, 2]))
+            .unwrap()
+            .allocation_id();
+        let second = context
+            .bind_discharged(ReferenceType::new(ListType { length: 2 }), ListIrValue::List(vec![3, 4]))
+            .unwrap()
+            .allocation_id();
+
+        // A captured alias uses the input's representative; a different captured allocation keeps its own identity.
+        let summary = ReferenceDischargeRegionSummary::new(
+            &ListOperation::Call,
+            0,
+            program.entry_region_ref(),
+            &[Some(first)],
+            &ReferenceDischargeCaptureScope::new(vec![Some(first)]),
+        )
+        .unwrap();
+        assert_eq!(summary.reached_allocations().collect::<Vec<_>>(), vec![first]);
+        assert_eq!(summary.output_allocations(), &[Some(first), Some(first)]);
+        let summary = ReferenceDischargeRegionSummary::new(
+            &ListOperation::Call,
+            0,
+            program.entry_region_ref(),
+            &[Some(first)],
+            &ReferenceDischargeCaptureScope::new(vec![Some(second)]),
+        )
+        .unwrap();
+        assert_eq!(summary.reached_allocations().collect::<Vec<_>>(), vec![first, second]);
+        assert_eq!(summary.output_allocations(), &[Some(first), Some(second)]);
+    }
+
+    #[test]
     fn test_reference_discharge_region_summary_new_ignores_dead_reference_constants() {
         // Replay never materializes the unused reference, so it needs neither a capture binding nor a state input.
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
@@ -6658,9 +6363,8 @@ mod tests {
             ListOperation::Read,
             false,
         );
-        let local =
-            ValueId::new(region.entry_region_ref().id(), region.entry_region_ref().instructions()[0].outputs()[0]);
-        let local = format!("`{}` in region `{}`", local.atom(), local.region());
+        let entry = region.entry_region_ref();
+        let local = ReferenceRoot::Allocation { instruction: InstructionId::new(entry.id(), 0), output_index: 0 };
         assert_eq!(
             ReferenceDischargeRegionSummary::new(
                 &ListOperation::Call,
@@ -6669,10 +6373,14 @@ mod tests {
                 &[None],
                 &ReferenceDischargeCaptureScope::default(),
             ),
-            Err(ProgramError::MalformedProgram(format!(
-                "operation `test.scoped_call` does not allow region 0 to access local reference {local} with mode \
-                 `read`",
-            ))),
+            Err(ReferenceAnalysisError::DisallowedRegionAccess {
+                operation: "test.scoped_call",
+                instruction: InstructionId::new(entry.id(), 1),
+                region_index: 0,
+                root: local,
+                mode: ReferenceAccessMode::Read,
+            }
+            .into()),
         );
     }
 
@@ -6680,9 +6388,8 @@ mod tests {
     fn test_reference_discharge_region_summary_new_rejects_nested_local_consumption() {
         // Only the allocation's creating region may consume it, even though the whole outer closure owns it.
         let region = summary_region_with_local_reference(ListOperation::Call, ListOperation::Freeze, false);
-        let local =
-            ValueId::new(region.entry_region_ref().id(), region.entry_region_ref().instructions()[0].outputs()[0]);
-        let local = format!("`{}` in region `{}`", local.atom(), local.region());
+        let entry = region.entry_region_ref();
+        let local = ReferenceRoot::Allocation { instruction: InstructionId::new(entry.id(), 0), output_index: 0 };
         assert_eq!(
             ReferenceDischargeRegionSummary::new(
                 &ListOperation::Call,
@@ -6691,10 +6398,13 @@ mod tests {
                 &[None],
                 &ReferenceDischargeCaptureScope::default(),
             ),
-            Err(ProgramError::MalformedProgram(format!(
-                "reference discharge cannot pass local reference {local} into a region that consumes it through \
-                 `list.freeze`",
-            ))),
+            Err(ReferenceAnalysisError::ConsumptionOutsideCreationScope {
+                operation: "list.freeze",
+                instruction: InstructionId::new(entry.instructions()[1].regions()[0], 0),
+                region: entry.instructions()[1].regions()[0],
+                root: local,
+            }
+            .into()),
         );
     }
 
@@ -6743,12 +6453,27 @@ mod tests {
                 &[Some(first.allocation_id()), Some(second.allocation_id())],
                 context.captures(),
             ),
-            Err(ProgramError::MalformedProgram(
-                "operation `test.scoped_call` forwards output 0 from a region whose allocation differs from its \
-                 declared input identity"
-                    .to_string(),
-            )),
+            Err(ReferenceAnalysisError::ReferenceRootMismatch {
+                operation: "test.scoped_call",
+                instruction: InstructionId::new(region.entry_region_ref().id(), 0),
+                output_index: 0,
+                region_index: 0,
+                region_output_index: 0,
+                expected: ReferenceRoot::RegionInput { region: region.entry_region_ref().id(), input_index: 0 },
+                actual: ReferenceRoot::RegionInput { region: region.entry_region_ref().id(), input_index: 1 },
+            }
+            .into()),
         );
+        // The same output declarations are consistent when both formal inputs name the same caller allocation.
+        let summary = ReferenceDischargeRegionSummary::new(
+            &ListOperation::Call,
+            0,
+            region.entry_region_ref(),
+            &[Some(first.allocation_id()), Some(first.allocation_id())],
+            context.captures(),
+        )
+        .unwrap();
+        assert_eq!(summary.output_allocations(), &[Some(first.allocation_id()), Some(first.allocation_id())]);
     }
 
     #[test]
@@ -6890,9 +6615,13 @@ mod tests {
                 &[Some(allocation)],
                 context.captures(),
             ),
-            Err(ProgramError::MalformedProgram(format!(
-                "reference discharge cannot pass {allocation} into a region that consumes it through `list.freeze`",
-            ))),
+            Err(ReferenceAnalysisError::ExternalReferenceConsumption {
+                operation: "list.freeze",
+                instruction: InstructionId::new(program.entry_region_ref().id(), 0),
+                root: ReferenceRoot::RegionInput { region: program.entry_region_ref().id(), input_index: 0 },
+                external_source: ReferenceSource::Input { index: 0 },
+            }
+            .into()),
         );
     }
 
@@ -6910,11 +6639,13 @@ mod tests {
         let scope = ReferenceDischargeCaptureScope::default();
         assert_eq!(
             ReferenceDischargeRegionSummary::new(&ListOperation::Call, 0, reads.entry_region_ref(), &[], &scope),
-            Err(ProgramError::MalformedProgram(format!(
-                "operation `list.read` reaches a reference that entered region `{}` neither through its boundary nor \
-                 through its capture scope",
-                reads.entry_region_ref().id(),
-            ))),
+            Err(ReferenceAnalysisError::InvalidReferenceCapture {
+                region: reads.entry_region_ref().id(),
+                atom: captured,
+                capture_index: 2,
+                capture_count: 0,
+            }
+            .into()),
         );
 
         let mut builder = ProgramBuilder::<ListIrValue, ListOperation>::new();
@@ -6924,11 +6655,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             ReferenceDischargeRegionSummary::new(&ListOperation::Call, 0, returns.entry_region_ref(), &[], &scope),
-            Err(ProgramError::MalformedProgram(format!(
-                "region `{}` returns a reference that entered it neither through its boundary nor through its capture \
-                 scope",
-                returns.entry_region_ref().id(),
-            ))),
+            Err(ReferenceAnalysisError::InvalidReferenceCapture {
+                region: returns.entry_region_ref().id(),
+                atom: captured,
+                capture_index: 2,
+                capture_count: 0,
+            }
+            .into()),
         );
     }
 
