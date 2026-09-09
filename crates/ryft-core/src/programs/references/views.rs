@@ -1,37 +1,37 @@
-//! View descriptions and paths layered on the structural [`ReferenceAnalysis`].
+//! Contains machinery for representing and working with _reference views_ and paths layered on the structural
+//! [`ReferenceAnalysis`]. The generic analysis records _that_ a reference-typed value is a narrowing view of its
+//! [`ReferenceRoot`], through [`ReferenceAliasEdge`](crate::ReferenceAliasEdge)s of kind [`ReferenceAliasKind::View`],
+//! but leaves the selected coordinates to the value family (e.g., an array view is an index or slice, while a
+//! downstream family may split a register into halves). [`ReferenceViewOperation`] describes these selections for an
+//! operation family, and [`ReferenceViewAnalysis`] composes the per-edge descriptions into a [`ReferenceViewPath`] for
+//! every reference-typed value. Transforms that rebuild references (e.g., for tangent, cotangent, and residual
+//! reconstruction) consult the view analysis and reapply descriptions through the same contract, so no transform ever
+//! matches view operations by name, and downstream operations such as the array family's `reference_index` and
+//! `reference_slice` operations are not special-cased anywhere.
 //!
-//! The generic analysis records *that* a reference-typed value is a narrowing view of its root, through
-//! [`ReferenceAliasEdge`](crate::programs::references::ReferenceAliasEdge)s of kind [`ReferenceAliasKind::View`], but
-//! leaves the selected coordinates to the value family (an array view is an index or slice, while a downstream family
-//! may split a register into halves). [`ReferenceViewOperation`] describes these selections for an operation family,
-//! and [`ReferenceViewAnalysis`] composes the per-edge descriptions into a [`ReferenceViewPath`] for every
-//! reference-typed value. Transforms that rebuild references (tangent, cotangent, and residual reconstruction) consult
-//! the view analysis and reapply descriptions through the same contract, so no transform ever matches view operations
-//! by name and the array family's `reference_index` and `reference_slice` are not special-cased anywhere.
-//!
-//! Everything here is static dispatch on the operation family `O`: descriptions are owned data, validation and
-//! reapplication are associated functions of the family, and no trait object or `Self`-outside-the-receiver appears,
-//! so the contract composes with the closed operation enums that backends own.
+//! Everything in this module leverages static dispatch on the operation family `O`. View descriptions are owned data,
+//! validation and reapplication are associated functions of the family, so the contract composes with the closed
+//! operation enums that backends own.
 //!
 //! # Symbols And Bindings
 //!
-//! A description is a value of the family's [`ReferenceView`] type and may depend on coordinates that are not part of
-//! the description itself: a traced operand of the describing instruction, or the iteration counter of a
-//! region-carrying instruction whose region input the view describes. Such coordinates are *symbolic* in the
-//! description and named relative to the describing operation by [`ViewSymbol`]s, in the order
-//! [`ReferenceView::symbols`] reports them. The view analysis *closes* every description over the instruction that
-//! created it: each symbol becomes a [`ViewSymbolBinding`] (the program identity of the operand value, or the region
-//! whose iteration counter is meant), and the description together with its bindings forms one [`ReferenceViewStep`] of
-//! a [`ReferenceViewPath`]. Static descriptions report no symbols and carry empty bindings, so equality of static paths
-//! is equality of their description sequences.
+//! A view description is a value of the family's [`ReferenceView`] type and may depend on coordinates that are not
+//! part of the description itself (e.g., a traced operand of the describing instruction, or the iteration counter
+//! of a region carrying instruction whose region input the view describes). Such coordinates are _symbolic_ in the
+//! description and named relative to the describing operation by [`ViewSymbol`]s, in the order that
+//! [`ReferenceView::symbols`] reports them. The view analysis _closes_ every description over the instruction that
+//! created it. Each symbol becomes a [`ViewSymbolBinding`] (i.e., the program identity of the operand value, or the
+//! region whose iteration counter is meant), and the description together with its bindings forms one
+//! [`ReferenceViewStep`] of a [`ReferenceViewPath`]. Static descriptions report no symbols and carry empty bindings,
+//! so equality of static paths is equality of their description sequences.
 //!
 //! The binding type is a parameter of the path because the same path shape serves consumers that close symbols
-//! differently: the view analysis binds program identities, an eager handle carries only static steps and uses the
-//! uninhabited [`NoBinding`], and a discharge policy may close symbols over destination values.
+//! differently: the view analysis binds program identities, an eager handle carries only static steps and uses
+//! the uninhabited [`NoBinding`], and a discharge policy may close symbols over destination values.
 //!
 //! # Validating Views Against Transformed References
 //!
-//! A description is validated against the *current* source reference type before it is reapplied. A tangent or
+//! A view description is validated against the _current_ source reference type before it is reapplied. A tangent or
 //! cotangent root may have a different referent type from the primal root (e.g., a widened floating-point tangent
 //! type), so a description that was valid on the primal root is re-checked against the transformed root rather than
 //! assumed to transfer.
@@ -39,46 +39,42 @@
 //! # Batching Moves The Axis Through The Mapping
 //!
 //! [`ReferenceViewOperation::reapply_view`] rebuilds a description over a root with the same dimensions as the one it
-//! was derived on, which is what tangent, cotangent, and residual reconstruction need. Batching is different: it
+//! was derived on, which is what tangent, cotangent, and residual reconstruction need. Batching is different in that it
 //! inserts an axis into the packed root, and a primal description reapplied unchanged to a batched root would index or
 //! slice the wrong axis. The contract therefore splits the two concerns. [`ReferenceView::batch`] is pure axis
-//! arithmetic on the description: given the packed source type and the source's batch axis, it returns the description
-//! that selects the same per-item coordinates of the packed source together with the batch axis of the derived
-//! reference. The shared rule [`batch_reference_view_operation`] then binds that batched description through
-//! `reapply_view` on the parent context, so every view operation of every family batches through one rule and no
-//! operation carries the axis arithmetic itself.
+//! arithmetic on the description (i.e., given the packed source type and the source's batch axis, it returns the
+//! description that selects the same per-item coordinates of the packed source together with the batch axis of the
+//! derived reference). The shared rule [`batch_reference_view_operation`] then binds that batched description through
+//! [`reapply_view`](ReferenceViewOperation::reapply_view) on the parent context, so every view operation of every
+//! family batches through one rule and no operation carries the axis arithmetic itself.
 //!
 //! # Overlap Queries
 //!
-//! Two paths of one root may select the same coordinates, provably different coordinates, or coordinates whose
-//! relation is not decidable statically. [`ReferenceView::overlap`] answers that question for two closed paths of one
-//! root as a [`ViewOverlap`]; [`ReferenceViewPath::overlap`] and [`ReferenceViewAnalysis::overlap`] expose it on paths
-//! and on analyzed values. Two symbolic coordinates are the same coordinate exactly when their bindings are equal, so a
-//! path that selects a slot by one instruction's operand and a path that selects a slot by the same operand agree,
-//! while two different operands, or an operand against a static coordinate, may overlap. The query is what lets a
-//! transform admit two handles of one root side by side only when they are provably disjoint (e.g., a stacked
-//! reference operand of a `scan` viewed per iteration next to a carry of the same root). The `scan` discharge rule is
-//! the first consumer: it rejects any other handle of the stack's allocation inside the body unless the query proves
-//! it disjoint from the per-iteration view. Dynamic indexing will use the same query as its may-alias oracle.
+//! Two paths of one root may select the same coordinates, provably different coordinates, or coordinates whose relation
+//! is not decidable statically. [`ReferenceView::overlap`] answers that question for two closed paths of one root as a
+//! [`ViewOverlap`]; [`ReferenceViewPath::overlap`] and [`ReferenceViewAnalysis::overlap`] expose it on paths and on
+//! analyzed values. Two symbolic coordinates are the same coordinate exactly when their bindings are equal, so a path
+//! that selects a slot by one instruction's operand and a path that selects a slot by the same operand agree, while two
+//! different operands, or an operand against a static coordinate, may overlap. The query is what lets a transform admit
+//! two handles of one root side by side only when they are provably disjoint (e.g., a stacked reference operand of a
+//! `scan` operation viewed per iteration next to a carry of the same root). The `scan` operation discharge rule is an
+//! example consumer as it rejects any other handle of the stack's allocation inside the body unless the query proves it
+//! disjoint from the per-iteration view. Dynamic indexing will use the same query as its "may-alias" oracle.
 //!
 //! # Boundary Views
 //!
-//! Views are typically created by instruction outputs and never cross an attached-region boundary: a nested region
-//! input with [`InputRegionProvenance::Forwarded`](crate::InputRegionProvenance::Forwarded) provenance is a complete
-//! handle of a caller root and carries the empty path. The one exception is a view that the attaching operation itself
-//! creates for a region input, such as the per-iteration slice a `scan` presents its body for a reference-typed stacked
-//! operand. The operation declares the source input with
-//! [`InputRegionProvenance::View`](crate::InputRegionProvenance::View) through
-//! [`Operation::input_region_provenance`] and describes the view through
-//! [`ReferenceViewOperation::region_input_view`]; the analysis records the nested input as a view of that input
-//! (refer to the "Boundaries" section of the `analysis` module documentation) and closes its
-//! [`Iteration`](ViewSymbol::Iteration) symbol over the *attached region* rather than over the attaching
-//! instruction, so a shared region attached by several instructions has one path per nested input. Boundary views are
-//! created by their operation and never reapplied: `reapply_view` rejects an `Iteration` symbol, and a transform that
-//! restates the operation (the fused forward pass, the reversed scan of transposition, the batched scan) restates the
-//! boundary view with it.
-
-// TODO(eaplatanios): Review this module.
+//! Views are typically created by instruction outputs and never cross an attached region boundary: a nested region
+//! input with [`InputRegionProvenance::Forwarded`] provenance is a complete handle of a caller root and carries the
+//! empty path. The one exception is a view that the attaching operation itself creates for a region input, such as the
+//! per-iteration slice a `scan` operation presents its body for a reference-typed stacked operand. The operation
+//! declares the source input with [`InputRegionProvenance::View`] through [`Operation::input_region_provenance`] and
+//! describes the view through [`ReferenceViewOperation::region_input_view`]. The analysis records the nested input as
+//! a view of that input (refer to the "Boundaries" section of the [`analysis`](super::analysis) module documentation)
+//! and closes its [`Iteration`](ViewSymbol::Iteration) symbol over the _attached region_ rather than over the attaching
+//! instruction and so a shared region attached by several instructions has one path per nested input. Boundary views
+//! are created by their operation and never reapplied. [`reapply_view`](ReferenceViewOperation::reapply_view) rejects
+//! an [`Iteration`](ViewSymbol::Iteration) symbol, and a transform that restates the operation (e.g., the fused forward
+//! pass, the reversed scan of transposition, the batched scan, etc.) restates the boundary view with it.
 
 use std::collections::BTreeMap;
 use std::fmt::Debug;
@@ -103,7 +99,7 @@ use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::{Value, ValueId};
 
-/// Error produced by [`ReferenceViewOperation::validate_view`] when one view description does not compose onto its
+/// Error produced by [`ReferenceViewOperation::validate_view`] when a view description does not compose onto its
 /// source reference type or does not derive the declared output reference type.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum ReferenceViewValidationError {
@@ -127,8 +123,8 @@ pub enum ReferenceViewValidationError {
 
 /// Error produced by [`ReferenceViewAnalysis`] when the generic reference analysis fails or when a derived view path
 /// cannot be reconciled with the program's declared reference types. Conversion to [`ProgramError`] preserves an
-/// underlying [`ReferenceAnalysisError`] through its typed conversion; view-specific failures are preserved through
-/// [`ReferenceError::ViewAnalysis`](crate::programs::references::ReferenceError::ViewAnalysis).
+/// underlying [`ReferenceAnalysisError`] through its typed conversion. View-specific failures are preserved through
+/// [`ReferenceError::ViewAnalysis`](crate::ReferenceError::ViewAnalysis).
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum ReferenceViewAnalysisError {
     /// The generic reference analysis rejected the region closure.
@@ -145,8 +141,8 @@ pub enum ReferenceViewAnalysisError {
         instruction: InstructionId,
     },
 
-    /// A view operation declares an output referent type that differs from the referent its description derives from
-    /// the source referent.
+    /// A view operation declares an output referent type that differs from the referent its description derives
+    /// from the source referent.
     #[error(
         "operation `{operation}` at {instruction} declares view referent type `{actual}` but its transform derives \
          referent type `{expected}` from the source view"
@@ -260,6 +256,8 @@ impl From<ReferenceViewAnalysisError> for ProgramError {
         }
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// A coordinate that a view description depends on but does not contain, named relative to the operation that
 /// describes the view.
