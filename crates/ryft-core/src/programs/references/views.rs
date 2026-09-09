@@ -77,7 +77,7 @@
 //! pass, the reversed scan of transposition, the batched scan, etc.) restates the boundary view with it.
 
 use std::collections::BTreeMap;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
 use std::hash::Hash;
 use std::sync::Arc;
 
@@ -124,115 +124,74 @@ pub enum ReferenceViewValidationError {
 /// Error produced by [`ReferenceViewAnalysis`] when the generic reference analysis fails or when a derived view path
 /// cannot be reconciled with the program's declared reference types. Conversion to [`ProgramError`] preserves an
 /// underlying [`ReferenceAnalysisError`] through its typed conversion. View-specific failures are preserved through
-/// [`ReferenceError::ViewAnalysis`](crate::ReferenceError::ViewAnalysis).
+/// [`ReferenceError::ViewAnalysis`](crate::ReferenceError::ViewAnalysis). Invalid descriptions retain their
+/// [`ReferenceViewValidationError`] as an error source; positions and symbols identify the exact declaration
+/// that failed without duplicating the validation error's variants.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum ReferenceViewAnalysisError {
-    /// The generic reference analysis rejected the region closure.
+    /// The structural reference analysis rejected the region and its attached computation regions.
     #[error(transparent)]
     Analysis(#[from] ReferenceAnalysisError),
 
-    /// An operation declares a view alias in its effects but describes no view for that output.
-    #[error("operation `{operation}` at {instruction} derives a reference view but exposes no view transform")]
+    /// An operation declares a view for an output or an attached region input but supplies no description for it.
+    #[error("operation `{operation}` at {instruction} declares a reference view at {position} but describes no view")]
     MissingView {
         /// Name of the operation.
         operation: &'static str,
 
         /// Instruction applying the operation.
         instruction: InstructionId,
+
+        /// Output or attached region input whose view description is missing.
+        position: ReferenceAliasPosition,
     },
 
-    /// A view operation declares an output referent type that differs from the referent its description derives
-    /// from the source referent.
-    #[error(
-        "operation `{operation}` at {instruction} declares view referent type `{actual}` but its transform derives \
-         referent type `{expected}` from the source view"
-    )]
-    ViewTypeMismatch {
+    /// A view description cannot be applied to its source or derives a type different from the declared type.
+    /// The underlying validation error retains the type mismatch or invalid-composition diagnostic.
+    #[error("operation `{operation}` at {instruction} has an invalid view at {position}: {source}")]
+    InvalidView {
         /// Name of the operation.
         operation: &'static str,
 
         /// Instruction applying the operation.
         instruction: InstructionId,
 
-        /// Referent type derived by the operation's description.
-        expected: String,
+        /// Output or attached region input described by the invalid view.
+        position: ReferenceAliasPosition,
 
-        /// Referent type declared by the operation's output.
-        actual: String,
+        /// Failure reported when validating the view against its source and declared output types.
+        #[source]
+        source: ReferenceViewValidationError,
     },
 
-    /// A view operation's description cannot be applied to the reference type of its source.
-    #[error("operation `{operation}` at {instruction} composes an invalid view transform: {message}")]
-    InvalidViewComposition {
+    /// A symbolic coordinate cannot be bound at the position whose view it describes. Operand symbols must name
+    /// existing non-reference operands, and iteration symbols may describe only attached region inputs.
+    #[error("operation `{operation}` at {instruction} describes a view at {position} through {symbol}, but {message}")]
+    InvalidViewSymbol {
         /// Name of the operation.
         operation: &'static str,
 
         /// Instruction applying the operation.
         instruction: InstructionId,
 
-        /// Description of why the view is invalid for the source.
+        /// Output or attached region input whose view uses the invalid symbol.
+        position: ReferenceAliasPosition,
+
+        /// Coordinate symbol that cannot be bound at this position.
+        symbol: ViewSymbol,
+
+        /// Explanation of why the symbol cannot identify a coordinate here.
         message: String,
-    },
-
-    /// A view operation's description depends on an operand symbol that names no non-reference operand of the
-    /// describing instruction.
-    #[error("operation `{operation}` at {instruction} describes a view through operand {operand_index}, but {message}")]
-    InvalidViewSymbolOperand {
-        /// Name of the operation.
-        operation: &'static str,
-
-        /// Instruction applying the operation.
-        instruction: InstructionId,
-
-        /// Operand named by the symbol.
-        operand_index: usize,
-
-        /// Description of why the operand cannot be a view coordinate.
-        message: String,
-    },
-
-    /// A view operation describes an output view through the iteration symbol, which only describes region inputs.
-    #[error(
-        "operation `{operation}` at {instruction} describes output {output_index} through the iteration counter, but \
-         an iteration symbol only describes region inputs"
-    )]
-    IterationSymbolAtOutput {
-        /// Name of the operation.
-        operation: &'static str,
-
-        /// Instruction applying the operation.
-        instruction: InstructionId,
-
-        /// Output described through the iteration symbol.
-        output_index: usize,
-    },
-
-    /// An operation declares [`InputRegionProvenance::View`](crate::InputRegionProvenance::View) for a region input but
-    /// describes no view for that input.
-    #[error(
-        "operation `{operation}` at {instruction} creates a boundary view for input {input_index} of region \
-         {region_index} but exposes no view transform"
-    )]
-    MissingBoundaryView {
-        /// Name of the operation.
-        operation: &'static str,
-
-        /// Instruction applying the operation.
-        instruction: InstructionId,
-
-        /// Position of the attached region among the instruction's regions.
-        region_index: usize,
-
-        /// Reference-typed input of the attached region.
-        input_index: usize,
     },
 
     /// Attachments of one shared region describe different views or bind their coordinates to different values.
+    /// Structural analysis already checked which inputs are views; this failure compares their actual descriptions
+    /// and bindings, which must agree because the analysis stores one path for each shared region input.
     #[error(
         "operation `{operation}` at {instruction} creates a boundary view for input {input_index} of region \
          {region_index} that differs from another attachment of the shared region"
     )]
-    InconsistentBoundaryView {
+    InconsistentBoundaryViews {
         /// Name of the operation.
         operation: &'static str,
 
@@ -274,6 +233,16 @@ pub enum ViewSymbol {
     /// symbol never describes an instruction output, and a view depending on it is created by its operation at the
     /// region boundary rather than reapplied.
     Iteration,
+}
+
+impl Display for ViewSymbol {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Operand(index) => write!(formatter, "operand {index}"),
+            Self::Iteration => write!(formatter, "the iteration counter"),
+        }
+    }
 }
 
 impl Parameter for ViewSymbol {}
@@ -642,7 +611,7 @@ impl<View> ReferenceViewAnalysis<View> {
                 value,
             )?;
             if paths[&value].steps() != [step] {
-                return Err(ReferenceViewAnalysisError::InconsistentBoundaryView {
+                return Err(ReferenceViewAnalysisError::InconsistentBoundaryViews {
                     operation: instruction.operation().name(),
                     instruction: id,
                     region_index,
@@ -786,28 +755,17 @@ impl<View> ReferenceViewAnalysis<View> {
         let operation = instruction.operation();
         let name = operation.name();
         let view = match position {
-            ReferenceAliasPosition::Output(output_index) => operation
-                .reference_view(output_index)
-                .ok_or(ReferenceViewAnalysisError::MissingView { operation: name, instruction: id })?,
-            ReferenceAliasPosition::RegionInput { region_index, input_index } => operation
-                .region_input_view(region_index, input_index)
-                .ok_or(ReferenceViewAnalysisError::MissingBoundaryView {
-                    operation: name,
-                    instruction: id,
-                    region_index,
-                    input_index,
-                })?,
-        };
+            ReferenceAliasPosition::Output(output_index) => operation.reference_view(output_index),
+            ReferenceAliasPosition::RegionInput { region_index, input_index } => {
+                operation.region_input_view(region_index, input_index)
+            }
+        }
+        .ok_or(ReferenceViewAnalysisError::MissingView { operation: name, instruction: id, position })?;
         let atoms = current.atoms();
         let source_type = atoms[source.atom().index()].r#type();
         let output_type = region.with_id(value.region()).unwrap().atoms()[value.atom().index()].r#type();
-        O::validate_view(&view, source_type.as_ref(), output_type.as_ref()).map_err(|error| match error {
-            ReferenceViewValidationError::TypeMismatch { expected, actual } => {
-                ReferenceViewAnalysisError::ViewTypeMismatch { operation: name, instruction: id, expected, actual }
-            }
-            ReferenceViewValidationError::InvalidComposition { message } => {
-                ReferenceViewAnalysisError::InvalidViewComposition { operation: name, instruction: id, message }
-            }
+        O::validate_view(&view, source_type.as_ref(), output_type.as_ref()).map_err(|source| {
+            ReferenceViewAnalysisError::InvalidView { operation: name, instruction: id, position, source }
         })?;
         // Operand symbols name non-reference coordinate values in this instruction. Iteration symbols instead
         // name the attached region, so matching attachments can share a path independently of their instruction
@@ -818,29 +776,33 @@ impl<View> ReferenceViewAnalysis<View> {
             match symbol {
                 ViewSymbol::Operand(operand_index) => {
                     let Some(atom) = inputs.get(operand_index) else {
-                        return Err(ReferenceViewAnalysisError::InvalidViewSymbolOperand {
+                        return Err(ReferenceViewAnalysisError::InvalidViewSymbol {
                             operation: name,
                             instruction: id,
-                            operand_index,
+                            position,
+                            symbol,
                             message: format!("the instruction has only {} operands", inputs.len()),
                         });
                     };
                     if atoms[atom.index()].r#type().is_reference() {
-                        return Err(ReferenceViewAnalysisError::InvalidViewSymbolOperand {
+                        return Err(ReferenceViewAnalysisError::InvalidViewSymbol {
                             operation: name,
                             instruction: id,
-                            operand_index,
+                            position,
+                            symbol,
                             message: "that operand is a reference rather than a coordinate value".to_string(),
                         });
                     }
                     bindings.push(ViewSymbolBinding::Value(ValueId::new(id.region(), *atom)));
                 }
                 ViewSymbol::Iteration => match position {
-                    ReferenceAliasPosition::Output(output_index) => {
-                        return Err(ReferenceViewAnalysisError::IterationSymbolAtOutput {
+                    ReferenceAliasPosition::Output(_) => {
+                        return Err(ReferenceViewAnalysisError::InvalidViewSymbol {
                             operation: name,
                             instruction: id,
-                            output_index,
+                            position,
+                            symbol,
+                            message: "an iteration symbol only describes region inputs".to_string(),
                         });
                     }
                     ReferenceAliasPosition::RegionInput { .. } => {
@@ -1399,7 +1361,7 @@ mod tests {
             ReferenceAnalysisError::InvalidReferenceConstant { region: RegionId::new(0), atom: AtomId::new(1) };
         assert_eq!(
             ReferenceViewAnalysisError::from(analysis.clone()),
-            ReferenceViewAnalysisError::Analysis(analysis.clone())
+            ReferenceViewAnalysisError::Analysis(analysis.clone()),
         );
         assert_eq!(
             ProgramError::from(ReferenceViewAnalysisError::Analysis(analysis.clone())),
@@ -1411,63 +1373,76 @@ mod tests {
              through inputs and captures",
         );
         assert_eq!(
-            ReferenceViewAnalysisError::MissingView { operation: "view", instruction: id(0, 2) }.to_string(),
-            "operation `view` at ^0[2] derives a reference view but exposes no view transform",
-        );
-        assert_eq!(
-            ReferenceViewAnalysisError::ViewTypeMismatch {
-                operation: "reference_index",
+            ReferenceViewAnalysisError::MissingView {
+                operation: "view",
                 instruction: id(0, 2),
-                expected: "f32[3]".to_string(),
-                actual: "f32[2]".to_string(),
+                position: ReferenceAliasPosition::Output(0),
             }
             .to_string(),
-            "operation `reference_index` at ^0[2] declares view referent type `f32[2]` but its transform derives \
-             referent type `f32[3]` from the source view",
+            "operation `view` at ^0[2] declares a reference view at output 0 but describes no view",
         );
         assert_eq!(
-            ReferenceViewAnalysisError::InvalidViewComposition {
+            ReferenceViewAnalysisError::InvalidView {
                 operation: "reference_index",
                 instruction: id(0, 2),
-                message: "reference index axis 2 is out of bounds for rank 2".to_string(),
+                position: ReferenceAliasPosition::Output(0),
+                source: ReferenceViewValidationError::TypeMismatch {
+                    expected: "f32[3]".to_string(),
+                    actual: "f32[2]".to_string(),
+                },
             }
             .to_string(),
-            "operation `reference_index` at ^0[2] composes an invalid view transform: reference index axis 2 is out of \
-             bounds for rank 2",
+            "operation `reference_index` at ^0[2] has an invalid view at output 0: view declares referent type `f32[2]` \
+             but derives referent type `f32[3]` from its source",
         );
         assert_eq!(
-            ReferenceViewAnalysisError::InvalidViewSymbolOperand {
+            ReferenceViewAnalysisError::InvalidView {
+                operation: "reference_index",
+                instruction: id(0, 2),
+                position: ReferenceAliasPosition::Output(0),
+                source: ReferenceViewValidationError::InvalidComposition {
+                    message: "reference index axis 2 is out of bounds for rank 2".to_string(),
+                },
+            }
+            .to_string(),
+            "operation `reference_index` at ^0[2] has an invalid view at output 0: invalid view composition: reference \
+             index axis 2 is out of bounds for rank 2",
+        );
+        assert_eq!(
+            ReferenceViewAnalysisError::InvalidViewSymbol {
                 operation: "symbolic_view",
                 instruction: id(0, 2),
-                operand_index: 3,
+                position: ReferenceAliasPosition::Output(0),
+                symbol: ViewSymbol::Operand(3),
                 message: "the instruction has only 2 operands".to_string(),
             }
             .to_string(),
-            "operation `symbolic_view` at ^0[2] describes a view through operand 3, but the instruction has only 2 \
-             operands",
+            "operation `symbolic_view` at ^0[2] describes a view at output 0 through operand 3, but the instruction has \
+             only 2 operands",
         );
         assert_eq!(
-            ReferenceViewAnalysisError::IterationSymbolAtOutput {
+            ReferenceViewAnalysisError::InvalidViewSymbol {
                 operation: "symbolic_view",
                 instruction: id(0, 2),
-                output_index: 0,
+                position: ReferenceAliasPosition::Output(0),
+                symbol: ViewSymbol::Iteration,
+                message: "an iteration symbol only describes region inputs".to_string(),
             }
             .to_string(),
-            "operation `symbolic_view` at ^0[2] describes output 0 through the iteration counter, but an iteration \
-             symbol only describes region inputs",
+            "operation `symbolic_view` at ^0[2] describes a view at output 0 through the iteration counter, but an \
+             iteration symbol only describes region inputs",
         );
         assert_eq!(
-            ReferenceViewAnalysisError::MissingBoundaryView {
+            ReferenceViewAnalysisError::MissingView {
                 operation: "scan",
                 instruction: id(1, 0),
-                region_index: 0,
-                input_index: 1,
+                position: ReferenceAliasPosition::RegionInput { region_index: 0, input_index: 1 },
             }
             .to_string(),
-            "operation `scan` at ^1[0] creates a boundary view for input 1 of region 0 but exposes no view transform",
+            "operation `scan` at ^1[0] declares a reference view at input 1 of region 0 but describes no view",
         );
         assert_eq!(
-            ReferenceViewAnalysisError::InconsistentBoundaryView {
+            ReferenceViewAnalysisError::InconsistentBoundaryViews {
                 operation: "scan",
                 instruction: id(1, 1),
                 region_index: 0,
@@ -1478,11 +1453,46 @@ mod tests {
              attachment of the shared region",
         );
         assert_eq!(
-            ProgramError::from(ReferenceViewAnalysisError::MissingView { operation: "view", instruction: id(0, 2) }),
+            ProgramError::from(ReferenceViewAnalysisError::MissingView {
+                operation: "view",
+                instruction: id(0, 2),
+                position: ReferenceAliasPosition::Output(0),
+            }),
             ProgramError::Reference(crate::programs::references::ReferenceError::ViewAnalysis(Box::new(
-                ReferenceViewAnalysisError::MissingView { operation: "view", instruction: id(0, 2) }
+                ReferenceViewAnalysisError::MissingView {
+                    operation: "view",
+                    instruction: id(0, 2),
+                    position: ReferenceAliasPosition::Output(0),
+                },
             ),)),
         );
+    }
+
+    #[test]
+    fn test_reference_view_analysis_error_source() {
+        use std::error::Error as _;
+
+        let validation =
+            ReferenceViewValidationError::TypeMismatch { expected: "f32[3]".to_string(), actual: "f32[2]".to_string() };
+        let error = ReferenceViewAnalysisError::InvalidView {
+            operation: "view",
+            instruction: id(0, 0),
+            position: ReferenceAliasPosition::RegionInput { region_index: 1, input_index: 2 },
+            source: validation.clone(),
+        };
+        assert_eq!(error.source().unwrap().downcast_ref::<ReferenceViewValidationError>(), Some(&validation));
+
+        // The umbrella conversion keeps the contextual analysis failure, including the typed validation cause.
+        assert_eq!(
+            ProgramError::from(error.clone()),
+            ProgramError::Reference(crate::programs::references::ReferenceError::ViewAnalysis(Box::new(error))),
+        );
+    }
+
+    #[test]
+    fn test_view_symbol() {
+        assert_eq!(ViewSymbol::Operand(2).to_string(), "operand 2");
+        assert_eq!(ViewSymbol::Iteration.to_string(), "the iteration counter");
     }
 
     #[test]
@@ -1732,11 +1742,14 @@ mod tests {
             builder.build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
         assert_eq!(
             ReferenceViewAnalysis::new(program.entry_region_ref(), 0).err(),
-            Some(ReferenceViewAnalysisError::ViewTypeMismatch {
+            Some(ReferenceViewAnalysisError::InvalidView {
                 operation: REFERENCE_INDEX_OPERATION_NAME,
                 instruction: id(0, 0),
-                expected: "f32[3]".to_string(),
-                actual: "f32[2]".to_string(),
+                position: ReferenceAliasPosition::Output(0),
+                source: ReferenceViewValidationError::TypeMismatch {
+                    expected: "f32[3]".to_string(),
+                    actual: "f32[2]".to_string(),
+                },
             }),
         );
     }
@@ -1758,10 +1771,13 @@ mod tests {
             builder.build::<Vec<TestValue>, Vec<TestValue>>(Vec::new(), vec![Placeholder], Vec::new()).unwrap();
         assert_eq!(
             ReferenceViewAnalysis::new(program.entry_region_ref(), 0).err(),
-            Some(ReferenceViewAnalysisError::InvalidViewComposition {
+            Some(ReferenceViewAnalysisError::InvalidView {
                 operation: REFERENCE_INDEX_OPERATION_NAME,
                 instruction: id(0, 0),
-                message: "reference index axis 2 is out of bounds for rank 2".to_string(),
+                position: ReferenceAliasPosition::Output(0),
+                source: ReferenceViewValidationError::InvalidComposition {
+                    message: "reference index axis 2 is out of bounds for rank 2".to_string(),
+                },
             }),
         );
     }
@@ -1905,7 +1921,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             ReferenceViewAnalysis::new(program.entry_region_ref(), 0).err(),
-            Some(ReferenceViewAnalysisError::MissingView { operation: "undescribed_view", instruction: id(0, 0) }),
+            Some(ReferenceViewAnalysisError::MissingView {
+                operation: "undescribed_view",
+                instruction: id(0, 0),
+                position: ReferenceAliasPosition::Output(0),
+            }),
         );
     }
 
@@ -1931,10 +1951,11 @@ mod tests {
         let program = symbolic_view_program(ViewSymbol::Operand(2));
         assert_eq!(
             ReferenceViewAnalysis::new(program.entry_region_ref(), 0).err(),
-            Some(ReferenceViewAnalysisError::InvalidViewSymbolOperand {
+            Some(ReferenceViewAnalysisError::InvalidViewSymbol {
                 operation: "symbolic_view",
                 instruction: id(0, 0),
-                operand_index: 2,
+                position: ReferenceAliasPosition::Output(0),
+                symbol: ViewSymbol::Operand(2),
                 message: "the instruction has only 2 operands".to_string(),
             }),
         );
@@ -1943,10 +1964,11 @@ mod tests {
         let program = symbolic_view_program(ViewSymbol::Operand(0));
         assert_eq!(
             ReferenceViewAnalysis::new(program.entry_region_ref(), 0).err(),
-            Some(ReferenceViewAnalysisError::InvalidViewSymbolOperand {
+            Some(ReferenceViewAnalysisError::InvalidViewSymbol {
                 operation: "symbolic_view",
                 instruction: id(0, 0),
-                operand_index: 0,
+                position: ReferenceAliasPosition::Output(0),
+                symbol: ViewSymbol::Operand(0),
                 message: "that operand is a reference rather than a coordinate value".to_string(),
             }),
         );
@@ -1955,10 +1977,12 @@ mod tests {
         let program = symbolic_view_program(ViewSymbol::Iteration);
         assert_eq!(
             ReferenceViewAnalysis::new(program.entry_region_ref(), 0).err(),
-            Some(ReferenceViewAnalysisError::IterationSymbolAtOutput {
+            Some(ReferenceViewAnalysisError::InvalidViewSymbol {
                 operation: "symbolic_view",
                 instruction: id(0, 0),
-                output_index: 0,
+                position: ReferenceAliasPosition::Output(0),
+                symbol: ViewSymbol::Iteration,
+                message: "an iteration symbol only describes region inputs".to_string(),
             }),
         );
     }
@@ -2017,11 +2041,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             ReferenceViewAnalysis::new(program.entry_region_ref(), 0).err(),
-            Some(ReferenceViewAnalysisError::ViewTypeMismatch {
+            Some(ReferenceViewAnalysisError::InvalidView {
                 operation: SCAN_OPERATION_NAME,
                 instruction: id(1, 0),
-                expected: "f32[2]".to_string(),
-                actual: "f32[3]".to_string(),
+                position: ReferenceAliasPosition::RegionInput { region_index: 0, input_index: 1 },
+                source: ReferenceViewValidationError::TypeMismatch {
+                    expected: "f32[2]".to_string(),
+                    actual: "f32[3]".to_string(),
+                },
             }),
         );
     }
@@ -2100,17 +2127,16 @@ mod tests {
         // The first attachment supplies a valid path, but cannot excuse the missing description on the second.
         assert_eq!(
             ReferenceViewAnalysis::new(missing.entry_region_ref(), 0).err(),
-            Some(ReferenceViewAnalysisError::MissingBoundaryView {
+            Some(ReferenceViewAnalysisError::MissingView {
                 operation: "undescribed_scan",
                 instruction: id(1, 1),
-                region_index: 0,
-                input_index: 1,
+                position: ReferenceAliasPosition::RegionInput { region_index: 0, input_index: 1 },
             }),
         );
         let inconsistent = program(SymbolicViewOperation::DescribedScan(ScanOperation::new(1, 3), index(0, 0)));
         assert_eq!(
             ReferenceViewAnalysis::new(inconsistent.entry_region_ref(), 0).err(),
-            Some(ReferenceViewAnalysisError::InconsistentBoundaryView {
+            Some(ReferenceViewAnalysisError::InconsistentBoundaryViews {
                 operation: "described_scan",
                 instruction: id(1, 1),
                 region_index: 0,
@@ -2150,11 +2176,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             ReferenceViewAnalysis::new(program.entry_region_ref(), 0).err(),
-            Some(ReferenceViewAnalysisError::MissingBoundaryView {
+            Some(ReferenceViewAnalysisError::MissingView {
                 operation: "undescribed_scan",
                 instruction: id(1, 0),
-                region_index: 0,
-                input_index: 1,
+                position: ReferenceAliasPosition::RegionInput { region_index: 0, input_index: 1 },
             }),
         );
     }

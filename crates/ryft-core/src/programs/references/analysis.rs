@@ -553,6 +553,18 @@ pub enum ReferenceAliasPosition {
     },
 }
 
+impl Display for ReferenceAliasPosition {
+    #[inline]
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Output(index) => write!(formatter, "output {index}"),
+            Self::RegionInput { region_index, input_index } => {
+                write!(formatter, "input {input_index} of region {region_index}")
+            }
+        }
+    }
+}
+
 /// Reference alias edge that defines one reference-typed value from another reference-typed value (i.e., that defines
 /// a view). Edges are recorded for [`ReferenceAlias`](crate::ReferenceAlias) outputs and for outputs constrained by
 /// [`Operation::reference_output_identity_input`], which are identity edges from the constrained input, both of which
@@ -2582,6 +2594,8 @@ mod tests {
     fn test_reference_alias_position() {
         let output = ReferenceAliasPosition::Output(2);
         let input = ReferenceAliasPosition::RegionInput { region_index: 0, input_index: 1 };
+        assert_eq!(output.to_string(), "output 2");
+        assert_eq!(input.to_string(), "input 1 of region 0");
         assert_eq!(format!("{output:?}"), "Output(2)");
         assert_eq!(format!("{input:?}"), "RegionInput { region_index: 0, input_index: 1 }");
         assert_ne!(output, input);
