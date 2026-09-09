@@ -1425,6 +1425,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ReferenceDischargeRegionResult<V, O
     }
 }
 
+// TODO(eaplatanios): Review this.
 /// Transitive reference-access summary of a [`Region`](crate::Region) closure, expressed in the caller allocations
 /// its boundary names. This is the analysis a structured rule needs before it can size its state boundary, and it is
 /// computed entirely from generic hooks (i.e., operation-local [`Operation::effects`], the input- and output-region
@@ -1508,16 +1509,13 @@ impl ReferenceDischargeRegionSummary {
                 )));
             }
         }
-        let inputs = inputs
-            .iter()
-            .map(|allocation| allocation.map(ReferenceDischargeSummaryRoot::Caller))
-            .collect::<Vec<_>>();
+        let inputs = inputs.iter().map(|allocation| allocation.map(ReferenceDischargeRoot::Caller)).collect::<Vec<_>>();
         let captures = captures
             .allocations()
             .iter()
-            .map(|allocation| allocation.map(ReferenceDischargeSummaryRoot::Caller))
+            .map(|allocation| allocation.map(ReferenceDischargeRoot::Caller))
             .collect::<Vec<_>>();
-        let summary = ReferenceDischargeRootSummary::new(operation, region_index, region, &inputs, &captures)?;
+        let summary = ReferenceDischargeSummaryState::new(operation, region_index, region, &inputs, &captures)?;
         // Local allocations have served their validation role. They do not identify caller state, including when
         // returned by this region, so the public summary exposes only the supplied discharge allocation identities.
         Ok(Self {
@@ -1525,23 +1523,23 @@ impl ReferenceDischargeRegionSummary {
                 .reached_allocations
                 .into_iter()
                 .filter_map(|root| match root {
-                    ReferenceDischargeSummaryRoot::Caller(allocation) => Some(allocation),
-                    ReferenceDischargeSummaryRoot::Local(_) => None,
+                    ReferenceDischargeRoot::Caller(allocation) => Some(allocation),
+                    ReferenceDischargeRoot::Local(_) => None,
                 })
                 .collect(),
             accessed_allocations: summary
                 .accessed_allocations
                 .into_iter()
                 .filter_map(|(root, modes)| match root {
-                    ReferenceDischargeSummaryRoot::Caller(allocation) => Some((allocation, modes)),
-                    ReferenceDischargeSummaryRoot::Local(_) => None,
+                    ReferenceDischargeRoot::Caller(allocation) => Some((allocation, modes)),
+                    ReferenceDischargeRoot::Local(_) => None,
                 })
                 .collect(),
             output_allocations: summary
                 .output_allocations
                 .into_iter()
                 .map(|root| match root {
-                    Some(ReferenceDischargeSummaryRoot::Caller(allocation)) => Some(allocation),
+                    Some(ReferenceDischargeRoot::Caller(allocation)) => Some(allocation),
                     _ => None,
                 })
                 .collect(),
@@ -1614,11 +1612,10 @@ impl ReferenceDischargeRegionSummary {
     }
 }
 
-// TODO(eaplatanios): Review this.
-/// Reference identity retained while validating a discharge summary. Source-local identities must not be erased
-/// until nested regions have checked their incoming references, but never enter a caller-facing summary.
+/// Reference identity retained while validating a [`ReferenceDischargeRegionSummary`]. Source-local identities must not
+/// be erased until nested regions have checked their incoming references, but never enter a caller-facing summary.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum ReferenceDischargeSummaryRoot {
+enum ReferenceDischargeRoot {
     /// Allocation already bound by the caller's discharge context.
     Caller(ReferenceDischargeAllocationId),
 
@@ -1626,16 +1623,15 @@ enum ReferenceDischargeSummaryRoot {
     Local(ValueId),
 }
 
-// TODO(eaplatanios): Review this.
-impl ReferenceDischargeSummaryRoot {
+impl ReferenceDischargeRoot {
     /// Returns whether this root was allocated in `region` rather than supplied by its caller.
     fn is_local_to(self, region: RegionId) -> bool {
         matches!(self, Self::Local(value) if value.region() == region)
     }
 }
 
-// TODO(eaplatanios): Review this.
-impl Display for ReferenceDischargeSummaryRoot {
+impl Display for ReferenceDischargeRoot {
+    #[inline]
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Caller(allocation) => Display::fmt(allocation, formatter),
@@ -1646,24 +1642,24 @@ impl Display for ReferenceDischargeSummaryRoot {
     }
 }
 
-// TODO(eaplatanios): Review this.
 /// Intermediate summary retaining source-local reference identities across nested region boundaries. Each region
 /// removes accesses to its own allocations only after validating its children; output identities remain available
 /// to its parent for forwarding and escape checks.
 #[derive(Default)]
-struct ReferenceDischargeRootSummary {
-    /// Incoming roots whose state or reference must be available during replay, even without an access.
-    reached_allocations: BTreeSet<ReferenceDischargeSummaryRoot>,
+struct ReferenceDischargeSummaryState {
+    /// Incoming [`ReferenceDischargeRoot`]s whose state or reference must be available during replay,
+    /// even without an access.
+    reached_allocations: BTreeSet<ReferenceDischargeRoot>,
 
-    /// Exact non-consuming access modes performed through incoming roots.
-    accessed_allocations: BTreeMap<ReferenceDischargeSummaryRoot, BTreeSet<ReferenceAccessMode>>,
+    /// Exact non-consuming [`ReferenceAccessMode`]s performed through incoming [`ReferenceDischargeRoot`]s.
+    accessed_allocations: BTreeMap<ReferenceDischargeRoot, BTreeSet<ReferenceAccessMode>>,
 
-    /// Roots denoted by declared outputs, retaining locally created references for the parent's escape checks.
-    output_allocations: Vec<Option<ReferenceDischargeSummaryRoot>>,
+    /// [`ReferenceDischargeRoot`]s denoted by declared outputs, retaining locally created references
+    /// for the parent's escape checks.
+    output_allocations: Vec<Option<ReferenceDischargeRoot>>,
 }
 
-// TODO(eaplatanios): Review this.
-impl ReferenceDischargeRootSummary {
+impl ReferenceDischargeSummaryState {
     /// Summarizes `region` using caller and source-local identities. `inputs` names its declared input roots, while
     /// `captures` is the enclosing capture scope. `operation` and `region_index` determine the region's capture and
     /// access rules.
@@ -1671,8 +1667,8 @@ impl ReferenceDischargeRootSummary {
         operation: &Owner,
         region_index: usize,
         region: RegionRef<'_, V, O>,
-        inputs: &[Option<ReferenceDischargeSummaryRoot>],
-        captures: &[Option<ReferenceDischargeSummaryRoot>],
+        inputs: &[Option<ReferenceDischargeRoot>],
+        captures: &[Option<ReferenceDischargeRoot>],
     ) -> Result<Self, ProgramError> {
         // A nested capture prefix binds the same roots as its inputs, including allocations created in an outer
         // region. Keep those local roots until each nested region has validated its incoming references.
@@ -1683,14 +1679,16 @@ impl ReferenceDischargeRootSummary {
             )))?,
             None => captures,
         };
+
         let mut summary = Self::default();
         let is_reference = |atom: AtomId| region.atoms()[atom.index()].r#type().is_reference();
-        let mut allocations = HashMap::<AtomId, ReferenceDischargeSummaryRoot>::new();
+        let mut allocations = HashMap::<AtomId, ReferenceDischargeRoot>::new();
         for (input, allocation) in region.input_ids().iter().copied().zip(inputs) {
             if is_reference(input) {
                 let allocation = allocation.ok_or_else(|| {
                     ProgramError::MalformedProgram(format!(
-                        "reference input `{input}` of region `{}` has no supplying allocation",
+                        "reference input `{}` of region `{}` has no supplying allocation",
+                        input,
                         region.id(),
                     ))
                 })?;
@@ -1698,11 +1696,11 @@ impl ReferenceDischargeRootSummary {
             }
         }
 
-        // A capture-scoped constant is seeded exactly like a boundary position. Materializing one makes its
-        // allocation reachable during replay but is not itself a semantic reference read; actual accesses are
-        // recorded from operation effect declarations below. Which constants are materialized must agree with the
-        // dead-constant rule of `RegionRef::interpret_with`, which lifts a constant only when an instruction input or a
-        // region output uses it; diverging would thread too little (the rebuilt region fails to lift) or too much.
+        // A capture-scoped constant is seeded exactly like a boundary position. Materializing one makes its allocation
+        // reachable during replay but is not itself a semantic reference read; actual accesses are recorded from
+        // operation effect declarations below. Which constants are materialized must agree with the dead-constant rule
+        // of `RegionRef::interpret_with`, which lifts a constant only when an instruction input or a region output uses
+        // it; diverging would thread too little (the rebuilt region fails to lift) or too much.
         let materialized_atoms = region
             .instructions()
             .iter()
@@ -1722,32 +1720,36 @@ impl ReferenceDischargeRootSummary {
                 }
             }
         }
+
         let input_atom = |instruction: &Instruction<O>, index: usize, role: &str| {
             instruction.inputs().get(index).copied().ok_or_else(|| {
                 ProgramError::MalformedProgram(format!(
-                    "operation `{}` names {role} input {index} but the application has {} inputs",
+                    "operation `{}` names {} input {} but the application has {} inputs",
                     instruction.operation().name(),
+                    role,
+                    index,
                     instruction.inputs().len(),
                 ))
             })
         };
 
-        // A reference-typed atom the traversal never bound denotes a reference that entered this region neither
-        // through its boundary nor through its capture scope. The environment has no allocation for it, so the
-        // summary reports it here rather than dropping the access and letting the replay fail later for a reason
-        // that no longer names the operation that performed it.
-        let resolve = |allocations: &HashMap<AtomId, ReferenceDischargeSummaryRoot>, atom: AtomId, operation: &str| {
-            match allocations.get(&atom) {
+        // A reference-typed atom the traversal never bound denotes a reference that entered this region neither through
+        // its boundary nor through its capture scope. The environment has no allocation for it, so the summary reports
+        // it here rather than dropping the access and letting the replay fail later for a reason that no longer names
+        // the operation that performed it.
+        let resolve =
+            |allocations: &HashMap<AtomId, ReferenceDischargeRoot>, atom: AtomId, operation: &str| match allocations
+                .get(&atom)
+            {
                 Some(allocation) => Ok(Some(*allocation)),
                 None if is_reference(atom) => Err(ProgramError::MalformedProgram(format!(
                     "operation `{}` reaches a reference that entered region `{}` neither through its boundary \
-                         nor through its capture scope",
+                     nor through its capture scope",
                     operation,
                     region.id(),
                 ))),
                 None => Ok(None),
-            }
-        };
+            };
         for instruction in region.instructions() {
             let nested_operation = instruction.operation();
             let effects = nested_operation.effects();
@@ -1759,8 +1761,8 @@ impl ReferenceDischargeRootSummary {
                     if mode.is_consuming() {
                         if !allocation.is_local_to(region.id()) {
                             return Err(ProgramError::MalformedProgram(format!(
-                                "reference discharge cannot pass {allocation} into a region that consumes it through \
-                                 `{}`",
+                                "reference discharge cannot pass {} into a region that consumes it through `{}`",
+                                allocation,
                                 nested_operation.name(),
                             )));
                         }
@@ -1770,6 +1772,7 @@ impl ReferenceDischargeRootSummary {
                     }
                 }
             }
+
             let classified_output = |output_index: usize| {
                 instruction.outputs().get(output_index).copied().ok_or_else(|| {
                     ProgramError::MalformedProgram(format!(
@@ -1780,10 +1783,12 @@ impl ReferenceDischargeRootSummary {
                     ))
                 })
             };
+
             for output_index in effects.allocation_output_indices() {
                 let output = classified_output(output_index)?;
-                allocations.insert(output, ReferenceDischargeSummaryRoot::Local(ValueId::new(region.id(), output)));
+                allocations.insert(output, ReferenceDischargeRoot::Local(ValueId::new(region.id(), output)));
             }
+
             for alias in effects.reference_aliases() {
                 let defined = classified_output(alias.output_index())?;
                 let allocation = resolve(
@@ -1799,6 +1804,7 @@ impl ReferenceDischargeRootSummary {
                 })?;
                 allocations.insert(defined, allocation);
             }
+
             let mut attached_output_allocations = Vec::with_capacity(instruction.regions().len());
             for (nested_region_index, attached) in instruction.regions().iter().copied().enumerate() {
                 // Dormant rule regions are inputs to later transforms rather than executed children of this
@@ -1810,6 +1816,7 @@ impl ReferenceDischargeRootSummary {
                     attached_output_allocations.push(Vec::new());
                     continue;
                 }
+
                 let attached = region.with_id(attached)?;
                 let nested = attached
                     .input_ids()
@@ -1840,10 +1847,9 @@ impl ReferenceDischargeRootSummary {
                     })
                     .collect::<Result<Vec<_>, _>>()?;
 
-                // The nested closure is summarized on its own first, so that an operation restricting what its
-                // regions may do to an entering allocation is held to that restriction here, where the offending
-                // region is still named, rather than only indirectly when a rebuilt region contradicts the widening
-                // it was given.
+                // The nested closure is summarized on its own first, so that an operation restricting what its regions
+                // may do to an entering allocation is held to that restriction here, where the offending region is
+                // still named, rather than only indirectly when a rebuilt region contradicts the widening it was given.
                 let nested_summary =
                     Self::new(nested_operation, nested_region_index, attached, nested.as_slice(), captures)?;
                 summary.reached_allocations.extend(nested_summary.reached_allocations);
@@ -1860,6 +1866,7 @@ impl ReferenceDischargeRootSummary {
                 if !is_reference(output) || allocations.contains_key(&output) {
                     continue;
                 }
+
                 // An identity declaration constrains every forwarded output; it is not a substitute for checking
                 // the attached regions. Each reference has a root, including references created inside the closure.
                 let identity = nested_operation.reference_output_identity_input(output_index);
@@ -1873,12 +1880,14 @@ impl ReferenceDischargeRootSummary {
                     })
                     .transpose()?
                     .flatten();
+
                 if identity.is_some() && preserved.is_none() {
                     return Err(ProgramError::MalformedProgram(format!(
                         "operation `{}` preserves a non-reference input at reference output {output_index}",
                         nested_operation.name(),
                     )));
                 }
+
                 for origin in nested_operation.output_region_provenance(output_index) {
                     let allocation = attached_output_allocations
                         .get(origin.region_index)
@@ -1894,27 +1903,31 @@ impl ReferenceDischargeRootSummary {
                                 origin.output_index,
                             ))
                         })?;
+
                     // A nested region may return an entering reference, but may not export an allocation it created.
                     if allocation.is_local_to(instruction.regions()[origin.region_index]) {
                         return Err(ProgramError::MalformedProgram(format!(
-                            "operation `{}` forwards output {output_index} from an allocation created inside its \
-                             region",
+                            "operation `{}` forwards output {} from an allocation created inside its region",
                             nested_operation.name(),
+                            output_index,
                         )));
                     }
+
                     match preserved {
                         Some(expected) if expected != allocation => {
                             return Err(ProgramError::MalformedProgram(if identity.is_some() {
                                 format!(
-                                    "operation `{}` forwards output {output_index} from a region whose allocation \
+                                    "operation `{}` forwards output {} from a region whose allocation \
                                      differs from its declared input identity",
                                     nested_operation.name(),
+                                    output_index,
                                 )
                             } else {
                                 format!(
-                                    "operation `{}` forwards output {output_index} from regions that return different \
+                                    "operation `{}` forwards output {} from regions that return different \
                                      reference allocations",
                                     nested_operation.name(),
+                                    output_index,
                                 )
                             }));
                         }
@@ -1922,16 +1935,19 @@ impl ReferenceDischargeRootSummary {
                         _ => {}
                     }
                 }
+
                 let preserved = preserved.ok_or_else(|| {
                     ProgramError::MalformedProgram(format!(
-                        "operation `{}` produces a reference at output {output_index} without declaring which input \
-                     allocation it preserves or which region output it forwards",
+                        "operation `{}` produces a reference at output {} without declaring which input \
+                         allocation it preserves or which region output it forwards",
                         nested_operation.name(),
+                        output_index,
                     ))
                 })?;
                 allocations.insert(output, preserved);
             }
         }
+
         for output in region.output_ids().iter().copied() {
             summary.output_allocations.push(match allocations.get(&output) {
                 Some(allocation) => Some(*allocation),
@@ -1945,11 +1961,12 @@ impl ReferenceDischargeRootSummary {
                 None => None,
             });
         }
+
         summary.reached_allocations.extend(summary.output_allocations.iter().copied().flatten());
 
-        // Nested regions have already validated accesses to these roots. Only now remove this region's own
-        // allocations, which are not incoming references governed by its owner's region-input policy. Output roots
-        // remain intact so the parent can distinguish an entering reference from an escaping fresh allocation.
+        // Nested regions have already validated accesses to these roots. Only now remove this region's own allocations,
+        // which are not incoming references governed by its owner's region-input policy. Output roots remain intact so
+        // the parent can distinguish an entering reference from an escaping fresh allocation.
         summary.reached_allocations.retain(|root| !root.is_local_to(region.id()));
         summary.accessed_allocations.retain(|root, _| !root.is_local_to(region.id()));
 
@@ -1959,12 +1976,16 @@ impl ReferenceDischargeRootSummary {
             for mode in modes {
                 if !operation.allows_reference_access_through_region_input(region_index, *mode) {
                     return Err(ProgramError::MalformedProgram(format!(
-                        "operation `{}` does not allow region {region_index} to access {allocation} with mode `{mode}`",
+                        "operation `{}` does not allow region {} to access {} with mode `{}`",
                         operation.name(),
+                        region_index,
+                        allocation,
+                        mode,
                     )));
                 }
             }
         }
+
         Ok(summary)
     }
 }
