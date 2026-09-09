@@ -393,7 +393,7 @@ where
         let (carry_operands, stacked_operands) = inputs.split_at(carry_count);
         let carries = carry_operands
             .iter()
-            .map(|input| context.operand_allocation(input, name))
+            .map(|input| context.input_allocation(input))
             .collect::<Result<Vec<_>, _>>()?;
 
         // Only the carries forward positionally into the body. Every remaining body input is the per-iteration slice of
@@ -417,7 +417,7 @@ where
         }
         let mut body_allocations = carries.clone();
         for input in &inputs[carry_count..body_input_types.len()] {
-            body_allocations.push(context.operand_allocation(input, name)?);
+            body_allocations.push(context.input_allocation(input)?);
         }
         let summary = context.region_summary(self, 0, body, body_allocations.as_slice())?;
 
@@ -540,13 +540,13 @@ where
         // reference when preserved, exactly like a carry does.
         let mut operands = Vec::with_capacity(inputs.len() + entering.len());
         for input in carry_operands {
-            operands.push(context.operand_value(input)?);
+            operands.push(context.input_value(input)?);
         }
         for allocation in &entering {
             operands.push(context.allocation_value(*allocation)?);
         }
         for input in stacked_operands {
-            operands.push(context.operand_value(input)?);
+            operands.push(context.input_value(input)?);
         }
         let published_views = boundary
             .added_outputs()

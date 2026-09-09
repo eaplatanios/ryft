@@ -283,7 +283,7 @@ where
         let name = self.name();
         self.validate_region_count(driver.region_count())?;
         let carries =
-            inputs.iter().map(|input| context.operand_allocation(input, name)).collect::<Result<Vec<_>, _>>()?;
+            inputs.iter().map(|input| context.input_allocation(input)).collect::<Result<Vec<_>, _>>()?;
 
         // Both regions observe the same entering state, so one summary of the two sizes one boundary.
         let condition = driver.region(0)?;
@@ -386,7 +386,7 @@ where
         };
         let mut operands = Vec::with_capacity(inputs.len() + entering.len() + 1);
         for input in inputs {
-            operands.push(context.operand_value(input)?);
+            operands.push(context.input_value(input)?);
         }
         for allocation in &entering {
             operands.push(context.allocation_value(*allocation)?);
