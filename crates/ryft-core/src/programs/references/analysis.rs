@@ -656,41 +656,41 @@ impl ReferenceRegionInputBinding {
     }
 }
 
-// TODO(eaplatanios): Review from this point onwards.
-
-/// Transitive reference accesses of one [`Instruction`](crate::Instruction): the modes it performs on each root,
-/// directly or anywhere inside its attached region closure, expressed in the namespace of the region containing the
-/// instruction. Nested region inputs are substituted through their bindings and allocations local to nested regions
-/// are dropped, so a caller sees exactly which of its own roots the instruction touches.
+/// Transitive [`ReferenceAccessMode`]s of one [`Instruction`](crate::Instruction). This contains the access modes
+/// involved for each [`ReferenceRoot`], directly or anywhere inside its attached [`Region`] closure, expressed in the
+/// namespace of the region containing the instruction. Nested region inputs are substituted through their bindings,
+/// and allocations local to nested regions are dropped, so a caller sees exactly which of its own roots the instruction
+/// touches.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReferenceTransitiveAccess {
-    /// Refer to [`Self::accesses`].
-    accesses: BTreeMap<ReferenceRoot, BTreeSet<ReferenceAccessMode>>,
+    /// [`ReferenceAccessMode`]s performed on each [`ReferenceRoot`], in canonical root order.
+    access_modes: BTreeMap<ReferenceRoot, BTreeSet<ReferenceAccessMode>>,
 }
 
 impl ReferenceTransitiveAccess {
-    /// Returns the access modes performed on each root, in canonical root order.
+    /// Returns the [`ReferenceAccessMode`]s performed on each [`ReferenceRoot`], in canonical root order.
     #[inline]
-    pub fn accesses(&self) -> &BTreeMap<ReferenceRoot, BTreeSet<ReferenceAccessMode>> {
-        &self.accesses
+    pub fn access_modes(&self) -> &BTreeMap<ReferenceRoot, BTreeSet<ReferenceAccessMode>> {
+        &self.access_modes
     }
 
-    /// Returns the accessed roots, in canonical root order.
+    /// Returns the [`ReferenceAccessMode`]s performed on `root`, in [`ReferenceAccessMode`] declaration order.
     #[inline]
-    pub fn roots(&self) -> impl Iterator<Item = ReferenceRoot> + '_ {
-        self.accesses.keys().copied()
+    pub fn access_modes_for(&self, root: ReferenceRoot) -> impl '_ + Iterator<Item = ReferenceAccessMode> {
+        self.access_modes.get(&root).into_iter().flatten().copied()
     }
 
-    /// Returns the access modes performed on `root`, in [`ReferenceAccessMode`] declaration order.
+    /// Returns the accessed [`ReferenceRoot`]s, in canonical root order.
     #[inline]
-    pub fn modes(&self, root: ReferenceRoot) -> impl Iterator<Item = ReferenceAccessMode> + '_ {
-        self.accesses.get(&root).into_iter().flatten().copied()
+    pub fn roots(&self) -> impl '_ + Iterator<Item = ReferenceRoot> {
+        self.access_modes.keys().copied()
     }
 
-    /// Returns whether any access writes, swaps, or accumulates into `root`.
+    /// Returns whether `root` is accessed with any of the [`ReferenceAccessMode::Write`],
+    /// [`ReferenceAccessMode::ReadWrite`], and [`ReferenceAccessMode::Accumulate`] modes.
     #[inline]
     pub fn is_mutated(&self, root: ReferenceRoot) -> bool {
-        self.modes(root).any(|mode| {
+        self.access_modes_for(root).any(|mode| {
             matches!(
                 mode,
                 ReferenceAccessMode::Write | ReferenceAccessMode::ReadWrite | ReferenceAccessMode::Accumulate
@@ -698,12 +698,14 @@ impl ReferenceTransitiveAccess {
         })
     }
 
-    /// Returns whether the instruction accesses no root at all.
+    /// Returns whether the corresponding [`Instruction`](crate::Instruction) accesses no [`ReferenceRoot`] at all.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.accesses.is_empty()
+        self.access_modes.is_empty()
     }
 }
+
+// TODO(eaplatanios): Review from this point onwards.
 
 /// Reference topology, access, and lifetime analysis of one [`Region`] computation closure. Transform rules, boundary
 /// validation, diagnostics, and lowering share this analysis through [`RegionRef::reference_analysis`]. It runs when
@@ -955,21 +957,6 @@ impl ReferenceAnalysis {
     }
 }
 
-impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Parameterized<V>>
-    Program<V, O, Input, Output>
-{
-    /// Analyzes the references of this [`Program`]'s entry region closure through the retained analysis of its entry
-    /// region. Refer to the documentation of [`RegionRef::reference_analysis`] for more information.
-    ///
-    /// # Parameters
-    ///
-    ///   - `capture_count`: Number of leading inputs that originate in a lifted capture table.
-    #[inline]
-    pub fn reference_analysis(&self, capture_count: usize) -> Result<Arc<ReferenceAnalysis>, ReferenceAnalysisError> {
-        self.entry_region_ref().reference_analysis(capture_count)
-    }
-}
-
 impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     /// Returns the [`ReferenceAnalysis`] of this [`Region`]'s closure, retained in the region's transform cache so
     /// that kernel validation and transform rules consulting the same closure share one analysis. Discharge shares
@@ -989,7 +976,12 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     /// Returns the [`ReferenceAnalysisError`] naming the first violated rule in program order. A failed analysis is
     /// not retained.
     pub fn reference_analysis(self, capture_count: usize) -> Result<Arc<ReferenceAnalysis>, ReferenceAnalysisError> {
-        self.reference_analysis_with_arguments(&ReferenceAnalysisTransformArguments::new(self, capture_count))
+        self.reference_analysis_with_arguments(&ReferenceAnalysisTransformArguments::new(
+            self,
+            Vec::new(),
+            Some(capture_count),
+            false,
+        ))
     }
 
     /// Analyzes an open computation region whose inherited captures have not been lifted into an input prefix.
@@ -1012,9 +1004,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
         self,
         capture_scope: Option<usize>,
     ) -> Result<Arc<ReferenceAnalysis>, ReferenceAnalysisError> {
-        let mut arguments = ReferenceAnalysisTransformArguments::new(self, capture_scope.unwrap_or(0));
-        arguments.capture_scope = capture_scope;
-        arguments.resolve_constants = true;
+        let arguments = ReferenceAnalysisTransformArguments::new(self, Vec::new(), capture_scope, true);
         self.reference_analysis_with_arguments(&arguments)
     }
 
@@ -1027,8 +1017,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
         capture_count: usize,
         consumable_inputs: Vec<usize>,
     ) -> Result<Arc<ReferenceAnalysis>, ReferenceAnalysisError> {
-        let mut arguments = ReferenceAnalysisTransformArguments::new(self, capture_count);
-        arguments.consumable_inputs = consumable_inputs;
+        let arguments = ReferenceAnalysisTransformArguments::new(self, consumable_inputs, Some(capture_count), false);
         self.reference_analysis_with_arguments(&arguments)
     }
 
@@ -1059,58 +1048,18 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> RegionRef<'r, V, O> {
     }
 }
 
-/// [`Region`] [`Transform`] marker for retained [`ReferenceAnalysis`] artifacts.
-pub(crate) struct ReferenceAnalysisTransform;
-
-impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for ReferenceAnalysisTransform {
-    type Arguments = ReferenceAnalysisTransformArguments;
-    type Artifact = TransformArtifact<V, O, Arc<ReferenceAnalysis>>;
-
-    const DEFAULT_CACHE_CAPACITY: usize = 2;
-}
-
-/// Argument key for one retained [`ReferenceAnalysisTransform`].
-///
-/// A [`ReferenceAnalysis`] records concrete [`RegionId`], [`InstructionId`], and [`ValueId`]s, while a region's
-/// transform cache is shared across topology-preserving imports that renumber attached regions. The capture count alone
-/// would therefore serve a rebased copy records that name the original arena's identifiers, so the key also
-/// carries the closure's region identifiers in first-encounter structural order (refer to the documentation of
-/// [`RegionRef::region_ids_in_closure`]). The identifier sequence alone does not make a hit valid, because two arenas
-/// may file different bodies under the same identifiers; what does is the sealing rule the cache rides on: re-sealing a
-/// region that attaches any descendant mints a fresh cache, and only closure-preserving imports (which keep every
-/// attached body up to a topology-preserving renumbering) carry the cache over. Within one cache, equal keys therefore
-/// name the same bodies, so every recorded identifier is still valid: a rebased copy gets its own entry, and repeated
-/// analysis of an unmoved region hits.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct ReferenceAnalysisTransformArguments {
-    /// Whether an open region may resolve inherited captures and concrete reference constants as external roots.
-    resolve_constants: bool,
-
-    /// Explicit lifted-capture prefix, or `None` when captures are inherited from an unknown outer scope.
-    capture_scope: Option<usize>,
-
-    /// Region identifiers of the analyzed closure in first-encounter structural order.
-    regions: Vec<RegionId>,
-
-    /// Entry input indices whose ownership is transferred to this region. All other external roots remain borrowed.
-    consumable_inputs: Vec<usize>,
-}
-
-impl ReferenceAnalysisTransformArguments {
-    /// Creates the key of the retained analysis of `region`'s closure under `capture_count` lifted captures. The
-    /// same key identifies analyses derived from these facts (e.g., the retained
-    /// [`ReferenceViewAnalysis`](crate::programs::references::ReferenceViewAnalysis)), so all of them share one cache
-    /// identity and one revalidation rule.
-    pub(crate) fn new<V: Value, O: Operation<Type = V::Type>>(
-        region: RegionRef<'_, V, O>,
-        capture_count: usize,
-    ) -> Self {
-        Self {
-            capture_scope: Some(capture_count),
-            regions: region.region_ids_in_closure(),
-            resolve_constants: false,
-            consumable_inputs: Vec::new(),
-        }
+impl<V: Value, O: Operation<Type = V::Type>, Input: Parameterized<V>, Output: Parameterized<V>>
+    Program<V, O, Input, Output>
+{
+    /// Analyzes the references of this [`Program`]'s entry region closure through the retained analysis of its entry
+    /// region. Refer to the documentation of [`RegionRef::reference_analysis`] for more information.
+    ///
+    /// # Parameters
+    ///
+    ///   - `capture_count`: Number of leading inputs that originate in a lifted capture table.
+    #[inline]
+    pub fn reference_analysis(&self, capture_count: usize) -> Result<Arc<ReferenceAnalysis>, ReferenceAnalysisError> {
+        self.entry_region_ref().reference_analysis(capture_count)
     }
 }
 
@@ -1151,7 +1100,7 @@ type BoundaryViews = Rc<[Option<ReferenceAliasEdge>]>;
 /// analysis uses the region's own namespace and retains this result; boundary analysis uses caller identities and
 /// derives a fresh result for each attachment.
 #[derive(Clone, Debug)]
-pub(super) struct RegionSummary {
+pub(crate) struct RegionSummary {
     /// Capture scope the region was analyzed under.
     scope: CaptureScope,
 
@@ -1822,11 +1771,79 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
             .transitive_accesses
             .entry(instruction)
             .or_default()
-            .accesses
+            .access_modes
             .entry(root)
             .or_default()
             .insert(mode);
         summary.accesses.entry(root).or_default().insert(mode);
+    }
+}
+
+// TODO(eaplatanios): Review up to here.
+
+/// [`Region`] [`Transform`] marker for retained [`ReferenceAnalysis`] artifacts.
+struct ReferenceAnalysisTransform;
+
+impl<V: Value, O: Operation<Type = V::Type>> Transform<Region<V, O>> for ReferenceAnalysisTransform {
+    type Arguments = ReferenceAnalysisTransformArguments;
+    type Artifact = TransformArtifact<V, O, Arc<ReferenceAnalysis>>;
+
+    const DEFAULT_CACHE_CAPACITY: usize = 8;
+}
+
+/// Cache key for a [`ReferenceAnalysisTransform`] result. It includes the analyzed [`Region`]'s closure identifiers,
+/// input ownership settings, and capture resolution settings, so requests with different analysis assumptions use
+/// separate cache entries.
+///
+/// The region identifiers are necessary because a [`ReferenceAnalysis`] stores [`RegionId`], [`InstructionId`], and
+/// [`ValueId`]s that refer to the analyzed program. Importing that program can preserve its computations and reuse its
+/// transform cache while assigning different region identifiers. For example, if an attached region changes from `^0`
+/// to `^3`, returning the original analysis would incorrectly report facts about `^0`. Including the identifiers
+/// returned by [`RegionRef::region_ids_in_closure`] in their first-encounter order gives the imported program a
+/// separate entry when those identifiers change.
+///
+/// This key is meaningful within its owning transform cache, not as a global identifier for a computation. Different
+/// [`Program`]s can use the same region identifiers. Cache reuse is safe because imports share a cache only when they
+/// preserve the complete computation closure, apart from renumbering; sealing a region with attached regions creates
+/// a fresh cache. Together, these rules ensure that equal keys within one cache refer to the same computations and
+/// recorded identifiers, allowing repeated requests to reuse the analysis.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct ReferenceAnalysisTransformArguments {
+    /// Refer to the documentation of [`ReferenceAnalysisTransformArguments::new`] for information on this field.
+    regions: Vec<RegionId>,
+
+    /// Refer to the documentation of [`ReferenceAnalysisTransformArguments::new`] for information on this field.
+    consumable_inputs: Vec<usize>,
+
+    /// Refer to the documentation of [`ReferenceAnalysisTransformArguments::new`] for information on this field.
+    capture_scope: Option<usize>,
+
+    /// Refer to the documentation of [`ReferenceAnalysisTransformArguments::new`] for information on this field.
+    resolve_constants: bool,
+}
+
+impl ReferenceAnalysisTransformArguments {
+    /// Creates a [`ReferenceAnalysisTransformArguments`] key for the retained analysis of `region`'s closure under
+    /// the supplied ownership and capture settings. The same key identifies analyses derived from these facts (e.g.,
+    /// the retained [`ReferenceViewAnalysis`](crate::ReferenceViewAnalysis)), and so all of them share one cache
+    /// identity and one revalidation rule.
+    ///
+    /// # Parameters
+    ///
+    ///   - `region`: Borrowed [`Region`] whose closure identifiers are included in the key.
+    ///   - `consumable_inputs`: Entry input indices whose ownership is transferred to the region. Captures remain
+    ///     borrowed even when their indices occur in this list.
+    ///   - `capture_scope`: Number of leading inputs binding lifted captures, or `None` for inherited captures.
+    ///     `Some(0)` declares an explicitly empty capture prefix.
+    ///   - `resolve_constants`: Whether concrete reference constants may become external roots. Unbound inherited
+    ///     capture constants may also become external roots when `capture_scope` is `None`.
+    pub(super) fn new<V: Value, O: Operation<Type = V::Type>>(
+        region: RegionRef<'_, V, O>,
+        consumable_inputs: Vec<usize>,
+        capture_scope: Option<usize>,
+        resolve_constants: bool,
+    ) -> Self {
+        Self { regions: region.region_ids_in_closure(), consumable_inputs, capture_scope, resolve_constants }
     }
 }
 
@@ -2467,16 +2484,19 @@ mod tests {
         // The call reaches `A` through the callee's capture constant and `B` through its bound input.
         let summary = analysis.transitive_access(id(1, 7)).unwrap();
         assert_eq!(
-            summary.accesses(),
+            summary.access_modes(),
             &BTreeMap::from([
                 (a, BTreeSet::from([ReferenceAccessMode::Read])),
                 (b, BTreeSet::from([ReferenceAccessMode::Read, ReferenceAccessMode::Write])),
             ]),
         );
         assert_eq!(summary.roots().collect::<Vec<_>>(), vec![a, b]);
-        assert_eq!(summary.modes(a).collect::<Vec<_>>(), vec![ReferenceAccessMode::Read]);
-        assert_eq!(summary.modes(b).collect::<Vec<_>>(), vec![ReferenceAccessMode::Read, ReferenceAccessMode::Write]);
-        assert_eq!(summary.modes(allocation_root(1, 0, 0)).count(), 0);
+        assert_eq!(summary.access_modes_for(a).collect::<Vec<_>>(), vec![ReferenceAccessMode::Read]);
+        assert_eq!(
+            summary.access_modes_for(b).collect::<Vec<_>>(),
+            vec![ReferenceAccessMode::Read, ReferenceAccessMode::Write]
+        );
+        assert_eq!(summary.access_modes_for(allocation_root(1, 0, 0)).count(), 0);
         assert!(!summary.is_mutated(a));
         assert!(summary.is_mutated(b));
         assert!(!summary.is_empty());
@@ -2553,7 +2573,7 @@ mod tests {
         assert_eq!(analysis.external_source(a), Some(ReferenceSource::Capture { index: 0 }));
         assert_eq!(analysis.region_input_bindings(), &[]);
         assert_eq!(
-            analysis.transitive_access(id(2, 0)).unwrap().accesses(),
+            analysis.transitive_access(id(2, 0)).unwrap().access_modes(),
             &BTreeMap::from([(a, BTreeSet::from([ReferenceAccessMode::Read, ReferenceAccessMode::Write]))]),
         );
         assert!(analysis.is_mutated(a));
@@ -2601,7 +2621,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            analysis.transitive_access(id(1, 0)).unwrap().accesses(),
+            analysis.transitive_access(id(1, 0)).unwrap().access_modes(),
             &BTreeMap::from([(a, BTreeSet::from([ReferenceAccessMode::Read, ReferenceAccessMode::Write]))]),
         );
         assert_eq!(
@@ -2637,7 +2657,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            analysis.transitive_access(id(2, 0)).unwrap().accesses(),
+            analysis.transitive_access(id(2, 0)).unwrap().access_modes(),
             &BTreeMap::from([(a, BTreeSet::from([ReferenceAccessMode::Read, ReferenceAccessMode::Accumulate]))]),
         );
         assert_eq!(analysis.output_roots(), &[Some(a), None]);
@@ -2675,7 +2695,7 @@ mod tests {
             &[ReferenceRegionInputBinding::new(id(1, 0), 0, value(0, 0), a, false)]
         );
         assert_eq!(
-            analysis.transitive_access(id(1, 0)).unwrap().accesses(),
+            analysis.transitive_access(id(1, 0)).unwrap().access_modes(),
             &BTreeMap::from([(a, BTreeSet::from([ReferenceAccessMode::Write]))]),
         );
         assert_eq!(analysis.output_roots(), &[Some(a), None]);
@@ -2724,7 +2744,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            analysis.transitive_access(id(2, 0)).unwrap().accesses(),
+            analysis.transitive_access(id(2, 0)).unwrap().access_modes(),
             &BTreeMap::from([(a, BTreeSet::from([ReferenceAccessMode::Read, ReferenceAccessMode::Write]))]),
         );
         assert_eq!(analysis.output_roots(), &[Some(a)]);
@@ -2828,7 +2848,7 @@ mod tests {
             &[ReferenceAccess::new(id(0, 0), 0, input_root(0, 1), ReferenceAccessMode::Read)],
         );
         assert_eq!(
-            analysis.transitive_access(id(1, 0)).unwrap().accesses(),
+            analysis.transitive_access(id(1, 0)).unwrap().access_modes(),
             &BTreeMap::from([(b, BTreeSet::from([ReferenceAccessMode::Read]))]),
         );
         assert_eq!(analysis.access_modes(b).collect::<Vec<_>>(), vec![ReferenceAccessMode::Read]);
@@ -2874,7 +2894,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            analysis.transitive_access(id(1, 1)).unwrap().accesses(),
+            analysis.transitive_access(id(1, 1)).unwrap().access_modes(),
             &BTreeMap::from([(b, BTreeSet::from([ReferenceAccessMode::Read]))]),
         );
 
@@ -3645,7 +3665,7 @@ mod tests {
             ))
         );
         assert_eq!(
-            analysis.transitive_access(id(2, 0)).unwrap().accesses(),
+            analysis.transitive_access(id(2, 0)).unwrap().access_modes(),
             &BTreeMap::from([(
                 reference,
                 BTreeSet::from([ReferenceAccessMode::Read, ReferenceAccessMode::Accumulate])
@@ -3660,7 +3680,7 @@ mod tests {
         let analysis = ReferenceAnalysis::new(program.entry_region_ref(), 0).unwrap();
         assert_eq!(analysis.root_of(value(2, 3)), Some(reference));
         assert_eq!(
-            analysis.transitive_access(id(2, 0)).unwrap().accesses(),
+            analysis.transitive_access(id(2, 0)).unwrap().access_modes(),
             &BTreeMap::from([(
                 reference,
                 BTreeSet::from([ReferenceAccessMode::Write, ReferenceAccessMode::Accumulate])
@@ -4066,26 +4086,26 @@ mod tests {
         assert_eq!(analysis.transitive_access(id(1, 0)), None);
         assert_eq!(analysis.transitive_access(id(1, 1)), None);
         assert_eq!(
-            analysis.transitive_access(id(1, 3)).unwrap().accesses(),
+            analysis.transitive_access(id(1, 3)).unwrap().access_modes(),
             &BTreeMap::from([(a, BTreeSet::from([ReferenceAccessMode::Read]))]),
         );
         assert_eq!(
-            analysis.transitive_access(id(1, 6)).unwrap().accesses(),
+            analysis.transitive_access(id(1, 6)).unwrap().access_modes(),
             &BTreeMap::from([(c, BTreeSet::from([ReferenceAccessMode::ReadWrite]))]),
         );
         assert_eq!(
-            analysis.transitive_access(id(1, 7)).unwrap().accesses(),
+            analysis.transitive_access(id(1, 7)).unwrap().access_modes(),
             &BTreeMap::from([
                 (a, BTreeSet::from([ReferenceAccessMode::Read])),
                 (b, BTreeSet::from([ReferenceAccessMode::Read, ReferenceAccessMode::Write])),
             ]),
         );
         assert_eq!(
-            analysis.transitive_access(id(0, 0)).unwrap().accesses(),
+            analysis.transitive_access(id(0, 0)).unwrap().access_modes(),
             &BTreeMap::from([(k, BTreeSet::from([ReferenceAccessMode::Write]))]),
         );
         assert_eq!(
-            analysis.transitive_access(id(1, 8)).unwrap().accesses(),
+            analysis.transitive_access(id(1, 8)).unwrap().access_modes(),
             &BTreeMap::from([(c, BTreeSet::from([ReferenceAccessMode::Consume]))]),
         );
         assert_eq!(analysis.transitive_access(id(1, 9)), None);
