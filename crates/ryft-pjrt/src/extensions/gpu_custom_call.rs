@@ -307,19 +307,19 @@ impl GpuCustomCallStatus {
 /// Typed XLA FFI [`GpuCustomCallHandler`].
 #[derive(Copy, Clone)]
 pub struct GpuCustomCallTypedHandler {
-    /// Refer to the documentation of [`GpuCustomCallFfiHandler::new`] for information on this field.
+    /// Refer to the documentation of [`GpuCustomCallTypedHandler::new`] for information on this field.
     instantiate: Option<FfiHandler>,
 
-    /// Refer to the documentation of [`GpuCustomCallFfiHandler::new`] for information on this field.
+    /// Refer to the documentation of [`GpuCustomCallTypedHandler::new`] for information on this field.
     prepare: Option<FfiHandler>,
 
-    /// Refer to the documentation of [`GpuCustomCallFfiHandler::new`] for information on this field.
+    /// Refer to the documentation of [`GpuCustomCallTypedHandler::new`] for information on this field.
     initialize: Option<FfiHandler>,
 
-    /// Refer to the documentation of [`GpuCustomCallFfiHandler::new`] for information on this field.
+    /// Refer to the documentation of [`GpuCustomCallTypedHandler::new`] for information on this field.
     execute: FfiHandler,
 
-    /// Refer to the documentation of [`GpuCustomCallFfiHandler::new`] for information on this field.
+    /// Refer to the documentation of [`GpuCustomCallTypedHandler::new`] for information on this field.
     traits: FfiHandlerTraits,
 }
 

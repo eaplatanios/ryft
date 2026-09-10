@@ -61,6 +61,6 @@ mod tests {
 
     #[test]
     fn test_version_display() {
-        assert_eq!(format!("{VERSION}"), "0.113");
+        assert_eq!(format!("{VERSION}"), "0.115");
     }
 }

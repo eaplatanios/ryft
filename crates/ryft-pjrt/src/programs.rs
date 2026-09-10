@@ -3165,7 +3165,7 @@ mod tests {
             // Test using an Ahead-Of-Time (AOT)-compiled executable which goes through the main code path.
             let executable = plugin.compile(&program, &topology, &options);
             match platform {
-                TestPlatform::Cpu | TestPlatform::Mps => assert!(executable.is_err()),
+                TestPlatform::Mps => assert!(executable.is_err()),
                 _ => {
                     let executable = executable.unwrap();
                     let loaded_executable = client.load_executable(&executable, Some(&options)).unwrap();
@@ -3358,7 +3358,7 @@ mod tests {
             let options = test_compilation_options();
             let executable = plugin.compile(&program, &topology, &options);
             match platform {
-                TestPlatform::Cpu | TestPlatform::Mps => assert!(executable.is_err()),
+                TestPlatform::Mps => assert!(executable.is_err()),
                 _ => {
                     let executable = executable.unwrap();
                     assert_eq!(executable.name().unwrap(), "main");
@@ -3370,7 +3370,7 @@ mod tests {
                     let output_memory_kinds = executable.output_memory_kinds();
                     assert_eq!(output_memory_kinds.unwrap(), vec!["device"]);
                     match platform {
-                        TestPlatform::Cuda12 | TestPlatform::Cuda13 => {
+                        TestPlatform::Cpu | TestPlatform::Cuda12 | TestPlatform::Cuda13 => {
                             assert_eq!(executable.generated_code_size_in_bytes(), Ok(0));
                         }
                         _ => {
@@ -3382,9 +3382,15 @@ mod tests {
                     assert!(matches!(executable.optimized_program(), Ok(Program::HloWithConfig { .. })));
                     assert!(executable.memory_statistics().is_ok());
                     match platform {
+                        TestPlatform::Cpu => assert!(matches!(
+                            executable.cost_analysis(),
+                            Err(Error::Unimplemented { message, .. })
+                                if message == "GetCostAnalysis is not implemented.",
+                        )),
                         TestPlatform::Cuda12 | TestPlatform::Cuda13 => assert!(matches!(
                             executable.cost_analysis(),
-                            Err(Error::Unimplemented { message, .. }) if message == "GetCostAnalysis is not supported.",
+                            Err(Error::Unimplemented { message, .. })
+                                if message == "GetCostAnalysis is not supported.",
                         )),
                         _ => assert!(executable.cost_analysis().is_err()),
                     }
@@ -3405,27 +3411,13 @@ mod tests {
 
     #[test]
     fn test_loaded_executable_delete() {
-        test_for_each_platform!(|_plugin, client, platform| {
+        test_for_each_platform!(|_plugin, client, _platform| {
             let program = test_program(false, false);
             let options = test_compilation_options();
             let loaded_executable = client.compile(&program, &options).unwrap();
-
-            // The assertions below encode known upstream bugs in the reference PJRT plugin implementations
-            // of `PJRT_LoadedExecutable_IsDeleted`, rather than the intended semantics:
-            //   - The StreamExecutor GPU implementation has inverted polarity (i.e., `return executable_ != nullptr;`
-            //     in `PjRtStreamExecutorLoadedExecutable::IsDeleted`), and so fresh executables report `true` and
-            //     deleted executables report `false`.
-            //   - The CPU implementation is a stub: `PjRtCpuLoadedExecutable::Delete` is a no-op and its `IsDeleted`
-            //     always returns `false`.
-            match platform {
-                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm7 => {
-                    assert_eq!(loaded_executable.is_deleted(), Ok(true));
-                }
-                _ => assert_eq!(loaded_executable.is_deleted(), Ok(false)),
-            };
-
-            assert!(unsafe { loaded_executable.delete() }.is_ok());
             assert_eq!(loaded_executable.is_deleted(), Ok(false));
+            assert!(unsafe { loaded_executable.delete() }.is_ok());
+            assert_eq!(loaded_executable.is_deleted(), Ok(true));
         });
     }
 

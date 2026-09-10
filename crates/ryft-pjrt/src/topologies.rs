@@ -751,9 +751,23 @@ mod tests {
                         let serialized_topology = topology.serialize().unwrap();
                         assert!(!serialized_topology.data().is_empty());
                         assert!(serialized_topology.proto().is_ok());
-
-                        // This always returns an error saying "No compiler registered for platform".
-                        assert!(client.deserialize_topology(serialized_topology.data()).is_err());
+                        let deserialized = client.deserialize_topology(serialized_topology.data());
+                        match platform {
+                            TestPlatform::Cpu | TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm7 => {
+                                let deserialized = deserialized.unwrap();
+                                assert_eq!(deserialized.platform_name(), topology.platform_name());
+                                assert_eq!(deserialized.platform_version(), topology.platform_version());
+                                if platform == TestPlatform::Cpu {
+                                    assert_eq!(deserialized.attributes(), topology.attributes());
+                                } else {
+                                    // GPU serialization preserves device metadata, but not the live client's
+                                    // target configuration and host compiler options.
+                                    assert!(deserialized.attribute("device_memory_bytes_limit").is_ok());
+                                }
+                                assert_eq!(deserialized.fingerprint(), fingerprint);
+                            }
+                            _ => assert!(deserialized.is_err()),
+                        }
                     }
                 }
 

@@ -27,8 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added support for the new `PJRT_Xla_Transform` extension through a safe `XlaTransform` trait API.
 - Added the `mps` feature and `load_mps_plugin()` for loading the `jax-mps` PJRT plugin.
 - Added `BufferType::element_size_in_bytes`.
-- Added the `BufferType::F6E3M2FN` and `BufferType::F6E2M3FN` 6-bit microscaling floating-point buffer types. Note
-  that the PJRT C API cannot represent these types yet and so they are only supported in Protobuf-backed APIs.
+- Added the `BufferType::F6E3M2FN` and `BufferType::F6E2M3FN` 6-bit microscaling floating-point buffer types.
 - Added the `FeedbackDirectedProfile` wrapper for OpenXLA's XProf-to-feedback-directed-profile conversion and
   deterministic multi-profile aggregation used by profile-guided latency estimation, owning the profile bytes
   produced by the native profiler bridge.
@@ -46,7 +45,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- Updated our PJRT C API bindings for version `0.113`.
+- Updated our PJRT C API bindings for version `0.115` and XLA FFI bindings for version `0.4`, including
+  GPU handler traits, the recording stage, invocation extensions, and preservation of native FFI error codes.
 - Made PJRT events, execution fences, executions, and buffers thread-safe through shared ownership and narrow native
   handle wrappers that reflect PJRT's thread-safety contracts. Event callbacks now require `Send + 'static`, the
   unsafe `EventHandle` was replaced by the safe shared-ownership `EventPromise`, and asynchronous host-buffer
@@ -73,6 +73,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Changed `TiledLayout::minor_to_major` to `Vec<u64>` from `Vec<i64>`.
 - Changed `ExecutionInput::buffer` to an `Arc<Buffer<'o>>` instead of a `Buffer<'o>`.
 - Changed `Memory` equality to fall back to memory-kind strings when a PJRT plugin does not implement memory kind IDs.
+
+### Removed
+
+- Removed the deprecated PJRT Host-Allocator and Triton extension wrappers, their FFI definitions, and associated APIs.
+  Host allocation remains available through `Client::host_memory_allocate` and `HostMemoryAllocation`.
 
 ## [0.0.2] - 2026-03-02
 

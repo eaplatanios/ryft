@@ -4181,7 +4181,11 @@ mod tests {
                 .unwrap();
             let buffer_and_callback = buffer.donate_with_control_dependency();
             match platform {
-                TestPlatform::Cuda12 | TestPlatform::Cuda13 | TestPlatform::Rocm7 | TestPlatform::Tpu => {
+                TestPlatform::Cpu
+                | TestPlatform::Cuda12
+                | TestPlatform::Cuda13
+                | TestPlatform::Rocm7
+                | TestPlatform::Tpu => {
                     // Test invoking the callback with no error.
                     let (buffer, callback) = buffer_and_callback.unwrap();
                     assert!(!buffer.ready().unwrap().ready().unwrap());
@@ -4378,6 +4382,7 @@ mod tests {
             assert_eq!(buffer.element_type(), Ok(BufferType::U8));
             assert_eq!(buffer.dimensions(), Ok([data.len() as u64].as_slice()));
             assert_eq!(buffer.device().unwrap().id(), device.id());
+            assert_eq!(buffer.copy_to_host(None).unwrap().r#await(), Ok(data.as_ref().clone()));
         });
     }
 
@@ -4394,6 +4399,7 @@ mod tests {
             assert_eq!(buffer.element_type(), Ok(BufferType::U8));
             assert_eq!(buffer.dimensions(), Ok([data.len() as u64].as_slice()));
             assert_eq!(buffer.device().unwrap().id(), device.id());
+            assert_eq!(buffer.copy_to_host(None).unwrap().r#await(), Ok(data.as_ref().clone()));
         });
     }
 
