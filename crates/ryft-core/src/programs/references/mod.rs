@@ -204,7 +204,7 @@
 //! concurrency; discharge sees the state-threading transformation and complete attached-region closure; and the
 //! boundary validator sees the live values a transform is about to bind.
 
-// TODO(eaplatanios): Review this module.
+// TODO(eaplatanios): Review this module's docstring.
 
 use thiserror::Error;
 
@@ -316,7 +316,6 @@ pub use values::{
 pub use views::{
     BatchableReferenceView, NoReferenceViewBinding, ReferenceView, ReferenceViewAnalysis, ReferenceViewAnalysisError,
     ReferenceViewOperation, ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError,
-    batch_reference_view_operation,
 };
 
 #[cfg(test)]

@@ -49,7 +49,7 @@ use crate::programs::{
     OperationProvider, ProgramError, ProjectedValue, ReferenceAlias, ReferenceAliasKind, ReferenceDischargeContext,
     ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
     ReferenceType, ReferenceView, ReferenceViewOperation, ReferenceViewValidationError, RegionInterface, TypeError,
-    Typed, Value, ValueProjection, batch_reference_view_operation,
+    Typed, Value, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -442,7 +442,7 @@ impl<
         _driver: &D,
         inputs: &[P::Batch],
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
-        batch_reference_view_operation(self, context, inputs)
+        ReferenceViewOperation::batch(&C::Operation::from(self.clone()), context, inputs)
     }
 }
 
@@ -761,7 +761,7 @@ impl<
         _driver: &D,
         inputs: &[P::Batch],
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
-        batch_reference_view_operation(self, context, inputs)
+        ReferenceViewOperation::batch(&C::Operation::from(self.clone()), context, inputs)
     }
 }
 
@@ -780,7 +780,7 @@ impl<
         _driver: &D,
         inputs: &[P::Batch],
     ) -> Result<BatchedOutputs<C, P>, BatchingError> {
-        batch_reference_view_operation(self, context, inputs)
+        ReferenceViewOperation::batch(&C::Operation::from(self.clone()), context, inputs)
     }
 }
 

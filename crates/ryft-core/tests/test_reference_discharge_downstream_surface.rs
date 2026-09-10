@@ -22,7 +22,7 @@
 //! (`ReferenceViewPath<RegisterView, C::Value>`) through which the policy reads and writes by binding the family's own
 //! bit operations on the destination, forward mode reapplies the view to the tangent reference with the primal index,
 //! reverse mode reaches the viewed cotangent reference through [`TranspositionContext`], which resolves the bound index
-//! to its transposed-program value, and batching goes through the shared [`batch_reference_view_operation`] rule.
+//! to its transposed-program value, and batching goes through the shared [`ReferenceViewOperation::batch`] rule.
 //! Eagerly, a bit view is a [`RegisterValue::BitReference`] handle over the root reference; a bit of a bit has no eager
 //! handle, so nested bit views are reachable only through staged programs and their discharge.
 //!
@@ -67,8 +67,7 @@ use ryft_core::{
     ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation,
     RegionId, RegionInterface, RegionRef, RegionSlot, Trace, Tracer, TracingContext, TransposableOperation,
     TranspositionContext, TranspositionDriver, Type, TypeError, Typed, Value, ValueId, Zero, ZeroOperation, batch,
-    batch_reference_view_operation, check_count, differentiate_at, discharge_reference_free_operation,
-    validate_reference_boundary,
+    check_count, differentiate_at, discharge_reference_free_operation, validate_reference_boundary,
 };
 
 /// Destination universe of the downstream programs: the eager context over the register family, which is what a
@@ -1292,7 +1291,9 @@ impl<
                     message: format!("`{}` has no batching rule in the register universe", self.name()),
                 });
             }
-            Self::Bit => return batch_reference_view_operation(self, context, inputs),
+            Self::Bit => {
+                return ReferenceViewOperation::batch(&C::Operation::from(self.clone()), context, inputs);
+            }
             _ => {}
         }
         let values = inputs

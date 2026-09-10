@@ -44,18 +44,24 @@ pub enum BroadcastingError {
 /// Broadcasting in Ryft has two orthogonal components:
 ///
 ///   - **Parameter Broadcasting:** Each concrete implementer defines what it means to combine two
-///     [`Parameter`](crate::parameters::Parameter)s. For example, [`DataType`] uses data-type promotion, [`Shape`]
+///     [`Parameter`](crate::Parameter)s. For example, [`DataType`] uses data-type promotion, [`Shape`]
 ///     follows the standard [NumPy broadcasting rules](https://numpy.org/doc/stable/user/basics.broadcasting.html),
-///     and [`ArrayType`] combines both by broadcasting its [`DataType`] and [`Shape`]. [`Layout`](crate::Layout)
-///     metadata is only preserved when both operands already agree on the same unchanged layout. Otherwise, the result
-///     leaves its layout unspecified.
+///     and [`ArrayType`] combines both by broadcasting its [`DataType`] and [`Shape`] and by using these rules:
+///       - [`Memory`] spaces must match. Combining values in different spaces requires an explicit transfer beforehand.
+///       - Symmetric broadcasting preserves an explicit [`Layout`](crate::Layout) only when both leaves agree on it.
+///         Directional broadcasting adopts the target's layout.
+///       - [`Sharding`]s are aligned with the shapes, padding missing leading axes with replicated dimensions.
+///         Replication is neutral; compatible non-replicated assignments are preserved. Two specified meshes must
+///         agree, a mesh axis may not appear in multiple output dimensions, and reduction-state and varying-manual-axis
+///         sets must agree when both leaves specify sharding. A non-replicated singleton dimension retains its sharding
+///         constraints.
 ///   - **Structural Broadcasting:** For [`Parameterized`] values whose leaves are [`ArrayType`]s, Ryft first aligns
 ///     the left-hand side to the target parameter structure using [`Parameterized::broadcast_to_parameter_structure`].
 ///     That alignment uses path-prefix broadcasting on named parameters, so a value with a smaller compatible parameter
 ///     structure can be broadcast into a larger one. Once the structures are aligned, leaf broadcasting is applied
 ///     pairwise and the final structured value is reconstructed.
 ///
-/// ## NumPy-style Broadcasting Semantics
+/// # NumPy-style Broadcasting Semantics
 ///
 /// For [`Shape`]s, Ryft follows the same broadcasting rules that NumPy uses:
 ///
@@ -79,51 +85,66 @@ pub enum BroadcastingError {
 /// broadcast exactly to the right-hand side's target. The default [`Broadcastable::broadcasted`] helper folds the
 /// symmetric operation over multiple values from left to right.
 ///
-/// ## Examples
+/// # Examples
 ///
 /// ```rust
-/// # use ryft_core::arrays::{Broadcastable, BroadcastingError};
-/// # use ryft_core::arrays::DataType::{Boolean, F32, F64};
-/// # use ryft_core::arrays::{ArrayType, Shape};
+/// # use ryft_core::{Broadcastable, BroadcastingError, Shape};
+/// #
+/// # fn main() -> Result<(), BroadcastingError> {
+/// let column = Shape::new(vec![4.into(), 1.into()]);
+/// let row = Shape::new(vec![3.into()]);
+/// let matrix = Shape::new(vec![4.into(), 3.into()]);
+/// assert_eq!(column.broadcast(&row)?, matrix);
+/// assert_eq!(row.broadcast_to(&matrix)?, matrix);
+/// assert!(!matrix.is_broadcastable_to(&row));
+/// # Ok(())
+/// # }
+/// ```
 ///
-/// let x = Shape::new(vec![4.into(), 3.into()]);
-/// let y = Shape::new(vec![3.into()]);
-/// let z = Shape::new(vec![4.into(), 1.into()]);
-/// let w = Shape::new(vec![4.into()]);
+/// [`ArrayType`] broadcasting combines [`Shape`] broadcasting and [`DataType`] promotion independently at each leaf:
 ///
-/// assert_eq!(x.broadcast(&y)?, x);
-/// assert_eq!(y.broadcast_to(&x)?, x);
-/// assert_eq!(z.broadcast(&y)?, Shape::new(vec![4.into(), 3.into()]));
-/// assert!(w.broadcast(&x).is_err());
-///
-/// let lhs = (ArrayType::scalar(Boolean), ArrayType::new(F32, Shape::new(vec![1.into(), 3.into()])));
-/// let rhs = (
-///     ArrayType::new(F32, Shape::new(vec![2.into(), 3.into()])),
-///     ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()])),
+/// ```rust
+/// # use ryft_core::{ArrayType, Broadcastable, BroadcastingError, DataType, Shape};
+/// #
+/// # fn main() -> Result<(), BroadcastingError> {
+/// let source = (
+///     ArrayType::scalar(DataType::Boolean),
+///     ArrayType::new(DataType::F32, Shape::new(vec![1.into(), 3.into()])),
 /// );
-///
+/// let target = (
+///     ArrayType::new(DataType::F32, Shape::new(vec![2.into(), 3.into()])),
+///     ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 1.into()])),
+/// );
 /// assert_eq!(
-///     lhs.broadcast(&rhs)?,
+///     source.broadcast(&target)?,
 ///     (
-///         ArrayType::new(F32, Shape::new(vec![2.into(), 3.into()])),
-///         ArrayType::new(F64, Shape::new(vec![2.into(), 3.into()])),
+///         ArrayType::new(DataType::F32, Shape::new(vec![2.into(), 3.into()])),
+///         ArrayType::new(DataType::F64, Shape::new(vec![2.into(), 3.into()])),
 ///     ),
 /// );
-/// # Ok::<(), BroadcastingError>(())
+/// # Ok(())
+/// # }
 /// ```
 pub trait Broadcastable: Sized {
     /// Broadcasts this value with `other` and returns the least common result that both values can broadcast to.
     /// This operation is _symmetric_. For example, with [`Shape`] values this returns the smallest shape that both
     /// operands can broadcast to, and with [`ArrayType`] values it combines [`DataType`] promotion with [`Shape`]
-    /// broadcasting.
+    /// broadcasting. Shapes may expand on either side, and element types are promoted to a common type. Incompatible
+    /// dimensions, types, parameter structures, memory spaces, or shardings return the corresponding
+    /// [`BroadcastingError`]. Neither operand is modified.
     fn broadcast(&self, other: &Self) -> Result<Self, BroadcastingError>;
 
     /// Broadcasts this value to the provided `other` value. Unlike [`Broadcastable::broadcast`], this operation
-    /// is _not symmetric_: `x.broadcast_to(y)` and `y.broadcast_to(x)` may differ and one of them may even fail.
+    /// is _not symmetric_ (i.e., `x.broadcast_to(y)` and `y.broadcast_to(x)` may differ and one of them may even fail).
+    /// The source cannot lose axes, shrink non-singleton dimensions, or require a data-type promotion beyond the target
+    /// type. For array types, the target layout is adopted and compatible sharding information from both operands is
+    /// combined, so the result may carry more sharding information than `other`. Incompatibility returns the
+    /// corresponding [`BroadcastingError`]. Neither operand is modified.
     fn broadcast_to(&self, other: &Self) -> Result<Self, BroadcastingError>;
 
-    /// Broadcasts the provided values into a single value by folding over [`Broadcastable::broadcast`] from left to
-    /// right. Returns [`BroadcastingError::EmptyBroadcastingInput`] if no values are provided.
+    /// Broadcasts the provided values into a single value by folding over [`Broadcastable::broadcast`]
+    /// from left to right. A singleton collection returns a clone of its sole value. An empty collection returns
+    /// [`BroadcastingError::EmptyBroadcastingInput`]; otherwise the first incompatible pair stops the fold.
     fn broadcasted<I: Borrow<Self>>(values: &[I]) -> Result<Self, BroadcastingError>
     where
         Self: Clone,
@@ -132,7 +153,13 @@ pub trait Broadcastable: Sized {
         tail.iter().try_fold(head.borrow().clone(), |accum, value| accum.broadcast(value.borrow()))
     }
 
-    /// Returns `true` if this value can be broadcast to `other`, and `false` otherwise.
+    /// Returns whether [`Broadcastable::broadcast_to`] would succeed, without returning the resulting metadata or
+    /// incompatibility error. This check is directional and includes element types, shapes, parameter structure,
+    /// memory spaces, and sharding constraints for array types.
+    ///
+    /// # Parameters
+    ///
+    ///   - `other`: Target metadata against which `self` is checked.
     fn is_broadcastable_to(&self, other: &Self) -> bool {
         self.broadcast_to(other).is_ok()
     }
@@ -309,8 +336,8 @@ impl<T: Parameterized<ArrayType>> Broadcastable for T {
 /// and returns the resulting [`Sharding`], using the following broadcasting rules:
 ///
 ///   - If neither operand carries sharding information, then this function returns no sharding information.
-///   - Any provided [`Sharding`] must already have the same rank as its source [`Shape`]. Mismatched shardings will be
-///     rejected before any broadcast-specific logic is applied.
+///   - Any provided [`Sharding`] must already have the same rank as its source [`Shape`], as guaranteed by the
+///     containing [`ArrayType`].
 ///   - When the operands have different ranks, the lower-rank sharding is left-padded with replicated dimensions so
 ///     that sharding alignment follows the same leading-rank promotion rules as [`Shape`] broadcasting.
 ///   - On an aligned axis, a singleton dimension is only treated as broadcast-trivial when its [`ShardingDimension`] is
@@ -335,7 +362,7 @@ impl<T: Parameterized<ArrayType>> Broadcastable for T {
 ///   - `lhs_sharding`: Optional [`Sharding`] for the left-hand operand.
 ///   - `rhs_shape`: [`Shape`] of the right-hand operand before broadcasting.
 ///   - `rhs_sharding`: Optional [`Sharding`] for the right-hand operand.
-///   - `broadcasted_shape`: Result of broadcasting `lhs_shape` to `rhs_shape`.
+///   - `broadcasted_shape`: Already validated result shape of the symmetric or directional broadcast.
 fn broadcast_sharding(
     lhs_shape: &Shape,
     lhs_sharding: Option<&Sharding>,
@@ -521,270 +548,655 @@ mod tests {
     use ryft_macros::Parameterized;
 
     use crate::arrays::DataType::*;
-    use crate::arrays::{
-        Layout, LogicalMesh, MeshAxis, MeshAxisType, Shape, StridedLayout, Tile, TileDimension, TiledLayout,
-    };
+    use crate::arrays::sharding::meshes::{LogicalMesh, MeshAxis, MeshAxisType};
+    use crate::arrays::types::dimensions::{DimensionBounds, DimensionVariable};
+    use crate::arrays::types::layouts::{Layout, StridedLayout, Tile, TileDimension, TiledLayout};
     use crate::parameters::{Parameter, ParameterError};
 
     use super::*;
 
+    #[derive(Parameterized, Clone, Debug, PartialEq, Eq)]
+    enum BroadcastParameters<P: Parameter> {
+        Wrapped { inner: P },
+        Pair { left: P, right: P },
+    }
+
     #[test]
-    fn test_data_type_broadcasting() {
+    fn test_data_type_broadcast() {
         assert_eq!(Boolean.broadcast(&U16), Ok(U16));
         assert_eq!(U16.broadcast(&Boolean), Ok(U16));
-        assert!(matches!(F8E3M4.broadcast(&F32), Err(BroadcastingError::IncompatibleDataTypes(_))));
+        assert!(
+            matches!(F8E3M4.broadcast(&F32), Err(BroadcastingError::IncompatibleDataTypes(DataTypeError::InvalidPromotion { message, .. })) if message == "cannot promote types `f8e3m4` and `f32` to a common type"),
+        );
+    }
 
+    #[test]
+    fn test_data_type_broadcast_to() {
         assert_eq!(Boolean.broadcast_to(&U16), Ok(U16));
-        assert!(matches!(F64.broadcast_to(&I32), Err(BroadcastingError::IncompatibleDataTypes(_))));
+        assert!(
+            matches!(F64.broadcast_to(&I32), Err(BroadcastingError::IncompatibleDataTypes(DataTypeError::InvalidPromotion { message, .. })) if message == "cannot promote type `f64` to type `i32`"),
+        );
+    }
 
-        assert!(Boolean.is_broadcastable_to(&U16));
-        assert!(!F64.is_broadcastable_to(&I32));
-
+    #[test]
+    fn test_data_type_broadcasted() {
         assert_eq!(DataType::broadcasted(&[&Boolean]), Ok(Boolean));
         assert_eq!(DataType::broadcasted(&[&Boolean, &U16]), Ok(U16));
         assert!(matches!(DataType::broadcasted::<DataType>(&[]), Err(BroadcastingError::EmptyBroadcastingInput)));
-        assert!(matches!(DataType::broadcasted(&[&F8E3M4, &F32]), Err(BroadcastingError::IncompatibleDataTypes(_))));
+        assert!(
+            matches!(DataType::broadcasted(&[&F8E3M4, &F32]), Err(BroadcastingError::IncompatibleDataTypes(DataTypeError::InvalidPromotion { message, .. })) if message == "cannot promote types `f8e3m4` and `f32` to a common type"),
+        );
     }
 
     #[test]
-    fn test_shape_broadcasting() {
-        let s0 = Shape::new(vec![42.into(), 4.into()]);
-        let s1 = Shape::new(vec![1.into(), 4.into()]);
-        let s2 = Shape::scalar();
-        let s3 = Shape::new(vec![5.into(), 3.into()]);
+    fn test_data_type_is_broadcastable_to() {
+        assert!(Boolean.is_broadcastable_to(&U16));
+        assert!(!F64.is_broadcastable_to(&I32));
+    }
 
-        assert_eq!(s1.broadcast(&s2), Ok(s1.clone()));
-        assert_eq!(s2.broadcast(&s1), Ok(s1.clone()));
-        assert!(matches!(s0.broadcast(&s3), Err(BroadcastingError::IncompatibleShapes { .. })));
+    #[test]
+    fn test_shape_broadcast() {
+        let matrix = Shape::new(vec![42.into(), 4.into()]);
+        let row = Shape::new(vec![1.into(), 4.into()]);
+        let scalar = Shape::scalar();
+        let incompatible_matrix = Shape::new(vec![5.into(), 3.into()]);
 
-        assert_eq!(s2.broadcast_to(&s1), Ok(s1.clone()));
-        assert!(matches!(s1.broadcast_to(&s2), Err(BroadcastingError::IncompatibleShapes { .. })));
+        // Leading rank promotion and singleton expansion combine independently.
+        assert_eq!(row.broadcast(&Shape::new(vec![42.into(), 1.into()])), Ok(matrix.clone()));
+        assert_eq!(row.broadcast(&scalar), Ok(row.clone()));
+        assert_eq!(scalar.broadcast(&row), Ok(row.clone()));
+        assert_eq!(
+            matrix.broadcast(&incompatible_matrix),
+            Err(BroadcastingError::IncompatibleShapes { lhs: matrix.clone(), rhs: incompatible_matrix.clone() }),
+        );
+    }
 
-        assert_eq!(Shape::broadcasted(&[&s0]), Ok(s0.clone()));
-        assert_eq!(Shape::broadcasted(&[&s1, &s2]), Ok(s1.clone()));
-        assert_eq!(Shape::broadcasted(&[&s2, &s1]), Ok(s1.clone()));
+    #[test]
+    fn test_shape_broadcast_zero_and_dynamic_dimensions() {
+        let singleton = Shape::new(vec![1.into()]);
+        let empty = Shape::new(vec![0.into()]);
+        let bounds = DimensionBounds::non_negative(Some(8)).unwrap();
+        let dynamic = Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("extent", bounds))]);
+        let other_dynamic = Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("other_extent", bounds))]);
+
+        // Singleton expansion accepts zero extents and symbols, but bounds do not establish symbol identity.
+        assert_eq!(singleton.broadcast(&empty), Ok(empty.clone()));
+        assert_eq!(empty.broadcast(&singleton), Ok(empty.clone()));
+        assert_eq!(singleton.broadcast(&dynamic), Ok(dynamic.clone()));
+        assert_eq!(dynamic.broadcast(&dynamic), Ok(dynamic.clone()));
+        assert_eq!(
+            dynamic.broadcast(&other_dynamic),
+            Err(BroadcastingError::IncompatibleShapes { lhs: dynamic.clone(), rhs: other_dynamic }),
+        );
+        assert_eq!(dynamic.broadcast(&empty), Err(BroadcastingError::IncompatibleShapes { lhs: dynamic, rhs: empty }));
+    }
+
+    #[test]
+    fn test_shape_broadcast_to() {
+        let row = Shape::new(vec![1.into(), 4.into()]);
+        let scalar = Shape::scalar();
+
+        // Directional broadcasting adopts target shape and layout.
+        assert_eq!(scalar.broadcast_to(&row), Ok(row.clone()));
+        assert_eq!(
+            row.broadcast_to(&scalar),
+            Err(BroadcastingError::IncompatibleShapes { lhs: row.clone(), rhs: scalar.clone() }),
+        );
+    }
+
+    #[test]
+    fn test_shape_broadcast_to_zero_and_dynamic_dimensions() {
+        let singleton = Shape::new(vec![1.into()]);
+        let empty = Shape::new(vec![0.into()]);
+        let bounds = DimensionBounds::non_negative(Some(8)).unwrap();
+        let dynamic = Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("extent", bounds))]);
+        let other_dynamic = Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("other_extent", bounds))]);
+
+        // Singleton expansion accepts zero extents and symbols, but bounds do not establish symbol identity.
+        assert_eq!(singleton.broadcast_to(&empty), Ok(empty.clone()));
+        assert_eq!(singleton.broadcast_to(&dynamic), Ok(dynamic.clone()));
+        assert_eq!(dynamic.broadcast_to(&dynamic), Ok(dynamic.clone()));
+        assert_eq!(
+            empty.broadcast_to(&singleton),
+            Err(BroadcastingError::IncompatibleShapes { lhs: empty, rhs: singleton.clone() }),
+        );
+        assert_eq!(
+            dynamic.broadcast_to(&singleton),
+            Err(BroadcastingError::IncompatibleShapes { lhs: dynamic.clone(), rhs: singleton }),
+        );
+        assert_eq!(
+            dynamic.broadcast_to(&other_dynamic),
+            Err(BroadcastingError::IncompatibleShapes { lhs: dynamic, rhs: other_dynamic }),
+        );
+    }
+
+    #[test]
+    fn test_shape_broadcasted() {
+        let matrix = Shape::new(vec![42.into(), 4.into()]);
+        let row = Shape::new(vec![1.into(), 4.into()]);
+        let scalar = Shape::scalar();
+        let incompatible_matrix = Shape::new(vec![5.into(), 3.into()]);
+
+        assert_eq!(Shape::broadcasted(&[&matrix]), Ok(matrix.clone()));
+        assert_eq!(Shape::broadcasted(&[&row, &scalar]), Ok(row.clone()));
+        assert_eq!(Shape::broadcasted(&[&scalar, &row]), Ok(row.clone()));
         assert!(matches!(Shape::broadcasted::<Shape>(&[]), Err(BroadcastingError::EmptyBroadcastingInput)));
-        assert!(matches!(Shape::broadcasted(&[&s0, &s3]), Err(BroadcastingError::IncompatibleShapes { .. })));
-
-        assert!(s2.is_broadcastable_to(&s1));
-        assert!(!s0.is_broadcastable_to(&s3));
+        assert_eq!(
+            Shape::broadcasted(&[&matrix, &incompatible_matrix]),
+            Err(BroadcastingError::IncompatibleShapes { lhs: matrix.clone(), rhs: incompatible_matrix.clone() }),
+        );
     }
 
     #[test]
-    fn test_array_type_broadcasting() {
-        let l0 = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![Tile::new(vec![TileDimension::Sized(4)])]));
-        let l1 = Layout::Strided(StridedLayout::new(vec![16, 4]));
+    fn test_shape_is_broadcastable_to() {
+        let matrix = Shape::new(vec![42.into(), 4.into()]);
+        let row = Shape::new(vec![1.into(), 4.into()]);
+        let scalar = Shape::scalar();
+        let incompatible_matrix = Shape::new(vec![5.into(), 3.into()]);
 
-        let m0 = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
-            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
-        ])
-        .unwrap();
-        let m1 = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
-        let m2 = LogicalMesh::new(vec![
-            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
-            MeshAxis::new("y", 4, MeshAxisType::Explicit).unwrap(),
-        ])
-        .unwrap();
-
-        let s0 = Sharding::new(m0.clone(), vec![ShardingDimension::sharded(["x"])])
-            .unwrap()
-            .with_varying_manual_axes(["x"])
-            .unwrap();
-        let s1 = Sharding::new(m0.clone(), vec![ShardingDimension::sharded(["x"])])
-            .unwrap()
-            .with_varying_manual_axes(["x"])
-            .unwrap();
-        let s2 = Sharding::new(m0.clone(), vec![ShardingDimension::sharded(["x"])])
-            .unwrap()
-            .with_varying_manual_axes(["y"])
-            .unwrap();
-        let s3 = Sharding::new(m0.clone(), vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
-            .unwrap()
-            .with_reduced_axes(["y"])
-            .unwrap();
-        let s4 = Sharding::new(m0.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
-            .unwrap()
-            .with_reduced_axes(["y"])
-            .unwrap();
-        let s5 = Sharding::new(m0.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
-            .unwrap();
-        let s6 = Sharding::new(m0, vec![ShardingDimension::sharded(["x"])])
-            .unwrap()
-            .with_varying_manual_axes(["x"])
-            .unwrap();
-        let s7 = Sharding::new(m1.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let s8 = Sharding::new(m1.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
-            .unwrap();
-        let s9 = Sharding::new(m1, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])]).unwrap();
-        let s10 = Sharding::new(m2.clone(), vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()])
-            .unwrap();
-        let s11 = Sharding::new(m2.clone(), vec![ShardingDimension::replicated(), ShardingDimension::sharded(["y"])])
-            .unwrap();
-        let s12 = Sharding::new(m2.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
-        let s13 = Sharding::new(m2, vec![ShardingDimension::sharded(["y"])]).unwrap();
-
-        let t0 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]));
-        let t1 = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()]));
-        let t2 = ArrayType::scalar(Boolean);
-        let t3 = ArrayType::new(F32, Shape::new(vec![5.into(), 3.into()]));
-        let t4 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()])).with_layout(l0.clone());
-        let t5 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()])).with_layout(l0.clone());
-        let t6 = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()])).with_layout(l1);
-        let t7 = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()])).with_layout(l0);
-        let t8 = ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(s0).unwrap();
-        let t9 = ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(s1).unwrap();
-        let t10 = ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(s2).unwrap();
-        let t11 = ArrayType::new(F32, Shape::new(vec![1.into(), 8.into()])).with_sharding(s3).unwrap();
-        let t12 = ArrayType::new(F32, Shape::new(vec![2.into(), 8.into()])).with_sharding(s4).unwrap();
-        let t13 = ArrayType::new(F32, Shape::new(vec![2.into(), 8.into()])).with_sharding(s5).unwrap();
-        let t14 = ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(s6).unwrap();
-        let t15 = ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(s7).unwrap();
-        let t16 = ArrayType::new(F32, Shape::new(vec![4.into(), 8.into()]));
-        let t17 = ArrayType::new(F32, Shape::new(vec![4.into(), 1.into()])).with_sharding(s8).unwrap();
-        let t18 = ArrayType::new(F32, Shape::new(vec![1.into(), 8.into()])).with_sharding(s9).unwrap();
-        let t19 = ArrayType::new(F32, Shape::new(vec![4.into(), 1.into()])).with_sharding(s10).unwrap();
-        let t20 = ArrayType::new(F32, Shape::new(vec![1.into(), 8.into()])).with_sharding(s11).unwrap();
-        let t21 = ArrayType::new(F32, Shape::new(vec![1.into()])).with_sharding(s12).unwrap();
-        let t22 = ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(s13).unwrap();
-        let t23 = ArrayType::new(F32, Shape::new(vec![8.into()]));
-
-        assert_eq!(t1.broadcast(&t2), Ok(t1.clone()));
-        assert_eq!(t2.broadcast(&t1), Ok(t1.clone()));
-        assert!(matches!(t0.broadcast(&t3), Err(BroadcastingError::IncompatibleShapes { .. })));
-        assert_eq!(t4.broadcast(&t5), Ok(t4.clone()));
-        assert_eq!(t4.broadcast(&t6), Ok(t0.clone()));
-        assert_eq!(t7.broadcast(&t0), Ok(t0.clone()));
-        assert_eq!(
-            t8.broadcast(&t9).map(|output| output.sharding().unwrap().varying_manual_axes().clone()),
-            Ok(BTreeSet::from(["x".to_string()]))
-        );
-        assert!(matches!(t8.broadcast(&t10), Err(BroadcastingError::IncompatibleShardings { .. })));
-        assert_eq!(
-            t15.broadcast(&t16).map(|output| output.sharding().unwrap().dimensions().to_vec()),
-            Ok(vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
-        );
-        assert!(matches!(t17.broadcast(&t18), Err(BroadcastingError::IncompatibleShardings { .. })));
-        assert_eq!(
-            t19.broadcast(&t20).map(|output| output.sharding().unwrap().dimensions().to_vec()),
-            Ok(vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])])
-        );
-        assert_eq!(
-            t21.broadcast(&t23).map(|output| output.sharding().unwrap().dimensions().to_vec()),
-            Ok(vec![ShardingDimension::sharded(["x"])])
-        );
-        assert!(matches!(t21.broadcast(&t22), Err(BroadcastingError::IncompatibleShardings { .. })));
-
-        assert_eq!(t2.broadcast_to(&t1), Ok(t1.clone()));
-        assert_eq!(t2.broadcast_to(&t4), Ok(t4.clone()));
-        assert!(matches!(t0.broadcast_to(&t3), Err(BroadcastingError::IncompatibleShapes { .. })));
-        assert_eq!(
-            t11.broadcast_to(&t12).map(|output| output.sharding().unwrap().reduced_axes().clone()),
-            Ok(BTreeSet::from(["y".to_string()]))
-        );
-        assert!(matches!(t11.broadcast_to(&t13), Err(BroadcastingError::IncompatibleShardings { .. })));
-        assert_eq!(
-            t2.broadcast_to(&t14).map(|output| output.sharding().unwrap().dimensions().to_vec()),
-            Ok(vec![ShardingDimension::sharded(["x"])])
-        );
-        assert_eq!(
-            t15.broadcast_to(&t16).map(|output| output.sharding().unwrap().dimensions().to_vec()),
-            Ok(vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
-        );
-
-        assert_eq!(ArrayType::broadcasted(&[&t0]), Ok(t0.clone()));
-        assert_eq!(ArrayType::broadcasted(&[&t1, &t2]), Ok(t1.clone()));
-        assert_eq!(ArrayType::broadcasted(&[&t2, &t1]), Ok(t1.clone()));
-        assert!(matches!(ArrayType::broadcasted::<ArrayType>(&[]), Err(BroadcastingError::EmptyBroadcastingInput)));
-        assert!(matches!(ArrayType::broadcasted(&[&t0, &t3]), Err(BroadcastingError::IncompatibleShapes { .. })));
-
-        assert!(t2.is_broadcastable_to(&t1));
-        assert!(!t0.is_broadcastable_to(&t3));
-        assert!(t2.is_broadcastable_to(&t14));
-        assert!(t11.is_broadcastable_to(&t12));
-        assert!(t15.is_broadcastable_to(&t16));
-        assert!(t21.is_broadcastable_to(&t23));
-        assert!(!t8.is_broadcastable_to(&t10));
-        assert!(!t11.is_broadcastable_to(&t13));
-        assert!(!t17.is_broadcastable_to(&t18));
+        assert!(scalar.is_broadcastable_to(&row));
+        assert!(!matrix.is_broadcastable_to(&incompatible_matrix));
     }
 
     #[test]
-    fn test_array_type_memory_broadcasting() {
+    fn test_shape_is_broadcastable_to_zero_and_dynamic_dimensions() {
+        let singleton = Shape::new(vec![1.into()]);
+        let empty = Shape::new(vec![0.into()]);
+        let bounds = DimensionBounds::non_negative(Some(8)).unwrap();
+        let dynamic = Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("extent", bounds))]);
+        let other_dynamic = Shape::new(vec![Dimension::Dynamic(DimensionVariable::new("other_extent", bounds))]);
+
+        // Singleton expansion accepts zero extents and symbols, but bounds do not establish symbol identity.
+        assert!(singleton.is_broadcastable_to(&empty));
+        assert!(singleton.is_broadcastable_to(&dynamic));
+        assert!(dynamic.is_broadcastable_to(&dynamic));
+        assert!(!empty.is_broadcastable_to(&singleton));
+        assert!(!dynamic.is_broadcastable_to(&singleton));
+        assert!(!dynamic.is_broadcastable_to(&other_dynamic));
+    }
+
+    #[test]
+    fn test_array_type_broadcast() {
+        let matrix = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]));
+        let row = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()]));
+        let scalar = ArrayType::scalar(Boolean);
+        let incompatible_matrix = ArrayType::new(F32, Shape::new(vec![5.into(), 3.into()]));
+
+        assert_eq!(row.broadcast(&scalar), Ok(row.clone()));
+        assert_eq!(scalar.broadcast(&row), Ok(row.clone()));
+        assert_eq!(
+            matrix.broadcast(&incompatible_matrix),
+            Err(BroadcastingError::IncompatibleShapes {
+                lhs: incompatible_matrix.shape().clone(),
+                rhs: matrix.shape().clone()
+            }),
+        );
+    }
+
+    #[test]
+    fn test_array_type_broadcast_layout() {
+        let tiled_layout = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![Tile::new(vec![TileDimension::Sized(4)])]));
+        let strided_layout = Layout::Strided(StridedLayout::new(vec![16, 4]));
+        let matrix = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]));
+        let tiled_matrix = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()])).with_layout(tiled_layout.clone());
+        let same_tiled_matrix =
+            ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()])).with_layout(tiled_layout.clone());
+        let strided_matrix = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()])).with_layout(strided_layout);
+        let tiled_row = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()])).with_layout(tiled_layout);
+
+        // Agreeing layouts survive; disagreement or a missing layout leaves the result unspecified.
+        assert_eq!(tiled_matrix.broadcast(&same_tiled_matrix), Ok(tiled_matrix.clone()));
+        assert_eq!(tiled_matrix.broadcast(&strided_matrix), Ok(matrix.clone()));
+        assert_eq!(tiled_row.broadcast(&matrix), Ok(matrix.clone()));
+    }
+
+    #[test]
+    fn test_array_type_broadcast_memory() {
         let device = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]));
         let pinned_host = device.clone().with_memory(Memory::Host { pinned: true });
         let pinned_host_scalar = ArrayType::scalar(F32).with_memory(Memory::Host { pinned: true });
 
-        // Same-memory operands broadcast and preserve their placement.
+        // Broadcasting preserves placement; its reversed retry determines the error operand order.
         assert_eq!(pinned_host.broadcast(&pinned_host_scalar), Ok(pinned_host.clone()));
-        assert_eq!(pinned_host_scalar.broadcast_to(&pinned_host), Ok(pinned_host.clone()));
-        assert!(pinned_host_scalar.is_broadcastable_to(&pinned_host));
-
-        // Mixed-memory operands never broadcast: combining them requires staging an explicit transfer first. The
-        // symmetric `broadcast` reports the error of its second (reversed) attempt.
         assert_eq!(
             device.broadcast(&pinned_host),
             Err(BroadcastingError::IncompatibleMemories { lhs: Memory::Host { pinned: true }, rhs: Memory::Device }),
         );
+    }
+
+    #[test]
+    fn test_array_type_broadcast_sharding() {
+        let manual_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let single_axis_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let two_axis_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 4, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let manual_sharding = Sharding::new(manual_mesh.clone(), vec![ShardingDimension::sharded(["x"])])
+            .unwrap()
+            .with_varying_manual_axes(["x"])
+            .unwrap();
+        let same_manual_sharding = Sharding::new(manual_mesh.clone(), vec![ShardingDimension::sharded(["x"])])
+            .unwrap()
+            .with_varying_manual_axes(["x"])
+            .unwrap();
+        let different_manual_sharding = Sharding::new(manual_mesh.clone(), vec![ShardingDimension::sharded(["x"])])
+            .unwrap()
+            .with_varying_manual_axes(["y"])
+            .unwrap();
+        let vector_sharding = Sharding::new(single_axis_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let column_sharding = Sharding::new(
+            single_axis_mesh.clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let row_sharding =
+            Sharding::new(single_axis_mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
+                .unwrap();
+        let outer_column_sharding = Sharding::new(
+            two_axis_mesh.clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let outer_row_sharding = Sharding::new(
+            two_axis_mesh.clone(),
+            vec![ShardingDimension::replicated(), ShardingDimension::sharded(["y"])],
+        )
+        .unwrap();
+        let singleton_sharding = Sharding::new(two_axis_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let conflicting_vector_sharding =
+            Sharding::new(two_axis_mesh, vec![ShardingDimension::sharded(["y"])]).unwrap();
+        let manual_vector = ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(manual_sharding).unwrap();
+        let same_manual_vector =
+            ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(same_manual_sharding).unwrap();
+        let different_manual_vector =
+            ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(different_manual_sharding).unwrap();
+        let sharded_vector = ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(vector_sharding).unwrap();
+        let unsharded_matrix = ArrayType::new(F32, Shape::new(vec![4.into(), 8.into()]));
+        let sharded_column =
+            ArrayType::new(F32, Shape::new(vec![4.into(), 1.into()])).with_sharding(column_sharding).unwrap();
+        let sharded_row =
+            ArrayType::new(F32, Shape::new(vec![1.into(), 8.into()])).with_sharding(row_sharding).unwrap();
+        let outer_column = ArrayType::new(F32, Shape::new(vec![4.into(), 1.into()]))
+            .with_sharding(outer_column_sharding)
+            .unwrap();
+        let outer_row =
+            ArrayType::new(F32, Shape::new(vec![1.into(), 8.into()])).with_sharding(outer_row_sharding).unwrap();
+        let sharded_singleton =
+            ArrayType::new(F32, Shape::new(vec![1.into()])).with_sharding(singleton_sharding).unwrap();
+        let conflicting_vector =
+            ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(conflicting_vector_sharding).unwrap();
+        let unsharded_vector = ArrayType::new(F32, Shape::new(vec![8.into()]));
+
+        // Manual-axis variation must agree when both operands carry sharding.
+        assert_eq!(
+            manual_vector.broadcast(&same_manual_vector).map(|output| output
+                .sharding()
+                .unwrap()
+                .varying_manual_axes()
+                .clone()),
+            Ok(BTreeSet::from(["x".to_string()])),
+        );
+        assert_eq!(
+            manual_vector.broadcast(&different_manual_vector),
+            Err(BroadcastingError::IncompatibleShardings {
+                lhs: different_manual_vector.sharding().cloned().map(Box::new),
+                rhs: manual_vector.sharding().cloned().map(Box::new)
+            }),
+        );
+        // Rank promotion pads shardings with replication; a mesh axis cannot serve two output dimensions.
+        assert_eq!(
+            sharded_vector
+                .broadcast(&unsharded_matrix)
+                .map(|output| output.sharding().unwrap().dimensions().to_vec()),
+            Ok(vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])]),
+        );
+        assert_eq!(
+            sharded_column.broadcast(&sharded_row),
+            Err(BroadcastingError::IncompatibleShardings {
+                lhs: sharded_row.sharding().cloned().map(Box::new),
+                rhs: sharded_column.sharding().cloned().map(Box::new)
+            }),
+        );
+        // Independent mesh axes combine, while non-replicated singleton axes retain their constraints.
+        assert_eq!(
+            outer_column.broadcast(&outer_row).map(|output| output.sharding().unwrap().dimensions().to_vec()),
+            Ok(vec![ShardingDimension::sharded(["x"]), ShardingDimension::sharded(["y"])]),
+        );
+        assert_eq!(
+            sharded_singleton.broadcast(&unsharded_vector).map(|output| output
+                .sharding()
+                .unwrap()
+                .dimensions()
+                .to_vec()),
+            Ok(vec![ShardingDimension::sharded(["x"])]),
+        );
+        assert_eq!(
+            sharded_singleton.broadcast(&conflicting_vector),
+            Err(BroadcastingError::IncompatibleShardings {
+                lhs: conflicting_vector.sharding().cloned().map(Box::new),
+                rhs: sharded_singleton.sharding().cloned().map(Box::new)
+            }),
+        );
+    }
+
+    #[test]
+    fn test_array_type_broadcast_to() {
+        let tiled_layout = Layout::Tiled(TiledLayout::new(vec![1, 0], vec![Tile::new(vec![TileDimension::Sized(4)])]));
+        let manual_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let single_axis_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let reduced_replicated_sharding =
+            Sharding::new(manual_mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
+                .unwrap()
+                .with_reduced_axes(["y"])
+                .unwrap();
+        let reduced_sharding = Sharding::new(
+            manual_mesh.clone(),
+            vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
+        )
+        .unwrap()
+        .with_reduced_axes(["y"])
+        .unwrap();
+        let unreduced_sharding = Sharding::new(
+            manual_mesh.clone(),
+            vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
+        )
+        .unwrap();
+        let vector_manual_sharding = Sharding::new(manual_mesh, vec![ShardingDimension::sharded(["x"])])
+            .unwrap()
+            .with_varying_manual_axes(["x"])
+            .unwrap();
+        let vector_sharding = Sharding::new(single_axis_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let matrix = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]));
+        let row = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()]));
+        let scalar = ArrayType::scalar(Boolean);
+        let incompatible_matrix = ArrayType::new(F32, Shape::new(vec![5.into(), 3.into()]));
+        let tiled_matrix = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()])).with_layout(tiled_layout.clone());
+        let reduced_row = ArrayType::new(F32, Shape::new(vec![1.into(), 8.into()]))
+            .with_sharding(reduced_replicated_sharding)
+            .unwrap();
+        let reduced_matrix =
+            ArrayType::new(F32, Shape::new(vec![2.into(), 8.into()])).with_sharding(reduced_sharding).unwrap();
+        let unreduced_matrix =
+            ArrayType::new(F32, Shape::new(vec![2.into(), 8.into()])).with_sharding(unreduced_sharding).unwrap();
+        let manual_target =
+            ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(vector_manual_sharding).unwrap();
+        let sharded_vector = ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(vector_sharding).unwrap();
+        let unsharded_matrix = ArrayType::new(F32, Shape::new(vec![4.into(), 8.into()]));
+
+        // Directional broadcasting adopts target shape and layout.
+        assert_eq!(scalar.broadcast_to(&row), Ok(row.clone()));
+        assert_eq!(scalar.broadcast_to(&tiled_matrix), Ok(tiled_matrix.clone()));
+        assert_eq!(
+            matrix.broadcast_to(&incompatible_matrix),
+            Err(BroadcastingError::IncompatibleShapes {
+                lhs: matrix.shape().clone(),
+                rhs: incompatible_matrix.shape().clone()
+            }),
+        );
+        // Reduction metadata must agree, and compatible sharding survives rank promotion.
+        assert_eq!(
+            reduced_row
+                .broadcast_to(&reduced_matrix)
+                .map(|output| output.sharding().unwrap().reduced_axes().clone()),
+            Ok(BTreeSet::from(["y".to_string()])),
+        );
+        assert_eq!(
+            reduced_row.broadcast_to(&unreduced_matrix),
+            Err(BroadcastingError::IncompatibleShardings {
+                lhs: reduced_row.sharding().cloned().map(Box::new),
+                rhs: unreduced_matrix.sharding().cloned().map(Box::new)
+            }),
+        );
+        assert_eq!(
+            scalar.broadcast_to(&manual_target).map(|output| output.sharding().unwrap().dimensions().to_vec()),
+            Ok(vec![ShardingDimension::sharded(["x"])]),
+        );
+        assert_eq!(
+            sharded_vector.broadcast_to(&unsharded_matrix).map(|output| output
+                .sharding()
+                .unwrap()
+                .dimensions()
+                .to_vec()),
+            Ok(vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])]),
+        );
+    }
+
+    #[test]
+    fn test_array_type_broadcast_to_memory() {
+        let device = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]));
+        let pinned_host = device.clone().with_memory(Memory::Host { pinned: true });
+        let pinned_host_scalar = ArrayType::scalar(F32).with_memory(Memory::Host { pinned: true });
+
+        assert_eq!(pinned_host_scalar.broadcast_to(&pinned_host), Ok(pinned_host.clone()));
         assert_eq!(
             device.broadcast_to(&pinned_host),
             Err(BroadcastingError::IncompatibleMemories { lhs: Memory::Device, rhs: Memory::Host { pinned: true } }),
         );
+    }
+
+    #[test]
+    fn test_array_type_broadcasted() {
+        let matrix = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]));
+        let row = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()]));
+        let scalar = ArrayType::scalar(Boolean);
+        let incompatible_matrix = ArrayType::new(F32, Shape::new(vec![5.into(), 3.into()]));
+
+        assert_eq!(ArrayType::broadcasted(&[&matrix]), Ok(matrix.clone()));
+        assert_eq!(ArrayType::broadcasted(&[&row, &scalar]), Ok(row.clone()));
+        assert_eq!(ArrayType::broadcasted(&[&scalar, &row]), Ok(row.clone()));
+        assert!(matches!(ArrayType::broadcasted::<ArrayType>(&[]), Err(BroadcastingError::EmptyBroadcastingInput)));
+        assert_eq!(
+            ArrayType::broadcasted(&[&matrix, &incompatible_matrix]),
+            Err(BroadcastingError::IncompatibleShapes {
+                lhs: incompatible_matrix.shape().clone(),
+                rhs: matrix.shape().clone()
+            }),
+        );
+    }
+
+    #[test]
+    fn test_array_type_is_broadcastable_to() {
+        let manual_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Manual).unwrap(),
+            MeshAxis::new("y", 2, MeshAxisType::Manual).unwrap(),
+        ])
+        .unwrap();
+        let single_axis_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap();
+        let two_axis_mesh = LogicalMesh::new(vec![
+            MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap(),
+            MeshAxis::new("y", 4, MeshAxisType::Explicit).unwrap(),
+        ])
+        .unwrap();
+        let manual_sharding = Sharding::new(manual_mesh.clone(), vec![ShardingDimension::sharded(["x"])])
+            .unwrap()
+            .with_varying_manual_axes(["x"])
+            .unwrap();
+        let different_manual_sharding = Sharding::new(manual_mesh.clone(), vec![ShardingDimension::sharded(["x"])])
+            .unwrap()
+            .with_varying_manual_axes(["y"])
+            .unwrap();
+        let reduced_replicated_sharding =
+            Sharding::new(manual_mesh.clone(), vec![ShardingDimension::replicated(), ShardingDimension::replicated()])
+                .unwrap()
+                .with_reduced_axes(["y"])
+                .unwrap();
+        let reduced_sharding = Sharding::new(
+            manual_mesh.clone(),
+            vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
+        )
+        .unwrap()
+        .with_reduced_axes(["y"])
+        .unwrap();
+        let unreduced_sharding = Sharding::new(
+            manual_mesh.clone(),
+            vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])],
+        )
+        .unwrap();
+        let vector_manual_sharding = Sharding::new(manual_mesh, vec![ShardingDimension::sharded(["x"])])
+            .unwrap()
+            .with_varying_manual_axes(["x"])
+            .unwrap();
+        let vector_sharding = Sharding::new(single_axis_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let column_sharding = Sharding::new(
+            single_axis_mesh.clone(),
+            vec![ShardingDimension::sharded(["x"]), ShardingDimension::replicated()],
+        )
+        .unwrap();
+        let row_sharding =
+            Sharding::new(single_axis_mesh, vec![ShardingDimension::replicated(), ShardingDimension::sharded(["x"])])
+                .unwrap();
+        let singleton_sharding = Sharding::new(two_axis_mesh.clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
+        let matrix = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]));
+        let row = ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()]));
+        let scalar = ArrayType::scalar(Boolean);
+        let incompatible_matrix = ArrayType::new(F32, Shape::new(vec![5.into(), 3.into()]));
+        let manual_vector = ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(manual_sharding).unwrap();
+        let different_manual_vector =
+            ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(different_manual_sharding).unwrap();
+        let reduced_row = ArrayType::new(F32, Shape::new(vec![1.into(), 8.into()]))
+            .with_sharding(reduced_replicated_sharding)
+            .unwrap();
+        let reduced_matrix =
+            ArrayType::new(F32, Shape::new(vec![2.into(), 8.into()])).with_sharding(reduced_sharding).unwrap();
+        let unreduced_matrix =
+            ArrayType::new(F32, Shape::new(vec![2.into(), 8.into()])).with_sharding(unreduced_sharding).unwrap();
+        let manual_target =
+            ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(vector_manual_sharding).unwrap();
+        let sharded_vector = ArrayType::new(F32, Shape::new(vec![8.into()])).with_sharding(vector_sharding).unwrap();
+        let unsharded_matrix = ArrayType::new(F32, Shape::new(vec![4.into(), 8.into()]));
+        let sharded_column =
+            ArrayType::new(F32, Shape::new(vec![4.into(), 1.into()])).with_sharding(column_sharding).unwrap();
+        let sharded_row =
+            ArrayType::new(F32, Shape::new(vec![1.into(), 8.into()])).with_sharding(row_sharding).unwrap();
+        let sharded_singleton =
+            ArrayType::new(F32, Shape::new(vec![1.into()])).with_sharding(singleton_sharding).unwrap();
+        let unsharded_vector = ArrayType::new(F32, Shape::new(vec![8.into()]));
+
+        assert!(scalar.is_broadcastable_to(&row));
+        assert!(!matrix.is_broadcastable_to(&incompatible_matrix));
+        assert!(scalar.is_broadcastable_to(&manual_target));
+        assert!(reduced_row.is_broadcastable_to(&reduced_matrix));
+        assert!(sharded_vector.is_broadcastable_to(&unsharded_matrix));
+        assert!(sharded_singleton.is_broadcastable_to(&unsharded_vector));
+        assert!(!manual_vector.is_broadcastable_to(&different_manual_vector));
+        assert!(!reduced_row.is_broadcastable_to(&unreduced_matrix));
+        assert!(!sharded_column.is_broadcastable_to(&sharded_row));
+    }
+
+    #[test]
+    fn test_array_type_is_broadcastable_to_memory() {
+        let device = ArrayType::new(F32, Shape::new(vec![42.into(), 4.into()]));
+        let pinned_host = device.clone().with_memory(Memory::Host { pinned: true });
+        let pinned_host_scalar = ArrayType::scalar(F32).with_memory(Memory::Host { pinned: true });
+
+        assert!(pinned_host_scalar.is_broadcastable_to(&pinned_host));
         assert!(!device.is_broadcastable_to(&pinned_host));
         assert!(!pinned_host.is_broadcastable_to(&device));
     }
 
     #[test]
-    fn test_parameterized_array_type_broadcastable() {
-        #[derive(Parameterized, Clone, Debug, PartialEq, Eq)]
-        enum TestEnum<P: Parameter> {
-            Wrapped { inner: P },
-            Pair { left: P, right: P },
-        }
-
-        let t0 = TestEnum::Pair {
+    fn test_parameterized_array_type_broadcast() {
+        let source = BroadcastParameters::Pair {
             left: ArrayType::scalar(F32),
             right: ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()])),
         };
-
-        let t1 = TestEnum::Pair {
+        let target = BroadcastParameters::Pair {
             left: ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()])),
             right: ArrayType::new(F64, Shape::new(vec![3.into(), 4.into()])),
         };
-
-        let t2 = TestEnum::Pair {
+        let incompatible_target = BroadcastParameters::Pair {
             left: ArrayType::new(F32, Shape::new(vec![2.into(), 1.into()])),
             right: ArrayType::new(F32, Shape::new(vec![1.into(), 3.into()])),
         };
+        let wrapped = BroadcastParameters::Wrapped { inner: ArrayType::scalar(F32) };
 
-        let t3 = TestEnum::Wrapped { inner: ArrayType::scalar(F32) };
-
-        assert_eq!(t0.broadcast(&t1), Ok(t1.clone()));
+        assert_eq!(source.broadcast(&target), Ok(target.clone()));
         assert!(matches!(
-            t3.broadcast(&t2),
+            wrapped.broadcast(&incompatible_target),
             Err(BroadcastingError::ParameterError(ParameterError::MissingParameters { .. })),
         ));
+    }
 
-        assert_eq!(t0.broadcast_to(&t1), Ok(t1.clone()));
+    #[test]
+    fn test_parameterized_array_type_broadcast_to() {
+        let source = BroadcastParameters::Pair {
+            left: ArrayType::scalar(F32),
+            right: ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()])),
+        };
+        let target = BroadcastParameters::Pair {
+            left: ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()])),
+            right: ArrayType::new(F64, Shape::new(vec![3.into(), 4.into()])),
+        };
+        let incompatible_target = BroadcastParameters::Pair {
+            left: ArrayType::new(F32, Shape::new(vec![2.into(), 1.into()])),
+            right: ArrayType::new(F32, Shape::new(vec![1.into(), 3.into()])),
+        };
+        let wrapped = BroadcastParameters::Wrapped { inner: ArrayType::scalar(F32) };
+
+        assert_eq!(source.broadcast_to(&target), Ok(target.clone()));
         assert!(matches!(
-            t3.broadcast_to(&t2),
+            wrapped.broadcast_to(&incompatible_target),
             Err(BroadcastingError::ParameterError(ParameterError::MissingParameters { .. })),
         ));
+    }
 
-        assert_eq!(TestEnum::broadcasted(&[&t0]), Ok(t0.clone()));
+    #[test]
+    fn test_parameterized_array_type_broadcasted() {
+        let source = BroadcastParameters::Pair {
+            left: ArrayType::scalar(F32),
+            right: ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()])),
+        };
+        let target = BroadcastParameters::Pair {
+            left: ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()])),
+            right: ArrayType::new(F64, Shape::new(vec![3.into(), 4.into()])),
+        };
+        let incompatible_target = BroadcastParameters::Pair {
+            left: ArrayType::new(F32, Shape::new(vec![2.into(), 1.into()])),
+            right: ArrayType::new(F32, Shape::new(vec![1.into(), 3.into()])),
+        };
+        let wrapped = BroadcastParameters::Wrapped { inner: ArrayType::scalar(F32) };
+
+        assert_eq!(BroadcastParameters::broadcasted(&[&source]), Ok(source.clone()));
         assert_eq!(
-            TestEnum::broadcasted(&[&t0, &t1]),
-            Ok(TestEnum::Pair {
+            BroadcastParameters::broadcasted(&[&source, &target]),
+            Ok(BroadcastParameters::Pair {
                 left: ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()])),
                 right: ArrayType::new(F64, Shape::new(vec![3.into(), 4.into()])),
             }),
         );
         assert!(matches!(
-            TestEnum::broadcasted(&[&t3, &t2]),
+            BroadcastParameters::broadcasted(&[&wrapped, &incompatible_target]),
             Err(BroadcastingError::ParameterError(ParameterError::MissingParameters { .. })),
         ));
+    }
 
-        assert!(t0.is_broadcastable_to(&t1));
-        assert!(!t3.is_broadcastable_to(&t2));
+    #[test]
+    fn test_parameterized_array_type_is_broadcastable_to() {
+        let source = BroadcastParameters::Pair {
+            left: ArrayType::scalar(F32),
+            right: ArrayType::new(F32, Shape::new(vec![1.into(), 4.into()])),
+        };
+        let target = BroadcastParameters::Pair {
+            left: ArrayType::new(F64, Shape::new(vec![2.into(), 1.into()])),
+            right: ArrayType::new(F64, Shape::new(vec![3.into(), 4.into()])),
+        };
+        let incompatible_target = BroadcastParameters::Pair {
+            left: ArrayType::new(F32, Shape::new(vec![2.into(), 1.into()])),
+            right: ArrayType::new(F32, Shape::new(vec![1.into(), 3.into()])),
+        };
+        let wrapped = BroadcastParameters::Wrapped { inner: ArrayType::scalar(F32) };
+
+        assert!(source.is_broadcastable_to(&target));
+        assert!(!wrapped.is_broadcastable_to(&incompatible_target));
     }
 }
