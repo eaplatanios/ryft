@@ -517,7 +517,7 @@ pub struct GpuClientOptions {
 
     /// Enables asynchronous host dispatch in the Stream Executor GPU client. The upstream option
     /// retains the `use_tfrt_gpu_client` name but no longer selects a separate TFRT client.
-    pub use_tfrt_gpu_client: bool,
+    pub use_async_dispatch: bool,
 
     /// Maximum number of computations allowed in flight. When omitted, the runtime chooses its default. The GPU
     /// plugin requires a value in `1..=i32::MAX` and returns [`Error::InvalidArgument`] otherwise.
@@ -580,7 +580,7 @@ impl GpuClientOptions {
             values.push(NamedValue::new("collective_memory_size", collective_memory_size as i64));
         }
         values.push(NamedValue::new("abort_collectives_on_failure", self.abort_collectives_on_failure));
-        values.push(NamedValue::new("use_tfrt_gpu_client", self.use_tfrt_gpu_client));
+        values.push(NamedValue::new("use_tfrt_gpu_client", self.use_async_dispatch));
         if let Some(maximum_in_flight_computations) = self.maximum_in_flight_computations {
             values.push(NamedValue::new("max_inflight_computations", i64::from(maximum_in_flight_computations)));
         }
@@ -612,7 +612,7 @@ impl Default for GpuClientOptions {
             allocator: GpuMemoryAllocator::default(),
             collective_memory_size: None,
             abort_collectives_on_failure: false,
-            use_tfrt_gpu_client: false,
+            use_async_dispatch: false,
             maximum_in_flight_computations: None,
             mock_gpu_topology: None,
         }
@@ -1511,7 +1511,7 @@ mod tests {
             allocator: GpuMemoryAllocator::CudaAsync { memory_fraction_to_preallocate: Some(0.5) },
             collective_memory_size: Some(1024),
             abort_collectives_on_failure: true,
-            use_tfrt_gpu_client: true,
+            use_async_dispatch: true,
             maximum_in_flight_computations: None,
             mock_gpu_topology: Some(MockGpuTopology {
                 partition_count: 2,
@@ -1583,7 +1583,7 @@ mod tests {
     #[test]
     fn test_gpu_client_options_to_named_values() {
         let options = GpuClientOptions {
-            use_tfrt_gpu_client: true,
+            use_async_dispatch: true,
             maximum_in_flight_computations: Some(32),
             ..Default::default()
         };

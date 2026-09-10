@@ -3,6 +3,7 @@ use std::marker::PhantomData;
 use crate::extensions::ffi::errors::FfiError;
 use crate::extensions::ffi::handlers::{FfiApi, FfiExecutionStage};
 use crate::extensions::ffi::types::FfiTypeId;
+use crate::extensions::ffi::versions::Version;
 use crate::macros::invoke_xla_ffi_api_error_fn;
 
 /// Function pointer for a task that is to be scheduled on a thread pool. The XLA runtime will call this function with
@@ -109,9 +110,10 @@ impl FfiContextExtension<'_> {
         unsafe { (*self.handle).id.extension_type }
     }
 
-    /// Returns the extension's major and minor Application Binary Interface (ABI) versions.
-    pub fn version(&self) -> (i32, i32) {
-        unsafe { ((*self.handle).id.major_version, (*self.handle).id.minor_version) }
+    /// Returns the extension's Application Binary Interface (ABI) [`Version`].
+    pub fn version(&self) -> Version {
+        let identifier = unsafe { &(*self.handle).id };
+        Version { major: identifier.major_version as usize, minor: identifier.minor_version as usize }
     }
 }
 
@@ -637,8 +639,8 @@ mod tests {
         };
         let extension = unsafe { FfiContextExtension::from_c_api(&header).unwrap() };
         assert_eq!(extension.extension_type(), 128);
-        assert_eq!(extension.version(), (0, 1));
-        assert_eq!(unsafe { extension.to_c_api() }, (&header as *const ffi::XLA_FFI_Extension).cast());
+        assert_eq!(extension.version(), Version { major: 0, minor: 1 });
+        assert_eq!(unsafe { extension.to_c_api() }, &header as *const ffi::XLA_FFI_Extension);
         assert!(matches!(
             unsafe { FfiContextExtension::from_c_api(std::ptr::null()) },
             Err(FfiError::InvalidArgument { message, .. })
@@ -678,8 +680,8 @@ mod tests {
         with_test_extension_context(Some(test_find_extension), &header, |context| {
             let extension = context.extension(128).unwrap().unwrap();
             assert_eq!(extension.extension_type(), 128);
-            assert_eq!(extension.version(), (0, 1));
-            assert_eq!(unsafe { extension.to_c_api() }, (&header as *const ffi::XLA_FFI_Extension).cast());
+            assert_eq!(extension.version(), Version { major: 0, minor: 1 });
+            assert_eq!(unsafe { extension.to_c_api() }, &header as *const ffi::XLA_FFI_Extension);
             assert!(matches!(context.extension(129), Ok(None)));
         });
     }

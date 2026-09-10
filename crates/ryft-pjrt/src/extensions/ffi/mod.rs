@@ -9,7 +9,9 @@ pub mod versions;
 
 pub use attributes::{FfiArray, FfiAttribute, FfiAttributes, FfiScalar};
 pub use buffers::{FfiBuffer, FfiBufferType};
-pub use context::{FfiDeviceId, FfiExecutionContext, FfiExecutionState, FfiRunId, FfiStream, FfiTask, FfiUserData};
+pub use context::{
+    FfiContextExtension, FfiDeviceId, FfiExecutionContext, FfiExecutionState, FfiRunId, FfiStream, FfiTask, FfiUserData,
+};
 pub use errors::FfiError;
 pub use ffi::*;
 pub use futures::FfiFuture;
@@ -370,13 +372,12 @@ pub mod ffi {
 pub(crate) mod tests {
     use std::any::Any;
     use std::collections::HashMap;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicI32, Ordering};
-    use std::sync::{Arc, OnceLock};
 
     use indoc::indoc;
 
     use crate::extensions::ffi::errors::ffi::XLA_FFI_Error;
-    use crate::extensions::ffi::ffi::XLA_FFI_Api;
     use crate::extensions::ffi::handlers::ffi::XLA_FFI_CallFrame;
     use crate::extensions::ffi::{
         FfiApi, FfiBufferType, FfiCallFrame, FfiError, FfiExecutionStage, FfiHandler, FfiHandlerTraits, FfiInput,
@@ -551,16 +552,9 @@ pub(crate) mod tests {
         }
     }
 
-    /// Returns an [`FfiApi`] captured from the current XLA runtime.
+    /// Returns the static [`FfiApi`] exported by the linked CPU runtime.
     pub(crate) fn test_ffi_api() -> FfiApi {
-        static TEST_FFI_API_PTR: OnceLock<usize> = OnceLock::new();
-        if TEST_FFI_API_PTR.get().is_none() {
-            with_test_ffi_call_frame(|call_frame| {
-                let _ = TEST_FFI_API_PTR.set(unsafe { (*call_frame.to_c_api()).api as usize });
-            });
-        }
-        let ptr = TEST_FFI_API_PTR.get().copied().expect("failed to capture XLA FFI API pointer");
-        unsafe { FfiApi::from_c_api(ptr as *const XLA_FFI_Api).unwrap() }
+        unsafe { FfiApi::from_c_api(ryft_xla_sys::bindings::XLA_FFI_GetApi().cast()).unwrap() }
     }
 
     #[test]

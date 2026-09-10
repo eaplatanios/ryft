@@ -52,8 +52,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   GPU handler traits, the recording stage, invocation extensions, and preservation of native FFI error codes.
   FFI state access now rejects both execution and recording stages before calling native code, and invocation
   extensions validate their generic header before exposing borrowed backend data.
-- Updated `GpuClientOptions::use_tfrt_gpu_client` documentation to reflect upstream's asynchronous dispatch behavior
-  in the Stream Executor client.
+- Renamed `GpuClientOptions::use_tfrt_gpu_client` to `use_async_dispatch` to reflect upstream's asynchronous host
+  dispatch behavior in the Stream Executor client. The serialized native option key remains `use_tfrt_gpu_client`.
 - Made PJRT events, execution fences, executions, and buffers thread-safe through shared ownership and narrow native
   handle wrappers that reflect PJRT's thread-safety contracts. Event callbacks now require `Send + 'static`, the
   unsafe `EventHandle` was replaced by the safe shared-ownership `EventPromise`, and asynchronous host-buffer
