@@ -4,10 +4,11 @@ use ryft_xla_sys::bindings::{
 };
 
 use crate::dialects::stable_hlo::ReplicaGroupMeshAxesAttributeRef;
+use crate::macros::{mlir_op, mlir_op_trait, mlir_subtype_trait_impls};
 use crate::{
     Attribute, AttributeRef, Context, DenseIntegerElementsAttributeRef, DetachedOp, DetachedRegion, DialectHandle,
     Error, Location, OneRegion, Operation, OperationBuilder, RegionRef, Size, StringAttributeRef, StringRef,
-    TensorTypeRef, TryIntoWithContext, Type, Value, mlir_op, mlir_op_trait, mlir_subtype_trait_impls,
+    TensorTypeRef, TryIntoWithContext, Type, Value, ValueRef,
 };
 
 /// Represents the type of a StableHLO communication channel.
@@ -1052,9 +1053,13 @@ pub fn all_to_all<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>
     })
 }
 
+/// Name of the attribute indicating a runtime-selected collective root.
+pub const COLLECTIVE_HAS_DYNAMIC_ROOT_ATTRIBUTE: &str = "has_dynamic_root";
+
 /// StableHLO [`Operation`] that broadcasts data from a source process to target processes within each process group
 /// in the StableHLO process grid. This is a collective communication operation that implements broadcasting patterns.
-/// This operation has a single input/operand tensor and a single output/result tensor.
+/// Each input tensor has a corresponding result. The source is the first rank of each replica group unless a rank-one
+/// `i32` tensor supplies one dynamic root index per input tensor.
 ///
 /// # Example
 ///
@@ -1084,19 +1089,29 @@ pub fn all_to_all<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>
 pub trait CollectiveBroadcastOperation<'o, 'c: 'o, 't: 'c>:
     Operation<'o, 'c, 't> + HasReplicaGroups<'o, 'c, 't> + SupportsChannelHandle<'o, 'c, 't>
 {
+    /// Returns the optional rank-one `i32` tensor of root indices, one per data operand.
+    fn dynamic_roots(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.has_attribute(COLLECTIVE_HAS_DYNAMIC_ROOT_ATTRIBUTE) {
+            self.operand_value(self.operand_count().saturating_sub(1)).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 mlir_op!(CollectiveBroadcast);
-mlir_op_trait!(CollectiveBroadcast, OneResult);
 mlir_op_trait!(CollectiveBroadcast, ZeroRegions);
 mlir_op_trait!(CollectiveBroadcast, ZeroSuccessors);
 mlir_op_trait!(CollectiveBroadcast, @local HasReplicaGroups);
 mlir_op_trait!(CollectiveBroadcast, @local SupportsChannelHandle);
 
-/// Constructs a new detached/owned [`CollectiveBroadcastOperation`] at the specified [`Location`]. Refer to the
-/// documentation of [`CollectiveBroadcastOperation`] for more information on the operation semantics.
+/// Constructs a new detached/owned [`CollectiveBroadcastOperation`] at the specified [`Location`]. Pass data tensors in
+/// `inputs` and the optional root-index tensor separately in `dynamic_roots`. Only data tensors produce results.
+/// Omitting `dynamic_roots` selects the first rank in each replica group. Refer to the documentation of
+/// [`CollectiveBroadcastOperation`] for more information on the operation semantics.
 pub fn collective_broadcast<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
-    input: V,
+    inputs: &[V],
+    dynamic_roots: Option<V>,
     replica_groups: ReplicaGroups<'c, 't>,
     channel_id: Option<usize>,
     channel_type: Option<ChannelHandleType>,
@@ -1105,8 +1120,13 @@ pub fn collective_broadcast<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Locatio
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     let mut builder = OperationBuilder::new("stablehlo.collective_broadcast", location)
-        .add_operand(input)
+        .add_operands(inputs)
         .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location)?);
+    if let Some(dynamic_roots) = dynamic_roots {
+        builder = builder
+            .add_operand(dynamic_roots)
+            .add_attribute(COLLECTIVE_HAS_DYNAMIC_ROOT_ATTRIBUTE, context.unit_attribute());
+    }
     if let Some(channel_id) = channel_id {
         let channel_type = channel_type
             .ok_or_else(|| Error::invalid_argument("channel type is required when channel id is provided"))?;
@@ -1119,6 +1139,74 @@ pub fn collective_broadcast<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Locatio
         operation
             .cast()
             .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::collective_broadcast`"))
+    })
+}
+
+/// Reduces tensors across each replica group and returns the reduced values on its root rank. The root is the first
+/// rank in each group unless `dynamic_roots` supplies a rank-one `i32` tensor with one root index per data operand.
+/// The single-block region combines scalar pairs for each operand. Refer to the
+/// [official StableHLO specification](https://openxla.org/stablehlo/spec#collective_reduce).
+pub trait CollectiveReduceOperation<'o, 'c: 'o, 't: 'c>:
+    Operation<'o, 'c, 't> + HasReplicaGroups<'o, 'c, 't> + SupportsChannelHandle<'o, 'c, 't>
+{
+    /// Returns the optional rank-one `i32` tensor of root indices, one per data operand.
+    fn dynamic_roots(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        if self.has_attribute(COLLECTIVE_HAS_DYNAMIC_ROOT_ATTRIBUTE) {
+            self.operand_value(self.operand_count().saturating_sub(1)).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+mlir_op!(CollectiveReduce);
+mlir_op_trait!(CollectiveReduce, OneRegion);
+mlir_op_trait!(CollectiveReduce, SingleBlock);
+mlir_op_trait!(CollectiveReduce, SingleBlockRegions);
+mlir_op_trait!(CollectiveReduce, ZeroSuccessors);
+mlir_op_trait!(CollectiveReduce, @local HasReplicaGroups);
+mlir_op_trait!(CollectiveReduce, @local SupportsChannelHandle);
+
+/// Constructs a new detached/owned [`CollectiveReduceOperation`] at the specified [`Location`]. Pass data tensors in
+/// `inputs` and the optional root-index tensor separately in `dynamic_roots`. The `computation` region reduces pairs
+/// of scalar values for the data tensors; it does not receive the root-index tensor. Refer to the documentation of
+/// [`CollectiveReduceOperation`] for more information on the operation semantics.
+#[allow(clippy::too_many_arguments)]
+pub fn collective_reduce<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
+    inputs: &[V],
+    dynamic_roots: Option<V>,
+    replica_groups: ReplicaGroups<'c, 't>,
+    channel_id: Option<usize>,
+    channel_type: Option<ChannelHandleType>,
+    use_global_device_ids: bool,
+    computation: DetachedRegion<'c, 't>,
+    location: L,
+) -> Result<DetachedCollectiveReduceOperation<'c, 't>, Error> {
+    let context = location.context();
+    context.load_dialect(DialectHandle::stable_hlo()?)?;
+    let mut builder = OperationBuilder::new("stablehlo.collective_reduce", location)
+        .add_operands(inputs)
+        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location)?);
+    if let Some(dynamic_roots) = dynamic_roots {
+        builder = builder
+            .add_operand(dynamic_roots)
+            .add_attribute(COLLECTIVE_HAS_DYNAMIC_ROOT_ATTRIBUTE, context.unit_attribute());
+    }
+    if let Some(channel_id) = channel_id {
+        let channel_type = channel_type
+            .ok_or_else(|| Error::invalid_argument("channel type is required when channel ID is provided"))?;
+        builder = builder.add_attribute(
+            COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE,
+            context.stable_hlo_channel_handle(Some(channel_id), channel_type)?,
+        );
+    }
+    if use_global_device_ids {
+        builder = builder.add_attribute(COLLECTIVE_USE_GLOBAL_DEVICE_IDS_ATTRIBUTE, context.unit_attribute());
+    }
+    builder.add_region(computation).enable_result_type_inference().build().and_then(|operation| unsafe {
+        operation
+            .cast()
+            .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::collective_reduce`"))
     })
 }
 
@@ -1998,7 +2086,8 @@ mod tests {
             .append_operation({
                 let mut block = context.block(&[(tensor_type, location)]);
                 let op = collective_broadcast(
-                    block.argument(0).unwrap(),
+                    &[block.argument(0).unwrap()],
+                    None,
                     ReplicaGroups::dense(&[&[0, 2], &[1, 3]]),
                     Some(1),
                     Some(ChannelHandleType::DeviceToDevice),
@@ -2038,6 +2127,166 @@ mod tests {
                 }
             "},
         );
+    }
+
+    #[test]
+    fn test_collective_broadcast_dynamic_roots() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let data_type = context.tensor_type(context.float32_type(), &[Size::Static(4)], None, location).unwrap();
+        let roots_type =
+            context.tensor_type(context.signless_integer_type(32), &[Size::Static(2)], None, location).unwrap();
+        for has_dynamic_root in [false, true] {
+            let mut block = context.block(&[(data_type, location), (data_type, location), (roots_type, location)]);
+            let dynamic_roots = has_dynamic_root.then(|| block.argument(2).unwrap());
+            let operation = collective_broadcast(
+                &[block.argument(0).unwrap(), block.argument(1).unwrap()],
+                dynamic_roots,
+                ReplicaGroups::dense(&[&[0, 1]]),
+                None,
+                None,
+                location,
+            )
+            .unwrap();
+            assert!(operation.verify());
+            assert_eq!(operation.result_count(), 2);
+            assert_eq!(operation.dynamic_roots().unwrap(), dynamic_roots.map(|value| value.as_ref()));
+            assert_eq!(operation.result(0).unwrap().r#type().unwrap(), data_type.as_ref());
+            assert_eq!(operation.result(1).unwrap().r#type().unwrap(), data_type.as_ref());
+            let operation = block.append_operation(operation).unwrap();
+            block
+                .append_operation(
+                    func::r#return(&[operation.result(0).unwrap(), operation.result(1).unwrap()], location).unwrap(),
+                )
+                .unwrap();
+            let function = func::func(
+                "test_collective_broadcast_dynamic_roots",
+                func::FuncAttributes {
+                    arguments: vec![data_type.into(), data_type.into(), roots_type.into()],
+                    results: vec![data_type.into(), data_type.into()],
+                    ..Default::default()
+                },
+                block.try_into().unwrap(),
+                location,
+            )
+            .unwrap();
+            assert!(function.verify());
+            let parsed = context.parse_operation_from_bytes(function.bytecode(), "broadcast.mlir").unwrap();
+            assert!(parsed.verify());
+            assert_eq!(parsed.to_string(), function.to_string());
+        }
+    }
+
+    #[test]
+    fn test_collective_reduce() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let module = context.module(location).unwrap();
+        let f32_type = context.float32_type();
+        let tensor_type = context.tensor_type(f32_type, &[Size::Static(2), Size::Static(2)], None, location).unwrap();
+        let scalar_tensor_type = context.tensor_type(f32_type, &[], None, location).unwrap();
+        module
+            .body()
+            .unwrap()
+            .append_operation({
+                let mut block = context.block(&[(tensor_type, location)]);
+                let mut computation_region = context.region();
+                let mut computation_block =
+                    context.block(&[(scalar_tensor_type, location), (scalar_tensor_type, location)]);
+                let add_op = stable_hlo::add(
+                    computation_block.argument(0).unwrap(),
+                    computation_block.argument(1).unwrap(),
+                    location,
+                )
+                .unwrap();
+                let add_op = computation_block.append_operation(add_op).unwrap();
+                computation_block
+                    .append_operation(stable_hlo::r#return(&[add_op.result(0).unwrap()], location).unwrap())
+                    .unwrap();
+                computation_region.append_block(computation_block).unwrap();
+                let computation = computation_region.into();
+                let op = collective_reduce(
+                    &[block.argument(0).unwrap()],
+                    None,
+                    ReplicaGroups::dense(&[&[0, 2], &[1]]),
+                    Some(1),
+                    Some(ChannelHandleType::DeviceToDevice),
+                    true,
+                    computation,
+                    location,
+                )
+                .unwrap();
+                assert_eq!(op.replica_groups().unwrap(), ReplicaGroups::Dense(vec![vec![0, 2], vec![1]]));
+                assert_eq!(op.channel_id().unwrap(), Some(1));
+                assert_eq!(op.channel_type().unwrap(), Some(ChannelHandleType::DeviceToDevice));
+                assert!(op.use_global_device_ids());
+                let result = block.append_operation(op).unwrap();
+                block.append_operation(func::r#return(&[result.result(0).unwrap()], location).unwrap()).unwrap();
+                func::func(
+                    "test_collective_reduce",
+                    func::FuncAttributes {
+                        arguments: vec![tensor_type.into()],
+                        results: vec![tensor_type.into()],
+                        ..Default::default()
+                    },
+                    block.try_into().unwrap(),
+                    location,
+                )
+                .unwrap()
+            })
+            .unwrap();
+        assert!(module.verify().unwrap());
+        assert_eq!(
+            module.to_string(),
+            indoc! {"
+                module {
+                  func.func @test_collective_reduce(%arg0: tensor<2x2xf32>) -> tensor<2x2xf32> {
+                    %0 = \"stablehlo.collective_reduce\"(%arg0) <{\
+                      channel_handle = #stablehlo.channel_handle<handle = 1, type = 1>, \
+                      replica_groups = dense<[[0, 2], [1, -1]]> : tensor<2x2xi64>, \
+                      use_global_device_ids\
+                    }> ({
+                    ^bb0(%arg1: tensor<f32>, %arg2: tensor<f32>):
+                      %1 = stablehlo.add %arg1, %arg2 : tensor<f32>
+                      stablehlo.return %1 : tensor<f32>
+                    }) : (tensor<2x2xf32>) -> tensor<2x2xf32>
+                    return %0 : tensor<2x2xf32>
+                  }
+                }
+            "},
+        );
+    }
+
+    #[test]
+    fn test_collective_reduce_dynamic_roots() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let data_type = context.tensor_type(context.float32_type(), &[Size::Static(4)], None, location).unwrap();
+        let scalar_type = context.tensor_type(context.float32_type(), &[], None, location).unwrap();
+        let roots_type =
+            context.tensor_type(context.signless_integer_type(32), &[Size::Static(1)], None, location).unwrap();
+        let block = context.block(&[(data_type, location), (roots_type, location)]);
+        let mut reduction = context.block(&[(scalar_type, location), (scalar_type, location)]);
+        let sum = stable_hlo::add(reduction.argument(0).unwrap(), reduction.argument(1).unwrap(), location).unwrap();
+        let sum = reduction.append_operation(sum).unwrap();
+        reduction
+            .append_operation(stable_hlo::r#return(&[sum.result(0).unwrap()], location).unwrap())
+            .unwrap();
+        let operation = collective_reduce(
+            &[block.argument(0).unwrap()],
+            Some(block.argument(1).unwrap()),
+            ReplicaGroups::dense(&[&[0, 1]]),
+            None,
+            None,
+            false,
+            reduction.try_into().unwrap(),
+            location,
+        )
+        .unwrap();
+        assert!(operation.verify());
+        assert_eq!(operation.dynamic_roots().unwrap(), Some(block.argument(1).unwrap().as_ref()));
+        assert_eq!(operation.result_count(), 1);
+        assert_eq!(operation.result(0).unwrap().r#type().unwrap(), data_type.as_ref());
     }
 
     #[test]

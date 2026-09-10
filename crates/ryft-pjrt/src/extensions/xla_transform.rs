@@ -1,7 +1,7 @@
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Mutex;
 
-use crate::{Api, Client, Error, Plugin, invoke_pjrt_api_error_fn, slice_from_c_api};
+use crate::{Api, Client, Error, Plugin, invoke_pjrt_api_error_fn, invoke_pjrt_api_void_fn, slice_from_c_api};
 
 /// The PJRT XLA transform extension provides hooks for registering HLO module transformations that are applied during
 /// backend compilation. The extension is optional for PJRT [`Plugin`]s and _experimental_, meaning that incompatible
@@ -96,11 +96,14 @@ impl XlaTransformExtension {
     /// trace. The returned bytes are owned by Rust; plugin-owned trace storage is released before this function
     /// returns. Returns [`Error::Unimplemented`] if either trace callback is unavailable.
     pub fn hlo_pass_pipeline_trace(&self, module: &[u8]) -> Result<Vec<u8>, Error> {
-        use ffi::PJRT_Xla_Transform_Get_Hlo_Pass_Pipeline_Trace_Args;
+        use ffi::{
+            PJRT_Xla_Transform_Destroy_Hlo_Pass_Pipeline_Trace_Args,
+            PJRT_Xla_Transform_Get_Hlo_Pass_Pipeline_Trace_Args,
+        };
 
         // Check the destructor before obtaining storage owned by the plugin. Older extension layouts end before
         // the trace callbacks, so their fields must not be read until the size check succeeds.
-        let destroy = unsafe {
+        unsafe {
             let offset = std::mem::offset_of!(
                 ffi::PJRT_Xla_Transform_Extension,
                 PJRT_Xla_Transform_Destroy_Hlo_Pass_Pipeline_Trace,
@@ -110,24 +113,35 @@ impl XlaTransformExtension {
             {
                 return Err(Error::unimplemented("the XLA transform extension does not support HLO pipeline traces"));
             }
-            (*self.handle).PJRT_Xla_Transform_Destroy_Hlo_Pass_Pipeline_Trace.ok_or_else(|| {
-                Error::unimplemented("the XLA transform extension does not provide an HLO pipeline trace destructor")
-            })?
-        };
-        let mut trace = invoke_pjrt_api_error_fn!(
+            if (*self.handle).PJRT_Xla_Transform_Destroy_Hlo_Pass_Pipeline_Trace.is_none() {
+                return Err(Error::unimplemented(
+                    "the XLA transform extension does not provide an HLO pipeline trace destructor",
+                ));
+            }
+        }
+
+        invoke_pjrt_api_error_fn!(
             @extension ffi::PJRT_Xla_Transform_Extension => self,
             PJRT_Xla_Transform_Get_Hlo_Pass_Pipeline_Trace,
             { hlo_module = ffi::PJRT_XlaTransform_string { data: module.as_ptr().cast(), size: module.len() } },
             { trace },
-        )?;
-        let result = if trace.serialized_trace.is_null() && trace.serialized_trace_size != 0 {
-            Err(Error::internal("the XLA transform extension returned a null HLO pipeline trace with a nonzero size"))
-        } else {
-            Ok(unsafe { slice_from_c_api(trace.serialized_trace.cast::<u8>(), trace.serialized_trace_size) }.to_vec())
-        };
-        let mut arguments = ffi::PJRT_Xla_Transform_Destroy_Hlo_Pass_Pipeline_Trace_Args::new(&mut trace);
-        unsafe { destroy(&mut arguments) };
-        result
+        )
+        .and_then(|mut trace| {
+            let result = if trace.serialized_trace.is_null() && trace.serialized_trace_size != 0 {
+                Err(Error::internal(
+                    "the XLA transform extension returned a null HLO pipeline trace with a nonzero size",
+                ))
+            } else {
+                Ok(unsafe { slice_from_c_api(trace.serialized_trace.cast::<u8>(), trace.serialized_trace_size) }
+                    .to_vec())
+            };
+            invoke_pjrt_api_void_fn!(
+                @extension ffi::PJRT_Xla_Transform_Extension => self,
+                PJRT_Xla_Transform_Destroy_Hlo_Pass_Pipeline_Trace,
+                { trace = &mut trace },
+            )?;
+            result
+        })
     }
 }
 
@@ -578,13 +592,18 @@ pub(crate) mod ffi {
 
 #[cfg(test)]
 mod tests {
-    use crate::extensions::xla_transform::{XlaTransformPipelineStage, XlaTransformResult};
-    use crate::tests::{TestPlatform, test_for_each_platform};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use pretty_assertions::assert_eq;
+
+    use crate::tests::{TestPlatform, test_cpu_plugin, test_for_each_platform};
     use crate::{Error, errors, slice_from_c_api};
+
+    use super::*;
 
     struct NoOpTransform;
 
-    impl super::XlaTransform for NoOpTransform {
+    impl XlaTransform for NoOpTransform {
         fn transform_module(&mut self, _module: &[u8]) -> Result<XlaTransformResult, Error> {
             Ok(XlaTransformResult::Unchanged)
         }
@@ -695,5 +714,105 @@ mod tests {
                 }
             }
         });
+    }
+
+    #[test]
+    fn test_xla_transform_extension_hlo_pass_pipeline_trace() {
+        static GET_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static DESTROY_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+        /// Returns a plugin-owned copy of the input, or a malformed trace for the designated fixture.
+        unsafe extern "C" fn get_trace(
+            arguments: *mut ffi::PJRT_Xla_Transform_Get_Hlo_Pass_Pipeline_Trace_Args,
+        ) -> *mut crate::errors::ffi::PJRT_Error {
+            GET_COUNT.fetch_add(1, Ordering::SeqCst);
+            let arguments = unsafe { &mut *arguments };
+            let module = unsafe { slice_from_c_api(arguments.hlo_module.data.cast::<u8>(), arguments.hlo_module.size) };
+            if module == b"null" {
+                arguments.trace.serialized_trace_size = 1;
+            } else if !module.is_empty() {
+                let bytes = module.to_vec().into_boxed_slice();
+                arguments.trace.serialized_trace_size = bytes.len();
+                arguments.trace.serialized_trace = Box::into_raw(bytes).cast::<std::ffi::c_char>();
+            }
+            std::ptr::null_mut()
+        }
+
+        /// Releases only the allocation transferred by `get_trace`, after overwriting its contents.
+        unsafe extern "C" fn destroy_trace(
+            arguments: *mut ffi::PJRT_Xla_Transform_Destroy_Hlo_Pass_Pipeline_Trace_Args,
+        ) {
+            DESTROY_COUNT.fetch_add(1, Ordering::SeqCst);
+            let trace = unsafe { &mut *(*arguments).trace };
+            if !trace.serialized_trace.is_null() {
+                let bytes = std::ptr::slice_from_raw_parts_mut(
+                    trace.serialized_trace.cast_mut().cast::<u8>(),
+                    trace.serialized_trace_size,
+                );
+                let mut bytes = unsafe { Box::from_raw(bytes) };
+                bytes.fill(0);
+            }
+        }
+
+        let api = test_cpu_plugin().api();
+        let mut handle = ffi::PJRT_Xla_Transform_Extension {
+            base: crate::ffi::PJRT_Extension_Base {
+                struct_size: size_of::<ffi::PJRT_Xla_Transform_Extension>(),
+                extension_type: crate::ffi::PJRT_Extension_Type_XlaTransform,
+                next: std::ptr::null_mut(),
+            },
+            PJRT_Register_Xla_Transform: None,
+            PJRT_Clear_Xla_Transform: None,
+            PJRT_Xla_Transform_Get_Hlo_Pass_Pipeline_Trace: Some(get_trace),
+            PJRT_Xla_Transform_Destroy_Hlo_Pass_Pipeline_Trace: Some(destroy_trace),
+        };
+        let extension = XlaTransformExtension { handle: &raw const handle, api };
+
+        // Binary data, including embedded zero and non-UTF-8 bytes, survives plugin storage destruction.
+        assert_eq!(extension.hlo_pass_pipeline_trace(&[1, 0, 255]), Ok(vec![1, 0, 255]));
+        assert_eq!(GET_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(DESTROY_COUNT.load(Ordering::SeqCst), 1);
+        assert_eq!(extension.hlo_pass_pipeline_trace(&[]), Ok(Vec::new()));
+        assert_eq!(DESTROY_COUNT.load(Ordering::SeqCst), 2);
+
+        // Malformed output must still be released before returning the validation error.
+        assert!(matches!(
+            extension.hlo_pass_pipeline_trace(b"null"),
+            Err(Error::Internal { message, .. })
+                if message == "the XLA transform extension returned a null HLO pipeline trace with a nonzero size",
+        ));
+        assert_eq!(GET_COUNT.load(Ordering::SeqCst), 3);
+        assert_eq!(DESTROY_COUNT.load(Ordering::SeqCst), 3);
+
+        // Never acquire output if its destructor is missing or outside the advertised extension layout.
+        handle.PJRT_Xla_Transform_Destroy_Hlo_Pass_Pipeline_Trace = None;
+        let extension = XlaTransformExtension { handle: &raw const handle, api };
+        assert!(matches!(
+            extension.hlo_pass_pipeline_trace(b"input"),
+            Err(Error::Unimplemented { message, .. })
+                if message == "the XLA transform extension does not provide an HLO pipeline trace destructor",
+        ));
+        handle.PJRT_Xla_Transform_Destroy_Hlo_Pass_Pipeline_Trace = Some(destroy_trace);
+        handle.base.struct_size =
+            std::mem::offset_of!(ffi::PJRT_Xla_Transform_Extension, PJRT_Xla_Transform_Get_Hlo_Pass_Pipeline_Trace,);
+        let extension = XlaTransformExtension { handle: &raw const handle, api };
+        assert!(matches!(
+            extension.hlo_pass_pipeline_trace(b"input"),
+            Err(Error::Unimplemented { message, .. })
+                if message == "the XLA transform extension does not support HLO pipeline traces",
+        ));
+        handle.base.struct_size = size_of::<ffi::PJRT_Xla_Transform_Extension>();
+        handle.PJRT_Xla_Transform_Get_Hlo_Pass_Pipeline_Trace = None;
+        let extension = XlaTransformExtension { handle: &raw const handle, api };
+        assert!(matches!(
+            extension.hlo_pass_pipeline_trace(b"input"),
+            Err(Error::Unimplemented { message, .. }) if message == format!(
+                "`PJRT_Xla_Transform_Get_Hlo_Pass_Pipeline_Trace` is not implemented \
+                 in the loaded PJRT plugin (version {})",
+                api.version(),
+            ),
+        ));
+        assert_eq!(GET_COUNT.load(Ordering::SeqCst), 3);
+        assert_eq!(DESTROY_COUNT.load(Ordering::SeqCst), 3);
     }
 }
