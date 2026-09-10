@@ -197,12 +197,14 @@ impl<A: Value<Type = ArrayType>> ArrayIrOperation<A> {
 }
 
 impl<A: Value<Type = ArrayType>> ResidualZeroProvider<ArrayIrType> for ArrayIrOperation<A> {
+    #[inline]
     fn zero_residual_types(r#type: &ArrayIrType) -> Vec<ArrayIrType> {
         match r#type {
-            ArrayIrType::Array(r#type) => {
-                let (_, first_axes) = ExactShape::for_residual_zero(r#type.shape());
-                first_axes.into_iter().map(|(_, variable)| DimensionType::new(variable).into()).collect()
-            }
+            ArrayIrType::Array(r#type) => ExactShape::for_residual_zero(r#type.shape())
+                .1
+                .into_iter()
+                .map(|(_, variable)| DimensionType::new(variable).into())
+                .collect(),
             ArrayIrType::Dimension(_) | ArrayIrType::Reference(_) => Vec::new(),
         }
     }
