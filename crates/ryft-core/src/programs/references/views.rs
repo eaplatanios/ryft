@@ -1420,6 +1420,10 @@ mod tests {
             vec![Some(index(1, 0)), Some(index(1, 1))],
         );
 
+        // The returned handles must follow that same order, even though both outputs have the same type and axis.
+        assert_eq!(outputs[0].value().atom_id(), Ok(parent.builder().borrow().instructions()[0].outputs()[0]));
+        assert_eq!(outputs[1].value().atom_id(), Ok(parent.builder().borrow().instructions()[1].outputs()[0]));
+
         // The shared rule accepts several views of one source, but cannot reconstruct views of separate sources.
         let second = ArrayIrBatch::new(parent.input(reference_type([2, 3])), BatchAxis::new(0)).unwrap();
         assert_eq!(
