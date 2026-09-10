@@ -6227,12 +6227,12 @@ fn lower_while_to_while<'b, 'c: 'b, 't: 'c>(
 /// [`ScanOperation::with_unroll`] guarantees by construction). Logical iteration `i` computes its iteration index (`i`,
 /// or `length - 1 - i` when `reverse` is set), reads one slice of every stacked input with
 /// `stablehlo.dynamic_slice` (dropping the unit iteration axis with `stablehlo.reshape`), inlines the lowered body
-/// program over `[carries..., iteration_slices...]`, and writes each per-iteration output into its preallocated stacked
-/// zero accumulator with `stablehlo.dynamic_update_slice`. This is the same strategy JAX uses to lower `lax.scan`,
+/// program over `[index, carries..., iteration_slices...]`, and writes each per-iteration output into its
+/// preallocated stacked zero accumulator with `stablehlo.dynamic_update_slice`. This is the same strategy JAX uses to lower `lax.scan`,
 /// which is not an XLA primitive. When `unroll == length` no `stablehlo.while` is emitted at all: the body copies
-/// inline as straight-line operations at static iteration indices. The provided `input_values` must align with the body
-/// program's input signature: the first `carry_count` values are the carries and every remaining body input
-/// receives one stacked operand.
+/// inline as straight-line operations at static iteration indices. The provided `input_values` omit the body
+/// index input: the first `carry_count` values are carries and the remaining values are stacked operands, followed
+/// by the runtime length when the length is dynamic. Reference state is discharged before lowering.
 fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
     body_program: &FlatXlaProgram,
     carry_count: usize,
@@ -6253,19 +6253,21 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
     let threaded_effects = body_program.effects().classes();
     let body_input_types = body_program.input_types();
     let body_output_types = body_program.output_types();
+    // The checked scan signature includes an index supplied by this loop rather than an operation operand.
+    let operand_count = body_input_types.len() - 1;
     let runtime_length_count = usize::from(length.variable().is_some());
-    if input_values.len() != body_input_types.len() + runtime_length_count {
+    if input_values.len() != operand_count + runtime_length_count {
         return Err(LoweringError::UnsupportedOp {
             op: format!(
                 "{} expected {} lowered inputs but got {}",
                 SCAN_OPERATION_NAME,
-                body_input_types.len() + runtime_length_count,
+                operand_count + runtime_length_count,
                 input_values.len(),
             ),
         });
     }
     let (input_values, runtime_length) = if runtime_length_count == 1 {
-        (&input_values[..body_input_types.len()], Some(input_values[body_input_types.len()]))
+        (&input_values[..operand_count], Some(input_values[operand_count]))
     } else {
         (input_values, None)
     };
@@ -6281,8 +6283,8 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
             ),
         });
     }
-    let carry_types = &body_input_types[..carry_count];
-    let x_slice_types = body_input_types[carry_count..]
+    let carry_types = &body_input_types[1..1 + carry_count];
+    let x_slice_types = body_input_types[1 + carry_count..]
         .iter()
         .map(|r#type| <&ArrayType>::try_from(r#type).cloned())
         .collect::<Result<Vec<_>, _>>()
@@ -6540,7 +6542,7 @@ fn lower_scan_to_while<'b, 'c: 'b, 't: 'c>(
 }
 
 /// Emits one scan iteration at iteration index `index_value` into `block`: reads slice `index_value` of every stacked
-/// input (dropping the unit iteration axis), inlines the body program over `[carries..., x_slices...]`, writes each
+/// input (dropping the unit iteration axis), inlines the body program over `[index, carries..., x_slices...]`, writes each
 /// per-iteration output into its stacked accumulator at `index_value`, and returns the new carries and accumulators.
 /// This is the per-iteration building block shared by the looped and fully unrolled scan lowerings in
 /// [`lower_scan_to_while`].
@@ -6563,7 +6565,9 @@ fn lower_scan_iteration<'b, 'c: 'b, 't: 'c>(
 ) -> Result<(Vec<ValueRef<'b, 'c, 't>>, Vec<ValueRef<'b, 'c, 't>>), LoweringError> {
     // Read one slice of every stacked input and drop the unit iteration axis.
     let carry_count = carries.len();
-    let mut iteration_inputs = carries;
+    let mut iteration_inputs = Vec::with_capacity(1 + carry_count + x_slice_types.len());
+    iteration_inputs.push(index_value);
+    iteration_inputs.extend(carries);
     for (stack_offset, x_slice_type) in x_slice_types.iter().enumerate() {
         let slice_dimensions = static_dimensions(x_slice_type)?;
         let mut sizes = vec![1];
@@ -13629,6 +13633,7 @@ mod tests {
         };
 
         let mut scan_body_builder = CompositeXlaProgramBuilder::new();
+        scan_body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = scan_body_builder.add_input(scalar_f32.clone().into());
         let item = scan_body_builder.add_input(scalar_f32.clone().into());
         let next_carry =
@@ -13636,7 +13641,7 @@ mod tests {
         let scan_body = scan_body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![next_carry, next_carry],
-                vec![Placeholder; 2],
+                vec![Placeholder; 3],
                 vec![Placeholder; 2],
             )
             .unwrap();
@@ -14402,13 +14407,14 @@ mod tests {
 
         let scalar_f32 = ArrayType::scalar(DataType::F32);
         let mut body_builder = CompositeXlaProgramBuilder::new();
+        body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(scalar_f32.clone().into());
         let x = body_builder.add_input(scalar_f32.clone().into());
         let product = body_builder.add_instruction(MulOperation::new(), Vec::new(), vec![carry, x], None).unwrap()[0];
         let body = body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![product, product],
-                vec![Placeholder, Placeholder],
+                vec![Placeholder, Placeholder, Placeholder],
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
@@ -14450,12 +14456,13 @@ mod tests {
 
         let body = {
             let mut builder = CompositeXlaProgramBuilder::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
             let extent = builder.add_input(extent_type.into());
             let value = builder.add_input(dynamic_vector_type.clone().into());
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![extent, value],
-                    vec![Placeholder, Placeholder],
+                    vec![Placeholder, Placeholder, Placeholder],
                     vec![Placeholder, Placeholder],
                 )
                 .unwrap()
@@ -14509,11 +14516,12 @@ mod tests {
 
         let body = {
             let mut builder = CompositeXlaProgramBuilder::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![carry, carry],
-                    vec![Placeholder],
+                    vec![Placeholder, Placeholder],
                     vec![Placeholder, Placeholder],
                 )
                 .unwrap()
@@ -14568,6 +14576,7 @@ mod tests {
 
         let body = {
             let mut builder = CompositeXlaProgramBuilder::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
             let state = builder.add_input(state_type.into());
             let outputs = builder
                 .add_instruction(
@@ -14579,7 +14588,11 @@ mod tests {
                 .unwrap()
                 .to_vec();
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder, Placeholder])
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    outputs,
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder, Placeholder],
+                )
                 .unwrap()
         };
         let mut builder = CompositeXlaProgramBuilder::new();
@@ -14628,13 +14641,14 @@ mod tests {
 
         let scalar_f32 = ArrayType::scalar(DataType::F32);
         let mut body_builder = CompositeXlaProgramBuilder::new();
+        body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(scalar_f32.clone().into());
         let x = body_builder.add_input(scalar_f32.clone().into());
         let product = body_builder.add_instruction(MulOperation::new(), Vec::new(), vec![carry, x], None).unwrap()[0];
         let body = body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![product, product],
-                vec![Placeholder, Placeholder],
+                vec![Placeholder, Placeholder, Placeholder],
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
@@ -14676,13 +14690,14 @@ mod tests {
 
         let scalar_f32 = ArrayType::scalar(DataType::F32);
         let mut body_builder = CompositeXlaProgramBuilder::new();
+        body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(scalar_f32.clone().into());
         let x = body_builder.add_input(scalar_f32.clone().into());
         let product = body_builder.add_instruction(MulOperation::new(), Vec::new(), vec![carry, x], None).unwrap()[0];
         let body = body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![product, product],
-                vec![Placeholder, Placeholder],
+                vec![Placeholder, Placeholder, Placeholder],
                 vec![Placeholder, Placeholder],
             )
             .unwrap();
@@ -16233,13 +16248,18 @@ mod tests {
         // continues the chain (unused here because the program ends right after the scan).
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let mut body_builder = CompositeXlaProgramBuilder::new();
+        body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(scalar_f64.clone().into());
         let x = body_builder.add_input(scalar_f64.clone().into());
         let printed =
             body_builder.add_instruction(PrintOperation::new("iteration"), Vec::new(), vec![x], None).unwrap()[0];
         let sum = body_builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, printed], None).unwrap()[0];
         let body = body_builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder, Placeholder], vec![Placeholder])
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![sum],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
             .unwrap();
         let scan = CoreScanOperation::<XlaConstant>::new(1, 3);
 
@@ -16300,6 +16320,7 @@ mod tests {
         // contributes ordered I/O. The loop state carries two independent trailing tokens in canonical class order.
         let scalar_type = ArrayType::scalar(DataType::I64);
         let mut body_builder = CompositeXlaProgramBuilder::new();
+        body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(scalar_type.clone().into());
         let value = body_builder.add_input(scalar_type.clone().into());
         body_builder
@@ -16317,7 +16338,11 @@ mod tests {
             .add_instruction(PrintOperation::new("iteration"), Vec::new(), vec![value], None)
             .unwrap();
         let body = body_builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![carry], vec![Placeholder, Placeholder], vec![Placeholder])
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![carry],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
             .unwrap();
         let scan = CoreScanOperation::<XlaConstant>::new(1, 3);
 
@@ -16746,13 +16771,18 @@ mod tests {
         // XLA accepts and runs token-carrying loops (not just the flat token chain).
         let scalar_f64 = ArrayType::scalar(DataType::F64);
         let mut body_builder = CompositeXlaProgramBuilder::new();
+        body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(scalar_f64.clone().into());
         let x = body_builder.add_input(scalar_f64.clone().into());
         let printed =
             body_builder.add_instruction(PrintOperation::new("iteration"), Vec::new(), vec![x], None).unwrap()[0];
         let sum = body_builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, printed], None).unwrap()[0];
         let body = body_builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum], vec![Placeholder, Placeholder], vec![Placeholder])
+            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                vec![sum],
+                vec![Placeholder, Placeholder, Placeholder],
+                vec![Placeholder],
+            )
             .unwrap();
         let scan = CoreScanOperation::<XlaConstant>::new(1, 3);
 

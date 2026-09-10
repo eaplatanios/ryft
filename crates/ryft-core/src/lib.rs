@@ -32,13 +32,14 @@ pub use arrays::{
     DimensionOperations, DimensionSource, DimensionTracingContext, DimensionType, DimensionValue, DimensionVariable,
     ExactShape, ExactShapeDimension, Layout, LayoutError, LinearResiduals, LogicalMesh, MAX_DIMENSION_EXTENT, Memory,
     MeshAxis, MeshAxisType, ProcessIndex, REFERENCE_INDEX_OPERATION_NAME, REFERENCE_SLICE_OPERATION_NAME,
-    RaggedArrayExtentBatchingPolicy, RaggedAxis, RaggedMaskIdentity, ReferenceIndex, ReferenceIndexOperation,
-    ReferenceSlice, ReferenceSliceOperation, ReplicatedDimensionBatchingPolicy, Shape, Sharding, ShardingDimension,
-    ShardingError, ShardingVisualization, StaticArrayExtentBatchingPolicy, StaticShape, StridedLayout, Tile,
-    TileDimension, TiledLayout, bf16, decode_elements, decode_logical_bytes, encode_elements, encode_logical_bytes,
-    f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4, f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu,
-    f16, i1, i2, i4, materialize_array_tangent, reapply_array_reference_view, u1, u2, u4,
-    validate_array_reference_view, validate_storage_bytes,
+    RaggedArrayExtentBatchingPolicy, RaggedAxis, RaggedMaskIdentity, ReferenceDynamicIndex,
+    ReferenceDynamicIndexOperation, ReferenceIndex, ReferenceIndexOperation, ReferenceSlice, ReferenceSliceOperation,
+    ReplicatedDimensionBatchingPolicy, Shape, Sharding, ShardingDimension, ShardingError, ShardingVisualization,
+    StaticArrayExtentBatchingPolicy, StaticShape, StridedLayout, Tile, TileDimension, TiledLayout, bf16,
+    decode_elements, decode_logical_bytes, encode_elements, encode_logical_bytes, f4e2m1fn, f6e2m3fn, f6e3m2fn, f8e3m4,
+    f8e4m3, f8e4m3b11fnuz, f8e4m3fn, f8e4m3fnuz, f8e5m2, f8e5m2fnuz, f8e8m0fnu, f16, i1, i2, i4,
+    materialize_array_tangent, reapply_array_reference_view, u1, u2, u4, validate_array_reference_view,
+    validate_storage_bytes,
 };
 pub use axes::{AXIS_INDEX_OPERATION_NAME, Axes, Axis, AxisError, AxisIndex, AxisIndexOperation, NamedAxes, NamedAxis};
 pub use batching::{
@@ -86,9 +87,9 @@ pub use operations::constants::{
     ZERO_LIKE_OPERATION_NAME, ZERO_OPERATION_NAME, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 pub use operations::control_flow::{
-    CONDITION_OPERATION_NAME, ConditionOperation, SCAN_ITERATION_SYMBOL, SCAN_OPERATION_NAME, SELECT_OPERATION_NAME,
-    ScanOperation, Select, SelectOperation, WHILE_OPERATION_NAME, WhileOperation, WhilePredicate, WhileTypeSemantics,
-    transpose_primal_condition, transpose_primal_scan,
+    CONDITION_OPERATION_NAME, ConditionOperation, SCAN_OPERATION_NAME, SELECT_OPERATION_NAME, ScanOperation,
+    ScanReferenceDischarge, Select, SelectOperation, WHILE_OPERATION_NAME, WhileOperation, WhilePredicate,
+    WhileTypeSemantics, transpose_primal_condition, transpose_primal_scan,
 };
 pub use operations::cumulative::{
     CUMULATIVE_LOG_SUM_EXP_OPERATION_NAME, CUMULATIVE_MAX_OPERATION_NAME, CUMULATIVE_MIN_OPERATION_NAME,
@@ -194,14 +195,14 @@ pub use programs::{
     ReferenceId, ReferenceIdentity, ReferenceObservation, ReferenceRegionInputBinding, ReferenceReplacementPreparation,
     ReferenceReplacementTransaction, ReferenceRoot, ReferenceSource, ReferenceTransitiveAccess, ReferenceType,
     ReferenceTypeRefinements, ReferenceView, ReferenceViewAnalysis, ReferenceViewAnalysisError, ReferenceViewOperation,
-    ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep, ReferenceViewSymbol, ReferenceViewSymbolBinding,
-    ReferenceViewValidationError, Region, RegionArena, RegionArenaIterator, RegionDriver, RegionId, RegionInterface,
-    RegionRef, RegionReplayMappings, RegionRole, RegionSlot, RegionStatistics, RegionWithMetadata, ReplayRegionDriver,
-    TakenReferenceGuard, Transform, TransformArtifact, TransformCache, Type, TypeError, TypeIdentity,
-    TypeIdentityPosition, TypeIdentityRenaming, TypeIdentitySignature, TypeRefinements, Typed,
-    ValidatedPendingReplacementTransaction, Value, ValueId, ValueProjection, batch_reference_view_operation,
-    discharge_local_reference_operation, discharge_positional_region_operation, discharge_reference_free_operation,
-    infer_projected_operation_output_types, infer_projected_operation_region_input_types, validate_reference_boundary,
+    ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError, Region, RegionArena,
+    RegionArenaIterator, RegionDriver, RegionId, RegionInterface, RegionRef, RegionReplayMappings, RegionRole,
+    RegionSlot, RegionStatistics, RegionWithMetadata, ReplayRegionDriver, TakenReferenceGuard, Transform,
+    TransformArtifact, TransformCache, Type, TypeError, TypeIdentity, TypeIdentityPosition, TypeIdentityRenaming,
+    TypeIdentitySignature, TypeRefinements, Typed, ValidatedPendingReplacementTransaction, Value, ValueId,
+    ValueProjection, batch_reference_view_operation, discharge_local_reference_operation,
+    discharge_positional_region_operation, discharge_reference_free_operation, infer_projected_operation_output_types,
+    infer_projected_operation_region_input_types, validate_reference_boundary,
 };
 pub use specialization::{
     ReentrantSpecializationError, SpecializationCache, SpecializationCacheEntry, SpecializationCacheError,

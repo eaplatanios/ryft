@@ -169,7 +169,7 @@ where
 
     #[inline]
     fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
-        (region_index < 2).then_some(InputRegionProvenance::Forwarded { input_index: input_index + 1 })
+        (region_index < 2).then_some(InputRegionProvenance { input_index: input_index + 1 })
     }
 
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {

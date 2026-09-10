@@ -505,7 +505,7 @@ impl<V: Clone> Operation for ShardMapOperation<V> {
     // empty capture namespace.
     #[inline]
     fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
-        (region_index == 0).then_some(InputRegionProvenance::Forwarded { input_index })
+        (region_index == 0).then_some(InputRegionProvenance { input_index })
     }
 
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
@@ -627,7 +627,7 @@ where
         check_count!("input", body.input_ids(), inputs.len(), ProgramError);
         check_count!("output", body.output_ids(), self.output_types.len(), ProgramError);
         let allocations =
-            inputs.iter().map(|input| context.operand_allocation(input, name)).collect::<Result<Vec<_>, _>>()?;
+            inputs.iter().map(|input| context.boundary_allocation(input)).collect::<Result<Vec<_>, _>>()?;
         if allocations.iter().all(Option::is_none) && !body.contains_references_in_closure() {
             return discharge_reference_free_operation(self, context, driver, inputs);
         }
@@ -685,8 +685,9 @@ where
             .iter()
             .zip(&allocations)
             .map(|(input, allocation)| match allocation {
-                Some(allocation) => context.allocation_value(*allocation),
-                None => context.operand_value(input),
+                Some(allocation) => context
+                    .boundary_value(&ReferenceDischargeValue::Reference(context.allocation_reference(*allocation)?)),
+                None => context.boundary_value(input),
             })
             .collect::<Result<Vec<_>, _>>()?;
         let input_types = self
@@ -1317,14 +1318,14 @@ pub fn transpose_primal_shard_map<
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, ProgramError> {
     let operand_linear = inputs.iter().map(PartialValue::is_unknown).collect::<Vec<_>>();
     check_count!("input", operand_linear, operation.input_types.len(), ProgramError);
-    check_count!("input", cotangents.destination_kinds(), inputs.len(), ProgramError);
+    check_count!("input", cotangents.kinds(), inputs.len(), ProgramError);
 
     // A shard_map with no live output cotangents and no live reference operand is a zero linear map, so every operand
     // cotangent is zero. A live reference operand keeps the shard map live, because its accumulated state cotangent
     // flows through the transposed body even when no ordinary output cotangent does.
     if outputs.iter().all(MaybeZero::is_zero)
-        && !cotangents.has_live_reference_state()
-        && !driver.region(0)?.has_observable_transpose_effects()
+        && !cotangents.has_reference_state_destinations()
+        && !driver.region(0)?.has_observable_effects_in_closure()
     {
         return inputs
             .iter()
@@ -1340,7 +1341,7 @@ pub fn transpose_primal_shard_map<
     // reference input's cotangent is its cotangent reference itself and a dead reference input has no cotangent slot;
     // re-wrap it as a transposed shard-map boundary whose shardings are permuted to match.
     let (transposed_operation, transposed_body_program) =
-        transpose_shard_map_body(operation, driver, operand_linear.as_slice(), cotangents.destination_kinds())?;
+        transpose_shard_map_body(operation, driver, operand_linear.as_slice(), cotangents.kinds())?;
 
     // Stage the output cotangents, materializing a typed zero for each structurally zero cotangent, then stage a fresh
     // `shard_map` over the transposed body on `[outputs..., cotangent_references..., known_input_values...]`. Its
@@ -1358,7 +1359,7 @@ pub fn transpose_primal_shard_map<
         operands.push(materialize_transpose_cotangent(context, cotangent, &output_type, inputs)?);
     }
     let mut reference_destinations = cotangents.references().iter();
-    for (index, kind) in cotangents.destination_kinds().iter().enumerate() {
+    for (index, kind) in cotangents.kinds().iter().enumerate() {
         if *kind == CotangentDestinationKind::Reference {
             let reference = reference_destinations.next().unwrap();
             if operation.shard_map.input_replicated_manual_axes(index).is_empty() {
@@ -1432,7 +1433,7 @@ where
 {
     fn transpose<D: TranspositionDriver<V, XlaOperation<V>>>(
         &self,
-        context: &mut TranspositionContext<'_, V, XlaOperation<V>>,
+        context: &mut TranspositionContext<V, XlaOperation<V>>,
         driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, XlaOperation<V>>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>],
@@ -1442,7 +1443,7 @@ where
         check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
         let contributions =
             (|| -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, DifferentiationError> {
-                let cotangents = context.cotangent_destinations(inputs, accumulators)?;
+                let cotangents = context.cotangent_destinations(driver, inputs, accumulators)?;
                 transpose_primal_shard_map(self, context, driver, inputs, outputs, &cotangents)
                     .map_err(DifferentiationError::from)
             })()?;
@@ -1457,8 +1458,8 @@ where
 /// Transposes one tangent shard-map body into the reverse boundary and body consumed by
 /// [`transpose_primal_shard_map`].
 ///
-/// The tangent body's flat program is transposed with [`TranspositionDriver::transpose_program`] under
-/// `input_linearity` and `destination_kinds`, producing a shared program mapping
+/// The tangent body's flat program is transposed with [`TranspositionDriver::transpose_program`] using the input
+/// indices selected by `input_linearity` and their corresponding `destination_kinds`, producing a shared program mapping
 /// `[non_reference_output_cotangents..., cotangent_references..., known_input_values...]` to
 /// `[linear_input_cotangents...]`, where a `Reference`-kind input's cotangent is its cotangent reference forwarded by
 /// identity and an `Ignore`-kind input has no cotangent slot. The transposed boundary permutes and dualizes the
@@ -1487,7 +1488,16 @@ fn transpose_shard_map_body<
 ) -> Result<(ShardMapOperation<V>, Arc<Program<V, XlaOperation<V>, Vec<V>, Vec<V>>>), ProgramError> {
     check_count!("input", input_linearity, operation.input_types.len(), ProgramError);
     check_count!("input", destination_kinds, operation.input_types.len(), ProgramError);
-    let mut transposed_program = driver.transpose_program(driver.region(0)?, input_linearity, destination_kinds)?;
+    // The driver takes destinations only for selected inputs; keep the full masks below to reconstruct shardings
+    // and normalize replicated contributions in the original boundary's input order.
+    let (input_indices, selected_destination_kinds): (Vec<_>, Vec<_>) = input_linearity
+        .iter()
+        .zip(destination_kinds)
+        .enumerate()
+        .filter_map(|(index, (linear, kind))| linear.then_some((index, *kind)))
+        .unzip();
+    let mut transposed_program =
+        driver.transpose_program(driver.region(0)?, &input_indices, &selected_destination_kinds)?;
     let shard_map = operation.shard_map();
     let replicated_destinations = destination_kinds
         .iter()
@@ -1930,9 +1940,10 @@ mod tests {
         CotangentDestinations, DataType, DifferentiableType, DifferentiationError, Dimension, DimensionBounds,
         DimensionType, DimensionVariable, DomainTracingContext, EffectClasses, LogicalMesh, MaybeZero, MeshAxis,
         MeshAxisType, MulOperation, Operation, PartialValue, Placeholder, Program, ProgramBuilder, ProgramError,
-        ReferenceAddUpdateOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSource, ReferenceType,
-        RegionDriver, RegionInterface, RegionRef, Shape, Sharding, ShardingDimension, StagingContext, TracingContext,
-        TransposableOperation, TranspositionContext, TranspositionDriver, TypeError, Typed, ZeroOperation,
+        ReferenceAddUpdateOperation, ReferenceAnalysisError, ReferenceNewOperation, ReferenceReadOperation,
+        ReferenceSource, ReferenceType, RegionDriver, RegionInterface, RegionRef, Shape, Sharding, ShardingDimension,
+        StagingContext, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, TypeError,
+        Typed, ZeroOperation,
     };
 
     use crate::experimental::domains::XlaDomain;
@@ -1964,7 +1975,7 @@ mod tests {
         fn transpose_program(
             &self,
             _region: RegionRef<'_, XlaConstant, XlaOperation>,
-            _input_linearity: &[bool],
+            _input_indices: &[usize],
             _destination_kinds: &[CotangentDestinationKind],
         ) -> Result<Arc<Program<XlaConstant, XlaOperation, Vec<XlaConstant>, Vec<XlaConstant>>>, DifferentiationError>
         {
@@ -2511,7 +2522,7 @@ mod tests {
 
         let mut transposition_context = TranspositionContext::new(context.clone());
         let inputs = [PartialValue::Unknown(ArrayIrType::Array(tangent_type))];
-        let accumulators = transposition_context.input_accumulators(&inputs, &[]).unwrap();
+        let accumulators = transposition_context.cotangent_accumulators(&inputs, &[]).unwrap();
         XlaOperation::<XlaConstant>::ShardMap(Box::new(operation))
             .transpose(
                 &mut transposition_context,
@@ -3055,10 +3066,18 @@ mod tests {
                 .unwrap()
         };
         let program = shard_map_program(operation, capturing_body).unwrap();
-        assert!(matches!(
-            program.discharge_references(0),
-            Err(ProgramError::MalformedProgram(message)) if message.contains("reference-typed constant"),
-        ));
+        let body = program.entry_region_ref().instructions()[0].regions()[0];
+        let captured = program.region_ref(body).unwrap().instructions()[0].inputs()[0];
+        assert_eq!(
+            program.discharge_references(0).unwrap_err(),
+            ReferenceAnalysisError::InvalidReferenceCapture {
+                region: body,
+                atom: captured,
+                capture_index: 0,
+                capture_count: 0,
+            }
+            .into(),
+        );
     }
 
     /// A reference output forwards a reference input by identity under an equal sharding; the caller keeps the handle

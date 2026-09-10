@@ -2687,6 +2687,7 @@ mod tests {
             .unwrap();
 
         let mut scan_body_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        scan_body_builder.add_input(ArrayType::scalar(DataType::I64));
         let scan_carry = scan_body_builder.add_input(ArrayType::scalar(DataType::F64));
         let scan_element = scan_body_builder.add_input(ArrayType::scalar(DataType::F64));
         let while_condition_region = scan_body_builder.import_program(while_condition);
@@ -2702,7 +2703,7 @@ mod tests {
         let scan_body = scan_body_builder
             .build::<Vec<Array>, Vec<Array>>(
                 vec![next_carry, scan_element],
-                vec![Placeholder, Placeholder],
+                vec![Placeholder; 3],
                 vec![Placeholder, Placeholder],
             )
             .unwrap();

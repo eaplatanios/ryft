@@ -334,11 +334,12 @@ where
         // Build the scan body: one application of this same operation mapping a single per-item state to that
         // item's advanced state and bits.
         let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
+        builder.add_input(ArrayType::scalar(DataType::I64));
         let state_input = builder.add_input(self.algorithm.state_type());
         let outputs = builder.add_instruction(self.clone(), Vec::new(), vec![state_input], None)?.to_vec();
         let body = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
             outputs,
-            vec![Placeholder],
+            vec![Placeholder; 2],
             vec![Placeholder, Placeholder],
         )?;
 
@@ -393,6 +394,7 @@ where
 
         let state = driver.align_batch_axis(context, state.clone(), Axis::from(0))?;
         let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
+        builder.add_input(ArrayType::scalar(DataType::I64).into());
         let extent_inputs = output_extents
             .iter()
             .map(|extent| builder.add_input(extent.unbatched_type().clone()))
@@ -403,7 +405,7 @@ where
         let body_outputs = extent_inputs.iter().copied().chain(random_outputs).collect::<Vec<_>>();
         let body = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
             body_outputs,
-            vec![Placeholder; output_extents.len() + 1],
+            vec![Placeholder; output_extents.len() + 2],
             vec![Placeholder; output_extents.len() + 2],
         )?;
 
@@ -1063,9 +1065,9 @@ mod tests {
                 lambda %0:u64[3, 2] .
                 let %1:u64[3, 2], %2:u32[3, 4] = scan [carry_count=0, length=3, reverse=false] %0 [
                     body={
-                        lambda %0:u64[2] .
-                        let %1:u64[2], %2:u32[4] = rng_bit_generator [algorithm=three_fry, output_type=u32[4]] %0
-                        in (%1, %2)
+                        lambda %0:i64[], %1:u64[2] .
+                        let %2:u64[2], %3:u32[4] = rng_bit_generator [algorithm=three_fry, output_type=u32[4]] %1
+                        in (%2, %3)
                     },
                 ]
                 in (%1, %2)

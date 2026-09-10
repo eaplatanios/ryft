@@ -164,10 +164,9 @@ pub use references::{
     ReferenceObservation, ReferenceRegionInputBinding, ReferenceReplacementPreparation,
     ReferenceReplacementTransaction, ReferenceRoot, ReferenceSource, ReferenceTransitiveAccess, ReferenceType,
     ReferenceTypeRefinements, ReferenceView, ReferenceViewAnalysis, ReferenceViewAnalysisError, ReferenceViewOperation,
-    ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep, ReferenceViewSymbol, ReferenceViewSymbolBinding,
-    ReferenceViewValidationError, TakenReferenceGuard, ValidatedPendingReplacementTransaction,
-    batch_reference_view_operation, discharge_local_reference_operation, discharge_positional_region_operation,
-    discharge_reference_free_operation, validate_reference_boundary,
+    ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError, TakenReferenceGuard,
+    ValidatedPendingReplacementTransaction, batch_reference_view_operation, discharge_local_reference_operation,
+    discharge_positional_region_operation, discharge_reference_free_operation, validate_reference_boundary,
 };
 pub use regions::{
     BindingRegionDriver, CalleeRegionDriver, DestinationRegionMapping, EmptyRegionDriver, InputRegionProvenance,

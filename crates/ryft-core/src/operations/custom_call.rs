@@ -7,8 +7,8 @@ use std::marker::PhantomData;
 // TODO(eaplatanios): Why this import?
 use crate::arrays::{
     ArrayBatch, ArrayBatchingPolicy, ArrayExtentBatchingPolicy, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType,
-    ArrayType, Dimension, DimensionType, DimensionValue, DimensionVariable, Layout, RaggedAxis, ShardingDimension,
-    TiledLayout,
+    ArrayType, DataType, Dimension, DimensionType, DimensionValue, DimensionVariable, Layout, RaggedAxis,
+    ShardingDimension, TiledLayout,
 };
 use crate::axes::Axis;
 use crate::batching::{
@@ -1586,9 +1586,10 @@ where
                     }
                 }
 
-                // Build the scan body: one unbatched application of this same call over `[carries..., slices...]`,
+                // Build the scan body: one unbatched application of this same call over `[index, carries..., slices...]`,
                 // returning the unchanged carries followed by that item's outputs.
                 let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
+                builder.add_input(ArrayType::scalar(DataType::I64));
                 let mut operands = vec![None; inputs.len()];
                 let carry_inputs = carry_indices
                     .iter()
@@ -1612,7 +1613,7 @@ where
                 let body_outputs = carry_inputs.iter().copied().chain(outputs).collect::<Vec<_>>();
                 let body = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
                     body_outputs,
-                    vec![Placeholder; inputs.len()],
+                    vec![Placeholder; 1 + inputs.len()],
                     vec![Placeholder; carry_inputs.len() + self.output_types.len()],
                 )?;
 
@@ -1766,6 +1767,7 @@ where
                 // The replicated extents lead the carries so the body's call can reuse them verbatim as its own
                 // trailing extent operands, exactly as the unbatched call declared them.
                 let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
+                builder.add_input(ArrayType::scalar(DataType::I64).into());
                 let mut carry_inputs =
                     extents.iter().map(|extent| builder.add_input(extent.unbatched_type().clone())).collect::<Vec<_>>();
                 let mut operands = vec![None; arrays.len()];
@@ -1796,7 +1798,7 @@ where
                 let body_outputs = carry_inputs.iter().copied().chain(outputs).collect::<Vec<_>>();
                 let body = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
                     body_outputs,
-                    vec![Placeholder; carry_inputs.len() + stacked_indices.len()],
+                    vec![Placeholder; 1 + carry_inputs.len() + stacked_indices.len()],
                     vec![Placeholder; carry_inputs.len() + self.output_types.len()],
                 )?;
 
@@ -3013,14 +3015,14 @@ mod tests {
                         lambda %0:f32[2, 4], %1:i32[2] .
                         let %2:f32[2, 4] = scan [carry_count=0, length=2, reverse=false] %0 %1 [
                             body={
-                                lambda %0:f32[4], %1:i32[] .
-                                let %2:f32[4] = custom_call [
+                                lambda %0:i64[], %1:f32[4], %2:i32[] .
+                                let %3:f32[4] = custom_call [
                                     target=ryft.test.ragged,
                                     batching=sequential,
                                     ragged_contract={inputs=[data:operand(0)@0<=operand(1):length], \
                          outputs=[preserve(data)@0], ragged_discharged=true},
-                                ] %0 %1
-                                in (%2)
+                                ] %1 %2
+                                in (%3)
                             },
                         ]
                         in (%2)
@@ -3149,10 +3151,10 @@ mod tests {
                 lambda %0:f32[3, 2], %1:f32[2] .
                 let %2:f32[2], %3:f32[3, 2] = scan [carry_count=1, length=3, reverse=false] %1 %0 [
                     body={
-                        lambda %0:f32[2], %1:f32[2] .
-                        let %2:f32[2] = custom_call [target=ryft.test.add_one, has_side_effect=true, \
-                 batching=sequential] %1 %0
-                        in (%0, %2)
+                        lambda %0:i64[], %1:f32[2], %2:f32[2] .
+                        let %3:f32[2] = custom_call [target=ryft.test.add_one, has_side_effect=true, \
+                 batching=sequential] %2 %1
+                        in (%1, %3)
                     },
                 ]
                 in (%3)
@@ -3184,9 +3186,9 @@ mod tests {
                 lambda %0:f32[4, 2] .
                 let %1:f32[4, 2] = scan [carry_count=0, length=4, reverse=false, unroll=2] %0 [
                     body={
-                        lambda %0:f32[2] .
-                        let %1:f32[2] = custom_call [target=ryft.test.add_one, batching=sequential(unroll=2)] %0
-                        in (%1)
+                        lambda %0:i64[], %1:f32[2] .
+                        let %2:f32[2] = custom_call [target=ryft.test.add_one, batching=sequential(unroll=2)] %1
+                        in (%2)
                     },
                 ]
                 in (%1)
@@ -3755,9 +3757,9 @@ mod tests {
                 let %3:dimension<rows ∈ [1, 9)>, %4:f32[batch, rows] = scan [carry_count=1, length=batch, \
                  reverse=false] %2 %1 %0 [
                     body={
-                        lambda %0:dimension<rows ∈ [1, 9)>, %1:f32[2] .
-                        let %2:f32[rows] = custom_call [target=ryft.test.dynamic, batching=sequential] %1 %0
-                        in (%0, %2)
+                        lambda %0:i64[], %1:dimension<rows ∈ [1, 9)>, %2:f32[2] .
+                        let %3:f32[rows] = custom_call [target=ryft.test.dynamic, batching=sequential] %2 %1
+                        in (%1, %3)
                     },
                 ]
                 in (%4)

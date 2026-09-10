@@ -1854,17 +1854,18 @@ mod tests {
     use ryft_core::operations::sort::{ArgMax, TopK};
     use ryft_core::{
         Add, AddOperation, Array as CpuArray, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference,
-        ArrayReferenceViewTransform, ArrayType, Atan2, Broadcast, CalleeRegionDriver, CaptureReference, Compare,
-        ComparisonDirection, Context, Cos, CotangentDestinationKind, CumulativeLogSumExp, CumulativeSum, DataType,
-        Device, DeviceMesh, DifferentiableType, Differentiate, Dimension, DimensionBounds, DimensionVariable, Div,
-        DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice, DynamicUpdateSlice, EagerContext,
-        Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogSumExp, LogicalMesh, Logistic, MeshAxis,
-        MeshAxisType, Mul, MulOperation, OneLike, Placeholder, ProgramBuilder, ProgramError, ProjectedValue, Reduce,
-        ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceCompletion,
-        ReferenceCompletionBackend, ReferenceError, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
-        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceType, Reshape, ScanOperation, Select,
-        Shape, Sharding, ShardingDimension, Sin, StopGradient, StopGradientOperation, Sub, Tanh, Trace, Typed, Value,
-        ValueProjection, ViewIndex, WhileOperation, ZeroLike, differentiate_at,
+        ArrayReferenceViewIndex, ArrayReferenceViewTransform, ArrayType, Atan2, Broadcast, CalleeRegionDriver,
+        CaptureReference, Compare, ComparisonDirection, Context, Cos, CotangentDestinationKind, CumulativeLogSumExp,
+        CumulativeSum, DataType, Device, DeviceMesh, DifferentiableType, Differentiate, Dimension, DimensionBounds,
+        DimensionVariable, Div, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice,
+        DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogSumExp,
+        LogicalMesh, Logistic, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike, Placeholder, ProgramBuilder,
+        ProgramError, ProjectedValue, Reduce, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
+        ReferenceCompletion, ReferenceCompletionBackend, ReferenceDynamicIndexOperation, ReferenceError,
+        ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
+        ReferenceReadOperation, ReferenceType, Reshape, ScanOperation, Select, Shape, Sharding, ShardingDimension, Sin,
+        StopGradient, StopGradientOperation, Sub, Tanh, Trace, Typed, Value, ValueProjection, WhileOperation, ZeroLike,
+        differentiate_at,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
 
@@ -2293,79 +2294,119 @@ mod tests {
     }
 
     #[test]
-    fn test_public_jit_scan_captures_its_iteration_reference_view_in_nested_call() {
+    fn test_public_jit_scan_indexes_its_captured_reference_root_in_nested_call() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
         let mesh = single_device_mesh(&client);
         let domain = XlaDomain::new(&client);
-        let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(3)]));
-        let scalar_type = ArrayType::scalar(DataType::F32);
-        let reference_type = ArrayIrType::Reference(ReferenceType::new(scalar_type));
+        for (length, nested) in [(3, false), (3, true), (256, false), (256, true)] {
+            let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(length)]));
+            let reference_type = ArrayIrType::Reference(ReferenceType::new(input_type.clone()));
 
-        // The callee captures the scalar view supplied to this iteration, doubles its contents, and returns the
-        // updated value through capture 0 rather than its input atom. The JIT call's explicit capture prefix binds
-        // that constant to the same local view, not another view of the complete stacked root.
-        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
-        builder.add_input(reference_type.clone());
-        let reference = builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, reference_type.clone())));
-        let current =
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-        builder
-            .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, current], None)
-            .unwrap();
-        let updated =
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-        let callee = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![updated], vec![Placeholder], vec![Placeholder])
-            .unwrap();
-        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
-        let reference = builder.add_input(reference_type);
-        let callee = builder.import_region(callee.entry_region_ref());
-        let outputs = builder
-            .add_instruction(XlaOperation::JitCall(JitCallOperation::new(1)), vec![callee], vec![reference], None)
-            .unwrap()
-            .to_vec();
-        let body = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder], vec![Placeholder])
-            .unwrap();
-
-        // Discharge the source directly before compilation can lift captured constants into ordinary operands.
-        let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
-        let input = builder.add_input(input_type.clone().into());
-        let reference =
-            builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
-        let body_region = builder.import_region(body.entry_region_ref());
-        let outputs = builder
-            .add_instruction(XlaOperation::Scan(ScanOperation::new(0, 3)), vec![body_region], vec![reference], None)
-            .unwrap()[0];
-        let frozen =
-            builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
-        let source = builder
-            .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![outputs, frozen], vec![Placeholder], vec![Placeholder; 2])
-            .unwrap();
-        let program = source.discharge_references(0).unwrap().into_program_without_external_references().unwrap();
-
-        let compiled: CompiledXlaFunction<'_, ArrayType, (ArrayType, ArrayType)> = compile(
-            |input| {
-                let input = input.into_value();
-                let outputs = program.interpret_in_context(input.context(), vec![input.clone()]).unwrap();
-                let mut outputs = outputs.into_iter();
-                (
-                    ValueProjection::<ArrayType>::into_projected(outputs.next().unwrap()).unwrap(),
-                    ValueProjection::<ArrayType>::into_projected(outputs.next().unwrap()).unwrap(),
-                )
-            },
-            input_type.clone(),
-            &domain,
-            mesh.clone(),
-        )
-        .unwrap();
-        let input =
-            Array::from_host_buffer(&client, input_type, mesh, values_to_bytes::<f32>(&[1.0, 2.0, 3.0]).as_slice())
+            // The callee captures the complete root and receives the scan index as an ordinary input. It forms its
+            // scalar view locally, so no view crosses the call boundary. Capture 0 must still resolve to that same root
+            // when reference discharge runs before compilation lifts the captured constant into an ordinary operand.
+            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            builder.add_input(reference_type.clone());
+            let index = builder.add_input(ArrayType::scalar(DataType::I64).into());
+            let root = builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, reference_type.clone())));
+            let reference = builder
+                .add_instruction(ReferenceDynamicIndexOperation::new(0), Vec::new(), vec![root, index], None)
+                .unwrap()[0];
+            let current =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            builder
+                .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, current], None)
                 .unwrap();
-        let (outputs, frozen) = domain.interpret(&compiled.executable_function(), input).unwrap();
-        assert_eq!(read_f32_array(&client, &outputs), vec![2.0, 4.0, 6.0]);
-        assert_eq!(read_f32_array(&client, &frozen), vec![2.0, 4.0, 6.0]);
+            let updated =
+                builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            let callee = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![updated], vec![Placeholder; 2], vec![Placeholder])
+                .unwrap();
+            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let index = builder.add_input(ArrayType::scalar(DataType::I64).into());
+            let root = builder.add_input(ReferenceType::new(input_type.clone()).into());
+            // Compare selection inside the call with the direct slice-sized discharge path.
+            let outputs = if nested {
+                let callee = builder.import_region(callee.entry_region_ref());
+                builder
+                    .add_instruction(
+                        XlaOperation::JitCall(JitCallOperation::new(1)),
+                        vec![callee],
+                        vec![root, index],
+                        None,
+                    )
+                    .unwrap()
+                    .to_vec()
+            } else {
+                let reference = builder
+                    .add_instruction(ReferenceDynamicIndexOperation::new(0), Vec::new(), vec![root, index], None)
+                    .unwrap()[0];
+                let current = builder
+                    .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+                    .unwrap()[0];
+                builder
+                    .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, current], None)
+                    .unwrap();
+                builder
+                    .add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![reference], None)
+                    .unwrap()
+                    .to_vec()
+            };
+            let body = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(outputs, vec![Placeholder; 2], vec![Placeholder])
+                .unwrap();
+
+            // Discharge the source directly before compilation can lift captured constants into ordinary operands.
+            let mut builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+            let input = builder.add_input(input_type.clone().into());
+            let reference =
+                builder.add_instruction(ReferenceNewOperation::new(), Vec::new(), vec![input], None).unwrap()[0];
+            let body_region = builder.import_region(body.entry_region_ref());
+            let outputs = builder
+                .add_instruction(
+                    XlaOperation::Scan(ScanOperation::new(0, length)),
+                    vec![body_region],
+                    vec![reference],
+                    None,
+                )
+                .unwrap()[0];
+            let frozen =
+                builder.add_instruction(ReferenceFreezeOperation::new(), Vec::new(), vec![reference], None).unwrap()[0];
+            let source = builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![outputs, frozen],
+                    vec![Placeholder],
+                    vec![Placeholder; 2],
+                )
+                .unwrap();
+            let program = source.discharge_references(0).unwrap().into_program_without_external_references().unwrap();
+
+            let compiled: CompiledXlaFunction<'_, ArrayType, (ArrayType, ArrayType)> = compile(
+                |input| {
+                    let input = input.into_value();
+                    let outputs = program.interpret_in_context(input.context(), vec![input.clone()]).unwrap();
+                    let mut outputs = outputs.into_iter();
+                    (
+                        ValueProjection::<ArrayType>::into_projected(outputs.next().unwrap()).unwrap(),
+                        ValueProjection::<ArrayType>::into_projected(outputs.next().unwrap()).unwrap(),
+                    )
+                },
+                input_type.clone(),
+                &domain,
+                mesh.clone(),
+            )
+            .unwrap();
+            // A larger root exercises repeated updates through the same compiled loop and nested call.
+            let values = (1..=length).map(|value| value as f32).collect::<Vec<_>>();
+            let expected = values.iter().map(|value| value * 2.0).collect::<Vec<_>>();
+            let input =
+                Array::from_host_buffer(&client, input_type, mesh.clone(), values_to_bytes::<f32>(&values).as_slice())
+                    .unwrap();
+            let (outputs, frozen) = domain.interpret(&compiled.executable_function(), input).unwrap();
+            assert_eq!(read_f32_array(&client, &outputs), expected);
+            assert_eq!(read_f32_array(&client, &frozen), expected);
+        }
     }
 
     #[test]
@@ -2922,7 +2963,7 @@ mod tests {
                 .unwrap(),
         );
         let view = root
-            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(1) })
+            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) })
             .unwrap();
         assert!(matches!(
             compiled.call_statefully(&domain, ArrayIrValue::Reference(view)),

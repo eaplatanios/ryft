@@ -269,11 +269,11 @@ impl KernelReferenceSummary {
     }
 
     /// Returns the [`ArrayReferenceView`] of the reference-typed `value`, or [`None`] when `value` is not a
-    /// reference-typed value of the body closure. Refer to the documentation of [`ArrayReferenceAnalysis::view`] for
+    /// reference-typed value of the body closure. Refer to the documentation of [`ArrayReferenceAnalysis::path`] for
     /// more information.
     #[inline]
     pub fn view(&self, value: ValueId) -> Option<&ArrayReferenceView> {
-        self.analysis.view(value)
+        self.analysis.path(value)
     }
 
     /// Returns the lowering of the swap at `instruction`, or [`None`] when that instruction is not a swap of the body
@@ -329,7 +329,7 @@ pub fn validate_kernel_body(
                 parameters.push(Some(KernelParameterSummary {
                     root,
                     access,
-                    modes: generic.access_modes(root).collect(),
+                    modes: generic.access_modes_for(root).collect(),
                     mutated: generic.is_mutated(root),
                 }));
             }
@@ -354,7 +354,7 @@ pub fn validate_kernel_body(
     }
 
     let mut swap_lowerings = BTreeMap::new();
-    for access in generic.accesses() {
+    for access in generic.access_modes() {
         let instruction = access.instruction();
         // The generic analysis resolved every attached region of the closure, so the lookup cannot fail here.
         let containing = region.with_id(instruction.region()).unwrap();
@@ -433,10 +433,11 @@ fn entry_roots(
 mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayIrType, ArrayReferenceViewTransform, ArraySliceAxis, CaptureReference, ConditionOperation, DataType,
-        Placeholder, ReferenceAddUpdateOperation, ReferenceAnalysisError, ReferenceFreezeOperation,
-        ReferenceIndexOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSliceOperation,
-        ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation, ViewIndex,
+        ArrayIrType, ArrayReferenceViewIndex, ArrayReferenceViewTransform, ArraySliceAxis, CaptureReference,
+        ConditionOperation, DataType, Placeholder, ReferenceAddUpdateOperation, ReferenceAliasPosition,
+        ReferenceAnalysisError, ReferenceFreezeOperation, ReferenceIndexOperation, ReferenceNewOperation,
+        ReferenceReadOperation, ReferenceSliceOperation, ReferenceSource, ReferenceSwapOperation, ReferenceType,
+        ReferenceWriteOperation,
     };
 
     use crate::experimental::lowering::{LoweringError, lower_mlir_module_for_program};
@@ -540,9 +541,10 @@ mod tests {
             KernelValidationError::from(ArrayReferenceAnalysisError::MissingView {
                 operation: "view",
                 instruction: id(0, 1),
+                position: ReferenceAliasPosition::Output(0),
             })
             .to_string(),
-            "operation `view` at ^0[1] derives a reference view but exposes no view transform",
+            "operation `view` at ^0[1] declares a reference view at output 0 but describes no view",
         );
         assert_eq!(
             KernelValidationError::ParameterCountMismatch { expected: 3, actual: 2 }.to_string(),
@@ -698,12 +700,12 @@ mod tests {
         let summary = validate_kernel_body(program.entry_region_ref(), &contract).unwrap();
         assert_eq!(summary.view(value(0, 0)), Some(&ArrayReferenceView::root()));
         assert_eq!(
-            summary.view(value(0, 4)).map(|view| view.transforms().cloned().collect::<Vec<_>>()),
+            summary.view(value(0, 4)).map(|view| view.views().cloned().collect::<Vec<_>>()),
             Some(vec![ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(0, 1, 1)] }]),
         );
         assert_eq!(
-            summary.view(value(0, 6)).map(|view| view.transforms().cloned().collect::<Vec<_>>()),
-            Some(vec![ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Static(0) }]),
+            summary.view(value(0, 6)).map(|view| view.views().cloned().collect::<Vec<_>>()),
+            Some(vec![ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(0) }]),
         );
         assert_eq!(summary.view(value(0, 3)), None);
         assert_eq!(summary.view(value(0, 5)), None);
@@ -848,7 +850,7 @@ mod tests {
         assert_eq!(
             validate_kernel_body(program.entry_region_ref(), &contract).err(),
             Some(KernelValidationError::Analysis(ArrayReferenceAnalysisError::Analysis(
-                ReferenceAnalysisError::ConsumeExternal {
+                ReferenceAnalysisError::ExternalReferenceConsumption {
                     operation: "reference_freeze",
                     instruction: id(0, 0),
                     root: input_root(0, 0),
@@ -873,7 +875,7 @@ mod tests {
         assert_eq!(
             validate_kernel_body(program.entry_region_ref(), &contract).err(),
             Some(KernelValidationError::Analysis(ArrayReferenceAnalysisError::Analysis(
-                ReferenceAnalysisError::CaptureOutOfScope {
+                ReferenceAnalysisError::InvalidReferenceCapture {
                     region: RegionId::new(0),
                     atom: AtomId::new(0),
                     capture_index: 0,

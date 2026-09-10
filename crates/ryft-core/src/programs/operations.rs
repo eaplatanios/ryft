@@ -527,21 +527,18 @@ pub trait Operation: Clone {
         region_interfaces: &[RegionInterface<Self::Type>],
     ) -> Result<Vec<Self::Type>, TypeError>;
 
-    /// Returns how input `input_index` of the attached [`Region`](crate::Region) at `region_index` originates from an
-    /// input of this operation. [`InputRegionProvenance::Forwarded`] means the region receives the complete operation
-    /// input unchanged. [`InputRegionProvenance::View`] means the operation derives a view of that input for the
-    /// region, such as the per-iteration slice of a stacked `scan` input. The `input_index` stored in either variant
-    /// names the source in this operation's input list. The function argument of the same name identifies the
-    /// destination in the attached region's input list.
+    /// Returns the operation input supplying input `input_index` of the attached [`Region`](crate::Region) at
+    /// `region_index`. The returned [`InputRegionProvenance`] identifies the source in this operation's input list.
+    /// This describes dataflow correspondence rather than equal runtime values: for example, a scan supplies a slice
+    /// of a stacked array. Reference inputs preserve complete handle identity and derive any views inside the region.
     ///
     /// This is the input side counterpart of [`Self::output_region_provenance`]. Together they describe value flow
     /// across an operation's attached region boundary. For example, for a condition with inputs `(predicate, value)`,
     /// branch input `0` comes from instruction input `1`, while instruction output `0` may come from output `0` of
     /// either branch. Analyses use the input relation to carry identities and canonical resource roots into nested
-    /// regions without guessing from equal types or matching positions. For a reference view, the operation family
-    /// describes the view itself through
-    /// [`ReferenceViewOperation::region_input_view`](crate::ReferenceViewOperation::region_input_view).
-    /// The default is correct when no region input originates from an operation input.
+    /// regions without guessing from equal types or matching positions. Reference views are constructed explicitly
+    /// inside a region from complete reference roots. The default is correct when no region input originates from
+    /// an operation input.
     #[inline]
     fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
         let _ = (region_index, input_index);
@@ -1138,7 +1135,7 @@ mod tests {
         }
 
         fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
-            (region_index == 0).then_some(InputRegionProvenance::Forwarded { input_index: input_index + 1 })
+            (region_index == 0).then_some(InputRegionProvenance { input_index: input_index + 1 })
         }
 
         fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
@@ -1300,7 +1297,7 @@ mod tests {
             operation.infer_region_input_types(&[DataType::F32], &region_interfaces),
             Ok(vec![Some(vec![DataType::F32])]),
         );
-        assert_eq!(operation.input_region_provenance(0, 2), Some(InputRegionProvenance::Forwarded { input_index: 3 }),);
+        assert_eq!(operation.input_region_provenance(0, 2), Some(InputRegionProvenance { input_index: 3 }),);
         assert_eq!(operation.input_region_provenance(1, 2), None);
         assert_eq!(
             operation.infer_output_types(&[DataType::F32], &region_interfaces),

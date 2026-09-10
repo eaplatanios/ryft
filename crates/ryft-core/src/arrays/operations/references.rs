@@ -1,8 +1,9 @@
 //! Array-owned reference views and eager/staging implementations of generic reference capabilities.
 //!
-//! Indexing and slicing remain here because they require [`ArrayReferenceViewTransform`] geometry. The generic
-//! allocation, read, replacement, additive-update, and freeze payloads live in [`crate::programs::references`]; this
-//! module specializes them to [`ArrayIrType`] and implements their capabilities for array values and tracers.
+//! Indexing and slicing remain here because their [`ArrayReferenceViewTransform`] descriptions depend on array
+//! axes and shapes. The generic allocation, read, replacement, additive-update, and freeze payloads live in
+//! [`crate::programs::references`]; this module specializes them to [`ArrayIrType`] and implements their capabilities
+//! for array values and tracers.
 //!
 //! Staged and composite value calls validate the complete operand-type relationship before dispatching the operation.
 //! Their type diagnostics can therefore precede any eager reference-state error. Once an eager reference or derived
@@ -44,10 +45,10 @@ use crate::operations::{
 use crate::parameters::Parameter;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, OperationProvider, ProgramError, ProjectedValue,
-    ReferenceAlias, ReferenceAliasKind, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceType, ReferenceView, ReferenceViewOperation,
-    ReferenceViewSymbol, ReferenceViewValidationError, RegionInterface, TypeError, Typed, Value, ValueProjection,
+    Concretizable, EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, OperationProvider, ProgramError,
+    ProjectedValue, ReferenceAlias, ReferenceAliasKind, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceType, ReferenceView,
+    ReferenceViewOperation, ReferenceViewValidationError, RegionInterface, TypeError, Typed, Value, ValueProjection,
     batch_reference_view_operation,
 };
 use crate::tracing::{Tracer, TracingContext};
@@ -232,6 +233,185 @@ impl<C: Domain<Type = ArrayIrType, Value: ReferenceIndex<C::Value>>> Interpretab
     }
 }
 
+/// Canonical operation name for [`ReferenceDynamicIndexOperation`].
+pub const REFERENCE_DYNAMIC_INDEX_OPERATION_NAME: &str = "reference_dynamic_index";
+
+/// Pure reference view selecting a clamped scalar integer index and removing the selected axis.
+///
+/// The reference is input zero and the scalar integer index is input one. For a nonempty axis of length `n`, the
+/// selected index is clamped to `0..=n - 1`; unsigned indices retain their full value until clamping. The resulting
+/// reference aliases the same allocation, and constructing the view does not access that allocation's contents.
+///
+/// Type inference permits an empty selected axis so that an unreachable zero-trip scan body remains well typed.
+/// Executing a selection on an empty axis fails because there is no element to select.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
+pub struct ReferenceDynamicIndexOperation {
+    /// Axis selected in the input reference.
+    axis: usize,
+}
+
+impl ReferenceDynamicIndexOperation {
+    /// Creates a new dynamic reference index operation selecting `axis`.
+    pub const fn new(axis: usize) -> Self {
+        Self { axis }
+    }
+
+    /// Returns the allocation-preserving view, whose index is supplied by input one.
+    pub const fn transform(&self) -> ArrayReferenceViewTransform {
+        ArrayReferenceViewTransform::Index { axis: self.axis, index: ArrayReferenceViewIndex::Symbolic(1) }
+    }
+}
+
+impl Display for ReferenceDynamicIndexOperation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.render(formatter, 0)
+    }
+}
+
+impl Operation for ReferenceDynamicIndexOperation {
+    type Type = ArrayIrType;
+
+    fn name(&self) -> &'static str {
+        REFERENCE_DYNAMIC_INDEX_OPERATION_NAME
+    }
+
+    fn infer_output_types(
+        &self,
+        input_types: &[ArrayIrType],
+        region_interfaces: &[RegionInterface<ArrayIrType>],
+    ) -> Result<Vec<ArrayIrType>, TypeError> {
+        check_count!("input", input_types, 2, TypeError);
+        check_count!("region", region_interfaces, 0, TypeError);
+        let reference = <&ReferenceType<ArrayType>>::try_from(&input_types[0])?;
+        let index = <&ArrayType>::try_from(&input_types[1])?;
+        if index.rank() != 0 || !index.data_type().is_integer() {
+            return Err(TypeError::invalid(format!(
+                "`reference_dynamic_index` requires a scalar integer index but received `{index}`"
+            )));
+        }
+        Ok(vec![ReferenceType::new(self.transform().output_type(reference.referent())?).into()])
+    }
+
+    fn effects(&self) -> Cow<'_, Effects> {
+        Cow::Borrowed(&REFERENCE_VIEW_OPERATION_EFFECTS)
+    }
+
+    fn render(&self, formatter: &mut std::fmt::Formatter<'_>, indentation: usize) -> std::fmt::Result {
+        OperationFormatter::new(formatter, indentation, self.name())?
+            .bracketed(|operation| operation.field("axis", self.axis))
+    }
+}
+
+impl<C, P> ReferenceDischargeableOperation<C, P> for ReferenceDynamicIndexOperation
+where
+    C: Context<Type = ArrayIrType, Operation: From<ReferenceDynamicIndexOperation>>,
+    P: ReferenceDischargePolicy<C, Referent = ArrayType, Alias = ArrayReferenceView<C::Value>>,
+{
+    fn discharge_references<D: ReferenceDischargeDriver<C, P>>(
+        &self,
+        context: &ReferenceDischargeContext<C, P>,
+        _driver: &D,
+        inputs: &[ReferenceDischargeValue<C, P>],
+    ) -> Result<Vec<ReferenceDischargeValue<C, P>>, ProgramError> {
+        discharge_reference_view(self, self.transform(), context, inputs)
+    }
+}
+
+impl<C: Domain<Type = ArrayIrType, Value: ReferenceDynamicIndex>> InterpretableOperation<C>
+    for ReferenceDynamicIndexOperation
+{
+    fn interpret<D: InterpretationDriver<C>>(
+        &self,
+        _context: &C,
+        _driver: &D,
+        inputs: &[C::Value],
+    ) -> Result<Vec<C::Value>, ProgramError> {
+        check_count!("input", inputs, 2, ProgramError);
+        Ok(vec![inputs[0].reference_dynamic_index(self.axis, &inputs[1])?])
+    }
+}
+
+impl<C: Context<Type = ArrayIrType, Operation: From<ReferenceDynamicIndexOperation>>> PartiallyEvaluatableOperation<C>
+    for ReferenceDynamicIndexOperation
+{
+}
+
+impl<
+    C: Context<Type = ArrayIrType, Operation: ReferenceViewOperation + From<ReferenceDynamicIndexOperation>>,
+    P: BatchingPolicy<C>,
+> BatchableOperation<C, P> for ReferenceDynamicIndexOperation
+{
+    fn batch<D: BatchingDriver<C, P>>(
+        &self,
+        context: &BatchingContext<C, P>,
+        _driver: &D,
+        inputs: &[P::Batch],
+    ) -> Result<BatchedOutputs<C, P>, BatchingError> {
+        batch_reference_view_operation(self, context, inputs)
+    }
+}
+
+impl<C: Context<Type = ArrayIrType, Value: ReferenceDynamicIndex>> DifferentiableOperation<C>
+    for ReferenceDynamicIndexOperation
+{
+    fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
+        &self,
+        context: &DifferentiationContext<C, P>,
+        _driver: &D,
+        inputs: &[DifferentiationDual<C::Value>],
+    ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError> {
+        check_count!("input", inputs, 2, ProgramError);
+        let primal = inputs[0].primal().reference_dynamic_index(self.axis, inputs[1].primal())?;
+        Ok(vec![forwarded_tangent(&inputs[0], primal, |reference| {
+            reference.reference_dynamic_index(self.axis, &context.primal_to_tangent(inputs[1].primal().clone())?)
+        })?])
+    }
+}
+
+/// Derives a reference view using a scalar integer index supplied as a value.
+pub trait ReferenceDynamicIndex<Index = Self, Output = Self>: Sized {
+    /// Returns a reference selecting one element on `axis`, removing that axis and sharing the original allocation.
+    /// The index is clamped to the valid range, as for [`DynamicSlice`](crate::operations::DynamicSlice). Executing a
+    /// selection on an empty axis fails; a staged selection can still appear in an unexecuted zero-trip scan body.
+    ///
+    /// # Parameters
+    ///
+    ///   - `axis`: Axis of the current reference's referent to select and remove.
+    ///   - `index`: Scalar integer value selecting the element. Negative values select the first element and values
+    ///     beyond the axis length select the last. Eager reference handles read this value through
+    ///     [`Concretizable<i128>`], while staging retains it as an ordinary operand.
+    fn reference_dynamic_index(&self, axis: usize, index: &Index) -> Result<Output, ProgramError>;
+}
+
+impl<V: Value<Type = ArrayIrType>> ReferenceDynamicIndex for V
+where
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<ReferenceDynamicIndexOperation>,
+{
+    fn reference_dynamic_index(&self, axis: usize, index: &Self) -> Result<Self, ProgramError> {
+        Ok(self
+            .dispatch_domain()
+            .bind(ReferenceDynamicIndexOperation::new(axis), Vec::new(), &[self.clone(), index.clone()])?
+            .remove(0))
+    }
+}
+
+impl<V> ReferenceDynamicIndex<V, <V as ValueProjection<ReferenceType<ArrayType>>>::Projected>
+    for ProjectedValue<ReferenceType<ArrayType>, V>
+where
+    V: Value<Type = ArrayIrType> + ValueProjection<ReferenceType<ArrayType>>,
+    V::DispatchDomain: Context<Type = ArrayIrType>,
+    <V::DispatchDomain as Domain>::Operation: From<ReferenceDynamicIndexOperation>,
+{
+    fn reference_dynamic_index(
+        &self,
+        axis: usize,
+        index: &V,
+    ) -> Result<<V as ValueProjection<ReferenceType<ArrayType>>>::Projected, ProgramError> {
+        self.value().reference_dynamic_index(axis, index)?.into_projected().map_err(Into::into)
+    }
+}
+
 /// Pure reference-to-reference operation selecting one static range on every axis.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct ReferenceSliceOperation {
@@ -322,7 +502,7 @@ impl<C: Domain<Type = ArrayIrType, Value: ReferenceSlice<C::Value>>> Interpretab
 /// it validates the composed referent type with exactly the eager handle's arithmetic, rejecting an invalid composition
 /// before any handle exists, and then records the composed chain as the new handle's authoritative alias. Nothing is
 /// bound into the destination, because the portion this handle selects is materialized at each access rather than at
-/// the view. The step is closed over destination values: each [`ReferenceViewSymbol::Input`] the transform reports
+/// the view. The step is closed over destination values: each input index the transform reports
 /// binds the destination value of that operand, so the operands of a view operation are its reference followed by one
 /// value per symbol, and a static transform binds nothing.
 ///
@@ -343,11 +523,10 @@ impl<C: Domain<Type = ArrayIrType, Value: ReferenceSlice<C::Value>>> Interpretab
 /// Returns [`ProgramError::InvalidInputCount`] for an application that does not supply exactly one operand per symbol
 /// beyond the reference, [`ProgramError::MalformedProgram`] when the first operand is a value rather than a reference
 /// handle, when a symbol operand is a reference rather than a value, or when a symbol names the reference operand or an
-/// operand outside the application, [`ProgramError::UnsupportedOperation`] for a [`ReferenceViewSymbol::RegionLocal`]
-/// symbol, and [`ProgramError::InvalidOutputCount`] when replaying the view on a preserved allocation does not produce
-/// exactly one value. Propagates the view algebra's own [`TypeError`] when `transform` does not compose onto the
-/// incoming handle's referent, and the discharge context's own [`ProgramError::MalformedProgram`] when the replayed
-/// reference does not carry the composed type.
+/// operand outside the application, and [`ProgramError::InvalidOutputCount`] when replaying a preserved view does not
+/// produce exactly one value. Propagates the view algebra's [`TypeError`] when `transform` does not compose onto the
+/// incoming handle's referent, and [`ProgramError::MalformedProgram`] when the replayed reference does not carry the
+/// composed type.
 fn discharge_reference_view<C, P, O>(
     operation: &O,
     transform: ArrayReferenceViewTransform,
@@ -365,28 +544,22 @@ where
     let referent = transform.output_type(reference.r#type().referent())?;
     let bindings = symbols
         .iter()
-        .map(|symbol| match symbol {
-            ReferenceViewSymbol::Input(index) => match inputs.get(*index) {
-                Some(input) if *index > 0 => input.try_as_value("a view coordinate").cloned(),
-                _ => Err(ProgramError::MalformedProgram(format!(
-                    "reference view symbol names input {index} but the coordinate inputs of a view with {} \
-                     inputs are 1..{}",
-                    inputs.len(),
-                    inputs.len(),
-                ))),
-            },
-            ReferenceViewSymbol::RegionLocal { .. } => Err(ProgramError::UnsupportedOperation {
-                message: "a region-local view coordinate is supplied by its attaching operation and cannot be \
-                          discharged as an instruction"
-                    .to_string(),
-            }),
+        .map(|index| match inputs.get(*index) {
+            Some(input) if *index > 0 => input.try_as_value("a view index").cloned(),
+            _ => Err(ProgramError::MalformedProgram(format!(
+                "reference view symbol names input {index} but the index inputs of a view with {} inputs are 1..{}",
+                inputs.len(),
+                inputs.len(),
+            ))),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let alias = reference.alias().with_step(transform, bindings);
+    let alias = reference.alias().with_step(transform, bindings.clone());
     Ok(vec![
         context
             .alias_reference(reference, alias, ReferenceType::new(referent), |value| {
-                let mut outputs = context.parent().bind(operation.clone(), Vec::new(), std::slice::from_ref(value))?;
+                let mut operands = vec![value.clone()];
+                operands.extend(bindings.iter().cloned());
+                let mut outputs = context.parent().bind(operation.clone(), Vec::new(), &operands)?;
                 check_count!("output", outputs, 1, ProgramError);
                 Ok(outputs.remove(0))
             })?
@@ -408,7 +581,7 @@ impl<C: Context<Type = ArrayIrType, Operation: From<ReferenceSliceOperation>>> P
 
 macro_rules! impl_default_reference_view_transposition {
     // Installs the transposition rule for one array reference-view operation.
-    ($operation:ty) => {
+    ($operation:ty, $input_count:expr) => {
         // A view is aliasing metadata rather than a linear map of its own: the cotangent of a view operand is reached
         // by reapplying the view path to its root's cotangent reference inside the transposition context, so the
         // reverse sweep never needs this rule to run and every operand receives a structural zero.
@@ -423,8 +596,9 @@ macro_rules! impl_default_reference_view_transposition {
                 outputs: &[MaybeZero<Tracer<TracingContext<V, O>>>],
                 accumulators: &[crate::differentiation::CotangentAccumulator],
             ) -> Result<(), DifferentiationError> {
+                check_count!("input", inputs, $input_count, ProgramError);
                 check_count!("output", outputs, 1, ProgramError);
-                check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
+                check_count!("accumulator", accumulators, $input_count, DifferentiationError);
                 let contributions =
                     (|| -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
                         inputs.iter().map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?))).collect()
@@ -439,8 +613,9 @@ macro_rules! impl_default_reference_view_transposition {
     };
 }
 
-impl_default_reference_view_transposition!(ReferenceIndexOperation);
-impl_default_reference_view_transposition!(ReferenceSliceOperation);
+impl_default_reference_view_transposition!(ReferenceIndexOperation, 1);
+impl_default_reference_view_transposition!(ReferenceDynamicIndexOperation, 2);
+impl_default_reference_view_transposition!(ReferenceSliceOperation, 1);
 
 impl<C: Context<Type = ArrayIrType, Value: ReferenceIndex<C::Value>>> DifferentiableOperation<C>
     for ReferenceIndexOperation
@@ -546,16 +721,15 @@ pub fn validate_array_reference_view(
 /// Stages one [`ArrayReferenceViewTransform`] over the reference `source` through `context` and returns the derived
 /// reference. This is the array family's
 /// [`ReferenceViewOperation::reapply_view`](crate::programs::ReferenceViewOperation::reapply_view) rule, shared by
-/// every operation family that embeds the array view operations: a static [`Index`](ArrayReferenceViewTransform::Index)
-/// transform stages a [`ReferenceIndexOperation`] and a [`Slice`](ArrayReferenceViewTransform::Slice) transform
-/// stages a [`ReferenceSliceOperation`], through the same conversions the eager array reference views use. `symbols`
-/// supplies one value per symbol of `view`, which is none for both static transforms.
+/// every operation family that embeds the array view operations. Static and symbolic indices stage
+/// [`ReferenceIndexOperation`] and [`ReferenceDynamicIndexOperation`], respectively; a slice stages
+/// [`ReferenceSliceOperation`]. `symbols` supplies the scalar integer value for a symbolic index and is empty for
+/// static transforms.
 ///
 /// # Errors
 ///
 /// Returns [`ProgramError::MalformedProgram`] when `symbols` does not supply exactly one value per symbol of `view`,
-/// [`ProgramError::UnsupportedOperation`] for a symbolic index (no array operation reapplies one until dynamic
-/// indexing is supported), and [`ProgramError::InvalidOutputCount`] when the staged view does not produce exactly one
+/// [`ProgramError::InvalidOutputCount`] when the staged view does not produce exactly one
 /// value. Propagates the staging error of `context`.
 pub fn reapply_array_reference_view<C>(
     context: &C,
@@ -565,7 +739,7 @@ pub fn reapply_array_reference_view<C>(
 ) -> Result<C::Value, ProgramError>
 where
     C: Context<Type = ArrayIrType>,
-    C::Operation: From<ReferenceIndexOperation> + From<ReferenceSliceOperation>,
+    C::Operation: From<ReferenceIndexOperation> + From<ReferenceDynamicIndexOperation> + From<ReferenceSliceOperation>,
 {
     let expected = view.symbols().len();
     if symbols.len() != expected {
@@ -578,11 +752,8 @@ where
         ArrayReferenceViewTransform::Index { axis, index: ArrayReferenceViewIndex::Static(index) } => {
             context.bind(ReferenceIndexOperation::new(*axis, *index), Vec::new(), std::slice::from_ref(&source))?
         }
-        ArrayReferenceViewTransform::Index { index: ArrayReferenceViewIndex::Symbolic(_), .. } => {
-            return Err(ProgramError::UnsupportedOperation {
-                message: "no array operation reapplies a symbolic reference index until dynamic indexing is supported"
-                    .to_string(),
-            });
+        ArrayReferenceViewTransform::Index { axis, index: ArrayReferenceViewIndex::Symbolic(_) } => {
+            context.bind(ReferenceDynamicIndexOperation::new(*axis), Vec::new(), &[source, symbols[0].clone()])?
         }
         ArrayReferenceViewTransform::Slice { axes } => {
             context.bind(ReferenceSliceOperation::new(axes.clone()), Vec::new(), std::slice::from_ref(&source))?
@@ -938,6 +1109,28 @@ impl<A: Value<Type = ArrayType>> ReferenceIndex for ArrayIrValue<A> {
     }
 }
 
+impl<A: Value<Type = ArrayType> + Concretizable<i128>> ReferenceDynamicIndex for ArrayIrValue<A> {
+    fn reference_dynamic_index(&self, axis: usize, index: &Self) -> Result<Self, ProgramError> {
+        ReferenceDynamicIndexOperation::new(axis)
+            .infer_output_types(&[self.r#type().into_owned(), index.r#type().into_owned()], &[])?;
+        let reference = <Self as ValueProjection<ReferenceType<ArrayType>>>::projected(self)?;
+        let index = <Self as ValueProjection<ArrayType>>::projected(index)?;
+        let referent = reference.r#type();
+        let shape = referent
+            .referent()
+            .static_shape()
+            .ok_or_else(|| TypeError::invalid("eager reference indexing requires a static shape"))?;
+        let maximum = shape[axis]
+            .checked_sub(1)
+            .ok_or_else(|| TypeError::invalid("cannot dynamically index an empty reference axis"))?;
+        let index = index.concretize()?.clamp(0, maximum as i128) as usize;
+        Ok(Self::Reference(reference.with_transform(ArrayReferenceViewTransform::Index {
+            axis,
+            index: ArrayReferenceViewIndex::Static(index),
+        })?))
+    }
+}
+
 impl<A: Value<Type = ArrayType>> ReferenceSlice for ArrayIrValue<A> {
     fn reference_slice(&self, axes: &[ArraySliceAxis]) -> Result<Self, ProgramError> {
         // Projection rejects value operands and `with_transform` validates the transform against the handle's
@@ -975,8 +1168,7 @@ mod tests {
     use crate::parameters::Placeholder;
     use crate::partial::{PartialEvaluationContext, PartialEvaluationValue, ReferencePlacement};
     use crate::programs::{
-        EffectClass, EffectClasses, EmptyRegionDriver, ProgramBuilder, ProgramError, ReferenceError,
-        ReferenceViewSymbol, TypeError,
+        EffectClass, EffectClasses, EmptyRegionDriver, ProgramBuilder, ProgramError, ReferenceError, TypeError,
     };
     use crate::tracing::{Tracer, TracingContext};
 
@@ -991,6 +1183,38 @@ mod tests {
     type TestSwap = ReferenceSwapOperation<ArrayType, ArrayIrType>;
     type TestAddUpdate = ReferenceAddUpdateOperation<ArrayType, ArrayIrType>;
     type TestFreeze = ReferenceFreezeOperation<ArrayType, ArrayIrType>;
+
+    #[test]
+    fn test_reference_dynamic_index_operation_new() {
+        let operation = ReferenceDynamicIndexOperation::new(1);
+        assert_eq!(operation.to_string(), "reference_dynamic_index [axis=1]");
+        assert_eq!(
+            operation.transform(),
+            ArrayReferenceViewTransform::Index { axis: 1, index: ArrayReferenceViewIndex::Symbolic(1) }
+        );
+    }
+
+    #[test]
+    fn test_reference_dynamic_index_operation_infer_output_types() {
+        let operation = ReferenceDynamicIndexOperation::new(0);
+        let reference = ReferenceType::new(ArrayType::new_static(DataType::F32, [3, 2]));
+        let index = ArrayType::scalar(DataType::I64);
+        assert_eq!(
+            operation.infer_output_types(&[reference.into(), index.clone().into()], &[]),
+            Ok(vec![ReferenceType::new(ArrayType::new_static(DataType::F32, [2])).into()])
+        );
+
+        // An empty-axis body can be constructed for a zero-trip scan; no index is executed in that case.
+        let empty = ReferenceType::new(ArrayType::new_static(DataType::F32, [0, 2]));
+        assert_eq!(
+            operation.infer_output_types(&[empty.clone().into(), index.into()], &[]),
+            Ok(vec![ReferenceType::new(ArrayType::new_static(DataType::F32, [2])).into()])
+        );
+        assert_eq!(
+            operation.infer_output_types(&[empty.into(), ArrayType::scalar(DataType::F32).into()], &[]),
+            Err(TypeError::invalid("`reference_dynamic_index` requires a scalar integer index but received `f32[]`"))
+        );
+    }
 
     #[test]
     fn test_array_reference_view_operations() {
@@ -1149,6 +1373,26 @@ mod tests {
     }
 
     #[test]
+    fn test_reference_dynamic_index_operation_discharge_preserved_reference() {
+        let context =
+            ReferenceDischargeContext::<TestDestination, ArrayReferenceDischarge>::new(TestDestination::new());
+        let value = TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0])).reference_new().unwrap();
+        let reference = context
+            .bind_preserved(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])), value)
+            .unwrap();
+        let index = TestValue::Array(Array::scalar(2_i64));
+        let outputs = ReferenceDynamicIndexOperation::new(0)
+            .discharge_references(
+                &context,
+                &EmptyRegionDriver,
+                &[reference.into(), ReferenceDischargeValue::Value(index)],
+            )
+            .unwrap();
+        let view = outputs[0].try_as_reference("a dynamic reference view").unwrap();
+        assert_eq!(view.preserved().unwrap().read(), Ok(TestValue::Array(Array::scalar(3.0_f32))));
+    }
+
+    #[test]
     fn test_array_reference_view_operations_jvp() {
         let context = DifferentiationContext::fused(TestDestination::new());
         let allocation_type = ArrayType::new_static(DataType::F32, [2, 3]);
@@ -1167,6 +1411,15 @@ mod tests {
             context.clone(),
         );
         let indexed = context.bind(ReferenceIndexOperation::new(0, 1), Vec::new(), &[active.clone()]).unwrap();
+        let index = DifferentiationTracer::new(
+            DifferentiationDual::new_with_zero_tangent(TestValue::Array(Array::scalar(1_i64))).unwrap(),
+            context.clone(),
+        );
+        let dynamic =
+            context.bind(ReferenceDynamicIndexOperation::new(0), Vec::new(), &[active.clone(), index]).unwrap();
+        assert_eq!(dynamic[0].primal().read(), indexed[0].primal().read());
+        assert_eq!(dynamic[0].tangent().as_value().unwrap().read(), indexed[0].tangent().as_value().unwrap().read());
+
         assert_eq!(indexed.len(), 1);
         assert_eq!(indexed[0].primal().read(), Ok(TestValue::Array(Array::vector(vec![4.0_f32, 5.0, 6.0]))));
         assert_eq!(
@@ -1869,20 +2122,19 @@ mod tests {
     }
 
     #[test]
-    fn test_reapply_array_reference_view_rejects_symbolic_indices_and_symbol_count_mismatches() {
+    fn test_reapply_array_reference_view_rejects_invalid_indices_and_symbol_count_mismatches() {
         type TestContext = TracingContext<TestValue, TestOperation>;
 
-        // Reapplication receives exactly one value per symbol of the description, and no array operation can stage a
-        // symbolic index yet, even when its value is supplied.
+        // Reapplication checks both the number of supplied symbol values and their scalar integer type.
         let root_type = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3])));
-        let coordinate_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
+        let index_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let error = TestContext::trace(
             |inputs: Vec<Tracer<TestContext>>| {
                 let r#static =
                     ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) };
                 reapply_array_reference_view(inputs[0].context(), &r#static, inputs[0].clone(), &inputs[1..])
             },
-            vec![root_type.clone(), coordinate_type.clone()],
+            vec![root_type.clone(), index_type.clone()],
         )
         .unwrap_err();
         assert_eq!(
@@ -1895,21 +2147,18 @@ mod tests {
         );
         let error = TestContext::trace(
             |inputs: Vec<Tracer<TestContext>>| {
-                let symbolic = ArrayReferenceViewTransform::Index {
-                    axis: 0,
-                    index: ArrayReferenceViewIndex::Symbolic(ReferenceViewSymbol::Input(1)),
-                };
+                let symbolic =
+                    ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(1) };
                 reapply_array_reference_view(inputs[0].context(), &symbolic, inputs[0].clone(), &inputs[1..])
             },
-            vec![root_type, coordinate_type],
+            vec![root_type, index_type],
         )
         .unwrap_err();
         assert_eq!(
             error,
-            ProgramError::UnsupportedOperation {
-                message: "no array operation reapplies a symbolic reference index until dynamic indexing is supported"
-                    .to_string(),
-            },
+            ProgramError::Type(TypeError::invalid(
+                "`reference_dynamic_index` requires a scalar integer index but received `f32[]`"
+            )),
         );
     }
 
@@ -2111,6 +2360,27 @@ mod tests {
             ProgramError::MalformedProgram(
                 "`reference_read` reads a reference whose alias family `reference_freeze` already consumed".to_string(),
             ),
+        );
+    }
+
+    #[test]
+    fn test_array_ir_value_reference_dynamic_index() {
+        let reference = TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 3.0])).reference_new().unwrap();
+        let negative = TestValue::Array(Array::scalar(-9_i64));
+        let large = TestValue::Array(Array::scalar(u64::MAX));
+        assert_eq!(
+            reference.reference_dynamic_index(0, &negative).unwrap().read(),
+            Ok(TestValue::Array(Array::scalar(1.0_f32)))
+        );
+        let last = reference.reference_dynamic_index(0, &large).unwrap();
+        last.write(&TestValue::Array(Array::scalar(7.0_f32))).unwrap();
+        assert_eq!(reference.read(), Ok(TestValue::Array(Array::vector(vec![1.0_f32, 2.0, 7.0]))));
+
+        // Empty axes remain well typed, but eager execution cannot select an element from them.
+        let empty = TestValue::Array(Array::vector(Vec::<f32>::new())).reference_new().unwrap();
+        assert_eq!(
+            empty.reference_dynamic_index(0, &negative),
+            Err(TypeError::invalid("cannot dynamically index an empty reference axis").into())
         );
     }
 
@@ -2386,13 +2656,14 @@ mod tests {
         let stacked_type = ArrayType::new_static(DataType::F32, [3]);
         let body = {
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             let item = builder.add_input(scalar_type.clone().into());
             let reference = builder.add_instruction(TestNew::new(), Vec::new(), vec![carry], None).unwrap()[0];
             builder.add_instruction(TestAddUpdate::new(), Vec::new(), vec![reference, item], None).unwrap();
             let next = builder.add_instruction(TestRead::new(), Vec::new(), vec![reference], None).unwrap()[0];
             builder
-                .build::<Values, Values>(vec![next, next], vec![Placeholder; 2], vec![Placeholder; 2])
+                .build::<Values, Values>(vec![next, next], vec![Placeholder; 3], vec![Placeholder; 2])
                 .unwrap()
         };
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();

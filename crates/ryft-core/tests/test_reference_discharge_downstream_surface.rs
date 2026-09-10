@@ -17,7 +17,7 @@
 //! [`ReferenceViewOperation`]) from downstream position. `register.halves` is a static two-output view whose outputs
 //! carry two distinct descriptions; it has no discharge rule, no eager interpretation, and no transform rules, so it
 //! pins the analysis side of the contract only. `register.bit` is a dynamic single-output view of one bit of a
-//! register, described through the input that carries the bit index ([`ReferenceViewSymbol::Input`]): the analysis
+//! register, described through the input that carries the bit index by its operand position: the analysis
 //! closes the description over that input, the discharge alias is the view path closed over destination values
 //! (`ReferenceViewPath<RegisterView, C::Value>`) through which the policy reads and writes by binding the family's own
 //! bit operations on the destination, forward mode reapplies the view to the tangent reference with the primal index,
@@ -64,12 +64,11 @@ use ryft_core::{
     ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceEffect,
     ReferenceFreeze, ReferenceFreezeOperation, ReferenceId, ReferenceNew, ReferenceNewOperation, ReferenceRead,
     ReferenceReadOperation, ReferenceSource, ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceView,
-    ReferenceViewOperation, ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep, ReferenceViewSymbol,
-    ReferenceViewSymbolBinding, ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation, RegionId,
-    RegionInterface, RegionRef, RegionSlot, Trace, Tracer, TracingContext, TransposableOperation, TranspositionContext,
-    TranspositionDriver, Type, TypeError, Typed, Value, ValueId, Zero, ZeroOperation, batch,
-    batch_reference_view_operation, check_count, differentiate_at, discharge_reference_free_operation,
-    validate_reference_boundary,
+    ReferenceViewOperation, ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError,
+    ReferenceWrite, ReferenceWriteOperation, RegionId, RegionInterface, RegionRef, RegionSlot, Trace, Tracer,
+    TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError, Typed, Value,
+    ValueId, Zero, ZeroOperation, batch, batch_reference_view_operation, check_count, differentiate_at,
+    discharge_reference_free_operation, validate_reference_boundary,
 };
 
 /// Destination universe of the downstream programs: the eager context over the register family, which is what a
@@ -635,7 +634,7 @@ impl Operation for RegisterOperation {
     }
 
     fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
-        matches!(self, Self::Call).then_some(InputRegionProvenance::Forwarded { input_index })
+        matches!(self, Self::Call).then_some(InputRegionProvenance { input_index })
     }
 
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
@@ -815,8 +814,7 @@ where
                 check_count!("input", inputs, 2, ProgramError);
                 let reference = inputs[0].try_as_reference("a reference to view")?;
                 let index = inputs[1].try_as_value("a bit index")?.clone();
-                let alias =
-                    reference.alias().with_step(RegisterView::Bit(ReferenceViewSymbol::Input(1)), vec![index.clone()]);
+                let alias = reference.alias().with_step(RegisterView::Bit(1), vec![index.clone()]);
                 let viewed = context.alias_reference(reference, alias, ReferenceType::new(RegisterType), |parent| {
                     bind_register_output(context.parent(), Self::Bit, &[parent.clone(), index])
                 })?;
@@ -852,7 +850,7 @@ where
 
                 let result = driver.rebuild_region(
                     context,
-                    0,
+                    region,
                     &ReferenceDischargeRegionBoundary::new(
                         self,
                         0,
@@ -906,10 +904,8 @@ enum RegisterView {
     /// Static half of a register, selected by `register.halves`.
     Half(RegisterHalf),
 
-    /// One bit of a register, selected by `register.bit` at the index the symbol names:
-    /// [`ReferenceViewSymbol::Input`] of the index input for an instruction output, or
-    /// [`ReferenceViewSymbol::RegionLocal`] for an index supplied by a region-carrying operation.
-    Bit(ReferenceViewSymbol),
+    /// One bit of a register, selected by the value supplied at this instruction input position.
+    Bit(usize),
 }
 
 // A half is a static description while a bit depends on the one index its symbol names. Registers have no axes,
@@ -920,7 +916,7 @@ enum RegisterView {
 impl ReferenceView for RegisterView {
     type Type = RegisterIrType;
 
-    fn symbols(&self) -> Vec<ReferenceViewSymbol> {
+    fn symbols(&self) -> Vec<usize> {
         match self {
             Self::Half(_) => Vec::new(),
             Self::Bit(symbol) => vec![*symbol],
@@ -963,7 +959,7 @@ impl ReferenceViewOperation for RegisterOperation {
         match (self, output_index) {
             (Self::Halves, 0) => Some(RegisterView::Half(RegisterHalf::Low)),
             (Self::Halves, 1) => Some(RegisterView::Half(RegisterHalf::High)),
-            (Self::Bit, 0) => Some(RegisterView::Bit(ReferenceViewSymbol::Input(1))),
+            (Self::Bit, 0) => Some(RegisterView::Bit(1)),
             _ => None,
         }
     }
@@ -999,16 +995,12 @@ impl ReferenceViewOperation for RegisterOperation {
                     RegisterHalf::High => 1,
                 }))
             }
-            RegisterView::Bit(ReferenceViewSymbol::Input(_)) => {
+            RegisterView::Bit(_) => {
                 check_count!("input", symbols, 1, ProgramError);
                 let mut outputs = context.bind(Self::Bit, Vec::new(), &[source, symbols[0].clone()])?;
                 check_count!("output", outputs, 1, ProgramError);
                 Ok(outputs.remove(0))
             }
-            RegisterView::Bit(ReferenceViewSymbol::RegionLocal { .. }) => Err(ProgramError::UnsupportedOperation {
-                message: "`register.bit` cannot reapply a coordinate supplied only within an attached region"
-                    .to_string(),
-            }),
         }
     }
 }
@@ -1988,10 +1980,8 @@ fn test_downstream_view_description_overlap_and_batch() {
     let low = empty.with_view(RegisterView::Half(RegisterHalf::Low));
     let high = empty.with_view(RegisterView::Half(RegisterHalf::High));
     let low_high = low.with_view(RegisterView::Half(RegisterHalf::High));
-    let bit_of_1 = empty
-        .with_step(RegisterView::Bit(ReferenceViewSymbol::Input(1)), vec![ReferenceViewSymbolBinding::Value(value(1))]);
-    let bit_of_2 = empty
-        .with_step(RegisterView::Bit(ReferenceViewSymbol::Input(1)), vec![ReferenceViewSymbolBinding::Value(value(2))]);
+    let bit_of_1 = empty.with_step(RegisterView::Bit(1), vec![value(1)]);
+    let bit_of_2 = empty.with_step(RegisterView::Bit(1), vec![value(2)]);
     assert_eq!(low.overlap(&high, &root), ReferenceViewOverlap::Disjoint);
     assert_eq!(low.overlap(&low, &root), ReferenceViewOverlap::Same);
     assert_eq!(empty.overlap(&empty, &root), ReferenceViewOverlap::Same);
@@ -2003,11 +1993,7 @@ fn test_downstream_view_description_overlap_and_batch() {
     assert_eq!(bit_of_1.overlap(&low, &root), ReferenceViewOverlap::MayOverlap);
     assert_eq!(empty.overlap(&bit_of_1, &root), ReferenceViewOverlap::MayOverlap);
     assert_eq!(
-        low.with_step(
-            RegisterView::Bit(ReferenceViewSymbol::Input(1)),
-            vec![ReferenceViewSymbolBinding::Value(value(1))]
-        )
-        .overlap(&bit_of_1, &root),
+        low.with_step(RegisterView::Bit(1), vec![value(1)]).overlap(&bit_of_1, &root),
         ReferenceViewOverlap::MayOverlap
     );
 
@@ -2047,8 +2033,8 @@ fn test_downstream_view_description_overlap_and_batch() {
         Ok((RegisterView::Half(RegisterHalf::Low), BatchAxis::replicated()))
     );
     assert_eq!(
-        RegisterView::Bit(ReferenceViewSymbol::Input(1)).batch(&root, BatchAxis::replicated()),
-        Ok((RegisterView::Bit(ReferenceViewSymbol::Input(1)), BatchAxis::replicated()))
+        RegisterView::Bit(1).batch(&root, BatchAxis::replicated()),
+        Ok((RegisterView::Bit(1), BatchAxis::replicated()))
     );
     assert!(matches!(
         RegisterView::Half(RegisterHalf::High).batch(&root, BatchAxis::new(0)),
@@ -2077,9 +2063,9 @@ fn test_downstream_dynamic_view_analysis_closes_the_index_input() {
         .unwrap();
 
     // The dynamic description names the index input symbolically and reports it as its one symbol.
-    assert_eq!(RegisterOperation::Bit.reference_view(0), Some(RegisterView::Bit(ReferenceViewSymbol::Input(1))));
+    assert_eq!(RegisterOperation::Bit.reference_view(0), Some(RegisterView::Bit(1)));
     assert_eq!(RegisterOperation::Bit.reference_view(1), None);
-    assert_eq!(RegisterView::Bit(ReferenceViewSymbol::Input(1)).symbols(), vec![ReferenceViewSymbol::Input(1)]);
+    assert_eq!(RegisterView::Bit(1).symbols(), vec![1]);
     assert_eq!(RegisterView::Half(RegisterHalf::Low).symbols(), Vec::new());
 
     // The overlay closes the symbol over the index input of the instruction that created each view, so the two bits
@@ -2098,12 +2084,7 @@ fn test_downstream_dynamic_view_analysis_closes_the_index_input() {
             true,
         )),
     );
-    let bit_path = |index: usize| {
-        ReferenceViewPath::root().with_step(
-            RegisterView::Bit(ReferenceViewSymbol::Input(1)),
-            vec![ReferenceViewSymbolBinding::Value(value(index))],
-        )
-    };
+    let bit_path = |index: usize| ReferenceViewPath::root().with_step(RegisterView::Bit(1), vec![value(index)]);
     assert_eq!(analysis.path(value(3)), Some(&bit_path(1)));
     assert_eq!(analysis.path(value(4)), Some(&bit_path(1)));
     assert_eq!(analysis.path(value(5)), Some(&bit_path(2)));
@@ -2115,44 +2096,54 @@ fn test_downstream_dynamic_view_analysis_closes_the_index_input() {
 }
 
 #[test]
-fn test_downstream_reference_view_path_region_local_coordinates() {
-    // A downstream operation can declare multiple symbols without adding a core variant. Family names distinguish
-    // unrelated operation contracts, while symbol indices distinguish symbols in one family. The region identity
-    // confines each binding to the region that supplies its value.
-    let root = RegisterIrType::Reference(ReferenceType::new(RegisterType));
-    let first_symbol = ReferenceViewSymbol::RegionLocal { name: "register.window.bit", index: 0 };
-    let second_symbol = ReferenceViewSymbol::RegionLocal { name: "register.window.bit", index: 1 };
-    let other_symbol = ReferenceViewSymbol::RegionLocal { name: "register.packet.bit", index: 0 };
-    let first_binding =
-        ReferenceViewSymbolBinding::RegionLocal { region: RegionId::new(0), name: "register.window.bit", index: 0 };
-    let second_binding =
-        ReferenceViewSymbolBinding::RegionLocal { region: RegionId::new(0), name: "register.window.bit", index: 1 };
-    let other_binding =
-        ReferenceViewSymbolBinding::RegionLocal { region: RegionId::new(0), name: "register.packet.bit", index: 0 };
-    let nested_binding =
-        ReferenceViewSymbolBinding::RegionLocal { region: RegionId::new(1), name: "register.window.bit", index: 0 };
-    let first = ReferenceViewPath::root().with_step(RegisterView::Bit(first_symbol), vec![first_binding]);
-    let second = ReferenceViewPath::root().with_step(RegisterView::Bit(second_symbol), vec![second_binding]);
-    let other = ReferenceViewPath::root().with_step(RegisterView::Bit(other_symbol), vec![other_binding]);
-    let nested = ReferenceViewPath::root().with_step(RegisterView::Bit(first_symbol), vec![nested_binding]);
-    assert_eq!(first.overlap(&first, &root), ReferenceViewOverlap::Same);
-    assert_eq!(first.overlap(&second, &root), ReferenceViewOverlap::MayOverlap);
-    assert_eq!(first.overlap(&other, &root), ReferenceViewOverlap::MayOverlap);
-    assert_eq!(first.overlap(&nested, &root), ReferenceViewOverlap::MayOverlap);
-    assert_ne!(first, second);
-    assert_ne!(first, other);
-    assert_ne!(first, nested);
+fn test_downstream_reference_view_analysis_binds_explicit_region_inputs() {
+    let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
+    let reference = builder.add_input(RegisterIrType::Reference(ReferenceType::new(RegisterType)));
+    let first_index = builder.add_input(RegisterIrType::Register(RegisterType));
+    let second_index = builder.add_input(RegisterIrType::Register(RegisterType));
+    let first = builder
+        .add_instruction(RegisterOperation::Bit, Vec::new(), vec![reference, first_index], None)
+        .unwrap()[0];
+    let second = builder
+        .add_instruction(RegisterOperation::Bit, Vec::new(), vec![reference, second_index], None)
+        .unwrap()[0];
+    let body = builder
+        .build::<Vec<RegisterValue>, Vec<RegisterValue>>(Vec::new(), vec![Placeholder; 3], Vec::new())
+        .unwrap();
+
+    // The caller forwards a whole register and two ordinary index values. The body's instruction operands identify
+    // the indices directly; no operation-specific symbol representation is needed in generic analysis.
+    let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
+    let inputs = body.input_types().iter().map(|r#type| builder.add_input(r#type.clone())).collect::<Vec<_>>();
+    let region = builder.import_region(body.entry_region_ref());
+    builder.add_instruction(RegisterOperation::Call, vec![region], inputs, None).unwrap();
+    let program = builder
+        .build::<Vec<RegisterValue>, Vec<RegisterValue>>(Vec::new(), vec![Placeholder; 3], Vec::new())
+        .unwrap();
+    let entry = program.entry_region_ref();
+    let analysis = entry.reference_view_analysis(0).unwrap();
+    assert_eq!(
+        analysis.path(ValueId::new(region, first)),
+        Some(&ReferenceViewPath::root().with_step(RegisterView::Bit(1), vec![ValueId::new(region, first_index)]))
+    );
+    assert_eq!(
+        analysis.path(ValueId::new(region, second)),
+        Some(&ReferenceViewPath::root().with_step(RegisterView::Bit(1), vec![ValueId::new(region, second_index)]))
+    );
+    assert_eq!(
+        analysis.overlap(entry, ValueId::new(region, first), ValueId::new(region, second)),
+        Some(ReferenceViewOverlap::MayOverlap)
+    );
 }
 
 #[test]
 fn test_downstream_dynamic_view_reapplies_with_its_index() {
     // Reapplication binds the view over another source with the supplied index value, here eagerly into a bit handle,
-    // and rejects a symbol count that disagrees with the description or an index supplied only within an attached
-    // region.
+    // and rejects a symbol count that disagrees with the description.
     let context = RegisterDestination::new();
     let reference = Reference::new(RegisterValue::Register(6)).unwrap();
     let source = RegisterValue::Reference(reference.clone());
-    let bit = RegisterView::Bit(ReferenceViewSymbol::Input(1));
+    let bit = RegisterView::Bit(1);
     let reapplied =
         RegisterOperation::reapply_view(&context, &bit, source.clone(), &[RegisterValue::Register(1)]).unwrap();
     assert_eq!(reapplied, RegisterValue::BitReference { root: reference.clone(), index: 1 });
@@ -2170,16 +2161,6 @@ fn test_downstream_dynamic_view_reapplies_with_its_index() {
         ),
         Err(ProgramError::InvalidInputCount { expected: 0, actual: 1 }),
     );
-    assert!(matches!(
-        RegisterOperation::reapply_view(
-            &context,
-            &RegisterView::Bit(ReferenceViewSymbol::RegionLocal { name: "register.window.bit", index: 0 }),
-            source,
-            &[RegisterValue::Register(1)],
-        ),
-        Err(ProgramError::UnsupportedOperation { message })
-            if message == "`register.bit` cannot reapply a coordinate supplied only within an attached region",
-    ));
 }
 
 #[test]

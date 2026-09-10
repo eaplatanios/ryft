@@ -210,7 +210,7 @@ impl<T: WhileTypeSemantics> Operation for WhileOperation<T> {
 
     #[inline]
     fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
-        (region_index < 2).then_some(InputRegionProvenance::Forwarded { input_index })
+        (region_index < 2).then_some(InputRegionProvenance { input_index })
     }
 
     #[inline]
@@ -335,7 +335,7 @@ where
         };
         let condition_result = driver.rebuild_region(
             context,
-            0,
+            driver.region(0)?,
             &ReferenceDischargeRegionBoundary::new(
                 self,
                 0,
@@ -351,7 +351,7 @@ where
         condition_result.validate_predicted_mutations(condition_published.as_slice(), name)?;
         let body_result = driver.rebuild_region(
             context,
-            1,
+            driver.region(1)?,
             &ReferenceDischargeRegionBoundary::symmetric(
                 self,
                 1,
@@ -2102,7 +2102,8 @@ where
         iteration_input_types.clone(),
     )?
     .1;
-    let mut scan_body_input_types = iteration_input_types.clone();
+    let mut scan_body_input_types = vec![C::Type::from_array_type(ArrayType::scalar(DataType::I64))];
+    scan_body_input_types.extend(iteration_input_types.iter().cloned());
     scan_body_input_types.push(boolean_scalar_type);
     let scan_body = if uses_gateway {
         // Inactive bounded iterations contain only placeholder storage. Guard the restoration branch itself so a
@@ -2121,7 +2122,7 @@ where
         TracingContext::<C::Constant, C::Operation>::trace(
             |inputs| {
                 let trace_context = inputs[0].context().clone();
-                let (iteration_inputs, mask) = inputs.split_at(inputs.len() - 1);
+                let (iteration_inputs, mask) = inputs[1..].split_at(inputs.len() - 2);
                 let mut operands = Vec::with_capacity(inputs.len());
                 operands.push(mask[0].clone());
                 operands.extend_from_slice(iteration_inputs);
@@ -2138,7 +2139,7 @@ where
         TracingContext::<C::Constant, C::Operation>::trace(
             |inputs| -> Result<Vec<_>, ProgramError> {
                 let trace_context = inputs[0].context().clone();
-                let (iteration_inputs, mask) = inputs.split_at(inputs.len() - 1);
+                let (iteration_inputs, mask) = inputs[1..].split_at(inputs.len() - 2);
                 let active_outputs = active_body.interpret_in_context(&trace_context, iteration_inputs.to_vec())?;
                 let mut outputs = active_outputs[..invariant_residual_count].to_vec();
                 outputs.extend(
@@ -3031,8 +3032,8 @@ mod tests {
         // Operation identity, declared region slots, reference flow, and payload-free rendering.
         assert_eq!(operation.name(), WHILE_OPERATION_NAME);
         assert_eq!(operation.region_slots(), &[RegionSlot::computation("condition"), RegionSlot::computation("body")]);
-        assert_eq!(operation.input_region_provenance(0, 0), Some(InputRegionProvenance::Forwarded { input_index: 0 }),);
-        assert_eq!(operation.input_region_provenance(1, 0), Some(InputRegionProvenance::Forwarded { input_index: 0 }),);
+        assert_eq!(operation.input_region_provenance(0, 0), Some(InputRegionProvenance { input_index: 0 }),);
+        assert_eq!(operation.input_region_provenance(1, 0), Some(InputRegionProvenance { input_index: 0 }),);
         assert_eq!(
             operation.output_region_provenance(0),
             vec![OutputRegionProvenance { region_index: 1, output_index: 0 }],

@@ -27,8 +27,8 @@ use crate::programs::{
     Atom, AtomId, BindingRegionDriver, EffectClass, EmptyRegionDriver, Instruction, InstructionId, MaybeZero,
     Operation, OperationProjection, OperationProvider, Program, ProgramBuilder, ProgramError, Provenance,
     ReferenceAccessMode, ReferenceAliasKind, ReferenceAnalysis, ReferenceBoundary, ReferenceRoot,
-    ReferenceViewOperation, ReferenceViewSymbolBinding, Region, RegionDriver, RegionRef, RegionReplayMappings,
-    ReplayRegionDriver, Type, TypeError, TypeIdentityPosition, Typed, Value, ValueId, ValueProjection,
+    ReferenceViewOperation, Region, RegionDriver, RegionRef, RegionReplayMappings, ReplayRegionDriver, Type, TypeError,
+    TypeIdentityPosition, Typed, Value, ValueId, ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 
@@ -905,33 +905,21 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
             })?;
 
             view = path.steps().iter().try_fold(view, |view, step| {
-                // The overlay bound each symbol to a known primal operand of the view-creating instruction, whose
-                // transposed program value the reverse sweep materialized before this rule ran. A region-local
-                // boundary symbol has no such value: the transpose rule of the attaching operation re-creates it.
+                // Each binding names a known primal value, including the explicit index input of a `scan` operation's
+                // body. The reverse sweep materialized these values before invoking the rule, so no loop-specific
+                // symbol resolution, for example, is needed to reconstruct the cotangent view.
                 let symbols = step
                     .bindings()
                     .iter()
-                    .map(|binding| match binding {
-                        ReferenceViewSymbolBinding::Value(id) => self
-                            .cotangent_view_coordinates
-                            .get(id)
-                            .cloned()
-                            .ok_or_else(|| ProgramError::UnsupportedOperation {
+                    .map(|id| {
+                        self.cotangent_view_coordinates.get(id).cloned().ok_or_else(|| {
+                            ProgramError::UnsupportedOperation {
                                 message: format!(
-                                    "the view coordinate {id:?} of reference operand {value:?} is a linear value, so \
-                                     the view cannot be reapplied to the operand's cotangent reference",
+                                    "the index {id:?} of reference operand {value:?} is a linear value, so the view \
+                                     cannot be reapplied to the operand's cotangent reference",
                                 ),
-                            }),
-                        ReferenceViewSymbolBinding::RegionLocal { region, name, index } => {
-                            Err(ProgramError::UnsupportedOperation {
-                                message: format!(
-                                    "reference operand {value:?} views its root through region-local symbol `{name}` \
-                                     at index {index} of region {region:?}; boundary views are re-created by the \
-                                     transpose rule of the attaching operation and cannot be reapplied to a \
-                                     cotangent reference",
-                                ),
-                            })
-                        }
+                            }
+                        })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 O::reapply_view(&self.parent, step.view(), view, symbols.as_slice())
@@ -5286,6 +5274,7 @@ pub(crate) mod tests {
         // `r̄ = length`.
         let body = {
             let mut builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
             let element = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F32)));
             builder
@@ -5296,7 +5285,7 @@ pub(crate) mod tests {
             builder
                 .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
                     vec![carry, current],
-                    vec![Placeholder; 2],
+                    vec![Placeholder; 3],
                     vec![Placeholder; 2],
                 )
                 .unwrap()
@@ -6849,6 +6838,7 @@ pub(crate) mod tests {
         // is threaded through the reversed scan positionally and the body's view of it accumulates in place.
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let mut body_builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
+        body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
         let element = body_builder.add_input(scalar_type.clone());
         body_builder
@@ -6859,7 +6849,7 @@ pub(crate) mod tests {
         let body = body_builder
             .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
                 vec![carry, current],
-                vec![Placeholder; 2],
+                vec![Placeholder; 3],
                 vec![Placeholder; 2],
             )
             .unwrap();
@@ -6924,6 +6914,7 @@ pub(crate) mod tests {
         // the view: `add_update(r[1], x_i)` over `r: ref<f32[2]>` gives `x̄_i = r̄[1]`.
         let vector_reference_type: ArrayIrType = ReferenceType::new(ArrayType::new_static(DataType::F32, [2])).into();
         let mut body_builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
+        body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(vector_reference_type.clone());
         let element = body_builder.add_input(scalar_type.clone());
         let view = body_builder
@@ -6935,7 +6926,7 @@ pub(crate) mod tests {
         let body = body_builder
             .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
                 vec![carry],
-                vec![Placeholder; 2],
+                vec![Placeholder; 3],
                 vec![Placeholder],
             )
             .unwrap();
@@ -6973,6 +6964,7 @@ pub(crate) mod tests {
         let scalar_type = ArrayIrType::Array(ArrayType::scalar(DataType::F32));
         let stack_type = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3]));
         let mut body_builder = ProgramBuilder::<ReferenceTestValue, ReferenceTestOperation>::new();
+        body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let carry = body_builder.add_input(ArrayIrType::from(ReferenceType::new(ArrayType::scalar(DataType::F32))));
         let element = body_builder.add_input(scalar_type.clone());
         body_builder
@@ -6981,7 +6973,7 @@ pub(crate) mod tests {
         let body = body_builder
             .build::<Vec<ReferenceTestValue>, Vec<ReferenceTestValue>>(
                 vec![carry, element],
-                vec![Placeholder; 2],
+                vec![Placeholder; 3],
                 vec![Placeholder; 2],
             )
             .unwrap();

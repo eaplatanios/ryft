@@ -316,7 +316,7 @@ impl<T: DifferentiableType> Operation for CustomVjpOperation<T> {
     fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
         // The primal computation region receives every operand at its own position. The forward and backward regions
         // are dormant rules that reference analysis does not enter, so they declare no provenance.
-        (region_index == 0).then_some(InputRegionProvenance::Forwarded { input_index })
+        (region_index == 0).then_some(InputRegionProvenance { input_index })
     }
 
     #[inline]
@@ -1104,7 +1104,7 @@ mod tests {
 
         // The primal computation region receives every operand at its own position and its outputs are the call's,
         // while the dormant rule regions declare no operand provenance.
-        assert_eq!(operation.input_region_provenance(0, 0), Some(InputRegionProvenance::Forwarded { input_index: 0 }),);
+        assert_eq!(operation.input_region_provenance(0, 0), Some(InputRegionProvenance { input_index: 0 }),);
         assert_eq!(operation.input_region_provenance(1, 0), None);
         assert_eq!(operation.input_region_provenance(2, 0), None);
         assert_eq!(

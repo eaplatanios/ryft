@@ -13,7 +13,7 @@ use ryft_macros::Operation;
 use crate::arrays::arrays::Array;
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::ir::ArrayIrValue;
-use crate::arrays::references::{ArrayReferenceViewIndex, ArrayReferenceViewTransform};
+use crate::arrays::references::ArrayReferenceViewTransform;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::{Dimension, DimensionType};
 use crate::arrays::types::ir::ArrayIrType;
@@ -59,11 +59,11 @@ use crate::operations::{
     ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew,
     ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation,
     ReferenceWrite, ReferenceWriteOperation, Rem, RemOperation, Reshape, ReshapeOperation, ReshardOperation, Round,
-    RoundOperation, Rsqrt, RsqrtOperation, SCAN_ITERATION_SYMBOL, ScaledDot, ScaledDotOperation, ScanOperation,
-    Scatter, ScatterOperation, Select, SelectOperation, ShardingConstraintOperation, Sign, SignOperation, Sin,
-    SinOperation, Slice, SliceOperation, Sqrt, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation,
-    TagOperation, Tanh, TanhOperation, TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice,
-    UpdateSliceOperation, WhileOperation, Xor, XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
+    RoundOperation, Rsqrt, RsqrtOperation, ScaledDot, ScaledDotOperation, ScanOperation, Scatter, ScatterOperation,
+    Select, SelectOperation, ShardingConstraintOperation, Sign, SignOperation, Sin, SinOperation, Slice,
+    SliceOperation, Sqrt, SqrtOperation, StopGradient, StopGradientOperation, Sub, SubOperation, TagOperation, Tanh,
+    TanhOperation, TransferToMemoryOperation, Transpose, TransposeOperation, UpdateSlice, UpdateSliceOperation,
+    WhileOperation, Xor, XorOperation, Zero, ZeroLike, ZeroLikeOperation, ZeroOperation,
 };
 use crate::partial::PartialValue;
 use crate::programs::{
@@ -99,8 +99,9 @@ pub(crate) use math::ElementExtremum;
 
 // TODO(eaplatanios): This seems a bit weirdly placed.
 pub use references::{
-    REFERENCE_INDEX_OPERATION_NAME, REFERENCE_SLICE_OPERATION_NAME, ReferenceIndex, ReferenceIndexOperation,
-    ReferenceSlice, ReferenceSliceOperation, reapply_array_reference_view, validate_array_reference_view,
+    REFERENCE_DYNAMIC_INDEX_OPERATION_NAME, REFERENCE_INDEX_OPERATION_NAME, REFERENCE_SLICE_OPERATION_NAME,
+    ReferenceDynamicIndex, ReferenceDynamicIndexOperation, ReferenceIndex, ReferenceIndexOperation, ReferenceSlice,
+    ReferenceSliceOperation, reapply_array_reference_view, validate_array_reference_view,
 };
 
 /// Reusable [`Operation`] enum for ordinary staged programs over arrays.
@@ -459,6 +460,9 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// Derives an axis-removing indexed view of a reference.
     ReferenceIndex(ReferenceIndexOperation),
 
+    /// Derives a reference view using a clamped scalar index operand.
+    ReferenceDynamicIndex(ReferenceDynamicIndexOperation),
+
     /// Derives a rank-preserving static slice view of a reference.
     ReferenceSlice(ReferenceSliceOperation),
 
@@ -550,18 +554,17 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 
 /// Operation-family constructors for the canonical array operations that one array-reference view traversal stages.
 ///
-/// Mapping between a reference root and one derived handle's coordinates is a sequence of slices, reshapes, and
-/// update-slices, and both consumers of that mapping — the eager handles and the
-/// [`ArrayReferenceDischarge`](crate::ArrayReferenceDischarge) policy — walk the same
-/// [`ArrayReferenceView`](crate::ArrayReferenceView). This contract is what lets the staging consumer put those
-/// operations into a closed operation family it does not otherwise know the shape of, so core array IR and
-/// backend-owned supersets share one traversal without matching operation names.
+/// Mapping between a reference root and one derived handle's selected elements uses static or dynamic slices,
+/// reshapes, and corresponding updates. Both eager handles and the
+/// [`ArrayReferenceDischarge`](crate::ArrayReferenceDischarge) policy walk the same [`ArrayReferenceView`](crate::ArrayReferenceView). This contract lets the staging consumer
+/// construct those operations in a closed operation family, so core array IR and backend-owned supersets share one
+/// traversal without matching operation names.
 ///
-/// The static view contract itself (which outputs are views, their [`ArrayReferenceViewTransform`] descriptions, their
+/// The view contract itself (which outputs are views, their [`ArrayReferenceViewTransform`] descriptions, their
 /// type-level validation, and their reapplication to a transformed reference) is the family's
 /// [`ReferenceViewOperation`] implementation, which this trait refines to the array universe so that the array view
 /// overlay ([`ArrayReferenceAnalysis`](crate::ArrayReferenceAnalysis)) and the array discharge policy share one
-/// bound. The three constructors here stage array-valued operations over *discharged* values and are discharge-only.
+/// bound. The constructors here stage array-valued operations over *discharged* values and are discharge-only.
 pub trait ArrayReferenceViewOperation:
     ReferenceViewOperation<Type = ArrayIrType, View = ArrayReferenceViewTransform>
 {
@@ -573,31 +576,24 @@ pub trait ArrayReferenceViewOperation:
 
     /// Wraps a canonical homogeneous array update-slice for reference-view staging.
     fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self;
+
+    /// Wraps a dynamic slice over discharged reference state.
+    fn from_reference_dynamic_slice(operation: DynamicSliceOperation) -> Self;
+
+    /// Wraps a dynamic update over discharged reference state.
+    fn from_reference_dynamic_update_slice(operation: DynamicUpdateSliceOperation) -> Self;
 }
 
 impl<A: Value<Type = ArrayType>> ReferenceViewOperation for ArrayIrOperation<A> {
     type View = ArrayReferenceViewTransform;
 
     fn reference_view(&self, output_index: usize) -> Option<ArrayReferenceViewTransform> {
-        // The two view derivations are the only members whose reference semantics declare a view alias, and each
+        // The view derivations are the only members whose reference semantics declare a view alias, and each
         // declares it at its single output.
         match self {
+            Self::ReferenceDynamicIndex(operation) if output_index == 0 => Some(operation.transform()),
             Self::ReferenceIndex(operation) if output_index == 0 => Some(operation.transform()),
             Self::ReferenceSlice(operation) if output_index == 0 => Some(operation.transform()),
-            _ => None,
-        }
-    }
-
-    fn region_input_view(&self, region_index: usize, input_index: usize) -> Option<ArrayReferenceViewTransform> {
-        // A scan body's trailing inputs are the per-iteration slices of the stacked operands: a reference-typed one is
-        // the stacked reference indexed on its leading axis by the iteration counter.
-        match self {
-            Self::Scan(operation) if region_index == 0 && input_index >= operation.carry_count() => {
-                Some(ArrayReferenceViewTransform::Index {
-                    axis: 0,
-                    index: ArrayReferenceViewIndex::Symbolic(SCAN_ITERATION_SYMBOL),
-                })
-            }
             _ => None,
         }
     }
@@ -632,6 +628,14 @@ impl<A: Value<Type = ArrayType>> ArrayReferenceViewOperation for ArrayIrOperatio
     fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self {
         Self::Array(ArrayOperation::UpdateSlice(operation))
     }
+
+    fn from_reference_dynamic_slice(operation: DynamicSliceOperation) -> Self {
+        Self::Array(ArrayOperation::DynamicSlice(operation))
+    }
+
+    fn from_reference_dynamic_update_slice(operation: DynamicUpdateSliceOperation) -> Self {
+        Self::Array(ArrayOperation::DynamicUpdateSlice(operation))
+    }
 }
 
 /// Value-level capability bundle paired with the [`ArrayIrOperation`] family.
@@ -647,7 +651,7 @@ impl<A: Value<Type = ArrayType>> ArrayReferenceViewOperation for ArrayIrOperatio
 ///     [`DimensionSize`], [`DimensionFromScalar`], [`DimensionToScalar`], [`DynamicBroadcast`], and
 ///     [`DynamicReshape`], the whole-value reference capabilities [`ReferenceNew`], [`ReferenceRead`],
 ///     [`ReferenceWrite`], [`ReferenceSwap`], [`ReferenceAddUpdate`], and [`ReferenceFreeze`], and the reference view
-///     derivations [`ReferenceIndex`] and [`ReferenceSlice`].
+///     derivations [`ReferenceIndex`], [`ReferenceDynamicIndex`], and [`ReferenceSlice`].
 ///   - Homogeneous array capabilities such as [`Add`], [`Dot`], and [`Reshape`] are *not* members. The composite
 ///     family carries the array member payloads through [`ArrayIrOperation::Array`], so a composite value performs
 ///     them through its [`ValueProjection`] view onto [`ArrayType`]. Bounding them here would demand
@@ -722,7 +726,7 @@ pub trait ArrayIrOperations:
     + DimensionArithmetic + DimensionSize + DimensionFromScalar + DimensionToScalar
     + DynamicBroadcast + DynamicReshape
     // Whole-value references.
-    + ReferenceNew + ReferenceIndex + ReferenceSlice + ReferenceRead + ReferenceWrite + ReferenceSwap
+    + ReferenceNew + ReferenceDynamicIndex + ReferenceIndex + ReferenceSlice + ReferenceRead + ReferenceWrite + ReferenceSwap
     + ReferenceAddUpdate
     + ReferenceFreeze
 {
@@ -735,7 +739,13 @@ where
     V: Value<Type = ArrayIrType> + Compare,
     V: DimensionArithmetic + DimensionSize + DimensionFromScalar + DimensionToScalar,
     V: DynamicBroadcast + DynamicReshape,
-    V: ReferenceNew + ReferenceIndex + ReferenceSlice + ReferenceRead + ReferenceWrite + ReferenceSwap,
+    V: ReferenceNew
+        + ReferenceDynamicIndex
+        + ReferenceIndex
+        + ReferenceSlice
+        + ReferenceRead
+        + ReferenceWrite
+        + ReferenceSwap,
     V: ReferenceAddUpdate,
     V: ReferenceFreeze,
     V: ValueProjection<ArrayType, Projected: ArrayOperations>,
@@ -1113,6 +1123,7 @@ mod tests {
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, DimensionOperation};
+    use crate::arrays::references::ArrayReferenceViewIndex;
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{
@@ -1804,23 +1815,13 @@ mod tests {
     }
 
     #[test]
-    fn test_array_ir_operation_region_input_view() {
-        // Only the scan member creates boundary views: every trailing body input is the per-iteration slice of the
-        // stacked operand at its position, indexed on the leading axis by the iteration counter, while carries are
-        // forwarded complete handles and no other member attaches a region with a view input.
-        let view = ArrayReferenceViewTransform::Index {
-            axis: 0,
-            index: ArrayReferenceViewIndex::Symbolic(SCAN_ITERATION_SYMBOL),
-        };
-        let scan = TestOperation::Scan(ScanOperation::new(1, 3));
-        assert_eq!(scan.region_input_view(0, 0), None);
-        assert_eq!(scan.region_input_view(0, 1), Some(view.clone()));
-        assert_eq!(scan.region_input_view(0, 2), Some(view.clone()));
-        assert_eq!(scan.region_input_view(1, 1), None);
-        assert_eq!(TestOperation::While(WhileOperation::new()).region_input_view(0, 0), None);
-        assert_eq!(TestOperation::ReferenceIndex(ReferenceIndexOperation::new(0, 1)).region_input_view(0, 0), None);
+    fn test_array_ir_operation_reference_view_dynamic_index() {
+        let view = ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(1) };
+        let operation = TestOperation::ReferenceDynamicIndex(ReferenceDynamicIndexOperation::new(0));
+        assert_eq!(operation.reference_view(0), Some(view.clone()));
+        assert_eq!(operation.reference_view(1), None);
 
-        // The pair the scan creates validates as one view step from the stacked reference to the per-iteration slice
+        // The dynamic selection validates as one view step from the stacked reference to the selected slice
         // reference, and any other output referent is a type mismatch.
         let stacked = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3, 2])));
         let slice = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2])));
@@ -3010,9 +3011,9 @@ mod tests {
             ArrayIrOperation::Compare(_) => MemberKindSignature::DimensionToArrayGateway,
             ArrayIrOperation::DimensionSize(_) => MemberKindSignature::GeometryMixed,
             ArrayIrOperation::ReferenceNew(_) => MemberKindSignature::ArrayToReference,
-            ArrayIrOperation::ReferenceIndex(_) | ArrayIrOperation::ReferenceSlice(_) => {
-                MemberKindSignature::ReferenceToReference
-            }
+            ArrayIrOperation::ReferenceDynamicIndex(_)
+            | ArrayIrOperation::ReferenceIndex(_)
+            | ArrayIrOperation::ReferenceSlice(_) => MemberKindSignature::ReferenceToReference,
             ArrayIrOperation::ReferenceRead(_) => MemberKindSignature::ReferenceToArray,
             ArrayIrOperation::ReferenceWrite(_) => MemberKindSignature::ReferenceAndArrayToUnit,
             ArrayIrOperation::ReferenceSwap(_) => MemberKindSignature::ReferenceAndArrayToArray,

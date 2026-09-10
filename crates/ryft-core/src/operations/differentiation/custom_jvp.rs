@@ -228,7 +228,7 @@ impl<T: DifferentiableType> Operation for CustomJvpOperation<T> {
     fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
         // The primal computation region receives every operand at its own position. The JVP region is a dormant rule
         // that reference analysis does not enter, so it declares no provenance.
-        (region_index == 0).then_some(InputRegionProvenance::Forwarded { input_index })
+        (region_index == 0).then_some(InputRegionProvenance { input_index })
     }
 
     #[inline]
@@ -676,7 +676,8 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayBatch, ArrayBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayOperation,
-        ArrayReference, ArrayReferenceDischarge, ArrayType, DataType, Dimension, Shape, ShardingDimension,
+        ArrayReference, ArrayReferenceDischarge, ArrayType, DataType, Dimension, ReferenceDynamicIndexOperation, Shape,
+        ShardingDimension,
     };
     use crate::axes::AxisIndexOperation;
     use crate::batching::{
@@ -870,7 +871,7 @@ mod tests {
 
         // The primal computation region receives every operand at its own position and its outputs are the call's,
         // while the dormant rule region declares no operand provenance.
-        assert_eq!(operation.input_region_provenance(0, 1), Some(InputRegionProvenance::Forwarded { input_index: 1 }),);
+        assert_eq!(operation.input_region_provenance(0, 1), Some(InputRegionProvenance { input_index: 1 }),);
         assert_eq!(operation.input_region_provenance(1, 1), None);
         assert_eq!(
             operation.output_region_provenance(0),
@@ -1255,8 +1256,23 @@ mod tests {
         let regions = stateful_square_regions(false)
             .into_iter()
             .map(|body| {
+                // Inline the existing rule into the explicit scan body, retaining its instructions and effects.
+                let mut indexed_body = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+                indexed_body.add_input(ArrayType::scalar(DataType::I64).into());
+                let body_inputs =
+                    body.input_types().iter().map(|r#type| indexed_body.add_input(r#type.clone())).collect::<Vec<_>>();
+                let outputs = indexed_body.splice_program(&body, &body_inputs).unwrap();
+                let output_count = outputs.len();
+                let body = indexed_body
+                    .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
+                        outputs,
+                        vec![Placeholder; 1 + body_inputs.len()],
+                        vec![Placeholder; output_count],
+                    )
+                    .unwrap();
                 let mut builder = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
-                let inputs = (0..body.input_ids().len()).map(|_| builder.add_input(vector.clone())).collect::<Vec<_>>();
+                let inputs =
+                    (0..body.input_ids().len() - 1).map(|_| builder.add_input(vector.clone())).collect::<Vec<_>>();
                 let body = builder.import_program(body);
                 let outputs = builder
                     .add_instruction(ScanOperation::new(0, 3), vec![body], inputs.clone(), None)
@@ -1389,10 +1405,21 @@ mod tests {
             // either another carry or a per-iteration scalar view of the stacked reference. Each iteration writes
             // through the unknown formal, then reads through the known formal.
             let mut body = ProgramBuilder::<ArrayIrValue<Array>, ArrayIrOperation<Array>>::new();
+            let index = body.add_input(ArrayType::scalar(DataType::I64).into());
             let known_reference = body.add_input(reference_type.clone());
             let increment = body.add_input(scalar_type.clone());
-            let unknown_reference =
-                body.add_input(ArrayIrType::Reference(ReferenceType::new(ArrayType::scalar(DataType::F32))));
+            let unknown_root = body.add_input(reference_type.clone());
+            let unknown_reference = if scanned_view {
+                body.add_instruction(
+                    ReferenceDynamicIndexOperation::new(0),
+                    Vec::new(),
+                    vec![unknown_root, index],
+                    None,
+                )
+                .unwrap()[0]
+            } else {
+                unknown_root
+            };
             body.add_instruction(
                 ReferenceAddUpdateOperation::new(),
                 Vec::new(),
@@ -1420,7 +1447,7 @@ mod tests {
             let body = body
                 .build::<Vec<ArrayIrValue<Array>>, Vec<ArrayIrValue<Array>>>(
                     body_outputs,
-                    vec![Placeholder; 3],
+                    vec![Placeholder; 4],
                     vec![Placeholder; carry_count],
                 )
                 .unwrap();

@@ -38,15 +38,15 @@ use ryft_core::{
     PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program, ProgramBatchingOutputAxesPolicy,
     ProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation, ReduceOperation, ReferenceAddUpdateOperation,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
-    ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceIndexOperation, ReferenceNewOperation,
-    ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation, ReferenceViewOperation,
-    ReferenceViewValidationError, ReferenceWriteOperation, RegionInterface, RegionSlot, RemOperation, ReshapeOperation,
-    ReshardOperation, ResidualZeroProvider, RoundOperation, RsqrtOperation, ScaledDotOperation, ScanOperation,
-    ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation, SinOperation, SliceOperation,
-    SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation, TanhOperation, Tracer,
-    TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionContext,
-    TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection,
-    ViewIndex, ViewSymbol, WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
+    ReferenceDischargeableOperation, ReferenceDynamicIndexOperation, ReferenceFreezeOperation, ReferenceIndexOperation,
+    ReferenceNewOperation, ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation,
+    ReferenceViewOperation, ReferenceViewValidationError, ReferenceWriteOperation, RegionInterface, RegionSlot,
+    RemOperation, ReshapeOperation, ReshardOperation, ResidualZeroProvider, RoundOperation, RsqrtOperation,
+    ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation,
+    SinOperation, SliceOperation, SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation,
+    TanhOperation, Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation,
+    TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation,
+    Value, ValueProjection, WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
     discharge_positional_region_operation, reapply_array_reference_view, validate_array_reference_view,
 };
 use ryft_macros::Parameter;
@@ -282,6 +282,9 @@ where
     /// Unresolved axis-removing reference view retained until reference discharge.
     ReferenceIndex(ReferenceIndexOperation),
 
+    /// Unresolved dynamic axis-removing reference view retained until reference discharge.
+    ReferenceDynamicIndex(ReferenceDynamicIndexOperation),
+
     /// Unresolved static slice reference view retained until reference discharge.
     ReferenceSlice(ReferenceSliceOperation),
 
@@ -381,22 +384,12 @@ where
     type View = ArrayReferenceViewTransform;
 
     fn reference_view(&self, output_index: usize) -> Option<ArrayReferenceViewTransform> {
-        // The two view derivations are the only members whose effects declare a view alias, each at its
+        // The view derivations are the only members whose effects declare a view alias, each at its
         // single output; every other member and every backend-owned higher-order operation derives no view.
         match self {
             Self::ReferenceIndex(operation) if output_index == 0 => Some(operation.transform()),
+            Self::ReferenceDynamicIndex(operation) if output_index == 0 => Some(operation.transform()),
             Self::ReferenceSlice(operation) if output_index == 0 => Some(operation.transform()),
-            _ => None,
-        }
-    }
-
-    fn region_input_view(&self, region_index: usize, input_index: usize) -> Option<ArrayReferenceViewTransform> {
-        // A scan body's trailing inputs are the per-iteration slices of the stacked operands: a reference-typed one is
-        // the stacked reference indexed on its leading axis by the iteration counter.
-        match self {
-            Self::Scan(operation) if region_index == 0 && input_index >= operation.carry_count() => {
-                Some(ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Symbolic(ViewSymbol::Iteration) })
-            }
             _ => None,
         }
     }
@@ -434,6 +427,14 @@ where
     fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self {
         Self::Array(ArrayOperation::UpdateSlice(operation))
     }
+
+    fn from_reference_dynamic_slice(operation: DynamicSliceOperation) -> Self {
+        Self::Array(ArrayOperation::DynamicSlice(operation))
+    }
+
+    fn from_reference_dynamic_update_slice(operation: DynamicUpdateSliceOperation) -> Self {
+        Self::Array(ArrayOperation::DynamicUpdateSlice(operation))
+    }
 }
 
 impl<Constant> From<ArrayOperation<Constant::Projected>> for XlaOperation<Constant>
@@ -464,6 +465,7 @@ where
             ArrayIrOperation::DimensionSize(operation) => Self::DimensionSize(operation),
             ArrayIrOperation::ReferenceNew(operation) => Self::ReferenceNew(operation),
             ArrayIrOperation::ReferenceIndex(operation) => Self::ReferenceIndex(operation),
+            ArrayIrOperation::ReferenceDynamicIndex(operation) => Self::ReferenceDynamicIndex(operation),
             ArrayIrOperation::ReferenceSlice(operation) => Self::ReferenceSlice(operation),
             ArrayIrOperation::ReferenceRead(operation) => Self::ReferenceRead(operation),
             ArrayIrOperation::ReferenceWrite(operation) => Self::ReferenceWrite(operation),
@@ -762,6 +764,7 @@ where
             Self::DimensionSize(operation) => ArrayIrOperation::DimensionSize(operation.clone()),
             Self::ReferenceNew(operation) => ArrayIrOperation::ReferenceNew(*operation),
             Self::ReferenceIndex(operation) => ArrayIrOperation::ReferenceIndex(*operation),
+            Self::ReferenceDynamicIndex(operation) => ArrayIrOperation::ReferenceDynamicIndex(*operation),
             Self::ReferenceSlice(operation) => ArrayIrOperation::ReferenceSlice(operation.clone()),
             Self::ReferenceRead(operation) => ArrayIrOperation::ReferenceRead(*operation),
             Self::ReferenceWrite(operation) => ArrayIrOperation::ReferenceWrite(*operation),
@@ -913,7 +916,7 @@ impl<T: Type> Operation for JitCallOperation<T> {
 
     #[inline]
     fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
-        (region_index == 0).then_some(InputRegionProvenance::Forwarded { input_index })
+        (region_index == 0).then_some(InputRegionProvenance { input_index })
     }
 
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
@@ -1340,10 +1343,10 @@ pub fn transpose_primal_jit_call<
     // A jitted call with no live output cotangents and no live reference operand is a zero linear map, so every
     // operand cotangent is zero. A live reference operand keeps the call live, because its accumulated state cotangent
     // flows through the transposed callee even when no ordinary output cotangent does.
-    check_count!("input", cotangents.destination_kinds(), inputs.len(), ProgramError);
+    check_count!("input", cotangents.kinds(), inputs.len(), ProgramError);
     if outputs.iter().all(MaybeZero::is_zero)
-        && !cotangents.has_live_reference_state()
-        && !driver.region(0)?.has_observable_transpose_effects()
+        && !cotangents.has_reference_state_destinations()
+        && !driver.region(0)?.has_observable_effects_in_closure()
     {
         return inputs
             .iter()
@@ -1365,8 +1368,13 @@ pub fn transpose_primal_jit_call<
     // callee maps `[non_reference_output_cotangents..., cotangent_references..., known_input_values...]` to
     // `[linear_input_cotangents...]`, in callee-input order, where a live reference input's cotangent is its cotangent
     // reference itself and a dead reference input has no cotangent slot.
-    let transposed_callee =
-        driver.transpose_program(callee, operand_linear.as_slice(), cotangents.destination_kinds())?;
+    let (input_indices, destination_kinds): (Vec<_>, Vec<_>) = operand_linear
+        .iter()
+        .zip(cotangents.kinds())
+        .enumerate()
+        .filter_map(|(index, (linear, kind))| linear.then_some((index, *kind)))
+        .unzip();
+    let transposed_callee = driver.transpose_program(callee, &input_indices, &destination_kinds)?;
 
     // Stage the output cotangents, materializing a typed zero for each structurally zero cotangent, then stage a fresh
     // `jit_call` over the transposed callee on `[outputs..., cotangent_references..., known_input_values...]`. Its
@@ -1431,7 +1439,7 @@ where
 {
     fn transpose<D: TranspositionDriver<V, XlaOperation<V>>>(
         &self,
-        context: &mut TranspositionContext<'_, V, XlaOperation<V>>,
+        context: &mut TranspositionContext<V, XlaOperation<V>>,
         driver: &D,
         inputs: &[PartialValue<Tracer<TracingContext<V, XlaOperation<V>>>>],
         outputs: &[MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>],
@@ -1441,7 +1449,7 @@ where
         check_count!("accumulator", accumulators, inputs.len(), DifferentiationError);
         let contributions =
             (|| -> Result<Vec<MaybeZero<Tracer<TracingContext<V, XlaOperation<V>>>>>, DifferentiationError> {
-                let cotangents = context.cotangent_destinations(inputs, accumulators)?;
+                let cotangents = context.cotangent_destinations(driver, inputs, accumulators)?;
                 transpose_primal_jit_call(self, context, driver, inputs, outputs, &cotangents)
                     .map_err(DifferentiationError::from)
             })()?;
@@ -1461,19 +1469,19 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayIrOperation, ArrayIrOperations, ArrayIrType, ArrayOperation, ArrayOperations,
-        ArrayReferenceViewTransform, ArrayType, CaptureReference, CapturingContext, ConditionOperation, Context,
-        CotangentDestinationKind, CotangentDestinations, CustomJvpOperation, CustomVjpOperation, DataType,
-        DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation,
-        DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, DynamicBroadcastOperation,
-        EffectClasses, ExternalReferenceBinding, InputRegionProvenance, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType,
-        MulOperation, Operation, OutputRegionProvenance, PartialValue, Placeholder, ProgramBuilder, ProgramError,
-        ReferenceAddUpdateOperation, ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceFreezeOperation,
-        ReferenceIndexOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSource,
-        ReferenceSwapOperation, ReferenceType, ReferenceViewOperation, ReferenceViewValidationError,
+        ArrayReferenceViewIndex, ArrayReferenceViewTransform, ArrayType, CaptureReference, CapturingContext,
+        ConditionOperation, Context, CotangentDestinationKind, CotangentDestinations, CustomJvpOperation,
+        CustomVjpOperation, DataType, DifferentiableType, DifferentiationError, Dimension, DimensionBounds,
+        DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable, DomainTracingContext,
+        DynamicBroadcastOperation, EffectClasses, ExternalReferenceBinding, InputRegionProvenance, LogicalMesh,
+        MaybeZero, MeshAxis, MeshAxisType, MulOperation, Operation, OutputRegionProvenance, PartialValue, Placeholder,
+        ProgramBuilder, ProgramError, ReferenceAddUpdateOperation, ReferenceDischargeResult, ReferenceDischargeTarget,
+        ReferenceDynamicIndexOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
+        ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceViewOperation, ReferenceViewValidationError,
         ReferenceWriteOperation, RegionDriver, RegionInterface, RegionRef, RematerializeOperation,
         ResidualZeroProvider, ScanOperation, Shape, Sharding, ShardingDimension, StagingContext, Tracer,
-        TracingContext, TranspositionDriver, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection, ViewIndex,
-        ViewSymbol, WhileOperation, ZeroOperation,
+        TracingContext, TranspositionDriver, TypeError, TypeIdentityRenaming, Typed, Value, ValueProjection,
+        WhileOperation, ZeroOperation,
     };
 
     use crate::Array;
@@ -1508,7 +1516,7 @@ mod tests {
         fn transpose_program(
             &self,
             _region: RegionRef<'_, XlaConstant, XlaOperation>,
-            _input_linearity: &[bool],
+            _input_indices: &[usize],
             _destination_kinds: &[CotangentDestinationKind],
         ) -> Result<Arc<XlaProgram<Vec<XlaConstant>, Vec<XlaConstant>>>, DifferentiationError> {
             Ok(Arc::new(self.transposed.clone()))
@@ -1524,7 +1532,7 @@ mod tests {
         // A jitted call forwards its operands to the callee positionally, so region provenance, capture counts, and
         // output provenance are all index-preserving for the single callee region and absent for any other region.
         let operation = JitCallOperation::<ArrayIrType>::new(2);
-        assert_eq!(operation.input_region_provenance(0, 3), Some(InputRegionProvenance::Forwarded { input_index: 3 }),);
+        assert_eq!(operation.input_region_provenance(0, 3), Some(InputRegionProvenance { input_index: 3 }),);
         assert_eq!(operation.input_region_provenance(1, 3), None);
         assert_eq!(operation.region_capture_input_count(0), Some(2));
         assert_eq!(operation.region_capture_input_count(1), None);
@@ -1809,20 +1817,11 @@ mod tests {
     }
 
     #[test]
-    fn test_xla_operation_region_input_view() {
-        // The backend-owned scan creates the same boundary views as the core composite scan: every trailing body input
-        // is the per-iteration slice of its stacked operand, indexed on the leading axis by the iteration counter.
-        let view = ArrayReferenceViewTransform::Index { axis: 0, index: ViewIndex::Symbolic(ViewSymbol::Iteration) };
-        let scan = XlaOperation::<XlaConstant>::Scan(ScanOperation::new(1, 3));
-        assert_eq!(scan.region_input_view(0, 0), None);
-        assert_eq!(scan.region_input_view(0, 1), Some(view.clone()));
-        assert_eq!(scan.region_input_view(0, 2), Some(view.clone()));
-        assert_eq!(scan.region_input_view(1, 1), None);
-        assert_eq!(XlaOperation::<XlaConstant>::While(WhileOperation::new()).region_input_view(0, 0), None);
-        assert_eq!(
-            XlaOperation::<XlaConstant>::ReferenceIndex(ReferenceIndexOperation::new(0, 1)).region_input_view(0, 0),
-            None,
-        );
+    fn test_xla_operation_reference_view() {
+        let operation = XlaOperation::<XlaConstant>::ReferenceDynamicIndex(ReferenceDynamicIndexOperation::new(0));
+        let view = ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(1) };
+        assert_eq!(operation.reference_view(0), Some(view.clone()));
+        assert_eq!(operation.reference_view(1), None);
         let stacked = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3, 2])));
         let slice = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2])));
         assert_eq!(XlaOperation::<XlaConstant>::validate_view(&view, &stacked, &slice), Ok(()));
@@ -3179,6 +3178,7 @@ mod tests {
     fn test_scan_reference_discharge_widens_carries_and_preserves_scan_metadata() {
         let reference_type = ReferenceType::new(vector_type());
         let mut body_builder = ProgramBuilder::<XlaConstant, XlaOperation>::new();
+        body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let body_carry = body_builder.add_input(vector_type().into());
         let reference =
             body_builder.add_constant(XlaConstant::Captured(CaptureReference::new(0, reference_type.clone().into())));
@@ -3188,7 +3188,7 @@ mod tests {
         let body = body_builder
             .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                 vec![body_carry, value],
-                vec![Placeholder],
+                vec![Placeholder; 2],
                 vec![Placeholder; 2],
             )
             .unwrap();

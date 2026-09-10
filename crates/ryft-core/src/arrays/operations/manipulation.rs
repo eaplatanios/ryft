@@ -33,7 +33,7 @@ use crate::operations::{
     GatherOperation, GatherScatterMode, PAD_OPERATION_NAME, Pad, PadOperation, Permutation, Reshape, ReshapeParameters,
     Scatter, ScatterOperation, ScatterReductionKind, Slice, Transpose, UpdateSlice, Zero,
 };
-use crate::programs::{ProgramError, TypeError, Typed, Value, ValueProjection};
+use crate::programs::{Concretizable, ProgramError, TypeError, Typed, Value, ValueProjection};
 
 impl<A: DimensionSize<usize> + Pad + Value<Type = ArrayType>>
     InterpretableOperation<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>> for PadOperation<ArrayIrType>
@@ -254,9 +254,9 @@ impl Array {
             .iter()
             .enumerate()
             .map(|(axis, index)| {
-                let addressing = ArrayAddressing::new(index.r#type().into_owned()).unwrap();
-                let raw = index.index_value(&addressing, &[]);
-                let maximum = (input_shape[axis] - block_sizes[axis]) as i64;
+                // Input validation guarantees a scalar integer. Preserve unsigned extremes until after clamping.
+                let raw: i128 = index.concretize().unwrap();
+                let maximum = (input_shape[axis] - block_sizes[axis]) as i128;
                 raw.clamp(0, maximum) as usize
             })
             .collect()
@@ -733,6 +733,13 @@ mod tests {
     use crate::tracing::TracingContext;
 
     use super::*;
+
+    #[test]
+    fn test_array_dynamic_slice_unsigned_extreme() {
+        let input = Array::vector(vec![1_i32, 2, 3]);
+        assert_eq!(input.dynamic_slice(&[Array::scalar(u64::MAX)], &[1]), Ok(Array::vector(vec![3_i32])));
+        assert_eq!(input.dynamic_slice(&[Array::scalar(i64::MIN)], &[1]), Ok(Array::vector(vec![1_i32])));
+    }
 
     #[test]
     fn test_array_ir_reshape_partial_evaluation() {

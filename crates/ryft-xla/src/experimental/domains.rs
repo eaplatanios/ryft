@@ -4378,6 +4378,7 @@ fn data_dependent_padding_discipline(operation: &XlaOperation) -> DataDependentP
         XlaOperation::CustomCall(_) => Unsupported { reason: "custom-call physical-padding semantics are opaque" },
         XlaOperation::ReferenceNew(_)
         | XlaOperation::ReferenceIndex(_)
+        | XlaOperation::ReferenceDynamicIndex(_)
         | XlaOperation::ReferenceSlice(_)
         | XlaOperation::ReferenceRead(_)
         | XlaOperation::ReferenceWrite(_)
@@ -5334,7 +5335,7 @@ mod tests {
         CumulativeProductOperation, CumulativeSumOperation, CustomJvpOperation, Dimension, DimensionAddOperation,
         DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionRemOperation, DimensionRequirementOperation,
         DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation, DotDimensionNumbers,
-        DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation, DynamicShapeSliceOperation, Fill,
+        DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, Fill,
         IotaOperation, LogSumExpOperation, MulOperation, NegOperation, OneOperation, PrintOperation,
         RaggedDotDimensionNumbers, RaggedDotOperation, ReduceOperation, ReductionKind, ReferenceAddUpdate,
         ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceIndexOperation, ReferenceNew,
@@ -10168,6 +10169,7 @@ mod tests {
 
         let body = {
             let mut builder = XlaProgramBuilder::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
             let reference = builder.add_input(reference_type.into());
             let update = builder
                 .add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), Vec::new(), None)
@@ -10180,7 +10182,7 @@ mod tests {
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![reference, value],
-                    vec![Placeholder],
+                    vec![Placeholder, Placeholder],
                     vec![Placeholder; 2],
                 )
                 .unwrap()
@@ -10230,6 +10232,7 @@ mod tests {
 
         let body = {
             let mut builder = XlaProgramBuilder::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
             let reference = builder.add_input(reference_type.into());
             let update = builder
                 .add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), Vec::new(), None)
@@ -10238,7 +10241,11 @@ mod tests {
                 .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![reference, update], None)
                 .unwrap();
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![reference], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![reference],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder],
+                )
                 .unwrap()
         };
 
@@ -11024,6 +11031,37 @@ mod tests {
     }
 
     #[test]
+    fn test_eager_bind_clamps_unsigned_dynamic_indices_without_narrowing() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::new(&client);
+        let input = ArrayIrValue::Array(f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]));
+        let index = ArrayIrValue::Array(
+            Array::from_host_buffer(&client, ArrayType::scalar(DataType::U64), mesh.clone(), u64::MAX.to_ne_bytes())
+                .unwrap(),
+        );
+
+        // An unsigned index larger than i64::MAX selects the last valid slice, rather than wrapping negative.
+        let sliced = domain
+            .bind(
+                XlaOperation::Array(ArrayOperation::DynamicSlice(DynamicSliceOperation::new(vec![1]))),
+                Vec::new(),
+                &[input.clone(), index.clone()],
+            )
+            .unwrap();
+        assert_eq!(read_f32s(&client, program_array(&sliced[0])), vec![3.0]);
+        let updated = domain
+            .bind(
+                XlaOperation::Array(ArrayOperation::DynamicUpdateSlice(DynamicUpdateSliceOperation)),
+                Vec::new(),
+                &[input, ArrayIrValue::Array(f32_vector(&client, &mesh, &[9.0])), index],
+            )
+            .unwrap();
+        assert_eq!(read_f32s(&client, program_array(&updated[0])), vec![1.0, 2.0, 9.0]);
+    }
+
+    #[test]
     fn test_eager_bind_executes_scan_with_per_step_outputs() {
         use ryft_core::ScanOperation;
 
@@ -11033,10 +11071,11 @@ mod tests {
         let domain = XlaDomain::new(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
 
-        // Carry-only scan body `carry -> (carry + 1, carry + 1)`: the first output is the next carry and the second
+        // Carry-only scan body `(index, carry) -> (carry + 1, carry + 1)`: the first output is the next carry and the second
         // is the per-step stacked output, so scanning 4 steps from `0` yields the cumulative sums `[1, 2, 3, 4]`.
         let body = {
             let mut builder = XlaProgramBuilder::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             let one =
                 builder.add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), vec![], None).unwrap()[0];
@@ -11044,7 +11083,7 @@ mod tests {
             builder
                 .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
                     vec![next, next],
-                    vec![Placeholder; 1],
+                    vec![Placeholder; 2],
                     vec![Placeholder; 2],
                 )
                 .unwrap()
@@ -11058,6 +11097,41 @@ mod tests {
         assert_eq!(read_f32s(&client, program_array(&outputs[0])), vec![4.0]);
         assert_eq!(program_array(&outputs[1]).shape(), StaticShape::new(vec![4]));
         assert_eq!(read_f32s(&client, program_array(&outputs[1])), vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_eager_bind_executes_scan_with_explicit_slice_index() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = domain_mesh(&client, "x", 1);
+        let domain = XlaDomain::new(&client);
+        let scalar_type = ArrayType::scalar(DataType::I64);
+        let body = {
+            let mut builder = XlaProgramBuilder::new();
+            let index = builder.add_input(scalar_type.clone().into());
+            builder.add_input(scalar_type.clone().into());
+            builder
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![index, index],
+                    vec![Placeholder; 2],
+                    vec![Placeholder; 2],
+                )
+                .unwrap()
+        };
+
+        // The carry records the last visited index; stacked results retain slice order even when visits reverse.
+        // Check the same contract for looped, partially unrolled, and fully unrolled lowering.
+        for (reverse, unroll, last_index) in
+            [(false, 1, 3), (true, 1, 0), (false, 2, 3), (true, 2, 0), (false, 4, 3), (true, 4, 0)]
+        {
+            let initial =
+                Array::from_host_buffer(&client, scalar_type.clone(), mesh.clone(), &(-1_i64).to_ne_bytes()).unwrap();
+            let scan = ScanOperation::<XlaConstant>::new(1, 4).with_reverse(reverse).with_unroll(unroll).unwrap();
+            let outputs =
+                domain.bind(XlaOperation::Scan(scan), [body.clone()], &[ArrayIrValue::Array(initial)]).unwrap();
+            assert_eq!(read_i64s(&client, program_array(&outputs[0])), vec![last_index]);
+            assert_eq!(read_i64s(&client, program_array(&outputs[1])), vec![0, 1, 2, 3]);
+        }
     }
 
     #[test]
@@ -11077,12 +11151,17 @@ mod tests {
 
         let body = {
             let mut builder = XlaProgramBuilder::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             let one =
                 builder.add_instruction(OneOperation::new(scalar_type.clone()), Vec::new(), vec![], None).unwrap()[0];
             let next = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, one], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![next], vec![Placeholder], vec![Placeholder])
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(
+                    vec![next],
+                    vec![Placeholder, Placeholder],
+                    vec![Placeholder],
+                )
                 .unwrap()
         };
         let scan = ScanOperation::<XlaConstant>::new(1, length.r#type().to_dimension());
@@ -11108,17 +11187,18 @@ mod tests {
         let domain = XlaDomain::new(&client);
         let scalar_type = ArrayType::scalar(DataType::F32);
 
-        // Cumulative-sum scan body `(carry, x) -> (carry + x, carry + x)` over the stacked input `[1, 2, 3, 4]`
+        // Cumulative-sum scan body `(index, carry, x) -> (carry + x, carry + x)` over the stacked input `[1, 2, 3, 4]`
         // starting from carry `0`: the final carry is the total `10` and the stacked per-step outputs are the
         // running sums `[1, 3, 6, 10]`. The body's metadata-free declared types are refined by the concrete input
         // types, which carry normalized shardings, so the scan binds eagerly despite the metadata mismatch.
         let body = {
             let mut builder = XlaProgramBuilder::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             let x = builder.add_input(scalar_type.clone().into());
             let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, x], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum, sum], vec![Placeholder; 2], vec![Placeholder; 2])
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum, sum], vec![Placeholder; 3], vec![Placeholder; 2])
                 .unwrap()
         };
         let scan = ScanOperation::<XlaConstant>::new(1, 4);
@@ -11149,11 +11229,12 @@ mod tests {
         // output types leave shardings unspecified, so the outputs come back replicated over the mesh.
         let body = {
             let mut builder = XlaProgramBuilder::new();
+            builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = builder.add_input(scalar_type.clone().into());
             let x = builder.add_input(scalar_type.clone().into());
             let sum = builder.add_instruction(AddOperation::new(), Vec::new(), vec![carry, x], None).unwrap()[0];
             builder
-                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum, sum], vec![Placeholder; 2], vec![Placeholder; 2])
+                .build::<Vec<XlaConstant>, Vec<XlaConstant>>(vec![sum, sum], vec![Placeholder; 3], vec![Placeholder; 2])
                 .unwrap()
         };
         let scan = ScanOperation::<XlaConstant>::new(1, 4);

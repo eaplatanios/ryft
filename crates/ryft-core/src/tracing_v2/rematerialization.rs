@@ -380,9 +380,8 @@ impl<T: DifferentiableType> Operation for RematerializeOperation<T> {
         // only the leading non-differentiated operands positionally; the rest of their boundaries is bound by the
         // forward tail and by the transform that consumes the rule, not by the operands directly.
         match region_index {
-            0 | 1 => Some(InputRegionProvenance::Forwarded { input_index }),
-            2 | 3 => (input_index < self.non_differentiated_count)
-                .then_some(InputRegionProvenance::Forwarded { input_index }),
+            0 | 1 => Some(InputRegionProvenance { input_index }),
+            2 | 3 => (input_index < self.non_differentiated_count).then_some(InputRegionProvenance { input_index }),
             _ => None,
         }
     }
@@ -945,8 +944,7 @@ impl<'a, T: Type, O: Operation<Type = T>> RematerializationCandidate<'a, T, O> {
             let source = if let Some(input_index) = region.input_ids().iter().position(|input| *input == atom)
                 && let Some(origin) = instruction.operation().input_region_provenance(origin.region_index, input_index)
             {
-                let (InputRegionProvenance::Forwarded { input_index } | InputRegionProvenance::View { input_index }) =
-                    origin;
+                let InputRegionProvenance { input_index } = origin;
                 let atom = instruction.inputs().get(input_index).copied().ok_or_else(|| {
                     RematerializationError::UnsupportedProvenance {
                         message: format!(
@@ -2908,7 +2906,7 @@ mod tests {
     /// still produces the reference gradient (unsaved loop residuals recompute through the replayed known scan).
     #[test]
     fn test_rematerialization_policies_classify_residuals_inside_scan_bodies() {
-        // Loop body `[c, x] -> [c * (x · x)]` over three two-element rows: `f(c0) = c0 * Π |xᵢ|²`.
+        // Loop body `[index, c, x] -> [c * (x · x)]` over three two-element rows: `f(c0) = c0 * Π |xᵢ|²`.
         let rows = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]];
         let squared_norms: Vec<f64> = rows.iter().map(|row| row.iter().map(|value| value * value).sum()).collect();
         let expected_gradient: f64 = squared_norms.iter().product();
@@ -2918,6 +2916,7 @@ mod tests {
             use crate::programs::ProgramBuilder;
 
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            builder.add_input(ArrayType::scalar(DataType::I64));
             let carry = builder.add_input(ArrayType::scalar(DataType::F64));
             let row = builder.add_input(vector_type(2));
             let dot = builder
@@ -2932,7 +2931,7 @@ mod tests {
                 .add_instruction(crate::operations::math::MulOperation::new(), Vec::new(), vec![carry, dot], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<Array>, Vec<Array>>(vec![next], vec![Placeholder; 2], vec![Placeholder; 1])
+                .build::<Vec<Array>, Vec<Array>>(vec![next], vec![Placeholder; 3], vec![Placeholder; 1])
                 .unwrap()
         };
         let stacked = Array::from_f64s(
@@ -4163,7 +4162,7 @@ mod tests {
         use crate::parameters::Placeholder;
         use crate::programs::ProgramBuilder;
 
-        // Loop body `[c, x] -> [c * (x · x), x · x]`: the body's *second* output (the per-iteration dot) is defined
+        // Loop body `[index, c, x] -> [c * (x · x), x · x]`: the body's *second* output (the per-iteration dot) is defined
         // by the dot instruction's *first* (and only) output. Classifying the scan's stacked output at scan output
         // index 1 must therefore report the dot operation with the producer-local `output_index` 0 — not the outer
         // scan output index — while `residual_type` stays the outer stacked type.
@@ -4171,6 +4170,7 @@ mod tests {
         let row_type = vector_type(2);
         let body = {
             let mut builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+            builder.add_input(ArrayType::scalar(DataType::I64));
             let carry = builder.add_input(scalar_type.clone());
             let row = builder.add_input(row_type.clone());
             let dot = builder
@@ -4185,7 +4185,7 @@ mod tests {
                 .add_instruction(crate::operations::math::MulOperation::new(), Vec::new(), vec![carry, dot], None)
                 .unwrap()[0];
             builder
-                .build::<Vec<Array>, Vec<Array>>(vec![next, dot], vec![Placeholder; 2], vec![Placeholder; 2])
+                .build::<Vec<Array>, Vec<Array>>(vec![next, dot], vec![Placeholder; 3], vec![Placeholder; 2])
                 .unwrap()
         };
         let stacked_type = ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Static(3)]));
@@ -4203,9 +4203,10 @@ mod tests {
         // Partial evaluation can wrap a saved stack in a scan that only forwards each slice. Its input provenance
         // must lead back to the original dot rather than hiding that producer at the intermediate region boundary.
         let mut identity_builder = ProgramBuilder::<Array, ArrayOperation<Array>>::new();
+        identity_builder.add_input(ArrayType::scalar(DataType::I64));
         let input = identity_builder.add_input(ArrayType::scalar(DataType::F64));
         let identity = identity_builder
-            .build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder], vec![Placeholder])
+            .build::<Vec<Array>, Vec<Array>>(vec![input], vec![Placeholder; 2], vec![Placeholder])
             .unwrap();
         let identity_region = builder.import_region(identity.entry_region_ref());
         let forwarded = builder
@@ -4816,7 +4817,7 @@ mod tests {
                 _region_index: usize,
                 input_index: usize,
             ) -> Option<InputRegionProvenance> {
-                Some(InputRegionProvenance::Forwarded { input_index })
+                Some(InputRegionProvenance { input_index })
             }
 
             fn effects(&self) -> Cow<'_, Effects> {

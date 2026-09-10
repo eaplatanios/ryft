@@ -1568,28 +1568,16 @@ pub struct InstantiatedRegionMapping<T: Type> {
     pub destination_region: RegionId,
 }
 
-/// Describes how one input of a [`Region`] attached to an [`Operation`] originates from an input of that operation.
-/// The [`Operation::input_region_provenance`] function identifies the attached region and its input. The `input_index`
-/// stored here always identifies the source in the parent operation's input list. Despite the related name, this is
-/// unrelated to the non-semantic diagnostic [`Provenance`](crate::Provenance) recorded on instructions. This type
-/// instead describes real dataflow that transforms rely on.
+/// Identifies the operation input supplying an attached [`Region`] input. The region and its input position are
+/// selected by [`Operation::input_region_provenance`]; `input_index` identifies the source in the operation's input
+/// list. This records dataflow correspondence and not equality of runtime values (e.g., a `scan` operation supplies
+/// a slice of a stacked array and an evolving carry from the corresponding operation inputs). Reference inputs must
+/// preserve complete handle identity; views are constructed explicitly inside the region. Unlike diagnostic
+/// [`Provenance`](crate::Provenance), this information carries semantics used by transforms and analyses.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum InputRegionProvenance {
-    /// The attached region receives the operation input itself, preserving the complete value and, for a reference,
-    /// its complete handle identity.
-    Forwarded {
-        /// Index of the source in the parent operation's input list.
-        input_index: usize,
-    },
-
-    /// The operation derives a view of its input for the attached region. For a reference-typed region input,
-    /// the view preserves the source reference's allocation identity while selecting only part of its stored value.
-    /// The operation family describes that selection through
-    /// [`ReferenceViewOperation::region_input_view`](crate::ReferenceViewOperation::region_input_view).
-    View {
-        /// Index of the source in the parent operation's input list.
-        input_index: usize,
-    },
+pub struct InputRegionProvenance {
+    /// Index of the source in the parent operation's input list.
+    pub input_index: usize,
 }
 
 /// Identifies one attached [`Region`] output that may produce an [`Operation`] output. Provenance is relative to an

@@ -316,8 +316,8 @@ pub use values::{
 
 pub use views::{
     NoReferenceViewBinding, ReferenceView, ReferenceViewAnalysis, ReferenceViewAnalysisError, ReferenceViewOperation,
-    ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep, ReferenceViewSymbol, ReferenceViewSymbolBinding,
-    ReferenceViewValidationError, batch_reference_view_operation,
+    ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError,
+    batch_reference_view_operation,
 };
 
 #[cfg(test)]

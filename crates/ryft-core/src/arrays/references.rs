@@ -16,11 +16,10 @@
 //! # Symbolic Indices
 //!
 //! An [`Index`](ArrayReferenceViewTransform::Index) transform indexes one array axis using a static index or a
-//! [`ReferenceViewSymbol`]. The symbol names an instruction input or an index supplied within an attached region.
-//! Analysis binds input symbols to program values and local symbols to their region, family name, and symbol index.
+//! symbolic input position. Analysis binds each position to the [`ValueId`] of the corresponding instruction operand.
 //! Eager handles carry [`NoReferenceViewBinding`] and accept only static transforms. Discharge paths can store context
-//! values as bindings, but accesses through symbolic indices currently return [`ProgramError::UnsupportedOperation`]
-//! because the reconstruction policy does not yet provide dynamic slicing.
+//! values as bindings and reconstruct symbolic selections through dynamic slicing and updates. Runtime indices clamp
+//! to the selected axis, following the array dynamic-slicing contract.
 
 use std::borrow::Cow;
 use std::fmt::{Debug, Display};
@@ -39,14 +38,15 @@ use crate::batching::{BatchAxis, BatchingError};
 use crate::contexts::Context;
 use crate::macros::check_count;
 use crate::operations::{
-    Add, AddOperation, Reshape, ReshapeOperation, Slice, SliceOperation, UpdateSlice, UpdateSliceOperation,
+    Add, AddOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, Reshape, ReshapeOperation, Slice,
+    SliceOperation, UpdateSlice, UpdateSliceOperation,
 };
 use crate::parameters::Parameter;
 use crate::programs::{
     NoReferenceViewBinding, ProgramError, ReadyOrPendingReferenceGuard, Reference, ReferenceAccumulationPolicy,
     ReferenceDischargePolicy, ReferenceDischargeableType, ReferenceError, ReferenceId, ReferenceType, ReferenceView,
     ReferenceViewAnalysis, ReferenceViewAnalysisError, ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep,
-    ReferenceViewSymbol, ReferenceViewSymbolBinding, Type, TypeError, TypeIdentityRenaming, Typed, Value,
+    Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueId,
 };
 
 /// Error produced by [`ArrayReferenceAnalysis`]. Structural reference errors come from the generic
@@ -74,7 +74,7 @@ pub enum ArrayReferenceViewError {
 
     /// A view with a symbolic index was composed onto an eager handle, whose path carries only static steps.
     #[error("eager reference handles carry only static views; the operation that creates a symbolic view resolves it")]
-    SymbolicViewCoordinate,
+    SymbolicViewIndex,
 }
 
 /// One validated index transform in an [`ArrayReferenceView`]'s root-to-handle mapping.
@@ -87,9 +87,9 @@ pub enum ArrayReferenceViewError {
 ///
 /// Transforms are interpreted in order from the root outward. [`Index`](Self::Index) removes one axis at a static or
 /// symbolic index; [`Slice`](Self::Slice) preserves rank and selects one static unit-stride range per axis. The
-/// built-in scan supplies its local index when it creates per-iteration reference slices. Other operation families may
-/// supply their own region-local indices through the same view contract. Eager handles and standalone view discharge
-/// reject symbolic steps; traced reference indexing and strided slicing remain unsupported.
+/// built-in scan supplies its explicit body index to the dynamic reference-indexing operation. Eager handles
+/// resolve runtime indices before creating static views. Discharge reconstructs symbolic indices with dynamic slicing;
+/// strided slicing remains unsupported.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 #[non_exhaustive]
 pub enum ArrayReferenceViewTransform {
@@ -115,8 +115,8 @@ pub enum ArrayReferenceViewIndex {
     /// An index known when the view is described.
     Static(usize),
 
-    /// An index supplied by the named symbol, which the operation creating the view resolves.
-    Symbolic(ReferenceViewSymbol),
+    /// An index supplied by the instruction input at this position. Analysis binds it to that input's value.
+    Symbolic(usize),
 }
 
 impl ArrayReferenceViewTransform {
@@ -164,7 +164,7 @@ impl ArrayReferenceViewTransform {
                     ArrayReferenceViewIndex::Static(index) => *index,
                     ArrayReferenceViewIndex::Symbolic(_) => {
                         return Err(TypeError::invalid(
-                            "a symbolic coordinate has no static selection; the operation that creates the view \
+                            "a symbolic index has no static selection; the operation that creates the view \
                              resolves it",
                         ));
                     }
@@ -303,7 +303,7 @@ impl ArrayReferenceViewTransform {
 impl ReferenceView for ArrayReferenceViewTransform {
     type Type = ArrayIrType;
 
-    fn symbols(&self) -> Vec<ReferenceViewSymbol> {
+    fn symbols(&self) -> Vec<usize> {
         // A transform depends on at most one symbol, which supplies the index for a symbolic indexing step.
         match self {
             Self::Index { index: ArrayReferenceViewIndex::Symbolic(symbol), .. } => vec![*symbol],
@@ -356,9 +356,9 @@ impl ReferenceView for ArrayReferenceViewTransform {
         }
     }
 
-    // Both paths are folded to one range or symbolic index per root axis and compared axis by axis: two static ranges that do not
-    // intersect make the paths disjoint, identical static ranges and equal symbolic indices (same binding at the same
-    // offset) are the same, and everything else may overlap. A malformed path cannot be folded and is treated as
+    // Both paths fold to one range or symbolic index per root axis. Nonintersecting static ranges prove disjointness;
+    // identical static ranges or symbolic indices with equal bindings, offsets, and clamping extents prove equality.
+    // Everything else may overlap. A malformed path cannot be folded and is treated as
     // possibly overlapping, because paths are validated when they are derived and this query must not fail.
     fn overlap(
         root: &ArrayIrType,
@@ -370,7 +370,7 @@ impl ReferenceView for ArrayReferenceViewTransform {
         else {
             return ReferenceViewOverlap::MayOverlap;
         };
-        let (Some(a), Some(b)) = (RootCoordinate::fold(&shape, a), RootCoordinate::fold(&shape, b)) else {
+        let (Some(a), Some(b)) = (RootIndexSelection::fold(&shape, a), RootIndexSelection::fold(&shape, b)) else {
             return ReferenceViewOverlap::MayOverlap;
         };
         let mut overlap = ReferenceViewOverlap::Same;
@@ -388,7 +388,7 @@ impl ReferenceView for ArrayReferenceViewTransform {
 /// Indices that a folded [`ArrayReferenceView`] selects on one axis of its root, used by
 /// [`ReferenceView::overlap`] to compare two paths of one root.
 #[derive(Clone, Debug, PartialEq, Eq)]
-enum RootCoordinate {
+enum RootIndexSelection {
     /// A static unit-stride range `[start, limit)` of the root axis. Before any step touches the axis this is the
     /// complete axis, a slice narrows it, and a static index collapses it to one index.
     Range {
@@ -399,23 +399,26 @@ enum RootCoordinate {
         limit: usize,
     },
 
-    /// One index `offset + symbol` of the root axis, selected by a symbolic index whose value is `binding`
-    /// relative to the range `[offset, ..)` that the earlier steps narrowed the axis to.
+    /// One index `offset + clamp(symbol, 0, extent - 1)` of the root axis, selected relative to the
+    /// range that earlier steps narrowed the axis to. Clamping depends on this extent, not just the binding.
     Symbolic {
         /// Binding of the symbolic index.
-        binding: ReferenceViewSymbolBinding,
+        binding: ValueId,
 
         /// Start of the narrowed range that the symbolic index is relative to.
         offset: usize,
+
+        /// Size of the narrowed axis against which the runtime index is clamped.
+        extent: usize,
     },
 }
 
-impl RootCoordinate {
+impl RootIndexSelection {
     /// Folds the closed `steps` of a path over a root of static shape `shape` into one range or symbolic index per root
     /// axis, or [`None`] when the path is malformed for that root (an axis, index, binding, or stride that the
     /// derivation would have rejected).
     fn fold(shape: &StaticShape, steps: &[ReferenceViewStep<ArrayReferenceViewTransform>]) -> Option<Vec<Self>> {
-        let mut coordinates =
+        let mut indices =
             shape.dimensions().iter().map(|size| Self::Range { start: 0, limit: *size }).collect::<Vec<_>>();
         // Root axes that the folded steps have not indexed away yet, in view axis order.
         let mut remaining = (0..shape.rank()).collect::<Vec<_>>();
@@ -426,20 +429,20 @@ impl RootCoordinate {
                         return None;
                     }
                     let root_axis = remaining.remove(*axis);
-                    let Self::Range { start, limit } = coordinates[root_axis] else {
+                    let Self::Range { start, limit } = indices[root_axis] else {
                         return None;
                     };
-                    coordinates[root_axis] = match index {
+                    indices[root_axis] = match index {
                         ArrayReferenceViewIndex::Static(index) => {
                             // Invalid paths must remain conservative even when the relative index overflows.
-                            let coordinate = start.checked_add(*index)?;
-                            if coordinate >= limit {
+                            let index = start.checked_add(*index)?;
+                            if index >= limit {
                                 return None;
                             }
-                            Self::Range { start: coordinate, limit: coordinate + 1 }
+                            Self::Range { start: index, limit: index + 1 }
                         }
                         ArrayReferenceViewIndex::Symbolic(_) => {
-                            Self::Symbolic { binding: *step.bindings().first()?, offset: start }
+                            Self::Symbolic { binding: *step.bindings().first()?, offset: start, extent: limit - start }
                         }
                     };
                 }
@@ -448,7 +451,7 @@ impl RootCoordinate {
                         return None;
                     }
                     for (selection, root_axis) in axes.iter().zip(remaining.iter()) {
-                        let Self::Range { start, limit } = coordinates[*root_axis] else {
+                        let Self::Range { start, limit } = indices[*root_axis] else {
                             return None;
                         };
                         let narrowed_start = start.checked_add(selection.start())?;
@@ -456,12 +459,12 @@ impl RootCoordinate {
                         if selection.stride() != 1 || narrowed_limit > limit {
                             return None;
                         }
-                        coordinates[*root_axis] = Self::Range { start: narrowed_start, limit: narrowed_limit };
+                        indices[*root_axis] = Self::Range { start: narrowed_start, limit: narrowed_limit };
                     }
                 }
             }
         }
-        Some(coordinates)
+        Some(indices)
     }
 
     /// Returns the relation between the indices that this and `other` select on one root axis.
@@ -477,15 +480,9 @@ impl RootCoordinate {
                 }
             }
             (
-                Self::Symbolic { binding: a_binding, offset: a_offset },
-                Self::Symbolic { binding: b_binding, offset: b_offset },
-            ) if a_binding == b_binding => {
-                if a_offset == b_offset {
-                    ReferenceViewOverlap::Same
-                } else {
-                    ReferenceViewOverlap::Disjoint
-                }
-            }
+                Self::Symbolic { binding: a_binding, offset: a_offset, extent: a_extent },
+                Self::Symbolic { binding: b_binding, offset: b_offset, extent: b_extent },
+            ) if a_binding == b_binding && a_offset == b_offset && a_extent == b_extent => ReferenceViewOverlap::Same,
             (Self::Symbolic { .. }, Self::Symbolic { .. })
             | (Self::Range { .. }, Self::Symbolic { .. })
             | (Self::Symbolic { .. }, Self::Range { .. }) => ReferenceViewOverlap::MayOverlap,
@@ -540,13 +537,12 @@ impl ViewSelection {
 /// transform in reverse order. Consequently, overlapping handles may select the same root indices and observe one
 /// another's ordered mutations, while equality and hashing distinguish different transform sequences.
 ///
-/// `Binding` supplies symbolic indices: [`ReferenceViewSymbolBinding`] identifies program values, the uninhabited
+/// `Binding` supplies symbolic indices: [`ValueId`] identifies program values, the uninhabited
 /// [`NoReferenceViewBinding`] restricts eager handles to static steps, and `C::Value` binds discharge indices directly
 /// to context values. Supported index transforms are described by [`ArrayReferenceViewTransform`]. Pass root handles
-/// across attached-region and external runtime boundaries and recreate views inside the receiving scope; an attaching
-/// operation may create a boundary view, such as a scan's per-iteration slice of a stacked reference.
-pub type ArrayReferenceView<Binding = ReferenceViewSymbolBinding> =
-    ReferenceViewPath<ArrayReferenceViewTransform, Binding>;
+/// across attached-region and external runtime boundaries and recreate views inside the receiving scope. For example,
+/// a scan body selects a view of a stacked reference using its explicit index input.
+pub type ArrayReferenceView<Binding = ValueId> = ReferenceViewPath<ArrayReferenceViewTransform, Binding>;
 
 impl<Binding> ArrayReferenceView<Binding> {
     /// Returns the exact view type derived from `root_type`.
@@ -821,11 +817,11 @@ impl<A: Value<Type = ArrayType>> ArrayReference<A> {
     }
 
     /// Returns a copy of this handle with `transform` appended to its view, sharing the same root allocation. A
-    /// symbolic index is rejected with [`ArrayReferenceViewError::SymbolicViewCoordinate`]: an eager handle's path
+    /// symbolic index is rejected with [`ArrayReferenceViewError::SymbolicViewIndex`]: an eager handle's path
     /// carries only static steps, and the index is resolved by the operation that creates the view.
     pub fn with_transform(&self, transform: ArrayReferenceViewTransform) -> Result<Self, ProgramError> {
         if !transform.symbols().is_empty() {
-            return Err(ProgramError::custom(ArrayReferenceViewError::SymbolicViewCoordinate));
+            return Err(ProgramError::custom(ArrayReferenceViewError::SymbolicViewIndex));
         }
         // The cached handle type already reflects every earlier transform, so composition validates and derives
         // incrementally instead of re-folding the complete chain from the root type. Derivation is purely structural:
@@ -1009,10 +1005,8 @@ impl<A: Value<Type = ArrayType>> Typed for ArrayReference<A> {
 ///
 /// Root handles have an empty view, identity aliases copy their source view, and index or slice aliases append the
 /// operation's [`ArrayReferenceViewTransform`]. The resulting view reproduces the value's declared referent shape when
-/// applied to its root's array type. An attached region input has its own root: complete-handle inputs have empty
-/// views, while boundary views, such as a stacked `scan` input's per-iteration slice, retain the attaching operation's
-/// transform with its local index bound to that region. Their indices are relative to the nested input, not the
-/// caller's root.
+/// applied to its root's array type. Attached-region inputs receive complete reference handles. Selections inside
+/// that region are explicit instructions whose symbolic indices bind to the selecting operand's [`ValueId`].
 ///
 /// Construct an analysis with [`ReferenceViewAnalysis::new`] or reuse a cached one through
 /// [`RegionRef::reference_view_analysis`](crate::RegionRef::reference_view_analysis). Validation is explicit: consumers
@@ -1029,12 +1023,12 @@ pub type ArrayReferenceAnalysis = ReferenceViewAnalysis<ArrayReferenceViewTransf
 /// the context value it selects. Every access therefore reaches its indices through the same view traversal the eager
 /// handles use, which is what keeps staged and eager reference semantics from drifting apart: reading materializes the
 /// allocation-to-handle chain and takes its last snapshot, while a replacement or an accumulation writes the new leaf
-/// back through that chain in reverse. An access through a symbolic step is rejected with
-/// [`ProgramError::UnsupportedOperation`] until the view operations expose dynamic slicing.
+/// back through that chain in reverse. Symbolic indices use dynamic slicing and updates with the same clamping
+/// bounds, so reads and mutations always address the same elements.
 ///
 /// The reconstruction context is bounded by [`Context`] rather than [`Domain`](crate::Domain) because the view
-/// traversal binds canonical slice, reshape, and update-slice operations into it. Those three have no value-level
-/// capability in the composite array IR (the capabilities are stated over [`ArrayType`]-typed values), so the policy
+/// traversal binds canonical slicing, reshape, and update operations into it. Their value-level capabilities are
+/// stated over [`ArrayType`]-typed values rather than the composite array IR, so the policy
 /// constructs them through the context's operation family.
 #[derive(Copy, Clone, Debug)]
 pub struct ArrayReferenceDischarge;
@@ -1106,9 +1100,8 @@ where
 
 /// View carrier that binds the canonical slice, reshape, and update-slice operations of one array reference view into
 /// a reference discharge context, sharing the single [`ArrayReferenceView`] traversal with the eager value carrier,
-/// which is what keeps staged and eager reference semantics from drifting apart. Symbolic indices arrive closed over
-/// context values but have no dynamic slice constructor to lower to yet, so both symbolic hooks reject them with
-/// [`ProgramError::UnsupportedOperation`].
+/// which keeps staged and eager reference semantics consistent. Symbolic indices arrive closed over context values
+/// and select a size-one dynamic slice; updates restore the removed axis before replacing that slice.
 struct ContextViewCarrier<'c, C>(
     /// Context in which the slice, reshape, and update-slice operations are bound.
     &'c C,
@@ -1151,13 +1144,17 @@ where
         self.bind(C::Operation::from_reference_reshape(ReshapeOperation::new(shape)), &[input])
     }
 
-    fn index_symbolic(
-        &mut self,
-        _input: &C::Value,
-        _axis: usize,
-        _binding: &C::Value,
-    ) -> Result<C::Value, ProgramError> {
-        Err(symbolic_coordinate_unsupported())
+    fn index_symbolic(&mut self, input: &C::Value, axis: usize, binding: &C::Value) -> Result<C::Value, ProgramError> {
+        let input_type = self.array_type(input)?.into_owned();
+        let mut sizes = ArrayReferenceViewTransform::indexed_shape(axis, &input_type)?.dimensions().to_vec();
+        sizes[axis] = 1;
+        // Unselected axes span their complete extent, so dynamic slicing clamps their start to zero. Reusing
+        // the scalar index there avoids constructing redundant zero values in the context's value family.
+        let mut inputs = vec![input];
+        inputs.extend(std::iter::repeat_n(binding, sizes.len()));
+        let selected =
+            self.bind(C::Operation::from_reference_dynamic_slice(DynamicSliceOperation::new(sizes)), &inputs)?;
+        self.reshape(&selected, input_type.without_dimension(axis)?.0.shape().clone())
     }
 }
 
@@ -1176,20 +1173,21 @@ where
 
     fn update_index_symbolic(
         &mut self,
-        _target: &C::Value,
-        _update: &C::Value,
-        _axis: usize,
-        _binding: &C::Value,
+        target: &C::Value,
+        update: &C::Value,
+        axis: usize,
+        binding: &C::Value,
     ) -> Result<C::Value, ProgramError> {
-        Err(symbolic_coordinate_unsupported())
-    }
-}
-
-/// Returns the error with which the context carrier rejects an access through a symbolic view index.
-fn symbolic_coordinate_unsupported() -> ProgramError {
-    ProgramError::UnsupportedOperation {
-        message: "a symbolic reference view coordinate cannot be discharged until dynamic slicing is supported"
-            .to_string(),
+        let target_type = self.array_type(target)?.into_owned();
+        let mut dimensions = ArrayReferenceViewTransform::indexed_shape(axis, &target_type)?.dimensions().to_vec();
+        dimensions[axis] = 1;
+        let rank = dimensions.len();
+        let update = self.reshape(update, Shape::new(dimensions.into_iter().map(Dimension::Static).collect()))?;
+        // Restore the indexed axis before writing back. Full-size axes clamp to zero just as in the read path,
+        // while the selected axis uses the same runtime index and clamping extent as the original view.
+        let mut inputs = vec![target, &update];
+        inputs.extend(std::iter::repeat_n(binding, rank));
+        self.bind(C::Operation::from_reference_dynamic_update_slice(DynamicUpdateSliceOperation), &inputs)
     }
 }
 
@@ -1216,8 +1214,7 @@ mod tests {
     };
     use crate::parameters::Placeholder;
     use crate::programs::{
-        AtomId, Program, ProgramBuilder, ReferenceCompletion, ReferenceReplacementPreparation, ReferenceType,
-        ReferenceViewSymbol, RegionId, ValueId,
+        AtomId, Program, ProgramBuilder, ReferenceCompletion, ReferenceReplacementPreparation, ReferenceType, RegionId,
     };
     use crate::tracing::{Trace, Tracer, TracingContext};
 
@@ -1256,7 +1253,7 @@ mod tests {
                 "reference runtime transactions require an unrenamed root handle",
             ),
             (
-                ArrayReferenceViewError::SymbolicViewCoordinate,
+                ArrayReferenceViewError::SymbolicViewIndex,
                 concat!(
                     "eager reference handles carry only static views; ",
                     "the operation that creates a symbolic view resolves it",
@@ -1310,14 +1307,8 @@ mod tests {
             Err(TypeError::invalid("reference index 3 on axis 0 is out of bounds for size 3")),
         );
         assert_eq!(
-            ArrayReferenceViewTransform::Index {
-                axis: 2,
-                index: ArrayReferenceViewIndex::Symbolic(ReferenceViewSymbol::RegionLocal {
-                    name: "test::array_coordinates",
-                    index: 0
-                })
-            }
-            .output_type(&matrix_type),
+            ArrayReferenceViewTransform::Index { axis: 2, index: ArrayReferenceViewIndex::Symbolic(1) }
+                .output_type(&matrix_type),
             Err(TypeError::invalid("reference index axis 2 is out of bounds for rank 2")),
         );
 
@@ -1367,10 +1358,7 @@ mod tests {
     #[test]
     fn test_array_reference_view_transform_output_type_symbolic_index() {
         let matrix_type = ArrayType::new_static(DataType::F32, [3, 4]);
-        let symbolic = ArrayReferenceViewTransform::Index {
-            axis: 0,
-            index: ArrayReferenceViewIndex::Symbolic(ReferenceViewSymbol::Input(1)),
-        };
+        let symbolic = ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(1) };
         let static_index = ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) };
         // Removing a symbolic axis derives the same type even when no static index could select it.
         assert_eq!(symbolic.output_type(&matrix_type), static_index.output_type(&matrix_type));
@@ -1383,18 +1371,15 @@ mod tests {
 
     #[test]
     fn test_array_reference_view_transform_symbols() {
-        let symbolic = ArrayReferenceViewTransform::Index {
-            axis: 0,
-            index: ArrayReferenceViewIndex::Symbolic(ReferenceViewSymbol::Input(1)),
-        };
-        assert_eq!(symbolic.symbols(), vec![ReferenceViewSymbol::Input(1)]);
+        let symbolic = ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(1) };
+        assert_eq!(symbolic.symbols(), vec![1]);
         assert_eq!(
             ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) }.symbols(),
-            Vec::new(),
+            Vec::<usize>::new(),
         );
         assert_eq!(
             ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(0, 2, 1)] }.symbols(),
-            Vec::new(),
+            Vec::<usize>::new(),
         );
     }
 
@@ -1439,17 +1424,11 @@ mod tests {
         );
 
         // Batching preserves the symbol that supplies the index.
-        let symbolic = ArrayReferenceViewTransform::Index {
-            axis: 0,
-            index: ArrayReferenceViewIndex::Symbolic(ReferenceViewSymbol::Input(1)),
-        };
+        let symbolic = ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(1) };
         assert_eq!(
             symbolic.batch(&packed, BatchAxis::new(0)),
             Ok((
-                ArrayReferenceViewTransform::Index {
-                    axis: 1,
-                    index: ArrayReferenceViewIndex::Symbolic(ReferenceViewSymbol::Input(1))
-                },
+                ArrayReferenceViewTransform::Index { axis: 1, index: ArrayReferenceViewIndex::Symbolic(1) },
                 BatchAxis::new(0),
             )),
         );
@@ -1571,34 +1550,30 @@ mod tests {
         assert_eq!(empty.overlap(&rows_0_1, &root), ReferenceViewOverlap::MayOverlap);
         assert_eq!(empty.overlap(&row_1_column_1, &root), ReferenceViewOverlap::MayOverlap);
 
-        // Symbolic indices compare by binding: the same binding at the same offset is the same index, the
-        // same binding relative to differently narrowed axes is provably different, and different bindings or a binding
-        // against a static index may overlap.
-        let symbolic = ArrayReferenceViewTransform::Index {
-            axis: 0,
-            index: ArrayReferenceViewIndex::Symbolic(ReferenceViewSymbol::Input(1)),
-        };
-        let first = ReferenceViewSymbolBinding::Value(ValueId::new(RegionId::new(0), AtomId::new(1)));
-        let second = ReferenceViewSymbolBinding::Value(ValueId::new(RegionId::new(0), AtomId::new(2)));
-        let local_coordinate = ReferenceViewSymbolBinding::RegionLocal {
-            region: RegionId::new(1),
-            name: "test::array_coordinates",
-            index: 0,
-        };
+        // Symbolic indices agree only when their binding, offset, and clamping extent agree. Different
+        // offsets can clamp to the same root element, so they cannot establish disjointness.
+        let symbolic = ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(1) };
+        let first = ValueId::new(RegionId::new(0), AtomId::new(1));
+        let second = ValueId::new(RegionId::new(0), AtomId::new(2));
+        let other_region = ValueId::new(RegionId::new(1), AtomId::new(1));
         let row_first = empty.with_step(symbolic.clone(), vec![first]);
         let row_second = empty.with_step(symbolic.clone(), vec![second]);
-        let row_local_coordinate = empty.with_step(symbolic.clone(), vec![local_coordinate]);
+        let row_other_region = empty.with_step(symbolic.clone(), vec![other_region]);
         let shifted_row_first = rows_1_2.with_step(symbolic.clone(), vec![first]);
         assert_eq!(
             row_first.overlap(&empty.with_step(symbolic.clone(), vec![first]), &root),
             ReferenceViewOverlap::Same
         );
         assert_eq!(row_first.overlap(&row_second, &root), ReferenceViewOverlap::MayOverlap);
-        assert_eq!(row_first.overlap(&row_local_coordinate, &root), ReferenceViewOverlap::MayOverlap);
+        assert_eq!(row_first.overlap(&row_other_region, &root), ReferenceViewOverlap::MayOverlap);
         assert_eq!(row_first.overlap(&row_1, &root), ReferenceViewOverlap::MayOverlap);
         assert_eq!(row_first.overlap(&rows_2_3, &root), ReferenceViewOverlap::MayOverlap);
         assert_eq!(row_first.overlap(&empty, &root), ReferenceViewOverlap::MayOverlap);
-        assert_eq!(row_first.overlap(&shifted_row_first, &root), ReferenceViewOverlap::Disjoint);
+        assert_eq!(row_first.overlap(&shifted_row_first, &root), ReferenceViewOverlap::MayOverlap);
+        // Equal offsets with different extents also clamp differently: a large index selects row 3 in the
+        // whole root but row 1 in its first two rows.
+        let shortened_row_first = rows_0_1.with_step(symbolic.clone(), vec![first]);
+        assert_eq!(row_first.overlap(&shortened_row_first, &root), ReferenceViewOverlap::MayOverlap);
         assert_eq!(
             row_first
                 .with_view(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(0) })
@@ -1812,18 +1787,15 @@ mod tests {
     }
 
     #[test]
-    fn test_array_reference_with_transform_rejects_symbolic_coordinates() {
+    fn test_array_reference_with_transform_rejects_symbolic_indices() {
         // A symbolic index has no static selection, so neither an eager traversal nor an eager handle can carry it: the
         // operation that creates the view resolves the index.
-        let symbolic = ArrayReferenceViewTransform::Index {
-            axis: 0,
-            index: ArrayReferenceViewIndex::Symbolic(ReferenceViewSymbol::Input(1)),
-        };
+        let symbolic = ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(1) };
         let view: ArrayReferenceView<NoReferenceViewBinding> = ArrayReferenceView::root().with_view(symbolic.clone());
         assert_eq!(
             view.apply(&Array::matrix(3, 4, (1..=12).map(|value| value as f32).collect())),
             Err(TypeError::invalid(
-                "a symbolic coordinate has no static selection; the operation that creates the view resolves it",
+                "a symbolic index has no static selection; the operation that creates the view resolves it",
             )
             .into()),
         );
@@ -1831,7 +1803,7 @@ mod tests {
         let error = root.with_transform(symbolic).unwrap_err();
         assert_eq!(
             error.downcast_custom::<ArrayReferenceViewError>(),
-            Some(&ArrayReferenceViewError::SymbolicViewCoordinate),
+            Some(&ArrayReferenceViewError::SymbolicViewIndex),
         );
         assert_eq!(
             error.to_string(),
@@ -2442,57 +2414,56 @@ mod tests {
     }
 
     #[test]
-    fn test_array_reference_discharge_rejects_symbolic_coordinates() {
-        // A symbolic index is closed over the context value of the operand it names, so the alias alone carries
-        // everything an access needs. The context carrier has no dynamic slice constructor to lower that index to yet,
-        // so every access through such a step is rejected before anything is bound into the context, whichever position
-        // the step occupies in the chain.
-        let unsupported = ProgramError::UnsupportedOperation {
-            message: "a symbolic reference view coordinate cannot be discharged until dynamic slicing is supported"
-                .to_string(),
-        };
+    fn test_array_reference_discharge_symbolic_indices() {
+        // Stage a composed view: select a runtime row, then its last two columns. Updating the leaf must preserve
+        // both the rest of that row and every other row of the shared root.
         let stage = |inputs: Vec<Tracer<TestContext>>| {
             let context = inputs[0].context().clone();
-            let symbolic = ArrayReferenceViewTransform::Index {
-                axis: 0,
-                index: ArrayReferenceViewIndex::Symbolic(ReferenceViewSymbol::Input(1)),
-            };
-            let leaf: ArrayReferenceView<Tracer<TestContext>> =
-                ArrayReferenceView::root().with_step(symbolic.clone(), vec![inputs[1].clone()]);
-            let parent =
-                leaf.with_view(ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] });
-            for alias in [&leaf, &parent] {
-                assert_eq!(ArrayReferenceDischarge::read(&context, &inputs[0], alias), Err(unsupported.clone()));
-                assert_eq!(
-                    ArrayReferenceDischarge::write(&context, &inputs[0], inputs[2].clone(), alias),
-                    Err(unsupported.clone()),
-                );
-                assert_eq!(
-                    ArrayReferenceDischarge::swap(&context, &inputs[0], inputs[2].clone(), alias),
-                    Err(unsupported.clone()),
-                );
-                assert_eq!(
-                    ArrayReferenceDischarge::accumulate(&context, &inputs[0], inputs[2].clone(), alias),
-                    Err(unsupported.clone()),
-                );
-            }
-            Ok(vec![inputs[0].clone()])
+            let alias = ArrayReferenceView::root()
+                .with_step(
+                    ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(1) },
+                    vec![inputs[1].clone()],
+                )
+                .with_view(ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(1, 2, 1)] });
+            let selected = ArrayReferenceDischarge::read(&context, &inputs[0], &alias)?;
+            let written = ArrayReferenceDischarge::write(&context, &inputs[0], inputs[2].clone(), &alias)?;
+            let (previous, swapped) = ArrayReferenceDischarge::swap(&context, &inputs[0], inputs[2].clone(), &alias)?;
+            let accumulated = ArrayReferenceDischarge::accumulate(&context, &inputs[0], inputs[2].clone(), &alias)?;
+            Ok(vec![selected, written, previous, swapped, accumulated])
         };
+        let matrix_type = ArrayType::new_static(DataType::F32, [2, 3]);
         let (_, staged): (_, Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>) =
             EagerContext::<TestValue, TestOperation>::trace(
                 stage,
                 vec![
-                    ArrayIrType::Array(ArrayType::new_static(DataType::F32, [3, 4])),
+                    ArrayIrType::Array(matrix_type.clone()),
                     ArrayIrType::Array(ArrayType::scalar(DataType::I32)),
-                    ArrayIrType::Array(ArrayType::new_static(DataType::F32, [4])),
+                    ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2])),
                 ],
             )
             .unwrap();
-        assert_eq!(
-            staged.to_string(),
-            indoc! {"
-                lambda %0:f32[3, 4], %1:i32[], %2:f32[4] .
-                in (%0)"},
-        );
+        // Dynamic slicing clamps negative indices to the first row and oversized indices to the last row.
+        for (index, selected, written, accumulated) in [
+            (-8, vec![2.0, 3.0], vec![1.0, 20.0, 30.0, 4.0, 5.0, 6.0], vec![1.0, 22.0, 33.0, 4.0, 5.0, 6.0]),
+            (1, vec![5.0, 6.0], vec![1.0, 2.0, 3.0, 4.0, 20.0, 30.0], vec![1.0, 2.0, 3.0, 4.0, 25.0, 36.0]),
+            (80, vec![5.0, 6.0], vec![1.0, 2.0, 3.0, 4.0, 20.0, 30.0], vec![1.0, 2.0, 3.0, 4.0, 25.0, 36.0]),
+        ] {
+            let selected = TestValue::Array(Array::vector::<f32>(selected));
+            let written = TestValue::Array(Array::from_f64s(matrix_type.clone(), written));
+            assert_eq!(
+                staged.clone().interpret(vec![
+                    TestValue::Array(Array::from_f64s(matrix_type.clone(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])),
+                    TestValue::Array(Array::scalar::<i32>(index)),
+                    TestValue::Array(Array::vector::<f32>(vec![20.0, 30.0])),
+                ]),
+                Ok(vec![
+                    selected.clone(),
+                    written.clone(),
+                    selected,
+                    written,
+                    TestValue::Array(Array::from_f64s(matrix_type.clone(), accumulated)),
+                ]),
+            );
+        }
     }
 }

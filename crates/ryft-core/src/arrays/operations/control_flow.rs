@@ -14,7 +14,7 @@ use crate::arrays::addressing::ArrayAddressing;
 use crate::arrays::arrays::Array;
 use crate::arrays::broadcasting::Broadcastable;
 use crate::arrays::ir::ArrayIrValue;
-use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, ReferenceIndex};
+use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
 use crate::arrays::types::dimensions::{Dimension, DimensionType, Shape};
@@ -28,9 +28,9 @@ use crate::operations::control_flow::scan::{
 };
 use crate::operations::{
     AddOperation, AndOperation, BroadcastOperation, DimensionFromScalarOperation, DimensionToScalarOperation,
-    DynamicUpdateSliceOperation, OneOperation, RUNTIME_DIMENSION_DATA_TYPE, ReduceOperation, ReductionKind, Reshape,
-    Select, SelectOperation, Slice, TemporalResidualOperation, TemporalResidualType, UpdateSlice, WhilePredicate,
-    WhileResidualStackOperation, WhileResidualStackType, Zero, ZeroOperation,
+    DynamicUpdateSliceOperation, Fill, OneOperation, RUNTIME_DIMENSION_DATA_TYPE, ReduceOperation, ReductionKind,
+    Reshape, Select, SelectOperation, Slice, TemporalResidualOperation, TemporalResidualType, UpdateSlice,
+    WhilePredicate, WhileResidualStackOperation, WhileResidualStackType, Zero, ZeroOperation,
 };
 use crate::programs::{Operation, ProgramError, TypeError, Typed, Value, ValueProjection};
 
@@ -226,7 +226,7 @@ impl<A: Value<Type = ArrayType> + WhilePredicate> WhilePredicate for ArrayIrValu
 impl<A> ScanInterpretation<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>> for ArrayIrType
 where
     A: Reshape + Slice + UpdateSlice + Value<Type = ArrayType>,
-    EagerContext<A, ArrayOperation<A>>: Zero<A>,
+    EagerContext<A, ArrayOperation<A>>: Fill<i64, A> + Zero<A>,
 {
     fn interpret_scan<D: InterpretationDriver<EagerContext<ArrayIrValue<A>, ArrayIrOperation<A>>>>(
         carry_count: usize,
@@ -289,14 +289,16 @@ where
         let iterations: Box<dyn Iterator<Item = usize>> =
             if reverse { Box::new((0..length).rev()) } else { Box::new(0..length) };
         for iteration in iterations {
-            let mut iteration_inputs = carries.clone();
+            let mut iteration_inputs =
+                vec![ArrayIrValue::Array(array_context.fill(&ArrayType::scalar(DataType::I64), iteration as i64)?)];
+            iteration_inputs.extend(carries.iter().cloned());
             iteration_inputs.extend(
                 stacks
                     .iter()
                     .map(|stack| match stack {
-                        // A stacked reference enters the body as the per-iteration view of its leading axis, which
-                        // is the eager static view sharing the root's storage, so body mutations reach the referent.
-                        ArrayIrValue::Reference(_) => stack.reference_index(0, iteration),
+                        // The body selects its own view with the explicit index; passing the root preserves
+                        // shared storage when more than one body value aliases the same allocation.
+                        ArrayIrValue::Reference(_) => Ok(stack.clone()),
                         _ => Ok(ArrayIrValue::Array(read_scan_iteration(
                             <ArrayIrValue<A> as ValueProjection<ArrayType>>::projected(stack)?,
                             iteration,
@@ -433,6 +435,7 @@ mod tests {
     use crate::arrays::arrays::Array;
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
+    use crate::arrays::operations::references::ReferenceDynamicIndexOperation;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
     use crate::arrays::references::{ArrayReference, ArrayReferenceViewIndex, ArrayReferenceViewTransform};
     use crate::arrays::types::arrays::ArrayType;
@@ -920,8 +923,13 @@ mod tests {
         ) -> Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>> {
             let scalar_type = ArrayType::scalar(DataType::F32);
             let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+            let index = body_builder.add_input(ArrayType::scalar(DataType::I64).into());
             let carry = body_builder.add_input(scalar_type.clone().into());
-            let element = body_builder.add_input(ReferenceType::new(scalar_type.clone()).into());
+            let root =
+                body_builder.add_input(ReferenceType::new(ArrayType::new_static(DataType::F32, [length])).into());
+            let element = body_builder
+                .add_instruction(ReferenceDynamicIndexOperation::new(0), Vec::new(), vec![root, index], None)
+                .unwrap()[0];
             body_builder
                 .add_instruction(ReferenceAddUpdateOperation::new(), Vec::new(), vec![element, carry], None)
                 .unwrap();
@@ -932,7 +940,7 @@ mod tests {
                 .add_instruction(AddOperation::<ArrayIrType>::new(), Vec::new(), vec![carry, current], None)
                 .unwrap()[0];
             let body = body_builder
-                .build::<Vec<TestValue>, Vec<TestValue>>(vec![next_carry], vec![Placeholder; 2], vec![Placeholder])
+                .build::<Vec<TestValue>, Vec<TestValue>>(vec![next_carry], vec![Placeholder; 3], vec![Placeholder])
                 .unwrap();
             let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
             let body = builder.import_program(body);
@@ -958,7 +966,7 @@ mod tests {
             Ok(vec![array(carry)])
         }
 
-        // A stacked reference operand enters each iteration as the eager static view of its leading axis, so the body
+        // The body explicitly indexes the stacked reference on its leading axis, so the body
         // mutates the caller's referent in place exactly as the eager recurrence does, and the final carry observes
         // every updated slice.
         let scanned_stack = ArrayReference::new(Array::vector(vec![1.0f32, 2.0, 3.0]));
@@ -997,6 +1005,7 @@ mod tests {
         let array_type =
             ArrayType::new(DataType::F64, Shape::new(vec![Dimension::Dynamic(extent_type.variable().clone())]));
         let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let first = body_builder.add_input(ArrayIrType::Array(array_type.clone()));
         let second = body_builder.add_input(ArrayIrType::Array(array_type.clone()));
         let sum = body_builder
@@ -1008,7 +1017,7 @@ mod tests {
             )
             .unwrap()[0];
         let body = body_builder
-            .build::<Vec<TestValue>, Vec<TestValue>>(vec![sum, second], vec![Placeholder; 2], vec![Placeholder; 2])
+            .build::<Vec<TestValue>, Vec<TestValue>>(vec![sum, second], vec![Placeholder; 3], vec![Placeholder; 2])
             .unwrap();
 
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
@@ -1036,9 +1045,9 @@ mod tests {
                     %2:f64[extent] = zero [type=f64[extent]] %1
                     %3:f64[extent], %4:f64[extent] = scan [carry_count=2, length=2, reverse=true] %0 %2 [
                         body={
-                            lambda %0:f64[extent], %1:f64[extent] .
-                            let %2:f64[extent] = add %1 %0
-                            in (%0, %2)
+                            lambda %0:i64[], %1:f64[extent], %2:f64[extent] .
+                            let %3:f64[extent] = add %2 %1
+                            in (%1, %3)
                         },
                     ]
                 in (%3, %4)"}
@@ -1054,6 +1063,7 @@ mod tests {
         extent_type: DimensionType,
     ) -> Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>> {
         let mut builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        builder.add_input(ArrayType::scalar(DataType::I64).into());
         let extent = builder.add_input(ArrayIrType::Dimension(extent_type));
         let carry = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
         let item = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::F64)));
@@ -1065,7 +1075,7 @@ mod tests {
                 None,
             )
             .unwrap()[0];
-        builder.build(vec![extent, product, product], vec![Placeholder; 3], vec![Placeholder; 3]).unwrap()
+        builder.build(vec![extent, product, product], vec![Placeholder; 4], vec![Placeholder; 3]).unwrap()
     }
 
     #[test]
@@ -1138,6 +1148,7 @@ mod tests {
         let scalar_u64 = ArrayType::scalar(DataType::U64);
 
         let mut body_builder = ProgramBuilder::<TestValue, TestOperation>::new();
+        body_builder.add_input(ArrayType::scalar(DataType::I64).into());
         let state = body_builder.add_input(ArrayIrType::Array(scalar_f64.clone()));
         let counter = body_builder.add_input(ArrayIrType::Array(scalar_u64.clone()));
         let iteration = body_builder
@@ -1176,7 +1187,7 @@ mod tests {
         let body = body_builder
             .build::<Vec<TestValue>, Vec<TestValue>>(
                 vec![next_state, next_counter, next_state],
-                vec![Placeholder; 2],
+                vec![Placeholder; 3],
                 vec![Placeholder; 3],
             )
             .unwrap();

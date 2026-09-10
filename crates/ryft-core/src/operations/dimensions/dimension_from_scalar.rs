@@ -11,7 +11,8 @@ use std::fmt::Display;
 use ryft_macros::Parameter;
 
 use crate::arrays::{
-    ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, DimensionType, DimensionValue, DimensionVariable,
+    ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrType, ArrayType, DataType, DimensionType, DimensionValue,
+    DimensionVariable,
 };
 use crate::axes::Axis;
 use crate::batching::{BatchAxis, BatchableOperation, BatchedOutputs, BatchingContext, BatchingDriver, BatchingError};
@@ -182,11 +183,15 @@ where
         let scan_extent_type = scan_extent.r#type();
         let length = <&DimensionType>::try_from(scan_extent_type.as_ref())?.to_dimension();
         let mut builder = ProgramBuilder::<C::Constant, C::Operation>::new();
+        builder.add_input(ArrayType::scalar(DataType::I64).into());
         let scalar = builder.add_input(ArrayIrType::Array(input_type.clone()));
         let dimension = builder.add_instruction(self.clone(), Vec::new(), vec![scalar], None)?[0];
         let scalar = builder.add_instruction(DimensionToScalarOperation, Vec::new(), vec![dimension], None)?[0];
-        let body =
-            builder.build::<Vec<C::Constant>, Vec<C::Constant>>(vec![scalar], vec![Placeholder], vec![Placeholder])?;
+        let body = builder.build::<Vec<C::Constant>, Vec<C::Constant>>(
+            vec![scalar],
+            vec![Placeholder; 2],
+            vec![Placeholder],
+        )?;
 
         let scan = ScanOperation::<C::Constant>::new(0, length.clone());
         let mut packed_inputs = vec![input.into_value()];

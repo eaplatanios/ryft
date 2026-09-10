@@ -1096,9 +1096,10 @@ enum ReferenceDischargeBinding<V> {
 }
 
 /// Represents what a declared input of a rebuilt [`Region`](crate::Region) carries across a
-/// [`ReferenceDischargeRegionBoundary`] (i.e., a value, the complete handle of a caller allocation, or a boundary
-/// view that the attaching operation creates from a caller allocation for that region input like, for example, the
-/// per-iteration slice of a `scan` operation's stacked reference operand).
+/// [`ReferenceDischargeRegionBoundary`] (i.e., a value, the complete handle of a caller allocation, or an independently
+/// processed part of its state). This describes the discharge rewrite, rather than the original operation's input
+/// contract. For example, `scan` discharge can normalize explicit indexing of a reference root into a slice-sized state
+/// input, then stack the resulting slices to reconstruct the caller's allocation.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum ReferenceDischargeRegionInput {
     /// The input carries a value and no reference.
@@ -1109,10 +1110,12 @@ pub enum ReferenceDischargeRegionInput {
     /// allocation's successor state through the outputs that the boundary declares or adds for it.
     Allocation(ReferenceDischargeAllocationId),
 
-    /// The attaching operation selects a view of this caller allocation at the region boundary. A discharged view
-    /// becomes region-local state typed by the region input. A preserved view remains a reference input. The owning
-    /// rule requests any final view state through [`ReferenceDischargeRegionOutput::View`] and integrates it into the
-    /// caller allocation. Other handles in the region must not observe overlapping state independently.
+    /// The rebuilt region processes a selected part of this caller allocation, typed by the region input rather than
+    /// by the complete allocation. The owning rule proves that this state can be processed independently, requests its
+    /// final value through [`ReferenceDischargeRegionOutput::View`] when mutated, and integrates that value into the
+    /// caller allocation. This permits slice-sized `scan` discharge without exposing an implicit view in the source
+    /// `scan`'s body contract. Other handles must not observe overlapping state independently. A preserved allocation
+    /// retains its reference input and cannot publish an explicit state value.
     View(ReferenceDischargeAllocationId),
 }
 
@@ -1205,7 +1208,9 @@ impl ReferenceDischargeRegionBoundary {
     }
 
     /// Creates a [`ReferenceDischargeRegionBoundary`] whose added inputs and added outputs are the same allocations
-    /// inserted at the same position. This is the loop-carry shape that `while` and `scan` operation bodies thread.
+    /// inserted at the same position. This is the loop-carry shape used when input and output carry positions agree;
+    /// a `scan` operation's body has an extra index input and therefore specifies its input and output insertion
+    /// positions independently.
     #[inline]
     pub fn symmetric<O: Operation, I: Into<ReferenceDischargeRegionInput>, DeclaredInputs: IntoIterator<Item = I>>(
         operation: &O,
@@ -1882,7 +1887,8 @@ pub trait ReferenceDischargeDriver<C: Domain, P: ReferenceDischargePolicy<C>>:
     ///
     ///   - `context`: Active [`ReferenceDischargeContext`] supplying the current value or preserved reference for every
     ///     allocation named by `boundary`.
-    ///   - `index`: Position of the attached [`Region`](crate::Region) in [`Operation`]-defined order.
+    ///   - `region`: Source [`Region`](crate::Region) supplied by this driver, or an operation-normalized region
+    ///     preserving its source allocation and capture identities.
     ///   - `boundary`: Mapping between the source region's declared inputs and the reference-related inputs and outputs
     ///     required by the rebuilt region.
     ///
@@ -1899,7 +1905,7 @@ pub trait ReferenceDischargeDriver<C: Domain, P: ReferenceDischargePolicy<C>>:
     fn rebuild_region(
         &self,
         context: &ReferenceDischargeContext<C, P>,
-        index: usize,
+        region: RegionRef<'_, C::Constant, C::Operation>,
         boundary: &ReferenceDischargeRegionBoundary,
     ) -> Result<ReferenceDischargeRegionResult<C::Constant, C::Operation>, ProgramError>;
 }
@@ -1926,7 +1932,7 @@ impl<C: Domain, P: ReferenceDischargePolicy<C>> ReferenceDischargeDriver<C, P> f
     fn rebuild_region(
         &self,
         _context: &ReferenceDischargeContext<C, P>,
-        _index: usize,
+        _region: RegionRef<'_, C::Constant, C::Operation>,
         _boundary: &ReferenceDischargeRegionBoundary,
     ) -> Result<ReferenceDischargeRegionResult<C::Constant, C::Operation>, ProgramError> {
         Err(ProgramError::MalformedProgram("empty region driver cannot rebuild a region".to_string()))
@@ -2009,13 +2015,12 @@ where
     fn rebuild_region(
         &self,
         context: &ReferenceDischargeContext<C, P>,
-        index: usize,
+        region: RegionRef<'_, C::Constant, C::Operation>,
         boundary: &ReferenceDischargeRegionBoundary,
     ) -> Result<ReferenceDischargeRegionResult<C::Constant, C::Operation>, ProgramError> {
         // Rebuild the source region in a fresh trace with a fresh allocation environment. The caller and rebuilt region
         // can communicate only through the boundary described below: neither side can accidentally retain a handle or
         // value belonging to the other environment.
-        let region = self.region(index)?;
         let added_inputs = boundary.added_inputs();
         let added_outputs = boundary.added_outputs();
         check_count!("input", boundary.declared_inputs(), region.input_ids().len(), ProgramError);
@@ -4199,7 +4204,7 @@ pub fn discharge_local_reference_operation<
             ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), region.input_ids().len()),
             [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), region.output_ids().len())],
         );
-        let result = driver.rebuild_region(context, index, &boundary)?;
+        let result = driver.rebuild_region(context, driver.region(index)?, &boundary)?;
         result.validate_predicted_mutations(&[], name)?;
         regions.push(result.into_program());
     }
@@ -4324,7 +4329,7 @@ pub fn discharge_positional_region_operation<
             ReferenceDischargeRegionBoundaryInsertion::new(entering.to_vec(), forwarded.len()),
             [ReferenceDischargeRegionBoundaryInsertion::new(leaving.clone(), source_output_count).into()],
         );
-        let result = driver.rebuild_region(context, index, &boundary)?;
+        let result = driver.rebuild_region(context, driver.region(index)?, &boundary)?;
         result.validate_predicted_mutations(widening.published(), name)?;
         result.validate_predicted_output_allocations(summary.output_allocations(), name)?;
         regions.push(result.into_program());
@@ -4383,16 +4388,16 @@ mod tests {
 
     use crate::arrays::{
         Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReference, ArrayReferenceViewOperation,
-        ArrayReferenceViewTransform, ArrayType, DataType, ReferenceIndexOperation, ReferenceSliceOperation,
-        reapply_array_reference_view,
+        ArrayReferenceViewTransform, ArrayType, DataType, ReferenceDynamicIndexOperation, ReferenceIndexOperation,
+        ReferenceSliceOperation, reapply_array_reference_view,
     };
     use crate::captures::CaptureReference;
     use crate::contexts::EagerContext;
     use crate::interpretation::{InterpretableOperation, InterpretationDriver};
     use crate::operations::{
-        Add, AddOperation, ConditionOperation, ReferenceAddUpdateOperation, ReferenceFreezeOperation,
-        ReferenceNewOperation, ReferenceReadOperation, ReferenceSwapOperation, ReferenceWriteOperation,
-        ReshapeOperation, SliceOperation, UpdateSliceOperation,
+        Add, AddOperation, ConditionOperation, DynamicSliceOperation, DynamicUpdateSliceOperation,
+        ReferenceAddUpdateOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
+        ReferenceSwapOperation, ReferenceWriteOperation, ReshapeOperation, SliceOperation, UpdateSliceOperation,
     };
     use crate::parameters::{Parameter, Placeholder};
     use crate::programs::ProgramError;
@@ -4761,7 +4766,7 @@ mod tests {
 
         fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
             (matches!(self, Self::Call | Self::ScopedCall { dormant: false, .. }) && region_index == 0)
-                .then_some(InputRegionProvenance::Forwarded { input_index })
+                .then_some(InputRegionProvenance { input_index })
         }
 
         fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
@@ -6117,7 +6122,7 @@ mod tests {
             ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 2),
             [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 2)],
         );
-        let result = driver.rebuild_region(&context, 0, &boundary).unwrap();
+        let result = driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary).unwrap();
 
         // The region writes its entering allocation, so a widening that published nothing lost that update.
         assert_eq!(
@@ -6842,6 +6847,9 @@ mod tests {
     #[test]
     fn test_reference_discharge_driver_empty_region_driver() {
         let context = ListDischargeContext::new(ListDestination::new());
+        let empty = ProgramBuilder::<ListIrValue, ListOperation>::new()
+            .build::<Vec<ListIrValue>, Vec<ListIrValue>>(Vec::new(), Vec::new(), Vec::new())
+            .unwrap();
         let boundary = ReferenceDischargeRegionBoundary::new(
             &ListOperation::Call,
             0,
@@ -6861,7 +6869,7 @@ mod tests {
             Err(ProgramError::MalformedProgram("empty region driver cannot discharge a region".to_string())),
         );
         assert_eq!(
-            EmptyRegionDriver.rebuild_region(&context, 0, &boundary).unwrap_err(),
+            EmptyRegionDriver.rebuild_region(&context, empty.entry_region_ref(), &boundary).unwrap_err(),
             ProgramError::MalformedProgram("empty region driver cannot rebuild a region".to_string()),
         );
     }
@@ -6955,7 +6963,7 @@ mod tests {
             ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 0),
             [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 1)],
         );
-        let result = driver.rebuild_region(&context, 0, &boundary).unwrap();
+        let result = driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary).unwrap();
 
         // The rebuilt region reports what it did in the caller's own terms, and the caller's environment is untouched:
         // the allocation is still unmutated and still holds the state it entered with.
@@ -6993,7 +7001,7 @@ mod tests {
         let regions = [program];
         let driver = RecursiveReferenceDischargeDriver::new(&regions, None);
         assert!(matches!(
-            driver.rebuild_region(&context, 0, &boundary),
+            driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary),
             Err(ProgramError::MalformedProgram(message))
                 if message.starts_with("reference discharge accessed consumed reference allocation "),
         ));
@@ -7027,7 +7035,7 @@ mod tests {
             ReferenceDischargeRegionBoundaryInsertion::new(vec![allocation], 1),
             [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 0)],
         );
-        let result = driver.rebuild_region(&context, 0, &boundary).unwrap();
+        let result = driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary).unwrap();
         assert_eq!(
             result.program().to_string(),
             indoc! {"
@@ -7080,7 +7088,7 @@ mod tests {
             ReferenceDischargeRegionBoundaryInsertion::new(vec![allocation], 0),
             [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 0)],
         );
-        let result = driver.rebuild_region(&context, 0, &boundary).unwrap();
+        let result = driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary).unwrap();
         assert_eq!(
             result.program().to_string(),
             indoc! {"
@@ -7136,7 +7144,7 @@ mod tests {
                 ),
             ],
         );
-        let result = driver.rebuild_region(&context, 0, &boundary).unwrap();
+        let result = driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary).unwrap();
         assert_eq!(
             result.program().interpret(vec![ListIrValue::List(vec![1]), ListIrValue::List(vec![2, 3])]),
             Ok(vec![ListIrValue::List(vec![6]), ListIrValue::List(vec![2, 3]), ListIrValue::List(vec![6])]),
@@ -7152,7 +7160,7 @@ mod tests {
             ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 2),
             [ReferenceDischargeRegionBoundaryInsertion::new(vec![ReferenceDischargeRegionOutput::View(1)], 0)],
         );
-        assert!(matches!(driver.rebuild_region(&context, 0, &boundary),
+        assert!(matches!(driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary),
             Err(ProgramError::MalformedProgram(message)) if message == format!(
                 "reference discharge publishes input 1 of region `{region_id}` as a boundary view, but it \
                  is not a declared view input",
@@ -7165,7 +7173,7 @@ mod tests {
             ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 2),
             [ReferenceDischargeRegionBoundaryInsertion::new(vec![ReferenceDischargeRegionOutput::View(2)], 0)],
         );
-        assert!(matches!(driver.rebuild_region(&context, 0, &boundary),
+        assert!(matches!(driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary),
             Err(ProgramError::MalformedProgram(message)) if message == format!(
                 "reference discharge publishes input 2 of region `{region_id}` as a boundary view, but it \
                  is not a declared view input",
@@ -7183,7 +7191,7 @@ mod tests {
                 ReferenceDischargeRegionBoundaryInsertion::new(vec![ReferenceDischargeRegionOutput::View(0)], 1),
             ],
         );
-        assert!(matches!(driver.rebuild_region(&context, 0, &boundary),
+        assert!(matches!(driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary),
             Err(ProgramError::MalformedProgram(message)) if message == format!(
                 "reference discharge publishes boundary view input 0 of region `{region_id}` more than once",
             ),
@@ -7203,7 +7211,7 @@ mod tests {
                 ),
             ],
         );
-        assert!(matches!(driver.rebuild_region(&context, 0, &boundary),
+        assert!(matches!(driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary),
             Err(ProgramError::MalformedProgram(message)) if message == format!(
                 "reference discharge output insertion positions for region `{region_id}` are not in \
                  nondecreasing order",
@@ -7247,7 +7255,7 @@ mod tests {
                 ReferenceDischargeRegionBoundaryInsertion::new(vec![ReferenceDischargeRegionOutput::View(0)], 1),
             ],
         );
-        let result = driver.rebuild_region(&context, 0, &boundary).unwrap();
+        let result = driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary).unwrap();
         assert_eq!(
             result.program().to_string(),
             indoc! {"
@@ -7273,7 +7281,7 @@ mod tests {
             [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 1)],
         );
         assert_eq!(
-            driver.rebuild_region(&context, 0, &boundary).unwrap_err(),
+            driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary).unwrap_err(),
             ProgramError::MalformedProgram(format!(
                 "reference discharge mutated the boundary view at input 0 of region `{region}` without publishing \
                  its final state",
@@ -7294,7 +7302,7 @@ mod tests {
             ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 1),
             [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 1)],
         );
-        let result = driver.rebuild_region(&context, 0, &boundary).unwrap();
+        let result = driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary).unwrap();
         assert_eq!(
             result.program().to_string(),
             indoc! {"
@@ -7315,7 +7323,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            driver.rebuild_region(&context, 0, &boundary).unwrap_err(),
+            driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary).unwrap_err(),
             ProgramError::MalformedProgram(format!(
                 "reference discharge publishes the boundary view of preserved {preserved} at input 0 of region \
                  `{region}`",
@@ -7339,7 +7347,7 @@ mod tests {
             [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 0)],
         );
         assert_eq!(
-            driver.rebuild_region(&context, 0, &boundary).unwrap_err(),
+            driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary).unwrap_err(),
             ProgramError::MalformedProgram(format!(
                 "reference discharge assigns a boundary view of {allocation} to value input 0 of region `{region}`",
             )),
@@ -7366,7 +7374,7 @@ mod tests {
             [ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 0)],
         );
         assert_eq!(
-            driver.rebuild_region(&context, 0, &boundary).unwrap_err(),
+            driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary).unwrap_err(),
             ProgramError::MalformedProgram(format!(
                 "reference discharge passes {allocation} into region `{region}` both as a complete handle and as a \
                  boundary view",
@@ -7402,7 +7410,7 @@ mod tests {
         );
 
         assert_eq!(
-            driver.rebuild_region(&context, 0, &boundary).unwrap_err(),
+            driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary).unwrap_err(),
             ProgramError::MalformedProgram(format!(
                 "reference discharge cannot publish the view `ref<list<2>>` of {allocation} from region `{}`, \
                  whose boundary carries the complete stored value `ref<list<2>>`",
@@ -7434,7 +7442,7 @@ mod tests {
         );
 
         assert_eq!(
-            driver.rebuild_region(&context, 0, &boundary).unwrap_err(),
+            driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary).unwrap_err(),
             ProgramError::MalformedProgram(format!(
                 "reference discharge adds {allocation} to region `{}` more than once",
                 regions[0].entry_region_ref().id(),
@@ -7471,7 +7479,7 @@ mod tests {
         );
 
         assert_eq!(
-            driver.rebuild_region(&context, 0, &boundary).unwrap_err(),
+            driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary).unwrap_err(),
             ProgramError::MalformedProgram(format!(
                 "reference discharge adds {allocation} to region `{}`, which already carries it at a declared input",
                 regions[0].entry_region_ref().id(),
@@ -7510,7 +7518,7 @@ mod tests {
         );
 
         assert!(matches!(
-            driver.rebuild_region(&context, 0, &boundary),
+            driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary),
             Err(ProgramError::MalformedProgram(message))
                 if message.contains("reference discharge accessed consumed reference allocation"),
         ));
@@ -7560,7 +7568,7 @@ mod tests {
             ReferenceDischargeRegionBoundaryInsertion::new(vec![carried], 1),
             [ReferenceDischargeRegionBoundaryInsertion::new(vec![carried], 0).into()],
         );
-        let result = driver.rebuild_region(&context, 0, &boundary).unwrap();
+        let result = driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary).unwrap();
         assert_eq!(
             result.program().to_string(),
             indoc! {"
@@ -7605,7 +7613,7 @@ mod tests {
                        outputs: ReferenceDischargeRegionBoundaryInsertion| {
             let boundary =
                 ReferenceDischargeRegionBoundary::new(&ListOperation::Call, 0, declared, inputs, [outputs.into()]);
-            driver.rebuild_region(&context, 0, &boundary).unwrap_err()
+            driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary).unwrap_err()
         };
         let none = || ReferenceDischargeRegionBoundaryInsertion::new(Vec::new(), 0);
         let _ = reference;
@@ -7690,7 +7698,7 @@ mod tests {
         let prefix = "reference discharge cannot publish reference allocation ";
         let suffix = format!(" from region `{region_id}`, whose caller did not thread that allocation");
         assert!(matches!(
-            driver.rebuild_region(&context, 0, &boundary),
+            driver.rebuild_region(&context, driver.region(0).unwrap(), &boundary),
             Err(ProgramError::MalformedProgram(message)) if message.starts_with(prefix) && message.ends_with(&suffix),
         ));
     }
@@ -9110,7 +9118,7 @@ mod tests {
             ) -> Option<InputRegionProvenance> {
                 match self {
                     Self::Native(operation) => operation.input_region_provenance(region_index, input_index),
-                    Self::Call => Some(InputRegionProvenance::Forwarded { input_index }),
+                    Self::Call => Some(InputRegionProvenance { input_index }),
                 }
             }
 
@@ -9183,6 +9191,12 @@ mod tests {
             }
         }
 
+        impl From<ReferenceDynamicIndexOperation> for CallingOperation {
+            fn from(operation: ReferenceDynamicIndexOperation) -> Self {
+                Self::Native(operation.into())
+            }
+        }
+
         impl From<ReferenceSliceOperation> for CallingOperation {
             fn from(operation: ReferenceSliceOperation) -> Self {
                 Self::Native(operation.into())
@@ -9228,6 +9242,13 @@ mod tests {
 
             fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self {
                 Self::Native(DischargeOperation::from_reference_update_slice(operation))
+            }
+            fn from_reference_dynamic_slice(operation: DynamicSliceOperation) -> Self {
+                Self::Native(DischargeOperation::from_reference_dynamic_slice(operation))
+            }
+
+            fn from_reference_dynamic_update_slice(operation: DynamicUpdateSliceOperation) -> Self {
+                Self::Native(DischargeOperation::from_reference_dynamic_update_slice(operation))
             }
         }
 

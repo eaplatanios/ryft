@@ -49,6 +49,10 @@ use crate::programs::{Concretizable, ProgramError, TypeError, Typed, Value};
 /// `Array::with_unchecked_type`, which exists so that transform-validation tests can pin how the dynamic-shape
 /// rejections behave when a deliberately malformed value reaches them.
 ///
+/// Host concretization supports scalar Boolean values through [`Concretizable<bool>`] and scalar integers through
+/// [`Concretizable<i128>`]. The wider integer representation preserves all signed and unsigned element values,
+/// including `u64::MAX`, before callers perform range checks or clamping.
+///
 /// # Warning
 ///
 /// This backend prioritizes transparency over performance. It supports the physical strided and tiled layouts carried
@@ -729,6 +733,37 @@ impl Concretizable<bool> for Array {
     }
 }
 
+impl Concretizable<i128> for Array {
+    fn concretize(&self) -> Result<i128, ProgramError> {
+        if self.r#type.rank() != 0 || !self.r#type.data_type().is_integer() {
+            return Err(ProgramError::Concretization {
+                message: format!("cannot extract a concrete integer from `{}`; expected a scalar integer", self.r#type),
+            });
+        }
+
+        // The wider host representation preserves every signed and unsigned array integer before clamping.
+        let range = ArrayAddressing::new(self.r#type.clone())?.byte_range_for_flat_index(0);
+        let bytes = &self.bytes[range];
+        Ok(match self.r#type.data_type() {
+            DataType::I1 => i128::from(i1::decode(bytes).value()),
+            DataType::I2 => i128::from(i2::decode(bytes).value()),
+            DataType::I4 => i128::from(i4::decode(bytes).value()),
+            DataType::I8 => i128::from(i8::decode(bytes)),
+            DataType::I16 => i128::from(i16::decode(bytes)),
+            DataType::I32 => i128::from(i32::decode(bytes)),
+            DataType::I64 => i128::from(i64::decode(bytes)),
+            DataType::U1 => i128::from(u1::decode(bytes).value()),
+            DataType::U2 => i128::from(u2::decode(bytes).value()),
+            DataType::U4 => i128::from(u4::decode(bytes).value()),
+            DataType::U8 => i128::from(u8::decode(bytes)),
+            DataType::U16 => i128::from(u16::decode(bytes)),
+            DataType::U32 => i128::from(u32::decode(bytes)),
+            DataType::U64 => i128::from(u64::decode(bytes)),
+            _ => unreachable!(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use approx::assert_abs_diff_eq;
@@ -1200,14 +1235,41 @@ mod tests {
     }
 
     #[test]
-    fn test_array_boolean_concretization() {
+    fn test_array_concretize_bool() {
         let vector = Array::vector(vec![0.0, 2.5]);
         let boolean = vector.compare(&Array::vector(vec![0.0, 0.0]), ComparisonDirection::NotEqual).unwrap();
         assert_eq!(boolean.r#type().into_owned(), ArrayType::new_static(DataType::Boolean, [2]));
         assert_eq!(boolean, Array::vector(vec![false, true]));
         assert_eq!(Array::scalar(true).concretize(), Ok(true));
-        assert!(Array::vector(vec![true, false]).concretize().is_err());
-        assert!(Array::scalar(1.0).concretize().is_err());
+        let vector_result: Result<bool, ProgramError> = Array::vector(vec![true, false]).concretize();
+        let scalar_result: Result<bool, ProgramError> = Array::scalar(1.0).concretize();
+        assert_eq!(
+            vector_result,
+            Err(ProgramError::Concretization {
+                message: "cannot extract a concrete boolean from a value of type bool[2]; expected bool[]".to_string(),
+            }),
+        );
+        assert_eq!(
+            scalar_result,
+            Err(ProgramError::Concretization {
+                message: "cannot extract a concrete boolean from a value of type f64[]; expected bool[]".to_string(),
+            }),
+        );
+    }
+
+    #[test]
+    fn test_array_concretize_i128() {
+        let signed: Result<i128, ProgramError> = Array::scalar(i64::MIN).concretize();
+        let unsigned: Result<i128, ProgramError> = Array::scalar(u64::MAX).concretize();
+        assert_eq!(signed, Ok(i128::from(i64::MIN)));
+        assert_eq!(unsigned, Ok(i128::from(u64::MAX)));
+        let invalid: Result<i128, ProgramError> = Array::scalar(1.0_f32).concretize();
+        assert_eq!(
+            invalid,
+            Err(ProgramError::Concretization {
+                message: "cannot extract a concrete integer from `f32[]`; expected a scalar integer".to_string(),
+            })
+        );
     }
 
     #[test]

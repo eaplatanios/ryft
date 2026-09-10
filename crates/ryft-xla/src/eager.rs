@@ -17,8 +17,8 @@ use crate::{Array, ArrayShard};
 /// already follow it through [`Value::dispatch_domain`] — which for a concrete [`Array`] recovers the rich,
 /// PJRT-backed [`XlaDomain`](crate::XlaDomain) that compiles a cached single-operation program and executes it —
 /// so this module only implements the capabilities those blankets cannot cover: the foreign `std::ops` operator
-/// sugar (per-type implementations required by the orphan rule) and the host-readback predicates
-/// [`Concretizable<bool>`] and [`WhilePredicate`]. This helper is their shared bind-and-unwrap step; callers must pass
+/// sugar (per-type implementations required by the orphan rule) and host-readback capabilities such as
+/// [`Concretizable`] and [`WhilePredicate`]. This helper is their shared bind-and-unwrap step; callers must pass
 /// at least one input,
 /// and the first input determines the domain (and thereby the client and compile cache) the operation executes
 /// against.
@@ -67,6 +67,20 @@ impl Concretizable<bool> for Array<'_> {
                 self.r#type().as_ref(),
             ),
         })
+    }
+}
+
+impl Concretizable<i128> for Array<'_> {
+    fn concretize(&self) -> Result<i128, ProgramError> {
+        let shard = self.addressable_shards().next().ok_or_else(|| ProgramError::Concretization {
+            message: format!(
+                "cannot read an index from an array of type `{}` with no addressable shards",
+                self.r#type()
+            ),
+        })?;
+        // Decode through the CPU capability to preserve every signed and unsigned integer value. Rank-zero
+        // arrays are replicated, so reading one addressable shard provides the complete scalar.
+        ryft_core::Array::new(self.r#type().into_owned(), shard_host_bytes(shard)?)?.concretize()
     }
 }
 
@@ -1638,7 +1652,9 @@ mod tests {
         let branch =
             if predicate.concretize().unwrap() { small.add(&large).unwrap() } else { small.mul(&large).unwrap() };
         assert_eq!(read_f32s(&branch), vec![7.0]);
-        assert!(!large.compare(&small, ComparisonDirection::LessThan).unwrap().concretize().unwrap());
+        let reverse_predicate: bool =
+            large.compare(&small, ComparisonDirection::LessThan).unwrap().concretize().unwrap();
+        assert!(!reverse_predicate);
 
         // Elementwise truthiness is an explicit comparison against zero: zero maps to false and nonzero maps to true.
         let input = f32_vector(&client, &mesh, &[0.0, 2.0, 0.0]);
@@ -1648,7 +1664,35 @@ mod tests {
 
         // Rank-one predicates cannot collapse to a single Boolean.
         let vector_predicate = boolean_vector(&client, &mesh, &[true, false]);
-        assert!(matches!(vector_predicate.concretize(), Err(ProgramError::Concretization { .. })));
+        assert!(matches!(
+            Concretizable::<bool>::concretize(&vector_predicate),
+            Err(ProgramError::Concretization { .. })
+        ));
+    }
+
+    #[test]
+    fn test_eager_integer_concretization() {
+        let plugin = load_cpu_plugin().unwrap();
+        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let mesh = cpu_mesh(&client);
+        let signed = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::I64, &[]),
+            mesh.clone(),
+            i64::MIN.to_ne_bytes(),
+        )
+        .unwrap();
+        let unsigned = Array::from_host_buffer(
+            &client,
+            replicated_type(&mesh, DataType::U64, &[]),
+            mesh.clone(),
+            u64::MAX.to_ne_bytes(),
+        )
+        .unwrap();
+
+        // Keep the complete integer range before the caller applies bounds or converts to a host index.
+        assert_eq!(signed.concretize(), Ok(i128::from(i64::MIN)));
+        assert_eq!(unsigned.concretize(), Ok(i128::from(u64::MAX)));
     }
 
     #[test]

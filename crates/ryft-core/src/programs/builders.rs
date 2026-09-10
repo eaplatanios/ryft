@@ -216,8 +216,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
             )?;
             let resolved = match analysis.output_roots().get(output.output_index).copied().flatten() {
                 Some(ReferenceRoot::RegionInput { region: owner, input_index }) if owner == region.id() => {
-                    // Map the region input back to its caller operand. Views preserve allocation identity even
-                    // though they select different coordinates within that allocation.
+                    // Map the complete region input handle back to the caller operand supplying its root.
                     let input =
                         operation.input_region_provenance(output.region_index, input_index).ok_or_else(|| {
                             ProgramError::MalformedProgram(format!(
@@ -225,8 +224,7 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
                                 operation.name(),
                             ))
                         })?;
-                    let (InputRegionProvenance::Forwarded { input_index }
-                    | InputRegionProvenance::View { input_index }) = input;
+                    let InputRegionProvenance { input_index } = input;
                     let input = instruction.inputs().get(input_index).copied().ok_or_else(|| {
                         ProgramError::MalformedProgram(format!(
                             "operation `{}` forwards an unknown input",
@@ -950,22 +948,8 @@ mod tests {
             }
         }
 
-        fn effects(&self) -> Cow<'_, Effects> {
-            match self {
-                Self::Read => Cow::Owned(
-                    Effects::new(
-                        EffectClasses::NONE,
-                        vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
-                        Vec::new(),
-                    )
-                    .unwrap(),
-                ),
-                Self::Call(_) => Cow::Borrowed(Effects::empty()),
-            }
-        }
-
         fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
-            Some(InputRegionProvenance::Forwarded { input_index })
+            Some(InputRegionProvenance { input_index })
         }
 
         fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
@@ -979,6 +963,20 @@ mod tests {
             match self {
                 Self::Call(scope) => *scope,
                 Self::Read => None,
+            }
+        }
+
+        fn effects(&self) -> Cow<'_, Effects> {
+            match self {
+                Self::Read => Cow::Owned(
+                    Effects::new(
+                        EffectClasses::NONE,
+                        vec![ReferenceEffect::Access { input_index: 0, mode: ReferenceAccessMode::Read }],
+                        Vec::new(),
+                    )
+                    .unwrap(),
+                ),
+                Self::Call(_) => Cow::Borrowed(Effects::empty()),
             }
         }
     }
@@ -1931,12 +1929,12 @@ mod tests {
             }
         }
 
-        /// `ViewRegion` creates a boundary view of every operand for the corresponding region input.
+        /// `ForwardingRegion` forwards complete operand values to their corresponding region inputs.
         #[derive(Clone, Debug)]
         enum HookOperation {
             Allocate,
             Region { capture_input_count: Option<usize> },
-            ViewRegion,
+            ForwardingRegion,
         }
 
         impl Operation for HookOperation {
@@ -1946,32 +1944,14 @@ mod tests {
                 match self {
                     Self::Allocate => "test.allocate",
                     Self::Region { .. } => "test.region",
-                    Self::ViewRegion => "test.view_region",
+                    Self::ForwardingRegion => "test.forwarding_region",
                 }
             }
 
             fn region_slots(&self) -> &'static [RegionSlot] {
                 match self {
                     Self::Allocate => &[],
-                    Self::Region { .. } | Self::ViewRegion => const { &[RegionSlot::computation("body")] },
-                }
-            }
-
-            fn region_capture_input_count(&self, _region_index: usize) -> Option<usize> {
-                match self {
-                    Self::Allocate | Self::ViewRegion => None,
-                    Self::Region { capture_input_count } => *capture_input_count,
-                }
-            }
-
-            fn input_region_provenance(
-                &self,
-                _region_index: usize,
-                input_index: usize,
-            ) -> Option<InputRegionProvenance> {
-                match self {
-                    Self::ViewRegion => Some(InputRegionProvenance::View { input_index }),
-                    _ => None,
+                    Self::Region { .. } | Self::ForwardingRegion => const { &[RegionSlot::computation("body")] },
                 }
             }
 
@@ -1982,7 +1962,25 @@ mod tests {
             ) -> Result<Vec<HookType>, TypeError> {
                 match self {
                     Self::Allocate => Ok(vec![HookType::Reference]),
-                    Self::Region { .. } | Self::ViewRegion => Ok(region_interfaces[0].output_types().to_vec()),
+                    Self::Region { .. } | Self::ForwardingRegion => Ok(region_interfaces[0].output_types().to_vec()),
+                }
+            }
+
+            fn input_region_provenance(
+                &self,
+                _region_index: usize,
+                input_index: usize,
+            ) -> Option<InputRegionProvenance> {
+                match self {
+                    Self::ForwardingRegion => Some(InputRegionProvenance { input_index }),
+                    _ => None,
+                }
+            }
+
+            fn region_capture_input_count(&self, _region_index: usize) -> Option<usize> {
+                match self {
+                    Self::Allocate | Self::ForwardingRegion => None,
+                    Self::Region { capture_input_count } => *capture_input_count,
                 }
             }
 
@@ -1996,7 +1994,7 @@ mod tests {
                         )
                         .unwrap(),
                     ),
-                    Self::Region { .. } | Self::ViewRegion => Cow::Borrowed(Effects::empty()),
+                    Self::Region { .. } | Self::ForwardingRegion => Cow::Borrowed(Effects::empty()),
                 }
             }
         }
@@ -2075,20 +2073,20 @@ mod tests {
                 .is_ok()
         );
 
-        // A reference-typed region input may be a view that the operation creates from one of its own inputs.
+        // A reference-typed region input receives a complete root through the declared input provenance.
         let mut region_builder = ProgramBuilder::<HookValue, HookOperation>::new();
         region_builder.add_input(HookType::Reference);
         let payload = region_builder.add_input(HookType::Value);
-        let viewing_region = region_builder
+        let forwarding_region = region_builder
             .build::<Vec<HookValue>, Vec<HookValue>>(vec![payload], vec![Placeholder, Placeholder], vec![Placeholder])
             .unwrap();
         let mut builder = ProgramBuilder::<HookValue, HookOperation>::new();
-        let sealed = builder.import_region(viewing_region.entry_region_ref());
+        let sealed = builder.import_region(forwarding_region.entry_region_ref());
         let reference = builder.add_input(HookType::Reference);
         let payload = builder.add_input(HookType::Value);
         assert!(
             builder
-                .add_instruction(HookOperation::ViewRegion, vec![sealed], vec![reference, payload], None,)
+                .add_instruction(HookOperation::ForwardingRegion, vec![sealed], vec![reference, payload], None,)
                 .is_ok()
         );
     }
