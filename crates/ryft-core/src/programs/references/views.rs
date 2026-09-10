@@ -927,20 +927,21 @@ impl<V: Value, O: ReferenceViewOperation<Type = V::Type>> Transform<Region<V, O>
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
+    use std::collections::HashMap;
+    use std::error::Error as _;
 
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
         Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceView,
-        ArrayReferenceViewIndex, ArrayReferenceViewOperation, ArraySliceAxis, ArrayType, DataType, DimensionBounds,
-        DimensionType, DimensionValue, DimensionVariable, REFERENCE_INDEX_OPERATION_NAME,
-        ReferenceDynamicIndexOperation, ReferenceIndexOperation, ReferenceSliceOperation, reapply_array_reference_view,
+        ArrayReferenceViewIndex, ArraySliceAxis, ArrayType, DataType, DimensionBounds, DimensionType, DimensionValue,
+        DimensionVariable, REFERENCE_INDEX_OPERATION_NAME, ReferenceDynamicIndexOperation, ReferenceIndexOperation,
+        ReferenceSliceOperation, reapply_array_reference_view,
     };
     use crate::contexts::{EagerContext, StagingContext};
     use crate::operations::{
-        ConditionOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, ReferenceFreezeOperation, ReferenceNew,
-        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceWriteOperation, ReshapeOperation,
-        SliceOperation, UpdateSliceOperation, WhileOperation,
+        ConditionOperation, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
+        ReferenceReadOperation, ReferenceWriteOperation, WhileOperation,
     };
     use crate::parameters::Placeholder;
     use crate::programs::atoms::AtomId;
@@ -951,31 +952,26 @@ mod tests {
     use crate::programs::references::analysis::ReferenceAliasEdge;
     use crate::programs::references::discharge::ReferenceSource;
     use crate::programs::references::types::ReferenceType;
-    use crate::programs::regions::{OutputRegionProvenance, RegionId, RegionInterface, RegionSlot};
+    use crate::programs::regions::{RegionId, RegionInterface};
     use crate::programs::types::TypeError;
     use crate::tracing::TracingContext;
 
     use super::*;
 
+    /// Concrete array and reference values used by the test programs.
     type TestValue = ArrayIrValue<Array>;
 
+    /// Existing array-IR operations used by the test programs.
     type TestOperation = ArrayIrOperation<Array>;
 
+    /// Builder for test programs using existing array-IR operations.
     type TestBuilder = ProgramBuilder<TestValue, TestOperation>;
 
+    /// Test program with flat input and output parameters.
     type TestProgram = Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>;
 
+    /// Array view path whose symbols are bound to program values.
     type TestPath = ReferenceViewPath<ArrayReferenceView>;
-
-    /// Returns an instruction identity in the test program arena.
-    fn id(region: usize, index: usize) -> InstructionId {
-        InstructionId::new(RegionId::new(region), index)
-    }
-
-    /// Returns a value identity in the test program arena.
-    fn value(region: usize, atom: usize) -> ValueId {
-        ValueId::new(RegionId::new(region), AtomId::new(atom))
-    }
 
     /// Returns a reference type over a statically shaped `f32` array.
     fn reference_type(dimensions: impl Into<Vec<usize>>) -> ArrayIrType {
@@ -992,58 +988,50 @@ mod tests {
         let mut builder = TestBuilder::new();
         let matrix = builder.add_input(reference_type([2, 3]));
         let axes = vec![ArraySliceAxis::new(0, 1, 1), ArraySliceAxis::new(0, 3, 1)];
-        let row =
+        let slice =
             builder.add_instruction(ReferenceSliceOperation::new(axes), Vec::new(), vec![matrix], None).unwrap()[0];
-        let element =
-            builder.add_instruction(ReferenceIndexOperation::new(0, 0), Vec::new(), vec![row], None).unwrap()[0];
-        let snapshot =
-            builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![element], None).unwrap()[0];
+        let row =
+            builder.add_instruction(ReferenceIndexOperation::new(0, 0), Vec::new(), vec![slice], None).unwrap()[0];
+        let snapshot = builder.add_instruction(ReferenceReadOperation::new(), Vec::new(), vec![row], None).unwrap()[0];
         builder.build(vec![snapshot], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
-    /// Array-IR family extended with one two-input view operation which selects index `symbol` on axis 0 of its
-    /// reference input, `symbolic_view(reference: ref<f32[n]>, index: i64) -> ref<f32[]>`, and with operations exposing
-    /// additional behavior to test the shared batching rule's validation.
+    /// Array-IR operations with explicit view contracts for testing analysis and shared batching validation.
     #[derive(Clone, Debug)]
-    enum SymbolicViewOperation {
+    enum TestViewOperation {
+        /// An existing array-IR operation used to construct or read a view.
         Native(TestOperation),
+
+        /// A view whose symbol names an instruction input, including invalid positions for validation tests.
         Symbolic(usize),
+
+        /// A declared view alias without the corresponding view.
+        MissingView,
+
+        /// Two index views, with the second view optionally referring to a different input.
+        Pair { second_input: usize },
+
+        /// A view accompanied by either a source read or an extra non-reference output.
         AdditionalBehavior { reads: bool },
     }
 
-    impl SymbolicViewOperation {
+    impl TestViewOperation {
         /// Returns the view used by the symbolic test operation.
         fn view(symbol: usize) -> ArrayReferenceView {
             ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(symbol) }
         }
     }
 
-    impl Operation for SymbolicViewOperation {
+    impl Operation for TestViewOperation {
         type Type = ArrayIrType;
 
         fn name(&self) -> &'static str {
             match self {
                 Self::Native(operation) => operation.name(),
                 Self::Symbolic(_) => "symbolic_view",
+                Self::MissingView => "missing_view",
+                Self::Pair { .. } => "view_pair",
                 Self::AdditionalBehavior { .. } => "additional_behavior",
-            }
-        }
-
-        fn region_slots(&self) -> &'static [RegionSlot] {
-            match self {
-                Self::Native(operation) => operation.region_slots(),
-                Self::Symbolic(_) | Self::AdditionalBehavior { .. } => &[],
-            }
-        }
-
-        fn infer_region_input_types(
-            &self,
-            input_types: &[ArrayIrType],
-            region_interfaces: &[RegionInterface<ArrayIrType>],
-        ) -> Result<Vec<Option<Vec<ArrayIrType>>>, TypeError> {
-            match self {
-                Self::Native(operation) => operation.infer_region_input_types(input_types, region_interfaces),
-                Self::Symbolic(_) | Self::AdditionalBehavior { .. } => Ok(Vec::new()),
             }
         }
 
@@ -1054,6 +1042,16 @@ mod tests {
         ) -> Result<Vec<ArrayIrType>, TypeError> {
             match self {
                 Self::Native(operation) => operation.infer_output_types(input_types, region_interfaces),
+                Self::MissingView => Ok(vec![input_types[0].clone()]),
+                Self::Pair { second_input } => [0, *second_input]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, input)| {
+                        ReferenceIndexOperation::new(0, index)
+                            .infer_output_types(&input_types[input..=input], &[])
+                            .map(|outputs| outputs.into_iter().next().unwrap())
+                    })
+                    .collect(),
                 Self::AdditionalBehavior { reads } => {
                     let mut outputs = ReferenceIndexOperation::new(0, 0).infer_output_types(input_types, &[])?;
                     if !reads {
@@ -1065,27 +1063,6 @@ mod tests {
                     let reference = <&ReferenceType<ArrayType>>::try_from(&input_types[0])?;
                     Ok(vec![ReferenceType::new(Self::view(*symbol).output_type(reference.referent())?).into()])
                 }
-            }
-        }
-
-        fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
-            match self {
-                Self::Native(operation) => operation.input_region_provenance(region_index, input_index),
-                Self::Symbolic(_) | Self::AdditionalBehavior { .. } => None,
-            }
-        }
-
-        fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
-            match self {
-                Self::Native(operation) => operation.output_region_provenance(output_index),
-                Self::Symbolic(_) | Self::AdditionalBehavior { .. } => Vec::new(),
-            }
-        }
-
-        fn reference_output_identity_input(&self, output_index: usize) -> Option<usize> {
-            match self {
-                Self::Native(operation) => operation.reference_output_identity_input(output_index),
-                Self::Symbolic(_) | Self::AdditionalBehavior { .. } => None,
             }
         }
 
@@ -1104,7 +1081,18 @@ mod tests {
                     )
                     .unwrap(),
                 ),
-                Self::Symbolic(_) => Cow::Owned(
+                Self::Pair { second_input } => Cow::Owned(
+                    Effects::new(
+                        EffectClasses::NONE,
+                        Vec::new(),
+                        vec![
+                            ReferenceAlias::new(0, 0, ReferenceAliasKind::View),
+                            ReferenceAlias::new(1, *second_input, ReferenceAliasKind::View),
+                        ],
+                    )
+                    .unwrap(),
+                ),
+                Self::Symbolic(_) | Self::MissingView => Cow::Owned(
                     Effects::new(
                         EffectClasses::NONE,
                         Vec::new(),
@@ -1116,33 +1104,34 @@ mod tests {
         }
     }
 
-    impl From<ReferenceIndexOperation> for SymbolicViewOperation {
+    impl From<ReferenceIndexOperation> for TestViewOperation {
         fn from(operation: ReferenceIndexOperation) -> Self {
             Self::Native(operation.into())
         }
     }
 
-    impl From<ReferenceDynamicIndexOperation> for SymbolicViewOperation {
+    impl From<ReferenceDynamicIndexOperation> for TestViewOperation {
         fn from(operation: ReferenceDynamicIndexOperation) -> Self {
             Self::Native(operation.into())
         }
     }
 
-    impl From<ReferenceSliceOperation> for SymbolicViewOperation {
+    impl From<ReferenceSliceOperation> for TestViewOperation {
         fn from(operation: ReferenceSliceOperation) -> Self {
             Self::Native(operation.into())
         }
     }
 
-    impl ReferenceViewOperation for SymbolicViewOperation {
+    impl ReferenceViewOperation for TestViewOperation {
         type View = ArrayReferenceView;
 
         fn reference_view(&self, output_index: usize) -> Option<ArrayReferenceView> {
             match self {
                 Self::Native(operation) => operation.reference_view(output_index),
+                Self::Pair { .. } if output_index < 2 => Some(index(0, output_index)),
                 Self::Symbolic(symbol) if output_index == 0 => Some(Self::view(*symbol)),
                 Self::AdditionalBehavior { .. } if output_index == 0 => Some(index(0, 0)),
-                Self::Symbolic(_) | Self::AdditionalBehavior { .. } => None,
+                Self::Symbolic(_) | Self::MissingView | Self::Pair { .. } | Self::AdditionalBehavior { .. } => None,
             }
         }
 
@@ -1166,18 +1155,16 @@ mod tests {
 
     /// Builds `f(vector: ref<f32[2]>, index: i64) = read(symbolic_view(vector, index))`, whose view describes its index
     /// through `symbol`.
-    fn symbolic_view_program(
-        symbol: usize,
-    ) -> Program<TestValue, SymbolicViewOperation, Vec<TestValue>, Vec<TestValue>> {
-        let mut builder = ProgramBuilder::<TestValue, SymbolicViewOperation>::new();
+    fn symbolic_view_program(symbol: usize) -> Program<TestValue, TestViewOperation, Vec<TestValue>, Vec<TestValue>> {
+        let mut builder = ProgramBuilder::<TestValue, TestViewOperation>::new();
         let vector = builder.add_input(reference_type([2]));
         let index_value = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::I64)));
         let view = builder
-            .add_instruction(SymbolicViewOperation::Symbolic(symbol), Vec::new(), vec![vector, index_value], None)
+            .add_instruction(TestViewOperation::Symbolic(symbol), Vec::new(), vec![vector, index_value], None)
             .unwrap()[0];
         let snapshot = builder
             .add_instruction(
-                SymbolicViewOperation::Native(ReferenceReadOperation::new().into()),
+                TestViewOperation::Native(ReferenceReadOperation::new().into()),
                 Vec::new(),
                 vec![view],
                 None,
@@ -1218,14 +1205,18 @@ mod tests {
              through inputs and captures",
         );
         assert_eq!(
-            ReferenceViewAnalysisError::MissingView { operation: "view", instruction: id(0, 2), output_index: 0 }
-                .to_string(),
+            ReferenceViewAnalysisError::MissingView {
+                operation: "view",
+                instruction: InstructionId::new(RegionId::new(0), 2),
+                output_index: 0
+            }
+            .to_string(),
             "operation `view` at ^0[2] declares a reference view at output 0 but describes no view",
         );
         assert_eq!(
             ReferenceViewAnalysisError::InvalidView {
                 operation: "reference_index",
-                instruction: id(0, 2),
+                instruction: InstructionId::new(RegionId::new(0), 2),
                 output_index: 0,
                 source: ReferenceViewValidationError::TypeMismatch {
                     expected: "f32[3]".to_string(),
@@ -1239,7 +1230,7 @@ mod tests {
         assert_eq!(
             ReferenceViewAnalysisError::InvalidView {
                 operation: "reference_index",
-                instruction: id(0, 2),
+                instruction: InstructionId::new(RegionId::new(0), 2),
                 output_index: 0,
                 source: ReferenceViewValidationError::InvalidComposition {
                     message: "reference index axis 2 is out of bounds for rank 2".to_string(),
@@ -1252,7 +1243,7 @@ mod tests {
         assert_eq!(
             ReferenceViewAnalysisError::InvalidViewSymbol {
                 operation: "symbolic_view",
-                instruction: id(0, 2),
+                instruction: InstructionId::new(RegionId::new(0), 2),
                 output_index: 0,
                 symbol: 3,
                 message: "the instruction has only 2 inputs".to_string(),
@@ -1264,24 +1255,26 @@ mod tests {
         assert_eq!(
             ProgramError::from(ReferenceViewAnalysisError::MissingView {
                 operation: "view",
-                instruction: id(0, 2),
+                instruction: InstructionId::new(RegionId::new(0), 2),
                 output_index: 0,
             }),
             ProgramError::Reference(crate::programs::references::ReferenceError::ViewAnalysis(Box::new(
-                ReferenceViewAnalysisError::MissingView { operation: "view", instruction: id(0, 2), output_index: 0 },
+                ReferenceViewAnalysisError::MissingView {
+                    operation: "view",
+                    instruction: InstructionId::new(RegionId::new(0), 2),
+                    output_index: 0
+                },
             ),)),
         );
     }
 
     #[test]
     fn test_reference_view_analysis_error_source() {
-        use std::error::Error as _;
-
         let validation =
             ReferenceViewValidationError::TypeMismatch { expected: "f32[3]".to_string(), actual: "f32[2]".to_string() };
         let error = ReferenceViewAnalysisError::InvalidView {
             operation: "view",
-            instruction: id(0, 0),
+            instruction: InstructionId::new(RegionId::new(0), 0),
             output_index: 2,
             source: validation.clone(),
         };
@@ -1322,6 +1315,19 @@ mod tests {
         assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
         assert_eq!(outputs[0].value().read(), Ok(TestValue::Array(Array::vector(vec![2.0f32, 5.0]))));
 
+        // A dynamic index shared by every batch item follows the same axis adjustment as a static index.
+        let outputs = ReferenceViewOperation::batch(
+            &TestOperation::from(ReferenceDynamicIndexOperation::new(0)),
+            &context,
+            &[batch.clone(), ArrayIrBatch::replicated(TestValue::Array(Array::scalar(1i64)))],
+        )
+        .unwrap()
+        .into_parts()
+        .0;
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].value().read(), Ok(TestValue::Array(Array::vector(vec![1.0f32, 4.0]))));
+
         // A replicated source is viewed unchanged and stays replicated.
         let replicated = ArrayIrBatch::replicated(reference);
         let outputs = ReferenceViewOperation::batch(
@@ -1352,7 +1358,7 @@ mod tests {
             ReferenceViewOperation::batch(
                 &TestOperation::from(ReferenceNewOperation::<ArrayType, ArrayIrType>::new()),
                 &context,
-                &[batch.clone()],
+                &[ArrayIrBatch::replicated(TestValue::Array(Array::scalar(0.0f32)))],
             )
             .err(),
             Some(BatchingError::UnsupportedOperation {
@@ -1363,17 +1369,93 @@ mod tests {
         );
         assert_eq!(
             ReferenceViewOperation::batch(
-                &TestOperation::from(ReferenceIndexOperation::new(0, 1)),
+                &TestOperation::from(ReferenceDynamicIndexOperation::new(0)),
                 &context,
-                &[batch.clone(), batch]
+                &[batch, ArrayIrBatch::new(TestValue::Array(Array::vector(vec![0i64, 1])), BatchAxis::new(0)).unwrap()],
             )
             .err(),
             Some(BatchingError::UnsupportedOperation {
-                message: "`reference_index` requires input 1 to be replicated; batching a reference view through a \
+                message:
+                    "`reference_dynamic_index` requires input 1 to be replicated; batching a reference view through a \
                           mapped index input is not supported"
-                    .to_string(),
+                        .to_string(),
             }),
         );
+    }
+
+    #[test]
+    fn test_reference_view_operation_batch_multiple_outputs() {
+        let parent = TracingContext::<TestValue, TestViewOperation>::new();
+        let extent = parent
+            .lift(TestValue::Dimension(
+                DimensionValue::new(
+                    DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())),
+                    2,
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let input = ArrayIrBatch::new(parent.input(reference_type([2, 3])), BatchAxis::new(0)).unwrap();
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), extent);
+
+        // Each output is reconstructed independently, in output order, with the batch axis preserved.
+        let outputs =
+            ReferenceViewOperation::batch(&TestViewOperation::Pair { second_input: 0 }, &context, &[input.clone()])
+                .unwrap()
+                .into_parts()
+                .0;
+        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs[0].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[1].batch_axis(), BatchAxis::new(0));
+        assert_eq!(outputs[0].value().r#type().as_ref(), &reference_type([2]));
+        assert_eq!(outputs[1].value().r#type().as_ref(), &reference_type([2]));
+        assert_eq!(
+            parent
+                .builder()
+                .borrow()
+                .instructions()
+                .iter()
+                .map(|instruction| instruction.operation().reference_view(0))
+                .collect::<Vec<_>>(),
+            vec![Some(index(1, 0)), Some(index(1, 1))],
+        );
+
+        // The shared rule accepts several views of one source, but cannot reconstruct views of separate sources.
+        let second = ArrayIrBatch::new(parent.input(reference_type([2, 3])), BatchAxis::new(0)).unwrap();
+        assert_eq!(
+            ReferenceViewOperation::batch(&TestViewOperation::Pair { second_input: 1 }, &context, &[input, second],)
+                .err(),
+            Some(BatchingError::UnsupportedOperation {
+                message: "`view_pair` views inputs 0 and 1, but a view operation views one source".to_string(),
+            }),
+        );
+        assert_eq!(parent.builder().borrow().instructions().len(), 2);
+    }
+
+    #[test]
+    fn test_reference_view_operation_batch_rejects_missing_views() {
+        let parent = TracingContext::<TestValue, TestViewOperation>::new();
+        let extent = parent
+            .lift(TestValue::Dimension(
+                DimensionValue::new(
+                    DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())),
+                    2,
+                )
+                .unwrap(),
+            ))
+            .unwrap();
+        let input = ArrayIrBatch::replicated(parent.input(reference_type([2])));
+        let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), extent);
+
+        // Declaring a view alias is not enough: reconstruction needs the view for that output.
+        assert_eq!(
+            ReferenceViewOperation::batch(&TestViewOperation::MissingView, &context, &[input]).err(),
+            Some(BatchingError::from(ProgramError::MalformedProgram(
+                "operation `missing_view` derives a reference view at output 0 but exposes no view transform"
+                    .to_string(),
+            ))),
+        );
+        assert_eq!(parent.builder().borrow().instructions().len(), 0);
     }
 
     #[test]
@@ -1382,7 +1464,7 @@ mod tests {
             DimensionValue::new(DimensionType::new(DimensionVariable::new("batch", DimensionBounds::unbounded())), 2)
                 .unwrap(),
         );
-        let parent = TracingContext::<TestValue, SymbolicViewOperation>::new();
+        let parent = TracingContext::<TestValue, TestViewOperation>::new();
         let extent = parent.lift(extent).unwrap();
         let input = ArrayIrBatch::replicated(parent.input(reference_type([2])));
         let context = BatchingContext::<_, ArrayIrBatchingPolicy>::new(parent.clone(), extent);
@@ -1390,9 +1472,9 @@ mod tests {
         // Replaying only the view would discard either the extra value result or the source read effect.
         assert_eq!(
             ReferenceViewOperation::batch(
-                &SymbolicViewOperation::AdditionalBehavior { reads: false },
+                &TestViewOperation::AdditionalBehavior { reads: false },
                 &context,
-                &[input.clone()]
+                &[input.clone()],
             )
             .err(),
             Some(BatchingError::UnsupportedOperation {
@@ -1400,12 +1482,30 @@ mod tests {
             }),
         );
         assert_eq!(
-            ReferenceViewOperation::batch(&SymbolicViewOperation::AdditionalBehavior { reads: true }, &context, &[input]).err(),
+            ReferenceViewOperation::batch(&TestViewOperation::AdditionalBehavior { reads: true }, &context, &[input]).err(),
             Some(BatchingError::UnsupportedOperation {
                 message: "`additional_behavior` has effects or attached regions that cannot be preserved by batching only its reference views".to_string(),
             }),
         );
         assert_eq!(parent.builder().borrow().instructions().len(), 0);
+    }
+
+    #[test]
+    fn test_reference_view_step_view() {
+        let view = index(0, 1);
+        let path = TestPath::root().with_view(view.clone());
+        assert_eq!(path.steps()[0].view(), &view);
+    }
+
+    #[test]
+    fn test_reference_view_step_bindings() {
+        let static_path = TestPath::root().with_view(index(0, 1));
+        assert_eq!(static_path.steps()[0].bindings(), &[]);
+
+        // The binding identifies the value supplying the dynamic index; it is not the index's runtime value.
+        let path = TestPath::root()
+            .with_step(TestViewOperation::view(1), vec![ValueId::new(RegionId::new(0), AtomId::new(3))]);
+        assert_eq!(path.steps()[0].bindings(), &[ValueId::new(RegionId::new(0), AtomId::new(3))]);
     }
 
     #[test]
@@ -1420,11 +1520,21 @@ mod tests {
     }
 
     #[test]
+    fn test_reference_view_path_is_root() {
+        assert!(TestPath::root().is_root());
+        assert!(!TestPath::root().with_view(index(0, 1)).is_root());
+    }
+
+    #[test]
     fn test_reference_view_path_steps() {
-        let path = TestPath::root().with_view(index(0, 1));
-        assert_eq!(path.steps().len(), 1);
-        assert_eq!(path.steps()[0].view(), &index(0, 1));
-        assert_eq!(path.steps()[0].bindings(), &[]);
+        let path = TestPath::root().with_view(index(0, 1)).with_view(index(0, 2));
+        assert_eq!(
+            path.steps(),
+            &[
+                ReferenceViewStep { view: index(0, 1), bindings: Vec::new() },
+                ReferenceViewStep { view: index(0, 2), bindings: Vec::new() },
+            ],
+        );
     }
 
     #[test]
@@ -1435,24 +1545,23 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_view_path_is_root() {
-        assert!(TestPath::root().is_root());
-        assert!(!TestPath::root().with_view(index(0, 1)).is_root());
-    }
-
-    #[test]
     fn test_reference_view_path_with_step() {
         let row = TestPath::root().with_view(index(0, 1));
         let symbolic = ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(1) };
-        let bound = row.with_step(symbolic.clone(), vec![value(0, 3)]);
+        let bound = row.with_step(symbolic.clone(), vec![ValueId::new(RegionId::new(0), AtomId::new(3))]);
         assert_eq!(bound.views().collect::<Vec<_>>(), vec![&index(0, 1), &symbolic]);
-        assert_eq!(bound.steps()[1].bindings(), &[value(0, 3)]);
+        assert_eq!(bound.steps()[1].bindings(), &[ValueId::new(RegionId::new(0), AtomId::new(3))]);
         assert_eq!(row.views().collect::<Vec<_>>(), vec![&index(0, 1)]);
 
         // Equal views can select different indices when their source bindings differ.
-        assert_eq!(bound, row.with_step(symbolic.clone(), vec![value(0, 3)]));
-        assert_ne!(bound, row.with_step(symbolic.clone(), vec![value(0, 4)]));
-        assert_ne!(bound, row.with_step(symbolic, vec![value(1, 0)]));
+        assert_eq!(bound, row.with_step(symbolic.clone(), vec![ValueId::new(RegionId::new(0), AtomId::new(3))]));
+        assert_ne!(bound, row.with_step(symbolic.clone(), vec![ValueId::new(RegionId::new(0), AtomId::new(4))]));
+        assert_ne!(bound, row.with_step(symbolic, vec![ValueId::new(RegionId::new(1), AtomId::new(0))]));
+
+        // Paths used as map keys distinguish bindings as well as views.
+        let paths = HashMap::from([(bound.clone(), "bound")]);
+        assert_eq!(paths.get(&bound), Some(&"bound"));
+        assert_eq!(paths.get(&row), None);
     }
 
     #[test]
@@ -1489,41 +1598,34 @@ mod tests {
         assert_eq!(TestPath::root().overlap(&TestPath::root(), &root), ReferenceViewOverlap::Same);
 
         // Symbolic views agree when their input bindings agree. Different bindings may still select the same row.
-        let iteration = |region: usize| {
-            TestPath::root().with_step(
-                ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(1) },
-                vec![value(region, 0)],
-            )
-        };
-        assert_eq!(iteration(0).overlap(&iteration(0), &root), ReferenceViewOverlap::Same);
-        assert_eq!(iteration(0).overlap(&TestPath::root(), &root), ReferenceViewOverlap::MayOverlap);
-        assert_eq!(iteration(0).overlap(&row_1, &root), ReferenceViewOverlap::MayOverlap);
-        assert_eq!(iteration(0).overlap(&iteration(1), &root), ReferenceViewOverlap::MayOverlap);
+        let symbolic = TestPath::root()
+            .with_step(TestViewOperation::view(1), vec![ValueId::new(RegionId::new(0), AtomId::new(0))]);
+        let other = TestPath::root()
+            .with_step(TestViewOperation::view(1), vec![ValueId::new(RegionId::new(1), AtomId::new(0))]);
+        assert_eq!(symbolic.overlap(&symbolic, &root), ReferenceViewOverlap::Same);
+        assert_eq!(symbolic.overlap(&TestPath::root(), &root), ReferenceViewOverlap::MayOverlap);
+        assert_eq!(symbolic.overlap(&row_1, &root), ReferenceViewOverlap::MayOverlap);
+        assert_eq!(symbolic.overlap(&other, &root), ReferenceViewOverlap::MayOverlap);
     }
 
     #[test]
     fn test_reference_view_analysis_new() {
-        // The root carries the empty path, the row copies nothing but appends the slice, and the element appends the
-        // index after the slice; the read output is not reference-typed and has no path.
+        // Each view appends a step to its source path: first the slice, then its row index. The complete reference
+        // has an empty path, and the array returned by the read has no path.
         let program = chain_program();
         let analysis = ReferenceViewAnalysis::new(program.entry_region_ref(), 0).unwrap();
         let slice =
             ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(0, 1, 1), ArraySliceAxis::new(0, 3, 1)] };
-        assert_eq!(analysis.path(value(0, 0)), Some(&TestPath::root()));
-        assert_eq!(analysis.path(value(0, 1)), Some(&TestPath::root().with_view(slice.clone())));
-        assert_eq!(analysis.path(value(0, 2)), Some(&TestPath::root().with_view(slice.clone()).with_view(index(0, 0))));
-        assert_eq!(analysis.path(value(0, 3)), None);
-
-        // Both alias edges record the output that defines the aliasing value, which is what the view analysis asked the
-        // producing operation to describe.
+        assert_eq!(analysis.path(ValueId::new(RegionId::new(0), AtomId::new(0))), Some(&TestPath::root()));
         assert_eq!(
-            analysis.analysis().alias(value(0, 1)),
-            Some(ReferenceAliasEdge::new(id(0, 0), 0, value(0, 0), ReferenceAliasKind::View, true,)),
+            analysis.path(ValueId::new(RegionId::new(0), AtomId::new(1))),
+            Some(&TestPath::root().with_view(slice.clone())),
         );
         assert_eq!(
-            analysis.analysis().alias(value(0, 2)),
-            Some(ReferenceAliasEdge::new(id(0, 1), 0, value(0, 1), ReferenceAliasKind::View, true,)),
+            analysis.path(ValueId::new(RegionId::new(0), AtomId::new(2))),
+            Some(&TestPath::root().with_view(slice.clone()).with_view(index(0, 0))),
         );
+        assert_eq!(analysis.path(ValueId::new(RegionId::new(0), AtomId::new(3))), None);
     }
 
     #[test]
@@ -1605,17 +1707,23 @@ mod tests {
 
         let analysis = ReferenceViewAnalysis::new(program.entry_region_ref(), 0).unwrap();
         assert_eq!(
-            analysis.analysis().alias(value(2, 3)),
-            Some(ReferenceAliasEdge::new(id(2, 0), 1, value(2, 1), ReferenceAliasKind::Identity, false,)),
+            analysis.analysis().alias(ValueId::new(RegionId::new(2), AtomId::new(3))),
+            Some(ReferenceAliasEdge::new(
+                InstructionId::new(RegionId::new(2), 0),
+                1,
+                ValueId::new(RegionId::new(2), AtomId::new(1)),
+                ReferenceAliasKind::Identity,
+                false,
+            )),
         );
         assert_eq!(
             analysis.paths().collect::<Vec<_>>(),
             vec![
-                (value(0, 1), &TestPath::root()),
-                (value(1, 1), &TestPath::root()),
-                (value(1, 2), &TestPath::root().with_view(index(0, 1))),
-                (value(2, 1), &TestPath::root()),
-                (value(2, 3), &TestPath::root()),
+                (ValueId::new(RegionId::new(0), AtomId::new(1)), &TestPath::root()),
+                (ValueId::new(RegionId::new(1), AtomId::new(1)), &TestPath::root()),
+                (ValueId::new(RegionId::new(1), AtomId::new(2)), &TestPath::root().with_view(index(0, 1))),
+                (ValueId::new(RegionId::new(2), AtomId::new(1)), &TestPath::root()),
+                (ValueId::new(RegionId::new(2), AtomId::new(3)), &TestPath::root()),
             ],
         );
     }
@@ -1639,7 +1747,7 @@ mod tests {
             ReferenceViewAnalysis::new(program.entry_region_ref(), 0).err(),
             Some(ReferenceViewAnalysisError::InvalidView {
                 operation: REFERENCE_INDEX_OPERATION_NAME,
-                instruction: id(0, 0),
+                instruction: InstructionId::new(RegionId::new(0), 0),
                 output_index: 0,
                 source: ReferenceViewValidationError::TypeMismatch {
                     expected: "f32[3]".to_string(),
@@ -1668,7 +1776,7 @@ mod tests {
             ReferenceViewAnalysis::new(program.entry_region_ref(), 0).err(),
             Some(ReferenceViewAnalysisError::InvalidView {
                 operation: REFERENCE_INDEX_OPERATION_NAME,
-                instruction: id(0, 0),
+                instruction: InstructionId::new(RegionId::new(0), 0),
                 output_index: 0,
                 source: ReferenceViewValidationError::InvalidComposition {
                     message: "reference index axis 2 is out of bounds for rank 2".to_string(),
@@ -1692,7 +1800,7 @@ mod tests {
             ReferenceViewAnalysis::new(program.entry_region_ref(), 0).err(),
             Some(ReferenceViewAnalysisError::Analysis(ReferenceAnalysisError::ExternalReferenceConsumption {
                 operation: "reference_freeze",
-                instruction: id(0, 0),
+                instruction: InstructionId::new(RegionId::new(0), 0),
                 root: ReferenceRoot::RegionInput { region: RegionId::new(0), input_index: 0 },
                 external_source: ReferenceSource::Input { index: 0 },
             })),
@@ -1701,125 +1809,13 @@ mod tests {
 
     #[test]
     fn test_reference_view_analysis_new_rejects_missing_views() {
-        /// Array-IR family extended with one operation that declares a view alias but describes no view for it.
-        #[allow(clippy::large_enum_variant)]
-        #[derive(Clone, Debug)]
-        enum UndescribedViewOperation {
-            Native(TestOperation),
-            View,
-        }
-
-        impl Operation for UndescribedViewOperation {
-            type Type = ArrayIrType;
-
-            fn name(&self) -> &'static str {
-                match self {
-                    Self::Native(operation) => operation.name(),
-                    Self::View => "undescribed_view",
-                }
-            }
-
-            fn infer_output_types(
-                &self,
-                input_types: &[ArrayIrType],
-                region_interfaces: &[RegionInterface<ArrayIrType>],
-            ) -> Result<Vec<ArrayIrType>, TypeError> {
-                match self {
-                    Self::Native(operation) => operation.infer_output_types(input_types, region_interfaces),
-                    Self::View => Ok(vec![input_types[0].clone()]),
-                }
-            }
-
-            fn effects(&self) -> Cow<'_, Effects> {
-                match self {
-                    Self::Native(operation) => operation.effects(),
-                    Self::View => Cow::Owned(
-                        Effects::new(
-                            EffectClasses::NONE,
-                            Vec::new(),
-                            vec![ReferenceAlias::new(0, 0, ReferenceAliasKind::View)],
-                        )
-                        .unwrap(),
-                    ),
-                }
-            }
-        }
-
-        impl From<ReferenceIndexOperation> for UndescribedViewOperation {
-            fn from(operation: ReferenceIndexOperation) -> Self {
-                Self::Native(operation.into())
-            }
-        }
-
-        impl From<ReferenceDynamicIndexOperation> for UndescribedViewOperation {
-            fn from(operation: ReferenceDynamicIndexOperation) -> Self {
-                Self::Native(operation.into())
-            }
-        }
-
-        impl From<ReferenceSliceOperation> for UndescribedViewOperation {
-            fn from(operation: ReferenceSliceOperation) -> Self {
-                Self::Native(operation.into())
-            }
-        }
-
-        impl ReferenceViewOperation for UndescribedViewOperation {
-            type View = ArrayReferenceView;
-
-            fn reference_view(&self, output_index: usize) -> Option<ArrayReferenceView> {
-                match self {
-                    Self::Native(operation) => operation.reference_view(output_index),
-                    Self::View => None,
-                }
-            }
-
-            fn validate_reference_view(
-                view: &ArrayReferenceView,
-                source: &ArrayIrType,
-                target: &ArrayIrType,
-            ) -> Result<(), ReferenceViewValidationError> {
-                TestOperation::validate_reference_view(view, source, target)
-            }
-
-            fn reapply_reference_view<C: Context<Type = ArrayIrType, Operation = Self>>(
-                context: &C,
-                view: &ArrayReferenceView,
-                source: C::Value,
-                symbols: &[C::Value],
-            ) -> Result<C::Value, ProgramError> {
-                reapply_array_reference_view(context, view, source, symbols)
-            }
-        }
-
-        impl ArrayReferenceViewOperation for UndescribedViewOperation {
-            fn from_reference_reshape(operation: ReshapeOperation) -> Self {
-                Self::Native(TestOperation::from_reference_reshape(operation))
-            }
-
-            fn from_reference_slice(operation: SliceOperation) -> Self {
-                Self::Native(TestOperation::from_reference_slice(operation))
-            }
-
-            fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self {
-                Self::Native(TestOperation::from_reference_update_slice(operation))
-            }
-
-            fn from_reference_dynamic_slice(operation: DynamicSliceOperation) -> Self {
-                Self::Native(TestOperation::from_reference_dynamic_slice(operation))
-            }
-
-            fn from_reference_dynamic_update_slice(operation: DynamicUpdateSliceOperation) -> Self {
-                Self::Native(TestOperation::from_reference_dynamic_update_slice(operation))
-            }
-        }
-
-        let mut builder = ProgramBuilder::<TestValue, UndescribedViewOperation>::new();
+        let mut builder = ProgramBuilder::<TestValue, TestViewOperation>::new();
         let reference = builder.add_input(reference_type([2]));
         let view =
-            builder.add_instruction(UndescribedViewOperation::View, Vec::new(), vec![reference], None).unwrap()[0];
+            builder.add_instruction(TestViewOperation::MissingView, Vec::new(), vec![reference], None).unwrap()[0];
         let snapshot = builder
             .add_instruction(
-                UndescribedViewOperation::Native(ReferenceReadOperation::new().into()),
+                TestViewOperation::Native(ReferenceReadOperation::new().into()),
                 Vec::new(),
                 vec![view],
                 None,
@@ -1831,8 +1827,8 @@ mod tests {
         assert_eq!(
             ReferenceViewAnalysis::new(program.entry_region_ref(), 0).err(),
             Some(ReferenceViewAnalysisError::MissingView {
-                operation: "undescribed_view",
-                instruction: id(0, 0),
+                operation: "missing_view",
+                instruction: InstructionId::new(RegionId::new(0), 0),
                 output_index: 0,
             }),
         );
@@ -1840,15 +1836,23 @@ mod tests {
 
     #[test]
     fn test_reference_view_analysis_new_binds_input_symbols() {
-        // The view analysis closes the view over the describing instruction: its input symbol binds to the index
-        // input's identity, and the static read output has no path.
+        // The symbol binds to the index input of the instruction that creates the view. The read returns an array,
+        // so its output has no reference view path.
         let program = symbolic_view_program(1);
         let analysis = ReferenceViewAnalysis::new(program.entry_region_ref(), 0).unwrap();
-        let view = SymbolicViewOperation::view(1);
-        assert_eq!(analysis.path(value(0, 0)), Some(&TestPath::root()));
-        assert_eq!(analysis.path(value(0, 2)), Some(&TestPath::root().with_step(view.clone(), vec![value(0, 1)])),);
-        assert_eq!(analysis.path(value(0, 3)), None);
-        assert_eq!(analysis.path(value(0, 2)).map(|path| path.views().collect::<Vec<_>>()), Some(vec![&view]));
+        let view = TestViewOperation::view(1);
+        assert_eq!(analysis.path(ValueId::new(RegionId::new(0), AtomId::new(0))), Some(&TestPath::root()));
+        assert_eq!(
+            analysis.path(ValueId::new(RegionId::new(0), AtomId::new(2))),
+            Some(&TestPath::root().with_step(view.clone(), vec![ValueId::new(RegionId::new(0), AtomId::new(1))])),
+        );
+        assert_eq!(analysis.path(ValueId::new(RegionId::new(0), AtomId::new(3))), None);
+        assert_eq!(
+            analysis
+                .path(ValueId::new(RegionId::new(0), AtomId::new(2)))
+                .map(|path| path.views().collect::<Vec<_>>()),
+            Some(vec![&view])
+        );
     }
 
     #[test]
@@ -1884,11 +1888,11 @@ mod tests {
             .to_vec();
         let program: TestProgram = builder.build(outputs, vec![Placeholder; 4], vec![Placeholder]).unwrap();
         let analysis = program.entry_region_ref().reference_view_analysis(0).unwrap();
-        assert_eq!(analysis.path(value(0, 0)), Some(&TestPath::root()));
-        let path = analysis.path(value(0, 4)).unwrap();
+        assert_eq!(analysis.path(ValueId::new(RegionId::new(0), AtomId::new(0))), Some(&TestPath::root()));
+        let path = analysis.path(ValueId::new(RegionId::new(0), AtomId::new(4))).unwrap();
         assert_eq!(path.steps().len(), 2);
-        assert_eq!(path.steps()[0].bindings(), &[value(0, 1)]);
-        assert_eq!(path.steps()[1].bindings(), &[value(0, 2)]);
+        assert_eq!(path.steps()[0].bindings(), &[ValueId::new(RegionId::new(0), AtomId::new(1))]);
+        assert_eq!(path.steps()[1].bindings(), &[ValueId::new(RegionId::new(0), AtomId::new(2))]);
     }
 
     #[test]
@@ -1899,7 +1903,7 @@ mod tests {
             ReferenceViewAnalysis::new(program.entry_region_ref(), 0).err(),
             Some(ReferenceViewAnalysisError::InvalidViewSymbol {
                 operation: "symbolic_view",
-                instruction: id(0, 0),
+                instruction: InstructionId::new(RegionId::new(0), 0),
                 output_index: 0,
                 symbol: 2,
                 message: "the instruction has only 2 inputs".to_string(),
@@ -1912,7 +1916,7 @@ mod tests {
             ReferenceViewAnalysis::new(program.entry_region_ref(), 0).err(),
             Some(ReferenceViewAnalysisError::InvalidViewSymbol {
                 operation: "symbolic_view",
-                instruction: id(0, 0),
+                instruction: InstructionId::new(RegionId::new(0), 0),
                 output_index: 0,
                 symbol: 0,
                 message: "that input is a reference rather than an index value".to_string(),
@@ -1925,21 +1929,11 @@ mod tests {
         let program = chain_program();
         let analysis = ReferenceViewAnalysis::new(program.entry_region_ref(), 0).unwrap();
         assert_eq!(analysis.analysis().region(), RegionId::new(0));
-        assert!(analysis.analysis().is_view(value(0, 2)));
+        assert!(analysis.analysis().is_view(ValueId::new(RegionId::new(0), AtomId::new(2))));
 
         // The structural analysis is the retained one, not a second derivation.
         let retained = program.entry_region_ref().reference_analysis(0).unwrap();
         assert!(std::ptr::eq(analysis.analysis(), &*retained));
-    }
-
-    #[test]
-    fn test_reference_view_analysis_path() {
-        let program = chain_program();
-        let analysis = ReferenceViewAnalysis::new(program.entry_region_ref(), 0).unwrap();
-        assert_eq!(analysis.path(value(0, 0)), Some(&TestPath::root()));
-        assert_eq!(analysis.path(value(0, 2)).map(|path| path.views().len()), Some(2));
-        assert_eq!(analysis.path(value(0, 3)), None);
-        assert_eq!(analysis.path(value(1, 0)), None);
     }
 
     #[test]
@@ -1948,23 +1942,75 @@ mod tests {
         let analysis = ReferenceViewAnalysis::new(program.entry_region_ref(), 0).unwrap();
         assert_eq!(
             analysis.paths().map(|(value, path)| (value, path.views().len())).collect::<Vec<_>>(),
-            vec![(value(0, 0), 0), (value(0, 1), 1), (value(0, 2), 2)],
+            vec![
+                (ValueId::new(RegionId::new(0), AtomId::new(0)), 0),
+                (ValueId::new(RegionId::new(0), AtomId::new(1)), 1),
+                (ValueId::new(RegionId::new(0), AtomId::new(2)), 2)
+            ],
         );
     }
 
     #[test]
+    fn test_reference_view_analysis_path() {
+        let program = chain_program();
+        let analysis = ReferenceViewAnalysis::new(program.entry_region_ref(), 0).unwrap();
+        assert_eq!(analysis.path(ValueId::new(RegionId::new(0), AtomId::new(0))), Some(&TestPath::root()));
+        assert_eq!(
+            analysis.path(ValueId::new(RegionId::new(0), AtomId::new(2))).map(|path| path.views().len()),
+            Some(2)
+        );
+        assert_eq!(analysis.path(ValueId::new(RegionId::new(0), AtomId::new(3))), None);
+        assert_eq!(analysis.path(ValueId::new(RegionId::new(1), AtomId::new(0))), None);
+    }
+
+    #[test]
     fn test_reference_view_analysis_overlap() {
-        // Within one root both paths fold to root indices: the row slice may overlap with the complete root, and
+        // The row slice may overlap with the complete reference, and
         // indexing the single row of that slice selects exactly the slice's indices again. Values that are not
         // references, or that live in different regions, have no answer.
         let program = chain_program();
         let region = program.entry_region_ref();
         let analysis = ReferenceViewAnalysis::new(region, 0).unwrap();
-        assert_eq!(analysis.overlap(region, value(0, 0), value(0, 0)), Some(ReferenceViewOverlap::Same));
-        assert_eq!(analysis.overlap(region, value(0, 0), value(0, 1)), Some(ReferenceViewOverlap::MayOverlap));
-        assert_eq!(analysis.overlap(region, value(0, 1), value(0, 2)), Some(ReferenceViewOverlap::Same));
-        assert_eq!(analysis.overlap(region, value(0, 0), value(0, 3)), None);
-        assert_eq!(analysis.overlap(region, value(0, 0), value(1, 0)), None);
+        assert_eq!(
+            analysis.overlap(
+                region,
+                ValueId::new(RegionId::new(0), AtomId::new(0)),
+                ValueId::new(RegionId::new(0), AtomId::new(0))
+            ),
+            Some(ReferenceViewOverlap::Same)
+        );
+        assert_eq!(
+            analysis.overlap(
+                region,
+                ValueId::new(RegionId::new(0), AtomId::new(0)),
+                ValueId::new(RegionId::new(0), AtomId::new(1))
+            ),
+            Some(ReferenceViewOverlap::MayOverlap)
+        );
+        assert_eq!(
+            analysis.overlap(
+                region,
+                ValueId::new(RegionId::new(0), AtomId::new(1)),
+                ValueId::new(RegionId::new(0), AtomId::new(2))
+            ),
+            Some(ReferenceViewOverlap::Same)
+        );
+        assert_eq!(
+            analysis.overlap(
+                region,
+                ValueId::new(RegionId::new(0), AtomId::new(0)),
+                ValueId::new(RegionId::new(0), AtomId::new(3))
+            ),
+            None
+        );
+        assert_eq!(
+            analysis.overlap(
+                region,
+                ValueId::new(RegionId::new(0), AtomId::new(0)),
+                ValueId::new(RegionId::new(1), AtomId::new(0))
+            ),
+            None
+        );
 
         // Values of different roots are disjoint whatever their paths select.
         let mut builder = TestBuilder::new();
@@ -1989,24 +2035,52 @@ mod tests {
             .unwrap();
         let region = program.entry_region_ref();
         let analysis = ReferenceViewAnalysis::new(region, 0).unwrap();
-        assert_eq!(analysis.overlap(region, value(0, 0), value(0, 1)), Some(ReferenceViewOverlap::Disjoint));
-        assert_eq!(analysis.overlap(region, value(0, 2), value(0, 3)), Some(ReferenceViewOverlap::Disjoint));
-        assert_eq!(analysis.overlap(region, value(0, 0), value(0, 2)), Some(ReferenceViewOverlap::MayOverlap));
-        assert_eq!(analysis.overlap(region, value(0, 2), value(0, 2)), Some(ReferenceViewOverlap::Same));
+        assert_eq!(
+            analysis.overlap(
+                region,
+                ValueId::new(RegionId::new(0), AtomId::new(0)),
+                ValueId::new(RegionId::new(0), AtomId::new(1))
+            ),
+            Some(ReferenceViewOverlap::Disjoint)
+        );
+        assert_eq!(
+            analysis.overlap(
+                region,
+                ValueId::new(RegionId::new(0), AtomId::new(2)),
+                ValueId::new(RegionId::new(0), AtomId::new(3))
+            ),
+            Some(ReferenceViewOverlap::Disjoint)
+        );
+        assert_eq!(
+            analysis.overlap(
+                region,
+                ValueId::new(RegionId::new(0), AtomId::new(0)),
+                ValueId::new(RegionId::new(0), AtomId::new(2))
+            ),
+            Some(ReferenceViewOverlap::MayOverlap)
+        );
+        assert_eq!(
+            analysis.overlap(
+                region,
+                ValueId::new(RegionId::new(0), AtomId::new(2)),
+                ValueId::new(RegionId::new(0), AtomId::new(2))
+            ),
+            Some(ReferenceViewOverlap::Same)
+        );
 
         // Symbolic indices compare by their bindings: two views through the same index input select the
         // same slot, while views through different inputs, or against a static index or the root, may overlap.
-        let mut builder = ProgramBuilder::<TestValue, SymbolicViewOperation>::new();
+        let mut builder = ProgramBuilder::<TestValue, TestViewOperation>::new();
         let vector = builder.add_input(reference_type([2]));
         let index_value = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::I64)));
         let other = builder.add_input(ArrayIrType::Array(ArrayType::scalar(DataType::I64)));
-        let symbolic = SymbolicViewOperation::Symbolic(1);
+        let symbolic = TestViewOperation::Symbolic(1);
         builder.add_instruction(symbolic.clone(), Vec::new(), vec![vector, index_value], None).unwrap();
         builder.add_instruction(symbolic.clone(), Vec::new(), vec![vector, index_value], None).unwrap();
         builder.add_instruction(symbolic, Vec::new(), vec![vector, other], None).unwrap();
         builder
             .add_instruction(
-                SymbolicViewOperation::Native(ReferenceIndexOperation::new(0, 0).into()),
+                TestViewOperation::Native(ReferenceIndexOperation::new(0, 0).into()),
                 Vec::new(),
                 vec![vector],
                 None,
@@ -2017,10 +2091,38 @@ mod tests {
             .unwrap();
         let region = program.entry_region_ref();
         let analysis = ReferenceViewAnalysis::new(region, 0).unwrap();
-        assert_eq!(analysis.overlap(region, value(0, 3), value(0, 4)), Some(ReferenceViewOverlap::Same));
-        assert_eq!(analysis.overlap(region, value(0, 3), value(0, 5)), Some(ReferenceViewOverlap::MayOverlap));
-        assert_eq!(analysis.overlap(region, value(0, 3), value(0, 6)), Some(ReferenceViewOverlap::MayOverlap));
-        assert_eq!(analysis.overlap(region, value(0, 0), value(0, 3)), Some(ReferenceViewOverlap::MayOverlap));
+        assert_eq!(
+            analysis.overlap(
+                region,
+                ValueId::new(RegionId::new(0), AtomId::new(3)),
+                ValueId::new(RegionId::new(0), AtomId::new(4))
+            ),
+            Some(ReferenceViewOverlap::Same)
+        );
+        assert_eq!(
+            analysis.overlap(
+                region,
+                ValueId::new(RegionId::new(0), AtomId::new(3)),
+                ValueId::new(RegionId::new(0), AtomId::new(5))
+            ),
+            Some(ReferenceViewOverlap::MayOverlap)
+        );
+        assert_eq!(
+            analysis.overlap(
+                region,
+                ValueId::new(RegionId::new(0), AtomId::new(3)),
+                ValueId::new(RegionId::new(0), AtomId::new(6))
+            ),
+            Some(ReferenceViewOverlap::MayOverlap)
+        );
+        assert_eq!(
+            analysis.overlap(
+                region,
+                ValueId::new(RegionId::new(0), AtomId::new(0)),
+                ValueId::new(RegionId::new(0), AtomId::new(3))
+            ),
+            Some(ReferenceViewOverlap::MayOverlap)
+        );
     }
 
     #[test]
@@ -2032,7 +2134,7 @@ mod tests {
         // A second request under the same capture scope is served the retained view analysis.
         assert!(Arc::ptr_eq(&program.entry_region_ref().reference_view_analysis(0).unwrap(), &retained));
 
-        // A failed derivation is reported and not retained.
+        // A different capture count is validated instead of reusing the successful cached analysis.
         assert!(matches!(
             program.entry_region_ref().reference_view_analysis(2),
             Err(ReferenceViewAnalysisError::Analysis(ReferenceAnalysisError::InvalidCaptureScope { region, message }))
@@ -2069,7 +2171,10 @@ mod tests {
             .unwrap();
         let retained = first.entry_region_ref().reference_view_analysis(0).unwrap();
         assert_eq!(retained.analysis().region(), RegionId::new(1));
-        assert_eq!(retained.path(value(0, 1)), Some(&TestPath::root().with_view(index(0, 0))));
+        assert_eq!(
+            retained.path(ValueId::new(RegionId::new(0), AtomId::new(1))),
+            Some(&TestPath::root().with_view(index(0, 0)))
+        );
 
         // Re-sealing a copy of that entry into an arena whose region `^0` is the row-1 branch changes what the copy's
         // nested views select, so it must not be served the view analysis derived for the row-0 branch.
@@ -2082,8 +2187,11 @@ mod tests {
         .unwrap();
         let derived = rebased.entry_region_ref().reference_view_analysis(0).unwrap();
         assert!(!Arc::ptr_eq(&derived, &retained));
-        assert_eq!(derived.path(value(0, 1)), Some(&TestPath::root().with_view(index(0, 1))));
-        assert_eq!(derived.path(value(1, 1)), Some(&TestPath::root()));
+        assert_eq!(
+            derived.path(ValueId::new(RegionId::new(0), AtomId::new(1))),
+            Some(&TestPath::root().with_view(index(0, 1)))
+        );
+        assert_eq!(derived.path(ValueId::new(RegionId::new(1), AtomId::new(1))), Some(&TestPath::root()));
 
         // The source program keeps its own retained view analysis, because only the re-sealed copy was rebased.
         assert!(Arc::ptr_eq(&first.entry_region_ref().reference_view_analysis(0).unwrap(), &retained));

@@ -1,117 +1,94 @@
-//! Contains machinery for representing and working with typed, structured, and effect-aware programs.
+//! Typed programs, their construction and interpretation, and the shared infrastructure for program transforms.
 //!
-//! A [`Program`] is Ryft's backend-neutral dataflow IR. It owns a flat arena of [`Region`]s that consists of the public
-//! entry computation plus any nested computations referenced by its instructions, where each region stores typed
-//! atoms, operation instructions, a flat boundary, and enough metadata for interpretation, transformation,
-//! simplification, lowering, and compilation. Programs are immutable after construction. [`ProgramBuilder`]
-//! owns the mutable construction phase, sealing every non-entry region before instructions can attach it.
+//! A [`Program`] is Ryft's backend-neutral intermediate representation: it records which operations run, which values
+//! they use and produce, and which nested computations they invoke. The program graph is immutable after construction,
+//! so interpretation, analysis, transformation, and compilation can inspect the same representation. Operation-specific
+//! behavior belongs to [`Operation`] implementations and their interpretation and transform rules.
 //!
-//! # Program Lifecycle
+//! # Values, Instructions, and Boundaries
 //!
-//! Program construction is the only mutable phase. Every replay, transformation, analysis, and compilation step starts
-//! from an immutable program whose region graph and structured boundaries have already been validated. Refer to
-//! [`Program`] for a rendered diagram of this lifecycle.
+//! A [`Value`] is a leaf value that can flow through a program or a [`Context`](crate::Context), with a type
+//! provided by [`Typed`]. Within a program, an [`Atom`] represents either a stored constant or a typed variable.
+//! An [`Instruction`] records one operation application: its operation, input and output [`AtomId`]s, attached
+//! [`RegionId`]s, and source provenance. Operations supply type inference and effect declarations; instructions
+//! supply the values and nested computations for a particular application.
 //!
-//! # Entry Points
+//! Each [`Region`] has its own atom table, instruction sequence, and ordered input and output lists. A program owns
+//! an arena of regions and identifies one as its entry computation. Its public inputs and outputs retain their
+//! [`Parameterized`](crate::Parameterized) structure, such as tuples, vectors, or derived product types. Their leaves
+//! correspond positionally to [`Program::input_ids`] and [`Program::output_ids`]. [`Program::to_flat_program`] exposes
+//! those boundaries as vectors without changing the computation, allowing transforms to work with flat lists while
+//! user-facing APIs preserve the original structure.
 //!
-//! Most code obtains programs through [`trace`](crate::trace) or a transform rather than by manual construction, and
-//! replays them with [`Program::interpret`] (eagerly) or [`Program::interpret_in_context`] (through a chosen staging
-//! or transform context). Batching, differentiation, and partial evaluation add program-level functions in their own
-//! modules, and compilation opens captures, flattens boundaries, and hands the program to a backend
-//! [`CompilationDomain`](crate::CompilationDomain).
+//! # Constructing and Running Programs
 //!
-//! Direct [`ProgramBuilder`] use is appropriate for operation and transform infrastructure. Tracer operations call
-//! [`ProgramBuilder::add_instruction`], which infers output types, allocates variable atoms, validates arity, and
-//! records the instruction, and [`ProgramBuilder::build`] validates the requested boundaries and freezes the result.
-//! Keep [`AtomId`]s from one builder isolated from every other builder, use the checked instruction path, and
-//! propagate the builder's first stored error rather than continuing with invalid IDs.
+//! Most callers obtain a program through [`trace`](crate::trace) or a transform. [`Program::interpret`] runs it
+//! eagerly; [`Program::interpret_in_context`] replays it through a chosen context, which can execute operations
+//! or stage further work. [`Batching`](crate::batching), [`differentiation`](crate::differentiation), and
+//! [`partial evaluation`](crate::partial) provide their own program transformations. Compilation passes programs
+//! to a backend [`CompilationDomain`](crate::CompilationDomain).
 //!
-//! [`Program::to_flat_program`] converts structured boundaries to vectors without changing the dataflow. Use it at
-//! internal compiler or nested-program boundaries, and preserve the structured form in user-facing APIs.
+//! [`ProgramBuilder`] supports direct construction for operation rules and transform infrastructure.
+//! [`ProgramBuilder::add_instruction`] validates an application, infers its output types, and creates its output atoms.
+//! [`ProgramBuilder::build`] validates the requested entry boundary and produces the immutable program. Atom IDs belong
+//! to their builder; they must not be reused in another builder. Construction code must also propagate the builder's
+//! stored error instead of treating IDs produced after an error as valid. See [`Program`] for the program lifecycle.
 //!
-//! # Core Data Model
+//! # Nested Computations and Sharing
 //!
-//! [`Value`] is the common contract for leaf values that can inhabit programs or flow through Ryft contexts. Every
-//! value has one associated type through [`Typed`], plus separate dispatch and execution domains used by capabilities
-//! and transforms.
+//! Branches, loop bodies, callees, and custom derivative rules all use regions in the same program arena. Instructions
+//! attach them in the order declared by [`Operation::region_slots`]. Each [`RegionSlot`] declares an attached region's
+//! name and role. [`RegionRole::Computation`] regions execute as part of the operation, while [`RegionRole::Rule`]
+//! regions supply transform implementations and remain dormant during ordinary interpretation.
 //!
-//! [`Atom`] is either a stored constant or a typed variable, and [`AtomId`] is its stable index in the containing
-//! [`Region`]'s atom table. An [`Instruction`] owns one [`Operation`], lists the input and output atom IDs of that
-//! application, and carries the [`RegionId`]s of its attached nested regions, in the operation-defined order.
-//! Operations define their own type inference and effect classes and the program supplies graph structure and order.
+//! An attached region is sealed: its body and [`RegionInterface`] are complete before an instruction can use it.
+//! Regions cannot refer directly to one another's atoms; values pass through explicit region boundaries. Captures are
+//! handled through the owning trace's capture scope, as described in [`captures`](crate::captures). Operation rules
+//! navigate attached regions through [`RegionDriver`] implementations rather than storing nested programs in operation
+//! payloads.
 //!
-//! [`Program`] combines the region arena with typed, structured input and output boundaries on its entry region.
-//! The boundary types are [`Parameterized`](crate::Parameterized) containers whose leaves correspond positionally to
-//! [`Program::input_ids`] and [`Program::output_ids`], so compiler and transform kernels can operate on the flat IDs
-//! while callers retain tuples, vectors, maps, or derived product types. [`InstructionId`] and [`ValueId`] locate
-//! instructions and values across [`Region`]s.
+//! Repeated attachments of the same region ID share one stored computation. Builders support three ways to import one:
 //!
-//! # Regions, Sharing, and Sealing
+//!   - [`ProgramBuilder::import_region`] copies a borrowed region and every region reachable through its attachments,
+//!     preserving sharing within that graph.
+//!   - [`ProgramBuilder::import_program`] moves an owned program's arena into the builder without cloning its regions.
+//!   - [`ProgramBuilder::intern_callee`] reuses an imported [`Arc`]-held program. Callee identity and,
+//!     when supplied, its exact input-type instantiation determine reuse; structural equality alone does not.
 //!
-//! The canonical region graph and operation-application vocabulary lives in the [`regions`] module. This module owns
-//! the surrounding program arena and its construction, validation, transformation, and rendering machinery.
+//! [`RegionRef`] borrows a region together with access to its program arena. [`RegionRef::to_program`] copies its
+//! reachable graph into a standalone program. [`RegionId`], [`InstructionId`], and [`ValueId`] identify locations
+//! within one program, and [`AtomId`] identifies an atom within one region. Imports and rebuilds can renumber these
+//! locations; IDs from the source must not be used to address the rebuilt program. The [`regions`] module explains
+//! region access and interfaces in more detail.
 //!
-//! Every nested computation (e.g., a control-flow branch or body, a custom-derivative program, a rematerialization
-//! program, a JIT-ed callee, etc.) is a [`Region`] in the owning [`Program`]'s one canonical arena, referenced from its
-//! instructions through [`Instruction::regions`]. There is exactly one instruction edge kind: sharing is expressed by
-//! repeating a [`RegionId`], not by a parallel node table or by operation payloads owning programs. The
-//! [`ProgramBuilder`] offers three import policies for nested computations:
+//! # Effects and Program Inspection
 //!
-//!   - [`ProgramBuilder::import_region`] copies a borrowed [`RegionRef`]'s complete region closure into the arena,
-//!     preserving any sharing internal to the imported closure.
-//!   - [`ProgramBuilder::import_program`] splices an owned [`Program`]'s arena in directly without cloning, for owned
-//!     bodies whose builder would otherwise clone them away.
-//!   - [`ProgramBuilder::intern_callee`] interns a shared [`Rc`](std::rc::Rc)-held [`Program`] by pointer identity
-//!     (i.e., importing the same `Rc` twice yields the same root [`RegionId`], which is how repeated JIT-compiled calls
-//!     to one compiled callee share one region and how lowering deduplication can count occurrences per root).
+//! [`Effects`] describes an operation's intrinsic effects, including reference accesses and aliases. An
+//! [`EffectsSummary`] also accounts for attached computation regions. [`Program::effects`] summarizes the entry
+//! computation recursively, excluding dormant rule regions. These declarations preserve dependencies that are not
+//! expressed by immutable value inputs, such as a read following a write to the same reference. The [`references`]
+//! module provides the reference model, validation, and conversion of mutable state into explicit value dataflow.
 //!
-//! Only *sealed* regions are attachable. [`ProgramBuilder::add_instruction`] validates the attached region list
-//! against the operation's declared [`Operation::region_slots`] slots, and every non-entry region enters the arena
-//! as a complete, immutable program with an explicit boundary (i.e., an explicit [`RegionInterface`]). A region never
-//! references atoms of another region directly; values cross region boundaries only through the boundary inputs and
-//! outputs, and cross-program constants only through captures (see [`captures`](crate::captures) for the capture-scope
-//! model; captures are registered in the trace that owns the instruction, and nested traces reach the root table
-//! through their parent chain).
+//! [`Program::live_sets`] computes dependencies of the program outputs; [`Program::live_sets_for_atoms`] accepts other
+//! roots. [`Program::simplified`] removes unused work while retaining instructions with observable consequences even
+//! when their results are unused, in their original relative order. For example, an unused reference allocation and its
+//! dead aliases can disappear, but a reference write remains observable. [`Program::filtered`] restricts the entry
+//! boundary and accepts explicit keep-alive atoms for computations needed beyond the selected outputs.
 //!
-//! [`RegionRef`] borrows any sealed arena region for inspection or replay without cloning it.
-//! [`RegionRef::to_program`] materializes that borrowed region back into a standalone flat [`Program`], copying its
-//! reachable subtree. Locators such as [`InstructionId`], [`ValueId`], and [`RegionId`] are scoped to the program they
-//! were derived from. Materialization and rebuilds renumber arenas, and locators never cross [`Program`] boundaries.
+//! [`Program::statistics`] describes the stored graph, including dead instructions and dormant rule regions, without
+//! simplifying it. [`ProgramStatistics`] provides counts, operation histograms, dependency depths, and attachment
+//! edges.
 //!
-//! # Structural Identity and Transform Reuse
+//! # Transform Reuse and Extensibility
 //!
-//! A sealed region may retain context-free program artifacts already derived from its complete reachable contents.
-//! Cloning a program, importing a faithful region closure, or rebasing region identifiers while preserving graph
-//! topology shares those artifacts. Rewriting a region or attaching it to a different descendant closure invalidates
-//! them. This ownership rule keeps reuse local to the programs that carry the region and prevents a derived program
-//! from being served for a different nested graph.
+//! A sealed region can retain context-free artifacts derived from its complete reachable graph. Faithful clones and
+//! imports share those artifacts even when region IDs change. Rewriting the computation or changing its descendants
+//! invalidates them. Invocation-specific residual values, active contexts, and backend buffers remain outside this
+//! retained state. Downstream crates can define a [`Transform`] and obtain its typed result through
+//! [`RegionRef::transform`]; cache adoption and invalidation are handled by program construction.
 //!
-//! Only context-free structural results belong in that retained state. Invocation-specific residual values, active
-//! contexts, backend buffers, and other runtime data remain outside the program and its regions. External crates
-//! can define a [`Transform`] and request its typed artifact through [`RegionRef::transform`]. Raw cache
-//! adoption and invalidation remain internal construction invariants.
-//!
-//! # Effects, Liveness, and Simplification
-//!
-//! [`Program::effects`] unions the effects declared by its operations. Instruction order is semantically relevant
-//! for ordered effects even when the dataflow graph contains no dependency between them.
-//!
-//! [`Program::live_sets`] computes the atoms and instructions required by selected roots. [`Program::simplified`]
-//! removes dead pure work while retaining effectful instructions as roots. [`Program::filtered`] projects a program
-//! to selected boundaries and accepts explicit keep-alive atoms for work that must survive the projection. These APIs
-//! preserve the invariants checked by normal program construction rather than treating effects as ordinary unused
-//! values.
-//!
-//! [`Program::statistics`] is the structural-inspection entry point. It reports backend-neutral per-region counts,
-//! operation histograms, dependency depths, and attached-region edges for the stored program structure (including
-//! dormant rule regions and dead instructions) without applying any simplification. Refer to [`ProgramStatistics`]
-//! for more information.
-//!
-//! # Extending Programs
-//!
-//! New primitive behavior normally means adding an operation payload implementing [`Operation`] and including it in the
-//! appropriate closed operation family. Keep type inference, rendering, effects, and operation-specific transform rules
-//! with that payload, and never teach [`Program`] about individual operation variants.
+//! New operations define their type inference, effects, rendering, and transform rules alongside the operation type.
+//! The program representation supplies their common structure without needing cases for individual operation variants.
 
 use std::fmt::Debug;
 use std::sync::Arc;
