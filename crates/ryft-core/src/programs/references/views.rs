@@ -669,12 +669,10 @@ impl<View: ReferenceView> ReferenceViewAnalysis<View> {
         self.paths.get(&value)
     }
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Returns the [`ReferenceViewOverlap`] between the parts that the reference-typed values `a` and `b` of one region
-    /// select, or [`None`] when either is not a reference-typed value of the closure or the two values belong to
-    /// different regions. Roots are region-relative (a nested region input is a root of its own namespace even when it
-    /// carries a caller root), so only values of one region have comparable roots: values of different roots are
+    /// Returns the [`ReferenceViewOverlap`] between the views represented by `lhs` and `rhs`, or [`None`] when
+    /// either is not a reference-typed value of the closure or the values belong to different [`Region`]s. Roots are
+    /// region-relative (a nested region input is a root of its own namespace even when it carries a caller root), so
+    /// only values of one region have comparable roots: values of different roots are
     /// [`Disjoint`](ReferenceViewOverlap::Disjoint), and values of one root delegate to [`ReferenceView::overlap`] with
     /// the type of the root's defining atom, read from `region`, the closure this view analysis was derived for. The
     /// view analysis retains no types itself, because the region's transform cache holds it behind a `Send + Sync`
@@ -683,22 +681,23 @@ impl<View: ReferenceView> ReferenceViewAnalysis<View> {
     pub fn overlap<V: Value, O: ReferenceViewOperation<Type = V::Type, View = View>>(
         &self,
         region: RegionRef<'_, V, O>,
-        a: ValueId,
-        b: ValueId,
+        lhs: ValueId,
+        rhs: ValueId,
     ) -> Option<ReferenceViewOverlap>
     where
-        // Implied by `O::View`'s bounds, but the trait solver does not carry them through the projection equality.
         View: ReferenceView<Type = V::Type>,
     {
-        if a.region() != b.region() {
+        if lhs.region() != rhs.region() {
             return None;
         }
-        let root = self.analysis.root_of(a)?;
-        if root != self.analysis.root_of(b)? {
+
+        let root = self.analysis.root_of(lhs)?;
+        if root != self.analysis.root_of(rhs)? {
             return Some(ReferenceViewOverlap::Disjoint);
         }
+
         // Every root is defined exactly once, by the input atom or the allocating instruction output that names it,
-        // and every reference-typed value has a path, so once both roots resolved the remaining lookups cannot fail
+        // and every reference-typed value has `lhs` path, so once both roots resolved the remaining lookups cannot fail
         // for the region this view analysis was derived for.
         let current = region.with_id(root.region()).ok()?;
         let atom = match root {
@@ -709,9 +708,11 @@ impl<View: ReferenceView> ReferenceViewAnalysis<View> {
             }
         };
         let root_type = current.atoms().get(atom.index())?.r#type();
-        Some(self.paths[&a].overlap(&self.paths[&b], root_type.as_ref()))
+        Some(self.paths[&lhs].overlap(&self.paths[&rhs], root_type.as_ref()))
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 impl<'r, V: Value, O: ReferenceViewOperation<Type = V::Type>> RegionRef<'r, V, O> {
     /// Returns the [`ReferenceViewAnalysis`] of this [`Region`]'s closure, retained in the region's transform cache
