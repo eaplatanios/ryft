@@ -712,8 +712,6 @@ impl<View: ReferenceView> ReferenceViewAnalysis<View> {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 impl<'r, V: Value, O: ReferenceViewOperation<Type = V::Type>> RegionRef<'r, V, O> {
     /// Returns the [`ReferenceViewAnalysis`] of this [`Region`]'s closure, retained in the region's transform cache
     /// under exactly the cache identity of [`reference_analysis`](Self::reference_analysis): the same `capture_count`
@@ -738,8 +736,10 @@ impl<'r, V: Value, O: ReferenceViewOperation<Type = V::Type>> RegionRef<'r, V, O
         let artifact = self.transform::<ReferenceViewAnalysisTransform, _, ReferenceViewAnalysisError>(
             arguments,
             |region, arguments| {
-                let analysis = ReferenceViewAnalysis::new_with_arguments(region, arguments)?;
-                Ok(TransformArtifact::new(Vec::new(), Arc::new(analysis)))
+                Ok(TransformArtifact::new(
+                    Vec::new(),
+                    Arc::new(ReferenceViewAnalysis::new_with_arguments(region, arguments)?),
+                ))
             },
         )?;
         let (programs, analysis) = artifact.into_parts();
@@ -747,6 +747,8 @@ impl<'r, V: Value, O: ReferenceViewOperation<Type = V::Type>> RegionRef<'r, V, O
         Ok(analysis)
     }
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Batches one reference-view operation of the family of `C` through the [`BatchableReferenceView`] contract: the
 /// shared [`BatchableOperation`](crate::batching::BatchableOperation) rule of every operation whose effects declare
@@ -773,19 +775,17 @@ impl<'r, V: Value, O: ReferenceViewOperation<Type = V::Type>> RegionRef<'r, V, O
 /// input, has outputs other than its views, has observable effects or attached regions, or has a mapped non-source
 /// input (batching a view through a mapped symbol is not supported). Propagates errors from
 /// [`BatchableReferenceView::batch`] and the parent context's binding.
-pub fn batch_reference_view_operation<C, P, O>(
+pub fn batch_reference_view_operation<
+    O: Clone,
+    C: Context<Operation: ReferenceViewOperation<View: BatchableReferenceView> + From<O>>,
+    P: BatchingPolicy<C>,
+>(
     operation: &O,
     context: &BatchingContext<C, P>,
     inputs: &[P::Batch],
-) -> Result<BatchedOutputs<C, P>, BatchingError>
-where
-    C: Context<Operation: ReferenceViewOperation<View: BatchableReferenceView> + From<O>>,
-    P: BatchingPolicy<C>,
-    O: Clone,
-{
+) -> Result<BatchedOutputs<C, P>, BatchingError> {
     let operation = C::Operation::from(operation.clone());
     let name = operation.name();
-
     let effects = operation.effects();
     let not_a_view = |output_index: usize| BatchingError::UnsupportedOperation {
         message: format!(
