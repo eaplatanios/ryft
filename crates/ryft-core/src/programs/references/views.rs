@@ -209,8 +209,6 @@ pub enum ReferenceViewOverlap {
     MayOverlap,
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
 /// Owned description of one view step of a reference family, from a source reference to the reference it derives.
 /// Descriptions contain selection metadata, such as an array axis and a static index or an input position naming a
 /// dynamic index. They do not contain the reference allocation or the dynamic index value itself; [`ReferenceViewStep`]
@@ -225,10 +223,15 @@ pub trait ReferenceView: 'static + Clone + Debug + PartialEq + Eq + Hash + Send 
     /// Reference type family this [`ReferenceView`] addresses.
     type Type: Type;
 
-    /// Returns the symbols this description depends on, in the order their bindings and values are supplied to every
-    /// consumer. Each symbol is a non-reference input's position in the describing instruction. Static descriptions
-    /// return no symbols.
+    /// Returns the symbols that this [`ReferenceView`] depends on, in the order that their bindings
+    /// and values are supplied to every consumer. Each symbol is a non-reference input's position in the
+    /// [`Instruction`](crate::Instruction) that produces the view. For example, a dynamic indexing instruction with
+    /// inputs `[reference, index]` uses symbol `1` to name its index input and returns `vec![1]`. That symbol is the
+    /// input position, not the index's runtime value. A static index stored directly in the view needs no input
+    /// binding, so a view containing only static selections returns an empty vector.
     fn symbols(&self) -> Vec<usize>;
+
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Moves the batch axis of a source reference through this mapping. The batch axis of a reference is an axis of
     /// its packed referent that the per-item view never sees, so the batched description must select the same part of
