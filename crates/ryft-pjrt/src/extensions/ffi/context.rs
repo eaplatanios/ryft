@@ -1,10 +1,9 @@
 use std::marker::PhantomData;
 
-use crate::extensions::ffi::FfiExecutionStage;
 use crate::extensions::ffi::errors::FfiError;
-use crate::extensions::ffi::handlers::FfiApi;
+use crate::extensions::ffi::handlers::{FfiApi, FfiExecutionStage};
 use crate::extensions::ffi::types::FfiTypeId;
-use crate::invoke_xla_ffi_api_error_fn;
+use crate::macros::invoke_xla_ffi_api_error_fn;
 
 /// Function pointer for a task that is to be scheduled on a thread pool. The XLA runtime will call this function with
 /// a user-defined data pointer on one of the runtime-managed threads. For CPU backends, the task will be invoked on a
@@ -57,6 +56,65 @@ impl FfiUserData {
     }
 }
 
+/// Backend-specific extension borrowed for the lifetime of an XLA [`FfiHandler`](crate::extensions::ffi::FfiHandler)
+/// invocation. Extensions have independent identifiers and ABI versions; they are not owned by this wrapper.
+///
+/// Extensions pass custom runtime execution data to handlers through their invocation context. Each extension defines
+/// a unique 64-bit type identifier and its own API and ABI versions, with stability guarantees specific to that
+/// extension. An invocation context can contain at most one extension of each type. Extensions are attached through
+/// the native context's `extension_start` field and remain valid only for the lifetime of that context.
+///
+/// Extensions require no registration with the XLA FFI library and can be implemented entirely in headers. Their
+/// native definitions belong in separate headers from XLA FFI's `api.h` and `c_api.h` so consumers can include them
+/// independently. When adding a field to a native extension struct, its definition must update the `last_field`
+/// argument of `XLA_FFI_DEFINE_STRUCT_TRAITS` to keep the reported ABI size consistent with the struct layout.
+/// These requirements are defined by the [XLA FFI extension contract](
+/// https://github.com/openxla/xla/blob/eb6b90ed013f511eca088c52f541f3c0819f919e/xla/ffi/api/c_api.h#L79).
+#[derive(Copy, Clone)]
+pub struct FfiContextExtension<'o> {
+    /// Handle that represents this [`FfiContextExtension`] in the XLA FFI API.
+    handle: *const ffi::XLA_FFI_Extension,
+
+    /// [`PhantomData`] used to track the lifetime of the owner of this [`FfiContextExtension`].
+    owner: PhantomData<&'o ffi::XLA_FFI_Extension>,
+}
+
+impl FfiContextExtension<'_> {
+    /// Constructs a new [`FfiContextExtension`] from the provided [`XLA_FFI_Extension`](ffi::XLA_FFI_Extension) handle
+    /// that came from a function in the XLA FFI API.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be null or point to an aligned extension with a readable `struct_size` field. Its declared size
+    /// must accurately describe its readable storage, which must remain valid and immutable for the wrapper's lifetime.
+    /// This boundary supports extension lookup through the XLA FFI C API.
+    pub unsafe fn from_c_api(handle: *const ffi::XLA_FFI_Extension) -> Result<Self, FfiError> {
+        if handle.is_null() {
+            return Err(FfiError::invalid_argument("the provided XLA FFI extension handle is a null pointer"));
+        }
+        if unsafe { (*handle).struct_size } < size_of::<ffi::XLA_FFI_Extension>() {
+            return Err(FfiError::internal("the XLA FFI extension header is truncated"));
+        }
+        Ok(Self { handle, owner: PhantomData })
+    }
+
+    /// Returns the [`XLA_FFI_Extension`](ffi::XLA_FFI_Extension) that corresponds to this [`FfiContextExtension`]
+    /// and which can be passed to functions in the XLA FFI API.
+    pub unsafe fn to_c_api(&self) -> *const ffi::XLA_FFI_Extension {
+        self.handle.cast()
+    }
+
+    /// Returns the backend-defined extension identifier.
+    pub fn extension_type(&self) -> i64 {
+        unsafe { (*self.handle).id.extension_type }
+    }
+
+    /// Returns the extension's major and minor Application Binary Interface (ABI) versions.
+    pub fn version(&self) -> (i32, i32) {
+        unsafe { ((*self.handle).id.major_version, (*self.handle).id.minor_version) }
+    }
+}
+
 /// XLA execution context that provides access to per-invocation state
 /// for [`FfiHandler`](crate::extensions::ffi::FfiHandler)s.
 pub struct FfiExecutionContext<'o> {
@@ -93,6 +151,25 @@ impl<'o> FfiExecutionContext<'o> {
         self.api
     }
 
+    /// Looks up a backend-specific [`FfiContextExtension`] by its identifier for this invocation. Returns `Ok(None)`
+    /// if no extension has that identifier, or [`FfiError::Unimplemented`] if the runtime does not provide the lookup
+    /// API. A returned header must contain the complete generic extension header. Otherwise, this function returns
+    /// [`FfiError::Internal`]. Backend-specific layouts and ABI compatibility must be validated before using the
+    /// extension's native pointer.
+    pub fn extension(&self, extension_type: i64) -> Result<Option<FfiContextExtension<'o>>, FfiError> {
+        use ffi::XLA_FFI_InvokeContext_FindExtension_Args;
+        let handle = invoke_xla_ffi_api_error_fn!(
+            self.api,
+            XLA_FFI_InvokeContext_FindExtension,
+            { context = self.handle, extension_type = extension_type },
+            { extension },
+        )?;
+        if handle.is_null() {
+            return Ok(None);
+        }
+        unsafe { FfiContextExtension::from_c_api(handle) }.map(Some)
+    }
+
     /// Returns opaque user data from this [`FfiExecutionContext`] for the provided `type_id`.
     pub fn user_data(&self, type_id: FfiTypeId) -> Result<FfiUserData, FfiError> {
         use ffi::XLA_FFI_InvokeContext_Get_Args;
@@ -108,8 +185,8 @@ impl<'o> FfiExecutionContext<'o> {
 
     /// Sets [`FfiExecutionState`] for the provided [`FfiExecutionStage`] associated with the provided [`FfiTypeId`],
     /// for this [`FfiExecutionContext`]. Note that this function will return an [`FfiError`] if the state for the
-    /// specified type has already been set, or if the provided `stage` is the [`FfiExecutionStage::Execution`]
-    /// [stage](https://github.com/openxla/xla/blob/964a0a45a0c3090cd484a3c51e8f9d05ed10b968/xla/ffi/ffi_api.cc#L327).
+    /// specified type has already been set, or if `stage` is [`FfiExecutionStage::Execution`] or
+    /// [`FfiExecutionStage::Recording`], neither of which has associated state.
     ///
     /// # Safety
     ///
@@ -122,8 +199,10 @@ impl<'o> FfiExecutionContext<'o> {
         state: FfiExecutionState,
     ) -> Result<(), FfiError> {
         use ffi::XLA_FFI_State_Set_Args;
-        if stage == FfiExecutionStage::Execution {
-            return Err(FfiError::invalid_argument("the XLA execution stage does not have a state associated with it"));
+        if matches!(stage, FfiExecutionStage::Execution | FfiExecutionStage::Recording) {
+            return Err(FfiError::invalid_argument(
+                "the XLA execution and recording stages do not have state associated with them",
+            ));
         };
         let mut type_id_handle = unsafe { type_id.to_c_api() };
         invoke_xla_ffi_api_error_fn!(
@@ -141,12 +220,14 @@ impl<'o> FfiExecutionContext<'o> {
     /// Returns the [`FfiExecutionState`] for the provided [`FfiExecutionStage`] associated with the provided
     /// [`FfiTypeId`] for this [`FfiExecutionContext`]. Note that this function will return an [`FfiError`] if
     /// the state for the specified type has not been set, if it has been set to a value of a different type,
-    /// or if the provided `stage` is the [`FfiExecutionStage::Execution`]
-    /// [stage](https://github.com/openxla/xla/blob/964a0a45a0c3090cd484a3c51e8f9d05ed10b968/xla/ffi/ffi_api.cc#L327).
+    /// or if `stage` is [`FfiExecutionStage::Execution`] or [`FfiExecutionStage::Recording`], neither of which has
+    /// associated state.
     pub fn state(&self, stage: FfiExecutionStage, type_id: FfiTypeId) -> Result<FfiExecutionState, FfiError> {
         use ffi::XLA_FFI_State_Get_Args;
-        if stage == FfiExecutionStage::Execution {
-            return Err(FfiError::invalid_argument("the XLA execution stage does not have a state associated with it"));
+        if matches!(stage, FfiExecutionStage::Execution | FfiExecutionStage::Recording) {
+            return Err(FfiError::invalid_argument(
+                "the XLA execution and recording stages do not have state associated with them",
+            ));
         };
         let mut type_id_handle = unsafe { type_id.to_c_api() };
         invoke_xla_ffi_api_error_fn!(
@@ -242,6 +323,44 @@ pub(crate) mod ffi {
         _data: [u8; 0],
         _marker: PhantomData<(*mut u8, PhantomPinned)>,
     }
+
+    #[repr(C)]
+    pub struct XLA_FFI_ExtensionId {
+        pub extension_type: i64,
+        pub major_version: i32,
+        pub minor_version: i32,
+    }
+
+    #[repr(C)]
+    pub struct XLA_FFI_Extension {
+        pub struct_size: usize,
+        pub id: XLA_FFI_ExtensionId,
+        pub next: *const XLA_FFI_Extension,
+    }
+
+    #[repr(C)]
+    pub struct XLA_FFI_InvokeContext_FindExtension_Args {
+        pub struct_size: usize,
+        pub extension_start: *mut XLA_FFI_InternalExtension,
+        pub context: *mut XLA_FFI_InvokeContext,
+        pub extension_type: i64,
+        pub extension: *const XLA_FFI_Extension,
+    }
+
+    impl XLA_FFI_InvokeContext_FindExtension_Args {
+        pub fn new(context: *mut XLA_FFI_InvokeContext, extension_type: i64) -> Self {
+            Self {
+                struct_size: size_of::<Self>(),
+                extension_start: std::ptr::null_mut(),
+                context,
+                extension_type,
+                extension: std::ptr::null(),
+            }
+        }
+    }
+
+    pub type XLA_FFI_InvokeContext_FindExtension =
+        unsafe extern "C" fn(args: *mut XLA_FFI_InvokeContext_FindExtension_Args) -> *mut XLA_FFI_Error;
 
     #[repr(C)]
     pub struct XLA_FFI_InvokeContext_Get_Args {
@@ -468,10 +587,166 @@ pub(crate) mod ffi {
 
 #[cfg(test)]
 mod tests {
-    use crate::extensions::ffi::FfiExecutionStage;
-    use crate::extensions::ffi::errors::FfiError;
+    use pretty_assertions::assert_eq;
+    use ryft_xla_sys::bindings;
+
+    use crate::extensions::ffi::handlers::ffi::XLA_FFI_Api;
     use crate::extensions::ffi::tests::with_test_ffi_call_frame;
-    use crate::extensions::ffi::types::FfiTypeId;
+
+    use super::*;
+
+    /// Exercises the wrapper boundary without requiring a backend to attach an extension to a compiled invocation.
+    fn with_test_extension_context(
+        find_extension: Option<ffi::XLA_FFI_InvokeContext_FindExtension>,
+        extension: &ffi::XLA_FFI_Extension,
+        test: impl FnOnce(FfiExecutionContext<'_>),
+    ) {
+        // Every field is an integer, raw pointer, or optional function pointer, so zero is a valid representation.
+        // The API and extension remain alive until the borrowed test context has been consumed by the closure.
+        let mut api: XLA_FFI_Api = unsafe { std::mem::zeroed() };
+        api.struct_size = size_of::<XLA_FFI_Api>();
+        api.XLA_FFI_InvokeContext_FindExtension = find_extension;
+        let api = unsafe { FfiApi::from_c_api(&api).unwrap() };
+        let context = FfiExecutionContext {
+            handle: (extension as *const ffi::XLA_FFI_Extension).cast_mut().cast(),
+            api,
+            owner: PhantomData,
+        };
+        test(context);
+    }
+
+    /// Implements only lookup for the test context, whose opaque pointer refers to a single extension header.
+    unsafe extern "C" fn test_find_extension(
+        args: *mut ffi::XLA_FFI_InvokeContext_FindExtension_Args,
+    ) -> *mut crate::extensions::ffi::errors::ffi::XLA_FFI_Error {
+        unsafe {
+            let args = &mut *args;
+            let extension = &*args.context.cast::<ffi::XLA_FFI_Extension>();
+            args.extension =
+                if extension.id.extension_type == args.extension_type { extension } else { std::ptr::null() };
+        }
+        std::ptr::null_mut()
+    }
+
+    #[test]
+    fn test_ffi_context_extension_from_c_api() {
+        let header = ffi::XLA_FFI_Extension {
+            struct_size: size_of::<ffi::XLA_FFI_Extension>(),
+            id: ffi::XLA_FFI_ExtensionId { extension_type: 128, major_version: 0, minor_version: 1 },
+            next: std::ptr::null(),
+        };
+        let extension = unsafe { FfiContextExtension::from_c_api(&header).unwrap() };
+        assert_eq!(extension.extension_type(), 128);
+        assert_eq!(extension.version(), (0, 1));
+        assert_eq!(unsafe { extension.to_c_api() }, (&header as *const ffi::XLA_FFI_Extension).cast());
+        assert!(matches!(
+            unsafe { FfiContextExtension::from_c_api(std::ptr::null()) },
+            Err(FfiError::InvalidArgument { message, .. })
+                if message == "the provided XLA FFI extension handle is a null pointer",
+        ));
+    }
+
+    #[test]
+    fn test_ffi_context_extension_layout() {
+        assert_eq!(size_of::<ffi::XLA_FFI_ExtensionId>(), size_of::<bindings::XLA_FFI_ExtensionId>());
+        assert_eq!(size_of::<ffi::XLA_FFI_Extension>(), size_of::<bindings::XLA_FFI_Extension>());
+        assert_eq!(
+            std::mem::offset_of!(ffi::XLA_FFI_Extension, id),
+            std::mem::offset_of!(bindings::XLA_FFI_Extension, id),
+        );
+        assert_eq!(
+            std::mem::offset_of!(ffi::XLA_FFI_Extension, next),
+            std::mem::offset_of!(bindings::XLA_FFI_Extension, next),
+        );
+        assert_eq!(
+            size_of::<ffi::XLA_FFI_InvokeContext_FindExtension_Args>(),
+            size_of::<bindings::XLA_FFI_InvokeContext_FindExtension_Args>(),
+        );
+        assert_eq!(
+            std::mem::offset_of!(ffi::XLA_FFI_InvokeContext_FindExtension_Args, extension),
+            std::mem::offset_of!(bindings::XLA_FFI_InvokeContext_FindExtension_Args, extension),
+        );
+    }
+
+    #[test]
+    fn test_ffi_execution_context_extension() {
+        let header = ffi::XLA_FFI_Extension {
+            struct_size: size_of::<ffi::XLA_FFI_Extension>(),
+            id: ffi::XLA_FFI_ExtensionId { extension_type: 128, major_version: 0, minor_version: 1 },
+            next: std::ptr::null(),
+        };
+        with_test_extension_context(Some(test_find_extension), &header, |context| {
+            let extension = context.extension(128).unwrap().unwrap();
+            assert_eq!(extension.extension_type(), 128);
+            assert_eq!(extension.version(), (0, 1));
+            assert_eq!(unsafe { extension.to_c_api() }, (&header as *const ffi::XLA_FFI_Extension).cast());
+            assert!(matches!(context.extension(129), Ok(None)));
+        });
+    }
+
+    #[test]
+    fn test_ffi_execution_context_extension_rejects_truncated_header() {
+        let header = ffi::XLA_FFI_Extension {
+            struct_size: size_of::<ffi::XLA_FFI_Extension>() - 1,
+            id: ffi::XLA_FFI_ExtensionId { extension_type: 128, major_version: 0, minor_version: 1 },
+            next: std::ptr::null(),
+        };
+        with_test_extension_context(Some(test_find_extension), &header, |context| {
+            assert!(matches!(
+                context.extension(128),
+                Err(FfiError::Internal { message, .. }) if message == "the XLA FFI extension header is truncated",
+            ));
+        });
+    }
+
+    #[test]
+    fn test_ffi_execution_context_extension_unimplemented() {
+        let header = ffi::XLA_FFI_Extension {
+            struct_size: size_of::<ffi::XLA_FFI_Extension>(),
+            id: ffi::XLA_FFI_ExtensionId { extension_type: 128, major_version: 0, minor_version: 1 },
+            next: std::ptr::null(),
+        };
+        with_test_extension_context(None, &header, |context| {
+            assert!(matches!(
+                context.extension(128),
+                Err(FfiError::Unimplemented { message, .. })
+                    if message == "`XLA_FFI_InvokeContext_FindExtension` is not implemented in the loaded XLA FFI API (version 0.0)",
+            ));
+        });
+    }
+
+    #[test]
+    fn test_ffi_execution_context_set_state_rejects_recording() {
+        let header = ffi::XLA_FFI_Extension {
+            struct_size: size_of::<ffi::XLA_FFI_Extension>(),
+            id: ffi::XLA_FFI_ExtensionId { extension_type: 128, major_version: 0, minor_version: 1 },
+            next: std::ptr::null(),
+        };
+        // The API has no state callback: validation must reject Recording before invoking native code.
+        with_test_extension_context(None, &header, |context| {
+            assert!(matches!(
+                unsafe { context.set_state(FfiExecutionStage::Recording, FfiTypeId::new(42), std::ptr::null_mut()) },
+                Err(FfiError::InvalidArgument { message, .. })
+                    if message == "the XLA execution and recording stages do not have state associated with them",
+            ));
+        });
+    }
+
+    #[test]
+    fn test_ffi_execution_context_state_rejects_recording() {
+        let header = ffi::XLA_FFI_Extension {
+            struct_size: size_of::<ffi::XLA_FFI_Extension>(),
+            id: ffi::XLA_FFI_ExtensionId { extension_type: 128, major_version: 0, minor_version: 1 },
+            next: std::ptr::null(),
+        };
+        with_test_extension_context(None, &header, |context| {
+            assert!(matches!(
+                context.state(FfiExecutionStage::Recording, FfiTypeId::new(42)),
+                Err(FfiError::InvalidArgument { message, .. })
+                    if message == "the XLA execution and recording stages do not have state associated with them",
+            ));
+        });
+    }
 
     #[test]
     fn test_ffi_execution_context() {
@@ -479,39 +754,39 @@ mod tests {
             let context = call_frame.context().unwrap();
             assert!(matches!(
                 context.user_data(FfiTypeId::new(42)),
-                Err(FfiError::Unknown { message, .. })
-                  if message.contains("User data with type id 42 not found in execution context"),
+                Err(FfiError::NotFound { message, .. })
+                  if message == "User data with type id 42 not found in execution context",
             ));
             assert!(matches!(
                 context.set_state(FfiExecutionStage::Execution, FfiTypeId::new(42), std::ptr::null_mut()),
                 Err(FfiError::InvalidArgument { message, .. })
-                  if message.contains("the XLA execution stage does not have a state associated with it"),
+                  if message == "the XLA execution and recording stages do not have state associated with them",
             ));
             assert!(matches!(
                 context.state(FfiExecutionStage::Execution, FfiTypeId::new(42)),
                 Err(FfiError::InvalidArgument { message, .. })
-                  if message.contains("the XLA execution stage does not have a state associated with it"),
+                  if message == "the XLA execution and recording stages do not have state associated with them",
             ));
             assert!(matches!(
                 context.set_state(FfiExecutionStage::Instantiation, FfiTypeId::new(42), std::ptr::null_mut()),
-                Err(FfiError::Unknown { message, .. })
-                  if message.contains("Type id 42 is not registered with a static registry"),
+                Err(FfiError::Internal { message, .. })
+                  if message == "Type id 42 is not registered with a static registry",
             ));
             assert!(matches!(
                 context.state(FfiExecutionStage::Instantiation, FfiTypeId::new(42)),
-                Err(FfiError::Unknown { message, .. }) if message.contains("State is not set"),
+                Err(FfiError::NotFound { message, .. }) if message == "State is not set",
             ));
             assert!(matches!(
                 context.stream(),
-                Err(FfiError::Unknown { message, .. }) if message.contains("XLA FFI GPU context is not available"),
+                Err(FfiError::Unimplemented { message, .. }) if message == "XLA FFI GPU context is not available",
             ));
             assert!(matches!(
                 context.allocate_device_memory(256, 16),
-                Err(FfiError::Unknown { message, .. }) if message.contains("XLA FFI GPU context is not available"),
+                Err(FfiError::InvalidArgument { message, .. }) if message == "XLA FFI GPU context is not available",
             ));
             assert!(matches!(
                 context.free_device_memory(256, std::ptr::null_mut()),
-                Err(FfiError::Unknown { message, .. }) if message.contains("XLA FFI GPU context is not available"),
+                Err(FfiError::Unimplemented { message, .. }) if message == "XLA FFI GPU context is not available",
             ));
 
             unsafe extern "C" fn task_callback(_data: *mut std::ffi::c_void) {}
