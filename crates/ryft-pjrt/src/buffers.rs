@@ -2178,6 +2178,9 @@ impl<'s> Client<'s> {
         // Call the appropriate PJRT C API function to create the new buffer.
         let data = unsafe { data.data() };
         let dimensions = dimensions.as_ref().iter().map(|&dimension| dimension as i64).collect::<Vec<_>>();
+
+        // Retain both the native descriptor and its Rust-owned arrays throughout the native call.
+        let mut layout_handle = device_layout.as_ref().map(|layout| unsafe { layout.to_c_api() });
         let (buffer_handle, done_event_handle) = invoke_pjrt_api_error_fn!(
             self.api(),
             PJRT_Client_BufferFromHostBuffer,
@@ -2192,10 +2195,7 @@ impl<'s> Client<'s> {
                 host_buffer_semantics = B::host_buffer_semantics().to_c_api(),
                 device = std::ptr::null_mut(),
                 memory = memory.default_memory().to_c_api(),
-                device_layout = device_layout
-                    .as_ref()
-                    .map(|layout| &layout.to_c_api() as *const _ as *mut _)
-                    .unwrap_or(std::ptr::null_mut()),
+                device_layout = layout_handle.as_mut().map(|layout| layout as *mut _).unwrap_or(std::ptr::null_mut()),
             },
             { buffer, done_with_host_buffer },
         )?;
@@ -4358,6 +4358,20 @@ mod tests {
             assert_eq!(buffer.element_type(), Ok(BufferType::U8));
             assert_eq!(buffer.dimensions(), Ok([data.len() as u64].as_slice()));
             assert_eq!(buffer.device().unwrap().id(), device.id());
+
+            let layout = Layout::dense_major_to_minor(2);
+            let buffer = client
+                .buffer(data.as_slice(), BufferType::U8, [2u64, 4u64], None, device, Some(layout.clone()))
+                .unwrap();
+
+            // The explicit `Some` path must retain its native descriptor until PJRT consumes it.
+            #[allow(deprecated)]
+            let device_layout = buffer.layout();
+            assert_eq!(device_layout, Ok(layout));
+            assert_eq!(
+                buffer.copy_to_host(Some(Layout::dense_major_to_minor(2))).unwrap().r#await(),
+                Ok(data.to_vec()),
+            );
         });
     }
 

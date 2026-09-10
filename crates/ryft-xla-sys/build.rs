@@ -848,10 +848,10 @@ impl BuildConfiguration {
         match artifact {
             Artifact::RyftXlaSys => format!("ryft-xla-sys-{self}.tar.gz"),
             Artifact::PjrtPlugin => match self.device {
-                Device::Tpu => "libtpu-0.0.41-cp311-cp311-manylinux_2_31_x86_64.whl".to_string(),
-                Device::Neuron => "libneuronxla-3.0.2891.0%2Be2a4b1f5-py3-none-linux_x86_64.whl".to_string(),
+                Device::Tpu => "libtpu-0.0.47-cp311-cp311-manylinux_2_31_x86_64.whl".to_string(),
+                Device::Neuron => "libneuronxla-3.0.5356.0%2Bc743c3ec-py3-none-linux_x86_64.whl".to_string(),
                 Device::Metal => "jax_metal-0.1.1-py3-none-macosx_13_0_arm64.whl".to_string(),
-                Device::Mps => "jax_mps-0.10.1-cp313-cp313-macosx_14_0_arm64.whl".to_string(),
+                Device::Mps => "jax_mps-0.10.10-py3-none-macosx_14_0_arm64.whl".to_string(),
                 _ => format!("pjrt-plugin-{}.tar.gz", self.platform_string()),
             },
         }
@@ -862,7 +862,7 @@ impl BuildConfiguration {
     fn precompiled_artifact_url_prefix(&self, artifact: Artifact) -> String {
         match (artifact, self.device) {
             (Artifact::PjrtPlugin, Device::Tpu) => {
-                "https://files.pythonhosted.org/packages/51/76/24f89a712006681479f03590386c247923b14943ccbc3e4b1253fbbf4269"
+                "https://files.pythonhosted.org/packages/63/5e/d50adfd4e24d87eed40dfcea9fff89e780e87df738f0f24cce3a66d2cec4"
                     .to_string()
             }
             (Artifact::PjrtPlugin, Device::Neuron) => "https://pip.repos.neuron.amazonaws.com/libneuronxla".to_string(),
@@ -871,7 +871,7 @@ impl BuildConfiguration {
                     .to_string()
             }
             (Artifact::PjrtPlugin, Device::Mps) => {
-                "https://files.pythonhosted.org/packages/c2/df/ae7e8d15a46712e011057e79ffe7ab8128495171b95314acb36162e0cb20"
+                "https://files.pythonhosted.org/packages/2d/cc/d055fc820b97f234d975044a30118eadec0f009c4e5cec55af9d677f8bc0"
                     .to_string()
             }
             _ => format!(
@@ -913,16 +913,16 @@ impl BuildConfiguration {
                 Some("e911aa5170783d4fb3a4131e2e2d8e5d914d4f566a940015673de60aff6cc930")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Tpu) => {
-                Some("62dd05e942de8f1379eff9a1b2ada33e1a99d0fbddf52ffce57b18268a0413e6")
+                Some("5029587aa7f8cf5c4030857276abe0a9457ec684efd222c6128d681db781137d")
             }
             (Artifact::PjrtPlugin, OperatingSystem::Linux, Architecture::X86_64, Device::Neuron) => {
-                Some("b453709b37565902acc85bcfb4011d55e99381b81d831a5559847bba71f9cec3")
+                Some("5daa25f3ce54c562c104276b0a9f57192f3cc584445f32225c1617df5e3b0569")
             }
             (Artifact::PjrtPlugin, OperatingSystem::MacOS, Architecture::AArch64, Device::Metal) => {
                 Some("f1dbfecb298cdd3ba6da3ad6dc9a2adb63d71741f8b8ece28c296b32d608b6c8")
             }
             (Artifact::PjrtPlugin, OperatingSystem::MacOS, Architecture::AArch64, Device::Mps) => {
-                Some("fb7854a18a9d52949674d6633c940ad87e8c531d4dd98446f2044b564cd753fa")
+                Some("029f29b00c4abfbb942fc5a9b57308879e209e94c99a94f5069fd87055157fc1")
             }
             _ => None,
         }

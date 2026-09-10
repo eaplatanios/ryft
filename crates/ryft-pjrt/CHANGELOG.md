@@ -41,6 +41,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `Plugin::clear_xla_transform` for the new `PJRT_Clear_Xla_Transform` extension function.
 - Added adapters from CUDA PJRT clients and XLA FFI streams/buffers to the producer-neutral `ryft-cuda` artifact
   launcher behind the `cuda-12` and `cuda-13` features.
+- Fixed dangling native pointers to temporary buffer-layout descriptors and executable compilation options, and
+  preserved valid zero generated-code sizes instead of reporting them as unavailable.
 
 ### Changed
 

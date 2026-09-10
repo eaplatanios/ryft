@@ -220,7 +220,8 @@ impl Executable {
     /// for [`Executable`]s that are the result of ahead-of-time compilation (e.g., using [`Plugin::compile`],
     /// as opposed to [`Client::compile`] followed by [`LoadedExecutable::executable`]), this function may return
     /// an [`Error::Unavailable`]. That is because the size of the generated code may depend on the number and
-    /// type of addressable [`Device`]s after it is loaded, for example.
+    /// type of addressable [`Device`]s after it is loaded, for example. Note that zero is a valid size;
+    /// only a negative native size indicates that the generated code size is unknown.
     pub fn generated_code_size_in_bytes(&self) -> Result<usize, Error> {
         use ffi::PJRT_Executable_SizeOfGeneratedCodeInBytes_Args;
         let size = invoke_pjrt_api_error_fn!(
@@ -229,11 +230,7 @@ impl Executable {
             { executable = self.to_c_api() },
             { size_in_bytes },
         )?;
-        if size <= 0 {
-            Err(Error::unavailable("generated code size is unknown".to_string()))
-        } else {
-            Ok(size as usize)
-        }
+        if size < 0 { Err(Error::unavailable("generated code size is unknown".to_string())) } else { Ok(size as usize) }
     }
 
     /// Returns a unique fingerprint for this [`Executable`]. Two [`Executable`]s that were produced by compiling with
@@ -1720,7 +1717,7 @@ impl<'s> Client<'s> {
                     .as_ref()
                     .map(|options| options.as_ptr() as *const _)
                     .unwrap_or(std::ptr::null()),
-                compile_options_size = options_bytes.map(|options| options.len()).unwrap_or(0),
+                compile_options_size = options_bytes.as_ref().map(|options| options.len()).unwrap_or(0),
             },
             { loaded_executable },
         )
@@ -3130,22 +3127,19 @@ mod tests {
                     assert_eq!(executable.output_element_types(), Ok(vec![BufferType::I32]));
                     assert_eq!(executable.output_dimensions(), Ok(vec![vec![2, 1]]));
 
-                    // The CPU plugin reports memory kinds but still does not expose generated code size
-                    // and cost analysis.
+                    // The CPU plugin reports a valid zero code size but does not expose cost analysis.
                     let input_memory_kinds = executable.input_memory_kinds();
                     let output_memory_kinds = executable.output_memory_kinds();
                     assert_eq!(input_memory_kinds.unwrap(), vec!["device", "device"]);
                     assert_eq!(output_memory_kinds.unwrap(), vec!["device"]);
                     match platform {
                         TestPlatform::Cpu => {
-                            assert!(matches!(
-                                executable.generated_code_size_in_bytes(),
-                                Err(Error::Unavailable { .. }),
-                            ));
+                            assert_eq!(executable.generated_code_size_in_bytes(), Ok(0));
                             assert!(matches!(executable.cost_analysis(), Err(Error::Unimplemented { .. })));
                         }
                         _ => {
-                            assert!(executable.generated_code_size_in_bytes().is_ok());
+                            let generated_code_size = executable.generated_code_size_in_bytes();
+                            assert!(generated_code_size.is_ok(), "{generated_code_size:?}");
                             assert!(executable.cost_analysis().is_ok());
                         }
                     }
@@ -3180,6 +3174,15 @@ mod tests {
                         Ok(DeviceAssignment { replica_count: 1, computation_count: 1, assignment: vec![0] }),
                     );
                     let executable_from_loaded_executable = loaded_executable.executable().unwrap();
+                    // PJRT augments layouts and debug options while preserving the supplied compilation settings.
+                    let loaded_options = executable_from_loaded_executable.compilation_options().unwrap();
+                    assert_eq!(loaded_options.profile_version, options.profile_version);
+                    assert_eq!(loaded_options.compile_portable_executable, options.compile_portable_executable);
+                    assert_eq!(loaded_options.parameter_is_tupled_arguments, options.parameter_is_tupled_arguments);
+                    let loaded_build_options = loaded_options.executable_build_options.unwrap();
+                    let build_options = options.executable_build_options.as_ref().unwrap();
+                    assert_eq!(loaded_build_options.replica_count, build_options.replica_count);
+                    assert_eq!(loaded_build_options.partition_count, build_options.partition_count);
                     assert_eq!(executable_from_loaded_executable.name(), executable.name());
                     assert_eq!(executable_from_loaded_executable.replica_count(), executable.replica_count());
                     assert_eq!(executable_from_loaded_executable.computation_count(), executable.computation_count());
@@ -3224,14 +3227,31 @@ mod tests {
                         executable.output_element_types(),
                     );
                     assert_eq!(executable_from_loaded_executable.output_dimensions(), executable.output_dimensions());
-                    assert!(executable_from_loaded_executable.generated_code_size_in_bytes().is_err());
+                    match platform {
+                        TestPlatform::Cpu | TestPlatform::Cuda12 | TestPlatform::Cuda13 => {
+                            assert_eq!(executable_from_loaded_executable.generated_code_size_in_bytes(), Ok(0));
+                        }
+                        _ => assert!(matches!(
+                            executable_from_loaded_executable.generated_code_size_in_bytes(),
+                            Err(Error::Unavailable { .. }),
+                        )),
+                    }
                     assert_eq!(executable_from_loaded_executable.fingerprint(), executable.fingerprint());
                     assert_eq!(executable_from_loaded_executable.compilation_options(), Ok(options));
                     // The loaded executable optimized program and memory statistics
                     // are not guaranteed to match the original.
                     assert!(executable_from_loaded_executable.optimized_program().is_ok());
                     assert!(executable_from_loaded_executable.memory_statistics().is_ok());
-                    assert!(executable_from_loaded_executable.cost_analysis().is_err());
+                    match platform {
+                        TestPlatform::Cpu => assert!(matches!(
+                            executable_from_loaded_executable.cost_analysis(),
+                            Err(Error::Unimplemented { .. }),
+                        )),
+                        TestPlatform::Cuda12 | TestPlatform::Cuda13 => {
+                            assert!(!executable_from_loaded_executable.cost_analysis().unwrap().is_empty());
+                        }
+                        _ => assert!(executable_from_loaded_executable.cost_analysis().is_err()),
+                    }
                 }
             };
         });
@@ -3348,12 +3368,25 @@ mod tests {
                     assert_eq!(executable.output_dimensions(), Ok(vec![vec![2, 1]]));
                     let output_memory_kinds = executable.output_memory_kinds();
                     assert_eq!(output_memory_kinds.unwrap(), vec!["device"]);
-                    assert!(executable.generated_code_size_in_bytes().is_err());
+                    match platform {
+                        TestPlatform::Cuda12 | TestPlatform::Cuda13 => {
+                            assert_eq!(executable.generated_code_size_in_bytes(), Ok(0));
+                        }
+                        _ => {
+                            assert!(matches!(executable.generated_code_size_in_bytes(), Err(Error::Unavailable { .. })))
+                        }
+                    }
                     assert!(executable.fingerprint().is_ok());
                     assert!(executable.compilation_options().is_ok());
                     assert!(matches!(executable.optimized_program(), Ok(Program::HloWithConfig { .. })));
                     assert!(executable.memory_statistics().is_ok());
-                    assert!(executable.cost_analysis().is_err());
+                    match platform {
+                        TestPlatform::Cuda12 | TestPlatform::Cuda13 => assert!(matches!(
+                            executable.cost_analysis(),
+                            Err(Error::Unimplemented { message, .. }) if message == "GetCostAnalysis is not supported.",
+                        )),
+                        _ => assert!(executable.cost_analysis().is_err()),
+                    }
                     assert!(executable.serialize().is_ok());
                 }
             };

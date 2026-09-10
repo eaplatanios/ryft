@@ -50,3 +50,4 @@ thiserror.workspace = true
 [dev-dependencies]
 futures.workspace = true
 indoc.workspace = true
+pretty_assertions.workspace = true

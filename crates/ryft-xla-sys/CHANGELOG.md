@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added support for Linux AArch64.
 - Added C++ bindings for the `affine`, `arith`, `bufferization`, `builtin`, `complex`, `gpu`, `llvm`, `mosaic_gpu`,
   `mosaic_tpu`, `nvgpu`, `shape`, `sparse_tensor`, `transform`, Triton `tt`, and `ub` MLIR dialects.
-- Added the `mps` feature for loading the `jax-mps` PJRT plugin on macOS AArch64.
+- Added the `mps` feature for loading the `jax-mps` PJRT plugin (version `0.10.10`) on macOS AArch64.
 - Added Mosaic GPU type ID and serde-pass bindings, versioned bytecode/resource constants, CUDA-only `mosaic_gpu_v2`
   runtime registration, upstream Complex attribute bindings, and a source-owned UB poison attribute C API bridge.
 
@@ -34,8 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   tags are now reserved upstream.
 - Updated CUDA 12 and ROCm 7 Bazel build configuration for the new OpenXLA toolchain dependencies, including bumping
   `rules_ml_toolchain` and the hermetic ROCm distribution to `rocm_7.13.0_gfx908`.
-- Updated the PJRT TPU plugin to `libtpu` version `0.0.41`.
-- Updated the PJRT Neuron plugin to `libneuronxla` version `3.0.2891.0+e2a4b1f5`.
+- Updated the PJRT TPU plugin to `libtpu` version `0.0.47`.
+- Updated the PJRT Neuron plugin to `libneuronxla` version `3.0.5356.0+c743c3ec`.
 - Synchronized mirrored XLA protobuf definitions for command buffer command types, autotune backends, debug options,
   and GPU deviceless CUB mode.
 - Synchronized StableHLO C API bindings with upstream mesh and sub-axis attributes.
