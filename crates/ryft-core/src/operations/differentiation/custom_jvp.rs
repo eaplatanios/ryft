@@ -20,8 +20,8 @@ use crate::operations::constants::zero::Zero;
 use crate::parameters::{Parameterized, ParameterizedFamily};
 use crate::partial::PartiallyEvaluatableOperation;
 use crate::programs::{
-    InputRegionProvenance, Operation, OperationFormatter, OutputRegionProvenance, Program, ProgramError,
-    RegionInterface, RegionSlot, TypeError, Value,
+    Operation, OperationFormatter, OutputRegionProvenance, Program, ProgramError, RegionInterface, RegionSlot,
+    TypeError, Value,
 };
 use crate::tracing::{DomainTracer, Trace};
 
@@ -225,10 +225,10 @@ impl<T: DifferentiableType> Operation for CustomJvpOperation<T> {
     }
 
     #[inline]
-    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
         // The primal computation region receives every operand at its own position. The JVP region is a dormant rule
         // that reference analysis does not enter, so it declares no provenance.
-        (region_index == 0).then_some(InputRegionProvenance { input_index })
+        (region_index == 0).then_some(input_index)
     }
 
     #[inline]
@@ -871,7 +871,7 @@ mod tests {
 
         // The primal computation region receives every operand at its own position and its outputs are the call's,
         // while the dormant rule region declares no operand provenance.
-        assert_eq!(operation.input_region_provenance(0, 1), Some(InputRegionProvenance { input_index: 1 }),);
+        assert_eq!(operation.input_region_provenance(0, 1), Some(1));
         assert_eq!(operation.input_region_provenance(1, 1), None);
         assert_eq!(
             operation.output_region_provenance(0),

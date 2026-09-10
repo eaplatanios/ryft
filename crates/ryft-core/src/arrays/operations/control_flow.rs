@@ -437,7 +437,7 @@ mod tests {
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::references::ReferenceDynamicIndexOperation;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
-    use crate::arrays::references::{ArrayReference, ArrayReferenceViewIndex, ArrayReferenceViewTransform};
+    use crate::arrays::references::{ArrayReference, ArrayReferenceView, ArrayReferenceViewIndex};
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
@@ -956,7 +956,7 @@ mod tests {
         fn unrolled(stack: &ArrayReference<Array>, iterations: &[usize]) -> Result<Vec<TestValue>, ProgramError> {
             let mut carry = Array::scalar(1.0f32);
             for &iteration in iterations {
-                let element = stack.with_transform(ArrayReferenceViewTransform::Index {
+                let element = stack.with_transform(ArrayReferenceView::Index {
                     axis: 0,
                     index: ArrayReferenceViewIndex::Static(iteration),
                 })?;

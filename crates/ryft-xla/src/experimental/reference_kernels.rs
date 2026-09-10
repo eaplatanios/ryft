@@ -36,8 +36,8 @@ use std::fmt::Display;
 use std::sync::Arc;
 
 use ryft_core::{
-    ArrayReferenceAnalysis, ArrayReferenceAnalysisError, ArrayReferenceView, ArrayType, AtomId, InstructionId,
-    Operation, ReferenceAccessMode, ReferenceRoot, RegionId, RegionRef, ValueId,
+    ArrayReferenceAnalysis, ArrayReferenceViewPath, ArrayType, AtomId, InstructionId, Operation, ReferenceAccessMode,
+    ReferenceRoot, ReferenceViewAnalysisError, RegionId, RegionRef, ValueId,
 };
 use thiserror::Error;
 
@@ -51,7 +51,7 @@ pub enum KernelValidationError {
     /// constants (kernel bodies capture no references) and consumption of an entering operand, both of which the
     /// generic lifetime and capture rules reject before any kernel-specific rule runs.
     #[error(transparent)]
-    Analysis(#[from] ArrayReferenceAnalysisError),
+    Analysis(#[from] ReferenceViewAnalysisError),
 
     /// The contract declares a different number of parameters than the body has inputs.
     #[error("kernel boundary contract declares {actual} parameters but the kernel body has {expected} inputs")]
@@ -268,11 +268,11 @@ impl KernelReferenceSummary {
         self.parameters.as_slice()
     }
 
-    /// Returns the [`ArrayReferenceView`] of the reference-typed `value`, or [`None`] when `value` is not a
+    /// Returns the [`ArrayReferenceViewPath`] of the reference-typed `value`, or [`None`] when `value` is not a
     /// reference-typed value of the body closure. Refer to the documentation of [`ArrayReferenceAnalysis::path`] for
     /// more information.
     #[inline]
-    pub fn view(&self, value: ValueId) -> Option<&ArrayReferenceView> {
+    pub fn view(&self, value: ValueId) -> Option<&ArrayReferenceViewPath> {
         self.analysis.path(value)
     }
 
@@ -433,11 +433,10 @@ fn entry_roots(
 mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
-        ArrayIrType, ArrayReferenceViewIndex, ArrayReferenceViewTransform, ArraySliceAxis, CaptureReference,
-        ConditionOperation, DataType, Placeholder, ReferenceAddUpdateOperation, ReferenceAliasPosition,
-        ReferenceAnalysisError, ReferenceFreezeOperation, ReferenceIndexOperation, ReferenceNewOperation,
-        ReferenceReadOperation, ReferenceSliceOperation, ReferenceSource, ReferenceSwapOperation, ReferenceType,
-        ReferenceWriteOperation,
+        ArrayIrType, ArrayReferenceView, ArrayReferenceViewIndex, ArraySliceAxis, CaptureReference, ConditionOperation,
+        DataType, Placeholder, ReferenceAddUpdateOperation, ReferenceAnalysisError, ReferenceFreezeOperation,
+        ReferenceIndexOperation, ReferenceNewOperation, ReferenceReadOperation, ReferenceSliceOperation,
+        ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceWriteOperation,
     };
 
     use crate::experimental::lowering::{LoweringError, lower_mlir_module_for_program};
@@ -538,10 +537,10 @@ mod tests {
     #[test]
     fn test_kernel_validation_error() {
         assert_eq!(
-            KernelValidationError::from(ArrayReferenceAnalysisError::MissingView {
+            KernelValidationError::from(ReferenceViewAnalysisError::MissingView {
                 operation: "view",
                 instruction: id(0, 1),
-                position: ReferenceAliasPosition::Output(0),
+                output_index: 0,
             })
             .to_string(),
             "operation `view` at ^0[1] declares a reference view at output 0 but describes no view",
@@ -698,14 +697,14 @@ mod tests {
     fn test_kernel_reference_summary_view() {
         let (program, contract) = accepted_body();
         let summary = validate_kernel_body(program.entry_region_ref(), &contract).unwrap();
-        assert_eq!(summary.view(value(0, 0)), Some(&ArrayReferenceView::root()));
+        assert_eq!(summary.view(value(0, 0)), Some(&ArrayReferenceViewPath::root()));
         assert_eq!(
             summary.view(value(0, 4)).map(|view| view.views().cloned().collect::<Vec<_>>()),
-            Some(vec![ArrayReferenceViewTransform::Slice { axes: vec![ArraySliceAxis::new(0, 1, 1)] }]),
+            Some(vec![ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(0, 1, 1)] }]),
         );
         assert_eq!(
             summary.view(value(0, 6)).map(|view| view.views().cloned().collect::<Vec<_>>()),
-            Some(vec![ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(0) }]),
+            Some(vec![ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Static(0) }]),
         );
         assert_eq!(summary.view(value(0, 3)), None);
         assert_eq!(summary.view(value(0, 5)), None);
@@ -849,7 +848,7 @@ mod tests {
         let contract = KernelBoundaryContract::new(vec![Some(KernelParameterAccess::ReadWrite)]);
         assert_eq!(
             validate_kernel_body(program.entry_region_ref(), &contract).err(),
-            Some(KernelValidationError::Analysis(ArrayReferenceAnalysisError::Analysis(
+            Some(KernelValidationError::Analysis(ReferenceViewAnalysisError::Analysis(
                 ReferenceAnalysisError::ExternalReferenceConsumption {
                     operation: "reference_freeze",
                     instruction: id(0, 0),
@@ -874,7 +873,7 @@ mod tests {
         let contract = KernelBoundaryContract::new(Vec::new());
         assert_eq!(
             validate_kernel_body(program.entry_region_ref(), &contract).err(),
-            Some(KernelValidationError::Analysis(ArrayReferenceAnalysisError::Analysis(
+            Some(KernelValidationError::Analysis(ReferenceViewAnalysisError::Analysis(
                 ReferenceAnalysisError::InvalidReferenceCapture {
                     region: RegionId::new(0),
                     atom: AtomId::new(0),
@@ -969,8 +968,8 @@ mod tests {
         );
         assert!(summary.parameter(1).unwrap().is_mutated());
         assert_eq!(summary.swap_lowering(id(1, 0)), Some(KernelSwapLowering::Store));
-        assert_eq!(summary.view(value(0, 0)), Some(&ArrayReferenceView::root()));
-        assert_eq!(summary.view(value(1, 0)), Some(&ArrayReferenceView::root()));
+        assert_eq!(summary.view(value(0, 0)), Some(&ArrayReferenceViewPath::root()));
+        assert_eq!(summary.view(value(1, 0)), Some(&ArrayReferenceViewPath::root()));
 
         // The nested writes are attributed to the operand, so a read-only declaration is rejected at the branch
         // instruction that performs the first write.

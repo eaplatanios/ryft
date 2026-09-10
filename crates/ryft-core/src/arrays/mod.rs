@@ -37,8 +37,8 @@ pub use operations::{
     ReferenceSliceOperation, reapply_array_reference_view, validate_array_reference_view,
 };
 pub use references::{
-    ArrayReference, ArrayReferenceAnalysis, ArrayReferenceAnalysisError, ArrayReferenceDischarge, ArrayReferenceView,
-    ArrayReferenceViewError, ArrayReferenceViewIndex, ArrayReferenceViewTransform,
+    ArrayReference, ArrayReferenceAnalysis, ArrayReferenceDischarge, ArrayReferenceView, ArrayReferenceViewError,
+    ArrayReferenceViewIndex, ArrayReferenceViewPath,
 };
 pub use sharding::{
     Device, DeviceId, DeviceMesh, LogicalMesh, MeshAxis, MeshAxisType, ProcessIndex, Sharding, ShardingDimension,

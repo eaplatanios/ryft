@@ -75,13 +75,6 @@ impl<T: Type> RegionInterface<T> {
     }
 }
 
-/// Stand-in for `ryft_core::InputRegionProvenance`.
-#[derive(Debug, PartialEq, Eq)]
-struct InputRegionProvenance {
-    /// Position of the corresponding source in the operation's inputs.
-    input_index: usize,
-}
-
 /// Stand-in for `ryft_core::OutputRegionProvenance`.
 #[derive(Debug, PartialEq, Eq)]
 struct OutputRegionProvenance {
@@ -280,7 +273,7 @@ trait Operation: Clone {
         region_interfaces: &[RegionInterface<Self::Type>],
     ) -> Result<Vec<Self::Type>, TypeError>;
 
-    fn input_region_provenance(&self, _region_index: usize, _input_index: usize) -> Option<InputRegionProvenance> {
+    fn input_region_provenance(&self, _region_index: usize, _input_index: usize) -> Option<usize> {
         None
     }
 
@@ -1090,10 +1083,10 @@ impl Operation for PrintOperation {
         Ok(input_types.to_vec())
     }
 
-    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
         match region_index {
-            0 => Some(InputRegionProvenance { input_index }),
-            1 => Some(InputRegionProvenance { input_index: input_index + 1 }),
+            0 => Some(input_index),
+            1 => Some(input_index + 1),
             _ => None,
         }
     }
@@ -1500,8 +1493,8 @@ fn test_operation_generates_operation_forwarding() {
     assert!(!print.allows_reference_access_through_region_input(0, ReferenceAccessMode::ReadWrite));
     assert!(!print.allows_reference_access_through_region_input(1, ReferenceAccessMode::Read));
     assert_eq!(add.input_region_provenance(0, 0), None);
-    assert_eq!(print.input_region_provenance(0, 2), Some(InputRegionProvenance { input_index: 2 }),);
-    assert_eq!(print.input_region_provenance(1, 2), Some(InputRegionProvenance { input_index: 3 }),);
+    assert_eq!(print.input_region_provenance(0, 2), Some(2));
+    assert_eq!(print.input_region_provenance(1, 2), Some(3));
     assert!(!add.is_zero(0));
     assert!(print.is_zero(3));
     assert!(!print.is_zero(4));

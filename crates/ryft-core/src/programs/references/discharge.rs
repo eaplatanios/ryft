@@ -4387,8 +4387,8 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReference, ArrayReferenceViewOperation,
-        ArrayReferenceViewTransform, ArrayType, DataType, ReferenceDynamicIndexOperation, ReferenceIndexOperation,
+        Array, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReference, ArrayReferenceView,
+        ArrayReferenceViewOperation, ArrayType, DataType, ReferenceDynamicIndexOperation, ReferenceIndexOperation,
         ReferenceSliceOperation, reapply_array_reference_view,
     };
     use crate::captures::CaptureReference;
@@ -4414,9 +4414,7 @@ mod tests {
     use crate::programs::references::analysis::ReferenceAnalysisError;
     use crate::programs::references::types::ReferenceType;
     use crate::programs::references::views::{ReferenceViewOperation, ReferenceViewValidationError};
-    use crate::programs::regions::{
-        EmptyRegionDriver, InputRegionProvenance, OutputRegionProvenance, RegionId, RegionInterface, RegionSlot,
-    };
+    use crate::programs::regions::{EmptyRegionDriver, OutputRegionProvenance, RegionId, RegionInterface, RegionSlot};
     use crate::programs::types::{Type, TypeError, Typed};
     use crate::programs::values::Value;
 
@@ -4764,9 +4762,9 @@ mod tests {
             }
         }
 
-        fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
+        fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
             (matches!(self, Self::Call | Self::ScopedCall { dormant: false, .. }) && region_index == 0)
-                .then_some(InputRegionProvenance { input_index })
+                .then_some(input_index)
         }
 
         fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
@@ -9111,14 +9109,10 @@ mod tests {
                 }
             }
 
-            fn input_region_provenance(
-                &self,
-                region_index: usize,
-                input_index: usize,
-            ) -> Option<InputRegionProvenance> {
+            fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
                 match self {
                     Self::Native(operation) => operation.input_region_provenance(region_index, input_index),
-                    Self::Call => Some(InputRegionProvenance { input_index }),
+                    Self::Call => Some(input_index),
                 }
             }
 
@@ -9204,9 +9198,9 @@ mod tests {
         }
 
         impl ReferenceViewOperation for CallingOperation {
-            type View = ArrayReferenceViewTransform;
+            type View = ArrayReferenceView;
 
-            fn reference_view(&self, output_index: usize) -> Option<ArrayReferenceViewTransform> {
+            fn reference_view(&self, output_index: usize) -> Option<ArrayReferenceView> {
                 match self {
                     Self::Native(operation) => operation.reference_view(output_index),
                     Self::Call => None,
@@ -9214,7 +9208,7 @@ mod tests {
             }
 
             fn validate_view(
-                view: &ArrayReferenceViewTransform,
+                view: &ArrayReferenceView,
                 source: &ArrayIrType,
                 output: &ArrayIrType,
             ) -> Result<(), ReferenceViewValidationError> {
@@ -9223,7 +9217,7 @@ mod tests {
 
             fn reapply_view<C: Context<Type = ArrayIrType, Operation = Self>>(
                 context: &C,
-                view: &ArrayReferenceViewTransform,
+                view: &ArrayReferenceView,
                 source: C::Value,
                 symbols: &[C::Value],
             ) -> Result<C::Value, ProgramError> {

@@ -16,7 +16,7 @@ use ryft_core::operations::sort::SortOperation;
 use ryft_core::tracing_v2::rematerialization::RematerializeOperation;
 use ryft_core::{
     AbsOperation, AddOperation, AndOperation, Array as ReferenceArray, ArrayBatch, ArrayBatchingPolicy,
-    ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayReferenceViewOperation, ArrayReferenceViewTransform, ArrayType,
+    ArrayIrOperation, ArrayIrType, ArrayOperation, ArrayReferenceView, ArrayReferenceViewOperation, ArrayType,
     Atan2Operation, AxisIndexOperation, BatchAxis, BatchableOperation, BatchedOutputs, BatchedProgram, BatchingContext,
     BatchingDriver, BatchingError, BroadcastOperation, CalleeRegionDriver, CaptureConstant, CaptureReference,
     CeilOperation, CompareOperation, CompiledCallOperation, ConcatenateOperation, Concretizable, ConditionOperation,
@@ -30,11 +30,11 @@ use ryft_core::{
     DimensionSaturatingSubOperation, DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation,
     DimensionType, DimensionValue, DivOperation, DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation,
     DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, EagerContext, ErfOperation,
-    ExpOperation, FloorOperation, GatherOperation, InputRegionProvenance, IotaOperation, LinearCallOperation,
-    Log1pOperation, LogAddExpOperation, LogOperation, LogSumExpOperation, LogisticOperation, MaxOperation, MaybeZero,
-    MinOperation, MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation,
-    OperationFormatter, OperationProvider, OrOperation, OutputRegionProvenance, PadOperation, ParallelReduceOperation,
-    Parameter, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
+    ExpOperation, FloorOperation, GatherOperation, IotaOperation, LinearCallOperation, Log1pOperation,
+    LogAddExpOperation, LogOperation, LogSumExpOperation, LogisticOperation, MaxOperation, MaybeZero, MinOperation,
+    MulOperation, NegOperation, NotOperation, OneLikeOperation, OneOperation, Operation, OperationFormatter,
+    OperationProvider, OrOperation, OutputRegionProvenance, PadOperation, ParallelReduceOperation, Parameter,
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationValue, PartialValue,
     PartiallyEvaluatableOperation, PowOperation, PrintOperation, Program, ProgramBatchingOutputAxesPolicy,
     ProgramBuilder, ProgramError, ProjectedValue, RaggedDotOperation, ReduceOperation, ReferenceAddUpdateOperation,
     ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue,
@@ -381,9 +381,9 @@ impl<Constant> ReferenceViewOperation for XlaOperation<Constant>
 where
     Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
 {
-    type View = ArrayReferenceViewTransform;
+    type View = ArrayReferenceView;
 
-    fn reference_view(&self, output_index: usize) -> Option<ArrayReferenceViewTransform> {
+    fn reference_view(&self, output_index: usize) -> Option<ArrayReferenceView> {
         // The view derivations are the only members whose effects declare a view alias, each at its
         // single output; every other member and every backend-owned higher-order operation derives no view.
         match self {
@@ -395,7 +395,7 @@ where
     }
 
     fn validate_view(
-        view: &ArrayReferenceViewTransform,
+        view: &ArrayReferenceView,
         source: &ArrayIrType,
         output: &ArrayIrType,
     ) -> Result<(), ReferenceViewValidationError> {
@@ -404,7 +404,7 @@ where
 
     fn reapply_view<C: Context<Type = ArrayIrType, Operation = Self>>(
         context: &C,
-        view: &ArrayReferenceViewTransform,
+        view: &ArrayReferenceView,
         source: C::Value,
         symbols: &[C::Value],
     ) -> Result<C::Value, ProgramError> {
@@ -915,8 +915,8 @@ impl<T: Type> Operation for JitCallOperation<T> {
     }
 
     #[inline]
-    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
-        (region_index == 0).then_some(InputRegionProvenance { input_index })
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
+        (region_index == 0).then_some(input_index)
     }
 
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
@@ -1469,13 +1469,13 @@ mod tests {
     use pretty_assertions::assert_eq;
     use ryft_core::{
         AddOperation, ArrayIrOperation, ArrayIrOperations, ArrayIrType, ArrayOperation, ArrayOperations,
-        ArrayReferenceViewIndex, ArrayReferenceViewTransform, ArrayType, CaptureReference, CapturingContext,
-        ConditionOperation, Context, CotangentDestinationKind, CotangentDestinations, CustomJvpOperation,
-        CustomVjpOperation, DataType, DifferentiableType, DifferentiationError, Dimension, DimensionBounds,
-        DimensionFromScalarOperation, DimensionType, DimensionValue, DimensionVariable, DomainTracingContext,
-        DynamicBroadcastOperation, EffectClasses, ExternalReferenceBinding, InputRegionProvenance, LogicalMesh,
-        MaybeZero, MeshAxis, MeshAxisType, MulOperation, Operation, OutputRegionProvenance, PartialValue, Placeholder,
-        ProgramBuilder, ProgramError, ReferenceAddUpdateOperation, ReferenceDischargeResult, ReferenceDischargeTarget,
+        ArrayReferenceView, ArrayReferenceViewIndex, ArrayType, CaptureReference, CapturingContext, ConditionOperation,
+        Context, CotangentDestinationKind, CotangentDestinations, CustomJvpOperation, CustomVjpOperation, DataType,
+        DifferentiableType, DifferentiationError, Dimension, DimensionBounds, DimensionFromScalarOperation,
+        DimensionType, DimensionValue, DimensionVariable, DomainTracingContext, DynamicBroadcastOperation,
+        EffectClasses, ExternalReferenceBinding, LogicalMesh, MaybeZero, MeshAxis, MeshAxisType, MulOperation,
+        Operation, OutputRegionProvenance, PartialValue, Placeholder, ProgramBuilder, ProgramError,
+        ReferenceAddUpdateOperation, ReferenceDischargeResult, ReferenceDischargeTarget,
         ReferenceDynamicIndexOperation, ReferenceFreezeOperation, ReferenceNewOperation, ReferenceReadOperation,
         ReferenceSource, ReferenceSwapOperation, ReferenceType, ReferenceViewOperation, ReferenceViewValidationError,
         ReferenceWriteOperation, RegionDriver, RegionInterface, RegionRef, RematerializeOperation,
@@ -1532,7 +1532,7 @@ mod tests {
         // A jitted call forwards its operands to the callee positionally, so region provenance, capture counts, and
         // output provenance are all index-preserving for the single callee region and absent for any other region.
         let operation = JitCallOperation::<ArrayIrType>::new(2);
-        assert_eq!(operation.input_region_provenance(0, 3), Some(InputRegionProvenance { input_index: 3 }),);
+        assert_eq!(operation.input_region_provenance(0, 3), Some(3));
         assert_eq!(operation.input_region_provenance(1, 3), None);
         assert_eq!(operation.region_capture_input_count(0), Some(2));
         assert_eq!(operation.region_capture_input_count(1), None);
@@ -1819,7 +1819,7 @@ mod tests {
     #[test]
     fn test_xla_operation_reference_view() {
         let operation = XlaOperation::<XlaConstant>::ReferenceDynamicIndex(ReferenceDynamicIndexOperation::new(0));
-        let view = ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(1) };
+        let view = ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(1) };
         assert_eq!(operation.reference_view(0), Some(view.clone()));
         assert_eq!(operation.reference_view(1), None);
         let stacked = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3, 2])));

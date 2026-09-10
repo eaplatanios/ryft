@@ -13,7 +13,7 @@ use ryft_macros::Operation;
 use crate::arrays::arrays::Array;
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::ir::ArrayIrValue;
-use crate::arrays::references::ArrayReferenceViewTransform;
+use crate::arrays::references::ArrayReferenceView;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::{Dimension, DimensionType};
 use crate::arrays::types::ir::ArrayIrType;
@@ -556,18 +556,16 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
 ///
 /// Mapping between a reference root and one derived handle's selected elements uses static or dynamic slices,
 /// reshapes, and corresponding updates. Both eager handles and the
-/// [`ArrayReferenceDischarge`](crate::ArrayReferenceDischarge) policy walk the same [`ArrayReferenceView`](crate::ArrayReferenceView). This contract lets the staging consumer
+/// [`ArrayReferenceDischarge`](crate::ArrayReferenceDischarge) policy walk the same [`ArrayReferenceViewPath`](crate::ArrayReferenceViewPath). This contract lets the staging consumer
 /// construct those operations in a closed operation family, so core array IR and backend-owned supersets share one
 /// traversal without matching operation names.
 ///
-/// The view contract itself (which outputs are views, their [`ArrayReferenceViewTransform`] descriptions, their
+/// The view contract itself (which outputs are views, their [`ArrayReferenceView`] descriptions, their
 /// type-level validation, and their reapplication to a transformed reference) is the family's
 /// [`ReferenceViewOperation`] implementation, which this trait refines to the array universe so that the array view
 /// overlay ([`ArrayReferenceAnalysis`](crate::ArrayReferenceAnalysis)) and the array discharge policy share one
 /// bound. The constructors here stage array-valued operations over *discharged* values and are discharge-only.
-pub trait ArrayReferenceViewOperation:
-    ReferenceViewOperation<Type = ArrayIrType, View = ArrayReferenceViewTransform>
-{
+pub trait ArrayReferenceViewOperation: ReferenceViewOperation<Type = ArrayIrType, View = ArrayReferenceView> {
     /// Wraps a canonical homogeneous array reshape for reference-view staging.
     fn from_reference_reshape(operation: ReshapeOperation) -> Self;
 
@@ -585,9 +583,9 @@ pub trait ArrayReferenceViewOperation:
 }
 
 impl<A: Value<Type = ArrayType>> ReferenceViewOperation for ArrayIrOperation<A> {
-    type View = ArrayReferenceViewTransform;
+    type View = ArrayReferenceView;
 
-    fn reference_view(&self, output_index: usize) -> Option<ArrayReferenceViewTransform> {
+    fn reference_view(&self, output_index: usize) -> Option<ArrayReferenceView> {
         // The view derivations are the only members whose reference semantics declare a view alias, and each
         // declares it at its single output.
         match self {
@@ -599,7 +597,7 @@ impl<A: Value<Type = ArrayType>> ReferenceViewOperation for ArrayIrOperation<A> 
     }
 
     fn validate_view(
-        view: &ArrayReferenceViewTransform,
+        view: &ArrayReferenceView,
         source: &ArrayIrType,
         output: &ArrayIrType,
     ) -> Result<(), ReferenceViewValidationError> {
@@ -608,7 +606,7 @@ impl<A: Value<Type = ArrayType>> ReferenceViewOperation for ArrayIrOperation<A> 
 
     fn reapply_view<C: Context<Type = ArrayIrType, Operation = Self>>(
         context: &C,
-        view: &ArrayReferenceViewTransform,
+        view: &ArrayReferenceView,
         source: C::Value,
         symbols: &[C::Value],
     ) -> Result<C::Value, ProgramError> {
@@ -1816,7 +1814,7 @@ mod tests {
 
     #[test]
     fn test_array_ir_operation_reference_view_dynamic_index() {
-        let view = ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(1) };
+        let view = ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(1) };
         let operation = TestOperation::ReferenceDynamicIndex(ReferenceDynamicIndexOperation::new(0));
         assert_eq!(operation.reference_view(0), Some(view.clone()));
         assert_eq!(operation.reference_view(1), None);

@@ -128,9 +128,6 @@ impl_member_interpretable_operation_for_array_ir_constant_operation!(
     |context, output_type, _operation| context.zero(&output_type),
 );
 
-// TODO(eaplatanios): Restore the strict `Operation<Type = T>` super-trait bound once the next-generation trait solver
-//  stabilizes. The current solver cannot discharge this projection equality at implementation heads whose context type
-//  is built from `Self` (E0284). The equality is enforced per method through a `where` clause instead.
 impl<T: Type, O: Operation<Type = T> + From<ZeroOperation<T>>> OperationProvider<T, ZeroOperation<T>> for O {
     type Operation = Self;
 

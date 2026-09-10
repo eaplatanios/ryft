@@ -1854,17 +1854,17 @@ mod tests {
     use ryft_core::operations::sort::{ArgMax, TopK};
     use ryft_core::{
         Add, AddOperation, Array as CpuArray, ArrayIrType, ArrayIrValue, ArrayOperation, ArrayReference,
-        ArrayReferenceViewIndex, ArrayReferenceViewTransform, ArrayType, Atan2, Broadcast, CalleeRegionDriver,
-        CaptureReference, Compare, ComparisonDirection, Context, Cos, CotangentDestinationKind, CumulativeLogSumExp,
-        CumulativeSum, DataType, Device, DeviceMesh, DifferentiableType, Differentiate, Dimension, DimensionBounds,
-        DimensionVariable, Div, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice,
-        DynamicUpdateSlice, EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogSumExp,
-        LogicalMesh, Logistic, MeshAxis, MeshAxisType, Mul, MulOperation, OneLike, Placeholder, ProgramBuilder,
-        ProgramError, ProjectedValue, Reduce, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation,
-        ReferenceCompletion, ReferenceCompletionBackend, ReferenceDynamicIndexOperation, ReferenceError,
-        ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead,
-        ReferenceReadOperation, ReferenceType, Reshape, ScanOperation, Select, Shape, Sharding, ShardingDimension, Sin,
-        StopGradient, StopGradientOperation, Sub, Tanh, Trace, Typed, Value, ValueProjection, WhileOperation, ZeroLike,
+        ArrayReferenceView, ArrayReferenceViewIndex, ArrayType, Atan2, Broadcast, CalleeRegionDriver, CaptureReference,
+        Compare, ComparisonDirection, Context, Cos, CotangentDestinationKind, CumulativeLogSumExp, CumulativeSum,
+        DataType, Device, DeviceMesh, DifferentiableType, Differentiate, Dimension, DimensionBounds, DimensionVariable,
+        Div, DomainTracer, DomainTracingContext, Dot, DotDimensionNumbers, DynamicSlice, DynamicUpdateSlice,
+        EagerContext, Exp, Fill, ForwardModeDifferentiate, Hessian, Iota, Jacobian, LogSumExp, LogicalMesh, Logistic,
+        MeshAxis, MeshAxisType, Mul, MulOperation, OneLike, Placeholder, ProgramBuilder, ProgramError, ProjectedValue,
+        Reduce, ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceCompletion,
+        ReferenceCompletionBackend, ReferenceDynamicIndexOperation, ReferenceError, ReferenceFreeze,
+        ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
+        ReferenceType, Reshape, ScanOperation, Select, Shape, Sharding, ShardingDimension, Sin, StopGradient,
+        StopGradientOperation, Sub, Tanh, Trace, Typed, Value, ValueProjection, WhileOperation, ZeroLike,
         differentiate_at,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
@@ -2963,7 +2963,7 @@ mod tests {
                 .unwrap(),
         );
         let view = root
-            .with_transform(ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) })
+            .with_transform(ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Static(1) })
             .unwrap();
         assert!(matches!(
             compiled.call_statefully(&domain, ArrayIrValue::Reference(view)),

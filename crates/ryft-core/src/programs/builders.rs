@@ -16,7 +16,7 @@ use crate::programs::programs::Program;
 use crate::programs::provenance::Provenance;
 use crate::programs::references::{ReferenceIdentity, ReferenceRoot};
 use crate::programs::regions::{
-    InputRegionProvenance, Region, RegionArena, RegionId, RegionInterface, RegionRef, RegionRole, reachable_region_mask,
+    Region, RegionArena, RegionId, RegionInterface, RegionRef, RegionRole, reachable_region_mask,
 };
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::Value;
@@ -217,14 +217,13 @@ impl<V: Value, O: Operation<Type = V::Type>> ProgramBuilder<V, O> {
             let resolved = match analysis.output_roots().get(output.output_index).copied().flatten() {
                 Some(ReferenceRoot::RegionInput { region: owner, input_index }) if owner == region.id() => {
                     // Map the complete region input handle back to the caller operand supplying its root.
-                    let input =
+                    let input_index =
                         operation.input_region_provenance(output.region_index, input_index).ok_or_else(|| {
                             ProgramError::MalformedProgram(format!(
                                 "operation `{}` does not describe a forwarded reference input",
                                 operation.name(),
                             ))
                         })?;
-                    let InputRegionProvenance { input_index } = input;
                     let input = instruction.inputs().get(input_index).copied().ok_or_else(|| {
                         ProgramError::MalformedProgram(format!(
                             "operation `{}` forwards an unknown input",
@@ -900,7 +899,7 @@ mod tests {
     use crate::programs::instructions::InstructionId;
     use crate::programs::provenance::ProvenanceScope;
     use crate::programs::references::ReferenceType;
-    use crate::programs::regions::{InputRegionProvenance, OutputRegionProvenance, RegionSlot};
+    use crate::programs::regions::{OutputRegionProvenance, RegionSlot};
     use crate::programs::types::TypeError;
     use crate::programs::values::ValueId;
     use crate::tests::TestRegionOperation;
@@ -948,8 +947,8 @@ mod tests {
             }
         }
 
-        fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
-            Some(InputRegionProvenance { input_index })
+        fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> Option<usize> {
+            Some(input_index)
         }
 
         fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
@@ -1966,13 +1965,9 @@ mod tests {
                 }
             }
 
-            fn input_region_provenance(
-                &self,
-                _region_index: usize,
-                input_index: usize,
-            ) -> Option<InputRegionProvenance> {
+            fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> Option<usize> {
                 match self {
-                    Self::ForwardingRegion => Some(InputRegionProvenance { input_index }),
+                    Self::ForwardingRegion => Some(input_index),
                     _ => None,
                 }
             }
@@ -2118,12 +2113,12 @@ mod tests {
                 Ok(input_types.to_vec())
             }
 
-            fn effects(&self) -> Cow<'_, Effects> {
-                Cow::Borrowed(&self.effects)
-            }
-
             fn reference_output_identity_input(&self, output_index: usize) -> Option<usize> {
                 self.forwarded.and_then(|(output, input)| (output == output_index).then_some(input))
+            }
+
+            fn effects(&self) -> Cow<'_, Effects> {
+                Cow::Borrowed(&self.effects)
             }
         }
 

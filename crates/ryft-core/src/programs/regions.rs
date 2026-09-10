@@ -11,9 +11,9 @@
 //! derived metadata such as [`EffectClasses`] cannot become stale.
 //!
 //! [`RegionInterface`] is the type-and-effect summary passed to [`Operation::infer_output_types`]. It deliberately
-//! exposes a region boundary without exposing the region body. [`InputRegionProvenance`] describes how an attached
-//! region input originates from an operation input, while [`OutputRegionProvenance`] describes when an operation
-//! output originates from an attached-region output rather than directly from that [`Instruction`].
+//! exposes a region boundary without exposing the region body. [`Operation::input_region_provenance`] maps an attached
+//! region input to the corresponding operation input index. [`OutputRegionProvenance`] identifies both the attached
+//! region and its output when an operation output originates there rather than directly from that [`Instruction`].
 //!
 //! Operation rules receive application-scoped structural access to attached [`Region`]s through [`RegionDriver`]s.
 //! Binding applications obtain their complete ordered region sequence from [`BindingRegionDriver`], which can provide
@@ -1566,18 +1566,6 @@ pub struct InstantiatedRegionMapping<T: Type> {
 
     /// Root of the instantiated [`Region`] in the destination [`ProgramBuilder`]'s [`RegionArena`].
     pub destination_region: RegionId,
-}
-
-/// Identifies the operation input supplying an attached [`Region`] input. The region and its input position are
-/// selected by [`Operation::input_region_provenance`]; `input_index` identifies the source in the operation's input
-/// list. This records dataflow correspondence and not equality of runtime values (e.g., a `scan` operation supplies
-/// a slice of a stacked array and an evolving carry from the corresponding operation inputs). Reference inputs must
-/// preserve complete handle identity; views are constructed explicitly inside the region. Unlike diagnostic
-/// [`Provenance`](crate::Provenance), this information carries semantics used by transforms and analyses.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub struct InputRegionProvenance {
-    /// Index of the source in the parent operation's input list.
-    pub input_index: usize,
 }
 
 /// Identifies one attached [`Region`] output that may produce an [`Operation`] output. Provenance is relative to an

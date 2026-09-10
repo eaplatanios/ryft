@@ -41,10 +41,10 @@ use crate::partial::{
     PartialEvaluationOutput, PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, PartitionedProgram,
 };
 use crate::programs::{
-    CalleeRegionDriver, Concretizable, InputRegionProvenance, MaybeZero, Operation, OperationProjection,
-    OperationProvider, OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
-    ReferenceRoot, ReferenceViewOperation, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueProjection,
+    CalleeRegionDriver, Concretizable, MaybeZero, Operation, OperationProjection, OperationProvider,
+    OutputRegionProvenance, Program, ProgramBuilder, ProgramError, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceRoot,
+    ReferenceViewOperation, RegionInterface, RegionSlot, Type, TypeError, Typed, Value, ValueProjection,
     discharge_positional_region_operation,
 };
 use crate::tracing::{Tracer, TracingContext};
@@ -168,8 +168,8 @@ where
     }
 
     #[inline]
-    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
-        (region_index < 2).then_some(InputRegionProvenance { input_index: input_index + 1 })
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
+        (region_index < 2).then_some(input_index + 1)
     }
 
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {

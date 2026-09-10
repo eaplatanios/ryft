@@ -8,14 +8,14 @@ use ryft_core::{
     CalleeRegionDriver, CaptureConstant, Concretizable, ConstantOperation, Context, ConvertElementType,
     CotangentDestinationKind, CotangentDestinations, DifferentiableOperation, DifferentiableType,
     DifferentiationContext, DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy,
-    Dimension, DivOperation, InputRegionProvenance, LogicalMesh, MaybeZero, MeshAxisType, Operation,
-    OperationFormatter, OutputRegionProvenance, ParallelReduceOperation, ParallelReductionKind, Parameterized,
-    ParameterizedFamily, PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput,
-    PartialEvaluationValue, PartialValue, PartiallyEvaluatableOperation, Placeholder, Program, ProgramBuilder,
-    ProgramError, ProjectedValue, ReferenceAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceFreezeOperation,
-    ReferenceNewOperation, ReferenceRoot, ReferenceSource, ReferenceType, RegionInterface, RegionRef, RegionSlot,
-    ReshapeOperation, ReshapeParameters, Shape, Sharding, ShardingDimension, StagingContext, Tracer, TracingContext,
+    Dimension, DivOperation, LogicalMesh, MaybeZero, MeshAxisType, Operation, OperationFormatter,
+    OutputRegionProvenance, ParallelReduceOperation, ParallelReductionKind, Parameterized, ParameterizedFamily,
+    PartialEvaluationContext, PartialEvaluationDriver, PartialEvaluationInput, PartialEvaluationValue, PartialValue,
+    PartiallyEvaluatableOperation, Placeholder, Program, ProgramBuilder, ProgramError, ProjectedValue,
+    ReferenceAddUpdateOperation, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
+    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceFreezeOperation, ReferenceNewOperation,
+    ReferenceRoot, ReferenceSource, ReferenceType, RegionInterface, RegionRef, RegionSlot, ReshapeOperation,
+    ReshapeParameters, Shape, Sharding, ShardingDimension, StagingContext, Tracer, TracingContext,
     TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError, Typed, Value, ValueId,
     ValueProjection, Zero, ZeroOperation, discharge_reference_free_operation,
 };
@@ -504,8 +504,8 @@ impl<V: Clone> Operation for ShardMapOperation<V> {
     // jitted call, and the body is traced through a fresh-root context that discards captures, so it establishes an
     // empty capture namespace.
     #[inline]
-    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
-        (region_index == 0).then_some(InputRegionProvenance { input_index })
+    fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
+        (region_index == 0).then_some(input_index)
     }
 
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {

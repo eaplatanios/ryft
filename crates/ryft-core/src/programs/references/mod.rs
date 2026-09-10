@@ -291,8 +291,8 @@ mod values;
 mod views;
 
 pub use analysis::{
-    ReferenceAccess, ReferenceAliasEdge, ReferenceAliasPosition, ReferenceAnalysis, ReferenceAnalysisError,
-    ReferenceRegionInputBinding, ReferenceRoot, ReferenceTransitiveAccess,
+    ReferenceAccess, ReferenceAliasEdge, ReferenceAnalysis, ReferenceAnalysisError, ReferenceRegionInputBinding,
+    ReferenceRoot, ReferenceTransitiveAccess,
 };
 pub use discharge::{
     ExternalReferenceBinding, PartialReferenceDischargeResult, RecursiveReferenceDischargeDriver,
@@ -393,7 +393,7 @@ mod tests {
         let analysis_error = ReferenceViewAnalysisError::MissingView {
             operation: "view",
             instruction: InstructionId::new(RegionId::new(0), 1),
-            position: ReferenceAliasPosition::Output(0),
+            output_index: 0,
         };
         let error = ReferenceError::from(analysis_error.clone());
         assert_eq!(error, ReferenceError::ViewAnalysis(Box::new(analysis_error)));

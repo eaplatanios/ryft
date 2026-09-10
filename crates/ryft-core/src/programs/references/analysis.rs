@@ -50,8 +50,8 @@
 //!
 //! # Boundaries
 //!
-//! Complete-value handles cross region boundaries: a nested region input with [`InputRegionProvenance`] provenance
-//! denotes the caller root of the named operation input, and a forwarded region output denotes the root it carried in.
+//! Complete-value handles cross region boundaries. [`Operation::input_region_provenance`] maps a nested region input
+//! to the caller root of the named operation input, and a forwarded region output denotes the root it carried in.
 //! Derived views stay within their defining region; a region that needs a view recreates it from a complete root using
 //! an instruction. Each attachment records the caller root in a [`ReferenceRegionInputBinding`], so shared regions keep
 //! one structural analysis without conflating caller allocations. Reference-typed outputs resolve through
@@ -93,7 +93,7 @@ use crate::programs::operations::Operation;
 use crate::programs::programs::Program;
 use crate::programs::references::discharge::ReferenceSource;
 use crate::programs::references::values::ReferenceId;
-use crate::programs::regions::{InputRegionProvenance, Region, RegionId, RegionRef, RegionRole};
+use crate::programs::regions::{Region, RegionId, RegionRef, RegionRole};
 use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::{Value, ValueId};
@@ -509,24 +509,6 @@ impl ReferenceAccess {
     }
 }
 
-/// Position at which the [`Instruction`](crate::Instruction) of a [`ReferenceAliasEdge`] defines the aliasing value.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum ReferenceAliasPosition {
-    /// The aliasing value is the output of the [`Instruction`](crate::Instruction) at this index,
-    /// whose description a [`ReferenceViewOperation`](crate::ReferenceViewOperation) reports through
-    /// [`reference_view`](crate::ReferenceViewOperation::reference_view).
-    Output(usize),
-}
-
-impl Display for ReferenceAliasPosition {
-    #[inline]
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Output(index) => write!(formatter, "output {index}"),
-        }
-    }
-}
-
 /// Reference alias edge connecting two reference-typed values in the same [`Region`].
 /// Edges are recorded for [`ReferenceAlias`](crate::ReferenceAlias) outputs and outputs constrained by
 /// [`Operation::reference_output_identity_input`], which define identity edges from the constrained input. Narrowing
@@ -538,9 +520,8 @@ pub struct ReferenceAliasEdge {
     /// [`Instruction`](crate::Instruction) defining the aliasing value.
     instruction: InstructionId,
 
-    /// [`ReferenceAliasPosition`] at which the defining [`Instruction`](crate::Instruction)
-    /// defines the aliasing value.
-    position: ReferenceAliasPosition,
+    /// Output index of the defining [`Instruction`](crate::Instruction) that holds the aliasing value.
+    output_index: usize,
 
     /// [`ValueId`] of the reference-typed value the alias that this [`ReferenceAliasEdge`]
     /// corresponds to is derived from.
@@ -557,12 +538,12 @@ impl ReferenceAliasEdge {
     /// Creates a new [`ReferenceAliasEdge`].
     pub const fn new(
         instruction: InstructionId,
-        position: ReferenceAliasPosition,
+        output_index: usize,
         source: ValueId,
         kind: ReferenceAliasKind,
         narrows: bool,
     ) -> Self {
-        Self { instruction, position, source, kind, narrows }
+        Self { instruction, output_index, source, kind, narrows }
     }
 
     /// Returns the [`Instruction`](crate::Instruction) defining the aliasing value.
@@ -570,10 +551,9 @@ impl ReferenceAliasEdge {
         self.instruction
     }
 
-    /// Returns the [`ReferenceAliasPosition`] at which the defining [`Instruction`](crate::Instruction)
-    /// defines the aliasing value.
-    pub const fn position(self) -> ReferenceAliasPosition {
-        self.position
+    /// Returns the output index of the defining [`Instruction`](crate::Instruction) that holds the aliasing value.
+    pub const fn output_index(self) -> usize {
+        self.output_index
     }
 
     /// Returns the [`ValueId`] of the reference-typed value the alias that this [`ReferenceAliasEdge`]
@@ -1440,13 +1420,8 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                 let source_atom = input_atom(input_index, "aliased")?;
                 let source = self.resolve(value_id(source_atom), name, id, input_index)?;
                 let narrows = kind == ReferenceAliasKind::View || source.narrows;
-                let alias = ReferenceAliasEdge {
-                    instruction: id,
-                    position: ReferenceAliasPosition::Output(output_index),
-                    source: value_id(source_atom),
-                    kind,
-                    narrows,
-                };
+                let alias =
+                    ReferenceAliasEdge { instruction: id, output_index, source: value_id(source_atom), kind, narrows };
                 self.analysis
                     .values
                     .insert(value_id(atom), ValueRecord { root: source.root, narrows, alias: Some(alias) });
@@ -1489,7 +1464,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                                  input",
                             )));
                         }
-                        Some(InputRegionProvenance { input_index }) => input_index,
+                        Some(input_index) => input_index,
                     };
 
                     let atom = input_atom(supplying_index, "region-supplying")?;
@@ -1598,7 +1573,7 @@ impl<'r, V: Value, O: Operation<Type = V::Type>> Traversal<'r, V, O> {
                         let source = self.resolve(value_id(atom), name, id, input_index)?;
                         let alias = ReferenceAliasEdge {
                             instruction: id,
-                            position: ReferenceAliasPosition::Output(output_index),
+                            output_index,
                             source: value_id(atom),
                             kind: ReferenceAliasKind::Identity,
                             narrows: source.narrows,
@@ -2028,13 +2003,11 @@ mod tests {
             }
         }
 
-        fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
+        fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> Option<usize> {
             match self {
-                Self::Call | Self::CallWithCaptures(_) | Self::CallWithRule | Self::While => {
-                    Some(InputRegionProvenance { input_index })
-                }
-                Self::Condition => Some(InputRegionProvenance { input_index: input_index + 1 }),
-                Self::Scan { .. } => Some(InputRegionProvenance { input_index }),
+                Self::Call | Self::CallWithCaptures(_) | Self::CallWithRule | Self::While => Some(input_index),
+                Self::Condition => Some(input_index + 1),
+                Self::Scan { .. } => Some(input_index),
                 _ => None,
             }
         }
@@ -2480,24 +2453,15 @@ mod tests {
     }
 
     #[test]
-    fn test_reference_alias_position() {
-        let output = ReferenceAliasPosition::Output(2);
-        assert_eq!(output.to_string(), "output 2");
-        assert_eq!(format!("{output:?}"), "Output(2)");
-        let positions = HashMap::from([(output, "output")]);
-        assert_eq!(positions.get(&ReferenceAliasPosition::Output(2)), Some(&"output"));
-    }
-
-    #[test]
     fn test_reference_alias_edge_new() {
-        let output = ReferenceAliasPosition::Output(2);
+        let output = 2;
         let edge =
             ReferenceAliasEdge::new(instruction_id(1, 1), output, value_id(1, 3), ReferenceAliasKind::View, true);
         assert_eq!(
             edge,
             ReferenceAliasEdge::new(instruction_id(1, 1), output, value_id(1, 3), ReferenceAliasKind::View, true)
         );
-        let other = ReferenceAliasPosition::Output(0);
+        let other = 0;
         assert_ne!(
             edge,
             ReferenceAliasEdge::new(instruction_id(1, 1), other, value_id(1, 3), ReferenceAliasKind::View, true)
@@ -2510,61 +2474,31 @@ mod tests {
 
     #[test]
     fn test_reference_alias_edge_instruction() {
-        let edge = ReferenceAliasEdge::new(
-            instruction_id(1, 1),
-            ReferenceAliasPosition::Output(2),
-            value_id(1, 3),
-            ReferenceAliasKind::View,
-            true,
-        );
+        let edge = ReferenceAliasEdge::new(instruction_id(1, 1), 2, value_id(1, 3), ReferenceAliasKind::View, true);
         assert_eq!(edge.instruction(), instruction_id(1, 1));
     }
 
     #[test]
-    fn test_reference_alias_edge_position() {
-        let edge = ReferenceAliasEdge::new(
-            instruction_id(1, 1),
-            ReferenceAliasPosition::Output(2),
-            value_id(1, 3),
-            ReferenceAliasKind::View,
-            true,
-        );
-        assert_eq!(edge.position(), ReferenceAliasPosition::Output(2));
+    fn test_reference_alias_edge_output_index() {
+        let edge = ReferenceAliasEdge::new(instruction_id(1, 1), 2, value_id(1, 3), ReferenceAliasKind::View, true);
+        assert_eq!(edge.output_index(), 2);
     }
 
     #[test]
     fn test_reference_alias_edge_source() {
-        let edge = ReferenceAliasEdge::new(
-            instruction_id(1, 1),
-            ReferenceAliasPosition::Output(2),
-            value_id(1, 3),
-            ReferenceAliasKind::View,
-            true,
-        );
+        let edge = ReferenceAliasEdge::new(instruction_id(1, 1), 2, value_id(1, 3), ReferenceAliasKind::View, true);
         assert_eq!(edge.source(), value_id(1, 3));
     }
 
     #[test]
     fn test_reference_alias_edge_kind() {
-        let edge = ReferenceAliasEdge::new(
-            instruction_id(1, 1),
-            ReferenceAliasPosition::Output(2),
-            value_id(1, 3),
-            ReferenceAliasKind::View,
-            true,
-        );
+        let edge = ReferenceAliasEdge::new(instruction_id(1, 1), 2, value_id(1, 3), ReferenceAliasKind::View, true);
         assert_eq!(edge.kind(), ReferenceAliasKind::View);
     }
 
     #[test]
     fn test_reference_alias_edge_narrows() {
-        let edge = ReferenceAliasEdge::new(
-            instruction_id(1, 1),
-            ReferenceAliasPosition::Output(2),
-            value_id(1, 3),
-            ReferenceAliasKind::View,
-            true,
-        );
+        let edge = ReferenceAliasEdge::new(instruction_id(1, 1), 2, value_id(1, 3), ReferenceAliasKind::View, true);
         assert_eq!(edge.narrows(), true);
     }
 
@@ -2836,13 +2770,9 @@ mod tests {
         assert_eq!(analysis.root_of(value_id(2, 2)), Some(a));
         assert_eq!(
             analysis.alias(value_id(2, 2)),
-            Some(ReferenceAliasEdge::new(
-                instruction_id(2, 0),
-                ReferenceAliasPosition::Output(0),
-                value_id(2, 0),
-                ReferenceAliasKind::Identity,
-                false,
-            ))
+            Some(
+                ReferenceAliasEdge::new(instruction_id(2, 0), 0, value_id(2, 0), ReferenceAliasKind::Identity, false,)
+            )
         );
         assert!(!analysis.is_view(value_id(2, 2)));
         assert_eq!(
@@ -2881,13 +2811,9 @@ mod tests {
         assert_eq!(analysis.root_of(value_id(1, 2)), Some(a));
         assert_eq!(
             analysis.alias(value_id(1, 2)),
-            Some(ReferenceAliasEdge::new(
-                instruction_id(1, 0),
-                ReferenceAliasPosition::Output(0),
-                value_id(1, 0),
-                ReferenceAliasKind::Identity,
-                false,
-            ))
+            Some(
+                ReferenceAliasEdge::new(instruction_id(1, 0), 0, value_id(1, 0), ReferenceAliasKind::Identity, false,)
+            )
         );
         assert_eq!(
             analysis.region_input_bindings(),
@@ -3032,13 +2958,7 @@ mod tests {
         assert_eq!(analysis.alias(value_id(0, 0)), None);
         assert_eq!(
             analysis.alias(value_id(0, 2)),
-            Some(ReferenceAliasEdge::new(
-                instruction_id(0, 0),
-                ReferenceAliasPosition::Output(0),
-                value_id(0, 1),
-                ReferenceAliasKind::View,
-                true,
-            )),
+            Some(ReferenceAliasEdge::new(instruction_id(0, 0), 0, value_id(0, 1), ReferenceAliasKind::View, true,)),
         );
         assert_eq!(
             analysis.region_input_bindings(),
@@ -3080,13 +3000,7 @@ mod tests {
         let (a, b) = (input_root(1, 0), input_root(1, 1));
         assert_eq!(
             analysis.alias(value_id(0, 2)),
-            Some(ReferenceAliasEdge::new(
-                instruction_id(0, 0),
-                ReferenceAliasPosition::Output(0),
-                value_id(0, 1),
-                ReferenceAliasKind::View,
-                true,
-            )),
+            Some(ReferenceAliasEdge::new(instruction_id(0, 0), 0, value_id(0, 1), ReferenceAliasKind::View, true,)),
         );
         assert_eq!(
             analysis.region_input_bindings(),
@@ -3728,23 +3642,11 @@ mod tests {
         assert_eq!(analysis.external_source(input_root(0, 0)), None);
         assert_eq!(
             analysis.alias(value_id(2, 4)),
-            Some(ReferenceAliasEdge::new(
-                instruction_id(2, 0),
-                ReferenceAliasPosition::Output(0),
-                value_id(2, 0),
-                ReferenceAliasKind::View,
-                true,
-            ))
+            Some(ReferenceAliasEdge::new(instruction_id(2, 0), 0, value_id(2, 0), ReferenceAliasKind::View, true,))
         );
         assert_eq!(
             analysis.alias(value_id(2, 5)),
-            Some(ReferenceAliasEdge::new(
-                instruction_id(2, 1),
-                ReferenceAliasPosition::Output(0),
-                value_id(2, 4),
-                ReferenceAliasKind::View,
-                true,
-            ))
+            Some(ReferenceAliasEdge::new(instruction_id(2, 1), 0, value_id(2, 4), ReferenceAliasKind::View, true,))
         );
         assert!(analysis.is_view(value_id(2, 5)));
         assert_eq!(analysis.root_of(value_id(2, 5)), Some(captured));
@@ -3852,13 +3754,9 @@ mod tests {
         assert_eq!(analysis.root_of(value_id(2, 3)), Some(reference));
         assert_eq!(
             analysis.alias(value_id(2, 3)),
-            Some(ReferenceAliasEdge::new(
-                instruction_id(2, 0),
-                ReferenceAliasPosition::Output(1),
-                value_id(2, 1),
-                ReferenceAliasKind::Identity,
-                false,
-            ))
+            Some(
+                ReferenceAliasEdge::new(instruction_id(2, 0), 1, value_id(2, 1), ReferenceAliasKind::Identity, false,)
+            )
         );
         assert_eq!(
             analysis.transitive_access(instruction_id(2, 0)).unwrap().access_modes(),
@@ -3983,23 +3881,11 @@ mod tests {
         assert_eq!(analysis.alias(value_id(1, 3)), None);
         assert_eq!(
             analysis.alias(value_id(1, 4)),
-            Some(ReferenceAliasEdge::new(
-                instruction_id(1, 1),
-                ReferenceAliasPosition::Output(0),
-                value_id(1, 3),
-                ReferenceAliasKind::View,
-                true,
-            ))
+            Some(ReferenceAliasEdge::new(instruction_id(1, 1), 0, value_id(1, 3), ReferenceAliasKind::View, true,))
         );
         assert_eq!(
             analysis.alias(value_id(1, 5)),
-            Some(ReferenceAliasEdge::new(
-                instruction_id(1, 2),
-                ReferenceAliasPosition::Output(0),
-                value_id(1, 4),
-                ReferenceAliasKind::Identity,
-                true,
-            ))
+            Some(ReferenceAliasEdge::new(instruction_id(1, 2), 0, value_id(1, 4), ReferenceAliasKind::Identity, true,))
         );
         assert_eq!(analysis.alias(value_id(1, 0)), None);
         assert_eq!(analysis.alias(value_id(0, 3)), None);

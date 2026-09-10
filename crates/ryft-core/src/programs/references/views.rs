@@ -78,8 +78,7 @@ use crate::programs::effects::ReferenceAliasKind;
 use crate::programs::instructions::InstructionId;
 use crate::programs::operations::Operation;
 use crate::programs::references::analysis::{
-    ReferenceAliasPosition, ReferenceAnalysis, ReferenceAnalysisError, ReferenceAnalysisTransformArguments,
-    ReferenceRoot,
+    ReferenceAnalysis, ReferenceAnalysisError, ReferenceAnalysisTransformArguments, ReferenceRoot,
 };
 use crate::programs::regions::{Region, RegionRef};
 use crate::programs::transforms::{Transform, TransformArtifact};
@@ -121,7 +120,9 @@ pub enum ReferenceViewAnalysisError {
     Analysis(#[from] ReferenceAnalysisError),
 
     /// An operation declares a view for an output but supplies no description for it.
-    #[error("operation `{operation}` at {instruction} declares a reference view at {position} but describes no view")]
+    #[error(
+        "operation `{operation}` at {instruction} declares a reference view at output {output_index} but describes no view"
+    )]
     MissingView {
         /// Name of the operation.
         operation: &'static str,
@@ -130,12 +131,12 @@ pub enum ReferenceViewAnalysisError {
         instruction: InstructionId,
 
         /// Output whose view description is missing.
-        position: ReferenceAliasPosition,
+        output_index: usize,
     },
 
     /// A view description cannot be applied to its source or derives a type different from the declared type.
     /// The underlying validation error retains the type mismatch or invalid-composition diagnostic.
-    #[error("operation `{operation}` at {instruction} has an invalid view at {position}: {source}")]
+    #[error("operation `{operation}` at {instruction} has an invalid view at output {output_index}: {source}")]
     InvalidView {
         /// Name of the operation.
         operation: &'static str,
@@ -144,7 +145,7 @@ pub enum ReferenceViewAnalysisError {
         instruction: InstructionId,
 
         /// Output described by the invalid view.
-        position: ReferenceAliasPosition,
+        output_index: usize,
 
         /// Failure reported when validating the view against its source and declared output types.
         #[source]
@@ -153,7 +154,7 @@ pub enum ReferenceViewAnalysisError {
 
     /// A symbolic input position is out of range or names a reference rather than an index value.
     #[error(
-        "operation `{operation}` at {instruction} describes a view at {position} through input {symbol}, but {message}"
+        "operation `{operation}` at {instruction} describes a view at output {output_index} through input {symbol}, but {message}"
     )]
     InvalidViewSymbol {
         /// Name of the operation.
@@ -163,7 +164,7 @@ pub enum ReferenceViewAnalysisError {
         instruction: InstructionId,
 
         /// Output whose view uses the invalid symbol.
-        position: ReferenceAliasPosition,
+        output_index: usize,
 
         /// Symbol that cannot be bound at this position.
         symbol: usize,
@@ -338,11 +339,15 @@ impl<View, Binding> ReferenceViewStep<View, Binding> {
 ///
 /// The path stores only the steps, in root-to-value order; the root itself is a property of the structural
 /// [`ReferenceAnalysis`]. The empty path is the identity and denotes the complete root. Complete root handles, capture
-/// constants, and forwarded complete references carry it. Equality and
-/// hashing distinguish different step sequences, not the values they were derived for. `Binding` is what each step's
-/// symbols are closed over: the view analysis binds program identities ([`ValueId`]), and a path
-/// that only ever carries static steps uses [`NoReferenceViewBinding`]. Refer to the module documentation for more
-/// information.
+/// constants, and forwarded complete references carry it. Equality and hashing distinguish different step sequences,
+/// not the values they were derived for.
+///
+/// `Binding` specifies how symbolic indices are represented at the point where the path is used. View analysis stores
+/// [`ValueId`]s identifying source program values. Reference discharge instead stores context values, so a symbolic
+/// index can be used directly when rebuilding a read or update in that context. Eager reference handles resolve indices
+/// immediately and use [`NoReferenceViewBinding`], since their paths do not store unresolved symbolic values. These
+/// representations share the same descriptions and path operations; only the values bound to their symbols differ.
+/// Refer to the module documentation for more information.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct ReferenceViewPath<View, Binding = ValueId> {
     /// Refer to the documentation of [`Self::steps`].
@@ -578,7 +583,7 @@ impl<View> ReferenceViewAnalysis<View> {
                         path.steps.push(Self::derive_view_step(
                             region,
                             edge.instruction(),
-                            edge.position(),
+                            edge.output_index(),
                             edge.source(),
                             value,
                         )?);
@@ -596,7 +601,7 @@ impl<View> ReferenceViewAnalysis<View> {
     fn derive_view_step<V: Value, O: ReferenceViewOperation<Type = V::Type, View = View>>(
         region: RegionRef<'_, V, O>,
         id: InstructionId,
-        position: ReferenceAliasPosition,
+        output_index: usize,
         source: ValueId,
         value: ValueId,
     ) -> Result<ReferenceViewStep<View>, ReferenceViewAnalysisError>
@@ -608,15 +613,16 @@ impl<View> ReferenceViewAnalysis<View> {
         let instruction = &current.instructions()[id.index()];
         let operation = instruction.operation();
         let name = operation.name();
-        let view = match position {
-            ReferenceAliasPosition::Output(output_index) => operation.reference_view(output_index),
-        }
-        .ok_or(ReferenceViewAnalysisError::MissingView { operation: name, instruction: id, position })?;
+        let view = operation.reference_view(output_index).ok_or(ReferenceViewAnalysisError::MissingView {
+            operation: name,
+            instruction: id,
+            output_index,
+        })?;
         let atoms = current.atoms();
         let source_type = atoms[source.atom().index()].r#type();
         let output_type = region.with_id(value.region()).unwrap().atoms()[value.atom().index()].r#type();
         O::validate_view(&view, source_type.as_ref(), output_type.as_ref()).map_err(|source| {
-            ReferenceViewAnalysisError::InvalidView { operation: name, instruction: id, position, source }
+            ReferenceViewAnalysisError::InvalidView { operation: name, instruction: id, output_index, source }
         })?;
         // Resolve each symbolic input position to the ordinary program value supplied to this instruction.
         // A reference cannot supply a scalar index; the operation family validates the remaining index type rules.
@@ -627,7 +633,7 @@ impl<View> ReferenceViewAnalysis<View> {
                 return Err(ReferenceViewAnalysisError::InvalidViewSymbol {
                     operation: name,
                     instruction: id,
-                    position,
+                    output_index,
                     symbol: input_index,
                     message: format!("the instruction has only {} inputs", inputs.len()),
                 });
@@ -636,7 +642,7 @@ impl<View> ReferenceViewAnalysis<View> {
                 return Err(ReferenceViewAnalysisError::InvalidViewSymbol {
                     operation: name,
                     instruction: id,
-                    position,
+                    output_index,
                     symbol: input_index,
                     message: "that input is a reference rather than an index value".to_string(),
                 });
@@ -845,9 +851,9 @@ mod tests {
     use pretty_assertions::assert_eq;
 
     use crate::arrays::{
-        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue,
-        ArrayReferenceViewIndex, ArrayReferenceViewOperation, ArrayReferenceViewTransform, ArraySliceAxis, ArrayType,
-        DataType, DimensionBounds, DimensionType, DimensionValue, DimensionVariable, REFERENCE_INDEX_OPERATION_NAME,
+        Array, ArrayIrBatch, ArrayIrBatchingPolicy, ArrayIrOperation, ArrayIrType, ArrayIrValue, ArrayReferenceView,
+        ArrayReferenceViewIndex, ArrayReferenceViewOperation, ArraySliceAxis, ArrayType, DataType, DimensionBounds,
+        DimensionType, DimensionValue, DimensionVariable, REFERENCE_INDEX_OPERATION_NAME,
         ReferenceDynamicIndexOperation, ReferenceIndexOperation, ReferenceSliceOperation, reapply_array_reference_view,
     };
     use crate::contexts::{EagerContext, StagingContext};
@@ -862,12 +868,10 @@ mod tests {
     use crate::programs::effects::{EffectClasses, Effects, ReferenceAccessMode, ReferenceAlias, ReferenceEffect};
     use crate::programs::instructions::Instruction;
     use crate::programs::programs::Program;
-    use crate::programs::references::analysis::{ReferenceAliasEdge, ReferenceAliasPosition};
+    use crate::programs::references::analysis::ReferenceAliasEdge;
     use crate::programs::references::discharge::ReferenceSource;
     use crate::programs::references::types::ReferenceType;
-    use crate::programs::regions::{
-        InputRegionProvenance, OutputRegionProvenance, RegionId, RegionInterface, RegionSlot,
-    };
+    use crate::programs::regions::{OutputRegionProvenance, RegionId, RegionInterface, RegionSlot};
     use crate::programs::types::TypeError;
     use crate::tracing::TracingContext;
 
@@ -881,7 +885,7 @@ mod tests {
 
     type TestProgram = Program<TestValue, TestOperation, Vec<TestValue>, Vec<TestValue>>;
 
-    type TestPath = ReferenceViewPath<ArrayReferenceViewTransform>;
+    type TestPath = ReferenceViewPath<ArrayReferenceView>;
 
     /// Returns an instruction identity in the test program arena.
     fn id(region: usize, index: usize) -> InstructionId {
@@ -899,8 +903,8 @@ mod tests {
     }
 
     /// Returns a static index view for the given axis and index.
-    fn index(axis: usize, index: usize) -> ArrayReferenceViewTransform {
-        ArrayReferenceViewTransform::Index { axis, index: ArrayReferenceViewIndex::Static(index) }
+    fn index(axis: usize, index: usize) -> ArrayReferenceView {
+        ArrayReferenceView::Index { axis, index: ArrayReferenceViewIndex::Static(index) }
     }
 
     /// Builds `f(matrix: ref<f32[2, 3]>) = read(matrix[0:1, 0:3][0])`, a two-step view chain over one root.
@@ -929,8 +933,8 @@ mod tests {
 
     impl SymbolicViewOperation {
         /// Returns the view description used by the symbolic test operation.
-        fn view(symbol: usize) -> ArrayReferenceViewTransform {
-            ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(symbol) }
+        fn view(symbol: usize) -> ArrayReferenceView {
+            ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(symbol) }
         }
     }
 
@@ -984,7 +988,7 @@ mod tests {
             }
         }
 
-        fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
+        fn input_region_provenance(&self, region_index: usize, input_index: usize) -> Option<usize> {
             match self {
                 Self::Native(operation) => operation.input_region_provenance(region_index, input_index),
                 Self::Symbolic(_) | Self::AdditionalBehavior { .. } => None,
@@ -1051,9 +1055,9 @@ mod tests {
     }
 
     impl ReferenceViewOperation for SymbolicViewOperation {
-        type View = ArrayReferenceViewTransform;
+        type View = ArrayReferenceView;
 
-        fn reference_view(&self, output_index: usize) -> Option<ArrayReferenceViewTransform> {
+        fn reference_view(&self, output_index: usize) -> Option<ArrayReferenceView> {
             match self {
                 Self::Native(operation) => operation.reference_view(output_index),
                 Self::Symbolic(symbol) if output_index == 0 => Some(Self::view(*symbol)),
@@ -1063,7 +1067,7 @@ mod tests {
         }
 
         fn validate_view(
-            view: &ArrayReferenceViewTransform,
+            view: &ArrayReferenceView,
             source: &ArrayIrType,
             output: &ArrayIrType,
         ) -> Result<(), ReferenceViewValidationError> {
@@ -1072,7 +1076,7 @@ mod tests {
 
         fn reapply_view<C: Context<Type = ArrayIrType, Operation = Self>>(
             context: &C,
-            view: &ArrayReferenceViewTransform,
+            view: &ArrayReferenceView,
             source: C::Value,
             symbols: &[C::Value],
         ) -> Result<C::Value, ProgramError> {
@@ -1134,19 +1138,15 @@ mod tests {
              through inputs and captures",
         );
         assert_eq!(
-            ReferenceViewAnalysisError::MissingView {
-                operation: "view",
-                instruction: id(0, 2),
-                position: ReferenceAliasPosition::Output(0),
-            }
-            .to_string(),
+            ReferenceViewAnalysisError::MissingView { operation: "view", instruction: id(0, 2), output_index: 0 }
+                .to_string(),
             "operation `view` at ^0[2] declares a reference view at output 0 but describes no view",
         );
         assert_eq!(
             ReferenceViewAnalysisError::InvalidView {
                 operation: "reference_index",
                 instruction: id(0, 2),
-                position: ReferenceAliasPosition::Output(0),
+                output_index: 0,
                 source: ReferenceViewValidationError::TypeMismatch {
                     expected: "f32[3]".to_string(),
                     actual: "f32[2]".to_string(),
@@ -1160,7 +1160,7 @@ mod tests {
             ReferenceViewAnalysisError::InvalidView {
                 operation: "reference_index",
                 instruction: id(0, 2),
-                position: ReferenceAliasPosition::Output(0),
+                output_index: 0,
                 source: ReferenceViewValidationError::InvalidComposition {
                     message: "reference index axis 2 is out of bounds for rank 2".to_string(),
                 },
@@ -1173,7 +1173,7 @@ mod tests {
             ReferenceViewAnalysisError::InvalidViewSymbol {
                 operation: "symbolic_view",
                 instruction: id(0, 2),
-                position: ReferenceAliasPosition::Output(0),
+                output_index: 0,
                 symbol: 3,
                 message: "the instruction has only 2 inputs".to_string(),
             }
@@ -1185,14 +1185,10 @@ mod tests {
             ProgramError::from(ReferenceViewAnalysisError::MissingView {
                 operation: "view",
                 instruction: id(0, 2),
-                position: ReferenceAliasPosition::Output(0),
+                output_index: 0,
             }),
             ProgramError::Reference(crate::programs::references::ReferenceError::ViewAnalysis(Box::new(
-                ReferenceViewAnalysisError::MissingView {
-                    operation: "view",
-                    instruction: id(0, 2),
-                    position: ReferenceAliasPosition::Output(0),
-                },
+                ReferenceViewAnalysisError::MissingView { operation: "view", instruction: id(0, 2), output_index: 0 },
             ),)),
         );
     }
@@ -1206,7 +1202,7 @@ mod tests {
         let error = ReferenceViewAnalysisError::InvalidView {
             operation: "view",
             instruction: id(0, 0),
-            position: ReferenceAliasPosition::Output(2),
+            output_index: 2,
             source: validation.clone(),
         };
         assert_eq!(error.source().unwrap().downcast_ref::<ReferenceViewValidationError>(), Some(&validation));
@@ -1253,7 +1249,7 @@ mod tests {
     #[test]
     fn test_reference_view_path_with_step() {
         let row = TestPath::root().with_view(index(0, 1));
-        let symbolic = ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(1) };
+        let symbolic = ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(1) };
         let bound = row.with_step(symbolic.clone(), vec![value(0, 3)]);
         assert_eq!(bound.views().collect::<Vec<_>>(), vec![&index(0, 1), &symbolic]);
         assert_eq!(bound.steps()[1].bindings(), &[value(0, 3)]);
@@ -1301,7 +1297,7 @@ mod tests {
         // Symbolic views agree when their input bindings agree. Different bindings may still select the same row.
         let iteration = |region: usize| {
             TestPath::root().with_step(
-                ArrayReferenceViewTransform::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(1) },
+                ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(1) },
                 vec![value(region, 0)],
             )
         };
@@ -1317,9 +1313,8 @@ mod tests {
         // index after the slice; the read output is not reference-typed and has no path.
         let program = chain_program();
         let analysis = ReferenceViewAnalysis::new(program.entry_region_ref(), 0).unwrap();
-        let slice = ArrayReferenceViewTransform::Slice {
-            axes: vec![ArraySliceAxis::new(0, 1, 1), ArraySliceAxis::new(0, 3, 1)],
-        };
+        let slice =
+            ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(0, 1, 1), ArraySliceAxis::new(0, 3, 1)] };
         assert_eq!(analysis.path(value(0, 0)), Some(&TestPath::root()));
         assert_eq!(analysis.path(value(0, 1)), Some(&TestPath::root().with_view(slice.clone())));
         assert_eq!(analysis.path(value(0, 2)), Some(&TestPath::root().with_view(slice.clone()).with_view(index(0, 0))));
@@ -1329,23 +1324,11 @@ mod tests {
         // producing operation to describe.
         assert_eq!(
             analysis.analysis().alias(value(0, 1)),
-            Some(ReferenceAliasEdge::new(
-                id(0, 0),
-                ReferenceAliasPosition::Output(0),
-                value(0, 0),
-                ReferenceAliasKind::View,
-                true,
-            )),
+            Some(ReferenceAliasEdge::new(id(0, 0), 0, value(0, 0), ReferenceAliasKind::View, true,)),
         );
         assert_eq!(
             analysis.analysis().alias(value(0, 2)),
-            Some(ReferenceAliasEdge::new(
-                id(0, 1),
-                ReferenceAliasPosition::Output(0),
-                value(0, 1),
-                ReferenceAliasKind::View,
-                true,
-            )),
+            Some(ReferenceAliasEdge::new(id(0, 1), 0, value(0, 1), ReferenceAliasKind::View, true,)),
         );
     }
 
@@ -1429,13 +1412,7 @@ mod tests {
         let analysis = ReferenceViewAnalysis::new(program.entry_region_ref(), 0).unwrap();
         assert_eq!(
             analysis.analysis().alias(value(2, 3)),
-            Some(ReferenceAliasEdge::new(
-                id(2, 0),
-                ReferenceAliasPosition::Output(1),
-                value(2, 1),
-                ReferenceAliasKind::Identity,
-                false,
-            )),
+            Some(ReferenceAliasEdge::new(id(2, 0), 1, value(2, 1), ReferenceAliasKind::Identity, false,)),
         );
         assert_eq!(
             analysis.paths().collect::<Vec<_>>(),
@@ -1469,7 +1446,7 @@ mod tests {
             Some(ReferenceViewAnalysisError::InvalidView {
                 operation: REFERENCE_INDEX_OPERATION_NAME,
                 instruction: id(0, 0),
-                position: ReferenceAliasPosition::Output(0),
+                output_index: 0,
                 source: ReferenceViewValidationError::TypeMismatch {
                     expected: "f32[3]".to_string(),
                     actual: "f32[2]".to_string(),
@@ -1498,7 +1475,7 @@ mod tests {
             Some(ReferenceViewAnalysisError::InvalidView {
                 operation: REFERENCE_INDEX_OPERATION_NAME,
                 instruction: id(0, 0),
-                position: ReferenceAliasPosition::Output(0),
+                output_index: 0,
                 source: ReferenceViewValidationError::InvalidComposition {
                     message: "reference index axis 2 is out of bounds for rank 2".to_string(),
                 },
@@ -1593,9 +1570,9 @@ mod tests {
         }
 
         impl ReferenceViewOperation for UndescribedViewOperation {
-            type View = ArrayReferenceViewTransform;
+            type View = ArrayReferenceView;
 
-            fn reference_view(&self, output_index: usize) -> Option<ArrayReferenceViewTransform> {
+            fn reference_view(&self, output_index: usize) -> Option<ArrayReferenceView> {
                 match self {
                     Self::Native(operation) => operation.reference_view(output_index),
                     Self::View => None,
@@ -1603,7 +1580,7 @@ mod tests {
             }
 
             fn validate_view(
-                view: &ArrayReferenceViewTransform,
+                view: &ArrayReferenceView,
                 source: &ArrayIrType,
                 output: &ArrayIrType,
             ) -> Result<(), ReferenceViewValidationError> {
@@ -1612,7 +1589,7 @@ mod tests {
 
             fn reapply_view<C: Context<Type = ArrayIrType, Operation = Self>>(
                 context: &C,
-                view: &ArrayReferenceViewTransform,
+                view: &ArrayReferenceView,
                 source: C::Value,
                 symbols: &[C::Value],
             ) -> Result<C::Value, ProgramError> {
@@ -1662,7 +1639,7 @@ mod tests {
             Some(ReferenceViewAnalysisError::MissingView {
                 operation: "undescribed_view",
                 instruction: id(0, 0),
-                position: ReferenceAliasPosition::Output(0),
+                output_index: 0,
             }),
         );
     }
@@ -1729,7 +1706,7 @@ mod tests {
             Some(ReferenceViewAnalysisError::InvalidViewSymbol {
                 operation: "symbolic_view",
                 instruction: id(0, 0),
-                position: ReferenceAliasPosition::Output(0),
+                output_index: 0,
                 symbol: 2,
                 message: "the instruction has only 2 inputs".to_string(),
             }),
@@ -1742,7 +1719,7 @@ mod tests {
             Some(ReferenceViewAnalysisError::InvalidViewSymbol {
                 operation: "symbolic_view",
                 instruction: id(0, 0),
-                position: ReferenceAliasPosition::Output(0),
+                output_index: 0,
                 symbol: 0,
                 message: "that input is a reference rather than an index value".to_string(),
             }),

@@ -53,22 +53,21 @@ use ryft_core::{
     BoundaryPreservingBatchedProgram, Context, CotangentAccumulator, CotangentDestination, CotangentDestinationKind,
     CotangentSeed, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
     DifferentiationDual, DifferentiationError, DifferentiationPolicy, Domain, EagerContext, EffectClass, EffectClasses,
-    Effects, ExternalReferenceBinding, InputRegionProvenance, InstructionId, InterpretableOperation,
-    InterpretationDriver, MaybeZero, NoIdentity, OneOperation, Operation, OperationProvider, OutputRegionProvenance,
-    Parameter, PartialValue, PartiallyEvaluatableOperation, Placeholder, Program, ProgramBatchingOutputAxesPolicy,
-    ProgramBuilder, ProgramError, RecursiveBatchingPolicy, RecursiveReferenceDischargeDriver, Reference,
-    ReferenceAccessMode, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAlias, ReferenceAliasEdge,
-    ReferenceAliasKind, ReferenceAliasPosition, ReferenceBoundary, ReferenceBoundaryError, ReferenceDischargeContext,
-    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeRegionBoundary,
-    ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeResult, ReferenceDischargeTarget,
-    ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType, ReferenceEffect,
-    ReferenceFreeze, ReferenceFreezeOperation, ReferenceId, ReferenceNew, ReferenceNewOperation, ReferenceRead,
-    ReferenceReadOperation, ReferenceSource, ReferenceSwap, ReferenceSwapOperation, ReferenceType, ReferenceView,
-    ReferenceViewOperation, ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError,
-    ReferenceWrite, ReferenceWriteOperation, RegionId, RegionInterface, RegionRef, RegionSlot, Trace, Tracer,
-    TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, Type, TypeError, Typed, Value,
-    ValueId, Zero, ZeroOperation, batch, batch_reference_view_operation, check_count, differentiate_at,
-    discharge_reference_free_operation, validate_reference_boundary,
+    Effects, ExternalReferenceBinding, InstructionId, InterpretableOperation, InterpretationDriver, MaybeZero,
+    NoIdentity, OneOperation, Operation, OperationProvider, OutputRegionProvenance, Parameter, PartialValue,
+    PartiallyEvaluatableOperation, Placeholder, Program, ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError,
+    RecursiveBatchingPolicy, RecursiveReferenceDischargeDriver, Reference, ReferenceAccessMode, ReferenceAddUpdate,
+    ReferenceAddUpdateOperation, ReferenceAlias, ReferenceAliasEdge, ReferenceAliasKind, ReferenceBoundary,
+    ReferenceBoundaryError, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
+    ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeResult,
+    ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType,
+    ReferenceEffect, ReferenceFreeze, ReferenceFreezeOperation, ReferenceId, ReferenceNew, ReferenceNewOperation,
+    ReferenceRead, ReferenceReadOperation, ReferenceSource, ReferenceSwap, ReferenceSwapOperation, ReferenceType,
+    ReferenceView, ReferenceViewOperation, ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep,
+    ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation, RegionId, RegionInterface, RegionRef,
+    RegionSlot, Trace, Tracer, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, Type,
+    TypeError, Typed, Value, ValueId, Zero, ZeroOperation, batch, batch_reference_view_operation, check_count,
+    differentiate_at, discharge_reference_free_operation, validate_reference_boundary,
 };
 
 /// Destination universe of the downstream programs: the eager context over the register family, which is what a
@@ -633,8 +632,8 @@ impl Operation for RegisterOperation {
         }
     }
 
-    fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> Option<InputRegionProvenance> {
-        matches!(self, Self::Call).then_some(InputRegionProvenance { input_index })
+    fn input_region_provenance(&self, _region_index: usize, input_index: usize) -> Option<usize> {
+        matches!(self, Self::Call).then_some(input_index)
     }
 
     fn output_region_provenance(&self, output_index: usize) -> Vec<OutputRegionProvenance> {
@@ -1886,23 +1885,11 @@ fn test_downstream_view_operation_records_output_indices_and_distinct_paths() {
     let halves_instruction = InstructionId::new(RegionId::new(0), 0);
     assert_eq!(
         analysis.analysis().alias(value(1)),
-        Some(ReferenceAliasEdge::new(
-            halves_instruction,
-            ReferenceAliasPosition::Output(0),
-            value(0),
-            ReferenceAliasKind::View,
-            true,
-        )),
+        Some(ReferenceAliasEdge::new(halves_instruction, 0, value(0), ReferenceAliasKind::View, true,)),
     );
     assert_eq!(
         analysis.analysis().alias(value(2)),
-        Some(ReferenceAliasEdge::new(
-            halves_instruction,
-            ReferenceAliasPosition::Output(1),
-            value(0),
-            ReferenceAliasKind::View,
-            true,
-        )),
+        Some(ReferenceAliasEdge::new(halves_instruction, 1, value(0), ReferenceAliasKind::View, true,)),
     );
     assert_eq!(analysis.path(value(0)), Some(&ReferenceViewPath::root()));
     assert_eq!(
@@ -2078,7 +2065,7 @@ fn test_downstream_dynamic_view_analysis_closes_the_index_input() {
         analysis.analysis().alias(value(3)),
         Some(ReferenceAliasEdge::new(
             InstructionId::new(RegionId::new(0), 0),
-            ReferenceAliasPosition::Output(0),
+            0,
             value(0),
             ReferenceAliasKind::View,
             true,
