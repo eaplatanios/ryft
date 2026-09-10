@@ -511,10 +511,10 @@ impl<View> ReferenceViewAnalysis<View> {
     /// different regions. Roots are region-relative (a nested region input is a root of its own namespace even when it
     /// carries a caller root), so only values of one region have comparable roots: values of different roots are
     /// [`Disjoint`](ReferenceViewOverlap::Disjoint), and values of one root delegate to [`ReferenceView::overlap`] with
-    /// the type of the root's defining atom, read from `region`, the closure this view analysis was derived for. The view
-    /// analysis retains no types itself, because the region's transform cache holds it behind a
-    /// `Send + Sync` erasure that the value family's type is not required to satisfy. Callers that compare paths across
-    /// namespaces resolve the roots themselves and use [`ReferenceViewPath::overlap`].
+    /// the type of the root's defining atom, read from `region`, the closure this view analysis was derived for. The
+    /// view analysis retains no types itself, because the region's transform cache holds it behind a `Send + Sync`
+    /// erasure that the value family's type is not required to satisfy. Callers that compare paths across namespaces
+    /// resolve the roots themselves and use [`ReferenceViewPath::overlap`].
     pub fn overlap<V: Value, O: ReferenceViewOperation<Type = V::Type, View = View>>(
         &self,
         region: RegionRef<'_, V, O>,
@@ -703,10 +703,9 @@ impl<'r, V: Value, O: ReferenceViewOperation<Type = V::Type>> RegionRef<'r, V, O
 /// # Errors
 ///
 /// Returns [`BatchingError::UnsupportedOperation`] when the operation derives no view, views more than one source
-/// input, has outputs other than its views, has observable effects or attached regions, has a mapped non-source input
-/// (batching a view through a mapped symbol is not supported). Propagates the [`BatchingError`] of
-/// [`ReferenceView::batch`] and the errors of the
-/// parent context's binding.
+/// input, has outputs other than its views, has observable effects or attached regions, or has a mapped non-source
+/// input (batching a view through a mapped symbol is not supported). Propagates errors from [`ReferenceView::batch`]
+/// and the parent context's binding.
 pub fn batch_reference_view_operation<C, P, O>(
     operation: &O,
     context: &BatchingContext<C, P>,
@@ -814,7 +813,8 @@ where
                 .map(|input_index| {
                     inputs.get(input_index).map(|input| P::value(input).clone()).ok_or_else(|| {
                         BatchingError::from(ProgramError::MalformedProgram(format!(
-                            "`{name}` describes output {output_index} through input {input_index} but was applied to {} inputs",
+                            "`{name}` describes output {output_index} through input {input_index} but was applied to \
+                             {} inputs",
                             inputs.len(),
                         )))
                     })

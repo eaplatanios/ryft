@@ -238,9 +238,10 @@ pub const REFERENCE_DYNAMIC_INDEX_OPERATION_NAME: &str = "reference_dynamic_inde
 
 /// Pure reference view selecting a clamped scalar integer index and removing the selected axis.
 ///
-/// The reference is input zero and the scalar integer index is input one. For a nonempty axis of length `n`, the
-/// selected index is clamped to `0..=n - 1`; unsigned indices retain their full value until clamping. The resulting
-/// reference aliases the same allocation, and constructing the view does not access that allocation's contents.
+/// The reference is input zero and the scalar integer index is input one. The index and referent must occupy the
+/// same memory space. For a nonempty axis of length `n`, the selected index is clamped to `0..=n - 1`; unsigned indices
+/// retain their full value until clamping. The resulting reference aliases the same allocation, and constructing the
+/// view does not access that allocation's contents.
 ///
 /// Type inference permits an empty selected axis so that an unreachable zero-trip scan body remains well typed.
 /// Executing a selection on an empty axis fails because there is no element to select.
@@ -287,6 +288,13 @@ impl Operation for ReferenceDynamicIndexOperation {
         if index.rank() != 0 || !index.data_type().is_integer() {
             return Err(TypeError::invalid(format!(
                 "`reference_dynamic_index` requires a scalar integer index but received `{index}`"
+            )));
+        }
+        if index.memory() != reference.referent().memory() {
+            return Err(TypeError::invalid(format!(
+                "`reference_dynamic_index` reference and index must share one memory space but index resides in {} and reference resides in {}",
+                index.memory(),
+                reference.referent().memory(),
             )));
         }
         Ok(vec![ReferenceType::new(self.transform().output_type(reference.referent())?).into()])
@@ -377,8 +385,8 @@ pub trait ReferenceDynamicIndex<Index = Self, Output = Self>: Sized {
     /// # Parameters
     ///
     ///   - `axis`: Axis of the current reference's referent to select and remove.
-    ///   - `index`: Scalar integer value selecting the element. Negative values select the first element and values
-    ///     beyond the axis length select the last. Eager reference handles read this value through
+    ///   - `index`: Scalar integer value in the same memory space as the referent. Negative values select the first
+    ///     element and values beyond the axis length select the last. Eager reference handles read this value through
     ///     [`Concretizable<i128>`], while staging retains it as an ordinary operand.
     fn reference_dynamic_index(&self, axis: usize, index: &Index) -> Result<Output, ProgramError>;
 }
@@ -599,13 +607,8 @@ macro_rules! impl_default_reference_view_transposition {
                 check_count!("input", inputs, $input_count, ProgramError);
                 check_count!("output", outputs, 1, ProgramError);
                 check_count!("accumulator", accumulators, $input_count, DifferentiationError);
-                let contributions =
-                    (|| -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, DifferentiationError> {
-                        inputs.iter().map(|input| Ok(MaybeZero::Zero(input.r#type().cotangent()?))).collect()
-                    })()?;
-                check_count!("input", contributions, accumulators.len(), ProgramError);
-                for (accumulator, contribution) in accumulators.iter().zip(contributions) {
-                    accumulator.accumulate(context, contribution)?;
+                for (accumulator, input) in accumulators.iter().zip(inputs) {
+                    accumulator.accumulate(context, MaybeZero::Zero(input.r#type().cotangent()?))?;
                 }
                 Ok(())
             }
@@ -1154,6 +1157,7 @@ mod tests {
     use crate::arrays::references::{ArrayReferenceDischarge, ArrayReferenceViewError};
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
+    use crate::arrays::types::memories::Memory;
     use crate::axes::Axis;
     use crate::batching::{BatchAxis, BatchingTracer};
     use crate::contexts::{Context, EagerContext, StagingContext};
@@ -1202,6 +1206,26 @@ mod tests {
         assert_eq!(
             operation.infer_output_types(&[reference.into(), index.clone().into()], &[]),
             Ok(vec![ReferenceType::new(ArrayType::new_static(DataType::F32, [2])).into()])
+        );
+
+        let root = ReferenceType::new(ArrayType::new_static(DataType::F32, [3, 2]));
+        assert_eq!(
+            ReferenceDynamicIndexOperation::new(2)
+                .infer_output_types(&[root.clone().into(), index.clone().into()], &[]),
+            Err(TypeError::invalid("reference index axis 2 is out of bounds for rank 2")),
+        );
+        assert_eq!(
+            operation.infer_output_types(&[root.clone().into(), ArrayType::new_static(DataType::I64, [1]).into()], &[]),
+            Err(TypeError::invalid("`reference_dynamic_index` requires a scalar integer index but received `i64[1]`")),
+        );
+        let host_index = index.clone().with_memory(Memory::Host { pinned: false });
+        assert_eq!(
+            operation.infer_output_types(&[root.into(), host_index.clone().into()], &[]),
+            Err(TypeError::invalid(format!(
+                "`reference_dynamic_index` reference and index must share one memory space but index resides in {} and reference resides in {}",
+                host_index.memory(),
+                index.memory(),
+            ))),
         );
 
         // An empty-axis body can be constructed for a zero-trip scan; no index is executed in that case.
