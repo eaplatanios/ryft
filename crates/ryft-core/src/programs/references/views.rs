@@ -37,7 +37,7 @@
 //! [`ReferenceViewOperation::reapply_view`] rebuilds a description over a root with the same dimensions as the one it
 //! was derived on, which is what tangent, cotangent, and residual reconstruction need. Batching is different in that it
 //! inserts an axis into the packed root, and a primal description reapplied unchanged to a batched root would index or
-//! slice the wrong axis. The contract therefore splits the two concerns. [`ReferenceView::batch`] is pure axis
+//! slice the wrong axis. The contract therefore splits the two concerns. [`BatchableReferenceView::batch`] is pure axis
 //! arithmetic on the description (i.e., given the packed source type and the source's batch axis, it returns the
 //! description that selects the same part of each item of the packed source together with the batch axis of the
 //! derived reference). The shared rule [`batch_reference_view_operation`] then binds that batched description through
@@ -47,7 +47,7 @@
 //! # Overlap Queries
 //!
 //! Two paths of one root may select the same part, provably disjoint parts, or parts whose overlap is not decidable
-//! statically. [`ReferenceView::overlap`] answers that question for two closed paths of one root as a
+//! statically. [`ReferenceView::overlap`] answers that question for two paths starting from the same complete reference as a
 //! [`ReferenceViewOverlap`]; [`ReferenceViewPath::overlap`] and [`ReferenceViewAnalysis::overlap`] expose it on paths
 //! and on analyzed values. Equal symbol bindings identify the same value, but the view descriptions must also agree
 //! for the selections to be identical. For example, array indexing can clamp the same index differently after two
@@ -231,17 +231,43 @@ pub trait ReferenceView: 'static + Clone + Debug + PartialEq + Eq + Hash + Send 
     /// binding, so a view containing only static selections returns an empty vector.
     fn symbols(&self) -> Vec<usize>;
 
-    // TODO(eaplatanios): Review from here onwards.
-
-    /// Moves the batch axis of a source reference through this mapping. The batch axis of a reference is an axis of
-    /// its packed referent that the per-item view never sees, so the batched description must select the same part of
-    /// each item of the packed source that this description selects of the unbatched one, and the derived reference has
-    /// its own batch axis. This is pure axis arithmetic: the symbols of the description are untouched, and a replicated
-    /// `batch_axis` returns the description unchanged and replicated.
+    /// Returns whether `lhs` and `rhs` select separate parts, exactly the same part, or potentially overlapping parts
+    /// of the same reference allocation, without executing the program. Both paths are assumed to start from the
+    /// complete allocation. For example, paths selecting `reference[0]` and `reference[1]` are disjoint, while paths
+    /// selecting `reference[i]` and `reference[j]` may overlap when their indices are unknown. Equal symbol bindings
+    /// identify the same program value. Different bindings do not prove that the runtime values differ. Comparing
+    /// symbolic selections must also account for the selections themselves, including any clamping.
+    ///
+    /// Note that an empty path selects the complete allocation, two empty paths are considered
+    /// [`Same`](ReferenceViewOverlap::Same), and an empty path may overlap with a path selecting only part of
+    /// the allocation. Paths are validated when they are derived, and implementations may conservatively return
+    /// [`MayOverlap`](ReferenceViewOverlap::MayOverlap) for a malformed path instead of failing.
     ///
     /// # Parameters
     ///
-    ///   - `source`: Packed reference type of the batched source (i.e., the type with the batch axis inserted).
+    ///   - `type`: [`Type`] of the complete reference from which both paths start.
+    ///   - `lhs`: [`ReferenceViewStep`]s selecting the first part to compare, starting from the complete reference.
+    ///   - `rhs`: [`ReferenceViewStep`]s selecting the second part to compare, starting from the complete reference.
+    fn overlap(
+        r#type: &Self::Type,
+        lhs: &[ReferenceViewStep<Self>],
+        rhs: &[ReferenceViewStep<Self>],
+    ) -> ReferenceViewOverlap;
+}
+
+/// Optional batching capability for a [`ReferenceView`]. Implementations adjust a selection when its source reference
+/// gains a batch axis. Reference families that support analysis and discharge without batching need only implement
+/// [`ReferenceView`] but batching rules additionally require this trait.
+pub trait BatchableReferenceView: ReferenceView {
+    /// Moves the batch axis of a source reference through this [`ReferenceView`] mapping. The batch axis of a reference
+    /// is an axis of its packed referent that the per-item view never sees, so the batched description must select the
+    /// same part of each item of the packed source that this description selects of the unbatched one, and the derived
+    /// reference has its own batch axis. This is pure axis arithmetic: the symbols of the description are untouched,
+    /// and a replicated `batch_axis` returns the description unchanged and replicated.
+    ///
+    /// # Parameters
+    ///
+    ///   - `source`: Packed reference [`Type`] of the batched source (i.e., the type with the batch axis inserted).
     ///   - `batch_axis`: Batch axis of the source, positioned in the packed referent of `source`.
     ///
     /// # Errors
@@ -249,16 +275,9 @@ pub trait ReferenceView: 'static + Clone + Debug + PartialEq + Eq + Hash + Send 
     /// Returns a [`BatchingError`] when this family cannot carry `batch_axis` through the description (e.g., a family
     /// without axes rejects every mapped axis, and a static array slice cannot span a dynamically sized batch axis).
     fn batch(&self, source: &Self::Type, batch_axis: BatchAxis) -> Result<(Self, BatchAxis), BatchingError>;
-
-    /// Returns the overlap between the parts that two closed root-relative paths `a` and `b` select of one root of
-    /// type `root`. Equal symbol bindings identify the same value. Different bindings do not prove disjointness: for
-    /// example, different input values may supply equal array indices. The empty path denotes the complete root, so it
-    /// is [`Same`](ReferenceViewOverlap::Same) as itself and may overlap with any narrowing path. Paths are validated
-    /// when they are derived, so implementations may treat a malformed path conservatively as
-    /// [`MayOverlap`](ReferenceViewOverlap::MayOverlap) instead of failing.
-    fn overlap(root: &Self::Type, a: &[ReferenceViewStep<Self>], b: &[ReferenceViewStep<Self>])
-    -> ReferenceViewOverlap;
 }
+
+// TODO(eaplatanios): Review from here onwards.
 
 /// Static view contract of one operation family: the owned description of every view alias the family can derive,
 /// its type-level validation, and its reapplication to another reference with compatible dimensions.
@@ -269,7 +288,7 @@ pub trait ReferenceView: 'static + Clone + Debug + PartialEq + Eq + Hash + Send 
 /// transformed root. A tangent or cotangent root may have a different referent type from the primal root, so each
 /// description is validated against the current transformed source type before it is reapplied. Batching does not
 /// reapply a primal description unchanged, because a batched root has an extra axis; it first moves the batch axis
-/// through the description with [`ReferenceView::batch`] and then reapplies the batched description, which is what
+/// through the description with [`BatchableReferenceView::batch`] and then reapplies the batched description, which is what
 /// [`batch_reference_view_operation`] does for every view operation.
 pub trait ReferenceViewOperation: Operation {
     /// Description of one view step of this family, addressing this family's reference types.
@@ -393,7 +412,7 @@ impl<View, Binding> ReferenceViewPath<View, Binding> {
         Self { steps: Vec::new() }
     }
 
-    /// Returns the ordered closed steps applied from the root outward.
+    /// Returns the steps and their bindings in the order they are applied, starting from the complete reference.
     #[inline]
     pub fn steps(&self) -> &[ReferenceViewStep<View, Binding>] {
         self.steps.as_slice()
@@ -439,7 +458,7 @@ impl<View, Binding> ReferenceViewPath<View, Binding> {
 
 impl<View: ReferenceView> ReferenceViewPath<View> {
     /// Returns the overlap between the parts this path and `other` select of one root of type `root`, through
-    /// [`ReferenceView::overlap`]. Both paths must be root-relative paths of the same root; callers that compare
+    /// [`ReferenceView::overlap`]. Both paths must start from the same complete reference; callers that compare
     /// analyzed values of one region use [`ReferenceViewAnalysis::overlap`], which checks the roots first, while this
     /// function serves callers that resolve roots across namespaces themselves.
     #[inline]
@@ -719,13 +738,13 @@ impl<'r, V: Value, O: ReferenceViewOperation<Type = V::Type>> RegionRef<'r, V, O
     }
 }
 
-/// Batches one reference-view operation of the family of `C` through the [`ReferenceView`] contract: the shared
+/// Batches one reference-view operation of the family of `C` through the [`BatchableReferenceView`] contract: the shared
 /// [`BatchableOperation`](crate::batching::BatchableOperation) rule of every operation whose effects declare only
 /// [`View`](ReferenceAliasKind::View) aliases of one source input.
 ///
 /// The rule reads the operation's [`effects`](Operation::effects) to find the single source input and the view outputs,
 /// requires every other input (the inputs named by the views' symbols) to be replicated, and then, for each view output
-/// in output order, moves the source's batch axis through the description with [`ReferenceView::batch`] and binds the
+/// in output order, moves the source's batch axis through the description with [`BatchableReferenceView::batch`] and binds the
 /// batched description over the packed source through [`ReferenceViewOperation::reapply_view`] on the parent context,
 /// supplying the packed value of each input a symbol names. Each reapplication binds one operation on the parent, so an
 /// operation with several view outputs (e.g., a family that splits a register into two halves) is bound once per
@@ -742,7 +761,7 @@ impl<'r, V: Value, O: ReferenceViewOperation<Type = V::Type>> RegionRef<'r, V, O
 ///
 /// Returns [`BatchingError::UnsupportedOperation`] when the operation derives no view, views more than one source
 /// input, has outputs other than its views, has observable effects or attached regions, or has a mapped non-source
-/// input (batching a view through a mapped symbol is not supported). Propagates errors from [`ReferenceView::batch`]
+/// input (batching a view through a mapped symbol is not supported). Propagates errors from [`BatchableReferenceView::batch`]
 /// and the parent context's binding.
 pub fn batch_reference_view_operation<C, P, O>(
     operation: &O,
@@ -750,7 +769,7 @@ pub fn batch_reference_view_operation<C, P, O>(
     inputs: &[P::Batch],
 ) -> Result<BatchedOutputs<C, P>, BatchingError>
 where
-    C: Context<Operation: ReferenceViewOperation + From<O>>,
+    C: Context<Operation: ReferenceViewOperation<View: BatchableReferenceView> + From<O>>,
     P: BatchingPolicy<C>,
     O: Clone,
 {
