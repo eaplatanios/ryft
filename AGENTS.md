@@ -360,7 +360,10 @@ Consult that file before writing or revising unit tests.
 - Keep dialect-loading calls before constructing dialect-specific entities when required for safety.
 - Keep paired owned/reference operation types (e.g., `Detached...Operation` and `...OperationRef`) consistent.
 - For operation constructor APIs, pass `location` as the last parameter and use generic `L: Location<'c, 't>`.
-- For operation documentation strings, avoid Markdown tables for operands/results; prefer clear Markdown lists.
+- For operation documentation strings, follow the StableHLO style: explain semantics, include a `# Example` with MLIR
+  rendering, and link to the operation's official documentation. Constructor docstrings link back to the operation
+  semantics and describe non-obvious parameters using the standard `# Parameters` format. Avoid Markdown tables for
+  operands/results; prefer clear Markdown lists instead.
 - For operation constructor documentation strings, avoid boilerplate Rust call examples unless usage is non-obvious.
 
 ### `ryft-pjrt`
