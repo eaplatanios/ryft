@@ -1236,7 +1236,9 @@ mod tests {
     #[test]
     fn test_array() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
         let client_devices = client.addressable_devices().unwrap();
         let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
         let mesh = DeviceMesh::new(logical_mesh_2x2(), devices.clone()).unwrap();
@@ -1323,7 +1325,9 @@ mod tests {
     #[test]
     fn test_zero_array_host_transfer_is_bufferless() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
         let mesh = DeviceMesh::new(logical_mesh, vec![device]).unwrap();
@@ -1346,7 +1350,9 @@ mod tests {
     #[test]
     fn test_zero_array_buffer_construction_rejects_a_noncanonical_physical_carrier() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let device = client.addressable_devices().unwrap()[0].clone();
         let logical_device = Device::from_pjrt(&device).unwrap();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
@@ -1362,7 +1368,9 @@ mod tests {
     #[test]
     fn test_zero_array_buffer_construction_discards_a_canonical_physical_carrier() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let device = client.addressable_devices().unwrap()[0].clone();
         let logical_device = Device::from_pjrt(&device).unwrap();
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Auto).unwrap()]).unwrap();
@@ -1380,7 +1388,9 @@ mod tests {
     #[test]
     fn test_zero_array_distinguishes_local_bufferless_and_remote_shards() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let local_device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
         let remote_device = Device::new(local_device.id() + 1, client.process_index().unwrap() + 1);
         let logical_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap();
@@ -1399,7 +1409,9 @@ mod tests {
     #[test]
     fn test_array_client() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
         let client_devices = client.addressable_devices().unwrap();
         let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
         let mesh = DeviceMesh::new(logical_mesh_2x2(), devices).unwrap();
@@ -1448,7 +1460,9 @@ mod tests {
         // A client that does not own the addressable shard buffers is rejected — both at construction time and
         // through `Array::with_client` — even when that client was created from the same plugin with identical
         // options.
-        let other_client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+        let other_client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
         let error = array.with_client(&other_client).unwrap_err();
         assert!(matches!(&error, Error::PjrtError(PjrtError::InvalidArgument { .. })));
         assert!(error.to_string().starts_with("the provided client does not own the addressable shard buffer"));

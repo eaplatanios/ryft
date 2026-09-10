@@ -3674,7 +3674,10 @@ mod tests {
     #[test]
     fn test_loaded_executable_execute_validation_errors() {
         let plugin = test_cpu_plugin();
-        let client = plugin.api().client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let client = plugin
+            .api()
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
         let program = test_program(false, false);
         let options = CompilationOptions {
             executable_build_options: Some(ExecutableCompilationOptions {

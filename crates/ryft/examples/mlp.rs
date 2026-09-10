@@ -275,7 +275,7 @@ mod xla_backend {
             return Ok(candidate);
         }
 
-        Ok((load_cpu_plugin()?, ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })))
+        Ok((load_cpu_plugin()?, ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() })))
     }
 
     /// Runs MLP training through XLA on the selected PJRT platform.

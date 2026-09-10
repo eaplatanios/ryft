@@ -484,7 +484,10 @@ mod tests {
         // Verify we can mint a PJRT client through the runtime. The client borrows the
         // runtime's KV store, so it must be dropped before the runtime falls out of scope.
         let client = runtime
-            .create_client(&plugin, ClientOptions::CPU(CpuClientOptions { device_count: Some(1) }))
+            .create_client(
+                &plugin,
+                ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }),
+            )
             .unwrap();
         assert!(!client.addressable_devices().unwrap().is_empty());
     }

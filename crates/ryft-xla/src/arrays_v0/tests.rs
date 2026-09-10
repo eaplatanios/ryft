@@ -58,7 +58,9 @@ fn test_array_new_requires_sharding_without_single_buffer() {
 #[test]
 fn test_array_new_accepts_unsharded_type_with_single_buffer() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+        .unwrap();
     let devices = client
         .addressable_devices()
         .unwrap()
@@ -107,7 +109,9 @@ fn test_array_new_rejects_dynamic_shape() {
 #[test]
 fn test_device_put_visualizes_uneven_1d_partitioning() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+        .unwrap();
     let client_devices = client.addressable_devices().unwrap();
     let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
     let mesh =
@@ -140,7 +144,9 @@ fn test_device_put_visualizes_uneven_1d_partitioning() {
 #[test]
 fn test_device_put_visualizes_2d_partitioning() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+        .unwrap();
     let client_devices = client.addressable_devices().unwrap();
     let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
     let mesh = DeviceMesh::new(logical_mesh_2x2(), devices).unwrap();
@@ -237,7 +243,9 @@ fn test_device_put_visualizes_2d_partitioning() {
 #[test]
 fn test_array_put_reshards_fully_addressable_array() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+        .unwrap();
     let client_devices = client.addressable_devices().unwrap();
     let source_mesh = DeviceMesh::new(
         LogicalMesh::new(vec![MeshAxis::new("source", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
@@ -317,7 +325,9 @@ fn test_array_put_reshards_fully_addressable_array() {
 #[test]
 fn test_array_put_copies_matching_local_shards_without_full_source_addressability() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+        .unwrap();
     let local_device = client.addressable_devices().unwrap().remove(0);
     let local_device_id = local_device.id().unwrap();
     let remote_device_id = local_device_id + 1;
@@ -362,7 +372,9 @@ fn test_array_put_copies_matching_local_shards_without_full_source_addressabilit
 #[test]
 fn test_plan_exact_shard_put_uses_cross_host_send_and_receive_for_remote_exact_moves() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+        .unwrap();
     let local_device = client.addressable_devices().unwrap().remove(0);
     let local_device_id = local_device.id().unwrap();
     let remote_device_id = local_device_id + 1;
@@ -411,7 +423,9 @@ fn test_plan_exact_shard_put_uses_cross_host_send_and_receive_for_remote_exact_m
 #[test]
 fn test_array_put_rejects_non_addressable_source_shards() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+        .unwrap();
     let source_mesh = DeviceMesh::new(
         LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Auto).unwrap()]).unwrap(),
         vec![Device::new(0, 0), Device::new(1, 1)],
@@ -443,7 +457,9 @@ fn test_array_put_rejects_non_addressable_source_shards() {
 #[test]
 fn test_device_put_broadcasts_root_placement_over_array_tuple() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+        .unwrap();
     let client_devices = client.addressable_devices().unwrap();
     let source_mesh = DeviceMesh::new(
         LogicalMesh::new(vec![MeshAxis::new("source", 1, MeshAxisType::Auto).unwrap()]).unwrap(),
@@ -542,7 +558,9 @@ fn test_device_put_broadcasts_root_placement_over_array_tuple() {
 #[test]
 fn test_device_put_preserves_partially_addressable_array_when_device_is_absent() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+        .unwrap();
     let local_device = client.addressable_devices().unwrap().remove(0);
     let local_device_id = local_device.id().unwrap();
     let remote_device_id = local_device_id + 1;
@@ -585,7 +603,9 @@ fn test_device_put_preserves_partially_addressable_array_when_device_is_absent()
 #[test]
 fn test_array_to_device_preserves_same_partially_addressable_placement() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+        .unwrap();
     let local_device = client.addressable_devices().unwrap().remove(0);
     let local_device_id = local_device.id().unwrap();
     let remote_device_id = local_device_id + 1;
@@ -630,7 +650,9 @@ fn test_array_to_device_preserves_same_partially_addressable_placement() {
 #[test]
 fn test_device_put_rejects_mismatched_src_for_array_leaf() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+        .unwrap();
     let client_device = client.addressable_devices().unwrap().remove(0);
     let source_device = Device::from_pjrt(client_device).unwrap();
     let source_mesh = DeviceMesh::new(
@@ -681,7 +703,7 @@ fn test_array_driven_shardy_jit_sharded_matmul_on_cpu() {
     // Use the same 8-device CPU setup as `ryft_pjrt` tests.
     let plugin = load_cpu_plugin().unwrap();
     let client = plugin
-        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(8) }))
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(8), ..Default::default() }))
         .expect("failed to create 8-device CPU client");
     let client_devices = client.addressable_devices().unwrap();
     assert_eq!(client_devices.len(), 8);
@@ -833,7 +855,9 @@ fn four_device_mesh_x(client: &ryft_pjrt::Client<'_>) -> DeviceMesh {
 #[test]
 fn test_compiled_reshard_replicated_to_sharded_on_same_mesh() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+        .unwrap();
     let mesh = four_device_mesh_x(&client);
     let engine = XlaDomain::new(&client);
 
@@ -875,7 +899,9 @@ fn test_compiled_reshard_replicated_to_sharded_on_same_mesh() {
 #[test]
 fn test_zero_space_reshard_is_bufferless_and_preserves_type_metadata() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+        .unwrap();
     let mesh = four_device_mesh_x(&client);
     let engine = XlaDomain::new(&client);
     let source_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
@@ -902,7 +928,9 @@ fn test_zero_space_reshard_is_bufferless_and_preserves_type_metadata() {
 #[test]
 fn test_compiled_reshard_sharded_to_replicated_on_same_mesh() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+        .unwrap();
     let mesh = four_device_mesh_x(&client);
     let engine = XlaDomain::new(&client);
 
@@ -943,7 +971,9 @@ fn test_compiled_reshard_sharded_to_replicated_on_same_mesh() {
 #[test]
 fn test_compiled_reshard_sharded_to_differently_sharded_on_same_mesh() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+        .unwrap();
     let devices = client
         .addressable_devices()
         .unwrap()
@@ -1003,7 +1033,9 @@ fn test_compiled_reshard_sharded_to_differently_sharded_on_same_mesh() {
 #[test]
 fn test_compiled_reshard_cross_mesh_replicated_source_to_sharded_destination() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+        .unwrap();
     let client_devices = client.addressable_devices().unwrap();
 
     // Source lives on a 1-device sub-mesh.
@@ -1052,7 +1084,9 @@ fn test_compiled_reshard_cross_mesh_replicated_source_to_sharded_destination() {
 #[test]
 fn test_to_device_donates_source_and_returns_independently_readable_output() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+        .unwrap();
     let mesh = four_device_mesh_x(&client);
     let engine = XlaDomain::new(&client);
 
@@ -1098,7 +1132,9 @@ fn test_to_device_donates_source_and_returns_independently_readable_output() {
 #[ignore = "timing-sensitive; runs locally to validate the structural cache hit"]
 fn bench_compiled_reshard_cache_hit_avoids_trace_and_lower() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+        .unwrap();
     let mesh = four_device_mesh_x(&client);
     let engine = XlaDomain::new(&client);
     let values = (0..4096).map(|index| index as f32).collect::<Vec<_>>();
@@ -1137,7 +1173,9 @@ fn bench_compiled_reshard_cache_hit_avoids_trace_and_lower() {
 #[test]
 fn test_compilation_context_preserves_custom_base_options() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+        .unwrap();
     let mesh = four_device_mesh_x(&client);
 
     // Construct contexts with two distinct base option templates. Different `Debug`
@@ -1184,7 +1222,9 @@ fn test_compilation_context_preserves_custom_base_options() {
 #[test]
 fn test_to_placement_rejects_non_addressable_destination_device() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+        .unwrap();
     let local_device = client.addressable_devices().unwrap().remove(0);
     let local_device_id = local_device.id().unwrap();
     let remote_device_id = local_device_id + 1;
@@ -1232,7 +1272,9 @@ fn test_to_placement_rejects_non_addressable_destination_device() {
 #[test]
 fn test_compiled_reshard_with_explicit_mesh_axes() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+        .unwrap();
     let devices = client
         .addressable_devices()
         .unwrap()
@@ -1290,7 +1332,9 @@ fn test_compiled_reshard_with_explicit_mesh_axes() {
 #[test]
 fn test_to_with_manual_mesh_axes_uses_host_fallback() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+        .unwrap();
     let devices = client
         .addressable_devices()
         .unwrap()
@@ -1357,7 +1401,9 @@ fn two_device_sub_mesh_x(client: &ryft_pjrt::Client<'_>) -> DeviceMesh {
 #[test]
 fn test_compiled_reshard_cross_mesh_sharded_source_to_replicated_destination() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+        .unwrap();
     let engine = XlaDomain::new(&client);
 
     // Source: sharded along "x" on a 2-device sub-mesh (devices 0 and 1 each hold half the data).
@@ -1403,7 +1449,9 @@ fn test_compiled_reshard_cross_mesh_sharded_source_to_replicated_destination() {
 #[test]
 fn test_compiled_reshard_cross_mesh_sharded_source_to_sharded_destination() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+        .unwrap();
     let engine = XlaDomain::new(&client);
 
     // Source: sharded along "x" on a 2-device sub-mesh.
@@ -1449,7 +1497,9 @@ fn test_compiled_reshard_cross_mesh_sharded_source_to_sharded_destination() {
 #[test]
 fn test_compiled_reshard_cross_mesh_sharded_source_compiles_two_executables() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+        .unwrap();
     let engine = XlaDomain::new(&client);
 
     let source_mesh = two_device_sub_mesh_x(&client);
@@ -1481,7 +1531,9 @@ fn test_compiled_reshard_cross_mesh_sharded_source_compiles_two_executables() {
 #[test]
 fn test_fast_path_replicated_cross_mesh_to_replicated_destination() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+        .unwrap();
     let client_devices = client.addressable_devices().unwrap();
 
     // Source: replicated on a 1-device sub-mesh.
@@ -1531,7 +1583,9 @@ fn test_fast_path_replicated_cross_mesh_to_replicated_destination() {
 #[test]
 fn test_compiled_reshard_caches_executable_across_calls() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+        .unwrap();
     let mesh = four_device_mesh_x(&client);
     let engine = XlaDomain::new(&client);
 
@@ -1571,7 +1625,9 @@ fn test_compiled_reshard_caches_executable_across_calls() {
 #[test]
 fn test_compilation_context_lru_evicts_oldest_entry() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+        .unwrap();
     let devices = client
         .addressable_devices()
         .unwrap()
@@ -1637,7 +1693,9 @@ fn test_compilation_context_lru_evicts_oldest_entry() {
 #[test]
 fn test_compilation_context_disk_cache_warm_starts_a_fresh_context() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+        .unwrap();
     let mesh = four_device_mesh_x(&client);
     let cache_dir = tempfile::tempdir().unwrap();
 
@@ -1681,7 +1739,9 @@ fn test_compilation_context_disk_cache_warm_starts_a_fresh_context() {
 #[test]
 fn test_compilation_context_clear_cache() {
     let plugin = load_cpu_plugin().unwrap();
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+    let client = plugin
+        .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+        .unwrap();
     let mesh = four_device_mesh_x(&client);
     let engine = XlaDomain::new(&client);
 

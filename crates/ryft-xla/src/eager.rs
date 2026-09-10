@@ -447,7 +447,9 @@ mod tests {
     #[test]
     fn test_eager_arithmetic_and_trigonometric_capabilities() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
         let a = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0]);
         let b = f32_vector(&client, &mesh, &[10.0, 20.0, 30.0, 40.0]);
@@ -483,7 +485,9 @@ mod tests {
     #[test]
     fn test_eager_value_parity_with_reference_backend() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
 
         let left_values = [0.5f32, 1.25, 2.0, 3.75];
@@ -639,7 +643,9 @@ mod tests {
     #[test]
     fn test_eager_extrema_match_jax_semantics() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
 
         // Boolean extrema use false/true identities, including when the reduced axis is empty.
@@ -726,7 +732,9 @@ mod tests {
     #[test]
     fn test_eager_erf_parity_with_reference_backend() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
 
         let values = [
@@ -766,7 +774,9 @@ mod tests {
         use ryft_core::operations::custom_call::{CustomCall, CustomCallOperation};
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         ensure_add_one_handler_registered(&client).unwrap();
         let mesh = cpu_mesh(&client);
 
@@ -815,7 +825,9 @@ mod tests {
         use ryft_core::operations::custom_call::{CustomCall, CustomCallBatching, CustomCallOperation};
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         ensure_add_one_handler_registered(&client).unwrap();
         let mesh = cpu_mesh(&client);
 
@@ -875,7 +887,9 @@ mod tests {
         };
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         ensure_add_one_handler_registered(&client).unwrap();
         let mesh = cpu_mesh(&client);
         let row_type = replicated_type(&mesh, DataType::F32, &[4]);
@@ -948,7 +962,9 @@ mod tests {
         use crate::XlaDomain;
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         ensure_add_one_handler_registered(&client).unwrap();
         let mesh = cpu_mesh(&client);
         let input = f32_vector(&client, &mesh, &[1.5, 2.5]);
@@ -986,7 +1002,9 @@ mod tests {
         use ryft_core::operations::sort::{ArgMax, ArgMin, Sort, SortDirection, TopK};
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
 
         let key_values = [3.0f32, 1.0, 3.0, -0.0, 0.0, 2.0];
@@ -1036,7 +1054,9 @@ mod tests {
         use ryft_core::operations::sort::{Sort, SortDirection};
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
 
         let primary_values = [2i32, 1, 2, 1, 2, 1];
@@ -1109,7 +1129,9 @@ mod tests {
         use ryft_core::operations::random::{RandomAlgorithm, RngBitGenerator};
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
 
         let state_values = [42u64, 7u64];
@@ -1168,7 +1190,9 @@ mod tests {
         use ryft_core::operations::random::{RandomAlgorithm, RngBitGenerator};
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
 
         let state_values = [42u64, 7u64, 9u64];
@@ -1229,7 +1253,9 @@ mod tests {
         use ryft_core::operations::random::Random;
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
 
         let state_values = [11u64, 3u64];
@@ -1296,7 +1322,9 @@ mod tests {
         use ryft_core::DotDimensionNumbers;
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
 
         let operand_type =
@@ -1329,7 +1357,9 @@ mod tests {
         use ryft_core::{DotDimensionNumbers, ScaledDot};
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
 
         let element_type =
@@ -1389,7 +1419,9 @@ mod tests {
         use ryft_core::operations::attention::{AttentionConfiguration, AttentionInputs, DotProductAttention};
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
         let dimensions = [1usize, 3, 2, 2];
         let host_type =
@@ -1491,7 +1523,9 @@ mod tests {
         use crate::XlaDomain;
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
         let dimensions = [1usize, 2, 1, 2];
         let values = [0.25_f32, -0.5, 0.75, 1.0];
@@ -1539,7 +1573,9 @@ mod tests {
     #[test]
     fn test_eager_operator_sugar() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
         let a = f32_vector(&client, &mesh, &[1.0, 2.0]);
         let b = f32_vector(&client, &mesh, &[3.0, 5.0]);
@@ -1561,7 +1597,9 @@ mod tests {
     #[test]
     fn test_eager_transpose_and_reshape_round_trip() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
         let matrix = f32_matrix(&client, &mesh, 2, 3, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
 
@@ -1583,7 +1621,9 @@ mod tests {
     #[test]
     fn test_eager_compare_and_select() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
         let a = f32_vector(&client, &mesh, &[1.0, 5.0, 3.0, 8.0]);
         let b = f32_vector(&client, &mesh, &[4.0, 2.0, 3.0, 9.0]);
@@ -1599,7 +1639,9 @@ mod tests {
     #[test]
     fn test_eager_manipulation_capabilities() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
         let vector = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0]);
 
@@ -1642,7 +1684,9 @@ mod tests {
     #[test]
     fn test_eager_boolean_concretization() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
         let small = f32_scalar(&client, &mesh, 2.0);
         let large = f32_scalar(&client, &mesh, 5.0);
@@ -1673,7 +1717,9 @@ mod tests {
     #[test]
     fn test_eager_integer_concretization() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
         let signed = Array::from_host_buffer(
             &client,
@@ -1698,7 +1744,9 @@ mod tests {
     #[test]
     fn test_eager_dimension_gateways() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh_with_axis_size(&client, 2);
 
         let matrix = f32_matrix(&client, &mesh, 2, 3, &[0.0; 6]);
@@ -1735,7 +1783,9 @@ mod tests {
     #[test]
     fn test_eager_while_predicate() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
 
         let mixed = boolean_vector(&client, &mesh, &[false, true]);
@@ -1755,7 +1805,9 @@ mod tests {
     #[test]
     fn test_eager_chained_operations_propagate_client_and_cache() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
         let a = f32_vector(&client, &mesh, &[1.0, 2.0]);
         let b = f32_vector(&client, &mesh, &[3.0, 4.0]);
@@ -1782,7 +1834,9 @@ mod tests {
     #[test]
     fn test_execution_domain_recovery() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
 
         // Arrays with an attached client recover a client-backed domain.
@@ -1807,7 +1861,9 @@ mod tests {
     #[test]
     fn test_eager_jvp() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         let tangents = f32_vector(&client, &mesh, &[1.0, 1.0, 1.0]);
@@ -1823,7 +1879,9 @@ mod tests {
     #[test]
     fn test_eager_abs_jvp_at_zero() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
         let primal = f32_scalar(&client, &mesh, 0.0);
         let tangent = f32_scalar(&client, &mesh, 3.0);
@@ -1846,7 +1904,9 @@ mod tests {
     #[test]
     fn test_eager_batch_abs_preserves_mapped_axis_sharding() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh_with_axis_size(&client, 2);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let input_type = ArrayType::new(DataType::C64, Shape::new(vec![Dimension::Static(4)]))
@@ -1876,7 +1936,9 @@ mod tests {
     #[test]
     fn test_eager_value_and_grad() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         let domain = x.execution_domain();
@@ -1896,7 +1958,9 @@ mod tests {
     #[test]
     fn test_eager_free_grad() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         let domain = x.execution_domain();
@@ -1916,7 +1980,9 @@ mod tests {
     #[test]
     fn test_eager_vjp_pullback() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         let domain = x.execution_domain();
@@ -1941,7 +2007,9 @@ mod tests {
         use ryft_core::operations::complex::{Conjugate, Real};
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
         let z = num_complex::Complex::new(0.7f32, -0.3f32);
         let x = c64_scalar(&client, &mesh, z);
@@ -1986,7 +2054,9 @@ mod tests {
     #[test]
     fn test_eager_value_and_grad_with_aux() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         let domain = x.execution_domain();
@@ -2008,7 +2078,9 @@ mod tests {
     #[test]
     fn test_eager_differentiation_capture_preserves_nontrivial_sharding_and_placement() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh_with_axis_size(&client, 2);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
@@ -2059,7 +2131,9 @@ mod tests {
     #[test]
     fn test_eager_grad_of_batched_function() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         let domain = x.execution_domain();
@@ -2080,7 +2154,9 @@ mod tests {
     #[test]
     fn test_eager_jacobian_forward() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         let domain = x.execution_domain();
@@ -2099,7 +2175,9 @@ mod tests {
     #[test]
     fn test_eager_coordinate_basis_stays_on_device_across_element_types() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
         for data_type in [DataType::F16, DataType::BF16] {
             let r#type = replicated_type(&mesh, data_type, &[3]);
@@ -2183,7 +2261,9 @@ mod tests {
     #[test]
     fn test_eager_jacobian_forward_over_f16_input() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
         let r#type = replicated_type(&mesh, DataType::F16, &[3]);
         let bytes = [1.0, 2.0, 3.0].iter().flat_map(|value| f16::from_f64(*value).to_ne_bytes()).collect::<Vec<_>>();
@@ -2200,7 +2280,9 @@ mod tests {
     #[test]
     fn test_eager_holomorphic_dense_differentiation() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
         let value = num_complex::Complex::new(1.0f32, 2.0);
         let input = c64_scalar(&client, &mesh, value);
@@ -2233,7 +2315,9 @@ mod tests {
     #[test]
     fn test_eager_jacobian_forward_over_sharded_input() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh_with_axis_size(&client, 2);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
@@ -2259,7 +2343,9 @@ mod tests {
     #[test]
     fn test_eager_jacobian_reverse_over_sharded_input() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh_with_axis_size(&client, 2);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let r#type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
@@ -2284,7 +2370,9 @@ mod tests {
     #[test]
     fn test_eager_jacobian_reverse() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         let jacobian = differentiate_at(x).jacobian_reverse(|x| Mul::mul(&x, &x)).unwrap();
@@ -2301,7 +2389,9 @@ mod tests {
     #[test]
     fn test_eager_hessian() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         let domain = x.execution_domain();
@@ -2326,7 +2416,9 @@ mod tests {
     #[test]
     fn test_eager_vjp_pullback_apply() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
         let x = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
         let domain = x.execution_domain();
@@ -2341,7 +2433,9 @@ mod tests {
     #[test]
     fn test_free_batch_squares_vector_items() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = cpu_mesh(&client);
         let input = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]);
 

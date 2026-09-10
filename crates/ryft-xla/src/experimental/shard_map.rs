@@ -3610,7 +3610,7 @@ mod tests {
     fn test_traced_shard_map_executes_end_to_end_on_cpu() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) }))
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .expect("failed to create 4-device CPU client");
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
@@ -3695,7 +3695,7 @@ mod tests {
     fn test_traced_shard_map_matmul_renders_and_executes_end_to_end_on_cpu() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(8) }))
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(8), ..Default::default() }))
             .expect("failed to create 8-device CPU client");
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 8);
@@ -3870,7 +3870,7 @@ mod tests {
     fn test_shard_map_manual_computation_executes_end_to_end_on_cpu() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) }))
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .expect("failed to create 4-device CPU client");
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
@@ -3986,7 +3986,7 @@ mod tests {
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) }))
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .expect("failed to create 4-device CPU client");
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
@@ -4100,7 +4100,7 @@ mod tests {
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) }))
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .expect("failed to create 2-device CPU client");
         ensure_add_one_handler_registered(&client).unwrap();
         let client_devices = client.addressable_devices().unwrap();
@@ -4530,7 +4530,7 @@ mod tests {
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) }))
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .expect("failed to create 4-device CPU client");
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 4);
@@ -4740,7 +4740,7 @@ mod tests {
     fn test_shard_map_all_gather_lowers_and_executes_on_cpu() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) }))
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .expect("failed to create 2-device CPU client");
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 2);
@@ -4860,7 +4860,7 @@ mod tests {
     fn test_shard_map_untiled_all_gather_lowers_rank_insertion() {
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) }))
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .expect("failed to create 2-device CPU client");
         let client_devices = client.addressable_devices().unwrap();
         let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
@@ -5005,7 +5005,7 @@ mod tests {
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) }))
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
             .expect("failed to create 4-device CPU client");
         let client_devices = client.addressable_devices().unwrap();
         let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
@@ -5128,7 +5128,7 @@ mod tests {
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) }))
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .expect("failed to create 2-device CPU client");
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 2);
@@ -5248,7 +5248,7 @@ mod tests {
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) }))
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .expect("failed to create 2-device CPU client");
         let client_devices = client.addressable_devices().unwrap();
         let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();
@@ -5342,7 +5342,7 @@ mod tests {
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) }))
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .expect("failed to create 2-device CPU client");
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 2);
@@ -5451,7 +5451,7 @@ mod tests {
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) }))
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .expect("failed to create 2-device CPU client");
         let client_devices = client.addressable_devices().unwrap();
         assert_eq!(client_devices.len(), 2);
@@ -5565,7 +5565,7 @@ mod tests {
 
         let plugin = load_cpu_plugin().unwrap();
         let client = plugin
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) }))
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
             .expect("failed to create 2-device CPU client");
         let client_devices = client.addressable_devices().unwrap();
         let devices = client_devices.iter().map(|device| Device::from_pjrt(device).unwrap()).collect::<Vec<_>>();

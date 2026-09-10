@@ -24,6 +24,7 @@ pub(crate) mod tests {
             }),
             compile_portable_executable: false,
             profile_version: 0,
+            individually_defined_output_indices: Vec::new(),
             serialized_multi_slice_configuration: Vec::new(),
             environment_option_overrides: HashMap::new(),
             target_config: None,
@@ -50,8 +51,10 @@ pub(crate) mod tests {
         (|$plugin:ident, $client:ident, $platform:ident| $body:block) => {{
             {
                 let $plugin = $crate::load_cpu_plugin().expect("failed to load the PJRT CPU plugin");
-                let $client =
-                    $plugin.client($crate::ClientOptions::CPU($crate::CpuClientOptions { device_count: Some(8) }));
+                let $client = $plugin.client($crate::ClientOptions::CPU($crate::CpuClientOptions {
+                    device_count: Some(8),
+                    ..Default::default()
+                }));
                 let $client = $client.expect("failed to create a PJRT CPU client");
                 let $platform = $crate::tests::TestPlatform::Cpu;
                 $body

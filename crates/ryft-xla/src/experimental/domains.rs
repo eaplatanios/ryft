@@ -5335,14 +5335,15 @@ mod tests {
         CumulativeProductOperation, CumulativeSumOperation, CustomJvpOperation, Dimension, DimensionAddOperation,
         DimensionDivFloorOperation, DimensionFromScalarOperation, DimensionRemOperation, DimensionRequirementOperation,
         DimensionSizeOperation, DimensionSubOperation, DimensionToScalarOperation, DivOperation, DotDimensionNumbers,
-        DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation, DynamicShapeSliceOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, Fill,
-        IotaOperation, LogSumExpOperation, MulOperation, NegOperation, OneOperation, PrintOperation,
-        RaggedDotDimensionNumbers, RaggedDotOperation, ReduceOperation, ReductionKind, ReferenceAddUpdate,
-        ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceIndexOperation, ReferenceNew,
-        ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation,
-        ReferenceType, ReferenceWrite, ReferenceWriteOperation, ScaledDotOperation, ScanOperation,
-        ScatterDimensionNumbers, ScatterOperation, SelectOperation, Sharding, ShardingDimension, SliceOperation,
-        StaticShape, SubOperation, WhileOperation, ZeroOperation, try_jit_with_options,
+        DotOperation, DynamicBroadcastOperation, DynamicReshapeOperation, DynamicShapeSliceOperation,
+        DynamicSliceOperation, DynamicUpdateSliceOperation, Fill, IotaOperation, LogSumExpOperation, MulOperation,
+        NegOperation, OneOperation, PrintOperation, RaggedDotDimensionNumbers, RaggedDotOperation, ReduceOperation,
+        ReductionKind, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
+        ReferenceIndexOperation, ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation,
+        ReferenceSliceOperation, ReferenceSwapOperation, ReferenceType, ReferenceWrite, ReferenceWriteOperation,
+        ScaledDotOperation, ScanOperation, ScatterDimensionNumbers, ScatterOperation, SelectOperation, Sharding,
+        ShardingDimension, SliceOperation, StaticShape, SubOperation, WhileOperation, ZeroOperation,
+        try_jit_with_options,
     };
     use ryft_pjrt::{ClientOptions, CpuClientOptions, load_cpu_plugin};
     #[cfg(feature = "cuda-13")]
@@ -5855,7 +5856,9 @@ mod tests {
     #[test]
     fn test_replacement_metadata_rejects_changed_invocation_contract() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let signature = XlaExecutableSignature::new(&[], &[]);
         let current = XlaInvocationMetadata {
@@ -5958,7 +5961,9 @@ mod tests {
     #[test]
     fn test_domain_zero_defaults_missing_sharding_to_replicated() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 2);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
 
@@ -5979,7 +5984,9 @@ mod tests {
     #[test]
     fn test_domain_zero_constructs_a_bufferless_logical_zero_space_array() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh);
         let array_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]));
@@ -5993,7 +6000,9 @@ mod tests {
     #[test]
     fn test_domain_one_fills_sharded_array_with_ones() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 2);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let array_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
@@ -6030,7 +6039,9 @@ mod tests {
     #[test]
     fn test_domain_identity_fast_path_rejects_attached_regions() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh);
         let array_type = ArrayType::scalar(DataType::F32);
@@ -6056,7 +6067,9 @@ mod tests {
     #[test]
     fn test_domain_accessors_return_constructor_arguments() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let cloned = domain.clone();
@@ -6072,7 +6085,9 @@ mod tests {
         use std::collections::HashMap;
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let lhs_type = ArrayType::new_static(DataType::F32, [5, 2]);
@@ -6116,7 +6131,9 @@ mod tests {
     #[test]
     fn test_eager_dimension_dispatch_runs_on_the_host_without_compilation() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh);
         let left = DimensionValue::constant(2).unwrap();
@@ -6165,7 +6182,9 @@ mod tests {
     #[test]
     fn test_compiled_dimension_from_scalar_reports_observed_bounds_failure_on_cpu() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
@@ -6210,7 +6229,9 @@ mod tests {
     #[test]
     fn test_compiled_dimension_requirements_report_the_first_same_class_failure_on_cpu() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
@@ -6291,7 +6312,9 @@ mod tests {
     #[test]
     fn test_compiled_dimension_requirement_predicates_preserve_diagnostics_on_cpu() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
@@ -6361,7 +6384,9 @@ mod tests {
     #[test]
     fn test_compiled_dimension_arithmetic_preserves_checked_host_diagnostics_on_cpu() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::I64);
@@ -6448,7 +6473,9 @@ mod tests {
         use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         ensure_print_handler_registered(&client).unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
@@ -6515,7 +6542,9 @@ mod tests {
     #[test]
     fn test_eager_mixed_shape_operations_specialize_dimensions_and_share_the_array_kernel_cache() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input = f32_vector(&client, &mesh, &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
@@ -6578,7 +6607,9 @@ mod tests {
     #[test]
     fn test_production_composite_lowering_executes_dynamic_dimension_arithmetic_broadcast_and_reshape() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(8)).unwrap());
@@ -6793,7 +6824,9 @@ mod tests {
     #[test]
     fn test_production_composite_lowering_executes_dynamic_shape_slice() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input_type = replicated_vector_type(&mesh, 6);
@@ -6852,7 +6885,9 @@ mod tests {
         use ryft_core::Sin;
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let engine = XlaDomain::with_mesh(&client, mesh.clone());
 
@@ -6923,7 +6958,9 @@ mod tests {
     #[test]
     fn test_compiled_zero_space_identity_preserves_logical_type_and_canonical_value() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input_type = ArrayType::new(DataType::Zero, Shape::new(vec![Dimension::Static(3)]))
@@ -6989,7 +7026,9 @@ mod tests {
     #[test]
     fn test_compiled_mixed_zero_space_signature_projects_and_reconstructs_logical_values() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
@@ -7068,7 +7107,9 @@ mod tests {
     #[test]
     fn test_bounded_dynamic_input_packing_cost_guard() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let declared_type = ArrayType::new(
             DataType::F32,
@@ -7174,7 +7215,9 @@ mod tests {
     #[test]
     fn test_independent_bounded_materialization_misses_share_one_issue_phase() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let declared_type = ArrayType::new(
             DataType::F32,
@@ -7246,7 +7289,9 @@ mod tests {
     #[test]
     fn test_failed_bounded_upload_batch_is_not_published_and_retries() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let declared_type = ArrayType::new(
             DataType::F32,
@@ -7328,7 +7373,9 @@ mod tests {
     #[test]
     fn test_sharded_bounded_materialization_reuses_every_device_buffer() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 4);
         let sharding = Sharding::new(mesh.logical_mesh().clone(), vec![ShardingDimension::sharded(["x"])]).unwrap();
         let declared_type = ArrayType::new(
@@ -7375,7 +7422,9 @@ mod tests {
     #[test]
     fn test_bounded_dynamic_program_executes_on_multiple_cpu_devices() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 4);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 4);
@@ -7473,7 +7522,9 @@ mod tests {
     #[test]
     fn test_internal_dynamic_tensor_behind_a_static_boundary_takes_the_replica_path() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 4);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let extent = DimensionVariable::new("extent", DimensionBounds::new(1, Some(5)).unwrap());
@@ -7569,7 +7620,9 @@ mod tests {
         }
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let scalar_i64 = replicated_scalar_type(&mesh, DataType::I64);
@@ -7688,7 +7741,9 @@ mod tests {
     #[test]
     fn test_data_derived_padding_disciplines_execute_without_observable_padding() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
@@ -7798,7 +7853,9 @@ mod tests {
     #[test]
     fn test_data_derived_scaled_dot_and_attention_execute_without_observable_padding() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
@@ -8131,7 +8188,9 @@ mod tests {
     #[test]
     fn test_data_derived_prefix_slice_executes_at_multiple_extents() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input_sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
@@ -8188,7 +8247,9 @@ mod tests {
     #[test]
     fn test_data_derived_dynamic_shape_slice_checks_runtime_input_and_result_extents() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
@@ -8254,7 +8315,9 @@ mod tests {
     #[test]
     fn test_data_derived_compilation_rejects_unbounded_and_opaque_consumers() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let size_type = replicated_scalar_type(&mesh, DataType::I64);
@@ -8437,7 +8500,9 @@ mod tests {
         }
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let function: CompiledFunctionDispatcher<XlaDomain<'_>, _, (), ArrayIrType, ArrayIrType> = try_jit_with_options(
@@ -8473,8 +8538,9 @@ mod tests {
     #[test]
     fn test_input_bound_bucketing_rejects_unsupported_signatures() {
         let plugin = load_cpu_plugin().unwrap();
-        let single_device_client =
-            plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let single_device_client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let single_device_mesh = domain_mesh(&single_device_client, "x", 1);
         let single_device_domain = XlaDomain::with_mesh(&single_device_client, single_device_mesh.clone());
         let dimension_type =
@@ -8521,8 +8587,9 @@ mod tests {
                 if reason == "external reference inputs do not support input-bound bucketing",
         ));
 
-        let multi_device_client =
-            plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let multi_device_client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
         let multi_device_mesh = domain_mesh(&multi_device_client, "x", 2);
         let multi_device_domain = XlaDomain::with_mesh(&multi_device_client, multi_device_mesh.clone());
         assert!(matches!(
@@ -8552,7 +8619,9 @@ mod tests {
     #[test]
     fn test_input_bound_bucketing_alpha_normalizes_dispatch_keys() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let options = XlaOptions::new(mesh).with_input_bound_bucketing(XlaInputBoundBucketing::PowerOfTwo);
@@ -8604,7 +8673,9 @@ mod tests {
     #[test]
     fn test_bounded_dynamic_programs_reject_shard_map_regions_before_device_count_matters() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let manual_mesh = LogicalMesh::new(vec![MeshAxis::new("x", 1, MeshAxisType::Manual).unwrap()]).unwrap();
@@ -8673,7 +8744,9 @@ mod tests {
     #[test]
     fn test_concurrent_bounded_materialization_is_single_flight() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let declared_type = ArrayType::new(
             DataType::F32,
@@ -8730,7 +8803,9 @@ mod tests {
     #[test]
     fn test_materialize_zero_space_carriers_allocate_the_bounded_physical_shape() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         // The compiled module declares the bound-shaped `[3]` argument, so a below-bound `[2]` runtime value must
@@ -8764,7 +8839,9 @@ mod tests {
     #[test]
     fn test_below_bound_zero_space_inputs_skip_the_padding_tiers_and_carry_the_bounded_shape() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let sharding = Sharding::replicated(mesh.logical_mesh().clone(), 1);
         let declared_type = ArrayType::new(
@@ -8807,7 +8884,9 @@ mod tests {
         use ryft_core::Sin;
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
@@ -8844,7 +8923,9 @@ mod tests {
         use ryft_core::StagedFunction;
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
@@ -8938,7 +9019,9 @@ mod tests {
         use tempfile::tempdir;
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -9016,7 +9099,9 @@ mod tests {
         }
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let input_type = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Static(4)]))
             .with_sharding(Sharding::replicated(mesh.logical_mesh().clone(), 1))
@@ -9073,7 +9158,9 @@ mod tests {
     #[test]
     fn test_xla_persistent_executable_rejects_malformed_and_incompatible_metadata() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let domain = XlaDomain::new(&client);
 
         assert!(matches!(
@@ -9123,7 +9210,9 @@ mod tests {
     #[test]
     fn test_eager_bind_executes_binary_operation() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = array_domain(&client);
 
@@ -9138,7 +9227,9 @@ mod tests {
     #[test]
     fn test_reference_transaction_donation_respects_effective_buffer_ownership() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let device_id = client.addressable_devices().unwrap()[0].id().unwrap();
 
@@ -9180,7 +9271,9 @@ mod tests {
         );
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let reference = ArrayIrValue::Reference(ArrayReference::new(f32_vector(&client, &mesh, &[1.0])));
@@ -9297,7 +9390,9 @@ mod tests {
     #[test]
     fn test_stage_enforces_reference_boundary_sharding_policy() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let scalar_sharding = Sharding::new(mesh.logical_mesh().clone(), Vec::new()).unwrap();
@@ -9375,7 +9470,9 @@ mod tests {
     #[test]
     fn test_xla_lowering_rejects_unsupported_external_reference_storage_classes() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let replicated = |rank| Sharding::replicated(mesh.logical_mesh().clone(), rank);
@@ -9493,7 +9590,9 @@ mod tests {
     #[test]
     fn test_xla_lowering_discharges_and_executes_local_reference_state() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
@@ -9561,7 +9660,9 @@ mod tests {
     #[test]
     fn test_xla_lowering_accumulates_slice_cotangents_into_existing_state() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let mut builder = XlaProgramBuilder::new();
@@ -9593,7 +9694,9 @@ mod tests {
     #[test]
     fn test_xla_lowering_discharges_local_index_and_slice_reference_views() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let vector_type = replicated_vector_type(&mesh, 4);
@@ -9707,7 +9810,9 @@ mod tests {
     #[test]
     fn test_xla_lowering_discharges_and_executes_a_write_through_a_reference_view() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let vector_type = replicated_vector_type(&mesh, 4);
@@ -9748,7 +9853,9 @@ mod tests {
     #[test]
     fn test_xla_lowering_executes_indexed_reference_mutation() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let vector_type = replicated_vector_type(&mesh, 3);
@@ -9835,7 +9942,9 @@ mod tests {
     #[test]
     fn test_xla_lowering_preserves_lifted_capture_scope_inside_condition_regions() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
@@ -9874,7 +9983,9 @@ mod tests {
     #[test]
     fn test_xla_lowering_validates_capture_count_before_reference_discharge() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
@@ -9894,7 +10005,9 @@ mod tests {
     #[test]
     fn test_xla_lowering_discharges_local_reference_state_through_condition() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
@@ -10004,7 +10117,9 @@ mod tests {
     #[test]
     fn test_xla_condition_recreates_reference_view_inside_branch() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let vector_type = replicated_vector_type(&mesh, 3);
@@ -10104,7 +10219,9 @@ mod tests {
     #[test]
     fn test_xla_lowering_discharges_local_reference_state_through_while() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
@@ -10161,7 +10278,9 @@ mod tests {
     #[test]
     fn test_xla_lowering_discharges_local_reference_state_through_static_scan() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
@@ -10222,7 +10341,9 @@ mod tests {
     #[test]
     fn test_xla_lowering_discharges_local_reference_state_through_dynamic_scan() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
@@ -10293,7 +10414,9 @@ mod tests {
     #[test]
     fn test_xla_lowering_discharges_local_reference_state_through_nested_jit_call() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
@@ -10349,7 +10472,9 @@ mod tests {
     #[test]
     fn test_xla_lowering_carries_external_reference_state_metadata_after_discharge() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
 
@@ -10370,7 +10495,9 @@ mod tests {
     #[test]
     fn test_xla_persistent_v6_round_trips_and_validates_external_reference_state() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
@@ -10613,7 +10740,9 @@ mod tests {
     #[test]
     fn test_xla_persistent_v6_round_trips_bounded_dynamic_read_only_reference_state() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let extent = DimensionVariable::new("state_extent", DimensionBounds::new(1, Some(5)).unwrap());
@@ -10641,7 +10770,9 @@ mod tests {
     #[test]
     fn test_xla_persistent_v6_preserves_static_sharded_reference_metadata_and_round_trips_when_supported() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 2);
         let domain = XlaDomain::new(&client);
         let state_sharding =
@@ -10695,7 +10826,9 @@ mod tests {
     #[test]
     fn test_eager_bind_executes_promoted_and_broadcast_elementwise_operations() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = array_domain(&client);
 
@@ -10735,7 +10868,9 @@ mod tests {
     #[test]
     fn test_eager_bind_executes_unary_operation() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = array_domain(&client);
 
@@ -10749,7 +10884,9 @@ mod tests {
     #[test]
     fn test_eager_fill_materializes_scalar_literal_then_broadcasts_over_a_default_mesh() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let domain = array_domain(&client);
 
         for memory in [Memory::Device, Memory::Host { pinned: true }, Memory::Host { pinned: false }] {
@@ -10786,7 +10923,9 @@ mod tests {
     #[test]
     fn test_eager_bind_reuses_cached_executable_for_repeated_operations() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = array_domain(&client);
         assert_eq!(domain.parent().cache_size(), 0);
@@ -10810,8 +10949,12 @@ mod tests {
     #[test]
     fn test_eager_bind_rejects_inputs_placed_on_a_foreign_device() {
         let plugin = load_cpu_plugin().unwrap();
-        let domain_client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
-        let foreign_client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let domain_client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
+        let foreign_client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
         let foreign_mesh = domain_mesh(&foreign_client, "x", 2);
         let domain = array_domain(&domain_client);
 
@@ -10838,7 +10981,9 @@ mod tests {
     #[test]
     fn test_eager_bind_executes_condition_with_concrete_predicate() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let vector_type = replicated_vector_type(&mesh, 4);
@@ -10885,7 +11030,9 @@ mod tests {
     #[test]
     fn test_eager_bind_condition_branches_consume_forwarded_dimension_authority() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let extent = DimensionValue::constant(3).unwrap();
@@ -10946,7 +11093,9 @@ mod tests {
     #[test]
     fn test_eager_bind_executes_bounded_while() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
@@ -10995,7 +11144,9 @@ mod tests {
     #[test]
     fn test_eager_bind_executes_elementwise_operation_on_sharded_inputs() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 2);
         let domain = array_domain(&client);
 
@@ -11033,7 +11184,9 @@ mod tests {
     #[test]
     fn test_eager_bind_clamps_unsigned_dynamic_indices_without_narrowing() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let input = ArrayIrValue::Array(f32_vector(&client, &mesh, &[1.0, 2.0, 3.0]));
@@ -11066,7 +11219,9 @@ mod tests {
         use ryft_core::ScanOperation;
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
@@ -11102,7 +11257,9 @@ mod tests {
     #[test]
     fn test_eager_bind_executes_scan_with_explicit_slice_index() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let scalar_type = ArrayType::scalar(DataType::I64);
@@ -11139,7 +11296,9 @@ mod tests {
         use ryft_core::ScanOperation;
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let scalar_type = replicated_scalar_type(&mesh, DataType::F32);
@@ -11182,7 +11341,9 @@ mod tests {
         use ryft_core::ScanOperation;
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let scalar_type = ArrayType::scalar(DataType::F32);
@@ -11219,7 +11380,9 @@ mod tests {
         use ryft_core::ScanOperation;
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 2);
         let domain = XlaDomain::new(&client);
         let scalar_type = ArrayType::scalar(DataType::F32);
@@ -11266,7 +11429,9 @@ mod tests {
         use std::sync::Arc;
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::new(&client);
         let vector_type = replicated_vector_type(&mesh, 4);
@@ -11303,7 +11468,9 @@ mod tests {
         use crate::experimental::shard_map::{FlatTracedShardMap, ShardMap};
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
         let devices = client
             .addressable_devices()
             .unwrap()
@@ -11375,7 +11542,9 @@ mod tests {
         use ryft_core::{ParallelReduceOperation, ParallelReductionKind};
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = array_domain(&client);
 
@@ -11399,7 +11568,9 @@ mod tests {
         use crate::experimental::debugging::{ensure_print_handler_registered, with_captured_prints};
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = array_domain(&client);
         assert_eq!(ensure_print_handler_registered(&client), Ok(()));
@@ -11433,7 +11604,9 @@ mod tests {
     #[test]
     fn test_eager_bind_surfaces_shape_mismatch_as_type_error() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = array_domain(&client);
 
@@ -11548,7 +11721,9 @@ mod tests {
     #[test]
     fn test_xla_lowering_preserves_provenance_locations_end_to_end() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let mesh = domain_mesh(&client, "x", 1);
         let domain = XlaDomain::with_mesh(&client, mesh.clone());
         let input_type = replicated_scalar_type(&mesh, DataType::F64);

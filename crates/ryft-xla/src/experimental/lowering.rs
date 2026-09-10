@@ -10693,7 +10693,9 @@ mod tests {
         );
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let executable = client
             .compile(
                 &PjrtProgram::Mlir { bytecode: module.into_bytes() },
@@ -10761,7 +10763,9 @@ mod tests {
         use crate::{Array, FromPjrt};
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(2), ..Default::default() }))
+            .unwrap();
         let client_devices = client.addressable_devices().unwrap();
         let mesh = DeviceMesh::new(
             LogicalMesh::new(vec![MeshAxis::new("x", 2, MeshAxisType::Explicit).unwrap()]).unwrap(),
@@ -12109,7 +12113,9 @@ mod tests {
         );
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let executable = client
             .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
             .unwrap();
@@ -12559,7 +12565,9 @@ mod tests {
         let group_sizes_dimensions =
             group_sizes_shape.dimensions().iter().map(|dimension| *dimension as u64).collect::<Vec<_>>();
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let executable = client
             .compile(&PjrtProgram::Mlir { bytecode: module.into_bytes() }, &ragged_dot_cpu_compilation_options())
             .unwrap();
@@ -12727,7 +12735,9 @@ mod tests {
 
         let module = lowered_ragged_dot_module(RaggedDotLoweringStrategy::Instruction).unwrap();
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         assert!(matches!(
             client.compile(
                 &PjrtProgram::Mlir { bytecode: module.into_bytes() },
@@ -16707,7 +16717,9 @@ mod tests {
         use crate::{Array, CompiledXlaFunction, FromPjrt, compile};
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         ensure_print_handler_registered(&client).unwrap();
         let device = Device::from_pjrt(&client.addressable_devices().unwrap()[0]).unwrap();
         let mesh = DeviceMesh::new(
@@ -16810,7 +16822,9 @@ mod tests {
             to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         ensure_print_handler_registered(&client).unwrap();
         let options = CompilationOptions {
             argument_layouts: Vec::new(),
@@ -16938,7 +16952,9 @@ mod tests {
             to_mlir_module_for_program(&program, &[], &input_types, &output_types, "main", None, None).unwrap();
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let options = CompilationOptions {
             argument_layouts: Vec::new(),
             parameter_is_tupled_arguments: false,
@@ -18243,7 +18259,9 @@ mod tests {
         }
 
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         let executable = client
             .compile(
                 &PjrtProgram::Mlir { bytecode: module.into_bytes() },

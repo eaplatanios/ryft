@@ -338,7 +338,9 @@ mod tests {
     #[test]
     fn test_print_custom_call_executes_on_cpu() {
         let plugin = load_cpu_plugin().unwrap();
-        let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) })).unwrap();
+        let client = plugin
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))
+            .unwrap();
         assert_eq!(ensure_print_handler_registered(&client), Ok(()));
         // Registration is idempotent.
         assert_eq!(ensure_print_handler_registered(&client), Ok(()));

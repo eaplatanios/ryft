@@ -476,8 +476,10 @@ mod tests {
         (|$plugin:ident, $client:ident, $platform:ident| $body:block) => {{
             {
                 let $plugin = $crate::tests::test_cpu_plugin();
-                let $client =
-                    $plugin.client($crate::ClientOptions::CPU($crate::CpuClientOptions { device_count: Some(8) }));
+                let $client = $plugin.client($crate::ClientOptions::CPU($crate::CpuClientOptions {
+                    device_count: Some(8),
+                    ..Default::default()
+                }));
                 let $client = $client.expect("failed to create a PJRT CPU client");
                 let $platform = $crate::tests::TestPlatform::Cpu;
                 $body
@@ -572,7 +574,7 @@ mod tests {
 
     pub(crate) fn test_cpu_client() -> Client<'static> {
         test_cpu_plugin()
-            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(8) }))
+            .client(ClientOptions::CPU(CpuClientOptions { device_count: Some(8), ..Default::default() }))
             .expect("failed to create a PJRT CPU client")
     }
 

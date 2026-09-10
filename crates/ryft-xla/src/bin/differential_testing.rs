@@ -200,7 +200,7 @@ fn execute_collective_module(
 /// Creates the CPU client, logical-to-physical mesh, and sharding shared by collective emitters.
 fn collective_runtime() -> Result<(Client<'static>, DeviceMesh, Sharding), Box<dyn Error>> {
     let plugin = load_cpu_plugin()?;
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4) }))?;
+    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(4), ..Default::default() }))?;
     let client_devices = client.addressable_devices()?;
     let devices = client_devices.iter().map(Device::from_pjrt).collect::<Result<Vec<_>, _>>()?;
     let mesh = collective_mesh();

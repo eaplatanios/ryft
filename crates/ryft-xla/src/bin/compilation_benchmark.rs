@@ -234,7 +234,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let plugin = load_cpu_plugin()?;
-    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1) }))?;
+    let client = plugin.client(ClientOptions::CPU(CpuClientOptions { device_count: Some(1), ..Default::default() }))?;
     let mesh = mesh(&client)?;
     let r#type = input_type(&mesh, arguments.size)?;
     let input = input_array(&client, &mesh, r#type.clone(), arguments.size)?;
