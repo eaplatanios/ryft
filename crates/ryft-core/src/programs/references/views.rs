@@ -540,9 +540,111 @@ impl<View: ReferenceView> ReferenceViewAnalysis<View> {
         region: RegionRef<'_, V, O>,
         arguments: &ReferenceAnalysisTransformArguments,
     ) -> Result<Self, ReferenceViewAnalysisError> {
+        // Reuse structural analysis to establish roots, alias edges, and valid reference lifetimes before building
+        // the view paths. It also guarantees that following alias sources cannot form a cycle.
         let analysis = region.reference_analysis_impl(arguments)?;
-        let mut paths = BTreeMap::new();
-        analysis.values().try_for_each(|value| Self::derive_path(region, &analysis, &mut paths, value))?;
+        let mut paths: BTreeMap<ValueId, ReferenceViewPath<View>> = BTreeMap::new();
+        for value in analysis.values() {
+            // Atom identifiers need not follow dependency order. Follow unresolved alias sources until reaching a root
+            // or an existing path, then process the collected values in reverse. This avoids recursion for long alias
+            // chains and lets each value reuse the path already recorded for its source.
+            let mut pending = Vec::new();
+            let mut source = value;
+            while !paths.contains_key(&source) {
+                pending.push(source);
+                let Some(edge) = analysis.alias(source) else {
+                    break;
+                };
+                source = edge.source();
+            }
+
+            // Sources are installed first, so each alias can copy its source path without another traversal.
+            for value in pending.into_iter().rev() {
+                let path = match analysis.alias(value) {
+                    None => {
+                        // A value without an alias edge denotes the complete reference.
+                        ReferenceViewPath::root()
+                    }
+                    Some(edge) => {
+                        // Identity aliases retain the source path while view aliases append their own view.
+                        let mut path = paths[&edge.source()].clone();
+                        if edge.kind() == ReferenceAliasKind::View {
+                            let id = edge.instruction();
+                            let output_index = edge.output_index();
+                            let source = edge.source();
+
+                            // Structural analysis resolved both values and the instruction before recording this edge.
+                            let current = region.with_id(id.region()).unwrap();
+                            let instruction = &current.instructions()[id.index()];
+                            let operation = instruction.operation();
+                            let name = operation.name();
+
+                            // Every declared view alias must supply a view before its types
+                            // or symbolic inputs can be checked.
+                            let view = operation.reference_view(output_index).ok_or(
+                                ReferenceViewAnalysisError::MissingView {
+                                    operation: name,
+                                    instruction: id,
+                                    output_index,
+                                },
+                            )?;
+
+                            // Check that applying the view to its source produces the reference type
+                            // declared by this output.
+                            let atoms = current.atoms();
+                            O::validate_reference_view(
+                                &view,
+                                current.atoms()[source.atom().index()].r#type().as_ref(),
+                                region.with_id(value.region()).unwrap().atoms()[value.atom().index()].r#type().as_ref(),
+                            )
+                            .map_err(|source| ReferenceViewAnalysisError::InvalidView {
+                                operation: name,
+                                instruction: id,
+                                output_index,
+                                source,
+                            })?;
+
+                            // Resolve each symbolic input position to the ordinary program value supplied to this
+                            // instruction. A reference cannot supply a scalar index; the operation family validates
+                            // the remaining index type rules.
+                            let inputs = instruction.inputs();
+                            let bindings = view
+                                .symbols()
+                                .into_iter()
+                                .map(|input_index| {
+                                    let Some(atom) = inputs.get(input_index) else {
+                                        return Err(ReferenceViewAnalysisError::InvalidViewSymbol {
+                                            operation: name,
+                                            instruction: id,
+                                            output_index,
+                                            symbol: input_index,
+                                            message: format!("the instruction has only {} inputs", inputs.len()),
+                                        });
+                                    };
+                                    if atoms[atom.index()].r#type().is_reference() {
+                                        return Err(ReferenceViewAnalysisError::InvalidViewSymbol {
+                                            operation: name,
+                                            instruction: id,
+                                            output_index,
+                                            symbol: input_index,
+                                            message: "that input is a reference rather than an index value".to_string(),
+                                        });
+                                    }
+                                    Ok(ValueId::new(id.region(), *atom))
+                                })
+                                .collect::<Result<Vec<_>, ReferenceViewAnalysisError>>()?;
+
+                            // Record the validated view and its bindings after the source's steps.
+                            path.steps.push(ReferenceViewStep { view, bindings });
+                        }
+                        path
+                    }
+                };
+
+                paths.insert(value, path);
+            }
+        }
+
         Ok(Self { analysis, paths })
     }
 
@@ -608,100 +710,6 @@ impl<View: ReferenceView> ReferenceViewAnalysis<View> {
         };
         let root_type = current.atoms().get(atom.index())?.r#type();
         Some(self.paths[&a].overlap(&self.paths[&b], root_type.as_ref()))
-    }
-
-    /// Derives the path of `value`, recording each unresolved alias source before its dependent value. Instruction
-    /// order guarantees acyclic aliases, but atom identifiers need not follow that order, so an explicit worklist
-    /// avoids recursion proportional to the length of a valid alias chain.
-    fn derive_path<V: Value, O: ReferenceViewOperation<Type = V::Type, View = View>>(
-        region: RegionRef<'_, V, O>,
-        analysis: &ReferenceAnalysis,
-        paths: &mut BTreeMap<ValueId, ReferenceViewPath<View>>,
-        value: ValueId,
-    ) -> Result<(), ReferenceViewAnalysisError> {
-        let mut pending = Vec::new();
-        let mut source = value;
-        while !paths.contains_key(&source) {
-            pending.push(source);
-            let Some(edge) = analysis.alias(source) else {
-                break;
-            };
-            source = edge.source();
-        }
-        // Sources are installed first, so each alias can copy its source path without another traversal.
-        for value in pending.into_iter().rev() {
-            let path = match analysis.alias(value) {
-                None => ReferenceViewPath::root(),
-                Some(edge) => {
-                    let mut path = paths[&edge.source()].clone();
-                    if edge.kind() == ReferenceAliasKind::View {
-                        path.steps.push(Self::derive_view_step(
-                            region,
-                            edge.instruction(),
-                            edge.output_index(),
-                            edge.source(),
-                            value,
-                        )?);
-                    }
-                    path
-                }
-            };
-            paths.insert(value, path);
-        }
-        Ok(())
-    }
-
-    /// Validates one view against its source and result reference types, then binds each symbol to the describing
-    /// instruction's input value.
-    fn derive_view_step<V: Value, O: ReferenceViewOperation<Type = V::Type, View = View>>(
-        region: RegionRef<'_, V, O>,
-        id: InstructionId,
-        output_index: usize,
-        source: ValueId,
-        value: ValueId,
-    ) -> Result<ReferenceViewStep<View>, ReferenceViewAnalysisError> {
-        // Structural analysis resolved both values and the instruction before recording this edge.
-        let current = region.with_id(id.region()).unwrap();
-        let instruction = &current.instructions()[id.index()];
-        let operation = instruction.operation();
-        let name = operation.name();
-        let view = operation.reference_view(output_index).ok_or(ReferenceViewAnalysisError::MissingView {
-            operation: name,
-            instruction: id,
-            output_index,
-        })?;
-        let atoms = current.atoms();
-        let source_type = atoms[source.atom().index()].r#type();
-        let output_type = region.with_id(value.region()).unwrap().atoms()[value.atom().index()].r#type();
-        O::validate_reference_view(&view, source_type.as_ref(), output_type.as_ref()).map_err(|source| {
-            ReferenceViewAnalysisError::InvalidView { operation: name, instruction: id, output_index, source }
-        })?;
-        // Resolve each symbolic input position to the ordinary program value supplied to this instruction.
-        // A reference cannot supply a scalar index; the operation family validates the remaining index type rules.
-        let inputs = instruction.inputs();
-        let mut bindings = Vec::new();
-        for input_index in view.symbols() {
-            let Some(atom) = inputs.get(input_index) else {
-                return Err(ReferenceViewAnalysisError::InvalidViewSymbol {
-                    operation: name,
-                    instruction: id,
-                    output_index,
-                    symbol: input_index,
-                    message: format!("the instruction has only {} inputs", inputs.len()),
-                });
-            };
-            if atoms[atom.index()].r#type().is_reference() {
-                return Err(ReferenceViewAnalysisError::InvalidViewSymbol {
-                    operation: name,
-                    instruction: id,
-                    output_index,
-                    symbol: input_index,
-                    message: "that input is a reference rather than an index value".to_string(),
-                });
-            }
-            bindings.push(ValueId::new(id.region(), *atom));
-        }
-        Ok(ReferenceViewStep { view, bindings })
     }
 }
 
