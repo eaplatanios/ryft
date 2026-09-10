@@ -121,10 +121,10 @@ pub fn rng<
 ) -> Result<DetachedRngOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.rng", location)
-        .add_operand(a)
-        .add_operand(b)
-        .add_operand(shape)
-        .add_attribute(RNG_DISTRIBUTION_ATTRIBUTE, distribution.try_into_with_context(location.context())?)
+        .add_operand(a)?
+        .add_operand(b)?
+        .add_operand(shape)?
+        .add_attribute(RNG_DISTRIBUTION_ATTRIBUTE, distribution.try_into_with_context(location.context())?)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -198,10 +198,10 @@ pub fn rng_bit_generator<
 ) -> Result<DetachedRngBitGeneratorOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.rng_bit_generator", location)
-        .add_operand(state)
-        .add_attribute(RNG_ALGORITHM_ATTRIBUTE, algorithm.try_into_with_context(location.context())?)
-        .add_result(state.r#type()?)
-        .add_result(output_type)
+        .add_operand(state)?
+        .add_attribute(RNG_ALGORITHM_ATTRIBUTE, algorithm.try_into_with_context(location.context())?)?
+        .add_result(state.r#type()?)?
+        .add_result(output_type)?
         .build()
         .and_then(|operation| unsafe {
             operation

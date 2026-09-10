@@ -86,13 +86,13 @@ macro_rules! gpu_dimension_operation {
                 let context = location.context();
                 context.load_dialect(DialectHandle::gpu()?)?;
                 let builder = OperationBuilder::new($operation_name, location)
-                    .add_attribute(DIMENSION_ATTRIBUTE, context.gpu_dimension_attribute(dimension)?)
-                    .add_result(context.index_type());
+                    .add_attribute(DIMENSION_ATTRIBUTE, context.gpu_dimension_attribute(dimension)?)?
+                    .add_result(context.index_type())?;
                 let builder = if let Some(upper_bound) = upper_bound {
                     builder.add_attribute(
                         UPPER_BOUND_ATTRIBUTE,
                         context.integer_attribute(context.index_type(), upper_bound as i64),
-                    )
+                    )?
                 } else {
                     builder
                 };
@@ -143,12 +143,12 @@ macro_rules! gpu_upper_bound_index_operation {
             ) -> Result<[<Detached $name Operation>]<'c, 't>, Error> {
                 let context = location.context();
                 context.load_dialect(DialectHandle::gpu()?)?;
-                let builder = OperationBuilder::new($operation_name, location).add_result(context.index_type());
+                let builder = OperationBuilder::new($operation_name, location).add_result(context.index_type())?;
                 let builder = if let Some(upper_bound) = upper_bound {
                     builder.add_attribute(
                         UPPER_BOUND_ATTRIBUTE,
                         context.integer_attribute(context.index_type(), upper_bound as i64),
-                    )
+                    )?
                 } else {
                     builder
                 };
@@ -377,33 +377,33 @@ pub fn func<'c, 't: 'c, N: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't>
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.func", location)
-        .add_attribute(SYMBOL_NAME_ATTRIBUTE, name.try_into_with_context(context)?)
+        .add_attribute(SYMBOL_NAME_ATTRIBUTE, name.try_into_with_context(context)?)?
         .add_attribute(
             FUNCTION_TYPE_ATTRIBUTE,
             context.type_attribute(context.function_type(&properties.arguments, &properties.results)),
-        );
+        )?;
     if properties.is_kernel {
-        builder = builder.add_attribute(KERNEL_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(KERNEL_ATTRIBUTE, context.unit_attribute())?;
     }
     if let Some(known_block_size) = properties.known_block_size {
         builder =
-            builder.add_attribute(KNOWN_BLOCK_SIZE_ATTRIBUTE, context.dense_i32_array_attribute(&known_block_size)?);
+            builder.add_attribute(KNOWN_BLOCK_SIZE_ATTRIBUTE, context.dense_i32_array_attribute(&known_block_size)?)?;
     }
     if let Some(known_grid_size) = properties.known_grid_size {
         builder =
-            builder.add_attribute(KNOWN_GRID_SIZE_ATTRIBUTE, context.dense_i32_array_attribute(&known_grid_size)?);
+            builder.add_attribute(KNOWN_GRID_SIZE_ATTRIBUTE, context.dense_i32_array_attribute(&known_grid_size)?)?;
     }
     if let Some(known_cluster_size) = properties.known_cluster_size {
         builder = builder
-            .add_attribute(KNOWN_CLUSTER_SIZE_ATTRIBUTE, context.dense_i32_array_attribute(&known_cluster_size)?);
+            .add_attribute(KNOWN_CLUSTER_SIZE_ATTRIBUTE, context.dense_i32_array_attribute(&known_cluster_size)?)?;
     }
     if properties.workgroup_attribution_count > 0 {
         builder = builder.add_attribute(
             WORKGROUP_ATTRIBUTIONS_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), properties.workgroup_attribution_count as i64),
-        );
+        )?;
     }
-    builder.add_region(body).build().and_then(|operation| unsafe {
+    builder.add_region(body)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::func`"))
     })
 }
@@ -429,7 +429,7 @@ pub fn dynamic_shared_memory<'c, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedDynamicSharedMemoryOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.dynamic_shared_memory", location)
-        .add_result(memref_type)
+        .add_result(memref_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -614,22 +614,22 @@ pub fn launch_func<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
         usize::from(properties.async_object.is_some()),
     ];
     let mut builder = OperationBuilder::new("gpu.launch_func", location)
-        .add_operands(properties.async_dependencies.as_slice())
-        .add_attribute(KERNEL_ATTRIBUTE, properties.kernel)
-        .add_operands(properties.grid_size.values().as_slice())
-        .add_operands(properties.block_size.values().as_slice());
+        .add_operands(properties.async_dependencies.as_slice())?
+        .add_attribute(KERNEL_ATTRIBUTE, properties.kernel)?
+        .add_operands(properties.grid_size.values().as_slice())?
+        .add_operands(properties.block_size.values().as_slice())?;
     if let Some(cluster_size) = cluster_size {
-        builder = builder.add_operands(cluster_size.as_slice());
+        builder = builder.add_operands(cluster_size.as_slice())?;
     }
     if let Some(dynamic_shared_memory_size) = properties.dynamic_shared_memory_size {
-        builder = builder.add_operand(dynamic_shared_memory_size);
+        builder = builder.add_operand(dynamic_shared_memory_size)?;
     }
-    builder = builder.add_operands(properties.kernel_operands.as_slice());
+    builder = builder.add_operands(properties.kernel_operands.as_slice())?;
     if let Some(async_object) = properties.async_object {
-        builder = builder.add_operand(async_object);
+        builder = builder.add_operand(async_object)?;
     }
     if properties.is_async {
-        builder = builder.add_result(context.gpu_async_token_type()?);
+        builder = builder.add_result(context.gpu_async_token_type()?)?;
     }
     if !properties.is_async {
         segment_sizes[12] = usize::from(properties.async_object.is_some());
@@ -637,7 +637,7 @@ pub fn launch_func<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let segment_sizes = segment_sizes.iter().map(|size| *size as i32).collect::<Vec<_>>();
     let segment_sizes = context.dense_i32_array_attribute(segment_sizes.as_slice())?;
     builder
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, segment_sizes)
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, segment_sizes)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::launch_func`"))
@@ -853,41 +853,41 @@ pub fn launch<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
         usize::from(properties.async_object.is_some()),
     ];
     let mut builder = OperationBuilder::new("gpu.launch", location)
-        .add_operands(properties.async_dependencies.as_slice())
-        .add_operands(properties.grid_size.values().as_slice())
-        .add_operands(properties.block_size.values().as_slice());
+        .add_operands(properties.async_dependencies.as_slice())?
+        .add_operands(properties.grid_size.values().as_slice())?
+        .add_operands(properties.block_size.values().as_slice())?;
     if let Some(cluster_size) = cluster_size {
-        builder = builder.add_operands(cluster_size.as_slice());
+        builder = builder.add_operands(cluster_size.as_slice())?;
     }
     if let Some(dynamic_shared_memory_size) = properties.dynamic_shared_memory_size {
-        builder = builder.add_operand(dynamic_shared_memory_size);
+        builder = builder.add_operand(dynamic_shared_memory_size)?;
     }
     if let Some(async_object) = properties.async_object {
-        builder = builder.add_operand(async_object);
+        builder = builder.add_operand(async_object)?;
     }
     if properties.cooperative {
-        builder = builder.add_attribute("cooperative", context.unit_attribute());
+        builder = builder.add_attribute("cooperative", context.unit_attribute())?;
     }
     if let Some(module) = properties.module {
-        builder = builder.add_attribute(MODULE_ATTRIBUTE, module);
+        builder = builder.add_attribute(MODULE_ATTRIBUTE, module)?;
     }
     if let Some(function) = properties.function {
-        builder = builder.add_attribute(FUNCTION_ATTRIBUTE, function);
+        builder = builder.add_attribute(FUNCTION_ATTRIBUTE, function)?;
     }
     if let Some(workgroup_attributions) = properties.workgroup_attributions {
         builder = builder.add_attribute(
             WORKGROUP_ATTRIBUTIONS_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), workgroup_attributions as i64),
-        );
+        )?;
     }
     if properties.is_async {
-        builder = builder.add_result(context.gpu_async_token_type()?);
+        builder = builder.add_result(context.gpu_async_token_type()?)?;
     }
     let segment_sizes = segment_sizes.iter().map(|size| *size as i32).collect::<Vec<_>>();
     let segment_sizes = context.dense_i32_array_attribute(segment_sizes.as_slice())?;
     builder
-        .add_region(body)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, segment_sizes)
+        .add_region(body)?
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, segment_sizes)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::launch`"))
@@ -923,8 +923,8 @@ pub fn printf<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.printf", location)
-        .add_attribute(FORMAT_ATTRIBUTE, context.string_attribute(format))
-        .add_operands(arguments)
+        .add_attribute(FORMAT_ATTRIBUTE, context.string_attribute(format))?
+        .add_operands(arguments)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::printf`"))
@@ -953,7 +953,7 @@ pub fn r#return<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedReturnOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.return", location)
-        .add_operands(values)
+        .add_operands(values)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::return`"))
@@ -1000,7 +1000,7 @@ pub fn r#yield<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedYieldOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.yield", location)
-        .add_operands(values)
+        .add_operands(values)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::yield`"))
@@ -1069,14 +1069,15 @@ pub fn all_reduce<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>
 ) -> Result<DetachedAllReduceOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
-    let mut builder = OperationBuilder::new("gpu.all_reduce", location).add_operand(value).add_result(result_type);
+    let mut builder = OperationBuilder::new("gpu.all_reduce", location).add_operand(value)?.add_result(result_type)?;
     if let Some(operation_kind) = operation_kind {
-        builder = builder.add_attribute(OP_ATTRIBUTE, context.gpu_all_reduce_operation_kind_attribute(operation_kind)?);
+        builder =
+            builder.add_attribute(OP_ATTRIBUTE, context.gpu_all_reduce_operation_kind_attribute(operation_kind)?)?;
     }
     if is_uniform {
-        builder = builder.add_attribute(UNIFORM_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(UNIFORM_ATTRIBUTE, context.unit_attribute())?;
     }
-    builder.add_region(body).build().and_then(|operation| unsafe {
+    builder.add_region(body)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::all_reduce`"))
     })
 }
@@ -1146,21 +1147,21 @@ pub fn subgroup_reduce<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c,
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.subgroup_reduce", location)
-        .add_operand(value)
-        .add_attribute(OP_ATTRIBUTE, context.gpu_all_reduce_operation_kind_attribute(operation_kind)?)
+        .add_operand(value)?
+        .add_attribute(OP_ATTRIBUTE, context.gpu_all_reduce_operation_kind_attribute(operation_kind)?)?
         .add_attribute(
             CLUSTER_STRIDE_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(32), cluster_stride as i64),
-        )
-        .add_result(value.r#type()?);
+        )?
+        .add_result(value.r#type()?)?;
     if is_uniform {
-        builder = builder.add_attribute(UNIFORM_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(UNIFORM_ATTRIBUTE, context.unit_attribute())?;
     }
     if let Some(cluster_size) = cluster_size {
         builder = builder.add_attribute(
             CLUSTER_SIZE_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(32), cluster_size as i64),
-        );
+        )?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -1239,12 +1240,12 @@ pub fn shuffle<
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.shuffle", location)
-        .add_operand(value)
-        .add_operand(offset)
-        .add_operand(width)
-        .add_attribute(MODE_ATTRIBUTE, context.gpu_shuffle_mode_attribute(mode)?)
-        .add_result(value.r#type()?)
-        .add_result(context.signless_integer_type(1))
+        .add_operand(value)?
+        .add_operand(offset)?
+        .add_operand(width)?
+        .add_attribute(MODE_ATTRIBUTE, context.gpu_shuffle_mode_attribute(mode)?)?
+        .add_result(value.r#type()?)?
+        .add_result(context.signless_integer_type(1))?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::shuffle`"))
@@ -1299,11 +1300,11 @@ pub fn rotate<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.rotate", location)
-        .add_operand(value)
-        .add_attribute(OFFSET_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), offset as i64))
-        .add_attribute(WIDTH_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), width as i64))
-        .add_result(value.r#type()?)
-        .add_result(context.signless_integer_type(1))
+        .add_operand(value)?
+        .add_attribute(OFFSET_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), offset as i64))?
+        .add_attribute(WIDTH_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), width as i64))?
+        .add_result(value.r#type()?)?
+        .add_result(context.signless_integer_type(1))?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::rotate`"))
@@ -1351,7 +1352,8 @@ pub fn barrier<'c, 't: 'c, L: Location<'c, 't>>(
             .iter()
             .map(|address_space| Ok(context.gpu_address_space_attribute(*address_space)?.as_ref()))
             .collect::<Result<Vec<_>, Error>>()?;
-        builder = builder.add_attribute(ADDRESS_SPACES_ATTRIBUTE, context.array_attribute(address_spaces.as_slice()));
+        builder =
+            builder.add_attribute(ADDRESS_SPACES_ATTRIBUTE, context.array_attribute(address_spaces.as_slice()))?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::barrier`"))
@@ -1403,14 +1405,14 @@ pub fn module<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.module", location)
-        .add_attribute(crate::SYMBOL_NAME_ATTRIBUTE, context.string_attribute(name));
+        .add_attribute(crate::SYMBOL_NAME_ATTRIBUTE, context.string_attribute(name))?;
     if let Some(targets) = targets {
-        builder = builder.add_attribute(TARGETS_ATTRIBUTE, targets);
+        builder = builder.add_attribute(TARGETS_ATTRIBUTE, targets)?;
     }
     if let Some(offloading_handler) = offloading_handler {
-        builder = builder.add_attribute(OFFLOADING_HANDLER_ATTRIBUTE, offloading_handler);
+        builder = builder.add_attribute(OFFLOADING_HANDLER_ATTRIBUTE, offloading_handler)?;
     }
-    builder.add_region(body).build().and_then(|operation| unsafe {
+    builder.add_region(body)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::module`"))
     })
 }
@@ -1447,10 +1449,10 @@ pub fn binary<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.binary", location)
-        .add_attribute(crate::SYMBOL_NAME_ATTRIBUTE, context.string_attribute(name))
-        .add_attribute(OBJECTS_ATTRIBUTE, objects);
+        .add_attribute(crate::SYMBOL_NAME_ATTRIBUTE, context.string_attribute(name))?
+        .add_attribute(OBJECTS_ATTRIBUTE, objects)?;
     if let Some(offloading_handler) = offloading_handler {
-        builder = builder.add_attribute(OFFLOADING_HANDLER_ATTRIBUTE, offloading_handler);
+        builder = builder.add_attribute(OFFLOADING_HANDLER_ATTRIBUTE, offloading_handler)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::binary`"))
@@ -1481,7 +1483,7 @@ macro_rules! gpu_one_memref_operand_operation {
             ) -> Result<[<Detached $name Operation>]<'c, 't>, Error> {
                 location.context().load_dialect(DialectHandle::gpu()?)?;
                 OperationBuilder::new($operation_name, location)
-                    .add_operand(value)
+                    .add_operand(value)?
                     .build()
                     .and_then(|operation| unsafe {
                         operation.cast().ok_or_else(|| {
@@ -1538,9 +1540,9 @@ pub fn wait<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedWaitOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
-    let mut builder = OperationBuilder::new("gpu.wait", location).add_operands(async_dependencies);
+    let mut builder = OperationBuilder::new("gpu.wait", location).add_operands(async_dependencies)?;
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type()?);
+        builder = builder.add_result(context.gpu_async_token_type()?)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::wait`"))
@@ -1605,15 +1607,15 @@ pub fn alloc<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.alloc", location)
-        .add_operands(async_dependencies)
-        .add_operands(dynamic_sizes)
-        .add_operands(symbol_operands)
-        .add_result(memref_type);
+        .add_operands(async_dependencies)?
+        .add_operands(dynamic_sizes)?
+        .add_operands(symbol_operands)?
+        .add_result(memref_type)?;
     if host_shared {
-        builder = builder.add_attribute(HOST_SHARED_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(HOST_SHARED_ATTRIBUTE, context.unit_attribute())?;
     }
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type()?);
+        builder = builder.add_result(context.gpu_async_token_type()?)?;
     }
     let segment_sizes = [async_dependencies.len(), dynamic_sizes.len(), symbol_operands.len()]
         .iter()
@@ -1621,7 +1623,7 @@ pub fn alloc<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
         .collect::<Vec<_>>();
     let segment_sizes = context.dense_i32_array_attribute(segment_sizes.as_slice())?;
     builder
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, segment_sizes)
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, segment_sizes)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::alloc`"))
@@ -1710,10 +1712,11 @@ pub fn dealloc<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedDeallocOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
-    let mut builder =
-        OperationBuilder::new("gpu.dealloc", location).add_operands(async_dependencies).add_operand(memref);
+    let mut builder = OperationBuilder::new("gpu.dealloc", location)
+        .add_operands(async_dependencies)?
+        .add_operand(memref)?;
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type()?);
+        builder = builder.add_result(context.gpu_async_token_type()?)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::dealloc`"))
@@ -1731,11 +1734,11 @@ pub fn memcpy<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.memcpy", location)
-        .add_operands(async_dependencies)
-        .add_operand(destination)
-        .add_operand(source);
+        .add_operands(async_dependencies)?
+        .add_operand(destination)?
+        .add_operand(source)?;
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type()?);
+        builder = builder.add_result(context.gpu_async_token_type()?)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::memcpy`"))
@@ -1753,11 +1756,11 @@ pub fn memset<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.memset", location)
-        .add_operands(async_dependencies)
-        .add_operand(destination)
-        .add_operand(value);
+        .add_operands(async_dependencies)?
+        .add_operand(destination)?
+        .add_operand(value)?;
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type()?);
+        builder = builder.add_result(context.gpu_async_token_type()?)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::memset`"))
@@ -1783,7 +1786,7 @@ pub fn set_default_device<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<
 ) -> Result<DetachedSetDefaultDeviceOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.set_default_device", location)
-        .add_operand(device_index)
+        .add_operand(device_index)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1843,12 +1846,12 @@ pub fn subgroup_mma_load_matrix<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.subgroup_mma_load_matrix", location)
-        .add_operand(source_memref)
-        .add_operands(indices)
-        .add_attribute(LEAD_DIMENSION_ATTRIBUTE, context.integer_attribute(context.index_type(), lead_dimension))
-        .add_result(result_type);
+        .add_operand(source_memref)?
+        .add_operands(indices)?
+        .add_attribute(LEAD_DIMENSION_ATTRIBUTE, context.integer_attribute(context.index_type(), lead_dimension))?
+        .add_result(result_type)?;
     if transpose {
-        builder = builder.add_attribute(TRANSPOSE_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(TRANSPOSE_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -1901,12 +1904,12 @@ pub fn subgroup_mma_store_matrix<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.subgroup_mma_store_matrix", location)
-        .add_operand(source)
-        .add_operand(destination_memref)
-        .add_operands(indices)
-        .add_attribute(LEAD_DIMENSION_ATTRIBUTE, context.integer_attribute(context.index_type(), lead_dimension));
+        .add_operand(source)?
+        .add_operand(destination_memref)?
+        .add_operands(indices)?
+        .add_attribute(LEAD_DIMENSION_ATTRIBUTE, context.integer_attribute(context.index_type(), lead_dimension))?;
     if transpose {
-        builder = builder.add_attribute(TRANSPOSE_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(TRANSPOSE_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -1972,15 +1975,15 @@ pub fn subgroup_mma_compute<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c,
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.subgroup_mma_compute", location)
-        .add_operand(a)
-        .add_operand(b)
-        .add_operand(c)
-        .add_result(result_type);
+        .add_operand(a)?
+        .add_operand(b)?
+        .add_operand(c)?
+        .add_result(result_type)?;
     if a_transpose {
-        builder = builder.add_attribute(A_TRANSPOSE_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(A_TRANSPOSE_ATTRIBUTE, context.unit_attribute())?;
     }
     if b_transpose {
-        builder = builder.add_attribute(B_TRANSPOSE_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(B_TRANSPOSE_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -2016,8 +2019,8 @@ pub fn subgroup_mma_constant_matrix<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Loca
 ) -> Result<DetachedSubgroupMmaConstantMatrixOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.subgroup_mma_constant_matrix", location)
-        .add_operand(value)
-        .add_result(result_type)
+        .add_operand(value)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -2058,9 +2061,9 @@ pub fn subgroup_mma_extract_thread_local<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L:
 ) -> Result<DetachedSubgroupMmaExtractThreadLocalOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.subgroup_mma_extract_thread_local", location)
-        .add_operand(matrix)
-        .add_operands(indices)
-        .add_result(result_type)
+        .add_operand(matrix)?
+        .add_operands(indices)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -2107,10 +2110,10 @@ pub fn subgroup_mma_insert_thread_local<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: 
 ) -> Result<DetachedSubgroupMmaInsertThreadLocalOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.subgroup_mma_insert_thread_local", location)
-        .add_operand(value)
-        .add_operand(matrix)
-        .add_operands(indices)
-        .add_result(result_type)
+        .add_operand(value)?
+        .add_operand(matrix)?
+        .add_operands(indices)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -2164,9 +2167,9 @@ pub fn subgroup_mma_elementwise<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.subgroup_mma_elementwise", location)
-        .add_operands(arguments)
-        .add_attribute(OP_TYPE_ATTRIBUTE, context.gpu_mma_elementwise_operation_attribute(operation)?)
-        .add_result(result_type)
+        .add_operands(arguments)?
+        .add_attribute(OP_TYPE_ATTRIBUTE, context.gpu_mma_elementwise_operation_attribute(operation)?)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -2228,10 +2231,10 @@ macro_rules! gpu_sparse_async_operation {
             ) -> Result<[<Detached $name Operation>]<'c, 't>, Error> {
                 let context = location.context();
                 context.load_dialect(DialectHandle::gpu()?)?;
-                let mut builder = OperationBuilder::new($operation_name, location).add_operands(async_dependencies);
-                $(builder = builder.add_operand($method);)*
+                let mut builder = OperationBuilder::new($operation_name, location).add_operands(async_dependencies)?;
+                $(builder = builder.add_operand($method)?;)*
                 if is_async {
-                    builder = builder.add_result(context.gpu_async_token_type()?);
+                    builder = builder.add_result(context.gpu_async_token_type()?)?;
                 }
                 builder.build().and_then(|operation| unsafe {
                     operation.cast().ok_or_else(|| {
@@ -2304,11 +2307,11 @@ macro_rules! gpu_sparse_create_sp_mat_operation {
                 let context = location.context();
                 context.load_dialect(DialectHandle::gpu()?)?;
                 let mut builder = OperationBuilder::new($operation_name, location)
-                    .add_operands(async_dependencies)
-                    $(.add_operand($method))+
-                    .add_result(context.gpu_sparse_sp_mat_handle_type()?);
+                    .add_operands(async_dependencies)?
+                    $(.add_operand($method)?)+
+                    .add_result(context.gpu_sparse_sp_mat_handle_type()?)?;
                 if is_async {
-                    builder = builder.add_result(context.gpu_async_token_type()?);
+                    builder = builder.add_result(context.gpu_async_token_type()?)?;
                 }
                 builder.build().and_then(|operation| unsafe {
                     operation.cast().ok_or_else(|| {
@@ -2378,16 +2381,16 @@ pub fn create_dn_tensor<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.create_dn_tensor", location)
-        .add_operands(async_dependencies)
-        .add_operand(memref)
-        .add_operands(dimensions)
+        .add_operands(async_dependencies)?
+        .add_operand(memref)?
+        .add_operands(dimensions)?
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
             context.dense_i32_array_attribute(&[async_dependencies.len() as i32, 1, dimensions.len() as i32])?,
-        )
-        .add_result(context.gpu_sparse_dn_tensor_handle_type()?);
+        )?
+        .add_result(context.gpu_sparse_dn_tensor_handle_type()?)?;
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type()?);
+        builder = builder.add_result(context.gpu_async_token_type()?)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -2529,14 +2532,14 @@ pub fn create_2_to_4_sp_mat<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.create_2to4_spmat", location)
-        .add_operands(async_dependencies)
-        .add_operand(rows)
-        .add_operand(columns)
-        .add_operand(memref)
-        .add_attribute(PRUNE_FLAG_ATTRIBUTE, context.gpu_prune_2_to_4_sparse_matrix_flag_attribute(prune_flag)?)
-        .add_result(context.gpu_sparse_sp_mat_handle_type()?);
+        .add_operands(async_dependencies)?
+        .add_operand(rows)?
+        .add_operand(columns)?
+        .add_operand(memref)?
+        .add_attribute(PRUNE_FLAG_ATTRIBUTE, context.gpu_prune_2_to_4_sparse_matrix_flag_attribute(prune_flag)?)?
+        .add_result(context.gpu_sparse_sp_mat_handle_type()?)?;
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type()?);
+        builder = builder.add_result(context.gpu_async_token_type()?)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -2641,15 +2644,15 @@ pub fn spmv_buffer_size<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.spmv_buffer_size", location)
-        .add_operands(async_dependencies)
-        .add_operand(sparse_matrix_a)
-        .add_operand(dense_tensor_x)
-        .add_operand(dense_tensor_y)
-        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a)?)
-        .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type))
-        .add_result(context.index_type());
+        .add_operands(async_dependencies)?
+        .add_operand(sparse_matrix_a)?
+        .add_operand(dense_tensor_x)?
+        .add_operand(dense_tensor_y)?
+        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a)?)?
+        .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type))?
+        .add_result(context.index_type())?;
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type()?);
+        builder = builder.add_result(context.gpu_async_token_type()?)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -2738,15 +2741,15 @@ pub fn spmv<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.spmv", location)
-        .add_operands(async_dependencies)
-        .add_operand(sparse_matrix_a)
-        .add_operand(dense_tensor_x)
-        .add_operand(dense_tensor_y)
-        .add_operand(buffer)
-        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a)?)
-        .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type));
+        .add_operands(async_dependencies)?
+        .add_operand(sparse_matrix_a)?
+        .add_operand(dense_tensor_x)?
+        .add_operand(dense_tensor_y)?
+        .add_operand(buffer)?
+        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a)?)?
+        .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type))?;
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type()?);
+        builder = builder.add_result(context.gpu_async_token_type()?)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::spmv`"))
@@ -2862,22 +2865,22 @@ pub fn spmm_buffer_size<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.spmm_buffer_size", location)
-        .add_operands(async_dependencies)
-        .add_operand(sparse_matrix_a)
-        .add_operand(dense_matrix_b)
-        .add_operand(dense_matrix_c)
-        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a)?)
-        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b)?)
-        .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type))
+        .add_operands(async_dependencies)?
+        .add_operand(sparse_matrix_a)?
+        .add_operand(dense_matrix_b)?
+        .add_operand(dense_matrix_c)?
+        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a)?)?
+        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b)?)?
+        .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type))?
         .add_attribute(
             RESULT_SEGMENT_SIZES_ATTRIBUTE,
             context.dense_i32_array_attribute(&[buffer_size_count as i32, if is_async { 1 } else { 0 }])?,
-        );
+        )?;
     for _ in 0..buffer_size_count {
-        builder = builder.add_result(context.index_type());
+        builder = builder.add_result(context.index_type())?;
     }
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type()?);
+        builder = builder.add_result(context.gpu_async_token_type()?)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -2999,20 +3002,20 @@ pub fn spmm<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.spmm", location)
-        .add_operands(async_dependencies)
-        .add_operand(sparse_matrix_a)
-        .add_operand(dense_matrix_b)
-        .add_operand(dense_matrix_c)
-        .add_operands(buffers)
-        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a)?)
-        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b)?)
-        .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type))
+        .add_operands(async_dependencies)?
+        .add_operand(sparse_matrix_a)?
+        .add_operand(dense_matrix_b)?
+        .add_operand(dense_matrix_c)?
+        .add_operands(buffers)?
+        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a)?)?
+        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b)?)?
+        .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type))?
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
             context.dense_i32_array_attribute(&[async_dependencies.len() as i32, 1, 1, 1, buffers.len() as i32])?,
-        );
+        )?;
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type()?);
+        builder = builder.add_result(context.gpu_async_token_type()?)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::spmm`"))
@@ -3113,16 +3116,16 @@ pub fn sddmm_buffer_size<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.sddmm_buffer_size", location)
-        .add_operands(async_dependencies)
-        .add_operand(dense_matrix_a)
-        .add_operand(dense_matrix_b)
-        .add_operand(sparse_matrix_c)
-        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a)?)
-        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b)?)
-        .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type))
-        .add_result(context.index_type());
+        .add_operands(async_dependencies)?
+        .add_operand(dense_matrix_a)?
+        .add_operand(dense_matrix_b)?
+        .add_operand(sparse_matrix_c)?
+        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a)?)?
+        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b)?)?
+        .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type))?
+        .add_result(context.index_type())?;
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type()?);
+        builder = builder.add_result(context.gpu_async_token_type()?)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -3226,16 +3229,16 @@ pub fn sddmm<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.sddmm", location)
-        .add_operands(async_dependencies)
-        .add_operand(dense_matrix_a)
-        .add_operand(dense_matrix_b)
-        .add_operand(sparse_matrix_c)
-        .add_operand(buffer)
-        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a)?)
-        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b)?)
-        .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type));
+        .add_operands(async_dependencies)?
+        .add_operand(dense_matrix_a)?
+        .add_operand(dense_matrix_b)?
+        .add_operand(sparse_matrix_c)?
+        .add_operand(buffer)?
+        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a)?)?
+        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b)?)?
+        .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type))?;
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type()?);
+        builder = builder.add_result(context.gpu_async_token_type()?)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::sddmm`"))
@@ -3282,10 +3285,10 @@ pub fn sp_gemm_create_descr<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.spgemm_create_descr", location)
-        .add_operands(async_dependencies)
-        .add_result(context.gpu_sparse_sp_gemm_operation_handle_type()?);
+        .add_operands(async_dependencies)?
+        .add_result(context.gpu_sparse_sp_gemm_operation_handle_type()?)?;
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type()?);
+        builder = builder.add_result(context.gpu_async_token_type()?)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -3432,20 +3435,20 @@ pub fn sp_gemm_work_estimation_or_compute<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.spgemm_work_estimation_or_compute", location)
-        .add_operands(async_dependencies)
-        .add_operand(descriptor)
-        .add_operand(sparse_matrix_a)
-        .add_operand(sparse_matrix_b)
-        .add_operand(sparse_matrix_c)
-        .add_operand(buffer_size)
-        .add_operand(buffer)
-        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a)?)
-        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b)?)
-        .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type))
-        .add_attribute(KIND_ATTRIBUTE, context.gpu_sp_gemm_work_kind_attribute(kind)?)
-        .add_result(context.index_type());
+        .add_operands(async_dependencies)?
+        .add_operand(descriptor)?
+        .add_operand(sparse_matrix_a)?
+        .add_operand(sparse_matrix_b)?
+        .add_operand(sparse_matrix_c)?
+        .add_operand(buffer_size)?
+        .add_operand(buffer)?
+        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a)?)?
+        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b)?)?
+        .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type))?
+        .add_attribute(KIND_ATTRIBUTE, context.gpu_sp_gemm_work_kind_attribute(kind)?)?
+        .add_result(context.index_type())?;
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type()?);
+        builder = builder.add_result(context.gpu_async_token_type()?)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -3549,16 +3552,16 @@ pub fn sp_gemm_copy<'o, 'c: 'o, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.spgemm_copy", location)
-        .add_operands(async_dependencies)
-        .add_operand(descriptor)
-        .add_operand(sparse_matrix_a)
-        .add_operand(sparse_matrix_b)
-        .add_operand(sparse_matrix_c)
-        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a)?)
-        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b)?)
-        .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type));
+        .add_operands(async_dependencies)?
+        .add_operand(descriptor)?
+        .add_operand(sparse_matrix_a)?
+        .add_operand(sparse_matrix_b)?
+        .add_operand(sparse_matrix_c)?
+        .add_attribute(MODE_A_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_a)?)?
+        .add_attribute(MODE_B_ATTRIBUTE, context.gpu_matrix_transpose_mode_attribute(mode_b)?)?
+        .add_attribute(COMPUTE_TYPE_ATTRIBUTE, context.type_attribute(compute_type))?;
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type()?);
+        builder = builder.add_result(context.gpu_async_token_type()?)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::sp_gemm_copy`"))
@@ -3621,13 +3624,13 @@ pub fn sp_mat_get_size<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.spmat_get_size", location)
-        .add_operands(async_dependencies)
-        .add_operand(sparse_matrix)
-        .add_result(context.index_type())
-        .add_result(context.index_type())
-        .add_result(context.index_type());
+        .add_operands(async_dependencies)?
+        .add_operand(sparse_matrix)?
+        .add_result(context.index_type())?
+        .add_result(context.index_type())?
+        .add_result(context.index_type())?;
     if is_async {
-        builder = builder.add_result(context.gpu_async_token_type()?);
+        builder = builder.add_result(context.gpu_async_token_type()?)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -3692,11 +3695,11 @@ pub fn warp_execute_on_lane_0<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.warp_execute_on_lane_0", location)
-        .add_operand(lane_id)
-        .add_operands(arguments)
-        .add_attribute(WARP_SIZE_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), warp_size))
-        .add_results(result_types)
-        .add_region(region)
+        .add_operand(lane_id)?
+        .add_operands(arguments)?
+        .add_attribute(WARP_SIZE_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), warp_size))?
+        .add_results(result_types)?
+        .add_region(region)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -3755,11 +3758,11 @@ pub fn subgroup_broadcast<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::gpu()?)?;
     let mut builder = OperationBuilder::new("gpu.subgroup_broadcast", location)
-        .add_operand(source)
-        .add_attribute(BROADCAST_TYPE_ATTRIBUTE, context.gpu_broadcast_type_attribute(broadcast_type)?)
-        .add_result(source.r#type()?);
+        .add_operand(source)?
+        .add_attribute(BROADCAST_TYPE_ATTRIBUTE, context.gpu_broadcast_type_attribute(broadcast_type)?)?
+        .add_result(source.r#type()?)?;
     if let Some(lane) = lane {
-        builder = builder.add_operand(lane);
+        builder = builder.add_operand(lane)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -3795,8 +3798,8 @@ pub fn ballot<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: Loca
 ) -> Result<DetachedBallotOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::gpu()?)?;
     OperationBuilder::new("gpu.ballot", location)
-        .add_operand(predicate)
-        .add_result(result_type)
+        .add_operand(predicate)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `gpu::ballot`"))

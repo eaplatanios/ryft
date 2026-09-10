@@ -48,9 +48,9 @@ pub fn apply<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::affine()?)?;
     OperationBuilder::new("affine.apply", location)
-        .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))
-        .add_operands(map_operands)
-        .add_result(context.index_type())
+        .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))?
+        .add_operands(map_operands)?
+        .add_result(context.index_type())?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::apply`"))
@@ -135,16 +135,16 @@ pub fn r#for<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let operand_segment_sizes =
         [lower_bound_operands.len() as i32, upper_bound_operands.len() as i32, inits.len() as i32];
     let builder = OperationBuilder::new("affine.for", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&operand_segment_sizes)?)
-        .add_attribute(LOWER_BOUND_MAP_ATTRIBUTE, context.affine_map_attribute(lower_bound_map))
-        .add_attribute(UPPER_BOUND_MAP_ATTRIBUTE, context.affine_map_attribute(upper_bound_map));
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&operand_segment_sizes)?)?
+        .add_attribute(LOWER_BOUND_MAP_ATTRIBUTE, context.affine_map_attribute(lower_bound_map))?
+        .add_attribute(UPPER_BOUND_MAP_ATTRIBUTE, context.affine_map_attribute(upper_bound_map))?;
     builder
-        .add_attribute(STEP_ATTRIBUTE, context.integer_attribute(context.index_type(), step))
-        .add_operands(lower_bound_operands)
-        .add_operands(upper_bound_operands)
-        .add_operands(inits)
-        .add_results(result_types)
-        .add_region(body)
+        .add_attribute(STEP_ATTRIBUTE, context.integer_attribute(context.index_type(), step))?
+        .add_operands(lower_bound_operands)?
+        .add_operands(upper_bound_operands)?
+        .add_operands(inits)?
+        .add_results(result_types)?
+        .add_region(body)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::for`"))
@@ -192,11 +192,11 @@ pub fn r#if<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::affine()?)?;
     OperationBuilder::new("affine.if", location)
-        .add_attribute(CONDITION_ATTRIBUTE, context.integer_set_attribute(condition))
-        .add_operands(condition_operands)
-        .add_results(result_types)
-        .add_region(then_region)
-        .add_region(else_region)
+        .add_attribute(CONDITION_ATTRIBUTE, context.integer_set_attribute(condition))?
+        .add_operands(condition_operands)?
+        .add_results(result_types)?
+        .add_region(then_region)?
+        .add_region(else_region)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::if`"))
@@ -238,10 +238,10 @@ pub fn load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::affine()?)?;
     OperationBuilder::new("affine.load", location)
-        .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))
-        .add_operand(memref)
-        .add_operands(indices)
-        .add_result(result_type)
+        .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))?
+        .add_operand(memref)?
+        .add_operands(indices)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::load`"))
@@ -278,9 +278,9 @@ pub fn min<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::affine()?)?;
     OperationBuilder::new("affine.min", location)
-        .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))
-        .add_operands(map_operands)
-        .add_result(context.index_type())
+        .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))?
+        .add_operands(map_operands)?
+        .add_result(context.index_type())?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::min`"))
@@ -317,9 +317,9 @@ pub fn max<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::affine()?)?;
     OperationBuilder::new("affine.max", location)
-        .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))
-        .add_operands(map_operands)
-        .add_result(context.index_type())
+        .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))?
+        .add_operands(map_operands)?
+        .add_result(context.index_type())?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::max`"))
@@ -449,23 +449,23 @@ pub fn parallel<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .map(|reduction| context.arith_atomic_rmw_kind_attribute(*reduction))
         .collect::<Result<Vec<_>, _>>()?;
     let builder = OperationBuilder::new("affine.parallel", location)
-        .add_attribute(REDUCTIONS_ATTRIBUTE, context.array_attribute(&reduction_attributes))
-        .add_attribute(LOWER_BOUNDS_MAP_ATTRIBUTE, context.affine_map_attribute(lower_bounds_map))
-        .add_attribute(UPPER_BOUNDS_MAP_ATTRIBUTE, context.affine_map_attribute(upper_bounds_map));
+        .add_attribute(REDUCTIONS_ATTRIBUTE, context.array_attribute(&reduction_attributes))?
+        .add_attribute(LOWER_BOUNDS_MAP_ATTRIBUTE, context.affine_map_attribute(lower_bounds_map))?
+        .add_attribute(UPPER_BOUNDS_MAP_ATTRIBUTE, context.affine_map_attribute(upper_bounds_map))?;
     builder
         .add_attribute(
             LOWER_BOUNDS_GROUPS_ATTRIBUTE,
             context.dense_i32_elements_attribute(lower_bounds_groups_type, lower_bounds_groups)?,
-        )
+        )?
         .add_attribute(
             UPPER_BOUNDS_GROUPS_ATTRIBUTE,
             context.dense_i32_elements_attribute(upper_bounds_groups_type, upper_bounds_groups)?,
-        )
-        .add_attribute(STEPS_ATTRIBUTE, context.array_attribute(&step_attributes))
-        .add_operands(lower_bounds_operands)
-        .add_operands(upper_bounds_operands)
-        .add_results(result_types)
-        .add_region(body)
+        )?
+        .add_attribute(STEPS_ATTRIBUTE, context.array_attribute(&step_attributes))?
+        .add_operands(lower_bounds_operands)?
+        .add_operands(upper_bounds_operands)?
+        .add_results(result_types)?
+        .add_region(body)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::parallel`"))
@@ -532,15 +532,15 @@ pub fn prefetch<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::affine()?)?;
     OperationBuilder::new("affine.prefetch", location)
-        .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))
-        .add_operand(memref)
-        .add_operands(indices)
-        .add_attribute(IS_WRITE_ATTRIBUTE, context.boolean_attribute(is_write))
+        .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))?
+        .add_operand(memref)?
+        .add_operands(indices)?
+        .add_attribute(IS_WRITE_ATTRIBUTE, context.boolean_attribute(is_write))?
         .add_attribute(
             LOCALITY_HINT_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(32), locality_hint.into()),
-        )
-        .add_attribute(IS_DATA_CACHE_ATTRIBUTE, context.boolean_attribute(is_data_cache))
+        )?
+        .add_attribute(IS_DATA_CACHE_ATTRIBUTE, context.boolean_attribute(is_data_cache))?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::prefetch`"))
@@ -586,10 +586,10 @@ pub fn store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::affine()?)?;
     OperationBuilder::new("affine.store", location)
-        .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))
-        .add_operand(value)
-        .add_operand(memref)
-        .add_operands(indices)
+        .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))?
+        .add_operand(value)?
+        .add_operand(memref)?
+        .add_operands(indices)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::store`"))
@@ -618,7 +618,7 @@ pub fn r#yield<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::affine()?)?;
     OperationBuilder::new("affine.yield", location)
-        .add_operands(values)
+        .add_operands(values)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::yield`"))
@@ -660,10 +660,10 @@ pub fn vector_load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::affine()?)?;
     OperationBuilder::new("affine.vector_load", location)
-        .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))
-        .add_operand(memref)
-        .add_operands(indices)
-        .add_result(result_type)
+        .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))?
+        .add_operand(memref)?
+        .add_operands(indices)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -711,10 +711,10 @@ pub fn vector_store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::affine()?)?;
     OperationBuilder::new("affine.vector_store", location)
-        .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))
-        .add_operand(value)
-        .add_operand(memref)
-        .add_operands(indices)
+        .add_attribute(MAP_ATTRIBUTE, context.affine_map_attribute(map))?
+        .add_operand(value)?
+        .add_operand(memref)?
+        .add_operands(indices)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -762,10 +762,10 @@ pub fn delinearize_index<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::affine()?)?;
     OperationBuilder::new("affine.delinearize_index", location)
-        .add_operand(linear_index)
-        .add_operands(dynamic_basis)
-        .add_attribute(STATIC_BASIS_ATTRIBUTE, context.dense_i64_array_attribute(static_basis)?)
-        .add_results(result_types)
+        .add_operand(linear_index)?
+        .add_operands(dynamic_basis)?
+        .add_attribute(STATIC_BASIS_ATTRIBUTE, context.dense_i64_array_attribute(static_basis)?)?
+        .add_results(result_types)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -825,13 +825,13 @@ pub fn linearize_index<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::affine()?)?;
     let operand_segment_sizes = [multi_index.len() as i32, dynamic_basis.len() as i32];
     let builder = OperationBuilder::new("affine.linearize_index", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&operand_segment_sizes)?);
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&operand_segment_sizes)?)?;
     let builder = builder
-        .add_operands(multi_index)
-        .add_operands(dynamic_basis)
-        .add_attribute(STATIC_BASIS_ATTRIBUTE, context.dense_i64_array_attribute(static_basis)?);
-    let builder = if disjoint { builder.add_attribute(DISJOINT_ATTRIBUTE, context.unit_attribute()) } else { builder };
-    builder.add_result(result_type).build().and_then(|operation| unsafe {
+        .add_operands(multi_index)?
+        .add_operands(dynamic_basis)?
+        .add_attribute(STATIC_BASIS_ATTRIBUTE, context.dense_i64_array_attribute(static_basis)?)?;
+    let builder = if disjoint { builder.add_attribute(DISJOINT_ATTRIBUTE, context.unit_attribute())? } else { builder };
+    builder.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation
             .cast()
             .ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::linearize_index`"))
@@ -953,15 +953,15 @@ pub fn dma_start<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::affine()?)?;
     let builder = OperationBuilder::new("affine.dma_start", location)
-        .add_operand(source)
-        .add_attribute(SOURCE_MAP_ATTRIBUTE, context.affine_map_attribute(source_map));
-    let builder = builder.add_operands(source_indices).add_operand(destination);
-    let builder = builder.add_attribute(DESTINATION_MAP_ATTRIBUTE, context.affine_map_attribute(destination_map));
-    let builder = builder.add_operands(destination_indices).add_operand(tag);
-    let builder = builder.add_attribute(TAG_MAP_ATTRIBUTE, context.affine_map_attribute(tag_map));
-    let builder = builder.add_operands(tag_indices).add_operand(num_elements);
+        .add_operand(source)?
+        .add_attribute(SOURCE_MAP_ATTRIBUTE, context.affine_map_attribute(source_map))?;
+    let builder = builder.add_operands(source_indices)?.add_operand(destination)?;
+    let builder = builder.add_attribute(DESTINATION_MAP_ATTRIBUTE, context.affine_map_attribute(destination_map))?;
+    let builder = builder.add_operands(destination_indices)?.add_operand(tag)?;
+    let builder = builder.add_attribute(TAG_MAP_ATTRIBUTE, context.affine_map_attribute(tag_map))?;
+    let builder = builder.add_operands(tag_indices)?.add_operand(num_elements)?;
     let builder = match (stride, elements_per_stride) {
-        (Some(stride), Some(elements_per_stride)) => builder.add_operand(stride).add_operand(elements_per_stride),
+        (Some(stride), Some(elements_per_stride)) => builder.add_operand(stride)?.add_operand(elements_per_stride)?,
         (None, None) => builder,
         _ => {
             return Err(Error::invalid_argument("`affine::dma_start` requires either both stride operands or neither"));
@@ -1012,10 +1012,10 @@ pub fn dma_wait<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::affine()?)?;
     OperationBuilder::new("affine.dma_wait", location)
-        .add_operand(tag)
-        .add_attribute(TAG_MAP_ATTRIBUTE, context.affine_map_attribute(tag_map))
-        .add_operands(tag_indices)
-        .add_operand(num_elements)
+        .add_operand(tag)?
+        .add_attribute(TAG_MAP_ATTRIBUTE, context.affine_map_attribute(tag_map))?
+        .add_operands(tag_indices)?
+        .add_operand(num_elements)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `affine::dma_wait`"))

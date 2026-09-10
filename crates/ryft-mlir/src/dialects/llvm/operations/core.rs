@@ -111,10 +111,10 @@ pub fn icmp<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     OperationBuilder::new("llvm.icmp", location)
-        .add_attribute(PREDICATE_ATTRIBUTE, predicate)
-        .add_operand(lhs)
-        .add_operand(rhs)
-        .add_result(result_type)
+        .add_attribute(PREDICATE_ATTRIBUTE, predicate)?
+        .add_operand(lhs)?
+        .add_operand(rhs)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::icmp`"))
@@ -180,12 +180,12 @@ pub fn fcmp<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new("llvm.fcmp", location)
-        .add_attribute(PREDICATE_ATTRIBUTE, predicate)
-        .add_operand(lhs)
-        .add_operand(rhs)
-        .add_result(result_type);
+        .add_attribute(PREDICATE_ATTRIBUTE, predicate)?
+        .add_operand(lhs)?
+        .add_operand(rhs)?
+        .add_result(result_type)?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute(FASTMATH_FLAGS_ATTRIBUTE, fastmath_flags);
+        builder = builder.add_attribute(FASTMATH_FLAGS_ATTRIBUTE, fastmath_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::fcmp`"))
@@ -235,10 +235,10 @@ pub fn select<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     OperationBuilder::new("llvm.select", location)
-        .add_operand(condition)
-        .add_operand(true_value)
-        .add_operand(false_value)
-        .add_result(true_value.r#type()?)
+        .add_operand(condition)?
+        .add_operand(true_value)?
+        .add_operand(false_value)?
+        .add_result(true_value.r#type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::select`"))
@@ -275,8 +275,8 @@ pub fn constant<'c, 't: 'c, A: Attribute<'c, 't>, T: Type<'c, 't>, L: Location<'
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     OperationBuilder::new("llvm.mlir.constant", location)
-        .add_attribute(VALUE_ATTRIBUTE, value)
-        .add_result(result_type)
+        .add_attribute(VALUE_ATTRIBUTE, value)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::constant`"))
@@ -305,7 +305,7 @@ pub fn undef<'c, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     OperationBuilder::new("llvm.mlir.undef", location)
-        .add_result(result_type)
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::undef`"))
@@ -331,7 +331,7 @@ pub fn poison<'c, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     OperationBuilder::new("llvm.mlir.poison", location)
-        .add_result(result_type)
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::poison`"))
@@ -357,7 +357,7 @@ pub fn zero<'c, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     OperationBuilder::new("llvm.mlir.zero", location)
-        .add_result(result_type)
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::zero`"))
@@ -416,17 +416,17 @@ pub fn alloca<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new("llvm.alloca", location)
-        .add_operand(array_size)
-        .add_attribute(ELEMENT_TYPE_ATTRIBUTE, context.type_attribute(element_type))
-        .add_result(result_type);
+        .add_operand(array_size)?
+        .add_attribute(ELEMENT_TYPE_ATTRIBUTE, context.type_attribute(element_type))?
+        .add_result(result_type)?;
     if let Some(alignment) = alignment {
         builder = builder.add_attribute(
             ALIGNMENT_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), alignment),
-        );
+        )?;
     }
     if inalloca {
-        builder = builder.add_attribute(INALLOCA_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(INALLOCA_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::alloca`"))
@@ -470,15 +470,15 @@ pub fn load<'address, 'c: 'address, 't: 'c, A: Value<'address, 'c, 't>, R: Type<
 ) -> Result<DetachedLoadOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
-    let mut builder = OperationBuilder::new("llvm.load", location).add_operand(address).add_result(result_type);
+    let mut builder = OperationBuilder::new("llvm.load", location).add_operand(address)?.add_result(result_type)?;
     if let Some(alignment) = alignment {
         builder = builder.add_attribute(
             ALIGNMENT_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), alignment),
-        );
+        )?;
     }
     if is_volatile {
-        builder = builder.add_attribute(VOLATILE_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(VOLATILE_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::load`"))
@@ -534,15 +534,15 @@ pub fn store<
 ) -> Result<DetachedStoreOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
-    let mut builder = OperationBuilder::new("llvm.store", location).add_operand(value).add_operand(address);
+    let mut builder = OperationBuilder::new("llvm.store", location).add_operand(value)?.add_operand(address)?;
     if let Some(alignment) = alignment {
         builder = builder.add_attribute(
             ALIGNMENT_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), alignment),
-        );
+        )?;
     }
     if is_volatile {
-        builder = builder.add_attribute(VOLATILE_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(VOLATILE_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::store`"))
@@ -573,7 +573,7 @@ pub fn r#return<'argument, 'c: 'argument, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new("llvm.return", location);
     if let Some(argument) = argument {
-        builder = builder.add_operand(argument);
+        builder = builder.add_operand(argument)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::return`"))
@@ -607,8 +607,8 @@ pub fn br<'b, 'v, 'c: 'b + 'v, 't: 'c, B: Block<'b, 'c, 't>, V: Value<'v, 'c, 't
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     OperationBuilder::new("llvm.br", location)
-        .add_operands(operands)
-        .add_successor(destination)
+        .add_operands(operands)?
+        .add_successor(destination)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::br`"))
@@ -660,8 +660,8 @@ pub fn address_of<'c, 't: 'c, S: Into<StringRef<'c>>, T: Type<'c, 't>, L: Locati
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     OperationBuilder::new("llvm.mlir.addressof", location)
-        .add_attribute(GLOBAL_NAME_ATTRIBUTE, context.flat_symbol_ref_attribute(global_name.into()))
-        .add_result(result_type)
+        .add_attribute(GLOBAL_NAME_ATTRIBUTE, context.flat_symbol_ref_attribute(global_name.into()))?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::address_of`"))
@@ -1967,12 +1967,16 @@ mod tests {
             .append_operation(
                 OperationBuilder::new("llvm.func", location)
                     .add_attribute("sym_name", context.string_attribute("global"))
+                    .unwrap()
                     .add_attribute(
                         "function_type",
                         context.type_attribute(context.llvm_function_type(pointer_type, &input_types, false).unwrap()),
                     )
+                    .unwrap()
                     .add_attribute("linkage", context.llvm_linkage_attribute(Linkage::External).unwrap())
+                    .unwrap()
                     .add_region(context.region())
+                    .unwrap()
                     .build()
                     .expect("invalid `llvm.func` declaration"),
             )

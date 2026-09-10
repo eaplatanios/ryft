@@ -121,16 +121,16 @@ pub fn batch_norm_inference<
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.batch_norm_inference", location)
-        .add_operand(input)
-        .add_operand(scale)
-        .add_operand(offset)
-        .add_operand(mean)
-        .add_operand(variance)
-        .add_attribute(BATCH_NORM_EPSILON_ATTRIBUTE, context.float_attribute(context.float32_type(), epsilon as f64))
+        .add_operand(input)?
+        .add_operand(scale)?
+        .add_operand(offset)?
+        .add_operand(mean)?
+        .add_operand(variance)?
+        .add_attribute(BATCH_NORM_EPSILON_ATTRIBUTE, context.float_attribute(context.float32_type(), epsilon as f64))?
         .add_attribute(
             BATCH_NORM_FEATURE_INDEX_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), feature_index as i64),
-        )
+        )?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -234,14 +234,14 @@ pub fn batch_norm_training<
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.batch_norm_training", location)
-        .add_operand(input)
-        .add_operand(scale)
-        .add_operand(offset)
-        .add_attribute(BATCH_NORM_EPSILON_ATTRIBUTE, context.float_attribute(context.float32_type(), epsilon as f64))
+        .add_operand(input)?
+        .add_operand(scale)?
+        .add_operand(offset)?
+        .add_attribute(BATCH_NORM_EPSILON_ATTRIBUTE, context.float_attribute(context.float32_type(), epsilon as f64))?
         .add_attribute(
             BATCH_NORM_FEATURE_INDEX_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), feature_index as i64),
-        )
+        )?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -392,16 +392,16 @@ pub fn batch_norm_grad<
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.batch_norm_grad", location)
-        .add_operand(input)
-        .add_operand(scale)
-        .add_operand(mean)
-        .add_operand(variance)
-        .add_operand(grad_output)
-        .add_attribute(BATCH_NORM_EPSILON_ATTRIBUTE, context.float_attribute(context.float32_type(), epsilon as f64))
+        .add_operand(input)?
+        .add_operand(scale)?
+        .add_operand(mean)?
+        .add_operand(variance)?
+        .add_operand(grad_output)?
+        .add_attribute(BATCH_NORM_EPSILON_ATTRIBUTE, context.float_attribute(context.float32_type(), epsilon as f64))?
         .add_attribute(
             BATCH_NORM_FEATURE_INDEX_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), feature_index as i64),
-        )
+        )?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {

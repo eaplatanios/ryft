@@ -84,22 +84,22 @@ pub fn alias<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(ALIAS_OPERATION_NAME, location);
-    builder = builder.add_attribute("alias_type", alias_type);
-    builder = builder.add_attribute("sym_name", sym_name);
-    builder = builder.add_attribute("linkage", linkage);
+    builder = builder.add_attribute("alias_type", alias_type)?;
+    builder = builder.add_attribute("sym_name", sym_name)?;
+    builder = builder.add_attribute("linkage", linkage)?;
     if dso_local {
-        builder = builder.add_attribute("dso_local", context.unit_attribute());
+        builder = builder.add_attribute("dso_local", context.unit_attribute())?;
     }
     if thread_local_ {
-        builder = builder.add_attribute("thread_local_", context.unit_attribute());
+        builder = builder.add_attribute("thread_local_", context.unit_attribute())?;
     }
     if let Some(unnamed_addr) = unnamed_addr {
-        builder = builder.add_attribute("unnamed_addr", unnamed_addr);
+        builder = builder.add_attribute("unnamed_addr", unnamed_addr)?;
     }
     if let Some(visibility_) = visibility_ {
-        builder = builder.add_attribute("visibility_", visibility_);
+        builder = builder.add_attribute("visibility_", visibility_)?;
     }
-    builder = builder.add_region(initializer);
+    builder = builder.add_region(initializer)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::alias`"))
     })
@@ -138,8 +138,8 @@ pub fn comdat<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(COMDAT_OPERATION_NAME, location);
-    builder = builder.add_attribute("sym_name", sym_name);
-    builder = builder.add_region(body);
+    builder = builder.add_attribute("sym_name", sym_name)?;
+    builder = builder.add_region(body)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::comdat`"))
     })
@@ -189,8 +189,8 @@ pub fn comdat_selector<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(COMDAT_SELECTOR_OPERATION_NAME, location);
-    builder = builder.add_attribute("sym_name", sym_name);
-    builder = builder.add_attribute("comdat", comdat);
+    builder = builder.add_attribute("sym_name", sym_name)?;
+    builder = builder.add_attribute("comdat", comdat)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -236,8 +236,8 @@ pub fn dso_local_equivalent<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(DSO_LOCAL_EQUIVALENT_OPERATION_NAME, location);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("function_name", function_name);
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("function_name", function_name)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -301,9 +301,9 @@ pub fn global_ctors<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(GLOBAL_CTORS_OPERATION_NAME, location);
-    builder = builder.add_attribute("ctors", ctors);
-    builder = builder.add_attribute("priorities", priorities);
-    builder = builder.add_attribute("data", data);
+    builder = builder.add_attribute("ctors", ctors)?;
+    builder = builder.add_attribute("priorities", priorities)?;
+    builder = builder.add_attribute("data", data)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::global_ctors`"))
     })
@@ -365,9 +365,9 @@ pub fn global_dtors<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(GLOBAL_DTORS_OPERATION_NAME, location);
-    builder = builder.add_attribute("dtors", dtors);
-    builder = builder.add_attribute("priorities", priorities);
-    builder = builder.add_attribute("data", data);
+    builder = builder.add_attribute("dtors", dtors)?;
+    builder = builder.add_attribute("priorities", priorities)?;
+    builder = builder.add_attribute("data", data)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::global_dtors`"))
     })
@@ -508,49 +508,49 @@ pub fn global<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(GLOBAL_OPERATION_NAME, location);
-    builder = builder.add_attribute("global_type", global_type);
+    builder = builder.add_attribute("global_type", global_type)?;
     if constant {
-        builder = builder.add_attribute("constant", context.unit_attribute());
+        builder = builder.add_attribute("constant", context.unit_attribute())?;
     }
-    builder = builder.add_attribute("sym_name", sym_name);
-    builder = builder.add_attribute("linkage", linkage);
+    builder = builder.add_attribute("sym_name", sym_name)?;
+    builder = builder.add_attribute("linkage", linkage)?;
     if dso_local {
-        builder = builder.add_attribute("dso_local", context.unit_attribute());
+        builder = builder.add_attribute("dso_local", context.unit_attribute())?;
     }
     if thread_local_ {
-        builder = builder.add_attribute("thread_local_", context.unit_attribute());
+        builder = builder.add_attribute("thread_local_", context.unit_attribute())?;
     }
     if externally_initialized {
-        builder = builder.add_attribute("externally_initialized", context.unit_attribute());
+        builder = builder.add_attribute("externally_initialized", context.unit_attribute())?;
     }
     if let Some(value) = value {
-        builder = builder.add_attribute("value", value);
+        builder = builder.add_attribute("value", value)?;
     }
     if let Some(alignment) = alignment {
-        builder = builder.add_attribute("alignment", alignment);
+        builder = builder.add_attribute("alignment", alignment)?;
     }
     if let Some(addr_space) = addr_space {
-        builder = builder.add_attribute("addr_space", addr_space);
+        builder = builder.add_attribute("addr_space", addr_space)?;
     }
     if let Some(unnamed_addr) = unnamed_addr {
-        builder = builder.add_attribute("unnamed_addr", unnamed_addr);
+        builder = builder.add_attribute("unnamed_addr", unnamed_addr)?;
     }
     if let Some(section) = section {
-        builder = builder.add_attribute("section", section);
+        builder = builder.add_attribute("section", section)?;
     }
     if let Some(comdat) = comdat {
-        builder = builder.add_attribute("comdat", comdat);
+        builder = builder.add_attribute("comdat", comdat)?;
     }
     if let Some(dbg_exprs) = dbg_exprs {
-        builder = builder.add_attribute("dbg_exprs", dbg_exprs);
+        builder = builder.add_attribute("dbg_exprs", dbg_exprs)?;
     }
     if let Some(visibility_) = visibility_ {
-        builder = builder.add_attribute("visibility_", visibility_);
+        builder = builder.add_attribute("visibility_", visibility_)?;
     }
     if let Some(target_specific_attrs) = target_specific_attrs {
-        builder = builder.add_attribute("target_specific_attrs", target_specific_attrs);
+        builder = builder.add_attribute("target_specific_attrs", target_specific_attrs)?;
     }
-    builder = builder.add_region(initializer);
+    builder = builder.add_region(initializer)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::global`"))
     })
@@ -660,22 +660,22 @@ pub fn ifunc<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(IFUNC_OPERATION_NAME, location);
-    builder = builder.add_attribute("sym_name", sym_name);
-    builder = builder.add_attribute("i_func_type", i_func_type);
-    builder = builder.add_attribute("resolver", resolver);
-    builder = builder.add_attribute("resolver_type", resolver_type);
-    builder = builder.add_attribute("linkage", linkage);
+    builder = builder.add_attribute("sym_name", sym_name)?;
+    builder = builder.add_attribute("i_func_type", i_func_type)?;
+    builder = builder.add_attribute("resolver", resolver)?;
+    builder = builder.add_attribute("resolver_type", resolver_type)?;
+    builder = builder.add_attribute("linkage", linkage)?;
     if dso_local {
-        builder = builder.add_attribute("dso_local", context.unit_attribute());
+        builder = builder.add_attribute("dso_local", context.unit_attribute())?;
     }
     if let Some(address_space) = address_space {
-        builder = builder.add_attribute("address_space", address_space);
+        builder = builder.add_attribute("address_space", address_space)?;
     }
     if let Some(unnamed_addr) = unnamed_addr {
-        builder = builder.add_attribute("unnamed_addr", unnamed_addr);
+        builder = builder.add_attribute("unnamed_addr", unnamed_addr)?;
     }
     if let Some(visibility_) = visibility_ {
-        builder = builder.add_attribute("visibility_", visibility_);
+        builder = builder.add_attribute("visibility_", visibility_)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::ifunc`"))
@@ -739,15 +739,15 @@ pub fn func<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(LLVM_FUNC_OPERATION_NAME, location);
-    builder = builder.add_attribute("sym_name", sym_name);
+    builder = builder.add_attribute("sym_name", sym_name)?;
     if let Some(sym_visibility) = sym_visibility {
-        builder = builder.add_attribute("sym_visibility", sym_visibility);
+        builder = builder.add_attribute("sym_visibility", sym_visibility)?;
     }
-    builder = builder.add_attribute("function_type", function_type);
+    builder = builder.add_attribute("function_type", function_type)?;
     if let Some(linkage) = linkage {
-        builder = builder.add_attribute("linkage", linkage);
+        builder = builder.add_attribute("linkage", linkage)?;
     }
-    builder = builder.add_region(body);
+    builder = builder.add_region(body)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::func`"))
     })
@@ -785,7 +785,7 @@ pub fn linker_options<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(LINKER_OPTIONS_OPERATION_NAME, location);
-    builder = builder.add_attribute("options", options);
+    builder = builder.add_attribute("options", options)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -825,7 +825,7 @@ pub fn module_flags<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(MODULE_FLAGS_OPERATION_NAME, location);
-    builder = builder.add_attribute("flags", flags);
+    builder = builder.add_attribute("flags", flags)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::module_flags`"))
     })
@@ -875,8 +875,8 @@ pub fn named_metadata<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(NAMED_METADATA_OPERATION_NAME, location);
-    builder = builder.add_attribute("metadata_name", metadata_name);
-    builder = builder.add_attribute("nodes", nodes);
+    builder = builder.add_attribute("metadata_name", metadata_name)?;
+    builder = builder.add_attribute("nodes", nodes)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()

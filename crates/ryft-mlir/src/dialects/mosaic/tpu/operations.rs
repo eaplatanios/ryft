@@ -60,10 +60,10 @@ pub fn all_reduce<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.all_reduce", location);
     let mut operands = Vec::new();
     operands.push(input);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(DIM_ATTRIBUTE, dim);
-    builder = builder.add_attribute(KIND_ATTRIBUTE, kind);
-    builder = builder.add_result(output_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(DIM_ATTRIBUTE, dim)?;
+    builder = builder.add_attribute(KIND_ATTRIBUTE, kind)?;
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedAllReduceOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -115,10 +115,10 @@ pub fn reduce_index<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.reduce_index", location);
     let mut operands = Vec::new();
     operands.push(input);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(AXIS_ATTRIBUTE, axis);
-    builder = builder.add_attribute(KIND_ATTRIBUTE, kind);
-    builder = builder.add_result(output_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(AXIS_ATTRIBUTE, axis)?;
+    builder = builder.add_attribute(KIND_ATTRIBUTE, kind)?;
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedReduceIndexOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -171,9 +171,9 @@ pub fn scan<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
         operands.push(mask);
     } else {
     }
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(KIND_ATTRIBUTE, kind);
-    builder = builder.add_result(output_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(KIND_ATTRIBUTE, kind)?;
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedScanOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -256,13 +256,13 @@ pub fn sort<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
         operands.push(mask);
     } else {
     }
-    builder = builder.add_operands(&operands);
+    builder = builder.add_operands(&operands)?;
     if let Some(descending) = descending {
-        builder = builder.add_attribute(DESCENDING_ATTRIBUTE, descending);
+        builder = builder.add_attribute(DESCENDING_ATTRIBUTE, descending)?;
     }
-    builder = builder.add_result(output_mask_type);
-    builder = builder.add_result(sorted_keys_type);
-    builder = builder.add_result(sorted_values_type);
+    builder = builder.add_result(output_mask_type)?;
+    builder = builder.add_result(sorted_keys_type)?;
+    builder = builder.add_result(sorted_values_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedSortOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -402,15 +402,15 @@ pub fn store<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     } else {
         operand_segment_sizes.push(0);
     }
-    builder = builder.add_operands(&operands);
+    builder = builder.add_operands(&operands)?;
     let operand_segment_sizes = builder.context().dense_i32_array_attribute(&operand_segment_sizes)?;
-    builder = builder.add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, operand_segment_sizes);
-    builder = builder.add_attribute(SUBLANE_MASK_ATTRIBUTE, sublane_mask);
+    builder = builder.add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, operand_segment_sizes)?;
+    builder = builder.add_attribute(SUBLANE_MASK_ATTRIBUTE, sublane_mask)?;
     if let Some(sublane_stride) = sublane_stride {
-        builder = builder.add_attribute(SUBLANE_STRIDE_ATTRIBUTE, sublane_stride);
+        builder = builder.add_attribute(SUBLANE_STRIDE_ATTRIBUTE, sublane_stride)?;
     }
     if let Some(add) = add {
-        builder = builder.add_attribute(ADD_ATTRIBUTE, add);
+        builder = builder.add_attribute(ADD_ATTRIBUTE, add)?;
     }
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedStoreOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
@@ -476,12 +476,12 @@ pub fn load<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut operands = Vec::new();
     operands.push(base);
     operands.extend_from_slice(indices);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(SUBLANE_MASK_ATTRIBUTE, sublane_mask);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(SUBLANE_MASK_ATTRIBUTE, sublane_mask)?;
     if let Some(sublane_stride) = sublane_stride {
-        builder = builder.add_attribute(SUBLANE_STRIDE_ATTRIBUTE, sublane_stride);
+        builder = builder.add_attribute(SUBLANE_STRIDE_ATTRIBUTE, sublane_stride)?;
     }
-    builder = builder.add_result(result_type);
+    builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedLoadOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -592,12 +592,12 @@ pub fn vector_store<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     } else {
         operand_segment_sizes.push(0);
     }
-    builder = builder.add_operands(&operands);
+    builder = builder.add_operands(&operands)?;
     let operand_segment_sizes = builder.context().dense_i32_array_attribute(&operand_segment_sizes)?;
-    builder = builder.add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, operand_segment_sizes);
-    builder = builder.add_attribute(STRIDES_ATTRIBUTE, strides);
+    builder = builder.add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, operand_segment_sizes)?;
+    builder = builder.add_attribute(STRIDES_ATTRIBUTE, strides)?;
     if let Some(add) = add {
-        builder = builder.add_attribute(ADD_ATTRIBUTE, add);
+        builder = builder.add_attribute(ADD_ATTRIBUTE, add)?;
     }
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedVectorStoreOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
@@ -676,11 +676,11 @@ pub fn vector_load<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     } else {
         operand_segment_sizes.push(0);
     }
-    builder = builder.add_operands(&operands);
+    builder = builder.add_operands(&operands)?;
     let operand_segment_sizes = builder.context().dense_i32_array_attribute(&operand_segment_sizes)?;
-    builder = builder.add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, operand_segment_sizes);
-    builder = builder.add_attribute(STRIDES_ATTRIBUTE, strides);
-    builder = builder.add_result(result_type);
+    builder = builder.add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, operand_segment_sizes)?;
+    builder = builder.add_attribute(STRIDES_ATTRIBUTE, strides)?;
+    builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedVectorLoadOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -725,9 +725,9 @@ pub fn strided_load<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut operands = Vec::new();
     operands.push(base);
     operands.extend_from_slice(indices);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(STRIDES_ATTRIBUTE, strides);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(STRIDES_ATTRIBUTE, strides)?;
+    builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedStridedLoadOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -773,8 +773,8 @@ pub fn strided_store<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     operands.push(value_to_store);
     operands.push(base);
     operands.extend_from_slice(indices);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(STRIDES_ATTRIBUTE, strides);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(STRIDES_ATTRIBUTE, strides)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedStridedStoreOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -829,10 +829,10 @@ pub fn shuffled_load<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut operands = Vec::new();
     operands.push(base);
     operands.extend_from_slice(indices);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(SUBLANE_MASK_ATTRIBUTE, sublane_mask);
-    builder = builder.add_attribute(SUBLANE_OFFSETS_ATTRIBUTE, sublane_offsets);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(SUBLANE_MASK_ATTRIBUTE, sublane_mask)?;
+    builder = builder.add_attribute(SUBLANE_OFFSETS_ATTRIBUTE, sublane_offsets)?;
+    builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedShuffledLoadOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -885,9 +885,9 @@ pub fn shuffled_store<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     operands.push(value_to_store);
     operands.push(base);
     operands.extend_from_slice(indices);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(SUBLANE_MASK_ATTRIBUTE, sublane_mask);
-    builder = builder.add_attribute(SUBLANE_OFFSETS_ATTRIBUTE, sublane_offsets);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(SUBLANE_MASK_ATTRIBUTE, sublane_mask)?;
+    builder = builder.add_attribute(SUBLANE_OFFSETS_ATTRIBUTE, sublane_offsets)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedShuffledStoreOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -960,10 +960,10 @@ pub fn vector_load_idx<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     } else {
         operand_segment_sizes.push(0);
     }
-    builder = builder.add_operands(&operands);
+    builder = builder.add_operands(&operands)?;
     let operand_segment_sizes = builder.context().dense_i32_array_attribute(&operand_segment_sizes)?;
-    builder = builder.add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, operand_segment_sizes);
-    builder = builder.add_result(value_type);
+    builder = builder.add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, operand_segment_sizes)?;
+    builder = builder.add_result(value_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedVectorLoadIdxOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -1066,11 +1066,11 @@ pub fn vector_store_idx<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     } else {
         operand_segment_sizes.push(0);
     }
-    builder = builder.add_operands(&operands);
+    builder = builder.add_operands(&operands)?;
     let operand_segment_sizes = builder.context().dense_i32_array_attribute(&operand_segment_sizes)?;
-    builder = builder.add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, operand_segment_sizes);
+    builder = builder.add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, operand_segment_sizes)?;
     if let Some(add) = add {
-        builder = builder.add_attribute(ADD_ATTRIBUTE, add);
+        builder = builder.add_attribute(ADD_ATTRIBUTE, add)?;
     }
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedVectorStoreIdxOperation>() }
@@ -1143,16 +1143,16 @@ pub fn rotate<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.rotate", location);
     let mut operands = Vec::new();
     operands.push(value);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(AMOUNT_ATTRIBUTE, amount);
-    builder = builder.add_attribute(DIMENSION_ATTRIBUTE, dimension);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(AMOUNT_ATTRIBUTE, amount)?;
+    builder = builder.add_attribute(DIMENSION_ATTRIBUTE, dimension)?;
     if let Some(stride) = stride {
-        builder = builder.add_attribute(STRIDE_ATTRIBUTE, stride);
+        builder = builder.add_attribute(STRIDE_ATTRIBUTE, stride)?;
     }
     if let Some(stride_dimension) = stride_dimension {
-        builder = builder.add_attribute(STRIDE_DIMENSION_ATTRIBUTE, stride_dimension);
+        builder = builder.add_attribute(STRIDE_DIMENSION_ATTRIBUTE, stride_dimension)?;
     }
-    builder = builder.add_result(result_type);
+    builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedRotateOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -1212,15 +1212,15 @@ pub fn dynamic_rotate<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut operands = Vec::new();
     operands.push(value);
     operands.push(amount);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(DIMENSION_ATTRIBUTE, dimension);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(DIMENSION_ATTRIBUTE, dimension)?;
     if let Some(stride) = stride {
-        builder = builder.add_attribute(STRIDE_ATTRIBUTE, stride);
+        builder = builder.add_attribute(STRIDE_ATTRIBUTE, stride)?;
     }
     if let Some(stride_dimension) = stride_dimension {
-        builder = builder.add_attribute(STRIDE_DIMENSION_ATTRIBUTE, stride_dimension);
+        builder = builder.add_attribute(STRIDE_DIMENSION_ATTRIBUTE, stride_dimension)?;
     }
-    builder = builder.add_result(result_type);
+    builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedDynamicRotateOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -1265,9 +1265,9 @@ pub fn scan_count<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut operands = Vec::new();
     operands.push(in_mask);
     operands.push(values);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_result(out_mask_type);
-    builder = builder.add_result(counts_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_result(out_mask_type)?;
+    builder = builder.add_result(counts_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedScanCountOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -1300,8 +1300,8 @@ pub fn iota<'c, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedIotaOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.iota", location);
-    builder = builder.add_attribute(DIMENSIONS_ATTRIBUTE, dimensions);
-    builder = builder.add_result(output_type);
+    builder = builder.add_attribute(DIMENSIONS_ATTRIBUTE, dimensions)?;
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedIotaOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -1332,8 +1332,8 @@ pub fn reshape<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.reshape", location);
     let mut operands = Vec::new();
     operands.push(source);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedReshapeOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -1379,10 +1379,10 @@ pub fn repeat<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.repeat", location);
     let mut operands = Vec::new();
     operands.push(source);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(DIMENSION_ATTRIBUTE, dimension);
-    builder = builder.add_attribute(TIMES_ATTRIBUTE, times);
-    builder = builder.add_result(output_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(DIMENSION_ATTRIBUTE, dimension)?;
+    builder = builder.add_attribute(TIMES_ATTRIBUTE, times)?;
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedRepeatOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -1422,9 +1422,9 @@ pub fn broadcast_in_sublanes<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.broadcast_in_sublanes", location);
     let mut operands = Vec::new();
     operands.push(source);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(LANE_ATTRIBUTE, lane);
-    builder = builder.add_result(output_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(LANE_ATTRIBUTE, lane)?;
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedBroadcastInSublanesOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -1526,16 +1526,16 @@ pub fn unpack_subelements<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.unpack_subelements", location);
     let mut operands = Vec::new();
     operands.push(source);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(INDEX_ATTRIBUTE, index);
-    builder = builder.add_attribute(PACK_FORMAT_ATTRIBUTE, pack_format);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(INDEX_ATTRIBUTE, index)?;
+    builder = builder.add_attribute(PACK_FORMAT_ATTRIBUTE, pack_format)?;
     if let Some(integer_extended) = integer_extended {
-        builder = builder.add_attribute(INTEGER_EXTENDED_ATTRIBUTE, integer_extended);
+        builder = builder.add_attribute(INTEGER_EXTENDED_ATTRIBUTE, integer_extended)?;
     }
     if let Some(unsigned_integers) = unsigned_integers {
-        builder = builder.add_attribute(UNSIGNED_INTEGERS_ATTRIBUTE, unsigned_integers);
+        builder = builder.add_attribute(UNSIGNED_INTEGERS_ATTRIBUTE, unsigned_integers)?;
     }
-    builder = builder.add_result(output_type);
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedUnpackSubelementsOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -1599,13 +1599,13 @@ pub fn pack_subelements<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.pack_subelements", location);
     let mut operands = Vec::new();
     operands.extend_from_slice(sources);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(POSITIONS_ATTRIBUTE, positions);
-    builder = builder.add_attribute(PACK_FORMAT_ATTRIBUTE, pack_format);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(POSITIONS_ATTRIBUTE, positions)?;
+    builder = builder.add_attribute(PACK_FORMAT_ATTRIBUTE, pack_format)?;
     if let Some(unsigned_integers) = unsigned_integers {
-        builder = builder.add_attribute(UNSIGNED_INTEGERS_ATTRIBUTE, unsigned_integers);
+        builder = builder.add_attribute(UNSIGNED_INTEGERS_ATTRIBUTE, unsigned_integers)?;
     }
-    builder = builder.add_result(output_type);
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedPackSubelementsOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -1647,9 +1647,9 @@ pub fn pack_elementwise<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.pack_elementwise", location);
     let mut operands = Vec::new();
     operands.extend_from_slice(sources);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(TARGET_TYPE_ATTRIBUTE, target_type);
-    builder = builder.add_result(output_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(TARGET_TYPE_ATTRIBUTE, target_type)?;
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedPackElementwiseOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -1696,10 +1696,10 @@ pub fn unpack_elementwise<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.unpack_elementwise", location);
     let mut operands = Vec::new();
     operands.push(source);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(SOURCE_TYPE_ATTRIBUTE, source_type);
-    builder = builder.add_attribute(INDEX_ATTRIBUTE, index);
-    builder = builder.add_result(output_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(SOURCE_TYPE_ATTRIBUTE, source_type)?;
+    builder = builder.add_attribute(INDEX_ATTRIBUTE, index)?;
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedUnpackElementwiseOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -1731,8 +1731,8 @@ pub fn relayout<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.relayout", location);
     let mut operands = Vec::new();
     operands.push(input);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_result(output_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedRelayoutOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -1770,9 +1770,9 @@ pub fn pack_mask<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.pack_vmsk", location);
     let mut operands = Vec::new();
     operands.extend_from_slice(sources);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(POSITIONS_ATTRIBUTE, positions);
-    builder = builder.add_result(output_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(POSITIONS_ATTRIBUTE, positions)?;
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedPackMaskOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -1818,10 +1818,10 @@ pub fn gather<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.gather", location);
     let mut operands = Vec::new();
     operands.push(source);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(INDICES_ATTRIBUTE, indices);
-    builder = builder.add_attribute(DIMENSION_ATTRIBUTE, dimension);
-    builder = builder.add_result(output_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(INDICES_ATTRIBUTE, indices)?;
+    builder = builder.add_attribute(DIMENSION_ATTRIBUTE, dimension)?;
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedGatherOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -1865,9 +1865,9 @@ pub fn dynamic_gather<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut operands = Vec::new();
     operands.push(source);
     operands.push(indices);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(DIMENSIONS_ATTRIBUTE, dimensions);
-    builder = builder.add_result(output_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(DIMENSIONS_ATTRIBUTE, dimensions)?;
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedDynamicGatherOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -1914,9 +1914,9 @@ pub fn fp_to_si<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.fptosi", location);
     let mut operands = Vec::new();
     operands.push(input);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(ROUNDING_MODE_ATTRIBUTE, rounding_mode);
-    builder = builder.add_result(output_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(ROUNDING_MODE_ATTRIBUTE, rounding_mode)?;
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedFpToSiOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -1959,9 +1959,9 @@ pub fn fp_to_ui<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.fptoui", location);
     let mut operands = Vec::new();
     operands.push(input);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(ROUNDING_MODE_ATTRIBUTE, rounding_mode);
-    builder = builder.add_result(output_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(ROUNDING_MODE_ATTRIBUTE, rounding_mode)?;
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedFpToUiOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -2004,9 +2004,9 @@ pub fn si_to_fp<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.sitofp", location);
     let mut operands = Vec::new();
     operands.push(input);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(ROUNDING_MODE_ATTRIBUTE, rounding_mode);
-    builder = builder.add_result(output_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(ROUNDING_MODE_ATTRIBUTE, rounding_mode)?;
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedSiToFpOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -2049,9 +2049,9 @@ pub fn ui_to_fp<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.uitofp", location);
     let mut operands = Vec::new();
     operands.push(input);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(ROUNDING_MODE_ATTRIBUTE, rounding_mode);
-    builder = builder.add_result(output_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(ROUNDING_MODE_ATTRIBUTE, rounding_mode)?;
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedUiToFpOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -2082,8 +2082,8 @@ pub fn ext_f<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.extf", location);
     let mut operands = Vec::new();
     operands.push(input);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_result(out_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_result(out_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedExtFOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -2126,9 +2126,9 @@ pub fn trunc_f<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.truncf", location);
     let mut operands = Vec::new();
     operands.push(input);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(ROUNDING_MODE_ATTRIBUTE, rounding_mode);
-    builder = builder.add_result(out_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(ROUNDING_MODE_ATTRIBUTE, rounding_mode)?;
+    builder = builder.add_result(out_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedTruncFOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -2237,20 +2237,20 @@ pub fn matmul<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     operands.push(lhs);
     operands.push(rhs);
     operands.push(acc);
-    builder = builder.add_operands(&operands);
+    builder = builder.add_operands(&operands)?;
     if let Some(transpose_lhs) = transpose_lhs {
-        builder = builder.add_attribute(TRANSPOSE_LHS_ATTRIBUTE, transpose_lhs);
+        builder = builder.add_attribute(TRANSPOSE_LHS_ATTRIBUTE, transpose_lhs)?;
     }
     if let Some(transpose_rhs) = transpose_rhs {
-        builder = builder.add_attribute(TRANSPOSE_RHS_ATTRIBUTE, transpose_rhs);
+        builder = builder.add_attribute(TRANSPOSE_RHS_ATTRIBUTE, transpose_rhs)?;
     }
     if let Some(precision) = precision {
-        builder = builder.add_attribute(PRECISION_ATTRIBUTE, precision);
+        builder = builder.add_attribute(PRECISION_ATTRIBUTE, precision)?;
     }
     if let Some(dimension_numbers) = dimension_numbers {
-        builder = builder.add_attribute(DIMENSION_NUMBERS_ATTRIBUTE, dimension_numbers);
+        builder = builder.add_attribute(DIMENSION_NUMBERS_ATTRIBUTE, dimension_numbers)?;
     }
-    builder = builder.add_result(result_type);
+    builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedMatmulOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -2330,13 +2330,13 @@ pub fn matmul_push_rhs<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.matmul_push_rhs", location);
     let mut operands = Vec::new();
     operands.push(rhs);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(MXU_INDEX_ATTRIBUTE, mxu_index);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(MXU_INDEX_ATTRIBUTE, mxu_index)?;
     if let Some(staging_register) = staging_register {
-        builder = builder.add_attribute(STAGING_REGISTER_ATTRIBUTE, staging_register);
+        builder = builder.add_attribute(STAGING_REGISTER_ATTRIBUTE, staging_register)?;
     }
     if let Some(transpose) = transpose {
-        builder = builder.add_attribute(TRANSPOSE_ATTRIBUTE, transpose);
+        builder = builder.add_attribute(TRANSPOSE_ATTRIBUTE, transpose)?;
     }
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedMatmulPushRhsOperation>() }
@@ -2391,11 +2391,11 @@ pub fn matmul_acc_lhs<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.matmul_acc_lhs", location);
     let mut operands = Vec::new();
     operands.push(lhs);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(ACC_ATTRIBUTE, acc);
-    builder = builder.add_attribute(MXU_INDEX_ATTRIBUTE, mxu_index);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(ACC_ATTRIBUTE, acc)?;
+    builder = builder.add_attribute(MXU_INDEX_ATTRIBUTE, mxu_index)?;
     if let Some(load_staged_rhs) = load_staged_rhs {
-        builder = builder.add_attribute(LOAD_STAGED_RHS_ATTRIBUTE, load_staged_rhs);
+        builder = builder.add_attribute(LOAD_STAGED_RHS_ATTRIBUTE, load_staged_rhs)?;
     }
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedMatmulAccLhsOperation>() }
@@ -2433,9 +2433,9 @@ pub fn matmul_pop<'c, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedMatmulPopOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.matmul_pop", location);
-    builder = builder.add_attribute(ACC_ATTRIBUTE, acc);
-    builder = builder.add_attribute(MXU_INDEX_ATTRIBUTE, mxu_index);
-    builder = builder.add_result(result_type);
+    builder = builder.add_attribute(ACC_ATTRIBUTE, acc)?;
+    builder = builder.add_attribute(MXU_INDEX_ATTRIBUTE, mxu_index)?;
+    builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedMatmulPopOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -2473,9 +2473,9 @@ pub fn concatenate<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.concatenate", location);
     let mut operands = Vec::new();
     operands.extend_from_slice(sources);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(DIMENSION_ATTRIBUTE, dimension);
-    builder = builder.add_result(output_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(DIMENSION_ATTRIBUTE, dimension)?;
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedConcatenateOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -2506,8 +2506,8 @@ pub fn bitcast<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.bitcast", location);
     let mut operands = Vec::new();
     operands.push(input);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_result(output_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedBitcastOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -2538,8 +2538,8 @@ pub fn bitcast_vreg<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.bitcast_vreg", location);
     let mut operands = Vec::new();
     operands.push(input);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_result(output_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedBitcastVregOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -2570,8 +2570,8 @@ pub fn weird<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.weird", location);
     let mut operands = Vec::new();
     operands.push(input);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_result(output_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedWeirdOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -2648,14 +2648,14 @@ pub fn reciprocal<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.reciprocal", location);
     let mut operands = Vec::new();
     operands.push(input);
-    builder = builder.add_operands(&operands);
+    builder = builder.add_operands(&operands)?;
     if let Some(approx) = approx {
-        builder = builder.add_attribute(APPROX_ATTRIBUTE, approx);
+        builder = builder.add_attribute(APPROX_ATTRIBUTE, approx)?;
     }
     if let Some(full_range) = full_range {
-        builder = builder.add_attribute(FULL_RANGE_ATTRIBUTE, full_range);
+        builder = builder.add_attribute(FULL_RANGE_ATTRIBUTE, full_range)?;
     }
-    builder = builder.add_result(output_type);
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedReciprocalOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -2693,8 +2693,8 @@ pub fn stochastic_convert<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut operands = Vec::new();
     operands.push(input);
     operands.push(random);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_result(output_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedStochasticConvertOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -2742,9 +2742,9 @@ pub fn stochastic_convert_elementwise<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut operands = Vec::new();
     operands.push(input);
     operands.push(random);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(DST_TYPE_ATTRIBUTE, dst_type);
-    builder = builder.add_result(output_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(DST_TYPE_ATTRIBUTE, dst_type)?;
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedStochasticConvertElementwiseOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -2777,8 +2777,8 @@ pub fn roll_vectors<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.roll_vectors", location);
     let mut operands = Vec::new();
     operands.extend_from_slice(input);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_result(output_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedRollVectorsOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -2809,8 +2809,8 @@ pub fn unroll_vectors<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.unroll_vectors", location);
     let mut operands = Vec::new();
     operands.push(input);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_results(result_types);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_results(result_types)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedUnrollVectorsOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -2851,8 +2851,8 @@ pub fn create_mask<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut operands = Vec::new();
     operands.extend_from_slice(low);
     operands.extend_from_slice(high);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_result(output_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedCreateMaskOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -2894,9 +2894,9 @@ pub fn create_subelement_mask<'c, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedCreateSubelementMaskOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.create_subelement_mask", location);
-    builder = builder.add_attribute(FROM_ATTRIBUTE, r#from);
-    builder = builder.add_attribute(TO_ATTRIBUTE, to);
-    builder = builder.add_result(output_type);
+    builder = builder.add_attribute(FROM_ATTRIBUTE, r#from)?;
+    builder = builder.add_attribute(TO_ATTRIBUTE, to)?;
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedCreateSubelementMaskOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -2937,9 +2937,9 @@ pub fn assume_multiple<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.assume_multiple", location);
     let mut operands = Vec::new();
     operands.push(value);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(MULTIPLE_ATTRIBUTE, multiple);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(MULTIPLE_ATTRIBUTE, multiple)?;
+    builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedAssumeMultipleOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -3001,10 +3001,10 @@ pub fn mem_ref_slice<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     operand_segment_sizes.push(base_idx.len() as i32);
     operands.extend_from_slice(dynamic_sizes);
     operand_segment_sizes.push(dynamic_sizes.len() as i32);
-    builder = builder.add_operands(&operands);
+    builder = builder.add_operands(&operands)?;
     let operand_segment_sizes = builder.context().dense_i32_array_attribute(&operand_segment_sizes)?;
-    builder = builder.add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, operand_segment_sizes);
-    builder = builder.add_result(result_type);
+    builder = builder.add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, operand_segment_sizes)?;
+    builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedMemRefSliceOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -3035,8 +3035,8 @@ pub fn mem_ref_squeeze<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.memref_squeeze", location);
     let mut operands = Vec::new();
     operands.push(input);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedMemRefSqueezeOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -3068,8 +3068,8 @@ pub fn mem_ref_reshape<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.memref_reshape", location);
     let mut operands = Vec::new();
     operands.push(input);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedMemRefReshapeOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -3101,8 +3101,8 @@ pub fn mem_ref_bitcast<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.memref_bitcast", location);
     let mut operands = Vec::new();
     operands.push(input);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedMemRefBitcastOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -3134,8 +3134,8 @@ pub fn reinterpret_cast<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.reinterpret_cast", location);
     let mut operands = Vec::new();
     operands.push(input);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedReinterpretCastOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -3167,8 +3167,8 @@ pub fn assume_layout<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.assume_layout", location);
     let mut operands = Vec::new();
     operands.push(input);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedAssumeLayoutOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -3200,8 +3200,8 @@ pub fn erase_layout<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.erase_memref_layout", location);
     let mut operands = Vec::new();
     operands.push(operand);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedEraseLayoutOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -3225,7 +3225,7 @@ pub fn device_id<'c, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedDeviceIdOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.device_id", location);
-    builder = builder.add_result(result_type);
+    builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedDeviceIdOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -3256,8 +3256,8 @@ pub fn semaphore_read<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.sem_read", location);
     let mut operands = Vec::new();
     operands.push(semaphore);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedSemaphoreReadOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -3290,7 +3290,7 @@ pub fn semaphore_wait<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut operands = Vec::new();
     operands.push(semaphore);
     operands.push(amount);
-    builder = builder.add_operands(&operands);
+    builder = builder.add_operands(&operands)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedSemaphoreWaitOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -3315,7 +3315,7 @@ pub fn alloca_semaphore<'c, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedAllocaSemaphoreOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.sem_alloc", location);
-    builder = builder.add_result(result_type);
+    builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedAllocaSemaphoreOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -3340,7 +3340,7 @@ pub fn get_barrier_semaphore<'c, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedGetBarrierSemaphoreOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.sem_barrier", location);
-    builder = builder.add_result(semaphore_type);
+    builder = builder.add_result(semaphore_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedGetBarrierSemaphoreOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -3455,9 +3455,9 @@ pub fn semaphore_signal<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     } else {
         operand_segment_sizes.push(0);
     }
-    builder = builder.add_operands(&operands);
+    builder = builder.add_operands(&operands)?;
     let operand_segment_sizes = builder.context().dense_i32_array_attribute(&operand_segment_sizes)?;
-    builder = builder.add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, operand_segment_sizes);
+    builder = builder.add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, operand_segment_sizes)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedSemaphoreSignalOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -3483,7 +3483,7 @@ pub fn barrier<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.barrier", location);
     let mut operands = Vec::new();
     operands.push(barrier_id);
-    builder = builder.add_operands(&operands);
+    builder = builder.add_operands(&operands)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedBarrierOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -3681,14 +3681,14 @@ pub fn enqueue_dma<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     } else {
         operand_segment_sizes.push(0);
     }
-    builder = builder.add_operands(&operands);
+    builder = builder.add_operands(&operands)?;
     let operand_segment_sizes = builder.context().dense_i32_array_attribute(&operand_segment_sizes)?;
-    builder = builder.add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, operand_segment_sizes);
+    builder = builder.add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, operand_segment_sizes)?;
     if let Some(priority) = priority {
-        builder = builder.add_attribute(PRIORITY_ATTRIBUTE, priority);
+        builder = builder.add_attribute(PRIORITY_ATTRIBUTE, priority)?;
     }
     if let Some(strict_ordering) = strict_ordering {
-        builder = builder.add_attribute(STRICT_ORDERING_ATTRIBUTE, strict_ordering);
+        builder = builder.add_attribute(STRICT_ORDERING_ATTRIBUTE, strict_ordering)?;
     }
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedEnqueueDmaOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
@@ -3765,9 +3765,9 @@ pub fn enqueue_indirect_dma<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
         operands.push(offset_filter);
     } else {
     }
-    builder = builder.add_operands(&operands);
+    builder = builder.add_operands(&operands)?;
     if let Some(add) = add {
-        builder = builder.add_attribute(ADD_ATTRIBUTE, add);
+        builder = builder.add_attribute(ADD_ATTRIBUTE, add)?;
     }
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedEnqueueIndirectDmaOperation>() }
@@ -3898,11 +3898,11 @@ pub fn wait_dma2<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     } else {
         operand_segment_sizes.push(0);
     }
-    builder = builder.add_operands(&operands);
+    builder = builder.add_operands(&operands)?;
     let operand_segment_sizes = builder.context().dense_i32_array_attribute(&operand_segment_sizes)?;
-    builder = builder.add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, operand_segment_sizes);
+    builder = builder.add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, operand_segment_sizes)?;
     if let Some(strict_ordering) = strict_ordering {
-        builder = builder.add_attribute(STRICT_ORDERING_ATTRIBUTE, strict_ordering);
+        builder = builder.add_attribute(STRICT_ORDERING_ATTRIBUTE, strict_ordering)?;
     }
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedWaitDma2Operation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
@@ -3942,7 +3942,7 @@ pub fn wait_indirect_dma<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     operands.push(semaphore);
     operands.push(source);
     operands.push(destination);
-    builder = builder.add_operands(&operands);
+    builder = builder.add_operands(&operands)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedWaitIndirectDmaOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -3968,8 +3968,8 @@ pub fn region<'c, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedRegionOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.region", location);
-    builder = builder.add_results(result_types);
-    builder = builder.add_region(region);
+    builder = builder.add_results(result_types)?;
+    builder = builder.add_region(region)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedRegionOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -4012,10 +4012,10 @@ pub fn trace<'c, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedTraceOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.trace", location);
-    builder = builder.add_attribute(MESSAGE_ATTRIBUTE, message);
-    builder = builder.add_attribute(LEVEL_ATTRIBUTE, level);
-    builder = builder.add_results(result_types);
-    builder = builder.add_region(region);
+    builder = builder.add_attribute(MESSAGE_ATTRIBUTE, message)?;
+    builder = builder.add_attribute(LEVEL_ATTRIBUTE, level)?;
+    builder = builder.add_results(result_types)?;
+    builder = builder.add_region(region)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedTraceOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -4045,8 +4045,8 @@ pub fn trace_start<'c, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedTraceStartOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.trace_start", location);
-    builder = builder.add_attribute(MESSAGE_ATTRIBUTE, message);
-    builder = builder.add_attribute(LEVEL_ATTRIBUTE, level);
+    builder = builder.add_attribute(MESSAGE_ATTRIBUTE, message)?;
+    builder = builder.add_attribute(LEVEL_ATTRIBUTE, level)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedTraceStartOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -4095,8 +4095,8 @@ pub fn trace_value<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.trace_value", location);
     let mut operands = Vec::new();
     operands.push(value);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(LABEL_ATTRIBUTE, label);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(LABEL_ATTRIBUTE, label)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedTraceValueOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -4122,7 +4122,7 @@ pub fn r#yield<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.yield", location);
     let mut operands = Vec::new();
     operands.extend_from_slice(results);
-    builder = builder.add_operands(&operands);
+    builder = builder.add_operands(&operands)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedYieldOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -4147,7 +4147,7 @@ pub fn delay<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.delay", location);
     let mut operands = Vec::new();
     operands.push(nanoseconds);
-    builder = builder.add_operands(&operands);
+    builder = builder.add_operands(&operands)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedDelayOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -4178,8 +4178,8 @@ pub fn mask_cast<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.mask_cast", location);
     let mut operands = Vec::new();
     operands.push(input);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedMaskCastOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -4209,8 +4209,8 @@ pub fn get_iteration_bound<'c, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedGetIterationBoundOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.iteration_bound", location);
-    builder = builder.add_attribute(DIM_ATTRIBUTE, dim);
-    builder = builder.add_result(result_type);
+    builder = builder.add_attribute(DIM_ATTRIBUTE, dim)?;
+    builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedGetIterationBoundOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -4235,7 +4235,7 @@ pub fn get_internal_scratch<'c, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedGetInternalScratchOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.internal_scratch", location);
-    builder = builder.add_result(result_type);
+    builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedGetInternalScratchOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -4262,7 +4262,7 @@ pub fn prng_set_seed_32<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.prng_set_seed_32", location);
     let mut operands = Vec::new();
     operands.extend_from_slice(seeds);
-    builder = builder.add_operands(&operands);
+    builder = builder.add_operands(&operands)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedPrngSeed32Operation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -4286,7 +4286,7 @@ pub fn prng_random_bits<'c, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedPrngRandomBitsOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.prng_random_bits", location);
-    builder = builder.add_result(output_type);
+    builder = builder.add_result(output_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedPrngRandomBitsOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -4334,9 +4334,9 @@ pub fn sublane_shuffle<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut operands = Vec::new();
     operands.push(lhs);
     operands.push(rhs);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(PATTERN_ATTRIBUTE, pattern);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(PATTERN_ATTRIBUTE, pattern)?;
+    builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedSublaneShuffleOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))
@@ -4377,9 +4377,9 @@ pub fn transpose<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.transpose", location);
     let mut operands = Vec::new();
     operands.push(vector);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(PERMUTATION_ATTRIBUTE, permutation);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(PERMUTATION_ATTRIBUTE, permutation)?;
+    builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedTransposeOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -4437,10 +4437,10 @@ pub fn log<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.log", location);
     let mut operands = Vec::new();
     operands.extend_from_slice(inputs);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(TAG_ATTRIBUTE, tag);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(TAG_ATTRIBUTE, tag)?;
     if let Some(formatted) = formatted {
-        builder = builder.add_attribute(FORMATTED_ATTRIBUTE, formatted);
+        builder = builder.add_attribute(FORMATTED_ATTRIBUTE, formatted)?;
     }
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedLogOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
@@ -4481,9 +4481,9 @@ pub fn log_buffer<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("tpu.log_buffer", location);
     let mut operands = Vec::new();
     operands.push(input);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_attribute(SHAPE_ATTRIBUTE, shape);
-    builder = builder.add_attribute(TAG_ATTRIBUTE, tag);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_attribute(SHAPE_ATTRIBUTE, shape)?;
+    builder = builder.add_attribute(TAG_ATTRIBUTE, tag)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedLogBufferOperation>() }.ok_or_else(|| Error::internal("invalid operation cast"))
 }
@@ -4538,8 +4538,8 @@ pub fn fetch_and_add_sync<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     operands.extend_from_slice(indices);
     operands.push(value);
     operands.push(core_id);
-    builder = builder.add_operands(&operands);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operands(&operands)?;
+    builder = builder.add_result(result_type)?;
     let operation = builder.build()?;
     unsafe { operation.cast::<DetachedFetchAndAddSyncOperation>() }
         .ok_or_else(|| Error::internal("invalid operation cast"))

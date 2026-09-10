@@ -51,7 +51,7 @@ pub fn constant<'c, 't, A: ElementsAttribute<'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedConstantOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.constant", location)
-        .add_attribute(CONSTANT_VALUE_ATTRIBUTE, value)
+        .add_attribute(CONSTANT_VALUE_ATTRIBUTE, value)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -119,8 +119,8 @@ pub fn iota<'c, 't: 'c, T: ShapedType<'c, 't>, L: Location<'c, 't>>(
             location
                 .context()
                 .integer_attribute(location.context().signless_integer_type(64), iota_dimension as i64),
-        )
-        .add_result(output_type)
+        )?
+        .add_result(output_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::iota`"))
@@ -177,14 +177,14 @@ pub fn dynamic_iota<'s, 'c: 's, 't: 'c, S: Value<'s, 'c, 't>, T: Type<'c, 't>, L
 ) -> Result<DetachedDynamicIotaOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.dynamic_iota", location)
-        .add_operand(output_shape)
+        .add_operand(output_shape)?
         .add_attribute(
             IOTA_DIMENSION_ATTRIBUTE,
             location
                 .context()
                 .integer_attribute(location.context().signless_integer_type(64), iota_dimension as i64),
-        )
-        .add_result(output_type)
+        )?
+        .add_result(output_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -287,13 +287,13 @@ pub fn sort<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.sort", location)
-        .add_operands(inputs)
+        .add_operands(inputs)?
         .add_attribute(
             SORT_DIMENSION_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), dimension as i64),
-        )
-        .add_attribute(SORT_IS_STABLE_ATTRIBUTE, context.boolean_attribute(is_stable))
-        .add_region(comparator)
+        )?
+        .add_attribute(SORT_IS_STABLE_ATTRIBUTE, context.boolean_attribute(is_stable))?
+        .add_region(comparator)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -351,13 +351,13 @@ pub fn reverse<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedReverseOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.reverse", location)
-        .add_operand(input)
+        .add_operand(input)?
         .add_attribute(
             REVERSE_DIMENSIONS_ATTRIBUTE,
             location
                 .context()
                 .dense_i64_array_attribute(dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
-        )
+        )?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -400,7 +400,7 @@ pub fn r#return<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedReturnOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.return", location)
-        .add_operands(values)
+        .add_operands(values)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::return`"))
@@ -442,7 +442,7 @@ pub fn optimization_barrier<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Locatio
 ) -> Result<DetachedOptimizationBarrierOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.optimization_barrier", location)
-        .add_operands(operands)
+        .add_operands(operands)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -580,23 +580,23 @@ pub fn composite<
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     let mut builder = OperationBuilder::new("stablehlo.composite", location)
-        .add_operands(operands)
-        .add_attribute(COMPOSITE_NAME_ATTRIBUTE, name.try_into_with_context(context)?)
-        .add_attribute(COMPOSITE_DECOMPOSITION_ATTRIBUTE, decomposition.try_into_with_context(context)?);
+        .add_operands(operands)?
+        .add_attribute(COMPOSITE_NAME_ATTRIBUTE, name.try_into_with_context(context)?)?
+        .add_attribute(COMPOSITE_DECOMPOSITION_ATTRIBUTE, decomposition.try_into_with_context(context)?)?;
     if let Some(attributes) = attributes.filter(|attributes| !attributes.is_empty()) {
         builder = builder.add_attribute(
             COMPOSITE_ATTRIBUTES_ATTRIBUTE,
             DictionaryAttributeRef::try_from_with_context(attributes, context)?,
-        )
+        )?
     }
     builder = builder.add_attribute(
         COMPOSITE_VERSION_ATTRIBUTE,
         context.integer_attribute(context.signless_integer_type(32), i64::from(version)),
-    );
+    )?;
     if !regions.is_empty() {
-        builder = builder.add_regions(regions);
+        builder = builder.add_regions(regions)?;
     }
-    builder.add_results(result_types).build().and_then(|operation| unsafe {
+    builder.add_results(result_types)?.build().and_then(|operation| unsafe {
         operation
             .cast()
             .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::composite`"))
@@ -1037,12 +1037,12 @@ pub fn custom_call<
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     let mut builder = OperationBuilder::new("stablehlo.custom_call", location)
-        .add_operands(inputs)
-        .add_attribute(CUSTOM_CALL_TARGET_NAME_ATTRIBUTE, target_name.try_into_with_context(context)?)
-        .add_attribute(CUSTOM_CALL_HAS_SIDE_EFFECT_ATTRIBUTE, context.boolean_attribute(has_side_effect));
+        .add_operands(inputs)?
+        .add_attribute(CUSTOM_CALL_TARGET_NAME_ATTRIBUTE, target_name.try_into_with_context(context)?)?
+        .add_attribute(CUSTOM_CALL_HAS_SIDE_EFFECT_ATTRIBUTE, context.boolean_attribute(has_side_effect))?;
 
     if let Some(backend_config) = backend_config {
-        builder = builder.add_attribute(CUSTOM_CALL_BACKEND_CONFIG_ATTRIBUTE, backend_config);
+        builder = builder.add_attribute(CUSTOM_CALL_BACKEND_CONFIG_ATTRIBUTE, backend_config)?;
     }
 
     if let Some(memory_layouts) = memory_layouts {
@@ -1058,7 +1058,7 @@ pub fn custom_call<
                         })
                         .collect::<Result<Vec<_>, _>>()?,
                 ),
-            )
+            )?
             .add_attribute(
                 CUSTOM_CALL_RESULT_LAYOUTS_ATTRIBUTE,
                 context.array_attribute(
@@ -1070,7 +1070,7 @@ pub fn custom_call<
                         })
                         .collect::<Result<Vec<_>, _>>()?,
                 ),
-            );
+            )?;
     }
 
     if let Some(result_tilings) = result_tilings {
@@ -1091,17 +1091,17 @@ pub fn custom_call<
                     })
                     .collect::<Result<Vec<_>, Error>>()?,
             ),
-        );
+        )?;
     }
 
     builder
         .add_attribute(
             CUSTOM_CALL_API_VERSION_ATTRIBUTE,
             IntegerAttributeRef::try_from_with_context(api_version, context)?,
-        )
-        .add_attribute(CUSTOM_CALL_CALLED_COMPUTATIONS_ATTRIBUTE, context.array_attribute(called_computations))
-        .add_attribute(CUSTOM_CALL_OUTPUT_OPERAND_ALIASES_ATTRIBUTE, context.array_attribute(output_operand_aliases))
-        .add_results(output_types)
+        )?
+        .add_attribute(CUSTOM_CALL_CALLED_COMPUTATIONS_ATTRIBUTE, context.array_attribute(called_computations))?
+        .add_attribute(CUSTOM_CALL_OUTPUT_OPERAND_ALIASES_ATTRIBUTE, context.array_attribute(output_operand_aliases))?
+        .add_results(output_types)?
         .build()
         .and_then(|operation| unsafe {
             operation

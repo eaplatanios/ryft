@@ -63,11 +63,11 @@ pub fn intr_annotation<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(ANNOTATION_OPERATION_NAME, location);
-    builder = builder.add_operand(integer);
-    builder = builder.add_operand(annotation);
-    builder = builder.add_operand(file_name);
-    builder = builder.add_operand(line);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(integer)?;
+    builder = builder.add_operand(annotation)?;
+    builder = builder.add_operand(file_name)?;
+    builder = builder.add_operand(line)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -125,9 +125,9 @@ pub fn intr_dbg_declare<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, L: Location<'
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(DBG_DECLARE_OPERATION_NAME, location);
-    builder = builder.add_operand(address);
-    builder = builder.add_attribute("varInfo", var_info);
-    builder = builder.add_attribute("locationExpr", location_expr);
+    builder = builder.add_operand(address)?;
+    builder = builder.add_attribute("varInfo", var_info)?;
+    builder = builder.add_attribute("locationExpr", location_expr)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -167,7 +167,7 @@ pub fn intr_dbg_label<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(DBG_LABEL_OPERATION_NAME, location);
-    builder = builder.add_attribute("label", label);
+    builder = builder.add_attribute("label", label)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -225,9 +225,9 @@ pub fn intr_dbg_value<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, L: Location<'c,
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(DBG_VALUE_OPERATION_NAME, location);
-    builder = builder.add_operand(value);
-    builder = builder.add_attribute("varInfo", var_info);
-    builder = builder.add_attribute("locationExpr", location_expr);
+    builder = builder.add_operand(value)?;
+    builder = builder.add_attribute("varInfo", var_info)?;
+    builder = builder.add_attribute("locationExpr", location_expr)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -294,8 +294,8 @@ pub fn intr_eh_type_id_for<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<'
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(EH_TYPEID_FOR_OPERATION_NAME, location);
-    builder = builder.add_operand(type_info);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(type_info)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -329,7 +329,7 @@ pub fn intr_fake_use<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(FAKE_USE_OPERATION_NAME, location);
-    builder = builder.add_operands(arguments);
+    builder = builder.add_operands(arguments)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -392,7 +392,7 @@ pub fn intr_ubsan_trap<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(UBSAN_TRAP_OPERATION_NAME, location);
-    builder = builder.add_attribute("failureKind", failure_kind);
+    builder = builder.add_attribute("failureKind", failure_kind)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -460,11 +460,11 @@ pub fn intr_var_annotation<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VAR_ANNOTATION_OPERATION_NAME, location);
-    builder = builder.add_operand(value);
-    builder = builder.add_operand(annotation);
-    builder = builder.add_operand(file_name);
-    builder = builder.add_operand(line);
-    builder = builder.add_operand(attribute);
+    builder = builder.add_operand(value)?;
+    builder = builder.add_operand(annotation)?;
+    builder = builder.add_operand(file_name)?;
+    builder = builder.add_operand(line)?;
+    builder = builder.add_operand(attribute)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()

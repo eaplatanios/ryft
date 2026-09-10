@@ -38,11 +38,11 @@ pub fn alternatives<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedAlternativesOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::transform()?)?;
-    let mut builder = OperationBuilder::new("transform.alternatives", location).add_results(result_types);
+    let mut builder = OperationBuilder::new("transform.alternatives", location).add_results(result_types)?;
     if let Some(scope) = scope {
-        builder = builder.add_operand(scope);
+        builder = builder.add_operand(scope)?;
     }
-    builder.add_regions(alternatives).build().and_then(|operation| unsafe {
+    builder.add_regions(alternatives)?.build().and_then(|operation| unsafe {
         operation
             .cast()
             .ok_or_else(|| Error::invalid_argument("invalid arguments to `transform::alternatives`"))
@@ -83,10 +83,10 @@ pub fn annotate<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::transform()?)?;
     let mut builder = OperationBuilder::new("transform.annotate", location)
-        .add_operand(target)
-        .add_attribute(NAME_ATTRIBUTE, context.string_attribute(name));
+        .add_operand(target)?
+        .add_attribute(NAME_ATTRIBUTE, context.string_attribute(name))?;
     if let Some(param) = param {
-        builder = builder.add_operand(param);
+        builder = builder.add_operand(param)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -113,7 +113,7 @@ pub fn apply_cse<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedApplyCommonSubexpressionEliminationOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::transform()?)?;
     OperationBuilder::new("transform.apply_cse", location)
-        .add_operand(target)
+        .add_operand(target)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -183,16 +183,16 @@ pub fn apply_conversion_patterns<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::transform()?)?;
     let mut builder = OperationBuilder::new("transform.apply_conversion_patterns", location)
-        .add_operand(target)
-        .add_region(patterns);
+        .add_operand(target)?
+        .add_region(patterns)?;
     if let Some(region) = default_type_converter_region {
-        builder = builder.add_region(region);
+        builder = builder.add_region(region)?;
     }
     if partial_conversion {
-        builder = builder.add_attribute(PARTIAL_CONVERSION_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(PARTIAL_CONVERSION_ATTRIBUTE, context.unit_attribute())?;
     }
     if preserve_handles {
-        builder = builder.add_attribute(PRESERVE_HANDLES_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(PRESERVE_HANDLES_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -223,7 +223,7 @@ pub fn apply_to_llvm_conversion_patterns<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::transform()?)?;
     OperationBuilder::new("transform.apply_conversion_patterns.dialect_to_llvm", location)
-        .add_attribute(DIALECT_NAME_ATTRIBUTE, context.string_attribute(dialect_name))
+        .add_attribute(DIALECT_NAME_ATTRIBUTE, context.string_attribute(dialect_name))?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| {
@@ -250,7 +250,7 @@ pub fn apply_dce<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedApplyDeadCodeEliminationOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::transform()?)?;
     OperationBuilder::new("transform.apply_dce", location)
-        .add_operand(target)
+        .add_operand(target)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -300,22 +300,23 @@ pub fn apply_patterns<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedApplyPatternsOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::transform()?)?;
-    let mut builder =
-        OperationBuilder::new("transform.apply_patterns", location).add_operand(target).add_region(patterns);
+    let mut builder = OperationBuilder::new("transform.apply_patterns", location)
+        .add_operand(target)?
+        .add_region(patterns)?;
     if apply_cse {
-        builder = builder.add_attribute(APPLY_CSE_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(APPLY_CSE_ATTRIBUTE, context.unit_attribute())?;
     }
     if let Some(max_iterations) = max_iterations {
         builder = builder.add_attribute(
             MAX_ITERATIONS_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), max_iterations),
-        );
+        )?;
     }
     if let Some(max_num_rewrites) = max_num_rewrites {
         builder = builder.add_attribute(
             MAX_NUM_REWRITES_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), max_num_rewrites),
-        );
+        )?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -362,7 +363,7 @@ pub fn apply_licm<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedApplyLoopInvariantCodeMotionOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::transform()?)?;
     OperationBuilder::new("transform.apply_licm", location)
-        .add_operand(target)
+        .add_operand(target)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -410,12 +411,12 @@ pub fn apply_registered_pass<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::transform()?)?;
     let mut builder = OperationBuilder::new("transform.apply_registered_pass", location)
-        .add_operand(target)
-        .add_operands(dynamic_options)
-        .add_result(result_type)
-        .add_attribute(PASS_NAME_ATTRIBUTE, context.string_attribute(pass_name));
+        .add_operand(target)?
+        .add_operands(dynamic_options)?
+        .add_result(result_type)?
+        .add_attribute(PASS_NAME_ATTRIBUTE, context.string_attribute(pass_name))?;
     if let Some(options) = options {
-        builder = builder.add_attribute(OPTIONS_ATTRIBUTE, options);
+        builder = builder.add_attribute(OPTIONS_ATTRIBUTE, options)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -448,8 +449,8 @@ pub fn cast<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedCastOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::transform()?)?;
     OperationBuilder::new("transform.cast", location)
-        .add_operand(input)
-        .add_result(output_type)
+        .add_operand(input)?
+        .add_result(output_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `transform::cast`"))
@@ -480,8 +481,8 @@ pub fn num_associations<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedNumAssociationsOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::transform()?)?;
     OperationBuilder::new("transform.num_associations", location)
-        .add_operand(handle)
-        .add_result(result_type)
+        .add_operand(handle)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -519,9 +520,9 @@ pub fn collect_matching<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::transform()?)?;
     OperationBuilder::new("transform.collect_matching", location)
-        .add_operand(root)
-        .add_results(result_types)
-        .add_attribute(MATCHER_ATTRIBUTE, context.flat_symbol_ref_attribute(matcher))
+        .add_operand(root)?
+        .add_results(result_types)?
+        .add_attribute(MATCHER_ATTRIBUTE, context.flat_symbol_ref_attribute(matcher))?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -585,16 +586,16 @@ pub fn foreach_match<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let action_attributes = actions.iter().map(|action| context.flat_symbol_ref_attribute(*action)).collect::<Vec<_>>();
     context.load_dialect(DialectHandle::transform()?)?;
     let mut builder = OperationBuilder::new("transform.foreach_match", location)
-        .add_operand(root)
-        .add_operands(forwarded_inputs)
-        .add_results(result_types)
-        .add_attribute(MATCHERS_ATTRIBUTE, context.array_attribute(&matcher_attributes))
-        .add_attribute(ACTIONS_ATTRIBUTE, context.array_attribute(&action_attributes));
+        .add_operand(root)?
+        .add_operands(forwarded_inputs)?
+        .add_results(result_types)?
+        .add_attribute(MATCHERS_ATTRIBUTE, context.array_attribute(&matcher_attributes))?
+        .add_attribute(ACTIONS_ATTRIBUTE, context.array_attribute(&action_attributes))?;
     if restrict_root {
-        builder = builder.add_attribute(RESTRICT_ROOT_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(RESTRICT_ROOT_ATTRIBUTE, context.unit_attribute())?;
     }
     if flatten_results {
-        builder = builder.add_attribute(FLATTEN_RESULTS_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(FLATTEN_RESULTS_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -638,11 +639,11 @@ pub fn foreach<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::transform()?)?;
     let mut builder = OperationBuilder::new("transform.foreach", location)
-        .add_operands(targets)
-        .add_results(result_types)
-        .add_region(body);
+        .add_operands(targets)?
+        .add_results(result_types)?
+        .add_region(body)?;
     if with_zip_shortest {
-        builder = builder.add_attribute(WITH_ZIP_SHORTEST_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(WITH_ZIP_SHORTEST_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `transform::foreach`"))
@@ -678,12 +679,12 @@ pub fn get_consumers_of_result<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::transform()?)?;
     OperationBuilder::new("transform.get_consumers_of_result", location)
-        .add_operand(target)
-        .add_result(result_type)
+        .add_operand(target)?
+        .add_result(result_type)?
         .add_attribute(
             RESULT_NUMBER_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), result_number),
-        )
+        )?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -711,8 +712,8 @@ pub fn get_defining_op<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedGetDefiningOpOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::transform()?)?;
     OperationBuilder::new("transform.get_defining_op", location)
-        .add_operand(target)
-        .add_result(result_type)
+        .add_operand(target)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -770,25 +771,25 @@ pub fn get_parent_op<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::transform()?)?;
     let mut builder = OperationBuilder::new("transform.get_parent_op", location)
-        .add_operand(target)
-        .add_result(result_type);
+        .add_operand(target)?
+        .add_result(result_type)?;
     if isolated_from_above {
-        builder = builder.add_attribute(ISOLATED_FROM_ABOVE_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(ISOLATED_FROM_ABOVE_ATTRIBUTE, context.unit_attribute())?;
     }
     if allow_empty_results {
-        builder = builder.add_attribute(ALLOW_EMPTY_RESULTS_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(ALLOW_EMPTY_RESULTS_ATTRIBUTE, context.unit_attribute())?;
     }
     if let Some(op_name) = op_name {
-        builder = builder.add_attribute(OP_NAME_ATTRIBUTE, context.string_attribute(op_name));
+        builder = builder.add_attribute(OP_NAME_ATTRIBUTE, context.string_attribute(op_name))?;
     }
     if deduplicate {
-        builder = builder.add_attribute(DEDUPLICATE_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(DEDUPLICATE_ATTRIBUTE, context.unit_attribute())?;
     }
     if let Some(nth_parent) = nth_parent {
         builder = builder.add_attribute(
             NTH_PARENT_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), nth_parent),
-        );
+        )?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -826,12 +827,12 @@ pub fn get_producer_of_operand<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::transform()?)?;
     OperationBuilder::new("transform.get_producer_of_operand", location)
-        .add_operand(target)
-        .add_result(result_type)
+        .add_operand(target)?
+        .add_result(result_type)?
         .add_attribute(
             OPERAND_NUMBER_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), operand_number),
-        )
+        )?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -877,14 +878,14 @@ pub fn get_operand<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::transform()?)?;
     let mut builder = OperationBuilder::new("transform.get_operand", location)
-        .add_operand(target)
-        .add_result(result_type)
-        .add_attribute(RAW_POSITION_LIST_ATTRIBUTE, context.dense_i64_array_attribute(positions)?);
+        .add_operand(target)?
+        .add_result(result_type)?
+        .add_attribute(RAW_POSITION_LIST_ATTRIBUTE, context.dense_i64_array_attribute(positions)?)?;
     if is_inverted {
-        builder = builder.add_attribute(IS_INVERTED_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(IS_INVERTED_ATTRIBUTE, context.unit_attribute())?;
     }
     if is_all {
-        builder = builder.add_attribute(IS_ALL_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(IS_ALL_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -921,14 +922,14 @@ pub fn get_result<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::transform()?)?;
     let mut builder = OperationBuilder::new("transform.get_result", location)
-        .add_operand(target)
-        .add_result(result_type)
-        .add_attribute(RAW_POSITION_LIST_ATTRIBUTE, context.dense_i64_array_attribute(positions)?);
+        .add_operand(target)?
+        .add_result(result_type)?
+        .add_attribute(RAW_POSITION_LIST_ATTRIBUTE, context.dense_i64_array_attribute(positions)?)?;
     if is_inverted {
-        builder = builder.add_attribute(IS_INVERTED_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(IS_INVERTED_ATTRIBUTE, context.unit_attribute())?;
     }
     if is_all {
-        builder = builder.add_attribute(IS_ALL_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(IS_ALL_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -965,9 +966,10 @@ pub fn get_type<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedGetTypeOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::transform()?)?;
-    let mut builder = OperationBuilder::new("transform.get_type", location).add_operand(value).add_result(result_type);
+    let mut builder =
+        OperationBuilder::new("transform.get_type", location).add_operand(value)?.add_result(result_type)?;
     if elemental {
-        builder = builder.add_attribute(ELEMENTAL_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(ELEMENTAL_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -1018,13 +1020,13 @@ pub fn include<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::transform()?)?;
     OperationBuilder::new("transform.include", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_attribute(TARGET_ATTRIBUTE, context.flat_symbol_ref_attribute(target))
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_attribute(TARGET_ATTRIBUTE, context.flat_symbol_ref_attribute(target))?
         .add_attribute(
             FAILURE_PROPAGATION_MODE_ATTRIBUTE,
             context.transform_failure_propagation_mode_attribute(failure_propagation_mode)?,
-        )
+        )?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `transform::include`"))
@@ -1052,7 +1054,7 @@ pub fn match_operation_empty<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedMatchOperationEmptyOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::transform()?)?;
     OperationBuilder::new("transform.match.operation_empty", location)
-        .add_operand(operand_handle)
+        .add_operand(operand_handle)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1085,8 +1087,8 @@ pub fn match_operation_name<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let op_name_attributes = op_names.iter().map(|op_name| context.string_attribute(*op_name)).collect::<Vec<_>>();
     context.load_dialect(DialectHandle::transform()?)?;
     OperationBuilder::new("transform.match.operation_name", location)
-        .add_operand(operand_handle)
-        .add_attribute(OP_NAMES_ATTRIBUTE, context.array_attribute(&op_name_attributes))
+        .add_operand(operand_handle)?
+        .add_attribute(OP_NAMES_ATTRIBUTE, context.array_attribute(&op_name_attributes))?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1138,9 +1140,9 @@ pub fn match_param_cmpi<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::transform()?)?;
     OperationBuilder::new("transform.match.param.cmpi", location)
-        .add_operand(param)
-        .add_operand(reference)
-        .add_attribute(PREDICATE_ATTRIBUTE, context.transform_match_cmp_i_predicate_attribute(predicate)?)
+        .add_operand(param)?
+        .add_operand(reference)?
+        .add_attribute(PREDICATE_ATTRIBUTE, context.transform_match_cmp_i_predicate_attribute(predicate)?)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1175,10 +1177,10 @@ pub fn merge_handles<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::transform()?)?;
     let mut builder = OperationBuilder::new("transform.merge_handles", location)
-        .add_operands(handles)
-        .add_result(result_type);
+        .add_operands(handles)?
+        .add_result(result_type)?;
     if deduplicate {
-        builder = builder.add_attribute(DEDUPLICATE_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(DEDUPLICATE_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -1214,9 +1216,9 @@ pub fn named_sequence<'c, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::transform()?)?;
     OperationBuilder::new("transform.named_sequence", location)
-        .add_attribute(SYMBOL_NAME_ATTRIBUTE, context.string_attribute(symbol_name))
-        .add_attribute(FUNCTION_TYPE_ATTRIBUTE, context.type_attribute(function_type))
-        .add_region(body)
+        .add_attribute(SYMBOL_NAME_ATTRIBUTE, context.string_attribute(symbol_name))?
+        .add_attribute(FUNCTION_TYPE_ATTRIBUTE, context.type_attribute(function_type))?
+        .add_region(body)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1257,19 +1259,19 @@ pub fn split_handle<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::transform()?)?;
     let mut builder = OperationBuilder::new("transform.split_handle", location)
-        .add_operand(handle)
-        .add_results(result_types);
+        .add_operand(handle)?
+        .add_results(result_types)?;
     if let Some(pass_through_empty_handle) = pass_through_empty_handle {
-        builder = builder.add_attribute(PASS_THROUGH_EMPTY_HANDLE_ATTRIBUTE, pass_through_empty_handle);
+        builder = builder.add_attribute(PASS_THROUGH_EMPTY_HANDLE_ATTRIBUTE, pass_through_empty_handle)?;
     }
     if let Some(fail_on_payload_too_small) = fail_on_payload_too_small {
-        builder = builder.add_attribute(FAIL_ON_PAYLOAD_TOO_SMALL_ATTRIBUTE, fail_on_payload_too_small);
+        builder = builder.add_attribute(FAIL_ON_PAYLOAD_TOO_SMALL_ATTRIBUTE, fail_on_payload_too_small)?;
     }
     if let Some(overflow_result) = overflow_result {
         builder = builder.add_attribute(
             OVERFLOW_RESULT_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), overflow_result),
-        );
+        )?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -1300,8 +1302,8 @@ pub fn param_constant<'c, 't: 'c, A: Attribute<'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedParamConstantOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::transform()?)?;
     OperationBuilder::new("transform.param.constant", location)
-        .add_attribute(VALUE_ATTRIBUTE, value)
-        .add_result(result_type)
+        .add_attribute(VALUE_ATTRIBUTE, value)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1343,19 +1345,19 @@ pub fn print<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::transform()?)?;
     let mut builder = OperationBuilder::new("transform.print", location);
     if let Some(target) = target {
-        builder = builder.add_operand(target);
+        builder = builder.add_operand(target)?;
     }
     if let Some(name) = name {
-        builder = builder.add_attribute(NAME_ATTRIBUTE, context.string_attribute(name));
+        builder = builder.add_attribute(NAME_ATTRIBUTE, context.string_attribute(name))?;
     }
     if assume_verified {
-        builder = builder.add_attribute(ASSUME_VERIFIED_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(ASSUME_VERIFIED_ATTRIBUTE, context.unit_attribute())?;
     }
     if use_local_scope {
-        builder = builder.add_attribute(USE_LOCAL_SCOPE_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(USE_LOCAL_SCOPE_ATTRIBUTE, context.unit_attribute())?;
     }
     if skip_regions {
-        builder = builder.add_attribute(SKIP_REGIONS_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(SKIP_REGIONS_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `transform::print`"))
@@ -1387,9 +1389,9 @@ pub fn replicate<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedReplicateOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::transform()?)?;
     OperationBuilder::new("transform.replicate", location)
-        .add_operand(pattern)
-        .add_operands(handles)
-        .add_results(result_types)
+        .add_operand(pattern)?
+        .add_operands(handles)?
+        .add_results(result_types)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1424,9 +1426,9 @@ pub fn select<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::transform()?)?;
     OperationBuilder::new("transform.select", location)
-        .add_operand(target)
-        .add_result(result_type)
-        .add_attribute(OP_NAME_ATTRIBUTE, context.string_attribute(op_name))
+        .add_operand(target)?
+        .add_result(result_type)?
+        .add_attribute(OP_NAME_ATTRIBUTE, context.string_attribute(op_name))?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `transform::select`"))
@@ -1475,20 +1477,20 @@ pub fn sequence<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::transform()?)?;
     let mut builder = OperationBuilder::new("transform.sequence", location)
-        .add_results(result_types)
+        .add_results(result_types)?
         .add_attribute(
             FAILURE_PROPAGATION_MODE_ATTRIBUTE,
             context.transform_failure_propagation_mode_attribute(failure_propagation_mode)?,
-        )
+        )?
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
             context.dense_i32_array_attribute(&[if root.is_some() { 1 } else { 0 }, extra_bindings.len() as i32])?,
-        )
-        .add_region(body);
+        )?
+        .add_region(body)?;
     if let Some(root) = root {
-        builder = builder.add_operand(root);
+        builder = builder.add_operand(root)?;
     }
-    builder = builder.add_operands(extra_bindings);
+    builder = builder.add_operands(extra_bindings)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -1514,7 +1516,7 @@ pub fn verify<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedVerifyOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::transform()?)?;
     OperationBuilder::new("transform.verify", location)
-        .add_operand(target)
+        .add_operand(target)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `transform::verify`"))
@@ -1542,7 +1544,7 @@ pub fn r#yield<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedYieldOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::transform()?)?;
     OperationBuilder::new("transform.yield", location)
-        .add_operands(operands)
+        .add_operands(operands)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `transform::yield`"))

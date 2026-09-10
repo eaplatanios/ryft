@@ -62,11 +62,11 @@ pub fn intr_vp_ashr<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_ASHR_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_ashr`"))
     })
@@ -132,11 +132,11 @@ pub fn intr_vp_add<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_ADD_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_add`"))
     })
@@ -202,11 +202,11 @@ pub fn intr_vp_and<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_AND_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_and`"))
     })
@@ -272,11 +272,11 @@ pub fn intr_vp_fadd<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_FADD_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_fadd`"))
     })
@@ -342,11 +342,11 @@ pub fn intr_vp_fdiv<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_FDIV_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_fdiv`"))
     })
@@ -419,12 +419,12 @@ pub fn intr_vp_fmuladd<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_FMUL_ADD_OPERATION_NAME, location);
-    builder = builder.add_operand(first);
-    builder = builder.add_operand(second);
-    builder = builder.add_operand(third);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(first)?;
+    builder = builder.add_operand(second)?;
+    builder = builder.add_operand(third)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -492,11 +492,11 @@ pub fn intr_vp_fmul<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_FMUL_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_fmul`"))
     })
@@ -555,10 +555,10 @@ pub fn intr_vp_fneg<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_FNEG_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_fneg`"))
     })
@@ -617,10 +617,10 @@ pub fn intr_vp_fpext<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_FPEXT_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -681,10 +681,10 @@ pub fn intr_vp_fptosi<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_FPTO_SI_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -745,10 +745,10 @@ pub fn intr_vp_fptoui<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_FPTO_UI_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -809,10 +809,10 @@ pub fn intr_vp_fptrunc<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_FPTRUNC_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -880,11 +880,11 @@ pub fn intr_vp_frem<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_FREM_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_frem`"))
     })
@@ -950,11 +950,11 @@ pub fn intr_vp_fsub<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_FSUB_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_fsub`"))
     })
@@ -1027,12 +1027,12 @@ pub fn intr_vp_fma<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_FMA_OPERATION_NAME, location);
-    builder = builder.add_operand(first);
-    builder = builder.add_operand(second);
-    builder = builder.add_operand(third);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(first)?;
+    builder = builder.add_operand(second)?;
+    builder = builder.add_operand(third)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_fma`"))
     })
@@ -1091,10 +1091,10 @@ pub fn intr_vp_inttoptr<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_INT_TO_PTR_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -1162,11 +1162,11 @@ pub fn intr_vp_lshr<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_LSHR_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_lshr`"))
     })
@@ -1225,10 +1225,10 @@ pub fn intr_vp_load<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_LOAD_OPERATION_NAME, location);
-    builder = builder.add_operand(pointer);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(pointer)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_load`"))
     })
@@ -1294,11 +1294,11 @@ pub fn intr_vp_merge<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_MERGE_MIN_OPERATION_NAME, location);
-    builder = builder.add_operand(condition);
-    builder = builder.add_operand(true_value);
-    builder = builder.add_operand(false_value);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(condition)?;
+    builder = builder.add_operand(true_value)?;
+    builder = builder.add_operand(false_value)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -1366,11 +1366,11 @@ pub fn intr_vp_mul<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_MUL_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_mul`"))
     })
@@ -1436,11 +1436,11 @@ pub fn intr_vp_or<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_OR_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_or`"))
     })
@@ -1499,10 +1499,10 @@ pub fn intr_vp_ptrtoint<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_PTR_TO_INT_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -1570,11 +1570,11 @@ pub fn intr_vp_reduce_add<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_REDUCE_ADD_OPERATION_NAME, location);
-    builder = builder.add_operand(start_value);
-    builder = builder.add_operand(value);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(start_value)?;
+    builder = builder.add_operand(value)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -1642,11 +1642,11 @@ pub fn intr_vp_reduce_and<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_REDUCE_AND_OPERATION_NAME, location);
-    builder = builder.add_operand(start_value);
-    builder = builder.add_operand(value);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(start_value)?;
+    builder = builder.add_operand(value)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -1714,11 +1714,11 @@ pub fn intr_vp_reduce_fadd<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_REDUCE_FADD_OPERATION_NAME, location);
-    builder = builder.add_operand(start_value);
-    builder = builder.add_operand(value);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(start_value)?;
+    builder = builder.add_operand(value)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -1786,11 +1786,11 @@ pub fn intr_vp_reduce_fmax<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_REDUCE_FMAX_OPERATION_NAME, location);
-    builder = builder.add_operand(start_value);
-    builder = builder.add_operand(value);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(start_value)?;
+    builder = builder.add_operand(value)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -1858,11 +1858,11 @@ pub fn intr_vp_reduce_fmin<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_REDUCE_FMIN_OPERATION_NAME, location);
-    builder = builder.add_operand(start_value);
-    builder = builder.add_operand(value);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(start_value)?;
+    builder = builder.add_operand(value)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -1930,11 +1930,11 @@ pub fn intr_vp_reduce_fmul<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_REDUCE_FMUL_OPERATION_NAME, location);
-    builder = builder.add_operand(start_value);
-    builder = builder.add_operand(value);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(start_value)?;
+    builder = builder.add_operand(value)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -2002,11 +2002,11 @@ pub fn intr_vp_reduce_mul<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_REDUCE_MUL_OPERATION_NAME, location);
-    builder = builder.add_operand(start_value);
-    builder = builder.add_operand(value);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(start_value)?;
+    builder = builder.add_operand(value)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -2074,11 +2074,11 @@ pub fn intr_vp_reduce_or<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_REDUCE_OR_OPERATION_NAME, location);
-    builder = builder.add_operand(start_value);
-    builder = builder.add_operand(value);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(start_value)?;
+    builder = builder.add_operand(value)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -2146,11 +2146,11 @@ pub fn intr_vp_reduce_smax<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_REDUCE_SMAX_OPERATION_NAME, location);
-    builder = builder.add_operand(start_value);
-    builder = builder.add_operand(value);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(start_value)?;
+    builder = builder.add_operand(value)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -2218,11 +2218,11 @@ pub fn intr_vp_reduce_smin<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_REDUCE_SMIN_OPERATION_NAME, location);
-    builder = builder.add_operand(start_value);
-    builder = builder.add_operand(value);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(start_value)?;
+    builder = builder.add_operand(value)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -2290,11 +2290,11 @@ pub fn intr_vp_reduce_umax<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_REDUCE_UMAX_OPERATION_NAME, location);
-    builder = builder.add_operand(start_value);
-    builder = builder.add_operand(value);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(start_value)?;
+    builder = builder.add_operand(value)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -2362,11 +2362,11 @@ pub fn intr_vp_reduce_umin<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_REDUCE_UMIN_OPERATION_NAME, location);
-    builder = builder.add_operand(start_value);
-    builder = builder.add_operand(value);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(start_value)?;
+    builder = builder.add_operand(value)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -2434,11 +2434,11 @@ pub fn intr_vp_reduce_xor<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_REDUCE_XOR_OPERATION_NAME, location);
-    builder = builder.add_operand(start_value);
-    builder = builder.add_operand(value);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(start_value)?;
+    builder = builder.add_operand(value)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -2506,11 +2506,11 @@ pub fn intr_vp_sdiv<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_SDIV_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_sdiv`"))
     })
@@ -2569,10 +2569,10 @@ pub fn intr_vp_sext<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_SEXT_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_sext`"))
     })
@@ -2631,10 +2631,10 @@ pub fn intr_vp_sitofp<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_SITO_FP_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -2702,11 +2702,11 @@ pub fn intr_vp_smax<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_SMAX_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_smax`"))
     })
@@ -2772,11 +2772,11 @@ pub fn intr_vp_smin<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_SMIN_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_smin`"))
     })
@@ -2842,11 +2842,11 @@ pub fn intr_vp_srem<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_SREM_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_srem`"))
     })
@@ -2912,11 +2912,11 @@ pub fn intr_vp_select<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_SELECT_MIN_OPERATION_NAME, location);
-    builder = builder.add_operand(condition);
-    builder = builder.add_operand(true_value);
-    builder = builder.add_operand(false_value);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(condition)?;
+    builder = builder.add_operand(true_value)?;
+    builder = builder.add_operand(false_value)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -2984,11 +2984,11 @@ pub fn intr_vp_shl<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_SHL_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_shl`"))
     })
@@ -3047,10 +3047,10 @@ pub fn intr_vp_store<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_STORE_OPERATION_NAME, location);
-    builder = builder.add_operand(value);
-    builder = builder.add_operand(pointer);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
+    builder = builder.add_operand(value)?;
+    builder = builder.add_operand(pointer)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -3118,11 +3118,11 @@ pub fn intr_experimental_vp_strided_load<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_STRIDED_LOAD_OPERATION_NAME, location);
-    builder = builder.add_operand(pointer);
-    builder = builder.add_operand(stride);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(pointer)?;
+    builder = builder.add_operand(stride)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -3190,11 +3190,11 @@ pub fn intr_experimental_vp_strided_store<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_STRIDED_STORE_OPERATION_NAME, location);
-    builder = builder.add_operand(value);
-    builder = builder.add_operand(pointer);
-    builder = builder.add_operand(stride);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
+    builder = builder.add_operand(value)?;
+    builder = builder.add_operand(pointer)?;
+    builder = builder.add_operand(stride)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -3262,11 +3262,11 @@ pub fn intr_vp_sub<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_SUB_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_sub`"))
     })
@@ -3325,10 +3325,10 @@ pub fn intr_vp_trunc<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_TRUNC_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -3396,11 +3396,11 @@ pub fn intr_vp_udiv<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_UDIV_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_udiv`"))
     })
@@ -3459,10 +3459,10 @@ pub fn intr_vp_uitofp<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_UITO_FP_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -3530,11 +3530,11 @@ pub fn intr_vp_umax<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_UMAX_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_umax`"))
     })
@@ -3600,11 +3600,11 @@ pub fn intr_vp_umin<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_UMIN_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_umin`"))
     })
@@ -3670,11 +3670,11 @@ pub fn intr_vp_urem<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_UREM_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_urem`"))
     })
@@ -3740,11 +3740,11 @@ pub fn intr_vp_xor<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_XOR_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_xor`"))
     })
@@ -3803,10 +3803,10 @@ pub fn intr_vp_zext<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VP_ZEXT_OPERATION_NAME, location);
-    builder = builder.add_operand(input);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(explicit_vector_length);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(input)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(explicit_vector_length)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_vp_zext`"))
     })

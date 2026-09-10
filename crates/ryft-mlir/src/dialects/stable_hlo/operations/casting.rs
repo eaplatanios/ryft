@@ -62,8 +62,8 @@ pub fn bitcast_convert<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>
 ) -> Result<DetachedBitcastConvertOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.bitcast_convert", location)
-        .add_operand(input)
-        .add_result(output_type)
+        .add_operand(input)?
+        .add_result(output_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -125,8 +125,8 @@ pub fn convert<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: Loc
 ) -> Result<DetachedConvertOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.convert", location)
-        .add_operand(input)
-        .add_result(output_type)
+        .add_operand(input)?
+        .add_result(output_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -187,8 +187,8 @@ pub fn uniform_dequantize<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 
 ) -> Result<DetachedUniformDequantizeOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.uniform_dequantize", location)
-        .add_operand(input)
-        .add_result(output_type)
+        .add_operand(input)?
+        .add_result(output_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -249,8 +249,8 @@ pub fn uniform_quantize<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't
 ) -> Result<DetachedUniformQuantizeOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.uniform_quantize", location)
-        .add_operand(input)
-        .add_result(output_type)
+        .add_operand(input)?
+        .add_result(output_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -345,15 +345,15 @@ pub fn reduce_precision<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.reduce_precision", location)
-        .add_operand(input)
+        .add_operand(input)?
         .add_attribute(
             REDUCE_PRECISION_EXPONENT_BITS_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(32), exponent_bits as i64),
-        )
+        )?
         .add_attribute(
             REDUCE_PRECISION_MANTISSA_BITS_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(32), mantissa_bits as i64),
-        )
+        )?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {

@@ -1494,6 +1494,7 @@ mod tests {
         let location = context.unknown_location();
         let mut op = OperationBuilder::new("foo", location)
             .add_attribute("foo", context.string_attribute("bar"))
+            .unwrap()
             .build()
             .unwrap();
         assert!(op.attribute("foo").unwrap().is_some());
@@ -1705,8 +1706,11 @@ mod tests {
         let argument_0 = block.argument(0).unwrap().as_ref();
         let op = OperationBuilder::new("foo", context.unknown_location())
             .add_operand(argument_0)
+            .unwrap()
             .add_operand(argument_0)
+            .unwrap()
             .add_operand(argument_0)
+            .unwrap()
             .build()
             .unwrap();
         assert_eq!(op.operand(0).unwrap().value().unwrap(), argument_0);
@@ -1753,8 +1757,11 @@ mod tests {
         // Try replacing all uses of one value inside an operation.
         let mut op = OperationBuilder::new("foo", context.unknown_location())
             .add_operand(argument_0)
+            .unwrap()
             .add_operand(argument_2)
+            .unwrap()
             .add_operand(argument_0)
+            .unwrap()
             .build()
             .unwrap();
         unsafe { op.replace_uses_of_with(argument_0, argument_2) };
@@ -1776,7 +1783,11 @@ mod tests {
         assert!(op.result(0).is_err());
 
         // Operation with two results.
-        let op = OperationBuilder::new("test.op", location).add_results(&[i32_type, i64_type]).build().unwrap();
+        let op = OperationBuilder::new("test.op", location)
+            .add_results(&[i32_type, i64_type])
+            .unwrap()
+            .build()
+            .unwrap();
         assert_eq!(op.result_count(), 2);
         assert!(op.result(0).is_ok());
         assert!(op.result(1).is_ok());
@@ -1807,8 +1818,11 @@ mod tests {
         let region_2 = context.region();
         let op = OperationBuilder::new("foo", location)
             .add_region(region_0)
+            .unwrap()
             .add_region(region_1)
+            .unwrap()
             .add_region(region_2)
+            .unwrap()
             .build()
             .unwrap();
         assert!(!op.is_empty());
@@ -1828,7 +1842,11 @@ mod tests {
         let block_0 = context.block_with_no_arguments();
         let block_1 = context.block_with_no_arguments();
         let block_2 = context.block_with_no_arguments();
-        let op = OperationBuilder::new("test.op", location).add_successors(&[&block_0, &block_1]).build().unwrap();
+        let op = OperationBuilder::new("test.op", location)
+            .add_successors(&[&block_0, &block_1])
+            .unwrap()
+            .build()
+            .unwrap();
         assert_eq!(op.successor_count(), 2);
         assert!(op.successor(0).is_ok());
         assert!(op.successor(1).is_ok());
@@ -1860,11 +1878,13 @@ mod tests {
         let mut block = context.block_with_no_arguments();
         let op = OperationBuilder::new("foo", location)
             .add_results(&[context.index_type()])
+            .unwrap()
             .add_region({
                 let mut block = context.block_with_no_arguments();
                 block.append_operation(OperationBuilder::new("bar", location).build().unwrap()).unwrap();
                 block.try_into().unwrap()
             })
+            .unwrap()
             .build()
             .unwrap();
         let op = block.append_operation(op).unwrap();
@@ -1945,12 +1965,14 @@ mod tests {
             .append_operation(
                 OperationBuilder::new("parent", location)
                     .add_results(&[context.index_type()])
+                    .unwrap()
                     .add_region({
                         let mut block = context.block_with_no_arguments();
                         block.append_operation(OperationBuilder::new("child_0", location).build().unwrap()).unwrap();
                         block.append_operation(OperationBuilder::new("child_1", location).build().unwrap()).unwrap();
                         block.try_into().unwrap()
                     })
+                    .unwrap()
                     .build()
                     .unwrap(),
             )
@@ -2006,12 +2028,14 @@ mod tests {
                                             .unwrap();
                                         block.try_into().unwrap()
                                     })
+                                    .unwrap()
                                     .build()
                                     .unwrap(),
                             )
                             .unwrap();
                         block.try_into().unwrap()
                     })
+                    .unwrap()
                     .build()
                     .unwrap(),
             )
@@ -2135,6 +2159,7 @@ mod tests {
         let location = context.unknown_location();
         let op_0 = OperationBuilder::new("test.op", location)
             .add_attribute("key", context.string_attribute("value"))
+            .unwrap()
             .build()
             .unwrap();
         let op_1 = op_0.clone();

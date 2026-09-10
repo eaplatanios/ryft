@@ -52,11 +52,11 @@ pub fn get_dimension_size<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.get_dimension_size", location)
-        .add_operand(input)
+        .add_operand(input)?
         .add_attribute(
             GET_DIMENSION_SIZE_DIMENSION_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), dimension as i64),
-        )
+        )?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -130,13 +130,13 @@ pub fn set_dimension_size<
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.set_dimension_size", location)
-        .add_operand(input)
-        .add_operand(size)
+        .add_operand(input)?
+        .add_operand(size)?
         .add_attribute(
             SET_DIMENSION_SIZE_DIMENSION_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), dimension as i64),
-        )
-        .add_result(output_type)
+        )?
+        .add_result(output_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -198,13 +198,13 @@ pub fn transpose<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedTransposeOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.transpose", location)
-        .add_operand(input)
+        .add_operand(input)?
         .add_attribute(
             TRANSPOSE_PERMUTATION_ATTRIBUTE,
             location
                 .context()
                 .dense_i64_array_attribute(permutation.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
-        )
+        )?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -279,8 +279,8 @@ pub fn reshape_with_output_type<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Loc
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.reshape", location)
-        .add_operand(input)
-        .add_result(output_type)
+        .add_operand(input)?
+        .add_result(output_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -383,13 +383,13 @@ pub fn dynamic_reshape<
         .transpose()?
         .map(|attribute| attribute.as_ref());
     OperationBuilder::new("stablehlo.dynamic_reshape", location)
-        .add_operand(input)
-        .add_operand(shape)
+        .add_operand(input)?
+        .add_operand(shape)?
         .add_result(
             context.tensor_type(element_type, output_shape.as_slice(), output_encoding, location).map_err(|_| {
                 Error::invalid_argument("failed to infer result type for `stable_hlo::dynamic_reshape`")
             })?,
-        )
+        )?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -477,12 +477,12 @@ pub fn broadcast<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: L
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.broadcast_in_dim", location)
-        .add_operand(input)
+        .add_operand(input)?
         .add_attribute(
             BROADCAST_DIMENSIONS_ATTRIBUTE,
             context.dense_i64_array_attribute(dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
-        )
-        .add_result(output_type)
+        )?
+        .add_result(output_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -644,19 +644,19 @@ pub fn dynamic_broadcast<
         })?;
     let output_shape = (0..output_rank).map(|_| Size::Dynamic).collect::<Vec<_>>();
     let mut builder = OperationBuilder::new("stablehlo.dynamic_broadcast_in_dim", location)
-        .add_operand(input)
-        .add_operand(shape)
+        .add_operand(input)?
+        .add_operand(shape)?
         .add_attribute(
             BROADCAST_DIMENSIONS_ATTRIBUTE,
             context.dense_i64_array_attribute(dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
-        );
+        )?;
     if let Some(known_expanding_dimensions) = known_expanding_dimensions {
         builder = builder.add_attribute(
             DYNAMIC_BROADCAST_KNOWN_EXPANDING_DIMENSIONS_ATTRIBUTE,
             context.dense_i64_array_attribute(
                 known_expanding_dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice(),
             )?,
-        );
+        )?;
     }
     if let Some(known_non_expanding_dimensions) = known_non_expanding_dimensions {
         builder = builder.add_attribute(
@@ -664,10 +664,10 @@ pub fn dynamic_broadcast<
             context.dense_i64_array_attribute(
                 known_non_expanding_dimensions.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice(),
             )?,
-        );
+        )?;
     }
     builder
-        .add_result(context.tensor_type(element_type, output_shape.as_slice(), None, location)?)
+        .add_result(context.tensor_type(element_type, output_shape.as_slice(), None, location)?)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -797,11 +797,11 @@ pub fn pad<
         })
         .collect::<Result<Vec<_>, _>>()?;
     OperationBuilder::new("stablehlo.pad", location)
-        .add_operand(input)
-        .add_operand(padding_value)
-        .add_attribute(EDGE_PADDING_LOW_ATTRIBUTE, context.dense_i64_array_attribute(edge_padding_low)?)
-        .add_attribute(EDGE_PADDING_HIGH_ATTRIBUTE, context.dense_i64_array_attribute(edge_padding_high)?)
-        .add_attribute(INTERIOR_PADDING_ATTRIBUTE, context.dense_i64_array_attribute(interior_padding.as_slice())?)
+        .add_operand(input)?
+        .add_operand(padding_value)?
+        .add_attribute(EDGE_PADDING_LOW_ATTRIBUTE, context.dense_i64_array_attribute(edge_padding_low)?)?
+        .add_attribute(EDGE_PADDING_HIGH_ATTRIBUTE, context.dense_i64_array_attribute(edge_padding_high)?)?
+        .add_attribute(INTERIOR_PADDING_ATTRIBUTE, context.dense_i64_array_attribute(interior_padding.as_slice())?)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -901,12 +901,12 @@ pub fn dynamic_pad<
 ) -> Result<DetachedDynamicPadOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.dynamic_pad", location)
-        .add_operand(input)
-        .add_operand(padding_value)
-        .add_operand(edge_padding_low)
-        .add_operand(edge_padding_high)
-        .add_operand(interior_padding)
-        .add_result(output_type)
+        .add_operand(input)?
+        .add_operand(padding_value)?
+        .add_operand(edge_padding_low)?
+        .add_operand(edge_padding_high)?
+        .add_operand(interior_padding)?
+        .add_result(output_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -969,11 +969,11 @@ pub fn concatenate<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.concatenate", location)
-        .add_operands(inputs)
+        .add_operands(inputs)?
         .add_attribute(
             CONCATENATE_DIMENSION_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), dimension as i64),
-        )
+        )?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -1068,21 +1068,21 @@ pub fn slice<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.slice", location)
-        .add_operand(input)
+        .add_operand(input)?
         .add_attribute(
             SLICE_START_INDICES_ATTRIBUTE,
             context
                 .dense_i64_array_attribute(start_indices.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
-        )
+        )?
         .add_attribute(
             SLICE_LIMIT_INDICES_ATTRIBUTE,
             context
                 .dense_i64_array_attribute(limit_indices.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
-        )
+        )?
         .add_attribute(
             SLICE_STRIDES_ATTRIBUTE,
             context.dense_i64_array_attribute(strides.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
-        )
+        )?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -1166,14 +1166,14 @@ pub fn dynamic_slice<'v, 'i, 'c: 'v + 'i, 't: 'c, V: Value<'v, 'c, 't>, I: Value
 ) -> Result<DetachedDynamicSliceOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.dynamic_slice", location)
-        .add_operand(input)
-        .add_operands(start_indices)
+        .add_operand(input)?
+        .add_operands(start_indices)?
         .add_attribute(
             DYNAMIC_SLICE_SLICE_SIZES_ATTRIBUTE,
             location
                 .context()
                 .dense_i64_array_attribute(slice_sizes.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
-        )
+        )?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -1238,11 +1238,11 @@ pub fn real_dynamic_slice<
 ) -> Result<DetachedRealDynamicSliceOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.real_dynamic_slice", location)
-        .add_operand(input)
-        .add_operand(start_indices)
-        .add_operand(limit_indices)
-        .add_operand(strides)
-        .add_result(output_type)
+        .add_operand(input)?
+        .add_operand(start_indices)?
+        .add_operand(limit_indices)?
+        .add_operand(strides)?
+        .add_result(output_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1334,7 +1334,7 @@ pub fn dynamic_update_slice<
     let mut operands = vec![operand.as_ref(), update.as_ref()];
     operands.extend(start_indices.iter().map(|v| v.as_ref()));
     OperationBuilder::new("stablehlo.dynamic_update_slice", location)
-        .add_operands(&operands)
+        .add_operands(&operands)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -1585,14 +1585,14 @@ pub fn gather<'v, 'i, 'c: 'v + 'i, 't: 'c, V: Value<'v, 'c, 't>, I: Value<'i, 'c
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.gather", location)
-        .add_operand(input)
-        .add_operand(start_indices)
-        .add_attribute(GATHER_DIMENSIONS_ATTRIBUTE, dimensions)
+        .add_operand(input)?
+        .add_operand(start_indices)?
+        .add_attribute(GATHER_DIMENSIONS_ATTRIBUTE, dimensions)?
         .add_attribute(
             GATHER_SLICE_SIZES_ATTRIBUTE,
             context.dense_i64_array_attribute(slice_sizes.iter().map(|v| *v as i64).collect::<Vec<_>>().as_slice())?,
-        )
-        .add_attribute(GATHER_INDICES_ARE_SORTED_ATTRIBUTE, context.boolean_attribute(indices_are_sorted))
+        )?
+        .add_attribute(GATHER_INDICES_ARE_SORTED_ATTRIBUTE, context.boolean_attribute(indices_are_sorted))?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -1711,12 +1711,12 @@ pub fn dynamic_gather<
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.dynamic_gather", location)
-        .add_operand(input)
-        .add_operand(start_indices)
-        .add_operand(slice_sizes)
-        .add_attribute(GATHER_DIMENSIONS_ATTRIBUTE, dimensions)
-        .add_attribute(GATHER_INDICES_ARE_SORTED_ATTRIBUTE, context.boolean_attribute(indices_are_sorted))
-        .add_result(output_type)
+        .add_operand(input)?
+        .add_operand(start_indices)?
+        .add_operand(slice_sizes)?
+        .add_attribute(GATHER_DIMENSIONS_ATTRIBUTE, dimensions)?
+        .add_attribute(GATHER_INDICES_ARE_SORTED_ATTRIBUTE, context.boolean_attribute(indices_are_sorted))?
+        .add_result(output_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1999,13 +1999,13 @@ pub fn scatter<
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.scatter", location)
-        .add_operands(inputs)
-        .add_operand(scatter_indices)
-        .add_operands(updates)
-        .add_attribute(SCATTER_DIMENSIONS_ATTRIBUTE, dimensions)
-        .add_attribute(SCATTER_INDICES_ARE_SORTED_ATTRIBUTE, context.boolean_attribute(indices_are_sorted))
-        .add_attribute(SCATTER_UNIQUE_INDICES_ATTRIBUTE, context.boolean_attribute(unique_indices))
-        .add_region(computation)
+        .add_operands(inputs)?
+        .add_operand(scatter_indices)?
+        .add_operands(updates)?
+        .add_attribute(SCATTER_DIMENSIONS_ATTRIBUTE, dimensions)?
+        .add_attribute(SCATTER_INDICES_ARE_SORTED_ATTRIBUTE, context.boolean_attribute(indices_are_sorted))?
+        .add_attribute(SCATTER_UNIQUE_INDICES_ATTRIBUTE, context.boolean_attribute(unique_indices))?
+        .add_region(computation)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -2140,16 +2140,16 @@ pub fn select_and_scatter<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     let mut builder = OperationBuilder::new("stablehlo.select_and_scatter", location)
-        .add_operand(input)
-        .add_operand(source)
-        .add_operand(initial_value);
+        .add_operand(input)?
+        .add_operand(source)?
+        .add_operand(initial_value)?;
     if let Some(window_dimensions) = window_dimensions {
         builder = builder.add_attribute(
             SELECT_AND_SCATTER_WINDOW_DIMENSIONS_ATTRIBUTE,
             context.dense_i64_array_attribute(
                 window_dimensions.iter().map(|value| *value as i64).collect::<Vec<_>>().as_slice(),
             )?,
-        );
+        )?;
     }
     if let Some(window_strides) = window_strides {
         builder = builder.add_attribute(
@@ -2157,21 +2157,18 @@ pub fn select_and_scatter<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<
             context.dense_i64_array_attribute(
                 window_strides.iter().map(|value| *value as i64).collect::<Vec<_>>().as_slice(),
             )?,
-        );
+        )?;
     }
     if let Some(padding) = padding {
-        builder = builder.add_attribute(PADDING_ATTRIBUTE, context.stable_hlo_padding(padding, location)?);
+        builder = builder.add_attribute(PADDING_ATTRIBUTE, context.stable_hlo_padding(padding, location)?)?;
     }
-    builder
-        .add_region(select)
-        .add_region(scatter)
-        .enable_result_type_inference()
-        .build()
-        .and_then(|operation| unsafe {
+    builder.add_region(select)?.add_region(scatter)?.enable_result_type_inference().build().and_then(
+        |operation| unsafe {
             operation
                 .cast()
                 .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::select_and_scatter`"))
-        })
+        },
+    )
 }
 
 #[cfg(test)]

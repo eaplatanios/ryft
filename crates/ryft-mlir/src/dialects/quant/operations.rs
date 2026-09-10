@@ -34,8 +34,8 @@ pub fn qcast<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: Locat
 ) -> Result<DetachedQCastOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::quant()?)?;
     OperationBuilder::new("quant.qcast", location)
-        .add_operand(input)
-        .add_result(output_type)
+        .add_operand(input)?
+        .add_result(output_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `quant::qcast`"))
@@ -74,8 +74,8 @@ pub fn dcast<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: Locat
 ) -> Result<DetachedDCastOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::quant()?)?;
     OperationBuilder::new("quant.dcast", location)
-        .add_operand(input)
-        .add_result(output_type)
+        .add_operand(input)?
+        .add_result(output_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `quant::dcast`"))
@@ -114,8 +114,8 @@ pub fn scast<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: Locat
 ) -> Result<DetachedSCastOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::quant()?)?;
     OperationBuilder::new("quant.scast", location)
-        .add_operand(input)
-        .add_result(output_type)
+        .add_operand(input)?
+        .add_result(output_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `quant::scast`"))

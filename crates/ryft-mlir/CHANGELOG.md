@@ -51,6 +51,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- Changed all `OperationBuilder::add_*` functions to return `Result<Self, Error>` and report context mismatches
+  immediately. Callers must now handle each addition's result (for example, using `?` in builder chains). A failed
+  addition consumes the builder and destroys its owned regions, including any rejected regions passed to that addition.
 - Updated the StableHLO `composite` operation to support regions.
 - Updated StableHLO `collective_broadcast` to accept multiple data tensors and optional dynamic roots. Both new
   collective root APIs exclude the root-index tensor from their inferred results.

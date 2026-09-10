@@ -233,7 +233,7 @@ pub fn after_all<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedAfterAllOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.after_all", location)
-        .add_operands(inputs)
+        .add_operands(inputs)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -415,18 +415,18 @@ pub fn send<'v, 'k, 'c: 'v + 'k, 't: 'c, V: Value<'v, 'c, 't>, K: Value<'k, 'c, 
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     let mut builder = OperationBuilder::new("stablehlo.send", location)
-        .add_operands(inputs)
-        .add_operand(token)
+        .add_operands(inputs)?
+        .add_operand(token)?
         .add_attribute(
             COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE,
             context.stable_hlo_channel_handle(Some(channel_id), channel_type)?,
-        )
-        .add_attribute(SEND_RECV_IS_HOST_TRANSFER_ATTRIBUTE, context.boolean_attribute(is_host_transfer));
+        )?
+        .add_attribute(SEND_RECV_IS_HOST_TRANSFER_ATTRIBUTE, context.boolean_attribute(is_host_transfer))?;
     if let Some(source_target_pairs) = source_target_pairs {
         builder = builder.add_attribute(
             COLLECTIVE_SOURCE_TARGET_PAIRS_ATTRIBUTE,
             context.stable_hlo_source_target_pairs_attribute(source_target_pairs, location)?,
-        );
+        )?;
     }
     builder.enable_result_type_inference().build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::send`"))
@@ -486,19 +486,19 @@ pub fn recv<'k, 'c: 'k, 't: 'c, K: Value<'k, 'c, 't>, T: Type<'c, 't>, L: Locati
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     let mut builder = OperationBuilder::new("stablehlo.recv", location)
-        .add_operand(token)
+        .add_operand(token)?
         .add_attribute(
             COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE,
             context.stable_hlo_channel_handle(Some(channel_id), channel_type)?,
-        )
-        .add_attribute(SEND_RECV_IS_HOST_TRANSFER_ATTRIBUTE, context.boolean_attribute(is_host_transfer));
+        )?
+        .add_attribute(SEND_RECV_IS_HOST_TRANSFER_ATTRIBUTE, context.boolean_attribute(is_host_transfer))?;
     if let Some(source_target_pairs) = source_target_pairs {
         builder = builder.add_attribute(
             COLLECTIVE_SOURCE_TARGET_PAIRS_ATTRIBUTE,
             context.stable_hlo_source_target_pairs_attribute(source_target_pairs, location)?,
-        );
+        )?;
     }
-    builder.add_results(output_types).add_result(context.stable_hlo_token_type()?).build().and_then(
+    builder.add_results(output_types)?.add_result(context.stable_hlo_token_type()?)?.build().and_then(
         |operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::recv`"))
         },
@@ -558,9 +558,9 @@ pub fn outfeed<
 ) -> Result<DetachedOutfeedOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.outfeed", location)
-        .add_operands(inputs)
-        .add_operand(token)
-        .add_attribute(OUTFEED_CONFIG_ATTRIBUTE, configuration.try_into_with_context(location.context())?)
+        .add_operands(inputs)?
+        .add_operand(token)?
+        .add_attribute(OUTFEED_CONFIG_ATTRIBUTE, configuration.try_into_with_context(location.context())?)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -625,10 +625,10 @@ pub fn infeed<
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.infeed", location)
-        .add_operand(token)
-        .add_attribute(INFEED_CONFIG_ATTRIBUTE, configuration.try_into_with_context(context)?)
-        .add_results(output_types)
-        .add_result(context.stable_hlo_token_type()?)
+        .add_operand(token)?
+        .add_attribute(INFEED_CONFIG_ATTRIBUTE, configuration.try_into_with_context(context)?)?
+        .add_results(output_types)?
+        .add_result(context.stable_hlo_token_type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::infeed`"))
@@ -826,21 +826,24 @@ pub fn all_gather<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: 
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     let i64_type = context.signless_integer_type(64);
     let mut builder = OperationBuilder::new("stablehlo.all_gather", location)
-        .add_operands(inputs)
-        .add_attribute(ALL_GATHER_DIMENSION_ATTRIBUTE, context.integer_attribute(i64_type, all_gather_dimension as i64))
-        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location)?);
+        .add_operands(inputs)?
+        .add_attribute(
+            ALL_GATHER_DIMENSION_ATTRIBUTE,
+            context.integer_attribute(i64_type, all_gather_dimension as i64),
+        )?
+        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location)?)?;
     if let Some(channel_id) = channel_id {
         let channel_type = channel_type
             .ok_or_else(|| Error::invalid_argument("channel type is required when channel id is provided"))?;
         builder = builder.add_attribute(
             COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE,
             context.stable_hlo_channel_handle(Some(channel_id), channel_type)?,
-        );
+        )?;
     }
     if use_global_device_ids {
-        builder = builder.add_attribute(COLLECTIVE_USE_GLOBAL_DEVICE_IDS_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(COLLECTIVE_USE_GLOBAL_DEVICE_IDS_ATTRIBUTE, context.unit_attribute())?;
     }
-    builder.add_results(output_types).build().and_then(|operation| unsafe {
+    builder.add_results(output_types)?.build().and_then(|operation| unsafe {
         operation
             .cast()
             .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::all_gather`"))
@@ -912,24 +915,28 @@ pub fn all_reduce<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     let mut builder = OperationBuilder::new("stablehlo.all_reduce", location)
-        .add_operands(inputs)
-        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location)?);
+        .add_operands(inputs)?
+        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location)?)?;
     if let Some(channel_id) = channel_id {
         let channel_type = channel_type
             .ok_or_else(|| Error::invalid_argument("channel type is required when channel id is provided"))?;
         builder = builder.add_attribute(
             COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE,
             context.stable_hlo_channel_handle(Some(channel_id), channel_type)?,
-        );
+        )?;
     }
     if use_global_device_ids {
-        builder = builder.add_attribute(COLLECTIVE_USE_GLOBAL_DEVICE_IDS_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(COLLECTIVE_USE_GLOBAL_DEVICE_IDS_ATTRIBUTE, context.unit_attribute())?;
     }
-    builder.add_region(computation).enable_result_type_inference().build().and_then(|operation| unsafe {
-        operation
-            .cast()
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::all_reduce`"))
-    })
+    builder
+        .add_region(computation)?
+        .enable_result_type_inference()
+        .build()
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::all_reduce`"))
+        })
 }
 
 /// Name of the [`Attribute`] that is used to store [`AllToAllOperation::split_dimension`].
@@ -1024,27 +1031,27 @@ pub fn all_to_all<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     let i64_type = context.signless_integer_type(64);
     let mut builder = OperationBuilder::new("stablehlo.all_to_all", location)
-        .add_operands(inputs)
+        .add_operands(inputs)?
         .add_attribute(
             ALL_TO_ALL_SPLIT_DIMENSION_ATTRIBUTE,
             context.integer_attribute(i64_type, split_dimension as i64),
-        )
-        .add_attribute(ALL_TO_ALL_SPLIT_COUNT_ATTRIBUTE, context.integer_attribute(i64_type, split_count as i64))
+        )?
+        .add_attribute(ALL_TO_ALL_SPLIT_COUNT_ATTRIBUTE, context.integer_attribute(i64_type, split_count as i64))?
         .add_attribute(
             ALL_TO_ALL_CONCATENATION_DIMENSION_ATTRIBUTE,
             context.integer_attribute(i64_type, concatenation_dimension as i64),
-        )
-        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location)?);
+        )?
+        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location)?)?;
     if let Some(channel_id) = channel_id {
         let channel_type = channel_type
             .ok_or_else(|| Error::invalid_argument("channel type is required when channel id is provided"))?;
         builder = builder.add_attribute(
             COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE,
             context.stable_hlo_channel_handle(Some(channel_id), channel_type)?,
-        );
+        )?;
     }
     if use_global_device_ids {
-        builder = builder.add_attribute(COLLECTIVE_USE_GLOBAL_DEVICE_IDS_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(COLLECTIVE_USE_GLOBAL_DEVICE_IDS_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.enable_result_type_inference().build().and_then(|operation| unsafe {
         operation
@@ -1120,12 +1127,12 @@ pub fn collective_broadcast<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Locatio
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     let mut builder = OperationBuilder::new("stablehlo.collective_broadcast", location)
-        .add_operands(inputs)
-        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location)?);
+        .add_operands(inputs)?
+        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location)?)?;
     if let Some(dynamic_roots) = dynamic_roots {
         builder = builder
-            .add_operand(dynamic_roots)
-            .add_attribute(COLLECTIVE_HAS_DYNAMIC_ROOT_ATTRIBUTE, context.unit_attribute());
+            .add_operand(dynamic_roots)?
+            .add_attribute(COLLECTIVE_HAS_DYNAMIC_ROOT_ATTRIBUTE, context.unit_attribute())?;
     }
     if let Some(channel_id) = channel_id {
         let channel_type = channel_type
@@ -1133,7 +1140,7 @@ pub fn collective_broadcast<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Locatio
         builder = builder.add_attribute(
             COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE,
             context.stable_hlo_channel_handle(Some(channel_id), channel_type)?,
-        );
+        )?;
     }
     builder.enable_result_type_inference().build().and_then(|operation| unsafe {
         operation
@@ -1214,12 +1221,12 @@ pub fn collective_reduce<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     let mut builder = OperationBuilder::new("stablehlo.collective_reduce", location)
-        .add_operands(inputs)
-        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location)?);
+        .add_operands(inputs)?
+        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location)?)?;
     if let Some(dynamic_roots) = dynamic_roots {
         builder = builder
-            .add_operand(dynamic_roots)
-            .add_attribute(COLLECTIVE_HAS_DYNAMIC_ROOT_ATTRIBUTE, context.unit_attribute());
+            .add_operand(dynamic_roots)?
+            .add_attribute(COLLECTIVE_HAS_DYNAMIC_ROOT_ATTRIBUTE, context.unit_attribute())?;
     }
     if let Some(channel_id) = channel_id {
         let channel_type = channel_type
@@ -1227,16 +1234,20 @@ pub fn collective_reduce<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'
         builder = builder.add_attribute(
             COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE,
             context.stable_hlo_channel_handle(Some(channel_id), channel_type)?,
-        );
+        )?;
     }
     if use_global_device_ids {
-        builder = builder.add_attribute(COLLECTIVE_USE_GLOBAL_DEVICE_IDS_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(COLLECTIVE_USE_GLOBAL_DEVICE_IDS_ATTRIBUTE, context.unit_attribute())?;
     }
-    builder.add_region(computation).enable_result_type_inference().build().and_then(|operation| unsafe {
-        operation
-            .cast()
-            .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::collective_reduce`"))
-    })
+    builder
+        .add_region(computation)?
+        .enable_result_type_inference()
+        .build()
+        .and_then(|operation| unsafe {
+            operation
+                .cast()
+                .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::collective_reduce`"))
+        })
 }
 
 /// StableHLO [`Operation`] that permutes data between processes according to specified
@@ -1290,17 +1301,18 @@ pub fn collective_permute<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<
 ) -> Result<DetachedCollectivePermuteOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
-    let mut builder = OperationBuilder::new("stablehlo.collective_permute", location).add_operand(input).add_attribute(
-        COLLECTIVE_SOURCE_TARGET_PAIRS_ATTRIBUTE,
-        context.stable_hlo_source_target_pairs_attribute(source_target_pairs, location)?,
-    );
+    let mut builder =
+        OperationBuilder::new("stablehlo.collective_permute", location).add_operand(input)?.add_attribute(
+            COLLECTIVE_SOURCE_TARGET_PAIRS_ATTRIBUTE,
+            context.stable_hlo_source_target_pairs_attribute(source_target_pairs, location)?,
+        )?;
     if let Some(channel_id) = channel_id {
         let channel_type = channel_type
             .ok_or_else(|| Error::invalid_argument("channel type is required when channel id is provided"))?;
         builder = builder.add_attribute(
             COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE,
             context.stable_hlo_channel_handle(Some(channel_id), channel_type)?,
-        );
+        )?;
     }
     builder.enable_result_type_inference().build().and_then(|operation| unsafe {
         operation
@@ -1390,24 +1402,24 @@ pub fn reduce_scatter<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>,
     let context = location.context();
     context.load_dialect(DialectHandle::stable_hlo()?)?;
     let mut builder = OperationBuilder::new("stablehlo.reduce_scatter", location)
-        .add_operand(operand)
+        .add_operand(operand)?
         .add_attribute(
             REDUCE_SCATTER_DIMENSION_ATTRIBUTE,
             location.context().integer_attribute(context.signless_integer_type(64), dimension as i64),
-        )
-        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location)?);
+        )?
+        .add_attribute(COLLECTIVE_REPLICA_GROUPS_ATTRIBUTE, replica_groups.to_attribute(context, location)?)?;
     if let Some(channel_id) = channel_id {
         let channel_type = channel_type
             .ok_or_else(|| Error::invalid_argument("channel type is required when channel id is provided"))?;
         builder = builder.add_attribute(
             COLLECTIVE_CHANNEL_HANDLE_ATTRIBUTE,
             context.stable_hlo_channel_handle(Some(channel_id), channel_type)?,
-        );
+        )?;
     }
     if use_global_device_ids {
-        builder = builder.add_attribute(COLLECTIVE_USE_GLOBAL_DEVICE_IDS_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(COLLECTIVE_USE_GLOBAL_DEVICE_IDS_ATTRIBUTE, context.unit_attribute())?;
     }
-    builder.add_region(computation).add_result(output_type).build().and_then(|operation| unsafe {
+    builder.add_region(computation)?.add_result(output_type)?.build().and_then(|operation| unsafe {
         operation
             .cast()
             .ok_or_else(|| Error::invalid_argument("invalid arguments to `stable_hlo::reduce_scatter`"))

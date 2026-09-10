@@ -27,7 +27,7 @@ pub fn constant<'c, 't: 'c, V: Attribute<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::arith()?)?;
     OperationBuilder::new("arith.constant", location)
-        .add_attribute("value", value)
+        .add_attribute("value", value)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -110,8 +110,8 @@ pub fn addui_extended<
         i1_type.as_ref()
     };
     OperationBuilder::new("arith.addui_extended", location)
-        .add_operands(&[lhs.as_ref(), rhs.as_ref()])
-        .add_results(&[input_type, overflow_type])
+        .add_operands(&[lhs.as_ref(), rhs.as_ref()])?
+        .add_results(&[input_type, overflow_type])?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -182,7 +182,7 @@ pub fn mulsi_extended<
     let context = location.context();
     context.load_dialect(DialectHandle::arith()?)?;
     OperationBuilder::new("arith.mulsi_extended", location)
-        .add_operands(&[lhs.as_ref(), rhs.as_ref()])
+        .add_operands(&[lhs.as_ref(), rhs.as_ref()])?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -236,7 +236,7 @@ pub fn mului_extended<
     let context = location.context();
     context.load_dialect(DialectHandle::arith()?)?;
     OperationBuilder::new("arith.mului_extended", location)
-        .add_operands(&[lhs.as_ref(), rhs.as_ref()])
+        .add_operands(&[lhs.as_ref(), rhs.as_ref()])?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -337,9 +337,9 @@ pub fn cmpf<
         .add_attribute(
             CMP_PREDICATE_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), predicate as i64),
-        )
-        .add_operand(lhs)
-        .add_operand(rhs)
+        )?
+        .add_operand(lhs)?
+        .add_operand(rhs)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -413,9 +413,9 @@ pub fn cmpi<
         .add_attribute(
             CMP_PREDICATE_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), predicate as i64),
-        )
-        .add_operand(lhs)
-        .add_operand(rhs)
+        )?
+        .add_operand(lhs)?
+        .add_operand(rhs)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -459,9 +459,9 @@ pub fn select<
 ) -> Result<DetachedSelectOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::arith()?)?;
     OperationBuilder::new("arith.select", location)
-        .add_operand(predicate)
-        .add_operand(on_true)
-        .add_operand(on_false)
+        .add_operand(predicate)?
+        .add_operand(on_true)?
+        .add_operand(on_false)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {

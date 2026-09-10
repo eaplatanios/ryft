@@ -106,9 +106,10 @@ pub fn absf_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'
     validate_float_like(result_type, "math.absf")?;
     let mut builder = OperationBuilder::new("math.absf", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::absf`"))
     })
 }
@@ -168,7 +169,7 @@ pub fn absi_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'
     if options.fastmath != FastMathFlags::NONE {
         return Err(Error::invalid_argument("fast-math flags are unsupported for integer Math operations"));
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::absi`"))
     })
 }
@@ -238,9 +239,10 @@ pub fn acosh_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<
     validate_float_like(result_type, "math.acosh")?;
     let mut builder = OperationBuilder::new("math.acosh", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::acosh`"))
     })
 }
@@ -310,9 +312,10 @@ pub fn asin_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'
     validate_float_like(result_type, "math.asin")?;
     let mut builder = OperationBuilder::new("math.asin", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::asin`"))
     })
 }
@@ -382,9 +385,10 @@ pub fn asinh_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<
     validate_float_like(result_type, "math.asinh")?;
     let mut builder = OperationBuilder::new("math.asinh", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::asinh`"))
     })
 }
@@ -454,9 +458,10 @@ pub fn atan_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'
     validate_float_like(result_type, "math.atan")?;
     let mut builder = OperationBuilder::new("math.atan", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::atan`"))
     })
 }
@@ -526,9 +531,10 @@ pub fn atanh_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<
     validate_float_like(result_type, "math.atanh")?;
     let mut builder = OperationBuilder::new("math.atanh", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::atanh`"))
     })
 }
@@ -623,12 +629,13 @@ pub fn atan2_with_options<
     validate_float_like(result_type, "math.atan2")?;
     let mut builder = OperationBuilder::new("math.atan2", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
     builder
-        .add_operand(lhs)
-        .add_operand(rhs)
-        .add_result(result_type)
+        .add_operand(lhs)?
+        .add_operand(rhs)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::atan2`"))
@@ -700,9 +707,10 @@ pub fn cbrt_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'
     validate_float_like(result_type, "math.cbrt")?;
     let mut builder = OperationBuilder::new("math.cbrt", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::cbrt`"))
     })
 }
@@ -772,9 +780,10 @@ pub fn ceil_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'
     validate_float_like(result_type, "math.ceil")?;
     let mut builder = OperationBuilder::new("math.ceil", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::ceil`"))
     })
 }
@@ -880,13 +889,14 @@ pub fn clampf_with_options<
     validate_float_like(result_type, "math.clampf")?;
     let mut builder = OperationBuilder::new("math.clampf", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
     builder
-        .add_operand(first)
-        .add_operand(second)
-        .add_operand(third)
-        .add_result(result_type)
+        .add_operand(first)?
+        .add_operand(second)?
+        .add_operand(third)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::clampf`"))
@@ -984,12 +994,13 @@ pub fn copysign_with_options<
     validate_float_like(result_type, "math.copysign")?;
     let mut builder = OperationBuilder::new("math.copysign", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
     builder
-        .add_operand(lhs)
-        .add_operand(rhs)
-        .add_result(result_type)
+        .add_operand(lhs)?
+        .add_operand(rhs)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::copysign`"))
@@ -1061,9 +1072,10 @@ pub fn cos_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c
     validate_float_like(result_type, "math.cos")?;
     let mut builder = OperationBuilder::new("math.cos", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::cos`"))
     })
 }
@@ -1133,9 +1145,10 @@ pub fn acos_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'
     validate_float_like(result_type, "math.acos")?;
     let mut builder = OperationBuilder::new("math.acos", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::acos`"))
     })
 }
@@ -1205,9 +1218,10 @@ pub fn cosh_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'
     validate_float_like(result_type, "math.cosh")?;
     let mut builder = OperationBuilder::new("math.cosh", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::cosh`"))
     })
 }
@@ -1277,9 +1291,10 @@ pub fn sin_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c
     validate_float_like(result_type, "math.sin")?;
     let mut builder = OperationBuilder::new("math.sin", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::sin`"))
     })
 }
@@ -1349,9 +1364,10 @@ pub fn sinh_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'
     validate_float_like(result_type, "math.sinh")?;
     let mut builder = OperationBuilder::new("math.sinh", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::sinh`"))
     })
 }
@@ -1425,12 +1441,13 @@ pub fn sincos_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location
     validate_float_like(result_type, "math.sincos")?;
     let mut builder = OperationBuilder::new("math.sincos", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
     builder
-        .add_operand(input)
-        .add_result(result_type)
-        .add_result(result_type)
+        .add_operand(input)?
+        .add_result(result_type)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::sincos`"))
@@ -1494,7 +1511,7 @@ pub fn count_leading_zeros_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>
     if options.fastmath != FastMathFlags::NONE {
         return Err(Error::invalid_argument("fast-math flags are unsupported for integer Math operations"));
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation
             .cast()
             .ok_or_else(|| Error::invalid_argument("invalid arguments to `math::count_leading_zeros`"))
@@ -1557,7 +1574,7 @@ pub fn count_trailing_zeros_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't
     if options.fastmath != FastMathFlags::NONE {
         return Err(Error::invalid_argument("fast-math flags are unsupported for integer Math operations"));
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation
             .cast()
             .ok_or_else(|| Error::invalid_argument("invalid arguments to `math::count_trailing_zeros`"))
@@ -1619,7 +1636,7 @@ pub fn count_set_bits_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: 
     if options.fastmath != FastMathFlags::NONE {
         return Err(Error::invalid_argument("fast-math flags are unsupported for integer Math operations"));
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation
             .cast()
             .ok_or_else(|| Error::invalid_argument("invalid arguments to `math::count_set_bits`"))
@@ -1691,9 +1708,10 @@ pub fn erf_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c
     validate_float_like(result_type, "math.erf")?;
     let mut builder = OperationBuilder::new("math.erf", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::erf`"))
     })
 }
@@ -1763,9 +1781,10 @@ pub fn erfc_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'
     validate_float_like(result_type, "math.erfc")?;
     let mut builder = OperationBuilder::new("math.erfc", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::erfc`"))
     })
 }
@@ -1835,9 +1854,10 @@ pub fn exp_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c
     validate_float_like(result_type, "math.exp")?;
     let mut builder = OperationBuilder::new("math.exp", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::exp`"))
     })
 }
@@ -1907,9 +1927,10 @@ pub fn exp2_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'
     validate_float_like(result_type, "math.exp2")?;
     let mut builder = OperationBuilder::new("math.exp2", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::exp2`"))
     })
 }
@@ -1979,9 +2000,10 @@ pub fn expm1_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<
     validate_float_like(result_type, "math.expm1")?;
     let mut builder = OperationBuilder::new("math.expm1", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::expm1`"))
     })
 }
@@ -2051,9 +2073,10 @@ pub fn floor_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<
     validate_float_like(result_type, "math.floor")?;
     let mut builder = OperationBuilder::new("math.floor", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::floor`"))
     })
 }
@@ -2176,16 +2199,18 @@ pub fn fma_with_options<
     validate_float_like(result_type, "math.fma")?;
     let mut builder = OperationBuilder::new("math.fma", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
     if let Some(rounding_mode) = options.rounding_mode {
-        builder = builder.add_attribute(ROUNDING_MODE_ATTRIBUTE, context.arith_rounding_mode_attribute(rounding_mode)?);
+        builder =
+            builder.add_attribute(ROUNDING_MODE_ATTRIBUTE, context.arith_rounding_mode_attribute(rounding_mode)?)?;
     }
     builder
-        .add_operand(first)
-        .add_operand(second)
-        .add_operand(third)
-        .add_result(result_type)
+        .add_operand(first)?
+        .add_operand(second)?
+        .add_operand(third)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::fma`"))
@@ -2273,9 +2298,9 @@ pub fn ipowi_with_options<
         return Err(Error::invalid_argument("fast-math flags are unsupported for integer Math operations"));
     }
     builder
-        .add_operand(lhs)
-        .add_operand(rhs)
-        .add_result(result_type)
+        .add_operand(lhs)?
+        .add_operand(rhs)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::ipowi`"))
@@ -2354,9 +2379,10 @@ where
     let result_type = boolean_type_like(context, input_type, location)?;
     let mut builder = OperationBuilder::new("math.isfinite", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::is_finite`"))
     })
 }
@@ -2431,9 +2457,10 @@ where
     let result_type = boolean_type_like(context, input_type, location)?;
     let mut builder = OperationBuilder::new("math.isinf", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::is_infinite`"))
     })
 }
@@ -2508,9 +2535,10 @@ where
     let result_type = boolean_type_like(context, input_type, location)?;
     let mut builder = OperationBuilder::new("math.isnan", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::is_nan`"))
     })
 }
@@ -2587,9 +2615,10 @@ where
     let result_type = boolean_type_like(context, input_type, location)?;
     let mut builder = OperationBuilder::new("math.isnormal", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::is_normal`"))
     })
 }
@@ -2659,9 +2688,10 @@ pub fn log_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c
     validate_float_like(result_type, "math.log")?;
     let mut builder = OperationBuilder::new("math.log", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::log`"))
     })
 }
@@ -2731,9 +2761,10 @@ pub fn log10_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<
     validate_float_like(result_type, "math.log10")?;
     let mut builder = OperationBuilder::new("math.log10", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::log10`"))
     })
 }
@@ -2803,9 +2834,10 @@ pub fn log1p_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<
     validate_float_like(result_type, "math.log1p")?;
     let mut builder = OperationBuilder::new("math.log1p", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::log1p`"))
     })
 }
@@ -2875,9 +2907,10 @@ pub fn log2_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'
     validate_float_like(result_type, "math.log2")?;
     let mut builder = OperationBuilder::new("math.log2", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::log2`"))
     })
 }
@@ -2972,12 +3005,13 @@ pub fn powf_with_options<
     validate_float_like(result_type, "math.powf")?;
     let mut builder = OperationBuilder::new("math.powf", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
     builder
-        .add_operand(lhs)
-        .add_operand(rhs)
-        .add_result(result_type)
+        .add_operand(lhs)?
+        .add_operand(rhs)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::powf`"))
@@ -3049,9 +3083,10 @@ pub fn rsqrt_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<
     validate_float_like(result_type, "math.rsqrt")?;
     let mut builder = OperationBuilder::new("math.rsqrt", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::rsqrt`"))
     })
 }
@@ -3121,9 +3156,10 @@ pub fn sqrt_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'
     validate_float_like(result_type, "math.sqrt")?;
     let mut builder = OperationBuilder::new("math.sqrt", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::sqrt`"))
     })
 }
@@ -3193,9 +3229,10 @@ pub fn tan_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c
     validate_float_like(result_type, "math.tan")?;
     let mut builder = OperationBuilder::new("math.tan", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::tan`"))
     })
 }
@@ -3265,9 +3302,10 @@ pub fn tanh_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'
     validate_float_like(result_type, "math.tanh")?;
     let mut builder = OperationBuilder::new("math.tanh", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::tanh`"))
     })
 }
@@ -3338,9 +3376,10 @@ pub fn round_even_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Loca
     validate_float_like(result_type, "math.roundeven")?;
     let mut builder = OperationBuilder::new("math.roundeven", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::round_even`"))
     })
 }
@@ -3410,9 +3449,10 @@ pub fn round_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<
     validate_float_like(result_type, "math.round")?;
     let mut builder = OperationBuilder::new("math.round", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::round`"))
     })
 }
@@ -3482,9 +3522,10 @@ pub fn trunc_with_options<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<
     validate_float_like(result_type, "math.trunc")?;
     let mut builder = OperationBuilder::new("math.trunc", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
-    builder.add_operand(input).add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_operand(input)?.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::trunc`"))
     })
 }
@@ -3580,12 +3621,13 @@ pub fn fpowi_with_options<
     validate_same_shape(result_type, power_type, "math.fpowi")?;
     let mut builder = OperationBuilder::new("math.fpowi", location);
     if options.fastmath != FastMathFlags::NONE {
-        builder = builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?);
+        builder =
+            builder.add_attribute(FASTMATH_ATTRIBUTE, context.arith_fast_math_flags_attribute(options.fastmath)?)?;
     }
     builder
-        .add_operand(base)
-        .add_operand(power)
-        .add_result(result_type)
+        .add_operand(base)?
+        .add_operand(power)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `math::fpowi`"))

@@ -10,13 +10,13 @@ use crate::{Attribute, Block, Context, DetachedRegion, Error, Location, Region, 
 
 /// [`OperationBuilder`]s are used to build [`Operation`]s.
 ///
-/// All components must belong to the builder's [`Context`]. Configuration retains the first context mismatch,
-/// and subsequent additions are ignored. [`OperationBuilder::build`] returns the retained error, if there is one.
-/// Batch additions validate every component before accepting any of them.
+/// All components must belong to the builder's [`Context`]. Each addition returns an [`Error`] immediately if a
+/// component belongs to another context. Batch additions validate every component before accepting any of them.
+/// Additions consume the builder, so a failed addition destroys it and its previously accepted regions.
 ///
 /// Pending components are stored in Rust-owned collections until construction. The builder owns added
-/// [`DetachedRegion`]s and destroys them if it is dropped or returns a configuration error. Region-taking
-/// functions also consume and destroy rejected regions, including regions supplied after an earlier error.
+/// [`DetachedRegion`]s and destroys them if it is dropped or an addition fails. Region-taking functions also consume
+/// and destroy rejected regions.
 pub struct OperationBuilder<'c, 't: 'c> {
     /// Handle that represents this [`OperationBuilder`] in the MLIR C API. The underlying native builder's component
     /// arrays stay empty until [`OperationBuilder::build`], where MLIR allocates and consumes them within that call.
@@ -39,9 +39,6 @@ pub struct OperationBuilder<'c, 't: 'c> {
 
     /// Non-owning native successor [`MlirBlock`] handles to attach to the operation being built.
     successors: Vec<MlirBlock>,
-
-    /// First error encountered while configuring this [`OperationBuilder`].
-    error: Option<Error>,
 }
 
 impl<'c, 't: 'c> OperationBuilder<'c, 't> {
@@ -58,7 +55,6 @@ impl<'c, 't: 'c> OperationBuilder<'c, 't> {
             result_types: Vec::new(),
             regions: Vec::new(),
             successors: Vec::new(),
-            error: None,
         }
     }
 
@@ -68,111 +64,106 @@ impl<'c, 't: 'c> OperationBuilder<'c, 't> {
     }
 
     /// Adds the provided [`Attribute`] to the [`Operation`] that is being built under the provided name.
+    /// Returns an [`Error`] and destroys the builder if a component belongs to another [`Context`].
     pub fn add_attribute<'b, 's: 'b, N: Into<StringRef<'s>>, A: Attribute<'c, 't>>(
         mut self,
         name: N,
         attribute: A,
-    ) -> Self
+    ) -> Result<Self, Error>
     where
         Self: 'b,
     {
-        if !self.validate_context(attribute.context(), "attribute") {
-            return self;
-        }
+        self.validate_context(attribute.context(), "attribute")?;
         let named_attribute = self.context.named_attribute(self.context.identifier(name.into()), attribute);
         self.attributes.push(unsafe { named_attribute.to_c_api() });
-        self
+        Ok(self)
     }
 
     /// Adds the provided [`Value`] as an operand (i.e., input) to the [`Operation`] that is being built.
-    pub fn add_operand<'v, V: Value<'v, 'c, 't>>(mut self, operand: V) -> Self
+    /// Returns an [`Error`] and destroys the builder if a component belongs to another [`Context`].
+    pub fn add_operand<'v, V: Value<'v, 'c, 't>>(mut self, operand: V) -> Result<Self, Error>
     where
         'c: 'v,
     {
-        if !self.validate_context(operand.context(), "operand") {
-            return self;
-        }
+        self.validate_context(operand.context(), "operand")?;
         self.operands.push(unsafe { operand.to_c_api() });
-        self
+        Ok(self)
     }
 
     /// Adds the provided [`Value`]s as operands (i.e., inputs) to the [`Operation`] that is being built.
-    pub fn add_operands<'v, V: Value<'v, 'c, 't>>(mut self, operands: &[V]) -> Self
+    /// Returns an [`Error`] and destroys the builder if a component belongs to another [`Context`].
+    pub fn add_operands<'v, V: Value<'v, 'c, 't>>(mut self, operands: &[V]) -> Result<Self, Error>
     where
         'c: 'v,
     {
-        if self.error.is_some() || !operands.iter().all(|operand| self.validate_context(operand.context(), "operand")) {
-            return self;
+        for operand in operands {
+            self.validate_context(operand.context(), "operand")?;
         }
         self.operands.extend(operands.iter().map(|operand| unsafe { operand.to_c_api() }));
-        self
+        Ok(self)
     }
 
     /// Adds a result of the provided [`Type`] to the [`Operation`] that is being built.
-    pub fn add_result<T: Type<'c, 't>>(mut self, result_type: T) -> Self {
-        if !self.validate_context(result_type.context(), "result type") {
-            return self;
-        }
+    /// Returns an [`Error`] and destroys the builder if a component belongs to another [`Context`].
+    pub fn add_result<T: Type<'c, 't>>(mut self, result_type: T) -> Result<Self, Error> {
+        self.validate_context(result_type.context(), "result type")?;
         self.result_types.push(unsafe { result_type.to_c_api() });
-        self
+        Ok(self)
     }
 
     /// Adds results of the provided [`Type`]s to the [`Operation`] that is being built.
-    pub fn add_results<T: Type<'c, 't>>(mut self, result_types: &[T]) -> Self {
-        if self.error.is_some()
-            || !result_types.iter().all(|result_type| self.validate_context(result_type.context(), "result type"))
-        {
-            return self;
+    /// Returns an [`Error`] and destroys the builder if a component belongs to another [`Context`].
+    pub fn add_results<T: Type<'c, 't>>(mut self, result_types: &[T]) -> Result<Self, Error> {
+        for result_type in result_types {
+            self.validate_context(result_type.context(), "result type")?;
         }
         self.result_types.extend(result_types.iter().map(|result_type| unsafe { result_type.to_c_api() }));
-        self
+        Ok(self)
     }
 
     /// Adds the provided [`Region`] to the [`Operation`] that is being built (and takes ownership of it).
-    /// A region from another context, or one supplied after an earlier configuration error, is destroyed immediately.
-    pub fn add_region(mut self, region: DetachedRegion<'c, 't>) -> Self {
-        if !self.validate_context(region.context(), "region") {
-            return self;
-        }
+    /// Returns an [`Error`] and destroys the builder and region if the region belongs to another context.
+    pub fn add_region(mut self, region: DetachedRegion<'c, 't>) -> Result<Self, Error> {
+        self.validate_context(region.context(), "region")?;
         self.regions.push(region);
-        self
+        Ok(self)
     }
 
     /// Adds the provided [`Region`]s to the [`Operation`] that is being built (and takes ownership of them).
-    /// If any region belongs to another context, the entire batch is rejected and destroyed. Regions supplied after
-    /// an earlier configuration error are also destroyed immediately.
-    pub fn add_regions(mut self, regions: Vec<DetachedRegion<'c, 't>>) -> Self {
-        if self.error.is_some() || !regions.iter().all(|region| self.validate_context(region.context(), "region")) {
-            return self;
+    /// If any region belongs to another context, this function returns an [`Error`] and destroys the builder
+    /// and the entire batch.
+    pub fn add_regions(mut self, regions: Vec<DetachedRegion<'c, 't>>) -> Result<Self, Error> {
+        for region in &regions {
+            self.validate_context(region.context(), "region")?;
         }
         self.regions.extend(regions);
-        self
+        Ok(self)
     }
 
     /// Adds the provided [`Block`] as a successor to the [`Operation`] that is being built.
     /// Refer to [`Block::successors`] for information on how successors are defined.
-    pub fn add_successor<'r, 'b: 'r, B: Block<'b, 'c, 't>>(mut self, block: &'r B) -> OperationBuilder<'c, 't>
+    /// Returns an [`Error`] and destroys the builder if a component belongs to another [`Context`].
+    pub fn add_successor<'r, 'b: 'r, B: Block<'b, 'c, 't>>(mut self, block: &'r B) -> Result<Self, Error>
     where
         'c: 'b,
     {
-        if !self.validate_context(block.context(), "successor") {
-            return self;
-        }
+        self.validate_context(block.context(), "successor")?;
         self.successors.push(unsafe { block.to_c_api() });
-        self
+        Ok(self)
     }
 
     /// Adds the provided [`Block`]s as successors to the [`Operation`] that is being built.
     /// Refer to [`Block::successors`] for information on how successors are defined.
-    pub fn add_successors<'r, 'b: 'r, B: Block<'b, 'c, 't>>(mut self, blocks: &[&'r B]) -> OperationBuilder<'c, 't>
+    /// Returns an [`Error`] and destroys the builder if a component belongs to another [`Context`].
+    pub fn add_successors<'r, 'b: 'r, B: Block<'b, 'c, 't>>(mut self, blocks: &[&'r B]) -> Result<Self, Error>
     where
         'c: 'b,
     {
-        if self.error.is_some() || !blocks.iter().all(|block| self.validate_context(block.context(), "successor")) {
-            return self;
+        for block in blocks {
+            self.validate_context(block.context(), "successor")?;
         }
         self.successors.extend(blocks.iter().map(|block| unsafe { block.to_c_api() }));
-        self
+        Ok(self)
     }
 
     /// Enables result type inference for the [`Operation`] that is being built. If enabled, then the caller does
@@ -181,20 +172,14 @@ impl<'c, 't: 'c> OperationBuilder<'c, 't> {
     /// automatically from the operation's operands and [`Attribute`]s. If enabled, [`OperationBuilder::build`] will
     /// return an [`Error`] if type inference fails, while also emitting diagnostics.
     pub fn enable_result_type_inference(mut self) -> Self {
-        if self.error.is_none() {
-            unsafe { mlirOperationStateEnableResultTypeInference(&mut self.handle) };
-        }
+        unsafe { mlirOperationStateEnableResultTypeInference(&mut self.handle) };
         self
     }
 
-    /// Builds and returns an [`Operation`], consuming this [`OperationBuilder`] in the process. Returns the first error
-    /// retained during configuration, if any, and destroys the pending regions. Otherwise, transfers the regions to
-    /// MLIR. If enabled result type inference fails, MLIR destroys those regions and this function returns an [`Error`]
+    /// Builds and returns an [`Operation`], consuming this [`OperationBuilder`] and transferring its regions to MLIR.
+    /// If enabled result type inference fails, MLIR destroys those regions and this function returns an [`Error`]
     /// after MLIR emits diagnostics.
     pub fn build(mut self) -> Result<DetachedOperation<'c, 't>, Error> {
-        if let Some(error) = self.error.take() {
-            return Err(error);
-        }
         let regions = self.regions.iter().map(|region| unsafe { region.to_c_api() }).collect::<Vec<_>>();
         let handle = {
             // The following context borrow ensures that access to the underlying MLIR data structures is done safely
@@ -256,17 +241,12 @@ impl<'c, 't: 'c> OperationBuilder<'c, 't> {
             .map_err(|_| Error::invalid_argument("failed to build operation"))
     }
 
-    /// Returns whether `context` matches this [`OperationBuilder`]'s context, retaining the first mismatch as an error.
-    fn validate_context(&mut self, context: &Context<'t>, component: &str) -> bool {
-        if self.error.is_some() {
-            return false;
-        }
+    /// Checks that `context` matches this [`OperationBuilder`]'s context.
+    fn validate_context(&self, context: &Context<'t>, component: &str) -> Result<(), Error> {
         if self.context.eq(context) {
-            true
+            Ok(())
         } else {
-            let message = format!("{component} context does not match operation builder context");
-            self.error = Some(Error::invalid_argument(message));
-            false
+            Err(Error::invalid_argument(format!("{component} context does not match operation builder context")))
         }
     }
 }
@@ -299,14 +279,23 @@ mod tests {
 
         let builder = OperationBuilder::new("test.op", location)
             .add_operand(arg_0)
+            .unwrap()
             .add_operands(&[arg_1, arg_0])
+            .unwrap()
             .add_attribute("attr_name", context.string_attribute("attr_value"))
+            .unwrap()
             .add_result(i32_type)
+            .unwrap()
             .add_results(&[i64_type, u64_type])
+            .unwrap()
             .add_region(region_0)
+            .unwrap()
             .add_regions(vec![region_1, region_2])
+            .unwrap()
             .add_successor(&block_1)
-            .add_successors(&[&block_2, &block_3]);
+            .unwrap()
+            .add_successors(&[&block_2, &block_3])
+            .unwrap();
         assert_eq!(builder.context(), &context);
         assert_eq!(builder.handle.nAttributes, 0);
         assert_eq!(builder.handle.nOperands, 0);
@@ -346,17 +335,42 @@ mod tests {
     }
 
     #[test]
+    fn test_operation_builder_add_attribute() {
+        let context = Context::new();
+        context.allow_unregistered_dialects();
+        let location = context.unknown_location();
+        let attribute = context.string_attribute("value");
+        let operation = OperationBuilder::new("test.op", location)
+            .add_attribute("name", attribute)
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(operation.attribute("name").unwrap().unwrap(), attribute);
+    }
+
+    #[test]
     fn test_operation_builder_add_attribute_rejects_different_context() {
         let context = Context::new();
         let other_context = Context::new();
-        let builder = OperationBuilder::new("test.op", context.unknown_location())
+        let result = OperationBuilder::new("test.op", context.unknown_location())
             .add_attribute("name", other_context.string_attribute("value"));
-        assert_eq!(builder.attributes.len(), 0);
         assert!(matches!(
-            builder.build(),
+            result,
             Err(Error::InvalidArgument { message, .. })
                 if message == "attribute context does not match operation builder context",
         ));
+    }
+
+    #[test]
+    fn test_operation_builder_add_operand() {
+        let context = Context::new();
+        context.allow_unregistered_dialects();
+        let location = context.unknown_location();
+        let block = context.block(&[(context.index_type(), location)]);
+        let operand = block.argument(0).unwrap();
+        let operation = OperationBuilder::new("test.op", location).add_operand(operand).unwrap().build().unwrap();
+        assert_eq!(operation.operand_count(), 1);
+        assert_eq!(operation.operand_value(0).unwrap(), operand);
     }
 
     #[test]
@@ -364,14 +378,32 @@ mod tests {
         let context = Context::new();
         let other_context = Context::new();
         let other_block = other_context.block(&[(other_context.index_type(), other_context.unknown_location())]);
-        let builder =
+        let result =
             OperationBuilder::new("test.op", context.unknown_location()).add_operand(other_block.argument(0).unwrap());
-        assert_eq!(builder.operands.len(), 0);
         assert!(matches!(
-            builder.build(),
+            result,
             Err(Error::InvalidArgument { message, .. })
                 if message == "operand context does not match operation builder context",
         ));
+    }
+
+    #[test]
+    fn test_operation_builder_add_operands() {
+        let context = Context::new();
+        context.allow_unregistered_dialects();
+        let location = context.unknown_location();
+        let block = context.block(&[(context.index_type(), location)]);
+        let operand = block.argument(0).unwrap();
+        let operation = OperationBuilder::new("test.op", location)
+            .add_operands(&[operand, operand])
+            .unwrap()
+            .add_operands::<crate::ValueRef>(&[])
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(operation.operand_count(), 2);
+        assert_eq!(operation.operand_value(0).unwrap(), operand);
+        assert_eq!(operation.operand_value(1).unwrap(), operand);
     }
 
     #[test]
@@ -380,52 +412,115 @@ mod tests {
         let other_context = Context::new();
         let block = context.block(&[(context.index_type(), context.unknown_location())]);
         let other_block = other_context.block(&[(other_context.index_type(), other_context.unknown_location())]);
-        let builder = OperationBuilder::new("test.op", context.unknown_location())
+        let result = OperationBuilder::new("test.op", context.unknown_location())
             .add_operands(&[block.argument(0).unwrap(), other_block.argument(0).unwrap()]);
-        assert_eq!(builder.operands.len(), 0);
         assert!(matches!(
-            builder.build(),
+            result,
             Err(Error::InvalidArgument { message, .. })
                 if message == "operand context does not match operation builder context",
         ));
     }
 
     #[test]
+    fn test_operation_builder_add_result() {
+        let context = Context::new();
+        context.allow_unregistered_dialects();
+        let location = context.unknown_location();
+        let result_type = context.index_type();
+        let operation = OperationBuilder::new("test.op", location).add_result(result_type).unwrap().build().unwrap();
+        assert_eq!(operation.result_count(), 1);
+        assert_eq!(operation.result_type(0).unwrap(), result_type);
+    }
+
+    #[test]
     fn test_operation_builder_add_result_rejects_different_context() {
         let context = Context::new();
         let other_context = Context::new();
-        let builder =
+        let result =
             OperationBuilder::new("test.op", context.unknown_location()).add_result(other_context.index_type());
-        assert_eq!(builder.result_types.len(), 0);
         assert!(matches!(
-            builder.build(),
+            result,
             Err(Error::InvalidArgument { message, .. })
                 if message == "result type context does not match operation builder context",
         ));
+    }
+
+    #[test]
+    fn test_operation_builder_add_result_destroys_accepted_regions_on_error() {
+        let context = Context::new();
+        context.allow_unregistered_dialects();
+        let location = context.unknown_location();
+        let source_block = context.block(&[(context.index_type(), location)]);
+        let source = source_block.argument(0).unwrap();
+        let mut body = context.block_with_no_arguments();
+        body.append_operation(
+            OperationBuilder::new("test.use", location).add_operand(source).unwrap().build().unwrap(),
+        )
+        .unwrap();
+        let region: DetachedRegion<'_, '_> = body.try_into().unwrap();
+        assert_eq!(source.uses().unwrap().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
+        let other_context = Context::new();
+        let result = OperationBuilder::new("test.owner", location)
+            .add_region(region)
+            .unwrap()
+            .add_result(other_context.index_type());
+        assert!(matches!(
+            result,
+            Err(Error::InvalidArgument { message, .. })
+                if message == "result type context does not match operation builder context",
+        ));
+        assert_eq!(source.uses().unwrap().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_operation_builder_add_results() {
+        let context = Context::new();
+        context.allow_unregistered_dialects();
+        let location = context.unknown_location();
+        let result_type = context.index_type();
+        let operation = OperationBuilder::new("test.op", location)
+            .add_results(&[result_type, result_type])
+            .unwrap()
+            .add_results::<crate::TypeRef>(&[])
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(operation.result_count(), 2);
+        assert_eq!(operation.result_type(0).unwrap(), result_type);
+        assert_eq!(operation.result_type(1).unwrap(), result_type);
     }
 
     #[test]
     fn test_operation_builder_add_results_rejects_mixed_contexts_atomically() {
         let context = Context::new();
         let other_context = Context::new();
-        let builder = OperationBuilder::new("test.op", context.unknown_location())
+        let result = OperationBuilder::new("test.op", context.unknown_location())
             .add_results(&[context.index_type(), other_context.index_type()]);
-        assert_eq!(builder.result_types.len(), 0);
         assert!(matches!(
-            builder.build(),
+            result,
             Err(Error::InvalidArgument { message, .. })
                 if message == "result type context does not match operation builder context",
         ));
     }
 
     #[test]
+    fn test_operation_builder_add_region() {
+        let context = Context::new();
+        context.allow_unregistered_dialects();
+        let location = context.unknown_location();
+
+        let operation =
+            OperationBuilder::new("test.op", location).add_region(context.region()).unwrap().build().unwrap();
+        assert_eq!(operation.region_count(), 1);
+    }
+
+    #[test]
     fn test_operation_builder_add_region_rejects_different_context() {
         let context = Context::new();
         let other_context = Context::new();
-        let builder = OperationBuilder::new("test.op", context.unknown_location()).add_region(other_context.region());
-        assert_eq!(builder.regions.len(), 0);
+        let result = OperationBuilder::new("test.op", context.unknown_location()).add_region(other_context.region());
         assert!(matches!(
-            builder.build(),
+            result,
             Err(Error::InvalidArgument { message, .. })
                 if message == "region context does not match operation builder context",
         ));
@@ -439,32 +534,91 @@ mod tests {
         let source_block = context.block(&[(context.index_type(), location)]);
         let source = source_block.argument(0).unwrap();
         let mut body = context.block_with_no_arguments();
-        body.append_operation(OperationBuilder::new("test.use", location).add_operand(source).build().unwrap())
-            .unwrap();
+        body.append_operation(
+            OperationBuilder::new("test.use", location).add_operand(source).unwrap().build().unwrap(),
+        )
+        .unwrap();
         let region: DetachedRegion<'_, '_> = body.try_into().unwrap();
         assert_eq!(source.uses().unwrap().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
         let other_context = Context::new();
-        let builder = OperationBuilder::new("test.owner", other_context.unknown_location()).add_region(region);
+        let result = OperationBuilder::new("test.owner", other_context.unknown_location()).add_region(region);
         assert_eq!(source.uses().unwrap().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
         assert!(matches!(
-            builder.build(),
+            result,
             Err(Error::InvalidArgument { message, .. })
                 if message == "region context does not match operation builder context",
         ));
     }
 
     #[test]
+    fn test_operation_builder_add_regions() {
+        let context = Context::new();
+        context.allow_unregistered_dialects();
+        let location = context.unknown_location();
+
+        let operation = OperationBuilder::new("test.op", location)
+            .add_regions(vec![context.region(), context.region()])
+            .unwrap()
+            .add_regions(vec![])
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(operation.region_count(), 2);
+    }
+
+    #[test]
     fn test_operation_builder_add_regions_rejects_mixed_contexts_atomically() {
         let context = Context::new();
         let other_context = Context::new();
-        let builder = OperationBuilder::new("test.op", context.unknown_location())
+        let result = OperationBuilder::new("test.op", context.unknown_location())
             .add_regions(vec![context.region(), other_context.region()]);
-        assert_eq!(builder.regions.len(), 0);
         assert!(matches!(
-            builder.build(),
+            result,
             Err(Error::InvalidArgument { message, .. })
                 if message == "region context does not match operation builder context",
         ));
+    }
+
+    #[test]
+    fn test_operation_builder_add_regions_destroys_accepted_and_rejected_regions() {
+        let context = Context::new();
+        context.allow_unregistered_dialects();
+        let location = context.unknown_location();
+        let source_block = context.block(&[(context.index_type(), location)]);
+        let source = source_block.argument(0).unwrap();
+        let mut accepted_body = context.block_with_no_arguments();
+        accepted_body
+            .append_operation(OperationBuilder::new("test.use", location).add_operand(source).unwrap().build().unwrap())
+            .unwrap();
+        let mut rejected_body = context.block_with_no_arguments();
+        rejected_body
+            .append_operation(OperationBuilder::new("test.use", location).add_operand(source).unwrap().build().unwrap())
+            .unwrap();
+        let accepted_region: DetachedRegion<'_, '_> = accepted_body.try_into().unwrap();
+        let rejected_region: DetachedRegion<'_, '_> = rejected_body.try_into().unwrap();
+        assert_eq!(source.uses().unwrap().collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+        let other_context = Context::new();
+        let result = OperationBuilder::new("test.owner", location)
+            .add_region(accepted_region)
+            .unwrap()
+            .add_regions(vec![rejected_region, other_context.region()]);
+        assert!(matches!(
+            result,
+            Err(Error::InvalidArgument { message, .. })
+                if message == "region context does not match operation builder context",
+        ));
+        assert_eq!(source.uses().unwrap().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn test_operation_builder_add_successor() {
+        let context = Context::new();
+        context.allow_unregistered_dialects();
+        let location = context.unknown_location();
+        let block = context.block_with_no_arguments();
+        let operation = OperationBuilder::new("test.op", location).add_successor(&block).unwrap().build().unwrap();
+        assert_eq!(operation.successor_count(), 1);
+        assert_eq!(operation.successor(0).unwrap(), block);
     }
 
     #[test]
@@ -472,13 +626,31 @@ mod tests {
         let context = Context::new();
         let other_context = Context::new();
         let other_block = other_context.block_with_no_arguments();
-        let builder = OperationBuilder::new("test.op", context.unknown_location()).add_successor(&other_block);
-        assert_eq!(builder.successors.len(), 0);
+        let result = OperationBuilder::new("test.op", context.unknown_location()).add_successor(&other_block);
         assert!(matches!(
-            builder.build(),
+            result,
             Err(Error::InvalidArgument { message, .. })
                 if message == "successor context does not match operation builder context",
         ));
+    }
+
+    #[test]
+    fn test_operation_builder_add_successors() {
+        let context = Context::new();
+        context.allow_unregistered_dialects();
+        let location = context.unknown_location();
+        let first_block = context.block_with_no_arguments();
+        let second_block = context.block_with_no_arguments();
+        let operation = OperationBuilder::new("test.op", location)
+            .add_successors(&[&first_block, &second_block])
+            .unwrap()
+            .add_successors::<crate::DetachedBlock>(&[])
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(operation.successor_count(), 2);
+        assert_eq!(operation.successor(0).unwrap(), first_block);
+        assert_eq!(operation.successor(1).unwrap(), second_block);
     }
 
     #[test]
@@ -487,11 +659,10 @@ mod tests {
         let other_context = Context::new();
         let block = context.block_with_no_arguments();
         let other_block = other_context.block_with_no_arguments();
-        let builder =
+        let result =
             OperationBuilder::new("test.op", context.unknown_location()).add_successors(&[&block, &other_block]);
-        assert_eq!(builder.successors.len(), 0);
         assert!(matches!(
-            builder.build(),
+            result,
             Err(Error::InvalidArgument { message, .. })
                 if message == "successor context does not match operation builder context",
         ));
@@ -505,67 +676,16 @@ mod tests {
         let source_block = context.block(&[(context.index_type(), location)]);
         let source = source_block.argument(0).unwrap();
         let mut body = context.block_with_no_arguments();
-        body.append_operation(OperationBuilder::new("test.use", location).add_operand(source).build().unwrap())
-            .unwrap();
+        body.append_operation(
+            OperationBuilder::new("test.use", location).add_operand(source).unwrap().build().unwrap(),
+        )
+        .unwrap();
         let region: DetachedRegion<'_, '_> = body.try_into().unwrap();
         assert_eq!(source.uses().unwrap().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
-        let operation = OperationBuilder::new("test.owner", location).add_region(region).build().unwrap();
+        let operation = OperationBuilder::new("test.owner", location).add_region(region).unwrap().build().unwrap();
         assert_eq!(operation.region_count(), 1);
         assert_eq!(source.uses().unwrap().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
         drop(operation);
-        assert_eq!(source.uses().unwrap().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
-    }
-
-    #[test]
-    fn test_operation_builder_build_retains_first_error() {
-        let context = Context::new();
-        let other_context = Context::new();
-        let other_block = other_context.block(&[(other_context.index_type(), other_context.unknown_location())]);
-        let builder = OperationBuilder::new("test.op", context.unknown_location())
-            .add_region(context.region())
-            .add_operand(other_block.argument(0).unwrap())
-            .add_result(other_context.index_type())
-            .add_attribute("ignored", context.unit_attribute())
-            .add_operand(other_block.argument(0).unwrap())
-            .add_results(&[context.index_type()])
-            .add_results::<crate::TypeRef>(&[])
-            .add_regions(vec![context.region()])
-            .add_regions(vec![])
-            .enable_result_type_inference();
-        assert_eq!(builder.regions.len(), 1);
-        assert_eq!(builder.operands.len(), 0);
-        assert_eq!(builder.result_types.len(), 0);
-        assert_eq!(builder.attributes.len(), 0);
-        assert!(!builder.handle.enableResultTypeInference);
-
-        assert!(matches!(
-            builder.build(),
-            Err(Error::InvalidArgument { message, .. })
-                if message == "operand context does not match operation builder context",
-        ));
-    }
-
-    #[test]
-    fn test_operation_builder_build_destroys_regions_on_configuration_error() {
-        let context = Context::new();
-        context.allow_unregistered_dialects();
-        let location = context.unknown_location();
-        let source_block = context.block(&[(context.index_type(), location)]);
-        let source = source_block.argument(0).unwrap();
-        let mut body = context.block_with_no_arguments();
-        body.append_operation(OperationBuilder::new("test.use", location).add_operand(source).build().unwrap())
-            .unwrap();
-        let region: DetachedRegion<'_, '_> = body.try_into().unwrap();
-        assert_eq!(source.uses().unwrap().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
-        let other_context = Context::new();
-        let builder = OperationBuilder::new("test.owner", location)
-            .add_region(region)
-            .add_result(other_context.index_type());
-        assert!(matches!(
-            builder.build(),
-            Err(Error::InvalidArgument { message, .. })
-                if message == "result type context does not match operation builder context",
-        ));
         assert_eq!(source.uses().unwrap().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
     }
 
@@ -577,12 +697,17 @@ mod tests {
         let source_block = context.block(&[(context.index_type(), location)]);
         let source = source_block.argument(0).unwrap();
         let mut body = context.block_with_no_arguments();
-        body.append_operation(OperationBuilder::new("test.use", location).add_operand(source).build().unwrap())
-            .unwrap();
+        body.append_operation(
+            OperationBuilder::new("test.use", location).add_operand(source).unwrap().build().unwrap(),
+        )
+        .unwrap();
         let region: DetachedRegion<'_, '_> = body.try_into().unwrap();
         assert_eq!(source.uses().unwrap().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
         // An unregistered operation cannot infer result types. MLIR must destroy the transferred region on failure.
-        let builder = OperationBuilder::new("test.owner", location).add_region(region).enable_result_type_inference();
+        let builder = OperationBuilder::new("test.owner", location)
+            .add_region(region)
+            .unwrap()
+            .enable_result_type_inference();
         assert!(matches!(
             builder.build(),
             Err(Error::InvalidArgument { message, .. }) if message == "failed to build operation",
@@ -611,14 +736,23 @@ mod tests {
         let region_2 = context.region();
         let builder = OperationBuilder::new("test.op", location)
             .add_operand(arg_0)
+            .unwrap()
             .add_operands(&[arg_1, arg_0])
+            .unwrap()
             .add_attribute("attr_name", context.string_attribute("attr_value"))
+            .unwrap()
             .add_result(i32_type)
+            .unwrap()
             .add_results(&[i64_type, u64_type])
+            .unwrap()
             .add_region(region_0)
+            .unwrap()
             .add_regions(vec![region_1, region_2])
+            .unwrap()
             .add_successor(&block_1)
-            .add_successors(&[&block_2, &block_3]);
+            .unwrap()
+            .add_successors(&[&block_2, &block_3])
+            .unwrap();
         assert_eq!(builder.context(), &context);
     }
 
@@ -630,11 +764,13 @@ mod tests {
         let source_block = context.block(&[(context.index_type(), location)]);
         let source = source_block.argument(0).unwrap();
         let mut body = context.block_with_no_arguments();
-        body.append_operation(OperationBuilder::new("test.use", location).add_operand(source).build().unwrap())
-            .unwrap();
+        body.append_operation(
+            OperationBuilder::new("test.use", location).add_operand(source).unwrap().build().unwrap(),
+        )
+        .unwrap();
         let region: DetachedRegion<'_, '_> = body.try_into().unwrap();
         assert_eq!(source.uses().unwrap().collect::<Result<Vec<_>, _>>().unwrap().len(), 1);
-        let builder = OperationBuilder::new("test.owner", location).add_region(region);
+        let builder = OperationBuilder::new("test.owner", location).add_region(region).unwrap();
         drop(builder);
         assert_eq!(source.uses().unwrap().collect::<Result<Vec<_>, _>>().unwrap().len(), 0);
     }

@@ -522,7 +522,9 @@ mod tests {
         // Test using an operation result.
         let op = OperationBuilder::new("arith.constant", location)
             .add_results(&[index_type])
+            .unwrap()
             .add_attribute("value", context.parse_attribute("0 : index").unwrap())
+            .unwrap()
             .build()
             .unwrap();
         let result = op.result(0).unwrap();
@@ -558,18 +560,22 @@ mod tests {
         let index_type = context.index_type();
         let op_0 = OperationBuilder::new("arith.constant", location)
             .add_results(&[index_type])
+            .unwrap()
             .add_attribute("value", context.parse_attribute("0 : index").unwrap())
+            .unwrap()
             .build()
             .unwrap();
         let op_1 = OperationBuilder::new("arith.constant", location)
             .add_results(&[index_type])
+            .unwrap()
             .add_attribute("value", context.parse_attribute("1 : index").unwrap())
+            .unwrap()
             .build()
             .unwrap();
         let value_0 = op_0.result(0).unwrap();
         let value_1 = op_1.result(0).unwrap();
-        let op_3 = OperationBuilder::new("test.op_3", location).add_operand(value_0).build().unwrap();
-        let op_4 = OperationBuilder::new("test.op_4", location).add_operand(value_0).build().unwrap();
+        let op_3 = OperationBuilder::new("test.op_3", location).add_operand(value_0).unwrap().build().unwrap();
+        let op_4 = OperationBuilder::new("test.op_4", location).add_operand(value_0).unwrap().build().unwrap();
         assert_eq!(op_3.operand_value(0).unwrap(), value_0);
         assert_eq!(op_3.operand_value(0).unwrap(), value_0);
         value_0.replace_uses(value_1);
@@ -615,7 +621,9 @@ mod tests {
         let index_type = context.index_type();
         let op = OperationBuilder::new("arith.constant", location)
             .add_results(&[index_type])
+            .unwrap()
             .add_attribute("value", context.parse_attribute("0 : index").unwrap())
+            .unwrap()
             .build()
             .unwrap();
         let result = op.result(0).unwrap();
@@ -645,8 +653,11 @@ mod tests {
         let block_argument = block.argument(0).unwrap();
         let op = OperationBuilder::new("arith.constant", location)
             .add_operand(block_argument)
+            .unwrap()
             .add_results(&[index_type])
+            .unwrap()
             .add_attribute("value", context.parse_attribute("0 : index").unwrap())
+            .unwrap()
             .build()
             .unwrap();
         let operand = op.operand(0).unwrap();

@@ -38,8 +38,8 @@ pub fn new<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.new", location)
-        .add_operand(source)
-        .add_result(result_type)
+        .add_operand(source)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::new`"))
@@ -94,9 +94,9 @@ pub fn assemble<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.assemble", location)
-        .add_operands(levels)
-        .add_operand(values)
-        .add_result(result_type)
+        .add_operands(levels)?
+        .add_operand(values)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -202,13 +202,13 @@ pub fn disassemble<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.disassemble", location)
-        .add_operand(tensor)
-        .add_operands(output_levels)
-        .add_operand(output_values)
-        .add_results(returned_level_types)
-        .add_result(returned_values_type)
-        .add_results(level_length_types)
-        .add_result(values_length_type)
+        .add_operand(tensor)?
+        .add_operands(output_levels)?
+        .add_operand(output_values)?
+        .add_results(returned_level_types)?
+        .add_result(returned_values_type)?
+        .add_results(level_length_types)?
+        .add_result(values_length_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -247,8 +247,8 @@ pub fn convert<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.convert", location)
-        .add_operand(source)
-        .add_result(result_type)
+        .add_operand(source)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -285,8 +285,8 @@ pub fn reinterpret_map<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.reinterpret_map", location)
-        .add_operand(source)
-        .add_result(result_type)
+        .add_operand(source)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -334,9 +334,9 @@ pub fn positions<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.positions", location)
-        .add_operand(tensor)
-        .add_attribute(LEVEL_ATTRIBUTE, context.integer_attribute(context.index_type(), level))
-        .add_result(result_type)
+        .add_operand(tensor)?
+        .add_attribute(LEVEL_ATTRIBUTE, context.integer_attribute(context.index_type(), level))?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -381,9 +381,9 @@ pub fn coordinates<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.coordinates", location)
-        .add_operand(tensor)
-        .add_attribute(LEVEL_ATTRIBUTE, context.integer_attribute(context.index_type(), level))
-        .add_result(result_type)
+        .add_operand(tensor)?
+        .add_attribute(LEVEL_ATTRIBUTE, context.integer_attribute(context.index_type(), level))?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -422,8 +422,8 @@ pub fn coordinates_buffer<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, '
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.coordinates_buffer", location)
-        .add_operand(tensor)
-        .add_result(result_type)
+        .add_operand(tensor)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -462,8 +462,8 @@ pub fn values<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.values", location)
-        .add_operand(tensor)
-        .add_result(result_type)
+        .add_operand(tensor)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -501,8 +501,8 @@ pub fn number_of_entries<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.number_of_entries", location)
-        .add_operand(tensor)
-        .add_result(context.index_type())
+        .add_operand(tensor)?
+        .add_result(context.index_type())?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -550,9 +550,9 @@ pub fn concatenate<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.concatenate", location)
-        .add_operands(inputs)
-        .add_attribute(DIMENSION_ATTRIBUTE, context.integer_attribute(context.index_type(), dimension))
-        .add_result(result_type)
+        .add_operands(inputs)?
+        .add_attribute(DIMENSION_ATTRIBUTE, context.integer_attribute(context.index_type(), dimension))?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -599,9 +599,9 @@ pub fn slice_offset<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.slice.offset", location)
-        .add_operand(slice)
-        .add_attribute(DIM_ATTRIBUTE, context.integer_attribute(context.index_type(), dimension))
-        .add_result(context.index_type())
+        .add_operand(slice)?
+        .add_attribute(DIM_ATTRIBUTE, context.integer_attribute(context.index_type(), dimension))?
+        .add_result(context.index_type())?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -645,9 +645,9 @@ pub fn slice_stride<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.slice.stride", location)
-        .add_operand(slice)
-        .add_attribute(DIM_ATTRIBUTE, context.integer_attribute(context.index_type(), dimension))
-        .add_result(context.index_type())
+        .add_operand(slice)?
+        .add_attribute(DIM_ATTRIBUTE, context.integer_attribute(context.index_type(), dimension))?
+        .add_result(context.index_type())?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -685,9 +685,10 @@ pub fn storage_specifier_init<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'
 ) -> Result<DetachedStorageSpecifierInitOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
-    let mut builder = OperationBuilder::new("sparse_tensor.storage_specifier.init", location).add_result(result_type);
+    let mut builder =
+        OperationBuilder::new("sparse_tensor.storage_specifier.init", location).add_result(result_type)?;
     if let Some(source) = source {
-        builder = builder.add_operand(source);
+        builder = builder.add_operand(source)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -750,14 +751,14 @@ pub fn storage_specifier_get<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     let mut builder = OperationBuilder::new("sparse_tensor.storage_specifier.get", location)
-        .add_operand(specifier)
+        .add_operand(specifier)?
         .add_attribute(
             SPECIFIER_KIND_ATTRIBUTE,
             context.sparse_tensor_storage_specifier_kind_attribute(specifier_kind)?,
-        )
-        .add_result(context.index_type());
+        )?
+        .add_result(context.index_type())?;
     if let Some(level) = level {
-        builder = builder.add_attribute(LEVEL_ATTRIBUTE, context.integer_attribute(context.index_type(), level));
+        builder = builder.add_attribute(LEVEL_ATTRIBUTE, context.integer_attribute(context.index_type(), level))?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -823,15 +824,15 @@ pub fn storage_specifier_set<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     let mut builder = OperationBuilder::new("sparse_tensor.storage_specifier.set", location)
-        .add_operand(specifier)
-        .add_operand(value)
+        .add_operand(specifier)?
+        .add_operand(value)?
         .add_attribute(
             SPECIFIER_KIND_ATTRIBUTE,
             context.sparse_tensor_storage_specifier_kind_attribute(specifier_kind)?,
-        )
-        .add_result(specifier.r#type()?);
+        )?
+        .add_result(specifier.r#type()?)?;
     if let Some(level) = level {
-        builder = builder.add_attribute(LEVEL_ATTRIBUTE, context.integer_attribute(context.index_type(), level));
+        builder = builder.add_attribute(LEVEL_ATTRIBUTE, context.integer_attribute(context.index_type(), level))?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -873,9 +874,9 @@ pub fn level<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.lvl", location)
-        .add_operand(source)
-        .add_operand(index)
-        .add_result(context.index_type())
+        .add_operand(source)?
+        .add_operand(index)?
+        .add_result(context.index_type())?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -944,13 +945,13 @@ pub fn coordinate_translate<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     let output_types = (0..output_count).map(|_| context.index_type()).collect::<Vec<_>>();
     OperationBuilder::new("sparse_tensor.crd_translate", location)
-        .add_operands(input_coordinates)
+        .add_operands(input_coordinates)?
         .add_attribute(
             DIRECTION_ATTRIBUTE,
             context.sparse_tensor_coordinate_translation_direction_attribute(direction)?,
-        )
-        .add_attribute(ENCODER_ATTRIBUTE, encoder)
-        .add_results(&output_types)
+        )?
+        .add_attribute(ENCODER_ATTRIBUTE, encoder)?
+        .add_results(&output_types)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1016,16 +1017,16 @@ pub fn push_back<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     let mut builder = OperationBuilder::new("sparse_tensor.push_back", location)
-        .add_operand(current_size)
-        .add_operand(input_buffer)
-        .add_operand(value)
-        .add_result(input_buffer.r#type()?)
-        .add_result(current_size.r#type()?);
+        .add_operand(current_size)?
+        .add_operand(input_buffer)?
+        .add_operand(value)?
+        .add_result(input_buffer.r#type()?)?
+        .add_result(current_size.r#type()?)?;
     if let Some(count) = count {
-        builder = builder.add_operand(count);
+        builder = builder.add_operand(count)?;
     }
     if inbounds {
-        builder = builder.add_attribute(INBOUNDS_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(INBOUNDS_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -1077,11 +1078,11 @@ pub fn expand<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.expand", location)
-        .add_operand(tensor)
-        .add_result(values_type)
-        .add_result(filled_type)
-        .add_result(added_type)
-        .add_result(context.index_type())
+        .add_operand(tensor)?
+        .add_result(values_type)?
+        .add_result(filled_type)?
+        .add_result(added_type)?
+        .add_result(context.index_type())?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1146,13 +1147,13 @@ pub fn compress<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.compress", location)
-        .add_operand(values)
-        .add_operand(filled)
-        .add_operand(added)
-        .add_operand(count)
-        .add_operand(tensor)
-        .add_operands(level_coordinates)
-        .add_result(tensor.r#type()?)
+        .add_operand(values)?
+        .add_operand(filled)?
+        .add_operand(added)?
+        .add_operand(count)?
+        .add_operand(tensor)?
+        .add_operands(level_coordinates)?
+        .add_result(tensor.r#type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1196,10 +1197,10 @@ pub fn load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     let mut builder = OperationBuilder::new("sparse_tensor.load", location)
-        .add_operand(tensor)
-        .add_result(tensor.r#type()?);
+        .add_operand(tensor)?
+        .add_result(tensor.r#type()?)?;
     if has_inserts {
-        builder = builder.add_attribute(HAS_INSERTS_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(HAS_INSERTS_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -1234,8 +1235,8 @@ pub fn out<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.out", location)
-        .add_operand(tensor)
-        .add_operand(destination)
+        .add_operand(tensor)?
+        .add_operand(destination)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `sparse_tensor::out`"))
@@ -1311,13 +1312,14 @@ pub fn sort<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     let mut builder = OperationBuilder::new("sparse_tensor.sort", location)
-        .add_operand(count)
-        .add_operand(coordinates_and_values)
-        .add_operands(payloads)
-        .add_attribute(PERMUTATION_MAP_ATTRIBUTE, context.affine_map_attribute(permutation_map))
-        .add_attribute(ALGORITHM_ATTRIBUTE, context.sparse_tensor_sort_kind_attribute(algorithm)?);
+        .add_operand(count)?
+        .add_operand(coordinates_and_values)?
+        .add_operands(payloads)?
+        .add_attribute(PERMUTATION_MAP_ATTRIBUTE, context.affine_map_attribute(permutation_map))?
+        .add_attribute(ALGORITHM_ATTRIBUTE, context.sparse_tensor_sort_kind_attribute(algorithm)?)?;
     if let Some(payload_count) = payload_count {
-        builder = builder.add_attribute(NY_ATTRIBUTE, context.integer_attribute(context.index_type(), payload_count));
+        builder =
+            builder.add_attribute(NY_ATTRIBUTE, context.integer_attribute(context.index_type(), payload_count))?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -1368,9 +1370,9 @@ pub fn reorder_coo<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.reorder_coo", location)
-        .add_operand(input_coo)
-        .add_attribute(ALGORITHM_ATTRIBUTE, context.sparse_tensor_sort_kind_attribute(algorithm)?)
-        .add_result(result_type)
+        .add_operand(input_coo)?
+        .add_attribute(ALGORITHM_ATTRIBUTE, context.sparse_tensor_sort_kind_attribute(algorithm)?)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1450,17 +1452,17 @@ pub fn binary<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     let mut builder = OperationBuilder::new("sparse_tensor.binary", location)
-        .add_operand(lhs)
-        .add_operand(rhs)
-        .add_result(result_type)
-        .add_region(overlap_region)
-        .add_region(left_region)
-        .add_region(right_region);
+        .add_operand(lhs)?
+        .add_operand(rhs)?
+        .add_result(result_type)?
+        .add_region(overlap_region)?
+        .add_region(left_region)?
+        .add_region(right_region)?;
     if left_identity {
-        builder = builder.add_attribute(LEFT_IDENTITY_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(LEFT_IDENTITY_ATTRIBUTE, context.unit_attribute())?;
     }
     if right_identity {
-        builder = builder.add_attribute(RIGHT_IDENTITY_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(RIGHT_IDENTITY_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -1510,10 +1512,10 @@ pub fn unary<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.unary", location)
-        .add_operand(input)
-        .add_result(result_type)
-        .add_region(present_region)
-        .add_region(absent_region)
+        .add_operand(input)?
+        .add_result(result_type)?
+        .add_region(present_region)?
+        .add_region(absent_region)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1569,11 +1571,11 @@ pub fn reduce<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.reduce", location)
-        .add_operand(lhs)
-        .add_operand(rhs)
-        .add_operand(identity)
-        .add_result(lhs.r#type()?)
-        .add_region(region)
+        .add_operand(lhs)?
+        .add_operand(rhs)?
+        .add_operand(identity)?
+        .add_result(lhs.r#type()?)?
+        .add_region(region)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1617,9 +1619,9 @@ pub fn select<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.select", location)
-        .add_operand(input)
-        .add_result(input.r#type()?)
-        .add_region(region)
+        .add_operand(input)?
+        .add_result(input.r#type()?)?
+        .add_region(region)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1654,7 +1656,7 @@ pub fn r#yield<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.yield", location)
-        .add_operands(values)
+        .add_operands(values)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1716,12 +1718,12 @@ pub fn foreach<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     let result_types = initial_values.iter().map(|value| value.r#type()).collect::<Result<Vec<_>, _>>()?;
     let mut builder = OperationBuilder::new("sparse_tensor.foreach", location)
-        .add_operand(tensor)
-        .add_operands(initial_values)
-        .add_results(&result_types)
-        .add_region(body);
+        .add_operand(tensor)?
+        .add_operands(initial_values)?
+        .add_results(&result_types)?
+        .add_region(body)?;
     if let Some(order) = order {
-        builder = builder.add_attribute(ORDER_ATTRIBUTE, context.affine_map_attribute(order));
+        builder = builder.add_attribute(ORDER_ATTRIBUTE, context.affine_map_attribute(order))?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -1784,12 +1786,12 @@ pub fn extract_iteration_space<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     let mut builder = OperationBuilder::new("sparse_tensor.extract_iteration_space", location)
-        .add_operand(tensor)
-        .add_attribute(LOWER_LEVEL_ATTRIBUTE, context.integer_attribute(context.index_type(), lower_level))
-        .add_attribute(UPPER_LEVEL_ATTRIBUTE, context.integer_attribute(context.index_type(), upper_level))
-        .add_result(result_type);
+        .add_operand(tensor)?
+        .add_attribute(LOWER_LEVEL_ATTRIBUTE, context.integer_attribute(context.index_type(), lower_level))?
+        .add_attribute(UPPER_LEVEL_ATTRIBUTE, context.integer_attribute(context.index_type(), upper_level))?
+        .add_result(result_type)?;
     if let Some(parent_iterator) = parent_iterator {
-        builder = builder.add_operand(parent_iterator);
+        builder = builder.add_operand(parent_iterator)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -1834,9 +1836,9 @@ pub fn extract_value<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.extract_value", location)
-        .add_operand(tensor)
-        .add_operand(iterator)
-        .add_result(result_type)
+        .add_operand(tensor)?
+        .add_operand(iterator)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1894,14 +1896,14 @@ pub fn iterate<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     let result_types = initial_values.iter().map(|value| value.r#type()).collect::<Result<Vec<_>, _>>()?;
     OperationBuilder::new("sparse_tensor.iterate", location)
-        .add_operand(iteration_space)
-        .add_operands(initial_values)
+        .add_operand(iteration_space)?
+        .add_operands(initial_values)?
         .add_attribute(
             COORDINATE_USED_LEVELS_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), coordinate_used_levels as i64),
-        )
-        .add_results(&result_types)
-        .add_region(body)
+        )?
+        .add_results(&result_types)?
+        .add_region(body)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1989,19 +1991,19 @@ pub fn coiterate<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         .map(|case| context.integer_attribute(context.signless_integer_type(64), *case as i64))
         .collect::<Vec<_>>();
     OperationBuilder::new("sparse_tensor.coiterate", location)
-        .add_operands(iteration_spaces)
-        .add_operands(initial_values)
+        .add_operands(iteration_spaces)?
+        .add_operands(initial_values)?
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
             context.dense_i32_array_attribute(&[iteration_spaces.len() as i32, initial_values.len() as i32])?,
-        )
+        )?
         .add_attribute(
             COORDINATE_USED_LEVELS_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), coordinate_used_levels as i64),
-        )
-        .add_attribute(CASES_ATTRIBUTE, context.array_attribute(&cases))
-        .add_results(&result_types)
-        .add_regions(case_regions)
+        )?
+        .add_attribute(CASES_ATTRIBUTE, context.array_attribute(&cases))?
+        .add_results(&result_types)?
+        .add_regions(case_regions)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -2030,7 +2032,7 @@ pub fn print<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.print", location)
-        .add_operand(tensor)
+        .add_operand(tensor)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -2060,7 +2062,7 @@ pub fn has_runtime_library<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::sparse_tensor()?)?;
     OperationBuilder::new("sparse_tensor.has_runtime_library", location)
-        .add_result(context.signless_integer_type(1))
+        .add_result(context.signless_integer_type(1))?
         .build()
         .and_then(|operation| unsafe {
             operation

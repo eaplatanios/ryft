@@ -49,9 +49,9 @@ pub fn intr_get_active_lane_mask<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(GET_ACTIVE_LANE_MASK_OPERATION_NAME, location);
-    builder = builder.add_operand(base);
-    builder = builder.add_operand(bound);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(base)?;
+    builder = builder.add_operand(bound)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -103,9 +103,9 @@ pub fn intr_invariant_end<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, V1: Value<'
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(INVARIANT_END_OPERATION_NAME, location);
-    builder = builder.add_operand(start);
-    builder = builder.add_operand(pointer);
-    builder = builder.add_attribute("size", size);
+    builder = builder.add_operand(start)?;
+    builder = builder.add_operand(pointer)?;
+    builder = builder.add_attribute("size", size)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -157,9 +157,9 @@ pub fn intr_invariant_start<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(INVARIANT_START_OPERATION_NAME, location);
-    builder = builder.add_operand(pointer);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("size", size);
+    builder = builder.add_operand(pointer)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("size", size)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -206,8 +206,8 @@ pub fn intr_launder_invariant_group<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(LAUNDER_INVARIANT_GROUP_OPERATION_NAME, location);
-    builder = builder.add_operand(pointer);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(pointer)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -241,7 +241,7 @@ pub fn intr_lifetime_end<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, L: Location<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(LIFETIME_END_OPERATION_NAME, location);
-    builder = builder.add_operand(pointer);
+    builder = builder.add_operand(pointer)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -275,7 +275,7 @@ pub fn intr_lifetime_start<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, L: Locatio
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(LIFETIME_START_OPERATION_NAME, location);
-    builder = builder.add_operand(pointer);
+    builder = builder.add_operand(pointer)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -353,11 +353,11 @@ pub fn intr_masked_load<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(MASKED_LOAD_OPERATION_NAME, location);
-    builder = builder.add_operand(data);
-    builder = builder.add_operand(mask);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("alignment", alignment);
-    builder = builder.add_attribute("nontemporal", nontemporal);
+    builder = builder.add_operand(data)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("alignment", alignment)?;
+    builder = builder.add_attribute("nontemporal", nontemporal)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -423,10 +423,10 @@ pub fn intr_masked_store<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(MASKED_STORE_OPERATION_NAME, location);
-    builder = builder.add_operand(value);
-    builder = builder.add_operand(data);
-    builder = builder.add_operand(mask);
-    builder = builder.add_attribute("alignment", alignment);
+    builder = builder.add_operand(value)?;
+    builder = builder.add_operand(data)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_attribute("alignment", alignment)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -516,12 +516,12 @@ pub fn intr_matrix_column_major_load<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(MATRIX_COLUMN_MAJOR_LOAD_OPERATION_NAME, location);
-    builder = builder.add_operand(data);
-    builder = builder.add_operand(stride);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("isVolatile", is_volatile);
-    builder = builder.add_attribute("rows", rows);
-    builder = builder.add_attribute("columns", columns);
+    builder = builder.add_operand(data)?;
+    builder = builder.add_operand(stride)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("isVolatile", is_volatile)?;
+    builder = builder.add_attribute("rows", rows)?;
+    builder = builder.add_attribute("columns", columns)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -611,12 +611,12 @@ pub fn intr_matrix_column_major_store<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(MATRIX_COLUMN_MAJOR_STORE_OPERATION_NAME, location);
-    builder = builder.add_operand(matrix);
-    builder = builder.add_operand(data);
-    builder = builder.add_operand(stride);
-    builder = builder.add_attribute("isVolatile", is_volatile);
-    builder = builder.add_attribute("rows", rows);
-    builder = builder.add_attribute("columns", columns);
+    builder = builder.add_operand(matrix)?;
+    builder = builder.add_operand(data)?;
+    builder = builder.add_operand(stride)?;
+    builder = builder.add_attribute("isVolatile", is_volatile)?;
+    builder = builder.add_attribute("rows", rows)?;
+    builder = builder.add_attribute("columns", columns)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -706,12 +706,12 @@ pub fn intr_matrix_multiply<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(MATRIX_MULTIPLY_OPERATION_NAME, location);
-    builder = builder.add_operand(lhs);
-    builder = builder.add_operand(rhs);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("lhs_rows", lhs_rows);
-    builder = builder.add_attribute("lhs_columns", lhs_columns);
-    builder = builder.add_attribute("rhs_columns", rhs_columns);
+    builder = builder.add_operand(lhs)?;
+    builder = builder.add_operand(rhs)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("lhs_rows", lhs_rows)?;
+    builder = builder.add_attribute("lhs_columns", lhs_columns)?;
+    builder = builder.add_attribute("rhs_columns", rhs_columns)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -775,10 +775,10 @@ pub fn intr_matrix_transpose<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: Type
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(MATRIX_TRANSPOSE_OPERATION_NAME, location);
-    builder = builder.add_operand(matrix);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("rows", rows);
-    builder = builder.add_attribute("columns", columns);
+    builder = builder.add_operand(matrix)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("rows", rows)?;
+    builder = builder.add_attribute("columns", columns)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -842,10 +842,10 @@ pub fn intr_memcpy_inline<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, V1: Value<'
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(MEMCPY_INLINE_OPERATION_NAME, location);
-    builder = builder.add_operand(destination);
-    builder = builder.add_operand(source);
-    builder = builder.add_attribute("len", len);
-    builder = builder.add_attribute("isVolatile", is_volatile);
+    builder = builder.add_operand(destination)?;
+    builder = builder.add_operand(source)?;
+    builder = builder.add_attribute("len", len)?;
+    builder = builder.add_attribute("isVolatile", is_volatile)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -911,10 +911,10 @@ pub fn intr_memcpy<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(MEMCPY_OPERATION_NAME, location);
-    builder = builder.add_operand(destination);
-    builder = builder.add_operand(source);
-    builder = builder.add_operand(length);
-    builder = builder.add_attribute("isVolatile", is_volatile);
+    builder = builder.add_operand(destination)?;
+    builder = builder.add_operand(source)?;
+    builder = builder.add_operand(length)?;
+    builder = builder.add_attribute("isVolatile", is_volatile)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_memcpy`"))
     })
@@ -978,10 +978,10 @@ pub fn intr_memmove<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(MEMMOVE_OPERATION_NAME, location);
-    builder = builder.add_operand(destination);
-    builder = builder.add_operand(source);
-    builder = builder.add_operand(length);
-    builder = builder.add_attribute("isVolatile", is_volatile);
+    builder = builder.add_operand(destination)?;
+    builder = builder.add_operand(source)?;
+    builder = builder.add_operand(length)?;
+    builder = builder.add_attribute("isVolatile", is_volatile)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_memmove`"))
     })
@@ -1043,10 +1043,10 @@ pub fn intr_memset_inline<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, V1: Value<'
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(MEMSET_INLINE_OPERATION_NAME, location);
-    builder = builder.add_operand(destination);
-    builder = builder.add_operand(value);
-    builder = builder.add_attribute("len", len);
-    builder = builder.add_attribute("isVolatile", is_volatile);
+    builder = builder.add_operand(destination)?;
+    builder = builder.add_operand(value)?;
+    builder = builder.add_attribute("len", len)?;
+    builder = builder.add_attribute("isVolatile", is_volatile)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -1112,10 +1112,10 @@ pub fn intr_memset<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(MEMSET_OPERATION_NAME, location);
-    builder = builder.add_operand(destination);
-    builder = builder.add_operand(value);
-    builder = builder.add_operand(length);
-    builder = builder.add_attribute("isVolatile", is_volatile);
+    builder = builder.add_operand(destination)?;
+    builder = builder.add_operand(value)?;
+    builder = builder.add_operand(length)?;
+    builder = builder.add_attribute("isVolatile", is_volatile)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_memset`"))
     })
@@ -1153,7 +1153,7 @@ pub fn intr_experimental_noalias_scope_decl<'v, 'c: 'v, 't: 'c, L: Location<'c, 
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(NO_ALIAS_SCOPE_DECL_OPERATION_NAME, location);
-    builder = builder.add_attribute("scope", scope);
+    builder = builder.add_attribute("scope", scope)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -1223,10 +1223,10 @@ pub fn intr_prefetch<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, L: Location<'c, 
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(PREFETCH_OPERATION_NAME, location);
-    builder = builder.add_operand(address);
-    builder = builder.add_attribute("rw", rw);
-    builder = builder.add_attribute("hint", hint);
-    builder = builder.add_attribute("cache", cache);
+    builder = builder.add_operand(address)?;
+    builder = builder.add_attribute("rw", rw)?;
+    builder = builder.add_attribute("hint", hint)?;
+    builder = builder.add_attribute("cache", cache)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -1301,12 +1301,12 @@ pub fn intr_ptr_annotation<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(PTR_ANNOTATION_OPERATION_NAME, location);
-    builder = builder.add_operand(pointer);
-    builder = builder.add_operand(annotation);
-    builder = builder.add_operand(file_name);
-    builder = builder.add_operand(line);
-    builder = builder.add_operand(attribute);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(pointer)?;
+    builder = builder.add_operand(annotation)?;
+    builder = builder.add_operand(file_name)?;
+    builder = builder.add_operand(line)?;
+    builder = builder.add_operand(attribute)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -1360,9 +1360,9 @@ pub fn intr_ptrmask<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(PTR_MASK_OPERATION_NAME, location);
-    builder = builder.add_operand(pointer);
-    builder = builder.add_operand(mask);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(pointer)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_ptrmask`"))
     })
@@ -1394,7 +1394,7 @@ pub fn intr_stack_restore<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, L: Location
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(STACK_RESTORE_OPERATION_NAME, location);
-    builder = builder.add_operand(pointer);
+    builder = builder.add_operand(pointer)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -1428,7 +1428,7 @@ pub fn intr_stack_save<'v, 'c: 'v, 't: 'c, T0: Type<'c, 't>, L: Location<'c, 't>
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(STACK_SAVE_OPERATION_NAME, location);
-    builder = builder.add_result(result_type);
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -1468,8 +1468,8 @@ pub fn intr_strip_invariant_group<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0:
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(STRIP_INVARIANT_GROUP_OPERATION_NAME, location);
-    builder = builder.add_operand(pointer);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(pointer)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -1509,8 +1509,8 @@ pub fn intr_thread_local_address<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, T0: 
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(THREAD_LOCAL_ADDRESS_OPERATION_NAME, location);
-    builder = builder.add_operand(global);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(global)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -1550,8 +1550,8 @@ pub fn intr_va_copy<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, V1: Value<'v, 'c,
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VA_COPY_OPERATION_NAME, location);
-    builder = builder.add_operand(destination_list);
-    builder = builder.add_operand(source_list);
+    builder = builder.add_operand(destination_list)?;
+    builder = builder.add_operand(source_list)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_va_copy`"))
     })
@@ -1583,7 +1583,7 @@ pub fn intr_va_end<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, L: Location<'c, 't
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VA_END_OPERATION_NAME, location);
-    builder = builder.add_operand(argument_list);
+    builder = builder.add_operand(argument_list)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::intr_va_end`"))
     })
@@ -1615,7 +1615,7 @@ pub fn intr_va_start<'v, 'c: 'v, 't: 'c, V0: Value<'v, 'c, 't>, L: Location<'c, 
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VA_START_OPERATION_NAME, location);
-    builder = builder.add_operand(argument_list);
+    builder = builder.add_operand(argument_list)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -1669,9 +1669,9 @@ pub fn intr_masked_compress_store<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(MASKED_COMPRESS_STORE_OPERATION_NAME, location);
-    builder = builder.add_operand(value);
-    builder = builder.add_operand(pointer);
-    builder = builder.add_operand(mask);
+    builder = builder.add_operand(value)?;
+    builder = builder.add_operand(pointer)?;
+    builder = builder.add_operand(mask)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -1732,10 +1732,10 @@ pub fn intr_masked_expand_load<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(MASKED_EXPAND_LOAD_OPERATION_NAME, location);
-    builder = builder.add_operand(pointer);
-    builder = builder.add_operand(mask);
-    builder = builder.add_operand(passthru);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(pointer)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_operand(passthru)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -1801,10 +1801,10 @@ pub fn intr_masked_gather<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(MASKED_GATHER_OPERATION_NAME, location);
-    builder = builder.add_operand(pointers);
-    builder = builder.add_operand(mask);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("alignment", alignment);
+    builder = builder.add_operand(pointers)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("alignment", alignment)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -1870,10 +1870,10 @@ pub fn intr_masked_scatter<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(MASKED_SCATTER_OPERATION_NAME, location);
-    builder = builder.add_operand(value);
-    builder = builder.add_operand(pointers);
-    builder = builder.add_operand(mask);
-    builder = builder.add_attribute("alignment", alignment);
+    builder = builder.add_operand(value)?;
+    builder = builder.add_operand(pointers)?;
+    builder = builder.add_operand(mask)?;
+    builder = builder.add_attribute("alignment", alignment)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()

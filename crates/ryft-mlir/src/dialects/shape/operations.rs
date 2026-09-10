@@ -47,8 +47,8 @@ pub fn add<
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.add", location)
-        .add_operands(&[lhs.as_ref(), rhs.as_ref()])
-        .add_result(result_type)
+        .add_operands(&[lhs.as_ref(), rhs.as_ref()])?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shape::add`"))
@@ -88,9 +88,10 @@ pub fn broadcast<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedBroadcastOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
-    let mut builder = OperationBuilder::new("shape.broadcast", location).add_operands(shapes).add_result(result_type);
+    let mut builder =
+        OperationBuilder::new("shape.broadcast", location).add_operands(shapes)?.add_result(result_type)?;
     if let Some(error) = error {
-        builder = builder.add_attribute(ERROR_ATTRIBUTE, error);
+        builder = builder.add_attribute(ERROR_ATTRIBUTE, error)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shape::broadcast`"))
@@ -127,8 +128,8 @@ pub fn const_shape<'c, 't: 'c, A: Attribute<'c, 't>, T: Type<'c, 't>, L: Locatio
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.const_shape", location)
-        .add_attribute(SHAPE_ATTRIBUTE, shape)
-        .add_result(result_type)
+        .add_attribute(SHAPE_ATTRIBUTE, shape)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shape::const_shape`"))
@@ -164,8 +165,8 @@ pub fn const_size<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.const_size", location)
-        .add_attribute(VALUE_ATTRIBUTE, context.integer_attribute(context.index_type(), value))
-        .add_result(context.shape_size_type()?)
+        .add_attribute(VALUE_ATTRIBUTE, context.integer_attribute(context.index_type(), value))?
+        .add_result(context.shape_size_type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shape::const_size`"))
@@ -212,8 +213,8 @@ pub fn div<
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.div", location)
-        .add_operands(&[lhs.as_ref(), rhs.as_ref()])
-        .add_result(result_type)
+        .add_operands(&[lhs.as_ref(), rhs.as_ref()])?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shape::div`"))
@@ -244,8 +245,8 @@ pub fn shape_eq<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.shape_eq", location)
-        .add_operands(shapes)
-        .add_result(context.signless_integer_type(1))
+        .add_operands(shapes)?
+        .add_result(context.signless_integer_type(1))?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shape::shape_eq`"))
@@ -276,8 +277,8 @@ pub fn from_extents<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.from_extents", location)
-        .add_operands(extents)
-        .add_result(context.shape_type()?)
+        .add_operands(extents)?
+        .add_result(context.shape_type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -310,8 +311,8 @@ pub fn from_extent_tensor<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.from_extent_tensor", location)
-        .add_operand(input)
-        .add_result(context.shape_type()?)
+        .add_operand(input)?
+        .add_result(context.shape_type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -341,8 +342,8 @@ pub fn is_broadcastable<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.is_broadcastable", location)
-        .add_operands(shapes)
-        .add_result(context.signless_integer_type(1))
+        .add_operands(shapes)?
+        .add_result(context.signless_integer_type(1))?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -376,8 +377,8 @@ pub fn rank<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: Locati
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.rank", location)
-        .add_operand(shape)
-        .add_result(result_type)
+        .add_operand(shape)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shape::rank`"))
@@ -409,8 +410,8 @@ pub fn to_extent_tensor<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.to_extent_tensor", location)
-        .add_operand(input)
-        .add_result(result_type)
+        .add_operand(input)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -459,8 +460,8 @@ pub fn dim<
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.dim", location)
-        .add_operands(&[value.as_ref(), index.as_ref()])
-        .add_result(result_type)
+        .add_operands(&[value.as_ref(), index.as_ref()])?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shape::dim`"))
@@ -507,8 +508,8 @@ pub fn get_extent<
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.get_extent", location)
-        .add_operands(&[shape.as_ref(), dimension.as_ref()])
-        .add_result(result_type)
+        .add_operands(&[shape.as_ref(), dimension.as_ref()])?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shape::get_extent`"))
@@ -539,8 +540,8 @@ pub fn index_to_size<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, '
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.index_to_size", location)
-        .add_operand(argument)
-        .add_result(context.shape_size_type()?)
+        .add_operand(argument)?
+        .add_result(context.shape_size_type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -589,8 +590,8 @@ pub fn max<
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.max", location)
-        .add_operands(&[lhs.as_ref(), rhs.as_ref()])
-        .add_result(result_type)
+        .add_operands(&[lhs.as_ref(), rhs.as_ref()])?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shape::max`"))
@@ -640,10 +641,10 @@ pub fn meet<
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     let mut builder = OperationBuilder::new("shape.meet", location)
-        .add_operands(&[first_argument.as_ref(), second_argument.as_ref()])
-        .add_result(result_type);
+        .add_operands(&[first_argument.as_ref(), second_argument.as_ref()])?
+        .add_result(result_type)?;
     if let Some(error) = error {
-        builder = builder.add_attribute(ERROR_ATTRIBUTE, error);
+        builder = builder.add_attribute(ERROR_ATTRIBUTE, error)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shape::meet`"))
@@ -690,8 +691,8 @@ pub fn min<
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.min", location)
-        .add_operands(&[lhs.as_ref(), rhs.as_ref()])
-        .add_result(result_type)
+        .add_operands(&[lhs.as_ref(), rhs.as_ref()])?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shape::min`"))
@@ -738,8 +739,8 @@ pub fn mul<
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.mul", location)
-        .add_operands(&[lhs.as_ref(), rhs.as_ref()])
-        .add_result(result_type)
+        .add_operands(&[lhs.as_ref(), rhs.as_ref()])?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shape::mul`"))
@@ -771,8 +772,8 @@ pub fn num_elements<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.num_elements", location)
-        .add_operand(shape)
-        .add_result(result_type)
+        .add_operand(shape)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -816,10 +817,10 @@ pub fn reduce<'v, 'c: 'v, 't: 'c, S: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.reduce", location)
-        .add_operand(shape)
-        .add_operands(initial_values)
-        .add_results(result_types)
-        .add_region(region)
+        .add_operand(shape)?
+        .add_operands(initial_values)?
+        .add_results(result_types)?
+        .add_region(region)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shape::reduce`"))
@@ -851,8 +852,8 @@ pub fn shape_of<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: Lo
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.shape_of", location)
-        .add_operand(argument)
-        .add_result(result_type)
+        .add_operand(argument)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shape::shape_of`"))
@@ -884,8 +885,8 @@ pub fn value_of<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>, L: Lo
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.value_of", location)
-        .add_operand(argument)
-        .add_result(result_type)
+        .add_operand(argument)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shape::value_of`"))
@@ -916,8 +917,8 @@ pub fn size_to_index<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, '
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.size_to_index", location)
-        .add_operand(argument)
-        .add_result(context.index_type())
+        .add_operand(argument)?
+        .add_result(context.index_type())?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -951,8 +952,8 @@ pub fn value_as_shape<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, T: Type<'c, 't>,
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.value_as_shape", location)
-        .add_operand(argument)
-        .add_result(result_type)
+        .add_operand(argument)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -999,8 +1000,8 @@ pub fn with_shape<
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.with_shape", location)
-        .add_operands(&[operand.as_ref(), shape.as_ref()])
-        .add_result(context.shape_value_shape_type()?)
+        .add_operands(&[operand.as_ref(), shape.as_ref()])?
+        .add_result(context.shape_value_shape_type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shape::with_shape`"))
@@ -1031,7 +1032,7 @@ pub fn r#yield<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.yield", location)
-        .add_operands(values)
+        .add_operands(values)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shape::yield`"))
@@ -1059,8 +1060,8 @@ pub fn debug_print<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.debug_print", location)
-        .add_operand(input.as_ref())
-        .add_result(input.r#type()?)
+        .add_operand(input.as_ref())?
+        .add_result(input.r#type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shape::debug_print`"))
@@ -1115,8 +1116,8 @@ pub fn split_at<
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.split_at", location)
-        .add_operands(&[operand.as_ref(), index.as_ref()])
-        .add_results(&result_types)
+        .add_operands(&[operand.as_ref(), index.as_ref()])?
+        .add_results(&result_types)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shape::split_at`"))
@@ -1163,8 +1164,8 @@ pub fn concat<
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.concat", location)
-        .add_operands(&[lhs.as_ref(), rhs.as_ref()])
-        .add_result(result_type)
+        .add_operands(&[lhs.as_ref(), rhs.as_ref()])?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shape::concat`"))
@@ -1196,8 +1197,8 @@ pub fn any<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.any", location)
-        .add_operands(inputs)
-        .add_result(result_type)
+        .add_operands(inputs)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shape::any`"))
@@ -1228,8 +1229,8 @@ pub fn assuming_all<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.assuming_all", location)
-        .add_operands(inputs)
-        .add_result(context.shape_witness_type()?)
+        .add_operands(inputs)?
+        .add_result(context.shape_witness_type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1267,9 +1268,9 @@ pub fn assuming<'v, 'c: 'v, 't: 'c, W: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.assuming", location)
-        .add_operand(witness)
-        .add_results(result_types)
-        .add_region(region)
+        .add_operand(witness)?
+        .add_results(result_types)?
+        .add_region(region)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shape::assuming`"))
@@ -1300,7 +1301,7 @@ pub fn assuming_yield<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.assuming_yield", location)
-        .add_operands(values)
+        .add_operands(values)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1330,8 +1331,8 @@ pub fn cstr_broadcastable<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.cstr_broadcastable", location)
-        .add_operands(shapes)
-        .add_result(context.shape_witness_type()?)
+        .add_operands(shapes)?
+        .add_result(context.shape_witness_type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1361,8 +1362,8 @@ pub fn cstr_eq<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.cstr_eq", location)
-        .add_operands(shapes)
-        .add_result(context.shape_witness_type()?)
+        .add_operands(shapes)?
+        .add_result(context.shape_witness_type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shape::cstr_eq`"))
@@ -1398,8 +1399,8 @@ pub fn const_witness<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.const_witness", location)
-        .add_attribute(PASSING_ATTRIBUTE, context.boolean_attribute(passing))
-        .add_result(context.shape_witness_type()?)
+        .add_attribute(PASSING_ATTRIBUTE, context.boolean_attribute(passing))?
+        .add_result(context.shape_witness_type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1438,9 +1439,9 @@ pub fn cstr_require<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.cstr_require", location)
-        .add_operand(predicate)
-        .add_attribute(MESSAGE_ATTRIBUTE, message)
-        .add_result(context.shape_witness_type()?)
+        .add_operand(predicate)?
+        .add_attribute(MESSAGE_ATTRIBUTE, message)?
+        .add_result(context.shape_witness_type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1484,9 +1485,9 @@ pub fn function_library<'c, 't: 'c, N: TryIntoWithContext<'c, 't, StringAttribut
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.function_library", location)
-        .add_attribute(SYMBOL_NAME_ATTRIBUTE, name.try_into_with_context(context)?)
-        .add_attribute(MAPPING_ATTRIBUTE, mapping)
-        .add_region(body)
+        .add_attribute(SYMBOL_NAME_ATTRIBUTE, name.try_into_with_context(context)?)?
+        .add_attribute(MAPPING_ATTRIBUTE, mapping)?
+        .add_region(body)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1543,14 +1544,14 @@ pub fn func<'c, 't: 'c, 's, N: TryIntoWithContext<'c, 't, StringAttributeRef<'c,
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     let mut builder = OperationBuilder::new("shape.func", location)
-        .add_attribute(SYMBOL_NAME_ATTRIBUTE, name.try_into_with_context(context)?);
+        .add_attribute(SYMBOL_NAME_ATTRIBUTE, name.try_into_with_context(context)?)?;
     builder = builder.add_attribute(
         FUNCTION_TYPE_ATTRIBUTE,
         context.type_attribute(context.function_type(
             &attributes.arguments.iter().map(|argument| argument.r#type).collect::<Vec<_>>(),
             &attributes.results.iter().map(|result| result.r#type).collect::<Vec<_>>(),
         )),
-    );
+    )?;
     if attributes.arguments.iter().any(|argument| argument.attributes.is_some()) {
         builder = DetachedFuncOperation::<'c, 't>::add_callable_argument_attributes(
             builder,
@@ -1565,12 +1566,12 @@ pub fn func<'c, 't: 'c, 's, N: TryIntoWithContext<'c, 't, StringAttributeRef<'c,
     }
     if attributes.visibility != SymbolVisibility::default() {
         builder = builder
-            .add_attribute(SYMBOL_VISIBILITY_ATTRIBUTE, context.symbol_visibility_attribute(attributes.visibility));
+            .add_attribute(SYMBOL_VISIBILITY_ATTRIBUTE, context.symbol_visibility_attribute(attributes.visibility))?;
     }
     for (attribute_name, attribute) in &attributes.other_attributes {
-        builder = builder.add_attribute(*attribute_name, *attribute);
+        builder = builder.add_attribute(*attribute_name, *attribute)?;
     }
-    builder.add_region(body).build().and_then(|operation| unsafe {
+    builder.add_region(body)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shape::func`"))
     })
 }
@@ -1599,7 +1600,7 @@ pub fn r#return<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::shape()?)?;
     OperationBuilder::new("shape.return", location)
-        .add_operands(values)
+        .add_operands(values)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `shape::return`"))

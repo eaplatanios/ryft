@@ -41,8 +41,8 @@ pub fn block_address<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(BLOCK_ADDRESS_OPERATION_NAME, location);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("block_addr", block_addr);
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("block_addr", block_addr)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -82,7 +82,7 @@ pub fn block_tag<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(BLOCK_TAG_OPERATION_NAME, location);
-    builder = builder.add_attribute("tag", tag);
+    builder = builder.add_attribute("tag", tag)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::block_tag`"))
     })
@@ -162,11 +162,11 @@ pub fn cond_br<
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(COND_BR_OPERATION_NAME, location);
-    builder = builder.add_operand(condition);
-    builder = builder.add_operands(true_destination_operands);
-    builder = builder.add_operands(false_destination_operands);
-    builder = builder.add_successor(true_destination);
-    builder = builder.add_successor(false_destination);
+    builder = builder.add_operand(condition)?;
+    builder = builder.add_operands(true_destination_operands)?;
+    builder = builder.add_operands(false_destination_operands)?;
+    builder = builder.add_successor(true_destination)?;
+    builder = builder.add_successor(false_destination)?;
     builder = builder.add_attribute(
         "operand_segment_sizes",
         context.dense_i32_array_attribute(&[
@@ -174,12 +174,12 @@ pub fn cond_br<
             true_destination_operands.len() as i32,
             false_destination_operands.len() as i32,
         ])?,
-    );
+    )?;
     if let Some(branch_weights) = branch_weights {
-        builder = builder.add_attribute("branch_weights", branch_weights);
+        builder = builder.add_attribute("branch_weights", branch_weights)?;
     }
     if let Some(loop_annotation) = loop_annotation {
-        builder = builder.add_attribute("loop_annotation", loop_annotation);
+        builder = builder.add_attribute("loop_annotation", loop_annotation)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::cond_br`"))
@@ -236,10 +236,10 @@ pub fn indirect_br<'b, 'c: 'b, 't: 'c, V1: Value<'c, 'c, 't>, B: Block<'b, 'c, '
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(INDIRECT_BR_OPERATION_NAME, location);
-    builder = builder.add_operand(address);
-    builder = builder.add_operands(successor_operands);
-    builder = builder.add_successors(destinations);
-    builder = builder.add_attribute("indbr_operand_segments", indbr_operand_segments);
+    builder = builder.add_operand(address)?;
+    builder = builder.add_operands(successor_operands)?;
+    builder = builder.add_successors(destinations)?;
+    builder = builder.add_attribute("indbr_operand_segments", indbr_operand_segments)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::indirect_br`"))
     })
@@ -374,13 +374,13 @@ pub fn invoke<'b, 'c: 'b, 't: 'c, B1: Block<'b, 'c, 't>, B2: Block<'b, 'c, 't>, 
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(INVOKE_OPERATION_NAME, location);
-    builder = builder.add_operands(callee_operands);
-    builder = builder.add_operands(normal_destination_operands);
-    builder = builder.add_operands(unwind_destination_operands);
-    builder = builder.add_operands(op_bundle_operands);
-    builder = builder.add_successor(normal_destination);
-    builder = builder.add_successor(unwind_destination);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operands(callee_operands)?;
+    builder = builder.add_operands(normal_destination_operands)?;
+    builder = builder.add_operands(unwind_destination_operands)?;
+    builder = builder.add_operands(op_bundle_operands)?;
+    builder = builder.add_successor(normal_destination)?;
+    builder = builder.add_successor(unwind_destination)?;
+    builder = builder.add_result(result_type)?;
     builder = builder.add_attribute(
         "operand_segment_sizes",
         context.dense_i32_array_attribute(&[
@@ -389,30 +389,30 @@ pub fn invoke<'b, 'c: 'b, 't: 'c, B1: Block<'b, 'c, 't>, B2: Block<'b, 'c, 't>, 
             unwind_destination_operands.len() as i32,
             op_bundle_operands.len() as i32,
         ])?,
-    );
+    )?;
     let empty_op_bundle_sizes = context.dense_i32_array_attribute(&[])?;
     builder =
-        builder.add_attribute("op_bundle_sizes", op_bundle_sizes.unwrap_or_else(|| empty_op_bundle_sizes.as_ref()));
+        builder.add_attribute("op_bundle_sizes", op_bundle_sizes.unwrap_or_else(|| empty_op_bundle_sizes.as_ref()))?;
     if let Some(var_callee_type) = var_callee_type {
-        builder = builder.add_attribute("var_callee_type", var_callee_type);
+        builder = builder.add_attribute("var_callee_type", var_callee_type)?;
     }
     if let Some(callee) = callee {
-        builder = builder.add_attribute("callee", callee);
+        builder = builder.add_attribute("callee", callee)?;
     }
     if let Some(arg_attrs) = arg_attrs {
-        builder = builder.add_attribute("arg_attrs", arg_attrs);
+        builder = builder.add_attribute("arg_attrs", arg_attrs)?;
     }
     if let Some(res_attrs) = res_attrs {
-        builder = builder.add_attribute("res_attrs", res_attrs);
+        builder = builder.add_attribute("res_attrs", res_attrs)?;
     }
     if let Some(branch_weights) = branch_weights {
-        builder = builder.add_attribute("branch_weights", branch_weights);
+        builder = builder.add_attribute("branch_weights", branch_weights)?;
     }
     if let Some(calling_convention) = calling_convention {
-        builder = builder.add_attribute("CConv", calling_convention);
+        builder = builder.add_attribute("CConv", calling_convention)?;
     }
     if let Some(op_bundle_tags) = op_bundle_tags {
-        builder = builder.add_attribute("op_bundle_tags", op_bundle_tags);
+        builder = builder.add_attribute("op_bundle_tags", op_bundle_tags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::invoke`"))
@@ -445,7 +445,7 @@ pub fn resume<'c, 't: 'c, V1: Value<'c, 'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(RESUME_OPERATION_NAME, location);
-    builder = builder.add_operand(value);
+    builder = builder.add_operand(value)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::resume`"))
     })
@@ -527,21 +527,21 @@ pub fn switch<'b, 'c: 'b, 't: 'c, V1: Value<'c, 'c, 't>, B: Block<'b, 'c, 't>, L
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(SWITCH_OPERATION_NAME, location);
-    builder = builder.add_operand(value);
-    builder = builder.add_operands(default_operands);
-    builder = builder.add_operands(case_operands);
-    builder = builder.add_successor(default_destination);
-    builder = builder.add_successors(case_destinations);
+    builder = builder.add_operand(value)?;
+    builder = builder.add_operands(default_operands)?;
+    builder = builder.add_operands(case_operands)?;
+    builder = builder.add_successor(default_destination)?;
+    builder = builder.add_successors(case_destinations)?;
     if let Some(case_values) = case_values {
-        builder = builder.add_attribute("case_values", case_values);
+        builder = builder.add_attribute("case_values", case_values)?;
     }
-    builder = builder.add_attribute("case_operand_segments", case_operand_segments);
+    builder = builder.add_attribute("case_operand_segments", case_operand_segments)?;
     builder = builder.add_attribute(
         "operand_segment_sizes",
         context.dense_i32_array_attribute(&[1, default_operands.len() as i32, case_operands.len() as i32])?,
-    );
+    )?;
     if let Some(branch_weights) = branch_weights {
-        builder = builder.add_attribute("branch_weights", branch_weights);
+        builder = builder.add_attribute("branch_weights", branch_weights)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::switch`"))

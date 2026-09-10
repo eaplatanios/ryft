@@ -57,8 +57,8 @@ pub fn case<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedCaseOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.case", location)
-        .add_operand(index)
-        .add_regions(branches)
+        .add_operand(index)?
+        .add_regions(branches)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -121,9 +121,9 @@ pub fn r#if<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedIfOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.if", location)
-        .add_operand(predicate)
-        .add_region(true_branch)
-        .add_region(false_branch)
+        .add_operand(predicate)?
+        .add_region(true_branch)?
+        .add_region(false_branch)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -200,9 +200,9 @@ pub fn r#while<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedWhileOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.while", location)
-        .add_operands(operands)
-        .add_region(condition)
-        .add_region(body)
+        .add_operands(operands)?
+        .add_region(condition)?
+        .add_region(body)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -273,9 +273,9 @@ pub fn select<
 ) -> Result<DetachedSelectOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.select", location)
-        .add_operand(predicate)
-        .add_operand(on_true)
-        .add_operand(on_false)
+        .add_operand(predicate)?
+        .add_operand(on_true)?
+        .add_operand(on_false)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {

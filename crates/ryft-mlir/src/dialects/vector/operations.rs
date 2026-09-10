@@ -188,11 +188,11 @@ pub unsafe fn raw_contraction<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.contract", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -311,11 +311,11 @@ pub unsafe fn raw_reduction<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.reduction", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `vector::reduction`"))
@@ -427,11 +427,11 @@ pub unsafe fn raw_multi_dim_reduction<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.multi_reduction", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -522,11 +522,11 @@ pub unsafe fn raw_broadcast<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.broadcast", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `vector::broadcast`"))
@@ -636,11 +636,11 @@ pub unsafe fn raw_shuffle<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.shuffle", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `vector::shuffle`"))
@@ -741,11 +741,11 @@ pub unsafe fn raw_interleave<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.interleave", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `vector::interleave`"))
@@ -845,11 +845,11 @@ pub unsafe fn raw_deinterleave<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.deinterleave", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -955,11 +955,11 @@ pub unsafe fn raw_extract<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.extract", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `vector::extract`"))
@@ -1070,11 +1070,11 @@ pub unsafe fn raw_fma<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.fma", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `vector::fma`"))
@@ -1160,11 +1160,11 @@ pub unsafe fn raw_to_elements<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.to_elements", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -1254,11 +1254,11 @@ pub unsafe fn raw_from_elements<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.from_elements", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -1370,11 +1370,11 @@ pub unsafe fn raw_insert<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.insert", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `vector::insert`"))
@@ -1483,11 +1483,11 @@ pub unsafe fn raw_scalable_insert<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.scalable.insert", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -1587,11 +1587,11 @@ pub unsafe fn raw_scalable_extract<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.scalable.extract", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -1703,11 +1703,11 @@ pub unsafe fn raw_insert_strided_slice<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.insert_strided_slice", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -1822,11 +1822,11 @@ pub unsafe fn raw_outer_product<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.outerproduct", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -1935,11 +1935,11 @@ pub unsafe fn raw_extract_strided_slice<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.extract_strided_slice", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -2060,11 +2060,11 @@ pub unsafe fn raw_transfer_read<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.transfer_read", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -2185,11 +2185,11 @@ pub unsafe fn raw_transfer_write<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.transfer_write", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -2301,11 +2301,11 @@ pub unsafe fn raw_load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.load", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `vector::load`"))
@@ -2417,11 +2417,11 @@ pub unsafe fn raw_store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.store", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `vector::store`"))
@@ -2540,11 +2540,11 @@ pub unsafe fn raw_masked_load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.maskedload", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -2655,11 +2655,11 @@ pub unsafe fn raw_masked_store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.maskedstore", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -2786,11 +2786,11 @@ pub unsafe fn raw_gather<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.gather", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `vector::gather`"))
@@ -2908,11 +2908,11 @@ pub unsafe fn raw_scatter<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.scatter", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `vector::scatter`"))
@@ -3032,11 +3032,11 @@ pub unsafe fn raw_expand_load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.expandload", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -3148,11 +3148,11 @@ pub unsafe fn raw_compress_store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.compressstore", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -3248,11 +3248,11 @@ pub unsafe fn raw_shape_cast<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.shape_cast", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `vector::shape_cast`"))
@@ -3346,11 +3346,11 @@ pub unsafe fn raw_bit_cast<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.bitcast", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `vector::bit_cast`"))
@@ -3439,11 +3439,11 @@ pub unsafe fn raw_type_cast<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.type_cast", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `vector::type_cast`"))
@@ -3535,11 +3535,11 @@ pub unsafe fn raw_constant_mask<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.constant_mask", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -3627,11 +3627,11 @@ pub unsafe fn raw_create_mask<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.create_mask", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -3736,11 +3736,11 @@ pub unsafe fn raw_mask<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.mask", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `vector::mask`"))
@@ -3846,11 +3846,11 @@ pub unsafe fn raw_transpose<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.transpose", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `vector::transpose`"))
@@ -3940,11 +3940,11 @@ pub unsafe fn raw_print<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.print", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `vector::print`"))
@@ -4010,11 +4010,11 @@ pub unsafe fn raw_vector_scale<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.vscale", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -4150,11 +4150,11 @@ pub unsafe fn raw_scan<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.scan", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `vector::scan`"))
@@ -4223,11 +4223,11 @@ pub unsafe fn raw_step<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.step", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `vector::step`"))
@@ -4299,11 +4299,11 @@ pub unsafe fn raw_yield<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::vector()?)?;
     let mut builder = OperationBuilder::new("vector.yield", location)
-        .add_operands(operands)
-        .add_results(result_types)
-        .add_regions(regions);
+        .add_operands(operands)?
+        .add_results(result_types)?
+        .add_regions(regions)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `vector::r#yield`"))

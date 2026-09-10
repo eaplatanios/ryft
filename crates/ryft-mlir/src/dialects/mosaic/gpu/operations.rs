@@ -75,16 +75,16 @@ pub fn initialize_barrier<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         return Err(Error::invalid_argument("expected positive `num_barriers` for `mosaic_gpu.initialize_barrier`"));
     }
     OperationBuilder::new("mosaic_gpu.initialize_barrier", location)
-        .add_operand(base_pointer)
+        .add_operand(base_pointer)?
         .add_attribute(
             ARRIVAL_COUNT_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), arrival_count),
-        )
+        )?
         .add_attribute(
             NUM_BARRIERS_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(32), i64::from(num_barriers)),
-        )
-        .add_attribute(ORDERS_TENSOR_CORE_ATTRIBUTE, context.boolean_attribute(orders_tensor_core))
+        )?
+        .add_attribute(ORDERS_TENSOR_CORE_ATTRIBUTE, context.boolean_attribute(orders_tensor_core))?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -119,8 +119,8 @@ pub fn arrive<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.arrive", location)
-        .add_operand(barrier)
-        .add_attribute(ORDERS_TENSOR_CORE_ATTRIBUTE, context.boolean_attribute(orders_tensor_core))
+        .add_operand(barrier)?
+        .add_attribute(ORDERS_TENSOR_CORE_ATTRIBUTE, context.boolean_attribute(orders_tensor_core))?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `mosaic_gpu::arrive`"))
@@ -155,8 +155,8 @@ pub fn arrive_expect_tx<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedArriveExpectTxOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.arrive_expect_tx", location)
-        .add_operand(barrier)
-        .add_operand(expect_tx)
+        .add_operand(barrier)?
+        .add_operand(expect_tx)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -190,8 +190,8 @@ pub fn wait<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedWaitOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.wait", location)
-        .add_operand(barrier)
-        .add_operand(parity)
+        .add_operand(barrier)?
+        .add_operand(parity)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `mosaic_gpu::wait`"))
@@ -229,9 +229,9 @@ pub fn try_cluster_cancel<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedTryClusterCancelOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.try_cluster_cancel", location)
-        .add_operand(cancellation_result)
-        .add_operand(barrier)
-        .add_operand(predicate)
+        .add_operand(cancellation_result)?
+        .add_operand(barrier)?
+        .add_operand(predicate)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -280,13 +280,13 @@ pub fn query_cluster_cancel<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.query_cluster_cancel", location)
-        .add_operand(cancellation_result)
+        .add_operand(cancellation_result)?
         .add_results(&[
             context.signless_integer_type(32),
             context.signless_integer_type(32),
             context.signless_integer_type(32),
             context.signless_integer_type(1),
-        ])
+        ])?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -418,12 +418,12 @@ pub fn async_load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         ));
     }
     let mut builder = OperationBuilder::new("mosaic_gpu.async_load", location)
-        .add_operand(source)
-        .add_operand(destination)
-        .add_operands(barrier.as_slice())
-        .add_operands(indices)
-        .add_operand(predicate)
-        .add_operands(global_memory_peer_id.as_slice())
+        .add_operand(source)?
+        .add_operand(destination)?
+        .add_operands(barrier.as_slice())?
+        .add_operands(indices)?
+        .add_operand(predicate)?
+        .add_operands(global_memory_peer_id.as_slice())?
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
             context.dense_i32_array_attribute(&[
@@ -435,12 +435,12 @@ pub fn async_load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
                 1,
                 i32::from(global_memory_peer_id.is_some()),
             ])?,
-        )
-        .add_attribute(SLICE_LENGTHS_ATTRIBUTE, context.dense_i64_array_attribute(slice_lengths)?)
-        .add_attribute(COLLECTIVE_ATTRIBUTE, collective)
-        .add_attribute(OOB_FILL_MODE_ATTRIBUTE, context.mosaic_gpu_oob_fill_mode_attribute(oob_fill_mode)?);
+        )?
+        .add_attribute(SLICE_LENGTHS_ATTRIBUTE, context.dense_i64_array_attribute(slice_lengths)?)?
+        .add_attribute(COLLECTIVE_ATTRIBUTE, collective)?
+        .add_attribute(OOB_FILL_MODE_ATTRIBUTE, context.mosaic_gpu_oob_fill_mode_attribute(oob_fill_mode)?)?;
     if let Some(leader_tracked) = leader_tracked {
-        builder = builder.add_attribute(LEADER_TRACKED_ATTRIBUTE, leader_tracked);
+        builder = builder.add_attribute(LEADER_TRACKED_ATTRIBUTE, leader_tracked)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -508,9 +508,9 @@ pub fn async_prefetch<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         ));
     }
     OperationBuilder::new("mosaic_gpu.async_prefetch", location)
-        .add_operand(source)
-        .add_operands(indices)
-        .add_operand(predicate)
+        .add_operand(source)?
+        .add_operands(indices)?
+        .add_operand(predicate)?
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
             context.dense_i32_array_attribute(&[
@@ -519,9 +519,9 @@ pub fn async_prefetch<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
                     .map_err(|_| Error::invalid_argument("too many `mosaic_gpu.async_prefetch` indices"))?,
                 1,
             ])?,
-        )
-        .add_attribute(SLICE_LENGTHS_ATTRIBUTE, context.dense_i64_array_attribute(slice_lengths)?)
-        .add_attribute(COLLECTIVE_ATTRIBUTE, collective)
+        )?
+        .add_attribute(SLICE_LENGTHS_ATTRIBUTE, context.dense_i64_array_attribute(slice_lengths)?)?
+        .add_attribute(COLLECTIVE_ATTRIBUTE, collective)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -633,11 +633,11 @@ pub fn async_store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         ));
     }
     let mut builder = OperationBuilder::new("mosaic_gpu.async_store", location)
-        .add_operand(source)
-        .add_operand(destination)
-        .add_operands(indices)
-        .add_operand(predicate)
-        .add_operands(global_memory_peer_id.as_slice())
+        .add_operand(source)?
+        .add_operand(destination)?
+        .add_operands(indices)?
+        .add_operand(predicate)?
+        .add_operands(global_memory_peer_id.as_slice())?
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
             context.dense_i32_array_attribute(&[
@@ -648,15 +648,15 @@ pub fn async_store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
                 1,
                 i32::from(global_memory_peer_id.is_some()),
             ])?,
-        )
-        .add_attribute(SLICE_LENGTHS_ATTRIBUTE, context.dense_i64_array_attribute(slice_lengths)?)
-        .add_attribute(IS_GLOBAL_BROADCAST_ATTRIBUTE, context.boolean_attribute(is_global_broadcast));
+        )?
+        .add_attribute(SLICE_LENGTHS_ATTRIBUTE, context.dense_i64_array_attribute(slice_lengths)?)?
+        .add_attribute(IS_GLOBAL_BROADCAST_ATTRIBUTE, context.boolean_attribute(is_global_broadcast))?;
     if let Some(commit_group) = commit_group {
-        builder = builder.add_attribute(COMMIT_GROUP_ATTRIBUTE, context.boolean_attribute(commit_group));
+        builder = builder.add_attribute(COMMIT_GROUP_ATTRIBUTE, context.boolean_attribute(commit_group))?;
     }
     if let Some(reduction_op) = reduction_op {
         builder =
-            builder.add_attribute(REDUCTION_OP_ATTRIBUTE, context.mosaic_gpu_tma_reduction_attribute(reduction_op)?);
+            builder.add_attribute(REDUCTION_OP_ATTRIBUTE, context.mosaic_gpu_tma_reduction_attribute(reduction_op)?)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -705,11 +705,11 @@ pub fn vector_load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedVectorLoadOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
-    let mut builder = OperationBuilder::new("mosaic_gpu.vector_load", location).add_operand(source);
+    let mut builder = OperationBuilder::new("mosaic_gpu.vector_load", location).add_operand(source)?;
     if let Some(optimized) = optimized {
-        builder = builder.add_attribute(OPTIMIZED_ATTRIBUTE, context.boolean_attribute(optimized));
+        builder = builder.add_attribute(OPTIMIZED_ATTRIBUTE, context.boolean_attribute(optimized))?;
     }
-    builder.add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation
             .cast()
             .ok_or_else(|| Error::invalid_argument("invalid arguments to `mosaic_gpu::vector_load`"))
@@ -759,12 +759,12 @@ pub fn multimem_load_reduce<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.multimem_load_reduce", location)
-        .add_operand(source)
+        .add_operand(source)?
         .add_attribute(
             REDUCTION_TYPE_ATTRIBUTE,
             context.mosaic_gpu_multimem_load_reduction_type_attribute(reduction_type)?,
-        )
-        .add_result(result_type)
+        )?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -827,15 +827,15 @@ pub fn vector_store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
     let mut builder = OperationBuilder::new("mosaic_gpu.vector_store", location)
-        .add_operand(value_to_store)
-        .add_operand(destination)
-        .add_attribute(MULTIMEM_ATTRIBUTE, context.boolean_attribute(multimem));
+        .add_operand(value_to_store)?
+        .add_operand(destination)?
+        .add_attribute(MULTIMEM_ATTRIBUTE, context.boolean_attribute(multimem))?;
     if let Some(optimized) = optimized {
-        builder = builder.add_attribute(OPTIMIZED_ATTRIBUTE, context.boolean_attribute(optimized));
+        builder = builder.add_attribute(OPTIMIZED_ATTRIBUTE, context.boolean_attribute(optimized))?;
     }
     if let Some(atomic_type) = atomic_type {
         builder =
-            builder.add_attribute(ATOMIC_TYPE_ATTRIBUTE, context.mosaic_gpu_atomic_op_type_attribute(atomic_type)?);
+            builder.add_attribute(ATOMIC_TYPE_ATTRIBUTE, context.mosaic_gpu_atomic_op_type_attribute(atomic_type)?)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -885,9 +885,9 @@ pub fn layout_cast<'v, 'c: 'v, 't: 'c, A: Attribute<'c, 't>, L: Location<'c, 't>
 ) -> Result<DetachedLayoutCastOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.layout_cast", location)
-        .add_operand(x)
-        .add_attribute(NEW_LAYOUT_ATTRIBUTE, new_layout)
-        .add_result(result_type)
+        .add_operand(x)?
+        .add_attribute(NEW_LAYOUT_ATTRIBUTE, new_layout)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -935,9 +935,9 @@ pub fn tmem_layout_cast<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedTmemLayoutCastOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.tmem_layout_cast", location)
-        .add_operand(r#ref)
-        .add_attribute(NEW_LAYOUT_ATTRIBUTE, new_layout)
-        .add_result(result_type)
+        .add_operand(r#ref)?
+        .add_attribute(NEW_LAYOUT_ATTRIBUTE, new_layout)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -983,9 +983,9 @@ pub fn broadcast_in_dim<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.broadcast_in_dim", location)
-        .add_operand(operand)
-        .add_attribute(BROADCAST_DIMENSIONS_ATTRIBUTE, context.dense_i64_array_attribute(broadcast_dimensions)?)
-        .add_result(result_type)
+        .add_operand(operand)?
+        .add_attribute(BROADCAST_DIMENSIONS_ATTRIBUTE, context.dense_i64_array_attribute(broadcast_dimensions)?)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1021,8 +1021,8 @@ pub fn reinterpret_cast<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedReinterpretCastOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.reinterpret_cast", location)
-        .add_operand(source)
-        .add_result(result_type)
+        .add_operand(source)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1080,12 +1080,14 @@ pub fn slice_smem<'c, 't: 'c, L: Location<'c, 't>>(
     let mut builder = OperationBuilder::new("mosaic_gpu.slice_smem", location).add_attribute(
         OFFSET_ATTRIBUTE,
         context.integer_attribute(context.signless_integer_type(32), i64::from(offset)),
-    );
+    )?;
     if let Some(alias_id) = alias_id {
-        builder = builder
-            .add_attribute(ALIAS_ID_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), alias_id));
+        builder = builder.add_attribute(
+            ALIAS_ID_ATTRIBUTE,
+            context.integer_attribute(context.signless_integer_type(64), alias_id),
+        )?;
     }
-    builder.add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation
             .cast()
             .ok_or_else(|| Error::invalid_argument("invalid arguments to `mosaic_gpu::slice_smem`"))
@@ -1130,10 +1132,10 @@ pub fn wgmma<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location.context().load_dialect(DialectHandle::mosaic_gpu()?)?;
     let result_type = accumulator.r#type()?;
     OperationBuilder::new("mosaic_gpu.wgmma", location)
-        .add_operand(accumulator)
-        .add_operand(a)
-        .add_operand(b)
-        .add_result(result_type)
+        .add_operand(accumulator)?
+        .add_operand(a)?
+        .add_operand(b)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `mosaic_gpu::wgmma`"))
@@ -1237,18 +1239,18 @@ pub fn tcgen05_mma<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
     let mut builder = OperationBuilder::new("mosaic_gpu.tcgen05_mma", location)
-        .add_operand(accumulator)
-        .add_operand(a)
-        .add_operand(b)
-        .add_operand(accumulate);
+        .add_operand(accumulator)?
+        .add_operand(a)?
+        .add_operand(b)?
+        .add_operand(accumulate)?;
     if let Some(a_scale) = a_scale {
-        builder = builder.add_operand(a_scale);
+        builder = builder.add_operand(a_scale)?;
     }
     if let Some(b_scale) = b_scale {
-        builder = builder.add_operand(b_scale);
+        builder = builder.add_operand(b_scale)?;
     }
     if let Some(a_sparse_metadata) = a_sparse_metadata {
-        builder = builder.add_operand(a_sparse_metadata);
+        builder = builder.add_operand(a_sparse_metadata)?;
     }
     builder
         .add_attribute(
@@ -1262,8 +1264,8 @@ pub fn tcgen05_mma<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
                 i32::from(b_scale.is_some()),
                 i32::from(a_sparse_metadata.is_some()),
             ])?,
-        )
-        .add_attribute(COLLECTIVE_MMA_ATTRIBUTE, context.boolean_attribute(collective))
+        )?
+        .add_attribute(COLLECTIVE_MMA_ATTRIBUTE, context.boolean_attribute(collective))?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1297,8 +1299,8 @@ pub fn optimization_barrier<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location.context().load_dialect(DialectHandle::mosaic_gpu()?)?;
     let result_types = operands.iter().map(|operand| operand.r#type()).collect::<Result<Vec<_>, _>>()?;
     OperationBuilder::new("mosaic_gpu.optimization_barrier", location)
-        .add_operands(operands)
-        .add_results(&result_types)
+        .add_operands(operands)?
+        .add_results(&result_types)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1326,7 +1328,7 @@ pub fn r#return<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedReturnOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.return", location)
-        .add_operands(operands)
+        .add_operands(operands)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `mosaic_gpu::return`"))
@@ -1389,12 +1391,12 @@ pub fn custom_primitive<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedCustomPrimitiveOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.custom_primitive", location)
-        .add_operands(operands)
-        .add_attribute(IN_LAYOUTS_ATTRIBUTE, in_layouts)
-        .add_attribute(IN_TRANSFORMS_ATTRIBUTE, in_transforms)
-        .add_attribute(OUT_LAYOUTS_ATTRIBUTE, out_layouts)
-        .add_results(result_types)
-        .add_region(body)
+        .add_operands(operands)?
+        .add_attribute(IN_LAYOUTS_ATTRIBUTE, in_layouts)?
+        .add_attribute(IN_TRANSFORMS_ATTRIBUTE, in_transforms)?
+        .add_attribute(OUT_LAYOUTS_ATTRIBUTE, out_layouts)?
+        .add_results(result_types)?
+        .add_region(body)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1431,8 +1433,8 @@ pub fn warp_map<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedWarpMapOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.warp_map", location)
-        .add_operands(operands)
-        .add_region(region)
+        .add_operands(operands)?
+        .add_region(region)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1477,9 +1479,9 @@ pub fn with_transforms<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedWithTransformsOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.with_transforms", location)
-        .add_operand(r#ref)
-        .add_attribute(TRANSFORMS_ATTRIBUTE, transforms)
-        .add_result(result_type)
+        .add_operand(r#ref)?
+        .add_attribute(TRANSFORMS_ATTRIBUTE, transforms)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1540,13 +1542,13 @@ pub fn tmem_alloc<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         return Err(Error::invalid_argument("expected positive `packing` for `mosaic_gpu.tmem_alloc`"));
     }
     OperationBuilder::new("mosaic_gpu.tmem_alloc", location)
-        .add_operand(smem_ptr)
-        .add_attribute(COLLECTIVE_TMEM_ATTRIBUTE, context.boolean_attribute(collective))
+        .add_operand(smem_ptr)?
+        .add_attribute(COLLECTIVE_TMEM_ATTRIBUTE, context.boolean_attribute(collective))?
         .add_attribute(
             PACKING_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(32), i64::from(packing)),
-        )
-        .add_result(result_type)
+        )?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1578,7 +1580,7 @@ pub fn tmem_relinquish_alloc_permit<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.tmem_relinquish_alloc_permit", location)
-        .add_attribute(COLLECTIVE_TMEM_ATTRIBUTE, context.boolean_attribute(collective))
+        .add_attribute(COLLECTIVE_TMEM_ATTRIBUTE, context.boolean_attribute(collective))?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| {
@@ -1605,7 +1607,7 @@ pub fn tmem_dealloc<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedTmemDeallocOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::mosaic_gpu()?)?;
-    OperationBuilder::new("mosaic_gpu.tmem_dealloc", location).add_operand(tmem_ref).build().and_then(
+    OperationBuilder::new("mosaic_gpu.tmem_dealloc", location).add_operand(tmem_ref)?.build().and_then(
         |operation| unsafe {
             operation
                 .cast()
@@ -1654,10 +1656,11 @@ pub fn async_load_tmem<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
     let mut builder = OperationBuilder::new("mosaic_gpu.async_load_tmem", location)
-        .add_operand(source)
+        .add_operand(source)?
         .enable_result_type_inference();
     if let Some(reduction) = reduction {
-        builder = builder.add_attribute(REDUCE_ATTRIBUTE, context.mosaic_gpu_tmem_load_reduction_attribute(reduction)?);
+        builder =
+            builder.add_attribute(REDUCE_ATTRIBUTE, context.mosaic_gpu_tmem_load_reduction_attribute(reduction)?)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -1691,8 +1694,8 @@ pub fn async_store_tmem<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedAsyncStoreTmemOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.async_store_tmem", location)
-        .add_operand(source)
-        .add_operand(destination)
+        .add_operand(source)?
+        .add_operand(destination)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1733,9 +1736,9 @@ pub fn async_store_smem_to_tmem<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.async_store_smem_to_tmem", location)
-        .add_operand(source)
-        .add_operand(destination)
-        .add_attribute(COLLECTIVE_TMEM_ATTRIBUTE, context.boolean_attribute(collective))
+        .add_operand(source)?
+        .add_operand(destination)?
+        .add_attribute(COLLECTIVE_TMEM_ATTRIBUTE, context.boolean_attribute(collective))?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1776,9 +1779,9 @@ pub fn async_store_sparse_metadata_smem_to_tmem<'v, 'c: 'v, 't: 'c, L: Location<
     let context = location.context();
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.async_store_sparse_metadata_smem_to_tmem", location)
-        .add_operand(source)
-        .add_operand(destination)
-        .add_attribute(COLLECTIVE_TMEM_ATTRIBUTE, context.boolean_attribute(collective))
+        .add_operand(source)?
+        .add_operand(destination)?
+        .add_attribute(COLLECTIVE_TMEM_ATTRIBUTE, context.boolean_attribute(collective))?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| {
@@ -1819,9 +1822,9 @@ pub fn async_store_scales_smem_to_tmem<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.async_store_scales_smem_to_tmem", location)
-        .add_operand(source)
-        .add_operand(destination)
-        .add_attribute(COLLECTIVE_TMEM_ATTRIBUTE, context.boolean_attribute(collective))
+        .add_operand(source)?
+        .add_operand(destination)?
+        .add_attribute(COLLECTIVE_TMEM_ATTRIBUTE, context.boolean_attribute(collective))?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| {
@@ -1880,15 +1883,17 @@ pub fn slice_tmem<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         return Err(Error::invalid_argument("expected non-negative `offset` for `mosaic_gpu.slice_tmem`"));
     }
     let mut builder = OperationBuilder::new("mosaic_gpu.slice_tmem", location)
-        .add_operand(source)
+        .add_operand(source)?
         .add_attribute(
             OFFSET_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(32), i64::from(offset)),
-        )
-        .add_result(result_type);
+        )?
+        .add_result(result_type)?;
     if let Some(alias_id) = alias_id {
-        builder = builder
-            .add_attribute(ALIAS_ID_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), alias_id));
+        builder = builder.add_attribute(
+            ALIAS_ID_ATTRIBUTE,
+            context.integer_attribute(context.signless_integer_type(64), alias_id),
+        )?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -1923,8 +1928,8 @@ pub fn tcgen05_commit_arrive<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.tcgen05_commit_arrive", location)
-        .add_operand(barrier)
-        .add_attribute(COLLECTIVE_TMEM_ATTRIBUTE, context.boolean_attribute(collective))
+        .add_operand(barrier)?
+        .add_attribute(COLLECTIVE_TMEM_ATTRIBUTE, context.boolean_attribute(collective))?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1962,8 +1967,8 @@ pub fn debug_print<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.debug_print", location)
-        .add_operand(value)
-        .add_attribute(FORMAT_ATTRIBUTE, context.string_attribute(format))
+        .add_operand(value)?
+        .add_attribute(FORMAT_ATTRIBUTE, context.string_attribute(format))?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1998,8 +2003,8 @@ pub fn print_layout<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.print_layout", location)
-        .add_operand(value)
-        .add_attribute(FORMAT_ATTRIBUTE, context.string_attribute(format))
+        .add_operand(value)?
+        .add_attribute(FORMAT_ATTRIBUTE, context.string_attribute(format))?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -2045,8 +2050,8 @@ pub fn broadcasted_iota<'c, 't: 'c, L: Location<'c, 't>>(
         .add_attribute(
             DIMENSION_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(32), i64::from(dimension)),
-        )
-        .add_result(result_type)
+        )?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -2087,8 +2092,8 @@ pub fn mma<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedMmaOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.mma", location)
-        .add_operands(&[accumulator, lhs, rhs])
-        .add_result(accumulator.r#type()?)
+        .add_operands(&[accumulator, lhs, rhs])?
+        .add_result(accumulator.r#type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `mosaic_gpu::mma`"))
@@ -2126,12 +2131,12 @@ pub fn vector_concat<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         return Err(Error::invalid_argument("expected nonempty vectors and a nonnegative concatenation dimension"));
     }
     OperationBuilder::new("mosaic_gpu.vector_concat", location)
-        .add_operands(operands)
-        .add_result(result_type)
+        .add_operands(operands)?
+        .add_result(result_type)?
         .add_attribute(
             DIMENSION_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(32), i64::from(dimension)),
-        )
+        )?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -2176,12 +2181,12 @@ pub fn assume_multiple<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         return Err(Error::invalid_argument("expected a positive `multiple`"));
     }
     OperationBuilder::new("mosaic_gpu.assume_multiple", location)
-        .add_operand(value)
-        .add_result(value.r#type()?)
+        .add_operand(value)?
+        .add_result(value.r#type()?)?
         .add_attribute(
             MULTIPLE_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(32), i64::from(multiple)),
-        )
+        )?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -2240,10 +2245,10 @@ pub fn get_cluster_ref<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
     OperationBuilder::new("mosaic_gpu.get_cluster_ref", location)
-        .add_operand(source)
-        .add_operands(coordinates[0].as_slice())
-        .add_operands(coordinates[1].as_slice())
-        .add_operands(coordinates[2].as_slice())
+        .add_operand(source)?
+        .add_operands(coordinates[0].as_slice())?
+        .add_operands(coordinates[1].as_slice())?
+        .add_operands(coordinates[2].as_slice())?
         .enable_result_type_inference()
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
@@ -2253,7 +2258,7 @@ pub fn get_cluster_ref<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
                 i32::from(coordinates[1].is_some()),
                 i32::from(coordinates[2].is_some()),
             ])?,
-        )
+        )?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -2330,14 +2335,14 @@ pub fn async_store_smem<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::mosaic_gpu()?)?;
     let mut builder = OperationBuilder::new("mosaic_gpu.async_store_smem", location)
-        .add_operands(&[value, destination, barrier, cluster_index])
-        .add_attribute(CLUSTER_DIMENSION_ATTRIBUTE, context.mosaic_gpu_dimension_attribute(cluster_dimension)?);
+        .add_operands(&[value, destination, barrier, cluster_index])?
+        .add_attribute(CLUSTER_DIMENSION_ATTRIBUTE, context.mosaic_gpu_dimension_attribute(cluster_dimension)?)?;
     if let Some(atomic_type) = atomic_type {
         builder =
-            builder.add_attribute(ATOMIC_TYPE_ATTRIBUTE, context.mosaic_gpu_atomic_op_type_attribute(atomic_type)?);
+            builder.add_attribute(ATOMIC_TYPE_ATTRIBUTE, context.mosaic_gpu_atomic_op_type_attribute(atomic_type)?)?;
     }
     if let Some(optimized) = optimized {
-        builder = builder.add_attribute(OPTIMIZED_ATTRIBUTE, context.boolean_attribute(optimized));
+        builder = builder.add_attribute(OPTIMIZED_ATTRIBUTE, context.boolean_attribute(optimized))?;
     }
     builder.build().and_then(|operation| unsafe {
         operation

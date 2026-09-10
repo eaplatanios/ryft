@@ -68,12 +68,12 @@ pub fn assume_alignment<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::memref()?)?;
     OperationBuilder::new("memref.assume_alignment", location)
-        .add_operand(memref)
+        .add_operand(memref)?
         .add_attribute(
             ALIGNMENT_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(32), alignment.into()),
-        )
-        .add_result(memref.r#type()?)
+        )?
+        .add_result(memref.r#type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -111,8 +111,8 @@ pub fn distinct_objects<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::memref()?)?;
     let result_types = operands.iter().map(|operand| operand.r#type()).collect::<Result<Vec<_>, _>>()?;
     OperationBuilder::new("memref.distinct_objects", location)
-        .add_operands(operands)
-        .add_results(&result_types)
+        .add_operands(operands)?
+        .add_results(&result_types)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -178,15 +178,15 @@ pub fn alloc<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
             context.dense_i32_array_attribute(&[dynamic_sizes.len() as i32, symbol_operands.len() as i32])?,
-        )
-        .add_operands(dynamic_sizes)
-        .add_operands(symbol_operands)
-        .add_result(memref_type);
+        )?
+        .add_operands(dynamic_sizes)?
+        .add_operands(symbol_operands)?
+        .add_result(memref_type)?;
     if let Some(alignment) = alignment {
         builder = builder.add_attribute(
             ALIGNMENT_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), alignment),
-        );
+        )?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `memref::alloc`"))
@@ -235,15 +235,15 @@ pub fn realloc<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedReallocOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::memref()?)?;
-    let mut builder = OperationBuilder::new("memref.realloc", location).add_operand(source).add_result(result_type);
+    let mut builder = OperationBuilder::new("memref.realloc", location).add_operand(source)?.add_result(result_type)?;
     if let Some(dynamic_result_size) = dynamic_result_size {
-        builder = builder.add_operand(dynamic_result_size);
+        builder = builder.add_operand(dynamic_result_size)?;
     }
     if let Some(alignment) = alignment {
         builder = builder.add_attribute(
             ALIGNMENT_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), alignment),
-        );
+        )?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `memref::realloc`"))
@@ -273,15 +273,15 @@ pub fn alloca<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
             context.dense_i32_array_attribute(&[dynamic_sizes.len() as i32, symbol_operands.len() as i32])?,
-        )
-        .add_operands(dynamic_sizes)
-        .add_operands(symbol_operands)
-        .add_result(memref_type);
+        )?
+        .add_operands(dynamic_sizes)?
+        .add_operands(symbol_operands)?
+        .add_result(memref_type)?;
     if let Some(alignment) = alignment {
         builder = builder.add_attribute(
             ALIGNMENT_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), alignment),
-        );
+        )?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `memref::alloca`"))
@@ -312,8 +312,8 @@ pub fn alloca_scope<'c, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::memref()?)?;
     OperationBuilder::new("memref.alloca_scope", location)
-        .add_results(result_types)
-        .add_region(body)
+        .add_results(result_types)?
+        .add_region(body)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -345,13 +345,14 @@ pub fn alloca_scope_return<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedAllocaScopeReturnOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::memref()?)?;
-    OperationBuilder::new("memref.alloca_scope.return", location).add_operands(values).build().and_then(
-        |operation| unsafe {
+    OperationBuilder::new("memref.alloca_scope.return", location)
+        .add_operands(values)?
+        .build()
+        .and_then(|operation| unsafe {
             operation
                 .cast()
                 .ok_or_else(|| Error::invalid_argument("invalid arguments to `memref::alloca_scope_return`"))
-        },
-    )
+        })
 }
 
 /// Operation trait for the `memref.cast` operation.
@@ -385,8 +386,8 @@ pub fn cast<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::memref()?)?;
     OperationBuilder::new("memref.cast", location)
-        .add_operand(source)
-        .add_result(dest_type)
+        .add_operand(source)?
+        .add_result(dest_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `memref::cast`"))
@@ -419,8 +420,8 @@ pub fn copy<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::memref()?)?;
     OperationBuilder::new("memref.copy", location)
-        .add_operand(source)
-        .add_operand(target)
+        .add_operand(source)?
+        .add_operand(target)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `memref::copy`"))
@@ -448,7 +449,7 @@ pub fn dealloc<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::memref()?)?;
     OperationBuilder::new("memref.dealloc", location)
-        .add_operand(memref)
+        .add_operand(memref)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `memref::dealloc`"))
@@ -484,9 +485,9 @@ pub fn dim<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::memref()?)?;
     OperationBuilder::new("memref.dim", location)
-        .add_operand(source)
-        .add_operand(index)
-        .add_result(context.index_type())
+        .add_operand(source)?
+        .add_operand(index)?
+        .add_result(context.index_type())?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `memref::dim`"))
@@ -612,15 +613,15 @@ pub fn dma_start<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::memref()?)?;
     let builder = OperationBuilder::new("memref.dma_start", location)
-        .add_operand(source)
-        .add_operands(source_indices)
-        .add_operand(destination)
-        .add_operands(destination_indices)
-        .add_operand(num_elements)
-        .add_operand(tag)
-        .add_operands(tag_indices);
+        .add_operand(source)?
+        .add_operands(source_indices)?
+        .add_operand(destination)?
+        .add_operands(destination_indices)?
+        .add_operand(num_elements)?
+        .add_operand(tag)?
+        .add_operands(tag_indices)?;
     let builder = match (stride, elements_per_stride) {
-        (Some(stride), Some(elements_per_stride)) => builder.add_operand(stride).add_operand(elements_per_stride),
+        (Some(stride), Some(elements_per_stride)) => builder.add_operand(stride)?.add_operand(elements_per_stride)?,
         (None, None) => builder,
         _ => {
             return Err(Error::invalid_argument("`memref::dma_start` requires either both stride operands or neither"));
@@ -675,9 +676,9 @@ pub fn dma_wait<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::memref()?)?;
     OperationBuilder::new("memref.dma_wait", location)
-        .add_operand(tag)
-        .add_operands(tag_indices)
-        .add_operand(num_elements)
+        .add_operand(tag)?
+        .add_operands(tag_indices)?
+        .add_operand(num_elements)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `memref::dma_wait`"))
@@ -715,8 +716,8 @@ pub fn extract_aligned_pointer_as_index<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>
     let context = location.context();
     context.load_dialect(DialectHandle::memref()?)?;
     OperationBuilder::new("memref.extract_aligned_pointer_as_index", location)
-        .add_operand(source)
-        .add_result(context.index_type())
+        .add_operand(source)?
+        .add_result(context.index_type())?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| {
@@ -789,9 +790,9 @@ pub fn extract_strided_metadata<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location
         .rank();
     let index_types = vec![context.index_type(); 1 + 2 * rank];
     OperationBuilder::new("memref.extract_strided_metadata", location)
-        .add_operand(source)
-        .add_result(base_buffer_type)
-        .add_results(&index_types)
+        .add_operand(source)?
+        .add_result(base_buffer_type)?
+        .add_results(&index_types)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -842,10 +843,10 @@ pub fn generic_atomic_rmw<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, '
     let context = location.context();
     context.load_dialect(DialectHandle::memref()?)?;
     OperationBuilder::new("memref.generic_atomic_rmw", location)
-        .add_operand(memref)
-        .add_operands(indices)
-        .add_result(result_type)
-        .add_region(atomic_body)
+        .add_operand(memref)?
+        .add_operands(indices)?
+        .add_result(result_type)?
+        .add_region(atomic_body)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -878,7 +879,7 @@ pub fn atomic_yield<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::memref()?)?;
     OperationBuilder::new("memref.atomic_yield", location)
-        .add_operand(value)
+        .add_operand(value)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -927,8 +928,8 @@ pub fn get_global<
     let context = location.context();
     context.load_dialect(DialectHandle::memref()?)?;
     OperationBuilder::new("memref.get_global", location)
-        .add_attribute(NAME_ATTRIBUTE, name.try_into_with_context(context)?)
-        .add_result(result_type)
+        .add_attribute(NAME_ATTRIBUTE, name.try_into_with_context(context)?)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `memref::get_global`"))
@@ -996,22 +997,23 @@ pub fn global<
     let context = location.context();
     context.load_dialect(DialectHandle::memref()?)?;
     let mut builder = OperationBuilder::new("memref.global", location)
-        .add_attribute(SYMBOL_NAME_ATTRIBUTE, name.try_into_with_context(context)?)
-        .add_attribute(TYPE_ATTRIBUTE, context.type_attribute(r#type));
+        .add_attribute(SYMBOL_NAME_ATTRIBUTE, name.try_into_with_context(context)?)?
+        .add_attribute(TYPE_ATTRIBUTE, context.type_attribute(r#type))?;
     if visibility != SymbolVisibility::default() {
-        builder = builder.add_attribute(SYMBOL_VISIBILITY_ATTRIBUTE, context.symbol_visibility_attribute(visibility));
+        builder =
+            builder.add_attribute(SYMBOL_VISIBILITY_ATTRIBUTE, context.symbol_visibility_attribute(visibility))?;
     }
     if let Some(initial_value) = initial_value {
-        builder = builder.add_attribute(INITIAL_VALUE_ATTRIBUTE, initial_value);
+        builder = builder.add_attribute(INITIAL_VALUE_ATTRIBUTE, initial_value)?;
     }
     if is_constant {
-        builder = builder.add_attribute(CONSTANT_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(CONSTANT_ATTRIBUTE, context.unit_attribute())?;
     }
     if let Some(alignment) = alignment {
         builder = builder.add_attribute(
             ALIGNMENT_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), alignment),
-        );
+        )?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `memref::global`"))
@@ -1070,17 +1072,17 @@ pub fn load<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::memref()?)?;
     let mut builder = OperationBuilder::new("memref.load", location)
-        .add_operand(memref)
-        .add_operands(indices)
-        .add_result(result_type);
+        .add_operand(memref)?
+        .add_operands(indices)?
+        .add_result(result_type)?;
     if nontemporal {
-        builder = builder.add_attribute(NONTEMPORAL_ATTRIBUTE, context.boolean_attribute(true));
+        builder = builder.add_attribute(NONTEMPORAL_ATTRIBUTE, context.boolean_attribute(true))?;
     }
     if let Some(alignment) = alignment {
         builder = builder.add_attribute(
             ALIGNMENT_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), alignment),
-        );
+        )?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `memref::load`"))
@@ -1118,8 +1120,8 @@ pub fn memory_space_cast<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't
     let context = location.context();
     context.load_dialect(DialectHandle::memref()?)?;
     OperationBuilder::new("memref.memory_space_cast", location)
-        .add_operand(source)
-        .add_result(dest_type)
+        .add_operand(source)?
+        .add_result(dest_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1182,14 +1184,14 @@ pub fn prefetch<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::memref()?)?;
     OperationBuilder::new("memref.prefetch", location)
-        .add_operand(memref)
-        .add_operands(indices)
-        .add_attribute(IS_WRITE_ATTRIBUTE, context.boolean_attribute(is_write))
+        .add_operand(memref)?
+        .add_operands(indices)?
+        .add_attribute(IS_WRITE_ATTRIBUTE, context.boolean_attribute(is_write))?
         .add_attribute(
             LOCALITY_HINT_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(32), locality_hint.into()),
-        )
-        .add_attribute(IS_DATA_CACHE_ATTRIBUTE, context.boolean_attribute(is_data_cache))
+        )?
+        .add_attribute(IS_DATA_CACHE_ATTRIBUTE, context.boolean_attribute(is_data_cache))?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `memref::prefetch`"))
@@ -1324,15 +1326,15 @@ pub fn reinterpret_cast<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>
                 dynamic_sizes.len() as i32,
                 dynamic_strides.len() as i32,
             ])?,
-        )
-        .add_attribute(STATIC_OFFSETS_ATTRIBUTE, context.dense_i64_array_attribute(&static_offsets)?)
-        .add_attribute(STATIC_SIZES_ATTRIBUTE, context.dense_i64_array_attribute(&static_sizes)?)
-        .add_attribute(STATIC_STRIDES_ATTRIBUTE, context.dense_i64_array_attribute(&static_strides)?)
-        .add_operand(source)
-        .add_operands(&dynamic_offsets)
-        .add_operands(&dynamic_sizes)
-        .add_operands(&dynamic_strides)
-        .add_result(result_type)
+        )?
+        .add_attribute(STATIC_OFFSETS_ATTRIBUTE, context.dense_i64_array_attribute(&static_offsets)?)?
+        .add_attribute(STATIC_SIZES_ATTRIBUTE, context.dense_i64_array_attribute(&static_sizes)?)?
+        .add_attribute(STATIC_STRIDES_ATTRIBUTE, context.dense_i64_array_attribute(&static_strides)?)?
+        .add_operand(source)?
+        .add_operands(&dynamic_offsets)?
+        .add_operands(&dynamic_sizes)?
+        .add_operands(&dynamic_strides)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1365,8 +1367,8 @@ pub fn rank<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::memref()?)?;
     OperationBuilder::new("memref.rank", location)
-        .add_operand(memref)
-        .add_result(context.index_type())
+        .add_operand(memref)?
+        .add_result(context.index_type())?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `memref::rank`"))
@@ -1409,9 +1411,9 @@ pub fn reshape<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::memref()?)?;
     OperationBuilder::new("memref.reshape", location)
-        .add_operand(source)
-        .add_operand(shape)
-        .add_result(result_type)
+        .add_operand(source)?
+        .add_operand(shape)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `memref::reshape`"))
@@ -1501,11 +1503,11 @@ pub fn expand_shape<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
         output_shape.iter().map(|index| index.static_value().unwrap_or(dynamic_index)).collect::<Vec<_>>();
     let dynamic_output_shape = output_shape.iter().filter_map(StaticOrDynamicIndex::dynamic_value).collect::<Vec<_>>();
     OperationBuilder::new("memref.expand_shape", location)
-        .add_operand(source)
-        .add_operands(&dynamic_output_shape)
-        .add_attribute(REASSOCIATION_ATTRIBUTE, context.array_attribute(&reassociation))
-        .add_attribute(STATIC_OUTPUT_SHAPE_ATTRIBUTE, context.dense_i64_array_attribute(&static_output_shape)?)
-        .add_result(result_type)
+        .add_operand(source)?
+        .add_operands(&dynamic_output_shape)?
+        .add_attribute(REASSOCIATION_ATTRIBUTE, context.array_attribute(&reassociation))?
+        .add_attribute(STATIC_OUTPUT_SHAPE_ATTRIBUTE, context.dense_i64_array_attribute(&static_output_shape)?)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1547,9 +1549,9 @@ pub fn collapse_shape<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
         })
         .collect::<Vec<_>>();
     OperationBuilder::new("memref.collapse_shape", location)
-        .add_operand(source)
-        .add_attribute(REASSOCIATION_ATTRIBUTE, context.array_attribute(&reassociation))
-        .add_result(result_type)
+        .add_operand(source)?
+        .add_attribute(REASSOCIATION_ATTRIBUTE, context.array_attribute(&reassociation))?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1611,17 +1613,17 @@ pub fn store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::memref()?)?;
     let mut builder = OperationBuilder::new("memref.store", location)
-        .add_operand(value)
-        .add_operand(memref)
-        .add_operands(indices);
+        .add_operand(value)?
+        .add_operand(memref)?
+        .add_operands(indices)?;
     if nontemporal {
-        builder = builder.add_attribute(NONTEMPORAL_ATTRIBUTE, context.boolean_attribute(true));
+        builder = builder.add_attribute(NONTEMPORAL_ATTRIBUTE, context.boolean_attribute(true))?;
     }
     if let Some(alignment) = alignment {
         builder = builder.add_attribute(
             ALIGNMENT_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(64), alignment),
-        );
+        )?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `memref::store`"))
@@ -1748,15 +1750,15 @@ pub fn subview<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
                 dynamic_sizes.len() as i32,
                 dynamic_strides.len() as i32,
             ])?,
-        )
-        .add_attribute(STATIC_OFFSETS_ATTRIBUTE, context.dense_i64_array_attribute(&static_offsets)?)
-        .add_attribute(STATIC_SIZES_ATTRIBUTE, context.dense_i64_array_attribute(&static_sizes)?)
-        .add_attribute(STATIC_STRIDES_ATTRIBUTE, context.dense_i64_array_attribute(&static_strides)?)
-        .add_operand(source)
-        .add_operands(&dynamic_offsets)
-        .add_operands(&dynamic_sizes)
-        .add_operands(&dynamic_strides)
-        .add_result(result_type)
+        )?
+        .add_attribute(STATIC_OFFSETS_ATTRIBUTE, context.dense_i64_array_attribute(&static_offsets)?)?
+        .add_attribute(STATIC_SIZES_ATTRIBUTE, context.dense_i64_array_attribute(&static_sizes)?)?
+        .add_attribute(STATIC_STRIDES_ATTRIBUTE, context.dense_i64_array_attribute(&static_strides)?)?
+        .add_operand(source)?
+        .add_operands(&dynamic_offsets)?
+        .add_operands(&dynamic_sizes)?
+        .add_operands(&dynamic_strides)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `memref::subview`"))
@@ -1802,9 +1804,9 @@ pub fn transpose<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::memref()?)?;
     OperationBuilder::new("memref.transpose", location)
-        .add_operand(input)
-        .add_attribute(PERMUTATION_ATTRIBUTE, context.affine_map_attribute(permutation))
-        .add_result(result_type)
+        .add_operand(input)?
+        .add_attribute(PERMUTATION_ATTRIBUTE, context.affine_map_attribute(permutation))?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `memref::transpose`"))
@@ -1853,10 +1855,10 @@ pub fn view<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::memref()?)?;
     OperationBuilder::new("memref.view", location)
-        .add_operand(source)
-        .add_operand(byte_shift)
-        .add_operands(sizes)
-        .add_result(result_type)
+        .add_operand(source)?
+        .add_operand(byte_shift)?
+        .add_operands(sizes)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `memref::view`"))
@@ -1919,11 +1921,11 @@ pub fn atomic_rmw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::memref()?)?;
     OperationBuilder::new("memref.atomic_rmw", location)
-        .add_attribute(KIND_ATTRIBUTE, context.arith_atomic_rmw_kind_attribute(kind)?)
-        .add_operand(value)
-        .add_operand(memref)
-        .add_operands(indices)
-        .add_result(value.r#type()?)
+        .add_attribute(KIND_ATTRIBUTE, context.arith_atomic_rmw_kind_attribute(kind)?)?
+        .add_operand(value)?
+        .add_operand(memref)?
+        .add_operands(indices)?
+        .add_result(value.r#type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `memref::atomic_rmw`"))

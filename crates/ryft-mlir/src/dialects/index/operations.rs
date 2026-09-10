@@ -25,7 +25,7 @@ pub fn constant<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::index()?)?;
     OperationBuilder::new("index.constant", location)
-        .add_attribute("value", context.integer_attribute(context.index_type(), value as i64))
+        .add_attribute("value", context.integer_attribute(context.index_type(), value as i64))?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -53,7 +53,7 @@ pub fn bool_constant<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::index()?)?;
     OperationBuilder::new("index.bool.constant", location)
-        .add_attribute("value", context.boolean_attribute(value))
+        .add_attribute("value", context.boolean_attribute(value))?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -166,9 +166,9 @@ pub fn cmp<
                 ComparisonPredicate::UnsignedGreaterThan => "#index<cmp_predicate ugt>",
                 ComparisonPredicate::UnsignedGreaterThanOrEqual => "#index<cmp_predicate uge>",
             })?,
-        )
-        .add_operand(lhs)
-        .add_operand(rhs)
+        )?
+        .add_operand(lhs)?
+        .add_operand(rhs)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {

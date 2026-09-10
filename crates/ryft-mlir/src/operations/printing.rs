@@ -308,7 +308,7 @@ mod tests {
         let index_type = context.index_type();
         let block = context.block(&[(index_type, location)]);
         let region = context.region();
-        let operation = OperationBuilder::new("test.op", location).add_region(region).build().unwrap();
+        let operation = OperationBuilder::new("test.op", location).add_region(region).unwrap().build().unwrap();
 
         // Check that we can create `AsmState` instances without crashing.
         let _ = AsmState::for_operation(&operation, OperationPrintingFlags::default());

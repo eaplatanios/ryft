@@ -54,8 +54,8 @@ pub fn shift_left<
 ) -> Result<DetachedShiftLeftOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.shift_left", location)
-        .add_operand(lhs)
-        .add_operand(rhs)
+        .add_operand(lhs)?
+        .add_operand(rhs)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -120,8 +120,8 @@ pub fn shift_right_arithmetic<
 ) -> Result<DetachedShiftRightArithmeticOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.shift_right_arithmetic", location)
-        .add_operand(lhs)
-        .add_operand(rhs)
+        .add_operand(lhs)?
+        .add_operand(rhs)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -186,8 +186,8 @@ pub fn shift_right_logical<
 ) -> Result<DetachedShiftRightLogicalOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.shift_right_logical", location)
-        .add_operand(lhs)
-        .add_operand(rhs)
+        .add_operand(lhs)?
+        .add_operand(rhs)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -229,7 +229,7 @@ pub fn count_leading_zeros<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location
 ) -> Result<DetachedCountLeadingZerosOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.count_leading_zeros", location)
-        .add_operand(input)
+        .add_operand(input)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -270,7 +270,7 @@ pub fn population_count<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c
 ) -> Result<DetachedPopulationCountOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.popcnt", location)
-        .add_operand(input)
+        .add_operand(input)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {

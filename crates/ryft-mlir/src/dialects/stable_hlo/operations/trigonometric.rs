@@ -43,8 +43,8 @@ pub fn sine<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedSineOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.sine", location)
-        .add_operand(input)
-        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)
+        .add_operand(input)?
+        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -91,8 +91,8 @@ pub fn cosine<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedCosineOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.cosine", location)
-        .add_operand(input)
-        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)
+        .add_operand(input)?
+        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -142,8 +142,8 @@ pub fn tan<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedTanOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.tan", location)
-        .add_operand(input)
-        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)
+        .add_operand(input)?
+        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -187,8 +187,8 @@ pub fn tanh<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedTanhOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.tanh", location)
-        .add_operand(input)
-        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)
+        .add_operand(input)?
+        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -251,8 +251,8 @@ pub fn atan2<
 ) -> Result<DetachedAtan2Operation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.atan2", location)
-        .add_operand(lhs)
-        .add_operand(rhs)
+        .add_operand(lhs)?
+        .add_operand(rhs)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {

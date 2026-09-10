@@ -61,8 +61,8 @@ pub fn bitcast<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::tensor()?)?;
     OperationBuilder::new("tensor.bitcast", location)
-        .add_operand(source)
-        .add_result(result_type)
+        .add_operand(source)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::bitcast`"))
@@ -99,8 +99,8 @@ pub fn cast<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::tensor()?)?;
     OperationBuilder::new("tensor.cast", location)
-        .add_operand(source)
-        .add_result(result_type)
+        .add_operand(source)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::cast`"))
@@ -146,9 +146,9 @@ pub fn concat<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::tensor()?)?;
     OperationBuilder::new("tensor.concat", location)
-        .add_operands(inputs)
-        .add_attribute(DIM_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), dimension))
-        .add_result(result_type)
+        .add_operands(inputs)?
+        .add_attribute(DIM_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), dimension))?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::concat`"))
@@ -188,9 +188,9 @@ pub fn dim<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::tensor()?)?;
     OperationBuilder::new("tensor.dim", location)
-        .add_operand(source)
-        .add_operand(index)
-        .add_result(context.index_type())
+        .add_operand(source)?
+        .add_operand(index)?
+        .add_result(context.index_type())?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::dim`"))
@@ -227,8 +227,8 @@ pub fn empty<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::tensor()?)?;
     OperationBuilder::new("tensor.empty", location)
-        .add_operands(dynamic_sizes)
-        .add_result(result_type)
+        .add_operands(dynamic_sizes)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::empty`"))
@@ -271,9 +271,9 @@ pub fn extract<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::tensor()?)?;
     OperationBuilder::new("tensor.extract", location)
-        .add_operand(tensor)
-        .add_operands(indices)
-        .add_result(result_type)
+        .add_operand(tensor)?
+        .add_operands(indices)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::extract`"))
@@ -415,15 +415,15 @@ pub fn extract_slice<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
                 dynamic_sizes.len() as i32,
                 dynamic_strides.len() as i32,
             ])?,
-        )
-        .add_attribute(STATIC_OFFSETS_ATTRIBUTE, context.dense_i64_array_attribute(&static_offsets)?)
-        .add_attribute(STATIC_SIZES_ATTRIBUTE, context.dense_i64_array_attribute(&static_sizes)?)
-        .add_attribute(STATIC_STRIDES_ATTRIBUTE, context.dense_i64_array_attribute(&static_strides)?)
-        .add_operand(source)
-        .add_operands(&dynamic_offsets)
-        .add_operands(&dynamic_sizes)
-        .add_operands(&dynamic_strides)
-        .add_result(result_type)
+        )?
+        .add_attribute(STATIC_OFFSETS_ATTRIBUTE, context.dense_i64_array_attribute(&static_offsets)?)?
+        .add_attribute(STATIC_SIZES_ATTRIBUTE, context.dense_i64_array_attribute(&static_sizes)?)?
+        .add_attribute(STATIC_STRIDES_ATTRIBUTE, context.dense_i64_array_attribute(&static_strides)?)?
+        .add_operand(source)?
+        .add_operands(&dynamic_offsets)?
+        .add_operands(&dynamic_sizes)?
+        .add_operands(&dynamic_strides)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -462,8 +462,8 @@ pub fn from_elements<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::tensor()?)?;
     OperationBuilder::new("tensor.from_elements", location)
-        .add_operands(elements)
-        .add_result(result_type)
+        .add_operands(elements)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -526,12 +526,12 @@ pub fn gather<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::tensor()?)?;
     let mut builder = OperationBuilder::new("tensor.gather", location)
-        .add_operand(source)
-        .add_operand(indices)
-        .add_attribute(GATHER_DIMS_ATTRIBUTE, context.dense_i64_array_attribute(gather_dimensions)?)
-        .add_result(result_type);
+        .add_operand(source)?
+        .add_operand(indices)?
+        .add_attribute(GATHER_DIMS_ATTRIBUTE, context.dense_i64_array_attribute(gather_dimensions)?)?
+        .add_result(result_type)?;
     if unique {
-        builder = builder.add_attribute(UNIQUE_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(UNIQUE_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::gather`"))
@@ -572,9 +572,9 @@ pub fn generate<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::tensor()?)?;
     OperationBuilder::new("tensor.generate", location)
-        .add_operands(dynamic_extents)
-        .add_result(result_type)
-        .add_region(body)
+        .add_operands(dynamic_extents)?
+        .add_result(result_type)?
+        .add_region(body)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::generate`"))
@@ -622,10 +622,10 @@ pub fn insert<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::tensor()?)?;
     OperationBuilder::new("tensor.insert", location)
-        .add_operand(scalar)
-        .add_operand(destination)
-        .add_operands(indices)
-        .add_result(destination.r#type()?)
+        .add_operand(scalar)?
+        .add_operand(destination)?
+        .add_operands(indices)?
+        .add_result(destination.r#type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::insert`"))
@@ -762,16 +762,16 @@ pub fn insert_slice<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
                 dynamic_sizes.len() as i32,
                 dynamic_strides.len() as i32,
             ])?,
-        )
-        .add_attribute(STATIC_OFFSETS_ATTRIBUTE, context.dense_i64_array_attribute(&static_offsets)?)
-        .add_attribute(STATIC_SIZES_ATTRIBUTE, context.dense_i64_array_attribute(&static_sizes)?)
-        .add_attribute(STATIC_STRIDES_ATTRIBUTE, context.dense_i64_array_attribute(&static_strides)?)
-        .add_operand(source)
-        .add_operand(destination)
-        .add_operands(&dynamic_offsets)
-        .add_operands(&dynamic_sizes)
-        .add_operands(&dynamic_strides)
-        .add_result(destination.r#type()?)
+        )?
+        .add_attribute(STATIC_OFFSETS_ATTRIBUTE, context.dense_i64_array_attribute(&static_offsets)?)?
+        .add_attribute(STATIC_SIZES_ATTRIBUTE, context.dense_i64_array_attribute(&static_sizes)?)?
+        .add_attribute(STATIC_STRIDES_ATTRIBUTE, context.dense_i64_array_attribute(&static_strides)?)?
+        .add_operand(source)?
+        .add_operand(destination)?
+        .add_operands(&dynamic_offsets)?
+        .add_operands(&dynamic_sizes)?
+        .add_operands(&dynamic_strides)?
+        .add_result(destination.r#type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -809,8 +809,8 @@ pub fn rank<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::tensor()?)?;
     OperationBuilder::new("tensor.rank", location)
-        .add_operand(tensor)
-        .add_result(context.index_type())
+        .add_operand(tensor)?
+        .add_result(context.index_type())?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::rank`"))
@@ -853,9 +853,9 @@ pub fn reshape<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::tensor()?)?;
     OperationBuilder::new("tensor.reshape", location)
-        .add_operand(source)
-        .add_operand(shape)
-        .add_result(result_type)
+        .add_operand(source)?
+        .add_operand(shape)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::reshape`"))
@@ -945,11 +945,11 @@ pub fn expand_shape<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
         output_shape.iter().map(|index| index.static_value().unwrap_or(dynamic_index)).collect::<Vec<_>>();
     let dynamic_output_shape = output_shape.iter().filter_map(StaticOrDynamicIndex::dynamic_value).collect::<Vec<_>>();
     OperationBuilder::new("tensor.expand_shape", location)
-        .add_operand(source)
-        .add_operands(&dynamic_output_shape)
-        .add_attribute(REASSOCIATION_ATTRIBUTE, context.array_attribute(&reassociation))
-        .add_attribute(STATIC_OUTPUT_SHAPE_ATTRIBUTE, context.dense_i64_array_attribute(&static_output_shape)?)
-        .add_result(result_type)
+        .add_operand(source)?
+        .add_operands(&dynamic_output_shape)?
+        .add_attribute(REASSOCIATION_ATTRIBUTE, context.array_attribute(&reassociation))?
+        .add_attribute(STATIC_OUTPUT_SHAPE_ATTRIBUTE, context.dense_i64_array_attribute(&static_output_shape)?)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -991,9 +991,9 @@ pub fn collapse_shape<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
         })
         .collect::<Vec<_>>();
     OperationBuilder::new("tensor.collapse_shape", location)
-        .add_operand(source)
-        .add_attribute(REASSOCIATION_ATTRIBUTE, context.array_attribute(&reassociation))
-        .add_result(result_type)
+        .add_operand(source)?
+        .add_attribute(REASSOCIATION_ATTRIBUTE, context.array_attribute(&reassociation))?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1115,16 +1115,16 @@ pub fn pad<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
             context.dense_i32_array_attribute(&[1, dynamic_low.len() as i32, dynamic_high.len() as i32])?,
-        )
-        .add_attribute(STATIC_LOW_ATTRIBUTE, context.dense_i64_array_attribute(&static_low)?)
-        .add_attribute(STATIC_HIGH_ATTRIBUTE, context.dense_i64_array_attribute(&static_high)?)
-        .add_operand(source)
-        .add_operands(&dynamic_low)
-        .add_operands(&dynamic_high)
-        .add_result(result_type)
-        .add_region(region);
+        )?
+        .add_attribute(STATIC_LOW_ATTRIBUTE, context.dense_i64_array_attribute(&static_low)?)?
+        .add_attribute(STATIC_HIGH_ATTRIBUTE, context.dense_i64_array_attribute(&static_high)?)?
+        .add_operand(source)?
+        .add_operands(&dynamic_low)?
+        .add_operands(&dynamic_high)?
+        .add_result(result_type)?
+        .add_region(region)?;
     if nofold {
-        builder = builder.add_attribute(NOFOLD_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(NOFOLD_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::pad`"))
@@ -1251,15 +1251,15 @@ pub fn parallel_insert_slice<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
                 dynamic_sizes.len() as i32,
                 dynamic_strides.len() as i32,
             ])?,
-        )
-        .add_attribute(STATIC_OFFSETS_ATTRIBUTE, context.dense_i64_array_attribute(&static_offsets)?)
-        .add_attribute(STATIC_SIZES_ATTRIBUTE, context.dense_i64_array_attribute(&static_sizes)?)
-        .add_attribute(STATIC_STRIDES_ATTRIBUTE, context.dense_i64_array_attribute(&static_strides)?)
-        .add_operand(source)
-        .add_operand(destination)
-        .add_operands(&dynamic_offsets)
-        .add_operands(&dynamic_sizes)
-        .add_operands(&dynamic_strides)
+        )?
+        .add_attribute(STATIC_OFFSETS_ATTRIBUTE, context.dense_i64_array_attribute(&static_offsets)?)?
+        .add_attribute(STATIC_SIZES_ATTRIBUTE, context.dense_i64_array_attribute(&static_sizes)?)?
+        .add_attribute(STATIC_STRIDES_ATTRIBUTE, context.dense_i64_array_attribute(&static_strides)?)?
+        .add_operand(source)?
+        .add_operand(destination)?
+        .add_operands(&dynamic_offsets)?
+        .add_operands(&dynamic_sizes)?
+        .add_operands(&dynamic_strides)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1324,13 +1324,13 @@ pub fn scatter<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::tensor()?)?;
     let mut builder = OperationBuilder::new("tensor.scatter", location)
-        .add_operand(source)
-        .add_operand(destination)
-        .add_operand(indices)
-        .add_attribute(SCATTER_DIMS_ATTRIBUTE, context.dense_i64_array_attribute(scatter_dimensions)?)
-        .add_result(destination.r#type()?);
+        .add_operand(source)?
+        .add_operand(destination)?
+        .add_operand(indices)?
+        .add_attribute(SCATTER_DIMS_ATTRIBUTE, context.dense_i64_array_attribute(scatter_dimensions)?)?
+        .add_result(destination.r#type()?)?;
     if unique {
-        builder = builder.add_attribute(UNIQUE_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(UNIQUE_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::scatter`"))
@@ -1373,9 +1373,9 @@ pub fn splat<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::tensor()?)?;
     OperationBuilder::new("tensor.splat", location)
-        .add_operand(input)
-        .add_operands(dynamic_sizes)
-        .add_result(result_type)
+        .add_operand(input)?
+        .add_operands(dynamic_sizes)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::splat`"))
@@ -1408,7 +1408,7 @@ pub fn r#yield<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::tensor()?)?;
     OperationBuilder::new("tensor.yield", location)
-        .add_operand(value)
+        .add_operand(value)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tensor::yield`"))

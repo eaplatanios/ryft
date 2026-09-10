@@ -47,11 +47,11 @@ pub fn apply_native_constraint<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::pdl()?)?;
     let mut builder = OperationBuilder::new("pdl.apply_native_constraint", location)
-        .add_attribute(NAME_ATTRIBUTE, name)
-        .add_operands(arguments)
-        .add_results(result_types);
+        .add_attribute(NAME_ATTRIBUTE, name)?
+        .add_operands(arguments)?
+        .add_results(result_types)?;
     if is_negated {
-        builder = builder.add_attribute(IS_NEGATED_ATTRIBUTE, context.boolean_attribute(true));
+        builder = builder.add_attribute(IS_NEGATED_ATTRIBUTE, context.boolean_attribute(true))?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -87,9 +87,9 @@ pub fn apply_native_rewrite<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::pdl()?)?;
     OperationBuilder::new("pdl.apply_native_rewrite", location)
-        .add_attribute(NAME_ATTRIBUTE, name)
-        .add_operands(arguments)
-        .add_results(result_types)
+        .add_attribute(NAME_ATTRIBUTE, name)?
+        .add_operands(arguments)?
+        .add_results(result_types)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -127,12 +127,12 @@ pub fn attribute<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedAttributeOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::pdl()?)?;
-    let mut builder = OperationBuilder::new("pdl.attribute", location).add_result(context.pdl_attribute_type()?);
+    let mut builder = OperationBuilder::new("pdl.attribute", location).add_result(context.pdl_attribute_type()?)?;
     if let Some(value_type) = value_type {
-        builder = builder.add_operand(value_type);
+        builder = builder.add_operand(value_type)?;
     }
     if let Some(value) = value {
-        builder = builder.add_attribute(VALUE_ATTRIBUTE, value);
+        builder = builder.add_attribute(VALUE_ATTRIBUTE, value)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `pdl::attribute`"))
@@ -159,7 +159,7 @@ pub fn erase<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::pdl()?)?;
     OperationBuilder::new("pdl.erase", location)
-        .add_operand(operation)
+        .add_operand(operation)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `pdl::erase`"))
@@ -186,9 +186,9 @@ pub fn operand<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedOperandOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::pdl()?)?;
-    let mut builder = OperationBuilder::new("pdl.operand", location).add_result(context.pdl_value_type()?);
+    let mut builder = OperationBuilder::new("pdl.operand", location).add_result(context.pdl_value_type()?)?;
     if let Some(value_type) = value_type {
-        builder = builder.add_operand(value_type);
+        builder = builder.add_operand(value_type)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `pdl::operand`"))
@@ -215,10 +215,10 @@ pub fn operands<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedOperandsOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::pdl()?)?;
-    let mut builder =
-        OperationBuilder::new("pdl.operands", location).add_result(context.pdl_range_type(context.pdl_value_type()?)?);
+    let mut builder = OperationBuilder::new("pdl.operands", location)
+        .add_result(context.pdl_range_type(context.pdl_value_type()?)?)?;
     if let Some(value_type) = value_type {
-        builder = builder.add_operand(value_type);
+        builder = builder.add_operand(value_type)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `pdl::operands`"))
@@ -307,14 +307,14 @@ pub fn operation<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::pdl()?)?;
     let segment_sizes = [operand_values.len() as i32, attribute_values.len() as i32, type_values.len() as i32];
     let mut builder = OperationBuilder::new("pdl.operation", location)
-        .add_operands(operand_values)
-        .add_operands(attribute_values)
-        .add_operands(type_values)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_attribute(ATTRIBUTE_VALUE_NAMES_ATTRIBUTE, context.array_attribute(attribute_value_names))
-        .add_result(context.pdl_operation_type()?);
+        .add_operands(operand_values)?
+        .add_operands(attribute_values)?
+        .add_operands(type_values)?
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_attribute(ATTRIBUTE_VALUE_NAMES_ATTRIBUTE, context.array_attribute(attribute_value_names))?
+        .add_result(context.pdl_operation_type()?)?;
     if let Some(op_name) = op_name {
-        builder = builder.add_attribute(OP_NAME_ATTRIBUTE, op_name);
+        builder = builder.add_attribute(OP_NAME_ATTRIBUTE, op_name)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `pdl::operation`"))
@@ -357,10 +357,10 @@ pub fn pattern<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::pdl()?)?;
     let mut builder = OperationBuilder::new("pdl.pattern", location)
-        .add_attribute(BENEFIT_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(16), benefit as i64))
-        .add_region(body);
+        .add_attribute(BENEFIT_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(16), benefit as i64))?
+        .add_region(body)?;
     if let Some(symbol_name) = symbol_name {
-        builder = builder.add_attribute(SYMBOL_NAME_ATTRIBUTE, symbol_name);
+        builder = builder.add_attribute(SYMBOL_NAME_ATTRIBUTE, symbol_name)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `pdl::pattern`"))
@@ -392,8 +392,8 @@ pub fn range<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::pdl()?)?;
     OperationBuilder::new("pdl.range", location)
-        .add_operands(arguments)
-        .add_result(result_type)
+        .add_operands(arguments)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `pdl::range`"))
@@ -446,12 +446,12 @@ pub fn replace<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::pdl()?)?;
     let segment_sizes = [1, i32::from(replacement_operation.is_some()), replacement_values.len() as i32];
     let mut builder = OperationBuilder::new("pdl.replace", location)
-        .add_operand(operation)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?);
+        .add_operand(operation)?
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?;
     if let Some(replacement_operation) = replacement_operation {
-        builder = builder.add_operand(replacement_operation);
+        builder = builder.add_operand(replacement_operation)?;
     }
-    builder.add_operands(replacement_values).build().and_then(|operation| unsafe {
+    builder.add_operands(replacement_values)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `pdl::replace`"))
     })
 }
@@ -491,9 +491,9 @@ pub fn result<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::pdl()?)?;
     OperationBuilder::new("pdl.result", location)
-        .add_operand(parent)
-        .add_attribute(INDEX_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), index as i64))
-        .add_result(context.pdl_value_type()?)
+        .add_operand(parent)?
+        .add_attribute(INDEX_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), index as i64))?
+        .add_result(context.pdl_value_type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `pdl::result`"))
@@ -537,10 +537,12 @@ pub fn results<'v, 'c: 'v, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedResultsOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::pdl()?)?;
-    let mut builder = OperationBuilder::new("pdl.results", location).add_operand(parent).add_result(result_type);
+    let mut builder = OperationBuilder::new("pdl.results", location).add_operand(parent)?.add_result(result_type)?;
     if let Some(index) = index {
-        builder = builder
-            .add_attribute(INDEX_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), index as i64));
+        builder = builder.add_attribute(
+            INDEX_ATTRIBUTE,
+            context.integer_attribute(context.signless_integer_type(32), index as i64),
+        )?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `pdl::results`"))
@@ -605,15 +607,15 @@ pub fn rewrite<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::pdl()?)?;
     let segment_sizes = [i32::from(root.is_some()), external_arguments.len() as i32];
     let mut builder = OperationBuilder::new("pdl.rewrite", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_region(body);
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_region(body)?;
     if let Some(root) = root {
-        builder = builder.add_operand(root);
+        builder = builder.add_operand(root)?;
     }
     if let Some(name) = name {
-        builder = builder.add_attribute(NAME_ATTRIBUTE, name);
+        builder = builder.add_attribute(NAME_ATTRIBUTE, name)?;
     }
-    builder.add_operands(external_arguments).build().and_then(|operation| unsafe {
+    builder.add_operands(external_arguments)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `pdl::rewrite`"))
     })
 }
@@ -649,9 +651,9 @@ pub fn r#type<'c, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedTypeOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::pdl()?)?;
-    let mut builder = OperationBuilder::new("pdl.type", location).add_result(context.pdl_type_type()?);
+    let mut builder = OperationBuilder::new("pdl.type", location).add_result(context.pdl_type_type()?)?;
     if let Some(constant_type) = constant_type {
-        builder = builder.add_attribute(CONSTANT_TYPE_ATTRIBUTE, constant_type);
+        builder = builder.add_attribute(CONSTANT_TYPE_ATTRIBUTE, constant_type)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `pdl::type`"))
@@ -687,9 +689,9 @@ pub fn types<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::pdl()?)?;
     let mut builder =
-        OperationBuilder::new("pdl.types", location).add_result(context.pdl_range_type(context.pdl_type_type()?)?);
+        OperationBuilder::new("pdl.types", location).add_result(context.pdl_range_type(context.pdl_type_type()?)?)?;
     if let Some(constant_types) = constant_types {
-        builder = builder.add_attribute(CONSTANT_TYPES_ATTRIBUTE, constant_types);
+        builder = builder.add_attribute(CONSTANT_TYPES_ATTRIBUTE, constant_types)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `pdl::types`"))

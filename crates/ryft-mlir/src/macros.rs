@@ -723,8 +723,8 @@ macro_rules! mlir_generic_unary_op {
                 context.load_dialect($crate::DialectHandle::$dialect()?)?;
                 let name = format!("{}.{}", stringify!($dialect), stringify!($op));
                 $crate::OperationBuilder::new(name.as_str(), location)
-                    .add_operands(&[input])
-                    .add_result(output_type)
+                    .add_operands(&[input])?
+                    .add_result(output_type)?
                     .build()
                     .and_then(|operation| unsafe {
                         $crate::DetachedOp::cast(operation).ok_or_else(|| {
@@ -787,7 +787,7 @@ macro_rules! mlir_unary_op {
                 context.load_dialect($crate::DialectHandle::$dialect()?)?;
                 let name = format!("{}.{}", stringify!($dialect), stringify!($op));
                 $crate::OperationBuilder::new(name.as_str(), location)
-                    .add_operands(&[input])
+                    .add_operands(&[input])?
                     .enable_result_type_inference()
                     .build()
                     .and_then(|operation| unsafe {
@@ -871,7 +871,7 @@ macro_rules! mlir_binary_op {
                 context.load_dialect($crate::DialectHandle::$dialect()?)?;
                 let name = format!("{}.{}", stringify!($dialect), stringify!($op));
                 $crate::OperationBuilder::new(name.as_str(), location)
-                    .add_operands(&[lhs.as_ref(), rhs.as_ref()])
+                    .add_operands(&[lhs.as_ref(), rhs.as_ref()])?
                     .enable_result_type_inference()
                     .build()
                     .and_then(|operation| unsafe {

@@ -62,7 +62,7 @@ pub fn r#yield<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedYieldOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::linalg()?)?;
     OperationBuilder::new("linalg.yield", location)
-        .add_operands(values)
+        .add_operands(values)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `linalg::yield`"))
@@ -94,8 +94,8 @@ pub fn index<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::linalg()?)?;
     OperationBuilder::new("linalg.index", location)
-        .add_attribute(DIM_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), dimension))
-        .add_result(context.index_type())
+        .add_attribute(DIM_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), dimension))?
+        .add_result(context.index_type())?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `linalg::index`"))
@@ -175,21 +175,21 @@ pub fn generic<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.generic", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_attribute(INDEXING_MAPS_ATTRIBUTE, indexing_maps)
-        .add_attribute(ITERATOR_TYPES_ATTRIBUTE, iterator_types)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(region);
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_attribute(INDEXING_MAPS_ATTRIBUTE, indexing_maps)?
+        .add_attribute(ITERATOR_TYPES_ATTRIBUTE, iterator_types)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(region)?;
     if let Some(doc) = doc {
-        builder = builder.add_attribute(DOC_ATTRIBUTE, doc);
+        builder = builder.add_attribute(DOC_ATTRIBUTE, doc)?;
     }
     if let Some(library_call) = library_call {
-        builder = builder.add_attribute(LIBRARY_CALL_ATTRIBUTE, library_call);
+        builder = builder.add_attribute(LIBRARY_CALL_ATTRIBUTE, library_call)?;
     }
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `linalg::generic`"))
@@ -232,12 +232,12 @@ pub fn map<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedMapOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::linalg()?)?;
     let mut builder = OperationBuilder::new("linalg.map", location)
-        .add_operands(inputs)
-        .add_operand(init)
-        .add_results(result_types)
-        .add_region(region);
+        .add_operands(inputs)?
+        .add_operand(init)?
+        .add_results(result_types)?
+        .add_region(region)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `linalg::map`"))
@@ -284,13 +284,13 @@ pub fn reduce<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::linalg()?)?;
     let mut builder = OperationBuilder::new("linalg.reduce", location)
-        .add_attribute(DIMENSIONS_ATTRIBUTE, context.dense_i64_array_attribute(dimensions)?)
-        .add_operands(inputs)
-        .add_operands(inits)
-        .add_results(result_types)
-        .add_region(region);
+        .add_attribute(DIMENSIONS_ATTRIBUTE, context.dense_i64_array_attribute(dimensions)?)?
+        .add_operands(inputs)?
+        .add_operands(inits)?
+        .add_results(result_types)?
+        .add_region(region)?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `linalg::reduce`"))
@@ -334,12 +334,12 @@ pub fn transpose<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::linalg()?)?;
     let mut builder = OperationBuilder::new("linalg.transpose", location)
-        .add_attribute(PERMUTATION_ATTRIBUTE, context.dense_i64_array_attribute(permutation)?)
-        .add_operands(&[input, init])
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(PERMUTATION_ATTRIBUTE, context.dense_i64_array_attribute(permutation)?)?
+        .add_operands(&[input, init])?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -380,12 +380,12 @@ pub fn broadcast<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::linalg()?)?;
     let mut builder = OperationBuilder::new("linalg.broadcast", location)
-        .add_attribute(DIMENSIONS_ATTRIBUTE, context.dense_i64_array_attribute(dimensions)?)
-        .add_operands(&[input, init])
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(DIMENSIONS_ATTRIBUTE, context.dense_i64_array_attribute(dimensions)?)?
+        .add_operands(&[input, init])?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -461,15 +461,15 @@ pub fn elementwise<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         context.array_attribute(&maps)
     };
     let mut builder = OperationBuilder::new("linalg.elementwise", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_attribute(KIND_ATTRIBUTE, context.linalg_elementwise_kind_attribute(kind)?)
-        .add_attribute(INDEXING_MAPS_ATTRIBUTE, indexing_maps)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_attribute(KIND_ATTRIBUTE, context.linalg_elementwise_kind_attribute(kind)?)?
+        .add_attribute(INDEXING_MAPS_ATTRIBUTE, indexing_maps)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -538,13 +538,13 @@ pub fn matmul<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.matmul", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -573,13 +573,13 @@ pub fn contract<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.contract", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -608,13 +608,13 @@ pub fn batch_matmul<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.batch_matmul", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -643,13 +643,13 @@ pub fn batch_reduce_matmul<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.batch_reduce_matmul", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -692,9 +692,9 @@ pub fn softmax<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::linalg()?)?;
     OperationBuilder::new("linalg.softmax", location)
-        .add_attribute(DIMENSION_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), dimension))
-        .add_operands(&[input, output])
-        .add_results(result_types)
+        .add_attribute(DIMENSION_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), dimension))?
+        .add_operands(&[input, output])?
+        .add_results(result_types)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `linalg::softmax`"))
@@ -746,9 +746,9 @@ pub fn winograd_filter_transform<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::linalg()?)?;
     OperationBuilder::new("linalg.winograd_filter_transform", location)
-        .add_attribute(FMR_ATTRIBUTE, context.linalg_winograd_conv_2d_fmr_attribute(fmr)?)
-        .add_operands(&[input, output])
-        .add_results(result_types)
+        .add_attribute(FMR_ATTRIBUTE, context.linalg_winograd_conv_2d_fmr_attribute(fmr)?)?
+        .add_operands(&[input, output])?
+        .add_results(result_types)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -799,9 +799,9 @@ pub fn winograd_input_transform<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::linalg()?)?;
     OperationBuilder::new("linalg.winograd_input_transform", location)
-        .add_attribute(FMR_ATTRIBUTE, context.linalg_winograd_conv_2d_fmr_attribute(fmr)?)
-        .add_operands(&[input, output])
-        .add_results(result_types)
+        .add_attribute(FMR_ATTRIBUTE, context.linalg_winograd_conv_2d_fmr_attribute(fmr)?)?
+        .add_operands(&[input, output])?
+        .add_results(result_types)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -852,9 +852,9 @@ pub fn winograd_output_transform<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::linalg()?)?;
     OperationBuilder::new("linalg.winograd_output_transform", location)
-        .add_attribute(FMR_ATTRIBUTE, context.linalg_winograd_conv_2d_fmr_attribute(fmr)?)
-        .add_operands(&[input, output])
-        .add_results(result_types)
+        .add_attribute(FMR_ATTRIBUTE, context.linalg_winograd_conv_2d_fmr_attribute(fmr)?)?
+        .add_operands(&[input, output])?
+        .add_results(result_types)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -942,15 +942,15 @@ pub fn pack<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [1, 1, i32::from(padding_value.is_some()), inner_tiles.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pack", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_attribute(OUTER_DIMS_PERM_ATTRIBUTE, context.dense_i64_array_attribute(outer_dims_perm)?)
-        .add_attribute(INNER_DIMS_POS_ATTRIBUTE, context.dense_i64_array_attribute(inner_dims_pos)?)
-        .add_attribute(STATIC_INNER_TILES_ATTRIBUTE, context.dense_i64_array_attribute(static_inner_tiles)?)
-        .add_operands(&[source, destination]);
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_attribute(OUTER_DIMS_PERM_ATTRIBUTE, context.dense_i64_array_attribute(outer_dims_perm)?)?
+        .add_attribute(INNER_DIMS_POS_ATTRIBUTE, context.dense_i64_array_attribute(inner_dims_pos)?)?
+        .add_attribute(STATIC_INNER_TILES_ATTRIBUTE, context.dense_i64_array_attribute(static_inner_tiles)?)?
+        .add_operands(&[source, destination])?;
     if let Some(padding_value) = padding_value {
-        builder = builder.add_operand(padding_value);
+        builder = builder.add_operand(padding_value)?;
     }
-    builder.add_operands(inner_tiles).add_results(result_types).build().and_then(|operation| unsafe {
+    builder.add_operands(inner_tiles)?.add_results(result_types)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `linalg::pack`"))
     })
 }
@@ -1012,13 +1012,13 @@ pub fn unpack<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [1, 1, inner_tiles.len() as i32];
     OperationBuilder::new("linalg.unpack", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_attribute(OUTER_DIMS_PERM_ATTRIBUTE, context.dense_i64_array_attribute(outer_dims_perm)?)
-        .add_attribute(INNER_DIMS_POS_ATTRIBUTE, context.dense_i64_array_attribute(inner_dims_pos)?)
-        .add_attribute(STATIC_INNER_TILES_ATTRIBUTE, context.dense_i64_array_attribute(static_inner_tiles)?)
-        .add_operands(&[source, destination])
-        .add_operands(inner_tiles)
-        .add_results(result_types)
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_attribute(OUTER_DIMS_PERM_ATTRIBUTE, context.dense_i64_array_attribute(outer_dims_perm)?)?
+        .add_attribute(INNER_DIMS_POS_ATTRIBUTE, context.dense_i64_array_attribute(inner_dims_pos)?)?
+        .add_attribute(STATIC_INNER_TILES_ATTRIBUTE, context.dense_i64_array_attribute(static_inner_tiles)?)?
+        .add_operands(&[source, destination])?
+        .add_operands(inner_tiles)?
+        .add_results(result_types)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `linalg::unpack`"))
@@ -1049,13 +1049,13 @@ pub fn copy<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.copy", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1082,13 +1082,13 @@ pub fn exp<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.exp", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1115,13 +1115,13 @@ pub fn log<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.log", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1148,13 +1148,13 @@ pub fn abs<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.abs", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1181,13 +1181,13 @@ pub fn ceil<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.ceil", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1214,13 +1214,13 @@ pub fn floor<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.floor", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1247,13 +1247,13 @@ pub fn negf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.negf", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1280,13 +1280,13 @@ pub fn reciprocal<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.reciprocal", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1313,13 +1313,13 @@ pub fn round<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.round", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1346,13 +1346,13 @@ pub fn sqrt<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.sqrt", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1379,13 +1379,13 @@ pub fn rsqrt<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.rsqrt", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1412,13 +1412,13 @@ pub fn square<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.square", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1445,13 +1445,13 @@ pub fn tanh<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.tanh", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1478,13 +1478,13 @@ pub fn erf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.erf", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1511,13 +1511,13 @@ pub fn add<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.add", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1544,13 +1544,13 @@ pub fn sub<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.sub", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1577,13 +1577,13 @@ pub fn mul<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.mul", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1610,13 +1610,13 @@ pub fn div<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.div", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1643,13 +1643,13 @@ pub fn div_unsigned<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.div_unsigned", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1676,13 +1676,13 @@ pub fn max<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.max", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1709,13 +1709,13 @@ pub fn min<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.min", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1742,13 +1742,13 @@ pub fn powf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.powf", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1775,13 +1775,13 @@ pub fn select<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.select", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1808,13 +1808,13 @@ pub fn quantized_matmul<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.quantized_matmul", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1841,13 +1841,13 @@ pub fn mmt4d<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.mmt4d", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1874,13 +1874,13 @@ pub fn batch_mmt4d<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.batch_mmt4d", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1907,13 +1907,13 @@ pub fn quantized_batch_matmul<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.quantized_batch_matmul", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1941,13 +1941,13 @@ pub fn matvec<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.matvec", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -1974,13 +1974,13 @@ pub fn vecmat<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.vecmat", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2007,13 +2007,13 @@ pub fn batch_matvec<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.batch_matvec", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2040,13 +2040,13 @@ pub fn batch_vecmat<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.batch_vecmat", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2073,13 +2073,13 @@ pub fn dot<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.dot", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2106,13 +2106,13 @@ pub fn conv_1d<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_1d", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2139,13 +2139,13 @@ pub fn conv_2d<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_2d", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2172,13 +2172,13 @@ pub fn conv_3d<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_3d", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2233,13 +2233,13 @@ pub fn conv_1d_nwc_wcf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_1d_nwc_wcf", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2267,13 +2267,13 @@ pub fn conv_1d_ncw_fcw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_1d_ncw_fcw", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2301,13 +2301,13 @@ pub fn conv_2d_nhwc_hwcf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_2d_nhwc_hwcf", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2335,13 +2335,13 @@ pub fn conv_2d_nhwc_fhwc<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_2d_nhwc_fhwc", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2369,13 +2369,13 @@ pub fn conv_2d_nhwc_hwcf_q<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_2d_nhwc_hwcf_q", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2403,13 +2403,13 @@ pub fn conv_2d_nhwc_fhwc_q<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_2d_nhwc_fhwc_q", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2437,13 +2437,13 @@ pub fn conv_2d_nchw_fchw_q<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_2d_nchw_fchw_q", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2471,13 +2471,13 @@ pub fn conv_2d_nchw_fchw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_2d_nchw_fchw", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2505,13 +2505,13 @@ pub fn conv_2d_ngchw_fgchw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_2d_ngchw_fgchw", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2539,13 +2539,13 @@ pub fn conv_2d_ngchw_gfchw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_2d_ngchw_gfchw", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2573,13 +2573,13 @@ pub fn conv_2d_nhwgc_gfhwc<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_2d_nhwgc_gfhwc", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2607,13 +2607,13 @@ pub fn conv_2d_nhwgc_gfhwc_q<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_2d_nhwgc_gfhwc_q", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2641,13 +2641,13 @@ pub fn conv_2d_ngchw_gfchw_q<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_2d_ngchw_gfchw_q", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2675,13 +2675,13 @@ pub fn conv_3d_ndhwc_dhwcf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_3d_ndhwc_dhwcf", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2709,13 +2709,13 @@ pub fn conv_3d_ndhwc_dhwcf_q<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_3d_ndhwc_dhwcf_q", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2743,13 +2743,13 @@ pub fn conv_3d_ncdhw_fcdhw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.conv_3d_ncdhw_fcdhw", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2777,13 +2777,13 @@ pub fn depthwise_conv_1d_nwc_wc<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.depthwise_conv_1d_nwc_wc", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2812,13 +2812,13 @@ pub fn depthwise_conv_1d_ncw_cw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.depthwise_conv_1d_ncw_cw", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2847,13 +2847,13 @@ pub fn depthwise_conv_1d_nwc_wcm<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.depthwise_conv_1d_nwc_wcm", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2882,13 +2882,13 @@ pub fn depthwise_conv_2d_nhwc_hwc<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.depthwise_conv_2d_nhwc_hwc", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2917,13 +2917,13 @@ pub fn depthwise_conv_2d_nchw_chw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.depthwise_conv_2d_nchw_chw", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2952,13 +2952,13 @@ pub fn depthwise_conv_2d_nhwc_hwc_q<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.depthwise_conv_2d_nhwc_hwc_q", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -2987,13 +2987,13 @@ pub fn depthwise_conv_2d_nhwc_hwcm<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.depthwise_conv_2d_nhwc_hwcm", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -3022,13 +3022,13 @@ pub fn depthwise_conv_2d_nhwc_hwcm_q<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.depthwise_conv_2d_nhwc_hwcm_q", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -3057,13 +3057,13 @@ pub fn depthwise_conv_3d_ndhwc_dhwc<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.depthwise_conv_3d_ndhwc_dhwc", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -3092,13 +3092,13 @@ pub fn depthwise_conv_3d_ncdhw_cdhw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.depthwise_conv_3d_ncdhw_cdhw", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -3127,13 +3127,13 @@ pub fn depthwise_conv_3d_ndhwc_dhwcm<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.depthwise_conv_3d_ndhwc_dhwcm", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -3162,13 +3162,13 @@ pub fn pooling_nhwc_sum<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_nhwc_sum", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -3196,13 +3196,13 @@ pub fn pooling_nchw_sum<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_nchw_sum", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -3230,13 +3230,13 @@ pub fn pooling_nhwc_max<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_nhwc_max", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -3264,13 +3264,13 @@ pub fn pooling_nhwc_max_unsigned<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_nhwc_max_unsigned", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -3299,13 +3299,13 @@ pub fn pooling_nchw_max<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_nchw_max", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -3333,13 +3333,13 @@ pub fn pooling_nhwc_min<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_nhwc_min", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -3367,13 +3367,13 @@ pub fn pooling_nhwc_min_unsigned<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_nhwc_min_unsigned", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -3402,13 +3402,13 @@ pub fn pooling_nwc_sum<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_nwc_sum", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -3436,13 +3436,13 @@ pub fn pooling_ncw_sum<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_ncw_sum", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -3470,13 +3470,13 @@ pub fn pooling_nwc_max<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_nwc_max", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -3504,13 +3504,13 @@ pub fn pooling_nwc_max_unsigned<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_nwc_max_unsigned", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -3539,13 +3539,13 @@ pub fn pooling_ncw_max<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_ncw_max", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -3573,13 +3573,13 @@ pub fn pooling_nwc_min<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_nwc_min", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -3607,13 +3607,13 @@ pub fn pooling_nwc_min_unsigned<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_nwc_min_unsigned", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -3642,13 +3642,13 @@ pub fn pooling_ndhwc_sum<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_ndhwc_sum", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -3676,13 +3676,13 @@ pub fn pooling_ndhwc_max<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_ndhwc_max", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -3710,13 +3710,13 @@ pub fn pooling_ndhwc_min<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.pooling_ndhwc_min", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -3743,13 +3743,13 @@ pub fn fill<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.fill", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };
@@ -3776,13 +3776,13 @@ pub fn fill_rng_2d<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::linalg()?)?;
     let segment_sizes = [inputs.len() as i32, outputs.len() as i32];
     let mut builder = OperationBuilder::new("linalg.fill_rng_2d", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_operands(inputs)
-        .add_operands(outputs)
-        .add_results(result_types)
-        .add_region(context.region());
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_operands(inputs)?
+        .add_operands(outputs)?
+        .add_results(result_types)?
+        .add_region(context.region())?;
     for (name, attribute) in attributes {
-        builder = builder.add_attribute(*name, *attribute);
+        builder = builder.add_attribute(*name, *attribute)?;
     }
     let operation = builder.build()?;
     unsafe { mlirLinalgFillBuiltinNamedOpRegion(operation.to_c_api()) };

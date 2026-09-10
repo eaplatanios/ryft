@@ -85,28 +85,28 @@ pub fn call_intrinsic<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CALL_INTRINSIC_OPERATION_NAME, location);
-    builder = builder.add_operands(arguments);
-    builder = builder.add_operands(op_bundle_operands);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("intrin", intrin);
+    builder = builder.add_operands(arguments)?;
+    builder = builder.add_operands(op_bundle_operands)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("intrin", intrin)?;
     builder = builder.add_attribute(
         "operand_segment_sizes",
         context.dense_i32_array_attribute(&[arguments.len() as i32, op_bundle_operands.len() as i32])?,
-    );
+    )?;
     let empty_op_bundle_sizes = context.dense_i32_array_attribute(&[])?;
     builder =
-        builder.add_attribute("op_bundle_sizes", op_bundle_sizes.unwrap_or_else(|| empty_op_bundle_sizes.as_ref()));
+        builder.add_attribute("op_bundle_sizes", op_bundle_sizes.unwrap_or_else(|| empty_op_bundle_sizes.as_ref()))?;
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmath_flags", fastmath_flags);
+        builder = builder.add_attribute("fastmath_flags", fastmath_flags)?;
     }
     if let Some(op_bundle_tags) = op_bundle_tags {
-        builder = builder.add_attribute("op_bundle_tags", op_bundle_tags);
+        builder = builder.add_attribute("op_bundle_tags", op_bundle_tags)?;
     }
     if let Some(arg_attrs) = arg_attrs {
-        builder = builder.add_attribute("arg_attrs", arg_attrs);
+        builder = builder.add_attribute("arg_attrs", arg_attrs)?;
     }
     if let Some(res_attrs) = res_attrs {
-        builder = builder.add_attribute("res_attrs", res_attrs);
+        builder = builder.add_attribute("res_attrs", res_attrs)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -208,36 +208,36 @@ pub fn call<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(CALL_OPERATION_NAME, location);
-    builder = builder.add_operands(callee_operands);
-    builder = builder.add_operands(op_bundle_operands);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operands(callee_operands)?;
+    builder = builder.add_operands(op_bundle_operands)?;
+    builder = builder.add_result(result_type)?;
     builder = builder.add_attribute(
         "operand_segment_sizes",
         context.dense_i32_array_attribute(&[callee_operands.len() as i32, op_bundle_operands.len() as i32])?,
-    );
+    )?;
     let empty_op_bundle_sizes = context.dense_i32_array_attribute(&[])?;
     builder =
-        builder.add_attribute("op_bundle_sizes", op_bundle_sizes.unwrap_or_else(|| empty_op_bundle_sizes.as_ref()));
+        builder.add_attribute("op_bundle_sizes", op_bundle_sizes.unwrap_or_else(|| empty_op_bundle_sizes.as_ref()))?;
     if let Some(var_callee_type) = var_callee_type {
-        builder = builder.add_attribute("var_callee_type", var_callee_type);
+        builder = builder.add_attribute("var_callee_type", var_callee_type)?;
     }
     if let Some(callee) = callee {
-        builder = builder.add_attribute("callee", callee);
+        builder = builder.add_attribute("callee", callee)?;
     }
     if let Some(fastmath_flags) = fastmath_flags {
-        builder = builder.add_attribute("fastmath_flags", fastmath_flags);
+        builder = builder.add_attribute("fastmath_flags", fastmath_flags)?;
     }
     if let Some(calling_convention) = calling_convention {
-        builder = builder.add_attribute("CConv", calling_convention);
+        builder = builder.add_attribute("CConv", calling_convention)?;
     }
     if let Some(op_bundle_tags) = op_bundle_tags {
-        builder = builder.add_attribute("op_bundle_tags", op_bundle_tags);
+        builder = builder.add_attribute("op_bundle_tags", op_bundle_tags)?;
     }
     if let Some(arg_attrs) = arg_attrs {
-        builder = builder.add_attribute("arg_attrs", arg_attrs);
+        builder = builder.add_attribute("arg_attrs", arg_attrs)?;
     }
     if let Some(res_attrs) = res_attrs {
-        builder = builder.add_attribute("res_attrs", res_attrs);
+        builder = builder.add_attribute("res_attrs", res_attrs)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::call`"))
@@ -330,24 +330,24 @@ pub fn inline_asm<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(INLINE_ASM_OPERATION_NAME, location);
-    builder = builder.add_operands(operands);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("asm_string", asm_string);
-    builder = builder.add_attribute("constraints", constraints);
+    builder = builder.add_operands(operands)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("asm_string", asm_string)?;
+    builder = builder.add_attribute("constraints", constraints)?;
     if has_side_effects {
-        builder = builder.add_attribute("has_side_effects", context.unit_attribute());
+        builder = builder.add_attribute("has_side_effects", context.unit_attribute())?;
     }
     if is_align_stack {
-        builder = builder.add_attribute("is_align_stack", context.unit_attribute());
+        builder = builder.add_attribute("is_align_stack", context.unit_attribute())?;
     }
     if let Some(tail_call_kind) = tail_call_kind {
-        builder = builder.add_attribute("tail_call_kind", tail_call_kind);
+        builder = builder.add_attribute("tail_call_kind", tail_call_kind)?;
     }
     if let Some(asm_dialect) = asm_dialect {
-        builder = builder.add_attribute("asm_dialect", asm_dialect);
+        builder = builder.add_attribute("asm_dialect", asm_dialect)?;
     }
     if let Some(operand_attrs) = operand_attrs {
-        builder = builder.add_attribute("operand_attrs", operand_attrs);
+        builder = builder.add_attribute("operand_attrs", operand_attrs)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::inline_asm`"))

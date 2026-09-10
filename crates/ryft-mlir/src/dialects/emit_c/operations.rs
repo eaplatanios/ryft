@@ -38,8 +38,8 @@ pub fn file<'c, 't: 'c, I: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't>
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.file", location)
-        .add_attribute(FILE_ID_ATTRIBUTE, id.try_into_with_context(context)?)
-        .add_region(body)
+        .add_attribute(FILE_ID_ATTRIBUTE, id.try_into_with_context(context)?)?
+        .add_region(body)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::file`"))
@@ -103,8 +103,8 @@ pub fn address_of<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.address_of", location)
-        .add_operand(reference)
-        .add_result(result_type)
+        .add_operand(reference)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::address_of`"))
@@ -139,8 +139,8 @@ pub fn add<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.add", location)
-        .add_operands(&[lhs.as_ref(), rhs.as_ref()])
-        .add_result(result_type)
+        .add_operands(&[lhs.as_ref(), rhs.as_ref()])?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::add`"))
@@ -175,8 +175,8 @@ pub fn bitwise_and<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.bitwise_and", location)
-        .add_operands(&[lhs.as_ref(), rhs.as_ref()])
-        .add_result(result_type)
+        .add_operands(&[lhs.as_ref(), rhs.as_ref()])?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -213,8 +213,8 @@ pub fn bitwise_left_shift<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.bitwise_left_shift", location)
-        .add_operands(&[lhs.as_ref(), rhs.as_ref()])
-        .add_result(result_type)
+        .add_operands(&[lhs.as_ref(), rhs.as_ref()])?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -249,8 +249,8 @@ pub fn bitwise_not<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.bitwise_not", location)
-        .add_operand(operand)
-        .add_result(result_type)
+        .add_operand(operand)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -287,8 +287,8 @@ pub fn bitwise_or<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.bitwise_or", location)
-        .add_operands(&[lhs.as_ref(), rhs.as_ref()])
-        .add_result(result_type)
+        .add_operands(&[lhs.as_ref(), rhs.as_ref()])?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::bitwise_or`"))
@@ -323,8 +323,8 @@ pub fn bitwise_right_shift<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.bitwise_right_shift", location)
-        .add_operands(&[lhs.as_ref(), rhs.as_ref()])
-        .add_result(result_type)
+        .add_operands(&[lhs.as_ref(), rhs.as_ref()])?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -361,8 +361,8 @@ pub fn bitwise_xor<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.bitwise_xor", location)
-        .add_operands(&[lhs.as_ref(), rhs.as_ref()])
-        .add_result(result_type)
+        .add_operands(&[lhs.as_ref(), rhs.as_ref()])?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -434,14 +434,14 @@ pub fn call_opaque<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.call_opaque", location)
-        .add_attribute(CALLEE_ATTRIBUTE, callee.try_into_with_context(context)?)
-        .add_operands(operands)
-        .add_results(result_types);
+        .add_attribute(CALLEE_ATTRIBUTE, callee.try_into_with_context(context)?)?
+        .add_operands(operands)?
+        .add_results(result_types)?;
     if let Some(args) = args {
-        builder = builder.add_attribute(ARGS_ATTRIBUTE, args);
+        builder = builder.add_attribute(ARGS_ATTRIBUTE, args)?;
     }
     if let Some(template_args) = template_args {
-        builder = builder.add_attribute(TEMPLATE_ARGS_ATTRIBUTE, template_args);
+        builder = builder.add_attribute(TEMPLATE_ARGS_ATTRIBUTE, template_args)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -476,8 +476,8 @@ pub fn cast<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.cast", location)
-        .add_operand(source)
-        .add_result(result_type)
+        .add_operand(source)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::cast`"))
@@ -530,9 +530,9 @@ pub fn cmp<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.cmp", location)
-        .add_attribute(CMP_PREDICATE_ATTRIBUTE, context.emit_c_cmp_predicate_attribute(predicate)?)
-        .add_operands(&[lhs.as_ref(), rhs.as_ref()])
-        .add_result(result_type)
+        .add_attribute(CMP_PREDICATE_ATTRIBUTE, context.emit_c_cmp_predicate_attribute(predicate)?)?
+        .add_operands(&[lhs.as_ref(), rhs.as_ref()])?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::cmp`"))
@@ -577,8 +577,8 @@ pub fn constant<'c, 't: 'c, A: Attribute<'c, 't>, ResultType: Type<'c, 't>, L: L
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.constant", location)
-        .add_attribute(VALUE_ATTRIBUTE, value)
-        .add_result(result_type)
+        .add_attribute(VALUE_ATTRIBUTE, value)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::constant`"))
@@ -611,8 +611,8 @@ pub fn dereference<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.dereference", location)
-        .add_operand(pointer)
-        .add_result(result_type)
+        .add_operand(pointer)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -649,8 +649,8 @@ pub fn div<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.div", location)
-        .add_operands(&[lhs.as_ref(), rhs.as_ref()])
-        .add_result(result_type)
+        .add_operands(&[lhs.as_ref(), rhs.as_ref()])?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::div`"))
@@ -701,11 +701,11 @@ pub fn expression<'definition, 'c: 'definition, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.expression", location)
-        .add_operands(definitions)
-        .add_result(result_type)
-        .add_region(region);
+        .add_operands(definitions)?
+        .add_result(result_type)?
+        .add_region(region)?;
     if do_not_inline {
-        builder = builder.add_attribute(DO_NOT_INLINE_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(DO_NOT_INLINE_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::expression`"))
@@ -760,8 +760,8 @@ pub fn r#for<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.for", location)
-        .add_operands(&[lower_bound.as_ref(), upper_bound.as_ref(), step.as_ref()])
-        .add_region(region)
+        .add_operands(&[lower_bound.as_ref(), upper_bound.as_ref(), step.as_ref()])?
+        .add_region(region)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::for`"))
@@ -808,14 +808,14 @@ pub fn call<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.call", location)
-        .add_attribute(CALLEE_ATTRIBUTE, callee.try_into_with_context(context)?)
-        .add_operands(operands)
-        .add_results(result_types);
+        .add_attribute(CALLEE_ATTRIBUTE, callee.try_into_with_context(context)?)?
+        .add_operands(operands)?
+        .add_results(result_types)?;
     if let Some(arg_attrs) = arg_attrs {
-        builder = builder.add_attribute(ARG_ATTRS_ATTRIBUTE, arg_attrs);
+        builder = builder.add_attribute(ARG_ATTRS_ATTRIBUTE, arg_attrs)?;
     }
     if let Some(res_attrs) = res_attrs {
-        builder = builder.add_attribute(RES_ATTRS_ATTRIBUTE, res_attrs);
+        builder = builder.add_attribute(RES_ATTRS_ATTRIBUTE, res_attrs)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::call`"))
@@ -847,7 +847,7 @@ pub fn declare_func<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.declare_func", location)
-        .add_attribute(SYMBOL_NAME_ATTRIBUTE, symbol_name.try_into_with_context(context)?)
+        .add_attribute(SYMBOL_NAME_ATTRIBUTE, symbol_name.try_into_with_context(context)?)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -920,17 +920,17 @@ pub fn func<'c, 't: 'c, N: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't>
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.func", location)
-        .add_attribute(SYMBOL_NAME_ATTRIBUTE, name.try_into_with_context(context)?)
-        .add_attribute(FUNCTION_TYPE_ATTRIBUTE, context.type_attribute(function_type))
-        .add_region(body);
+        .add_attribute(SYMBOL_NAME_ATTRIBUTE, name.try_into_with_context(context)?)?
+        .add_attribute(FUNCTION_TYPE_ATTRIBUTE, context.type_attribute(function_type))?
+        .add_region(body)?;
     if let Some(specifiers) = specifiers {
-        builder = builder.add_attribute(SPECIFIERS_ATTRIBUTE, specifiers);
+        builder = builder.add_attribute(SPECIFIERS_ATTRIBUTE, specifiers)?;
     }
     if let Some(arg_attrs) = arg_attrs {
-        builder = builder.add_attribute(ARG_ATTRS_ATTRIBUTE, arg_attrs);
+        builder = builder.add_attribute(ARG_ATTRS_ATTRIBUTE, arg_attrs)?;
     }
     if let Some(res_attrs) = res_attrs {
-        builder = builder.add_attribute(RES_ATTRS_ATTRIBUTE, res_attrs);
+        builder = builder.add_attribute(RES_ATTRS_ATTRIBUTE, res_attrs)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::func`"))
@@ -959,7 +959,7 @@ pub fn r#return<'value, 'c: 'value, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.return", location);
     if let Some(value) = value {
-        builder = builder.add_operand(value);
+        builder = builder.add_operand(value)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::return`"))
@@ -998,9 +998,9 @@ pub fn include<'c, 't: 'c, I: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.include", location)
-        .add_attribute(INCLUDE_ATTRIBUTE, include.try_into_with_context(context)?);
+        .add_attribute(INCLUDE_ATTRIBUTE, include.try_into_with_context(context)?)?;
     if is_standard_include {
-        builder = builder.add_attribute(IS_STANDARD_INCLUDE_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(IS_STANDARD_INCLUDE_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::include`"))
@@ -1041,8 +1041,8 @@ pub fn literal<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.literal", location)
-        .add_attribute(VALUE_ATTRIBUTE, value.try_into_with_context(context)?)
-        .add_result(result_type)
+        .add_attribute(VALUE_ATTRIBUTE, value.try_into_with_context(context)?)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::literal`"))
@@ -1076,8 +1076,8 @@ pub fn logical_and<
     context.load_dialect(DialectHandle::emit_c()?)?;
     let result_type = context.signless_integer_type(1);
     OperationBuilder::new("emitc.logical_and", location)
-        .add_operands(&[lhs.as_ref(), rhs.as_ref()])
-        .add_result(result_type)
+        .add_operands(&[lhs.as_ref(), rhs.as_ref()])?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1105,8 +1105,8 @@ pub fn logical_not<'operand, 'c: 'operand, 't: 'c, Operand: Value<'operand, 'c, 
     context.load_dialect(DialectHandle::emit_c()?)?;
     let result_type = context.signless_integer_type(1);
     OperationBuilder::new("emitc.logical_not", location)
-        .add_operand(operand)
-        .add_result(result_type)
+        .add_operand(operand)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1142,8 +1142,8 @@ pub fn logical_or<
     context.load_dialect(DialectHandle::emit_c()?)?;
     let result_type = context.signless_integer_type(1);
     OperationBuilder::new("emitc.logical_or", location)
-        .add_operands(&[lhs.as_ref(), rhs.as_ref()])
-        .add_result(result_type)
+        .add_operands(&[lhs.as_ref(), rhs.as_ref()])?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::logical_or`"))
@@ -1176,8 +1176,8 @@ pub fn load<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.load", location)
-        .add_operand(operand)
-        .add_result(result_type)
+        .add_operand(operand)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::load`"))
@@ -1212,8 +1212,8 @@ pub fn mul<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.mul", location)
-        .add_operands(&[lhs.as_ref(), rhs.as_ref()])
-        .add_result(result_type)
+        .add_operands(&[lhs.as_ref(), rhs.as_ref()])?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::mul`"))
@@ -1248,8 +1248,8 @@ pub fn rem<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.rem", location)
-        .add_operands(&[lhs.as_ref(), rhs.as_ref()])
-        .add_result(result_type)
+        .add_operands(&[lhs.as_ref(), rhs.as_ref()])?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::rem`"))
@@ -1284,8 +1284,8 @@ pub fn sub<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.sub", location)
-        .add_operands(&[lhs.as_ref(), rhs.as_ref()])
-        .add_result(result_type)
+        .add_operands(&[lhs.as_ref(), rhs.as_ref()])?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::sub`"))
@@ -1328,9 +1328,9 @@ pub fn member<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.member", location)
-        .add_attribute(MEMBER_ATTRIBUTE, member.try_into_with_context(context)?)
-        .add_operand(operand)
-        .add_result(result_type)
+        .add_attribute(MEMBER_ATTRIBUTE, member.try_into_with_context(context)?)?
+        .add_operand(operand)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::member`"))
@@ -1370,9 +1370,9 @@ pub fn member_of_ptr<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.member_of_ptr", location)
-        .add_attribute(MEMBER_ATTRIBUTE, member.try_into_with_context(context)?)
-        .add_operand(operand)
-        .add_result(result_type)
+        .add_attribute(MEMBER_ATTRIBUTE, member.try_into_with_context(context)?)?
+        .add_operand(operand)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1431,8 +1431,8 @@ pub fn conditional<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.conditional", location)
-        .add_operands(&[condition.as_ref(), true_value.as_ref(), false_value.as_ref()])
-        .add_result(result_type)
+        .add_operands(&[condition.as_ref(), true_value.as_ref(), false_value.as_ref()])?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1467,8 +1467,8 @@ pub fn unary_minus<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.unary_minus", location)
-        .add_operand(operand)
-        .add_result(result_type)
+        .add_operand(operand)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1503,8 +1503,8 @@ pub fn unary_plus<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.unary_plus", location)
-        .add_operand(operand)
-        .add_result(result_type)
+        .add_operand(operand)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::unary_plus`"))
@@ -1545,8 +1545,8 @@ pub fn variable<'c, 't: 'c, A: Attribute<'c, 't>, ResultType: Type<'c, 't>, L: L
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.variable", location)
-        .add_attribute(VALUE_ATTRIBUTE, value)
-        .add_result(result_type)
+        .add_attribute(VALUE_ATTRIBUTE, value)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::variable`"))
@@ -1626,19 +1626,19 @@ pub fn global<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.global", location)
-        .add_attribute(SYMBOL_NAME_ATTRIBUTE, symbol_name.try_into_with_context(context)?)
-        .add_attribute(TYPE_ATTRIBUTE, context.type_attribute(r#type));
+        .add_attribute(SYMBOL_NAME_ATTRIBUTE, symbol_name.try_into_with_context(context)?)?
+        .add_attribute(TYPE_ATTRIBUTE, context.type_attribute(r#type))?;
     if let Some(initial_value) = initial_value {
-        builder = builder.add_attribute(INITIAL_VALUE_ATTRIBUTE, initial_value);
+        builder = builder.add_attribute(INITIAL_VALUE_ATTRIBUTE, initial_value)?;
     }
     if extern_specifier {
-        builder = builder.add_attribute(EXTERN_SPECIFIER_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(EXTERN_SPECIFIER_ATTRIBUTE, context.unit_attribute())?;
     }
     if static_specifier {
-        builder = builder.add_attribute(STATIC_SPECIFIER_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(STATIC_SPECIFIER_ATTRIBUTE, context.unit_attribute())?;
     }
     if const_specifier {
-        builder = builder.add_attribute(CONST_SPECIFIER_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(CONST_SPECIFIER_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::global`"))
@@ -1682,8 +1682,8 @@ pub fn get_global<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.get_global", location)
-        .add_attribute(NAME_ATTRIBUTE, name.try_into_with_context(context)?)
-        .add_result(result_type)
+        .add_attribute(NAME_ATTRIBUTE, name.try_into_with_context(context)?)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::get_global`"))
@@ -1722,8 +1722,8 @@ pub fn verbatim<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.verbatim", location)
-        .add_attribute(VALUE_ATTRIBUTE, value.try_into_with_context(context)?)
-        .add_operands(format_arguments)
+        .add_attribute(VALUE_ATTRIBUTE, value.try_into_with_context(context)?)?
+        .add_operands(format_arguments)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::verbatim`"))
@@ -1764,7 +1764,7 @@ pub fn assign<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.assign", location)
-        .add_operands(&[variable.as_ref(), value.as_ref()])
+        .add_operands(&[variable.as_ref(), value.as_ref()])?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::assign`"))
@@ -1792,7 +1792,7 @@ pub fn r#yield<'value, 'c: 'value, 't: 'c, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.yield", location);
     if let Some(value) = value {
-        builder = builder.add_operand(value);
+        builder = builder.add_operand(value)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::yield`"))
@@ -1830,8 +1830,8 @@ pub fn r#if<'condition, 'c: 'condition, 't: 'c, Condition: Value<'condition, 'c,
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.if", location)
-        .add_operand(condition)
-        .add_regions(vec![then_region, else_region])
+        .add_operand(condition)?
+        .add_regions(vec![then_region, else_region])?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::if`"))
@@ -1879,9 +1879,9 @@ pub fn subscript<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.subscript", location)
-        .add_operand(value)
-        .add_operands(indices)
-        .add_result(result_type)
+        .add_operand(value)?
+        .add_operands(indices)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::subscript`"))
@@ -1930,9 +1930,9 @@ pub fn switch<'argument, 'c: 'argument, 't: 'c, Argument: Value<'argument, 'c, '
     let mut regions = vec![default_region];
     regions.extend(case_regions);
     OperationBuilder::new("emitc.switch", location)
-        .add_operand(argument)
-        .add_attribute(CASES_ATTRIBUTE, context.dense_i64_array_attribute(cases)?)
-        .add_regions(regions)
+        .add_operand(argument)?
+        .add_attribute(CASES_ATTRIBUTE, context.dense_i64_array_attribute(cases)?)?
+        .add_regions(regions)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::switch`"))
@@ -1978,10 +1978,10 @@ pub fn class<'c, 't: 'c, N: TryIntoWithContext<'c, 't, StringAttributeRef<'c, 't
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.class", location)
-        .add_attribute(SYMBOL_NAME_ATTRIBUTE, symbol_name.try_into_with_context(context)?)
-        .add_region(body);
+        .add_attribute(SYMBOL_NAME_ATTRIBUTE, symbol_name.try_into_with_context(context)?)?
+        .add_region(body)?;
     if final_specifier {
-        builder = builder.add_attribute(FINAL_SPECIFIER_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(FINAL_SPECIFIER_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::class`"))
@@ -2028,10 +2028,10 @@ pub fn field<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     let mut builder = OperationBuilder::new("emitc.field", location)
-        .add_attribute(SYMBOL_NAME_ATTRIBUTE, symbol_name.try_into_with_context(context)?)
-        .add_attribute(TYPE_ATTRIBUTE, context.type_attribute(r#type));
+        .add_attribute(SYMBOL_NAME_ATTRIBUTE, symbol_name.try_into_with_context(context)?)?
+        .add_attribute(TYPE_ATTRIBUTE, context.type_attribute(r#type))?;
     if let Some(initial_value) = initial_value {
-        builder = builder.add_attribute(INITIAL_VALUE_ATTRIBUTE, initial_value);
+        builder = builder.add_attribute(INITIAL_VALUE_ATTRIBUTE, initial_value)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::field`"))
@@ -2075,8 +2075,8 @@ pub fn get_field<
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
     OperationBuilder::new("emitc.get_field", location)
-        .add_attribute(FIELD_NAME_ATTRIBUTE, field_name.try_into_with_context(context)?)
-        .add_result(result_type)
+        .add_attribute(FIELD_NAME_ATTRIBUTE, field_name.try_into_with_context(context)?)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::get_field`"))
@@ -2107,7 +2107,7 @@ pub fn r#do<'c, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedDoOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::emit_c()?)?;
-    OperationBuilder::new("emitc.do", location).add_regions(vec![body, condition]).build().and_then(
+    OperationBuilder::new("emitc.do", location).add_regions(vec![body, condition])?.build().and_then(
         |operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `emit_c::do`"))
         },

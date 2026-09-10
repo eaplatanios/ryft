@@ -35,7 +35,7 @@ pub fn ceil<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedCeilOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.ceil", location)
-        .add_operand(input)
+        .add_operand(input)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -78,7 +78,7 @@ pub fn floor<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedFloorOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.floor", location)
-        .add_operand(input)
+        .add_operand(input)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -122,7 +122,7 @@ pub fn round_with_away_from_zero_tie_break<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 
 ) -> Result<DetachedRoundWithAwayFromZeroTieBreakOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.round_nearest_afz", location)
-        .add_operand(input)
+        .add_operand(input)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -168,7 +168,7 @@ pub fn round_with_nearest_even_tie_break<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't
 ) -> Result<DetachedRoundWithNearestEvenTieBreakOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.round_nearest_even", location)
-        .add_operand(input)
+        .add_operand(input)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {

@@ -46,8 +46,8 @@ pub fn complex<'r, 'i, 'c: 'r + 'i, 't: 'c, R: Value<'r, 'c, 't>, I: Value<'i, '
 ) -> Result<DetachedComplexOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.complex", location)
-        .add_operand(real)
-        .add_operand(imag)
+        .add_operand(real)?
+        .add_operand(imag)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -89,7 +89,7 @@ pub fn imag<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedImagOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.imag", location)
-        .add_operand(input)
+        .add_operand(input)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -128,7 +128,7 @@ pub fn real<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedRealOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.real", location)
-        .add_operand(input)
+        .add_operand(input)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {

@@ -158,13 +158,13 @@ pub fn compare<
 ) -> Result<DetachedCompareOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.compare", location)
-        .add_operand(lhs)
-        .add_operand(rhs)
+        .add_operand(lhs)?
+        .add_operand(rhs)?
         .add_attribute(
             COMPARISON_DIRECTION_ATTRIBUTE,
             location.context().stable_hlo_comparison_direction(comparison_direction)?,
-        )
-        .add_attribute(COMPARISON_TYPE_ATTRIBUTE, location.context().stable_hlo_comparison_type(comparison_type)?)
+        )?
+        .add_attribute(COMPARISON_TYPE_ATTRIBUTE, location.context().stable_hlo_comparison_type(comparison_type)?)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -227,9 +227,9 @@ pub fn clamp<
 ) -> Result<DetachedClampOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.clamp", location)
-        .add_operand(min)
-        .add_operand(input)
-        .add_operand(max)
+        .add_operand(min)?
+        .add_operand(input)?
+        .add_operand(max)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -294,8 +294,8 @@ pub fn maximum<
 ) -> Result<DetachedMaximumOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.maximum", location)
-        .add_operand(lhs)
-        .add_operand(rhs)
+        .add_operand(lhs)?
+        .add_operand(rhs)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -362,8 +362,8 @@ pub fn minimum<
 ) -> Result<DetachedMinimumOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.minimum", location)
-        .add_operand(lhs)
-        .add_operand(rhs)
+        .add_operand(lhs)?
+        .add_operand(rhs)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {

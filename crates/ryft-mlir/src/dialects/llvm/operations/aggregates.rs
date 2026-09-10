@@ -47,9 +47,9 @@ pub fn extract_value<'c, 't: 'c, V1: Value<'c, 'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(EXTRACT_VALUE_OPERATION_NAME, location);
-    builder = builder.add_operand(container);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("position", position);
+    builder = builder.add_operand(container)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("position", position)?;
     builder.build().and_then(|operation| unsafe {
         operation
             .cast()
@@ -107,10 +107,10 @@ pub fn insert_value<'c, 't: 'c, V1: Value<'c, 'c, 't>, V2: Value<'c, 'c, 't>, L:
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(INSERT_VALUE_OPERATION_NAME, location);
-    builder = builder.add_operand(container);
-    builder = builder.add_operand(value);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("position", position);
+    builder = builder.add_operand(container)?;
+    builder = builder.add_operand(value)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("position", position)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::insert_value`"))
     })
@@ -154,10 +154,10 @@ pub fn landing_pad<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(LANDING_PAD_OPERATION_NAME, location);
-    builder = builder.add_operands(clauses);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operands(clauses)?;
+    builder = builder.add_result(result_type)?;
     if cleanup {
-        builder = builder.add_attribute("cleanup", context.unit_attribute());
+        builder = builder.add_attribute("cleanup", context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::landing_pad`"))

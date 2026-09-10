@@ -61,8 +61,8 @@ pub fn power<
 ) -> Result<DetachedPowerOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.power", location)
-        .add_operand(lhs)
-        .add_operand(rhs)
+        .add_operand(lhs)?
+        .add_operand(rhs)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -106,8 +106,8 @@ pub fn sqrt<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedSqrtOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.sqrt", location)
-        .add_operand(input)
-        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)
+        .add_operand(input)?
+        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -151,8 +151,8 @@ pub fn rsqrt<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedRsqrtOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.rsqrt", location)
-        .add_operand(input)
-        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)
+        .add_operand(input)?
+        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -196,8 +196,8 @@ pub fn cbrt<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedCbrtOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.cbrt", location)
-        .add_operand(input)
-        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)
+        .add_operand(input)?
+        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -243,8 +243,8 @@ pub fn exponential<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>
 ) -> Result<DetachedExponentialOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.exponential", location)
-        .add_operand(input)
-        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)
+        .add_operand(input)?
+        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -292,8 +292,8 @@ pub fn exponential_minus_one<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Locati
 ) -> Result<DetachedExponentialMinusOneOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.exponential_minus_one", location)
-        .add_operand(input)
-        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)
+        .add_operand(input)?
+        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -339,8 +339,8 @@ pub fn log<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedLogOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.log", location)
-        .add_operand(input)
-        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)
+        .add_operand(input)?
+        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -386,8 +386,8 @@ pub fn log_plus_one<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't
 ) -> Result<DetachedLogPlusOneOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.log_plus_one", location)
-        .add_operand(input)
-        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)
+        .add_operand(input)?
+        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -434,8 +434,8 @@ pub fn logistic<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedLogisticOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::stable_hlo()?)?;
     OperationBuilder::new("stablehlo.logistic", location)
-        .add_operand(input)
-        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)
+        .add_operand(input)?
+        .add_attribute(RESULT_ACCURACY_ATTRIBUTE, location.context().stable_hlo_accuracy(accuracy)?)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {

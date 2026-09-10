@@ -138,17 +138,17 @@ pub fn alloc_tensor<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         i32::from(size_hint.is_some()),
     ];
     let mut builder = OperationBuilder::new("bufferization.alloc_tensor", location)
-        .add_operands(dynamic_sizes)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
-        .add_result(result_type);
+        .add_operands(dynamic_sizes)?
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
+        .add_result(result_type)?;
     if let Some(copy) = copy {
-        builder = builder.add_operand(copy);
+        builder = builder.add_operand(copy)?;
     }
     if let Some(size_hint) = size_hint {
-        builder = builder.add_operand(size_hint);
+        builder = builder.add_operand(size_hint)?;
     }
     if let Some(memory_space) = memory_space {
-        builder = builder.add_attribute(MEMORY_SPACE_ATTRIBUTE, memory_space);
+        builder = builder.add_attribute(MEMORY_SPACE_ATTRIBUTE, memory_space)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -206,8 +206,8 @@ pub fn clone<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location.context().load_dialect(DialectHandle::bufferization()?)?;
     validate_memref(input, "bufferization.clone")?;
     OperationBuilder::new("bufferization.clone", location)
-        .add_operand(input)
-        .add_result(output_type)
+        .add_operand(input)?
+        .add_result(output_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -332,16 +332,16 @@ pub fn materialize_in_destination<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         ));
     };
     let mut builder = OperationBuilder::new("bufferization.materialize_in_destination", location)
-        .add_operand(source)
-        .add_operand(destination);
+        .add_operand(source)?
+        .add_operand(destination)?;
     if restrict {
-        builder = builder.add_attribute(RESTRICT_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(RESTRICT_ATTRIBUTE, context.unit_attribute())?;
     }
     if writable {
-        builder = builder.add_attribute(WRITABLE_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(WRITABLE_ATTRIBUTE, context.unit_attribute())?;
     }
     if let Some(result_type) = result_type {
-        builder = builder.add_result(result_type);
+        builder = builder.add_result(result_type)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -385,7 +385,7 @@ pub fn dealloc_tensor<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location.context().load_dialect(DialectHandle::bufferization()?)?;
     validate_tensor(tensor, "bufferization.dealloc_tensor")?;
     OperationBuilder::new("bufferization.dealloc_tensor", location)
-        .add_operand(tensor)
+        .add_operand(tensor)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -471,13 +471,13 @@ pub fn to_tensor<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         "bufferization.to_tensor",
     )?;
     let mut builder = OperationBuilder::new("bufferization.to_tensor", location)
-        .add_operand(buffer)
-        .add_result(result_type);
+        .add_operand(buffer)?
+        .add_result(result_type)?;
     if restrict {
-        builder = builder.add_attribute(RESTRICT_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(RESTRICT_ATTRIBUTE, context.unit_attribute())?;
     }
     if writable {
-        builder = builder.add_attribute(WRITABLE_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(WRITABLE_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -557,10 +557,10 @@ pub fn to_buffer<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         "bufferization.to_buffer",
     )?;
     let mut builder = OperationBuilder::new("bufferization.to_buffer", location)
-        .add_operand(tensor)
-        .add_result(result_type);
+        .add_operand(tensor)?
+        .add_result(result_type)?;
     if read_only {
-        builder = builder.add_attribute(READ_ONLY_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(READ_ONLY_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -660,10 +660,10 @@ pub fn dealloc<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
             .map_err(|_| Error::invalid_argument("too many retained memrefs for `bufferization.dealloc`"))?,
     ];
     OperationBuilder::new("bufferization.dealloc", location)
-        .add_operands(memrefs)
-        .add_operands(conditions)
-        .add_operands(retained)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)
+        .add_operands(memrefs)?
+        .add_operands(conditions)?
+        .add_operands(retained)?
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&segment_sizes)?)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {

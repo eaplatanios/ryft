@@ -42,8 +42,8 @@ pub fn int_to_ptr<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedIntToPtrOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.int_to_ptr", location)
-        .add_operand(src)
-        .add_result(result_type)
+        .add_operand(src)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::int_to_ptr`"))
@@ -80,8 +80,8 @@ pub fn ptr_to_int<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedPtrToIntOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.ptr_to_int", location)
-        .add_operand(src)
-        .add_result(result_type)
+        .add_operand(src)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::ptr_to_int`"))
@@ -118,8 +118,8 @@ pub fn bitcast<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedBitcastOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.bitcast", location)
-        .add_operand(src)
-        .add_result(result_type)
+        .add_operand(src)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::bitcast`"))
@@ -167,11 +167,11 @@ pub fn fp_to_fp<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedFpToFpOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
-    let mut builder = OperationBuilder::new("tt.fp_to_fp", location).add_operand(src);
+    let mut builder = OperationBuilder::new("tt.fp_to_fp", location).add_operand(src)?;
     if let Some(rounding) = rounding {
-        builder = builder.add_attribute(ROUNDING_ATTRIBUTE, context.triton_tt_rounding_mode_attribute(rounding)?);
+        builder = builder.add_attribute(ROUNDING_ATTRIBUTE, context.triton_tt_rounding_mode_attribute(rounding)?)?;
     }
-    builder.add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::fp_to_fp`"))
     })
 }
@@ -233,11 +233,11 @@ pub fn clampf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.clampf", location)
-        .add_operand(x)
-        .add_operand(min)
-        .add_operand(max)
-        .add_attribute(PROPAGATE_NAN_ATTRIBUTE, context.triton_tt_propagate_nan_attribute(propagate_nan)?)
-        .add_result(result_type)
+        .add_operand(x)?
+        .add_operand(min)?
+        .add_operand(max)?
+        .add_attribute(PROPAGATE_NAN_ATTRIBUTE, context.triton_tt_propagate_nan_attribute(propagate_nan)?)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::clampf`"))
@@ -274,8 +274,8 @@ pub fn precise_sqrt<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedPreciseSqrtOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.precise_sqrt", location)
-        .add_operand(x)
-        .add_result(result_type)
+        .add_operand(x)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::precise_sqrt`"))
@@ -317,9 +317,9 @@ pub fn precise_divf<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedPreciseDivFOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.precise_divf", location)
-        .add_operand(x)
-        .add_operand(y)
-        .add_result(result_type)
+        .add_operand(x)?
+        .add_operand(y)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::precise_divf`"))
@@ -361,9 +361,9 @@ pub fn mulhiui<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedMulhiUIOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.mulhiui", location)
-        .add_operand(x)
-        .add_operand(y)
-        .add_result(result_type)
+        .add_operand(x)?
+        .add_operand(y)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::mulhiui`"))
@@ -405,9 +405,9 @@ pub fn addptr<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedAddPtrOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.addptr", location)
-        .add_operand(ptr)
-        .add_operand(offset)
-        .add_result(result_type)
+        .add_operand(ptr)?
+        .add_operand(offset)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::addptr`"))
@@ -506,22 +506,22 @@ pub fn load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedLoadOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
-    let mut builder = OperationBuilder::new("tt.load", location).add_operand(ptr);
+    let mut builder = OperationBuilder::new("tt.load", location).add_operand(ptr)?;
     if let Some(mask) = mask {
-        builder = builder.add_operand(mask);
+        builder = builder.add_operand(mask)?;
     }
     if let Some(other) = other {
-        builder = builder.add_operand(other);
+        builder = builder.add_operand(other)?;
     }
     builder
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
             context.dense_i32_array_attribute(&[1, i32::from(mask.is_some()), i32::from(other.is_some())])?,
-        )
-        .add_attribute(CACHE_ATTRIBUTE, context.triton_tt_cache_modifier_attribute(cache)?)
-        .add_attribute(EVICT_ATTRIBUTE, context.triton_tt_eviction_policy_attribute(evict)?)
-        .add_attribute(IS_VOLATILE_ATTRIBUTE, context.boolean_attribute(is_volatile))
-        .add_result(result_type)
+        )?
+        .add_attribute(CACHE_ATTRIBUTE, context.triton_tt_cache_modifier_attribute(cache)?)?
+        .add_attribute(EVICT_ATTRIBUTE, context.triton_tt_eviction_policy_attribute(evict)?)?
+        .add_attribute(IS_VOLATILE_ATTRIBUTE, context.boolean_attribute(is_volatile))?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::load`"))
@@ -599,19 +599,19 @@ pub fn store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedStoreOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
-    let mut builder = OperationBuilder::new("tt.store", location).add_operand(ptr).add_operand(value);
+    let mut builder = OperationBuilder::new("tt.store", location).add_operand(ptr)?.add_operand(value)?;
     if let Some(mask) = mask {
-        builder = builder.add_operand(mask);
+        builder = builder.add_operand(mask)?;
     }
     builder = builder
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
             context.dense_i32_array_attribute(&[1, 1, i32::from(mask.is_some())])?,
-        )
-        .add_attribute(CACHE_ATTRIBUTE, context.triton_tt_cache_modifier_attribute(cache)?)
-        .add_attribute(EVICT_ATTRIBUTE, context.triton_tt_eviction_policy_attribute(evict)?);
+        )?
+        .add_attribute(CACHE_ATTRIBUTE, context.triton_tt_cache_modifier_attribute(cache)?)?
+        .add_attribute(EVICT_ATTRIBUTE, context.triton_tt_eviction_policy_attribute(evict)?)?;
     if ignore_cta {
-        builder = builder.add_attribute(IGNORE_CTA_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(IGNORE_CTA_ATTRIBUTE, context.unit_attribute())?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::store`"))
@@ -692,14 +692,14 @@ pub fn atomic_poll<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedAtomicPollOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
-    let mut builder = OperationBuilder::new("tt.atomic_poll", location).add_operand(ptr).add_operand(expected);
+    let mut builder = OperationBuilder::new("tt.atomic_poll", location).add_operand(ptr)?.add_operand(expected)?;
     if let Some(timeout) = timeout {
-        builder = builder.add_operand(timeout);
+        builder = builder.add_operand(timeout)?;
     }
     builder
-        .add_attribute(SEM_ATTRIBUTE, context.triton_tt_mem_semantic_attribute(sem)?)
-        .add_attribute(SCOPE_ATTRIBUTE, context.triton_tt_mem_sync_scope_attribute(scope)?)
-        .add_result(result_type)
+        .add_attribute(SEM_ATTRIBUTE, context.triton_tt_mem_semantic_attribute(sem)?)?
+        .add_attribute(SCOPE_ATTRIBUTE, context.triton_tt_mem_sync_scope_attribute(scope)?)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::atomic_poll`"))
@@ -790,19 +790,19 @@ pub fn atomic_rmw<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedAtomicRmwOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
-    let mut builder = OperationBuilder::new("tt.atomic_rmw", location).add_operand(ptr).add_operand(val);
+    let mut builder = OperationBuilder::new("tt.atomic_rmw", location).add_operand(ptr)?.add_operand(val)?;
     if let Some(mask) = mask {
-        builder = builder.add_operand(mask);
+        builder = builder.add_operand(mask)?;
     }
     builder
         .add_attribute(
             OPERAND_SEGMENT_SIZES_ATTRIBUTE,
             context.dense_i32_array_attribute(&[1, 1, i32::from(mask.is_some())])?,
-        )
-        .add_attribute(ATOMIC_RMW_OP_ATTRIBUTE, context.triton_tt_rmw_op_attribute(atomic_rmw_op)?)
-        .add_attribute(SEM_ATTRIBUTE, context.triton_tt_mem_semantic_attribute(sem)?)
-        .add_attribute(SCOPE_ATTRIBUTE, context.triton_tt_mem_sync_scope_attribute(scope)?)
-        .add_result(result_type)
+        )?
+        .add_attribute(ATOMIC_RMW_OP_ATTRIBUTE, context.triton_tt_rmw_op_attribute(atomic_rmw_op)?)?
+        .add_attribute(SEM_ATTRIBUTE, context.triton_tt_mem_semantic_attribute(sem)?)?
+        .add_attribute(SCOPE_ATTRIBUTE, context.triton_tt_mem_sync_scope_attribute(scope)?)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::atomic_rmw`"))
@@ -875,12 +875,12 @@ pub fn atomic_cas<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.atomic_cas", location)
-        .add_operand(ptr)
-        .add_operand(cmp)
-        .add_operand(val)
-        .add_attribute(SEM_ATTRIBUTE, context.triton_tt_mem_semantic_attribute(sem)?)
-        .add_attribute(SCOPE_ATTRIBUTE, context.triton_tt_mem_sync_scope_attribute(scope)?)
-        .add_result(result_type)
+        .add_operand(ptr)?
+        .add_operand(cmp)?
+        .add_operand(val)?
+        .add_attribute(SEM_ATTRIBUTE, context.triton_tt_mem_semantic_attribute(sem)?)?
+        .add_attribute(SCOPE_ATTRIBUTE, context.triton_tt_mem_sync_scope_attribute(scope)?)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::atomic_cas`"))
@@ -917,8 +917,8 @@ pub fn splat<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedSplatOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.splat", location)
-        .add_operand(src)
-        .add_result(result_type)
+        .add_operand(src)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::splat`"))
@@ -955,8 +955,8 @@ pub fn unsplat<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedUnsplatOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.unsplat", location)
-        .add_operand(src)
-        .add_result(result_type)
+        .add_operand(src)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::unsplat`"))
@@ -1003,9 +1003,9 @@ pub fn expand_dims<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.expand_dims", location)
-        .add_operand(src)
-        .add_attribute(AXIS_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), axis))
-        .add_result(result_type)
+        .add_operand(src)?
+        .add_attribute(AXIS_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), axis))?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::expand_dims`"))
@@ -1060,14 +1060,14 @@ pub fn reshape<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedReshapeOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
-    let mut builder = OperationBuilder::new("tt.reshape", location).add_operand(src);
+    let mut builder = OperationBuilder::new("tt.reshape", location).add_operand(src)?;
     if allow_reorder {
-        builder = builder.add_attribute(ALLOW_REORDER_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(ALLOW_REORDER_ATTRIBUTE, context.unit_attribute())?;
     }
     if efficient_layout {
-        builder = builder.add_attribute(EFFICIENT_LAYOUT_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(EFFICIENT_LAYOUT_ATTRIBUTE, context.unit_attribute())?;
     }
-    builder.add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::reshape`"))
     })
 }
@@ -1102,8 +1102,8 @@ pub fn broadcast<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedBroadcastOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.broadcast", location)
-        .add_operand(src)
-        .add_result(result_type)
+        .add_operand(src)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::broadcast`"))
@@ -1145,9 +1145,9 @@ pub fn cat<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedCatOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.cat", location)
-        .add_operand(lhs)
-        .add_operand(rhs)
-        .add_result(result_type)
+        .add_operand(lhs)?
+        .add_operand(rhs)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::cat`"))
@@ -1189,9 +1189,9 @@ pub fn join<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedJoinOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.join", location)
-        .add_operand(lhs)
-        .add_operand(rhs)
-        .add_result(result_type)
+        .add_operand(lhs)?
+        .add_operand(rhs)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::join`"))
@@ -1231,8 +1231,8 @@ pub fn split<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedSplitOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.split", location)
-        .add_operand(src)
-        .add_results(result_types)
+        .add_operand(src)?
+        .add_results(result_types)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::split`"))
@@ -1279,9 +1279,9 @@ pub fn trans<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.trans", location)
-        .add_operand(src)
-        .add_attribute(ORDER_ATTRIBUTE, context.dense_i32_array_attribute(order)?)
-        .add_result(result_type)
+        .add_operand(src)?
+        .add_attribute(ORDER_ATTRIBUTE, context.dense_i32_array_attribute(order)?)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::trans`"))
@@ -1325,8 +1325,8 @@ pub fn get_program_id<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.get_program_id", location)
-        .add_attribute(AXIS_ATTRIBUTE, context.triton_tt_program_id_dim_attribute(axis)?)
-        .add_result(result_type)
+        .add_attribute(AXIS_ATTRIBUTE, context.triton_tt_program_id_dim_attribute(axis)?)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::get_program_id`"))
@@ -1370,8 +1370,8 @@ pub fn get_num_programs<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.get_num_programs", location)
-        .add_attribute(AXIS_ATTRIBUTE, context.triton_tt_program_id_dim_attribute(axis)?)
-        .add_result(result_type)
+        .add_attribute(AXIS_ATTRIBUTE, context.triton_tt_program_id_dim_attribute(axis)?)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1446,15 +1446,15 @@ pub fn dot<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.dot", location)
-        .add_operand(a)
-        .add_operand(b)
-        .add_operand(c)
-        .add_attribute(INPUT_PRECISION_ATTRIBUTE, context.triton_tt_input_precision_attribute(input_precision)?)
+        .add_operand(a)?
+        .add_operand(b)?
+        .add_operand(c)?
+        .add_attribute(INPUT_PRECISION_ATTRIBUTE, context.triton_tt_input_precision_attribute(input_precision)?)?
         .add_attribute(
             MAX_NUM_IMPRECISE_ACC_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(32), max_num_imprecise_acc),
-        )
-        .add_result(result_type)
+        )?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::dot`"))
@@ -1580,12 +1580,13 @@ pub fn dot_scaled<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedDotScaledOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
-    let mut builder = OperationBuilder::new("tt.dot_scaled", location).add_operand(a).add_operand(b).add_operand(c);
+    let mut builder =
+        OperationBuilder::new("tt.dot_scaled", location).add_operand(a)?.add_operand(b)?.add_operand(c)?;
     if let Some(a_scale) = a_scale {
-        builder = builder.add_operand(a_scale);
+        builder = builder.add_operand(a_scale)?;
     }
     if let Some(b_scale) = b_scale {
-        builder = builder.add_operand(b_scale);
+        builder = builder.add_operand(b_scale)?;
     }
     builder
         .add_attribute(
@@ -1597,13 +1598,13 @@ pub fn dot_scaled<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
                 i32::from(a_scale.is_some()),
                 i32::from(b_scale.is_some()),
             ])?,
-        )
-        .add_attribute(A_ELEM_TYPE_ATTRIBUTE, context.triton_tt_scale_dot_elem_type_attribute(a_elem_type)?)
-        .add_attribute(B_ELEM_TYPE_ATTRIBUTE, context.triton_tt_scale_dot_elem_type_attribute(b_elem_type)?)
-        .add_attribute(FAST_MATH_ATTRIBUTE, context.boolean_attribute(fast_math))
-        .add_attribute(LHS_K_PACK_ATTRIBUTE, context.boolean_attribute(lhs_k_pack))
-        .add_attribute(RHS_K_PACK_ATTRIBUTE, context.boolean_attribute(rhs_k_pack))
-        .add_result(result_type)
+        )?
+        .add_attribute(A_ELEM_TYPE_ATTRIBUTE, context.triton_tt_scale_dot_elem_type_attribute(a_elem_type)?)?
+        .add_attribute(B_ELEM_TYPE_ATTRIBUTE, context.triton_tt_scale_dot_elem_type_attribute(b_elem_type)?)?
+        .add_attribute(FAST_MATH_ATTRIBUTE, context.boolean_attribute(fast_math))?
+        .add_attribute(LHS_K_PACK_ATTRIBUTE, context.boolean_attribute(lhs_k_pack))?
+        .add_attribute(RHS_K_PACK_ATTRIBUTE, context.boolean_attribute(rhs_k_pack))?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::dot_scaled`"))
@@ -1651,10 +1652,10 @@ pub fn reduce<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.reduce", location)
-        .add_operands(srcs)
-        .add_attribute(AXIS_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), axis))
-        .add_region(combine_op)
-        .add_results(result_types)
+        .add_operands(srcs)?
+        .add_attribute(AXIS_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), axis))?
+        .add_region(combine_op)?
+        .add_results(result_types)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::reduce`"))
@@ -1682,7 +1683,7 @@ pub fn reduce_return<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedReduceReturnOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::triton_tt()?)?;
-    OperationBuilder::new("tt.reduce.return", location).add_operands(result_values).build().and_then(
+    OperationBuilder::new("tt.reduce.return", location).add_operands(result_values)?.build().and_then(
         |operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::reduce_return`"))
         },
@@ -1739,11 +1740,11 @@ pub fn scan<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.scan", location)
-        .add_operands(srcs)
-        .add_attribute(AXIS_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), axis))
-        .add_attribute(REVERSE_ATTRIBUTE, context.boolean_attribute(reverse))
-        .add_region(combine_op)
-        .add_results(result_types)
+        .add_operands(srcs)?
+        .add_attribute(AXIS_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), axis))?
+        .add_attribute(REVERSE_ATTRIBUTE, context.boolean_attribute(reverse))?
+        .add_region(combine_op)?
+        .add_results(result_types)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::scan`"))
@@ -1771,12 +1772,11 @@ pub fn scan_return<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedScanReturnOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::triton_tt()?)?;
-    OperationBuilder::new("tt.scan.return", location)
-        .add_operands(result_values)
-        .build()
-        .and_then(|operation| unsafe {
+    OperationBuilder::new("tt.scan.return", location).add_operands(result_values)?.build().and_then(
+        |operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::scan_return`"))
-        })
+        },
+    )
 }
 
 /// Name of the [`Attribute`] that stores a Triton `tt` map-elementwise packing factor.
@@ -1823,10 +1823,10 @@ pub fn map_elementwise<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.map_elementwise", location)
-        .add_operands(srcs)
-        .add_attribute(PACK_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), pack))
-        .add_region(scalar_op)
-        .add_results(result_types)
+        .add_operands(srcs)?
+        .add_attribute(PACK_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), pack))?
+        .add_region(scalar_op)?
+        .add_results(result_types)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1857,7 +1857,7 @@ pub fn map_elementwise_return<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedMapElementwiseReturnOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.map_elementwise.return", location)
-        .add_operands(result_values)
+        .add_operands(result_values)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1932,12 +1932,12 @@ pub fn extern_elementwise<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.extern_elementwise", location)
-        .add_operands(srcs)
-        .add_attribute(LIBNAME_ATTRIBUTE, context.string_attribute(libname))
-        .add_attribute(LIBPATH_ATTRIBUTE, context.string_attribute(libpath))
-        .add_attribute(SYMBOL_ATTRIBUTE, context.string_attribute(symbol))
-        .add_attribute(PURE_ATTRIBUTE, context.boolean_attribute(pure))
-        .add_result(result_type)
+        .add_operands(srcs)?
+        .add_attribute(LIBNAME_ATTRIBUTE, context.string_attribute(libname))?
+        .add_attribute(LIBPATH_ATTRIBUTE, context.string_attribute(libpath))?
+        .add_attribute(SYMBOL_ATTRIBUTE, context.string_attribute(symbol))?
+        .add_attribute(PURE_ATTRIBUTE, context.boolean_attribute(pure))?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1989,9 +1989,9 @@ pub fn make_range<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.make_range", location)
-        .add_attribute(START_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), start))
-        .add_attribute(END_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), end))
-        .add_result(result_type)
+        .add_attribute(START_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), start))?
+        .add_attribute(END_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), end))?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::make_range`"))
@@ -2060,15 +2060,15 @@ pub fn elementwise_inline_asm<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.elementwise_inline_asm", location)
-        .add_operands(args)
-        .add_attribute(ASM_STRING_ATTRIBUTE, context.string_attribute(asm_string))
-        .add_attribute(CONSTRAINTS_ATTRIBUTE, context.string_attribute(constraints))
-        .add_attribute(PURE_ATTRIBUTE, context.boolean_attribute(pure))
+        .add_operands(args)?
+        .add_attribute(ASM_STRING_ATTRIBUTE, context.string_attribute(asm_string))?
+        .add_attribute(CONSTRAINTS_ATTRIBUTE, context.string_attribute(constraints))?
+        .add_attribute(PURE_ATTRIBUTE, context.boolean_attribute(pure))?
         .add_attribute(
             PACKED_ELEMENT_ATTRIBUTE,
             context.integer_attribute(context.signless_integer_type(32), packed_element),
-        )
-        .add_results(result_types)
+        )?
+        .add_results(result_types)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -2111,11 +2111,11 @@ pub fn histogram<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     location: L,
 ) -> Result<DetachedHistogramOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::triton_tt()?)?;
-    let mut builder = OperationBuilder::new("tt.histogram", location).add_operand(src);
+    let mut builder = OperationBuilder::new("tt.histogram", location).add_operand(src)?;
     if let Some(mask) = mask {
-        builder = builder.add_operand(mask);
+        builder = builder.add_operand(mask)?;
     }
-    builder.add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::histogram`"))
     })
 }
@@ -2168,13 +2168,13 @@ pub fn gather<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
     let mut builder = OperationBuilder::new("tt.gather", location)
-        .add_operand(src)
-        .add_operand(indices)
-        .add_attribute(AXIS_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), axis));
+        .add_operand(src)?
+        .add_operand(indices)?
+        .add_attribute(AXIS_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(32), axis))?;
     if efficient_layout {
-        builder = builder.add_attribute(EFFICIENT_LAYOUT_ATTRIBUTE, context.unit_attribute());
+        builder = builder.add_attribute(EFFICIENT_LAYOUT_ATTRIBUTE, context.unit_attribute())?;
     }
-    builder.add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::gather`"))
     })
 }
@@ -2229,10 +2229,10 @@ pub fn print<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.print", location)
-        .add_operands(args)
-        .add_attribute(PREFIX_ATTRIBUTE, context.string_attribute(prefix))
-        .add_attribute(HEX_ATTRIBUTE, context.boolean_attribute(hex))
-        .add_attribute(IS_SIGNED_ATTRIBUTE, context.dense_i32_array_attribute(is_signed)?)
+        .add_operands(args)?
+        .add_attribute(PREFIX_ATTRIBUTE, context.string_attribute(prefix))?
+        .add_attribute(HEX_ATTRIBUTE, context.boolean_attribute(hex))?
+        .add_attribute(IS_SIGNED_ATTRIBUTE, context.dense_i32_array_attribute(is_signed)?)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::print`"))
@@ -2271,8 +2271,8 @@ pub fn assert<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.assert", location)
-        .add_operand(condition)
-        .add_attribute(MESSAGE_ATTRIBUTE, context.string_attribute(message))
+        .add_operand(condition)?
+        .add_attribute(MESSAGE_ATTRIBUTE, context.string_attribute(message))?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::assert`"))
@@ -2338,11 +2338,11 @@ pub fn make_tensor_descriptor<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.make_tensor_descriptor", location)
-        .add_operand(base)
-        .add_operands(shape)
-        .add_operands(strides)
-        .add_attribute(PADDING_ATTRIBUTE, context.triton_tt_padding_option_attribute(padding)?)
-        .add_result(result_type)
+        .add_operand(base)?
+        .add_operands(shape)?
+        .add_operands(strides)?
+        .add_attribute(PADDING_ATTRIBUTE, context.triton_tt_padding_option_attribute(padding)?)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -2389,9 +2389,9 @@ pub fn call<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.call", location)
-        .add_operands(operands)
-        .add_attribute(CALLEE_ATTRIBUTE, context.flat_symbol_ref_attribute(callee))
-        .add_results(result_types)
+        .add_operands(operands)?
+        .add_attribute(CALLEE_ATTRIBUTE, context.flat_symbol_ref_attribute(callee))?
+        .add_results(result_types)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::call`"))
@@ -2478,18 +2478,18 @@ pub fn func<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
     let mut builder = OperationBuilder::new("tt.func", location)
-        .add_attribute(SYMBOL_NAME_ATTRIBUTE, context.string_attribute(sym_name))
-        .add_attribute(FUNCTION_TYPE_ATTRIBUTE, context.type_attribute(function_type));
+        .add_attribute(SYMBOL_NAME_ATTRIBUTE, context.string_attribute(sym_name))?
+        .add_attribute(FUNCTION_TYPE_ATTRIBUTE, context.type_attribute(function_type))?;
     if let Some(sym_visibility) = sym_visibility {
-        builder = builder.add_attribute(SYMBOL_VISIBILITY_ATTRIBUTE, context.string_attribute(sym_visibility));
+        builder = builder.add_attribute(SYMBOL_VISIBILITY_ATTRIBUTE, context.string_attribute(sym_visibility))?;
     }
     if let Some(arg_attrs) = arg_attrs {
-        builder = builder.add_attribute(ARG_ATTRIBUTES_ATTRIBUTE, arg_attrs);
+        builder = builder.add_attribute(ARG_ATTRIBUTES_ATTRIBUTE, arg_attrs)?;
     }
     if let Some(res_attrs) = res_attrs {
-        builder = builder.add_attribute(RESULT_ATTRIBUTES_ATTRIBUTE, res_attrs);
+        builder = builder.add_attribute(RESULT_ATTRIBUTES_ATTRIBUTE, res_attrs)?;
     }
-    builder.add_region(body).build().and_then(|operation| unsafe {
+    builder.add_region(body)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::func`"))
     })
 }
@@ -2516,7 +2516,7 @@ pub fn r#return<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedReturnOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.return", location)
-        .add_operands(srcs)
+        .add_operands(srcs)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `tt::return`"))
@@ -2583,11 +2583,11 @@ pub fn descriptor_load<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.descriptor_load", location)
-        .add_operand(desc)
-        .add_operands(indices)
-        .add_attribute(CACHE_ATTRIBUTE, context.triton_tt_cache_modifier_attribute(cache)?)
-        .add_attribute(EVICT_ATTRIBUTE, context.triton_tt_eviction_policy_attribute(evict)?)
-        .add_result(result_type)
+        .add_operand(desc)?
+        .add_operands(indices)?
+        .add_attribute(CACHE_ATTRIBUTE, context.triton_tt_cache_modifier_attribute(cache)?)?
+        .add_attribute(EVICT_ATTRIBUTE, context.triton_tt_eviction_policy_attribute(evict)?)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -2630,9 +2630,9 @@ pub fn descriptor_store<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedDescriptorStoreOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.descriptor_store", location)
-        .add_operand(desc)
-        .add_operand(src)
-        .add_operands(indices)
+        .add_operand(desc)?
+        .add_operand(src)?
+        .add_operands(indices)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -2691,10 +2691,10 @@ pub fn descriptor_reduce<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.descriptor_reduce", location)
-        .add_operand(desc)
-        .add_operand(src)
-        .add_operands(indices)
-        .add_attribute(KIND_ATTRIBUTE, context.triton_tt_descriptor_reduce_kind_attribute(kind)?)
+        .add_operand(desc)?
+        .add_operand(src)?
+        .add_operands(indices)?
+        .add_attribute(KIND_ATTRIBUTE, context.triton_tt_descriptor_reduce_kind_attribute(kind)?)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -2744,10 +2744,10 @@ pub fn descriptor_gather<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedDescriptorGatherOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.descriptor_gather", location)
-        .add_operand(desc)
-        .add_operand(x_offsets)
-        .add_operand(y_offset)
-        .add_result(result_type)
+        .add_operand(desc)?
+        .add_operand(x_offsets)?
+        .add_operand(y_offset)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -2796,10 +2796,10 @@ pub fn descriptor_scatter<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
 ) -> Result<DetachedDescriptorScatterOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::triton_tt()?)?;
     OperationBuilder::new("tt.descriptor_scatter", location)
-        .add_operand(desc)
-        .add_operand(x_offsets)
-        .add_operand(y_offset)
-        .add_operand(src)
+        .add_operand(desc)?
+        .add_operand(x_offsets)?
+        .add_operand(y_offset)?
+        .add_operand(src)?
         .build()
         .and_then(|operation| unsafe {
             operation

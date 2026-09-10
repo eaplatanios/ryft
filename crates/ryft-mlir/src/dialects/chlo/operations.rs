@@ -115,17 +115,17 @@ pub fn ragged_dot<
     let context = location.context();
     context.load_dialect(DialectHandle::chlo()?)?;
     let mut builder = OperationBuilder::new("chlo.ragged_dot", location)
-        .add_operand(lhs)
-        .add_operand(rhs)
-        .add_operand(group_sizes)
-        .add_attribute(RAGGED_DOT_DIMENSIONS_ATTRIBUTE, dimensions);
+        .add_operand(lhs)?
+        .add_operand(rhs)?
+        .add_operand(group_sizes)?
+        .add_attribute(RAGGED_DOT_DIMENSIONS_ATTRIBUTE, dimensions)?;
     if let Some((lhs_precision, rhs_precision)) = precision {
         builder = builder.add_attribute(
             RAGGED_DOT_PRECISION_ATTRIBUTE,
             context.array_attribute(&[context.chlo_precision(lhs_precision)?, context.chlo_precision(rhs_precision)?]),
-        );
+        )?;
     }
-    builder.add_result(result_type).build().and_then(|operation| unsafe {
+    builder.add_result(result_type)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `chlo::ragged_dot`"))
     })
 }
@@ -162,7 +162,7 @@ pub fn erf<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedErfOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::chlo()?)?;
     OperationBuilder::new("chlo.erf", location)
-        .add_operand(input)
+        .add_operand(input)?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -235,9 +235,9 @@ pub fn top_k<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     context.load_dialect(DialectHandle::chlo()?)?;
     let k = i64::try_from(k).map_err(|_| Error::invalid_argument("`k` exceeds the signed 64-bit range"))?;
     OperationBuilder::new("chlo.top_k", location)
-        .add_operand(input)
-        .add_attribute(TOP_K_COUNT_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), k))
-        .add_attribute(TOP_K_IS_STABLE_ATTRIBUTE, context.boolean_attribute(is_stable))
+        .add_operand(input)?
+        .add_attribute(TOP_K_COUNT_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), k))?
+        .add_attribute(TOP_K_IS_STABLE_ATTRIBUTE, context.boolean_attribute(is_stable))?
         .enable_result_type_inference()
         .build()
         .and_then(|operation| unsafe {
@@ -279,9 +279,9 @@ pub fn mulhi<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedMulhiOperation<'c, 't>, Error> {
     location.context().load_dialect(DialectHandle::chlo()?)?;
     OperationBuilder::new("chlo.mulhi", location)
-        .add_result(lhs.r#type()?)
-        .add_operand(lhs)
-        .add_operand(rhs)
+        .add_result(lhs.r#type()?)?
+        .add_operand(lhs)?
+        .add_operand(rhs)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `chlo::mulhi`"))

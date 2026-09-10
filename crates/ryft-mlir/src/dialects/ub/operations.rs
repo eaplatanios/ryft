@@ -39,9 +39,9 @@ pub fn poison<'c, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedPoisonOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::ub()?)?;
-    let mut builder = OperationBuilder::new("ub.poison", location).add_result(result_type);
+    let mut builder = OperationBuilder::new("ub.poison", location).add_result(result_type)?;
     if let Some(value) = value {
-        builder = builder.add_attribute(VALUE_ATTRIBUTE, value);
+        builder = builder.add_attribute(VALUE_ATTRIBUTE, value)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `ub::poison`"))

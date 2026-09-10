@@ -69,11 +69,11 @@ pub fn execute<'v, 'c: 'v, 't: 'c, L: Location<'c, 't>>(
         result_types.push(context.async_value_type(*r#type)?.as_ref());
     }
     OperationBuilder::new("async.execute", location)
-        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&operand_segment_sizes)?)
-        .add_operands(dependencies)
-        .add_operands(body_operands)
-        .add_results(&result_types)
-        .add_region(body)
+        .add_attribute(OPERAND_SEGMENT_SIZES_ATTRIBUTE, context.dense_i32_array_attribute(&operand_segment_sizes)?)?
+        .add_operands(dependencies)?
+        .add_operands(body_operands)?
+        .add_results(&result_types)?
+        .add_region(body)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `async::execute`"))
@@ -133,14 +133,14 @@ pub fn func<'c, 't: 'c, 's, N: TryIntoWithContext<'c, 't, StringAttributeRef<'c,
     let context = location.context();
     context.load_dialect(DialectHandle::r#async()?)?;
     let mut builder = OperationBuilder::new("async.func", location)
-        .add_attribute(SYMBOL_NAME_ATTRIBUTE, name.try_into_with_context(context)?)
+        .add_attribute(SYMBOL_NAME_ATTRIBUTE, name.try_into_with_context(context)?)?
         .add_attribute(
             FUNCTION_TYPE_ATTRIBUTE,
             context.type_attribute(context.function_type(
                 &attributes.arguments.iter().map(|argument| argument.r#type).collect::<Vec<_>>(),
                 &attributes.results.iter().map(|result| result.r#type).collect::<Vec<_>>(),
             )),
-        );
+        )?;
     if attributes.arguments.iter().any(|argument| argument.attributes.is_some()) {
         builder = DetachedFuncOperation::<'c, 't>::add_callable_argument_attributes(
             builder,
@@ -155,12 +155,12 @@ pub fn func<'c, 't: 'c, 's, N: TryIntoWithContext<'c, 't, StringAttributeRef<'c,
     }
     if attributes.visibility != SymbolVisibility::default() {
         builder = builder
-            .add_attribute(SYMBOL_VISIBILITY_ATTRIBUTE, context.symbol_visibility_attribute(attributes.visibility));
+            .add_attribute(SYMBOL_VISIBILITY_ATTRIBUTE, context.symbol_visibility_attribute(attributes.visibility))?;
     }
     for (attribute_name, attribute) in &attributes.other_attributes {
-        builder = builder.add_attribute(*attribute_name, *attribute);
+        builder = builder.add_attribute(*attribute_name, *attribute)?;
     }
-    builder.add_region(body).build().and_then(|operation| unsafe {
+    builder.add_region(body)?.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `async::func`"))
     })
 }
@@ -221,9 +221,9 @@ pub fn call<
     let context = location.context();
     context.load_dialect(DialectHandle::r#async()?)?;
     let mut builder = OperationBuilder::new("async.call", location)
-        .add_attribute(CALLEE_ATTRIBUTE, callee.try_into_with_context(context)?)
-        .add_operands(&properties.arguments.iter().map(|argument| argument.value).collect::<Vec<_>>())
-        .add_results(&properties.results.iter().map(|result| result.r#type).collect::<Vec<_>>());
+        .add_attribute(CALLEE_ATTRIBUTE, callee.try_into_with_context(context)?)?
+        .add_operands(&properties.arguments.iter().map(|argument| argument.value).collect::<Vec<_>>())?
+        .add_results(&properties.results.iter().map(|result| result.r#type).collect::<Vec<_>>())?;
     if properties.arguments.iter().any(|argument| argument.attributes.is_some()) {
         builder = DetachedCallOperation::<'c, 't>::add_callable_argument_attributes(
             builder,
@@ -264,7 +264,7 @@ pub fn r#return<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.return", location)
-        .add_operands(values)
+        .add_operands(values)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `async::return`"))
@@ -294,7 +294,7 @@ pub fn yield_<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.yield", location)
-        .add_operands(values)
+        .add_operands(values)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `async::yield_`"))
@@ -325,9 +325,9 @@ pub fn r#await<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedAwaitOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::r#async()?)?;
-    let mut builder = OperationBuilder::new("async.await", location).add_operand(operand);
+    let mut builder = OperationBuilder::new("async.await", location).add_operand(operand)?;
     if let Some(value_type) = operand.r#type()?.cast::<ValueTypeRef>() {
-        builder = builder.add_result(value_type.value_type()?);
+        builder = builder.add_result(value_type.value_type()?)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `async::await`"))
@@ -364,8 +364,8 @@ pub fn create_group<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't
     let context = location.context();
     context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.create_group", location)
-        .add_operand(size)
-        .add_result(context.async_group_type()?)
+        .add_operand(size)?
+        .add_result(context.async_group_type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -414,9 +414,9 @@ pub fn add_to_group<
     let context = location.context();
     context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.add_to_group", location)
-        .add_operand(operand)
-        .add_operand(group)
-        .add_result(context.index_type())
+        .add_operand(operand)?
+        .add_operand(group)?
+        .add_result(context.index_type())?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -445,7 +445,7 @@ pub fn await_all<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.await_all", location)
-        .add_operand(operand)
+        .add_operand(operand)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `async::await_all`"))
@@ -471,7 +471,7 @@ pub fn coro_id<'c, 't: 'c, L: Location<'c, 't>>(location: L) -> Result<DetachedC
     let context = location.context();
     context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.coro.id", location)
-        .add_result(context.async_coro_id_type()?)
+        .add_result(context.async_coro_id_type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `async::coro_id`"))
@@ -505,8 +505,8 @@ pub fn coro_begin<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>
     let context = location.context();
     context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.coro.begin", location)
-        .add_operand(id)
-        .add_result(context.async_coro_handle_type()?)
+        .add_operand(id)?
+        .add_result(context.async_coro_handle_type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `async::coro_begin`"))
@@ -547,8 +547,8 @@ pub fn coro_free<
     let context = location.context();
     context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.coro.free", location)
-        .add_operand(id)
-        .add_operand(handle)
+        .add_operand(id)?
+        .add_operand(handle)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `async::coro_free`"))
@@ -575,7 +575,7 @@ pub fn coro_end<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.coro.end", location)
-        .add_operand(handle)
+        .add_operand(handle)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `async::coro_end`"))
@@ -609,8 +609,8 @@ pub fn coro_save<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.coro.save", location)
-        .add_operand(handle)
-        .add_result(context.async_coro_state_type()?)
+        .add_operand(handle)?
+        .add_result(context.async_coro_state_type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `async::coro_save`"))
@@ -666,10 +666,10 @@ pub fn coro_suspend<
     let context = location.context();
     context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.coro.suspend", location)
-        .add_operand(state)
-        .add_successor(suspend_destination)
-        .add_successor(resume_destination)
-        .add_successor(cleanup_destination)
+        .add_operand(state)?
+        .add_successor(suspend_destination)?
+        .add_successor(resume_destination)?
+        .add_successor(cleanup_destination)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -699,7 +699,7 @@ pub fn runtime_create<'c, 't: 'c, T: Type<'c, 't>, L: Location<'c, 't>>(
 ) -> Result<DetachedRuntimeCreateOperation<'c, 't>, Error> {
     let context = location.context();
     context.load_dialect(DialectHandle::r#async()?)?;
-    OperationBuilder::new("async.runtime.create", location).add_result(result_type).build().and_then(
+    OperationBuilder::new("async.runtime.create", location).add_result(result_type)?.build().and_then(
         |operation| unsafe {
             operation
                 .cast()
@@ -735,8 +735,8 @@ pub fn runtime_create_group<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Locatio
     let context = location.context();
     context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.runtime.create_group", location)
-        .add_operand(size)
-        .add_result(context.async_group_type()?)
+        .add_operand(size)?
+        .add_result(context.async_group_type()?)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -770,7 +770,7 @@ macro_rules! async_runtime_unary_op {
                 let context = location.context();
                 context.load_dialect(DialectHandle::r#async()?)?;
                 OperationBuilder::new($operation_name, location)
-                    .add_operand(operand)
+                    .add_operand(operand)?
                     .build()
                     .and_then(|operation| unsafe {
                         operation.cast().ok_or_else(|| {
@@ -834,8 +834,8 @@ pub fn runtime_is_error<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c
     let context = location.context();
     context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.runtime.is_error", location)
-        .add_operand(operand)
-        .add_result(context.signless_integer_type(1))
+        .add_operand(operand)?
+        .add_result(context.signless_integer_type(1))?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -864,7 +864,7 @@ pub fn runtime_resume<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 
     let context = location.context();
     context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.runtime.resume", location)
-        .add_operand(handle)
+        .add_operand(handle)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -907,8 +907,8 @@ pub fn runtime_await_and_resume<
     let context = location.context();
     context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.runtime.await_and_resume", location)
-        .add_operand(operand)
-        .add_operand(handle)
+        .add_operand(operand)?
+        .add_operand(handle)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -951,8 +951,8 @@ pub fn runtime_store<
     let context = location.context();
     context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.runtime.store", location)
-        .add_operand(value)
-        .add_operand(storage)
+        .add_operand(value)?
+        .add_operand(storage)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -993,8 +993,8 @@ pub fn runtime_load<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c, 't
         .ok_or_else(|| Error::invalid_argument("`async.runtime.load` storage must have `!async.value` type"))?
         .value_type()?;
     OperationBuilder::new("async.runtime.load", location)
-        .add_operand(storage)
-        .add_result(result_type)
+        .add_operand(storage)?
+        .add_result(result_type)?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1043,9 +1043,9 @@ pub fn runtime_add_to_group<
     let context = location.context();
     context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.runtime.add_to_group", location)
-        .add_operand(operand)
-        .add_operand(group)
-        .add_result(context.index_type())
+        .add_operand(operand)?
+        .add_operand(group)?
+        .add_result(context.index_type())?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1080,8 +1080,8 @@ pub fn runtime_add_ref<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c,
     let context = location.context();
     context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.runtime.add_ref", location)
-        .add_operand(operand)
-        .add_attribute(COUNT_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), count))
+        .add_operand(operand)?
+        .add_attribute(COUNT_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), count))?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1116,8 +1116,8 @@ pub fn runtime_drop_ref<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Location<'c
     let context = location.context();
     context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.runtime.drop_ref", location)
-        .add_operand(operand)
-        .add_attribute(COUNT_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), count))
+        .add_operand(operand)?
+        .add_attribute(COUNT_ATTRIBUTE, context.integer_attribute(context.signless_integer_type(64), count))?
         .build()
         .and_then(|operation| unsafe {
             operation
@@ -1147,7 +1147,7 @@ pub fn runtime_num_worker_threads<'c, 't: 'c, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::r#async()?)?;
     OperationBuilder::new("async.runtime.num_worker_threads", location)
-        .add_result(context.index_type())
+        .add_result(context.index_type())?
         .build()
         .and_then(|operation| unsafe {
             operation

@@ -71,13 +71,13 @@ pub fn get_element_ptr<'c, 't: 'c, V1: Value<'c, 'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(GEP_OPERATION_NAME, location);
-    builder = builder.add_operand(base);
-    builder = builder.add_operands(dynamic_indices);
-    builder = builder.add_result(result_type);
-    builder = builder.add_attribute("rawConstantIndices", raw_constant_indices);
-    builder = builder.add_attribute("elem_type", elem_type);
+    builder = builder.add_operand(base)?;
+    builder = builder.add_operands(dynamic_indices)?;
+    builder = builder.add_result(result_type)?;
+    builder = builder.add_attribute("rawConstantIndices", raw_constant_indices)?;
+    builder = builder.add_attribute("elem_type", elem_type)?;
     if let Some(no_wrap_flags) = no_wrap_flags {
-        builder = builder.add_attribute("noWrapFlags", no_wrap_flags);
+        builder = builder.add_attribute("noWrapFlags", no_wrap_flags)?;
     }
     builder.build().and_then(|operation| unsafe {
         operation
@@ -118,8 +118,8 @@ pub fn va_arg<'c, 't: 'c, V1: Value<'c, 'c, 't>, L: Location<'c, 't>>(
     let context = location.context();
     context.load_dialect(DialectHandle::llvm()?)?;
     let mut builder = OperationBuilder::new(VA_ARG_OPERATION_NAME, location);
-    builder = builder.add_operand(argument);
-    builder = builder.add_result(result_type);
+    builder = builder.add_operand(argument)?;
+    builder = builder.add_result(result_type)?;
     builder.build().and_then(|operation| unsafe {
         operation.cast().ok_or_else(|| Error::invalid_argument("invalid arguments to `llvm::va_arg`"))
     })
