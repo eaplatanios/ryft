@@ -353,59 +353,57 @@ pub trait ReferenceViewOperation: Operation {
     ) -> Result<C::Value, ProgramError>;
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// One view together with bindings for the values it depends on. A [`ReferenceViewPath`] composes these steps from a
-/// root reference to a derived reference.
+/// A [`ReferenceView`] view together with bindings for the values it depends on. [`ReferenceViewPath`]s compose these
+/// steps from a root reference to a derived reference.
 ///
-/// `View` is the view type, typically an implementation of [`ReferenceView`]. For example,
-/// [`ArrayReferenceView`](crate::arrays::ArrayReferenceView) describes indexing one axis or slicing an array. It stores
-/// metadata, not the referenced array. A dynamic index is represented in the view by the position of
-/// the instruction input supplying that index.
+/// `View` is the view type and must implement [`ReferenceView`]. For example,
+/// [`ArrayReferenceView`](crate::ArrayReferenceView) describes indexing one axis or slicing an array. It stores
+/// metadata and not the referenced array. A dynamic index is represented in the view by the position of the instruction
+/// input supplying that index.
 ///
-/// `Binding` is the type used to represent each such input: [`ValueId`] during program analysis, or a context value
-/// during reference discharge. The `bindings` vector contains one entry per symbol reported by
+/// `Binding` is the type used to represent each such input. It is set to [`ValueId`] during program analysis, or a
+/// context value during reference discharge. The `bindings` vector contains one entry per symbol reported by
 /// [`ReferenceView::symbols`], in that order. Static views have no symbols and carry an empty vector.
 ///
-/// For example, an instruction selecting `root[index]` has inputs `[root, index]`. Its array view is
-/// `Index { axis: 0, index: Symbolic(1) }`: `1` names the instruction's second input, not the array element to select.
-/// During analysis, the step binds that symbol to the [`ValueId`] of `index`. During discharge, it instead binds the
-/// symbol to the context value representing `index`, which can be passed directly to a dynamic slice operation.
+/// For example, an instruction selecting `root[index]` has inputs `[root, index]`. Its array view is `Index { axis: 0,
+/// index: Symbolic(1) }`: `1` names the instruction's second input, not the array element to select. During analysis,
+/// the step binds that symbol to the [`ValueId`] of `index`. During discharge, it instead binds the symbol to the
+/// context value representing `index`, which can be passed directly to a dynamic slice operation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
-pub struct ReferenceViewStep<View, Binding = ValueId> {
-    /// Refer to the documentation of [`Self::view`].
+pub struct ReferenceViewStep<View: ReferenceView, Binding = ValueId> {
+    /// [`ReferenceView`] of this [`ReferenceViewStep`].
     view: View,
 
-    /// Refer to the documentation of [`Self::bindings`].
+    /// Binding of each symbol of the [`ReferenceView`], in the order returned by [`ReferenceView::symbols`].
     bindings: Vec<Binding>,
 }
 
-impl<View, Binding> ReferenceViewStep<View, Binding> {
-    /// Returns the view of this step.
+impl<View: ReferenceView, Binding> ReferenceViewStep<View, Binding> {
+    /// Returns the [`ReferenceView`] of this [`ReferenceViewStep`].
     #[inline]
     pub fn view(&self) -> &View {
         &self.view
     }
 
-    /// Returns the binding of each symbol of the view, in the order returned by [`ReferenceView::symbols`].
+    /// Returns the binding of each symbol of the [`ReferenceView`], in the order returned
+    /// by [`ReferenceView::symbols`].
     #[inline]
     pub fn bindings(&self) -> &[Binding] {
         self.bindings.as_slice()
     }
 }
 
-/// Sequence of view steps from a reference root to one derived reference, in the order they are applied.
-///
-/// `View` is the type of each view, such as [`ArrayReferenceView`](crate::arrays::ArrayReferenceView), and `Binding`
-/// represents the inputs needed by a symbolic view. Each [`ReferenceViewStep`] pairs a `View` with a vector of
-/// `Binding`s. The path stores these steps, but neither the root allocation nor its identity; [`ReferenceAnalysis`]
-/// identifies the root when analyzing a program.
+/// Sequence of [`ReferenceViewStep`] from a reference root to one derived reference, in the order they are applied.
+/// `View` is the type of each view, such as [`ArrayReferenceView`](crate::ArrayReferenceView), and `Binding` represents
+/// the inputs needed by a symbolic view. Each [`ReferenceViewStep`] pairs a `View` with a vector of `Binding`s. The
+/// path stores these steps, but neither the root allocation nor its identity; [`ReferenceAnalysis`] identifies the root
+/// when analyzing a [`Program`](crate::Program).
 ///
 /// For example, selecting `root[row][column]` produces two steps: the first selects a row from the root, and the second
 /// selects an element from that row. With `View = ArrayReferenceView` and `Binding = ValueId`, the steps describe the
-/// two indexing operations and store the program identities of `row` and `column`. During discharge,
-/// `Binding = C::Value` stores their values in the reconstruction context instead, so the same path traversal can
-/// reapply the views without looking up source program identities.
+/// two indexing operations and store the program identities of `row` and `column`. During discharge, `Binding =
+/// C::Value` stores their values in the reconstruction context instead, so the same path traversal can reapply the
+/// views without looking up source program identities.
 ///
 /// Eager reference handles resolve indices immediately into static views and use [`NoReferenceViewBinding`]. Their
 /// steps have empty binding vectors. See [`ReferenceViewStep`] for how an instruction input position in a view
@@ -415,42 +413,42 @@ impl<View, Binding> ReferenceViewStep<View, Binding> {
 /// references carry it. Equality and hashing compare step views and bindings, not the identities of the reference
 /// handles or the array elements selected by different step sequences.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
-pub struct ReferenceViewPath<View, Binding = ValueId> {
-    /// Refer to the documentation of [`Self::steps`].
+pub struct ReferenceViewPath<View: ReferenceView, Binding = ValueId> {
+    /// [`ReferenceViewStep`]s in this [`ReferenceViewPath`] in the order they are applied,
+    /// starting from the complete reference.
     steps: Vec<ReferenceViewStep<View, Binding>>,
 }
 
-impl<View, Binding> ReferenceViewPath<View, Binding> {
-    /// Returns the empty path denoting the complete root.
-    #[inline]
+impl<View: ReferenceView, Binding> ReferenceViewPath<View, Binding> {
+    /// Returns the empty [`ReferenceViewPath`] denoting the complete root.
     pub const fn root() -> Self {
         Self { steps: Vec::new() }
     }
 
-    /// Returns the steps and their bindings in the order they are applied, starting from the complete reference.
-    #[inline]
-    pub fn steps(&self) -> &[ReferenceViewStep<View, Binding>] {
-        self.steps.as_slice()
-    }
-
-    /// Returns the ordered views applied from the root outward, without their bindings.
-    #[inline]
-    pub fn views(&self) -> impl ExactSizeIterator<Item = &View> + DoubleEndedIterator {
-        self.steps.iter().map(ReferenceViewStep::view)
-    }
-
-    /// Returns whether this path denotes the complete root.
+    /// Returns whether this [`ReferenceViewPath`] denotes the complete root (i.e., whether it is empty).
     #[inline]
     pub fn is_root(&self) -> bool {
         self.steps.is_empty()
     }
 
-    /// Returns a copy of this path extended by one more step applied to its current end, binding the symbols of `view`
-    /// to `bindings`. The caller must supply one binding per symbol in the order returned by
-    /// [`ReferenceView::symbols`]; this generic container does not validate the view or its bindings.
+    /// Returns the [`ReferenceViewStep`]s in this [`ReferenceViewPath`] in the order they are applied,
+    /// starting from the complete reference.
+    #[inline]
+    pub fn steps(&self) -> &[ReferenceViewStep<View, Binding>] {
+        self.steps.as_slice()
+    }
+
+    /// Returns the ordered [`ReferenceView`]s applied from the root outward, without their bindings.
+    #[inline]
+    pub fn views(&self) -> impl ExactSizeIterator<Item = &View> + DoubleEndedIterator {
+        self.steps.iter().map(ReferenceViewStep::view)
+    }
+
+    /// Returns a copy of this [`ReferenceViewPath`] extended by one more [`ReferenceViewStep`] applied to its current
+    /// end, binding the symbols of `view` to `bindings`. The caller must supply one binding per symbol in the order
+    /// returned by [`ReferenceView::symbols`]. This generic container does not validate the view or its bindings.
     pub fn with_step(&self, view: View, bindings: Vec<Binding>) -> Self
     where
-        View: Clone,
         Binding: Clone,
     {
         let mut steps = Vec::with_capacity(self.steps.len() + 1);
@@ -459,30 +457,30 @@ impl<View, Binding> ReferenceViewPath<View, Binding> {
         Self { steps }
     }
 
-    /// Returns a copy of this path extended by one more static view applied to its current end. This is the shorthand
-    /// of [`with_step`](Self::with_step) with no bindings; the caller must ensure `view` requires no symbols.
+    /// Returns a copy of this [`ReferenceViewPath`] extended by one more static [`ReferenceView`] applied to its
+    /// current end. This is the shorthand of [`with_step`](Self::with_step) with no bindings. The caller must ensure
+    /// that `view` requires no symbols.
     #[inline]
     pub fn with_view(&self, view: View) -> Self
     where
-        View: Clone,
         Binding: Clone,
     {
         self.with_step(view, Vec::new())
     }
 }
 
-impl<View: ReferenceView> ReferenceViewPath<View> {
-    /// Returns the overlap between the parts this path and `other` select of one root of type `root`, through
-    /// [`ReferenceView::overlap`]. Both paths must start from the same complete reference; callers that compare
-    /// analyzed values of one region use [`ReferenceViewAnalysis::overlap`], which checks the roots first, while this
-    /// function serves callers that resolve roots across namespaces themselves.
+impl<View: ReferenceView> ReferenceViewPath<View, ValueId> {
+    /// Returns the [`ReferenceViewOverlap`] between the parts this [`ReferenceViewPath`] and `other` select of one
+    /// root of type `root`, through [`ReferenceView::overlap`]. Both paths must start from the same complete reference.
+    /// Callers that compare analyzed values of one region use [`ReferenceViewAnalysis::overlap`], which checks the
+    /// roots first, while this function serves callers that resolve roots across namespaces themselves.
     #[inline]
     pub fn overlap(&self, other: &Self, root: &View::Type) -> ReferenceViewOverlap {
         View::overlap(root, self.steps(), other.steps())
     }
 }
 
-impl<View, Binding> Default for ReferenceViewPath<View, Binding> {
+impl<View: ReferenceView, Binding> Default for ReferenceViewPath<View, Binding> {
     #[inline]
     fn default() -> Self {
         Self::root()
@@ -491,34 +489,33 @@ impl<View, Binding> Default for ReferenceViewPath<View, Binding> {
 
 /// Structural [`ReferenceAnalysis`] of a [`Region`] closure together with the [`ReferenceViewPath`] of every
 /// reference-typed value in that closure, derived through the [`ReferenceViewOperation`] contract of the closure's
-/// operation family.
-///
-/// Every reference-typed value has exactly one path. A root handle (a region input, an allocation, a capture constant,
-/// or a forwarded region output) has the empty path, an identity alias copies the path of its source, and a view alias
-/// copies the path of its source and appends the view its producing operation reports for that edge's output, after
-/// that view was validated against the source and output reference types. Nested region inputs are separate roots of
-/// the structural analysis and carry empty paths. Instructions in each region create views of those roots, with any
-/// symbolic input positions bound to values in that region.
+/// operation family. Every reference-typed value has exactly one path. A root handle (i.e., a region input, an
+/// allocation, a capture constant, or a forwarded region output) has the empty [`ReferenceViewPath`], an identity alias
+/// copies the path of its source, and a view alias copies the path of its source and appends the view its producing
+/// operation reports for that edge's output, after that view was validated against the source and output reference
+/// types. Nested region inputs are separate roots of the structural analysis and carry empty paths. Instructions in
+/// each region create views of those roots, with any symbolic input positions bound to values in that region.
 ///
 /// The view analysis is retained in the region's transform cache under exactly the cache identity of the structural
-/// analysis (refer to the documentation of [`RegionRef::reference_view_analysis`]) and shares that analysis through an
-/// [`Arc`] rather than re-deriving it. Transforms and other consumers invoke this validation explicitly on their
-/// programs.
+/// analysis (refer to the documentation of [`RegionRef::reference_view_analysis`] for more information) and shares
+/// that analysis through an [`Arc`] rather than re-deriving it. Transforms and other consumers invoke this validation
+/// explicitly on their [`Program`](crate::Program)s.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ReferenceViewAnalysis<View> {
-    /// Refer to the documentation of [`Self::analysis`].
+pub struct ReferenceViewAnalysis<View: ReferenceView> {
+    /// Structural [`ReferenceAnalysis`] of the [`Region`] closure.
     analysis: Arc<ReferenceAnalysis>,
 
-    /// Refer to the documentation of [`Self::paths`].
+    /// [`ReferenceViewPath`] of every reference-typed value of the [`Region`] closure, in canonical [`ValueId`] order.
     paths: BTreeMap<ValueId, ReferenceViewPath<View>>,
 }
 
-impl<View> ReferenceViewAnalysis<View> {
-    /// Analyzes the complete closure of `region` and derives the [`ReferenceViewPath`] of every reference-typed value
-    /// in it. The structural analysis is obtained through [`RegionRef::reference_analysis`], so it is shared with every
-    /// other consumer of the same closure; this function itself is the uncached derivation of the view analysis, and
-    /// [`RegionRef::reference_view_analysis`] is its retained counterpart. Refer to the documentation of
-    /// [`RegionRef::reference_analysis`] for the meaning of `capture_count`.
+impl<View: ReferenceView> ReferenceViewAnalysis<View> {
+    /// Analyzes the complete [`Region`] closure of `region` and derives the [`ReferenceViewPath`] of every
+    /// reference-typed value in it, returning the resulting [`ReferenceViewAnalysis`]. The structural analysis is
+    /// obtained through [`RegionRef::reference_analysis`], and so it is shared with every other consumer of the same
+    /// closure. This function itself represents the uncached derivation of the view analysis, and
+    /// [`RegionRef::reference_view_analysis`] is its retained counterpart. Refer to the documentation
+    /// of [`RegionRef::reference_analysis`] for the meaning of `capture_count`.
     ///
     /// # Errors
     ///
@@ -526,55 +523,51 @@ impl<View> ReferenceViewAnalysis<View> {
     /// and otherwise the first path derivation failure in canonical value order: an operation declaring a view alias
     /// without describing it, a view that is invalid for its source, or a declared output referent that differs from
     /// the derived one.
+    #[inline]
     pub fn new<V: Value, O: ReferenceViewOperation<Type = V::Type, View = View>>(
         region: RegionRef<'_, V, O>,
         capture_count: usize,
-    ) -> Result<Self, ReferenceViewAnalysisError>
-    where
-        // Implied by `O::View`'s bounds, but the trait solver does not carry them through the projection equality.
-        View: ReferenceView,
-    {
+    ) -> Result<Self, ReferenceViewAnalysisError> {
         Self::new_with_arguments(
             region,
             &ReferenceAnalysisTransformArguments::new(region, Vec::new(), Some(capture_count), false),
         )
     }
 
-    /// Derives the view analysis exactly like [`new`](Self::new), obtaining the structural analysis under the
-    /// already-derived cache key `arguments` so that the closure is walked once per derivation.
+    /// Derives a [`ReferenceViewAnalysis`] exactly like [`new`](Self::new), obtaining the structural analysis under
+    /// the already-derived cache key `arguments` so that the [`Region`] closure is walked only once per derivation.
     fn new_with_arguments<V: Value, O: ReferenceViewOperation<Type = V::Type, View = View>>(
         region: RegionRef<'_, V, O>,
         arguments: &ReferenceAnalysisTransformArguments,
-    ) -> Result<Self, ReferenceViewAnalysisError>
-    where
-        // Implied by `O::View`'s bounds, but the trait solver does not carry them through the projection equality.
-        View: ReferenceView,
-    {
+    ) -> Result<Self, ReferenceViewAnalysisError> {
         let analysis = region.reference_analysis_impl(arguments)?;
         let mut paths = BTreeMap::new();
         analysis.values().try_for_each(|value| Self::derive_path(region, &analysis, &mut paths, value))?;
         Ok(Self { analysis, paths })
     }
 
-    /// Returns the structural [`ReferenceAnalysis`] of the closure.
+    /// Returns the structural [`ReferenceAnalysis`] of the [`Region`] closure.
     #[inline]
     pub fn analysis(&self) -> &ReferenceAnalysis {
         &self.analysis
     }
 
+    /// Returns the [`ReferenceViewPath`] of every reference-typed value of the [`Region`] closure,
+    /// in canonical [`ValueId`] order.
+    #[inline]
+    pub fn paths(&self) -> impl '_ + Iterator<Item = (ValueId, &ReferenceViewPath<View>)> {
+        self.paths.iter().map(|(value, path)| (*value, path))
+    }
+
     /// Returns the [`ReferenceViewPath`] from the root of the reference-typed `value` to the part it selects, or
-    /// [`None`] when `value` is not a reference-typed value of the closure. Root handles carry the empty path, and so
-    /// does a nested region input forwarded as a complete handle.
+    /// [`None`] when `value` is not a reference-typed value of the [`Region`] closure. Root handles carry the empty
+    /// path, and so does a nested region input forwarded as a complete handle.
     #[inline]
     pub fn path(&self, value: ValueId) -> Option<&ReferenceViewPath<View>> {
         self.paths.get(&value)
     }
 
-    /// Returns the [`ReferenceViewPath`] of every reference-typed value of the closure, in canonical [`ValueId`] order.
-    #[inline]
-    pub fn paths(&self) -> impl Iterator<Item = (ValueId, &ReferenceViewPath<View>)> + '_ {
-        self.paths.iter().map(|(value, path)| (*value, path))
-    }
+    // TODO(eaplatanios): Review from here onwards.
 
     /// Returns the [`ReferenceViewOverlap`] between the parts that the reference-typed values `a` and `b` of one region
     /// select, or [`None`] when either is not a reference-typed value of the closure or the two values belong to
@@ -625,10 +618,7 @@ impl<View> ReferenceViewAnalysis<View> {
         analysis: &ReferenceAnalysis,
         paths: &mut BTreeMap<ValueId, ReferenceViewPath<View>>,
         value: ValueId,
-    ) -> Result<(), ReferenceViewAnalysisError>
-    where
-        View: ReferenceView,
-    {
+    ) -> Result<(), ReferenceViewAnalysisError> {
         let mut pending = Vec::new();
         let mut source = value;
         while !paths.contains_key(&source) {
@@ -669,10 +659,7 @@ impl<View> ReferenceViewAnalysis<View> {
         output_index: usize,
         source: ValueId,
         value: ValueId,
-    ) -> Result<ReferenceViewStep<View>, ReferenceViewAnalysisError>
-    where
-        View: ReferenceView,
-    {
+    ) -> Result<ReferenceViewStep<View>, ReferenceViewAnalysisError> {
         // Structural analysis resolved both values and the instruction before recording this edge.
         let current = region.with_id(id.region()).unwrap();
         let instruction = &current.instructions()[id.index()];
