@@ -16,6 +16,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - Added C++ bindings for the `affine`, `arith`, `bufferization`, `builtin`, `complex`, `gpu`, `llvm`, `mosaic_gpu`,
   `mosaic_tpu`, `nvgpu`, `shape`, `sparse_tensor`, `transform`, Triton `tt`, and `ub` MLIR dialects.
 - Added the `mps` feature for loading the `jax-mps` PJRT plugin (version `0.10.10`) on macOS AArch64.
+- Added the `cuda` module for launching precompiled CUDA kernels through `ryft-cuda` using PJRT clients and XLA FFI
+  buffers and streams. Includes client CUDA version queries and launcher construction, plus unsafe buffer and stream
+  adapters, behind the `cuda-12` and `cuda-13` features.
 - Added Mosaic GPU type ID and serde-pass bindings, versioned bytecode/resource constants, CUDA-only `mosaic_gpu_v2`
   runtime registration, upstream Complex attribute bindings, and a source-owned UB poison attribute C API bridge.
 
