@@ -2117,8 +2117,8 @@ mod tests {
             indoc! {"
                 module {
                   func.func @memref_access(%arg0: index, %arg1: f32) -> f32 {
-                    %alloc = memref.alloc(%arg0) {alignment = 64 : i64} : memref<?xf32>
-                    memref.store %arg1, %alloc[%arg0] {alignment = 4 : i64, nontemporal = true} : memref<?xf32>
+                    %alloc = memref.alloc(%arg0) alignment = 64 : memref<?xf32>
+                    memref.store %arg1, %alloc[%arg0] alignment(4) nontemporal(true) : memref<?xf32>
                     memref.prefetch %alloc[%arg0], read, locality<3>, data : memref<?xf32>
                     %0 = memref.load %alloc[%arg0] : memref<?xf32>
                     memref.dealloc %alloc : memref<?xf32>
@@ -2468,7 +2468,7 @@ mod tests {
             module.to_string(),
             indoc! {"
                 module {
-                  memref.global \"private\" @weights : memref<4xf32> = uninitialized {alignment = 64 : i64}
+                  memref.global \"private\" @weights : memref<4xf32> = uninitialized alignment = 64
                   func.func @get_weights() -> memref<4xf32> {
                     %0 = memref.get_global @weights : memref<4xf32>
                     return %0 : memref<4xf32>
@@ -2567,7 +2567,7 @@ mod tests {
                   func.func @memref_misc(%arg0: index, %arg1: memref<?xf32>, %arg2: memref<?xf32>) -> (memref<?xf32>, memref<?xf32>, memref<?xf32, 3>) {
                     %0:2 = memref.distinct_objects %arg1, %arg2 : memref<?xf32>, memref<?xf32>
                     memref.copy %0#0, %0#1 : memref<?xf32> to memref<?xf32>
-                    %1 = memref.realloc %0#0(%arg0) {alignment = 128 : i64} : memref<?xf32> to memref<?xf32>
+                    %1 = memref.realloc %0#0(%arg0) alignment = 128 : memref<?xf32> to memref<?xf32>
                     %memspacecast = memref.memory_space_cast %0#1 : memref<?xf32> to memref<?xf32, 3>
                     return %0#1, %1, %memspacecast : memref<?xf32>, memref<?xf32>, memref<?xf32, 3>
                   }
@@ -2647,7 +2647,7 @@ mod tests {
                 module {
                   func.func @memref_reshape(%arg0: memref<4x1xf32>, %arg1: memref<1xi32>) -> memref<4xf32> {
                     memref.alloca_scope  {
-                      %alloca = memref.alloca() {alignment = 16 : i64} : memref<4xf32>
+                      %alloca = memref.alloca() alignment = 16 : memref<4xf32>
                     }
                     %reshape = memref.reshape %arg0(%arg1) : (memref<4x1xf32>, memref<1xi32>) -> memref<4xf32>
                     return %reshape : memref<4xf32>

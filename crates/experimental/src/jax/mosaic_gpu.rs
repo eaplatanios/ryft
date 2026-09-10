@@ -226,6 +226,8 @@ where
             module: None,
             function: None,
             workgroup_attributions: None,
+            async_object: None,
+            cooperative: false,
             is_async: true,
         },
         launch_block.try_into()?,

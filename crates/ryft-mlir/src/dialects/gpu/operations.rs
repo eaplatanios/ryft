@@ -671,6 +671,12 @@ pub struct LaunchProperties<'o, 'c: 'o, 't: 'c> {
     /// Number of workgroup attributions in the launch body.
     pub workgroup_attributions: Option<usize>,
 
+    /// Optional async object operand.
+    pub async_object: Option<ValueRef<'o, 'c, 't>>,
+
+    /// Whether to launch cooperatively.
+    pub cooperative: bool,
+
     /// Whether to return an async token.
     pub is_async: bool,
 }
@@ -763,6 +769,21 @@ pub trait LaunchOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> + OneRegion
         }
     }
 
+    /// Returns whether this is a cooperative launch.
+    fn cooperative(&self) -> bool {
+        self.has_attribute("cooperative")
+    }
+
+    /// Returns the optional async object operand.
+    fn async_object(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        let range = self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 11)?;
+        match range.len() {
+            0 => Ok(None),
+            1 => self.operand_value(range.start).map(Some),
+            _ => Err(Error::invalid_argument("invalid async object operand segment in `gpu.launch`")),
+        }
+    }
+
     /// Returns the optional module symbol.
     fn module_symbol(&self) -> Result<Option<FlatSymbolRefAttributeRef<'c, 't>>, Error> {
         if self.has_attribute(MODULE_ATTRIBUTE) {
@@ -829,6 +850,7 @@ pub fn launch<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
         usize::from(cluster_size.is_some()),
         usize::from(cluster_size.is_some()),
         usize::from(properties.dynamic_shared_memory_size.is_some()),
+        usize::from(properties.async_object.is_some()),
     ];
     let mut builder = OperationBuilder::new("gpu.launch", location)
         .add_operands(properties.async_dependencies.as_slice())
@@ -839,6 +861,12 @@ pub fn launch<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     }
     if let Some(dynamic_shared_memory_size) = properties.dynamic_shared_memory_size {
         builder = builder.add_operand(dynamic_shared_memory_size);
+    }
+    if let Some(async_object) = properties.async_object {
+        builder = builder.add_operand(async_object);
+    }
+    if properties.cooperative {
+        builder = builder.add_attribute("cooperative", context.unit_attribute());
     }
     if let Some(module) = properties.module {
         builder = builder.add_attribute(MODULE_ATTRIBUTE, module);
@@ -4022,6 +4050,8 @@ mod tests {
                 module: Some(module),
                 function: Some(function),
                 workgroup_attributions: Some(2),
+                async_object: Some(token),
+                cooperative: true,
                 is_async: true,
             },
             context.region(),
@@ -4035,6 +4065,8 @@ mod tests {
         assert_eq!(operation.block_size().unwrap(), block_size);
         assert_eq!(operation.cluster_size().unwrap(), Some(cluster_size));
         assert_eq!(operation.dynamic_shared_memory_size().unwrap(), Some(dynamic_shared_memory_size));
+        assert_eq!(operation.async_object().unwrap(), Some(token));
+        assert!(operation.cooperative());
         assert_eq!(operation.module_symbol().unwrap(), Some(module));
         assert_eq!(operation.function_symbol().unwrap(), Some(function));
         assert_eq!(operation.workgroup_attribution_count().unwrap(), 2);

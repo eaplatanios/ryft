@@ -2510,7 +2510,7 @@ mod tests {
                 #sparse = #sparse_tensor.encoding<{ map = (d0) -> (d0 : compressed) }>
                 module {
                   func.func @positions_test(%arg0: tensor<?xf64, #sparse>) -> memref<?xindex> {
-                    %0 = sparse_tensor.positions %arg0 {level = 0 : index} : tensor<?xf64, #sparse> to memref<?xindex>
+                    %0 = sparse_tensor.positions %arg0 level = 0 : tensor<?xf64, #sparse> to memref<?xindex>
                     return %0 : memref<?xindex>
                   }
                 }
@@ -2574,7 +2574,7 @@ mod tests {
                 #sparse = #sparse_tensor.encoding<{ map = (d0) -> (d0 : compressed) }>
                 module {
                   func.func @coordinates_test(%arg0: tensor<?xf64, #sparse>) -> memref<?xindex> {
-                    %0 = sparse_tensor.coordinates %arg0 {level = 0 : index} : tensor<?xf64, #sparse> to memref<?xindex>
+                    %0 = sparse_tensor.coordinates %arg0 level = 0 : tensor<?xf64, #sparse> to memref<?xindex>
                     return %0 : memref<?xindex>
                   }
                 }
@@ -2834,7 +2834,7 @@ mod tests {
                 module {
                   func.func @concatenate_test(%arg0: tensor<4xf64, #sparse>, %arg1: tensor<4xf64, #sparse>) \
                     -> tensor<8xf64, #sparse> {
-                    %0 = sparse_tensor.concatenate %arg0, %arg1 {dimension = 0 : index} : \
+                    %0 = sparse_tensor.concatenate %arg0, %arg1 dimension = 0 : \
                       tensor<4xf64, #sparse>, tensor<4xf64, #sparse> to tensor<8xf64, #sparse>
                     return %0 : tensor<8xf64, #sparse>
                   }
@@ -3724,7 +3724,7 @@ mod tests {
                 #map = affine_map<(d0) -> (d0)>
                 module {
                   func.func @sort_test(%arg0: index, %arg1: memref<?xindex>, %arg2: memref<?xf64>) {
-                    sparse_tensor.sort quick_sort %arg0, %arg1 jointly %arg2 {ny = 1 : index, perm_map = #map} \
+                    sparse_tensor.sort quick_sort %arg0, %arg1 jointly %arg2 perm_map = #map ny = 1 \
                       : memref<?xindex> jointly memref<?xf64>
                     return
                   }

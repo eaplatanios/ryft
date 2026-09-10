@@ -1873,7 +1873,7 @@ mod tests {
                     %0 = shape.const_shape [2, 3] : !shape.shape
                     %1 = shape.const_shape [1, 3] : !shape.shape
                     %2 = shape.from_extents %c2, %c3 : !shape.size, !shape.size
-                    %3 = shape.broadcast %0, %2 {error = \"cannot broadcast\"} : !shape.shape, !shape.shape -> !shape.shape
+                    %3 = shape.broadcast %0, %2 error = \"cannot broadcast\" : !shape.shape, !shape.shape -> !shape.shape
                     %4 = shape.shape_eq %3, %1 : !shape.shape, !shape.shape
                     %5 = shape.is_broadcastable %0, %1 : !shape.shape, !shape.shape
                     %6 = shape.concat %0, %1 : !shape.shape, !shape.shape -> !shape.shape

@@ -4021,10 +4021,16 @@ mod tests {
                   func.func @async_store_smem(%arg0: vector<4xf32>, %arg1: memref<4xf32, \
                 #gpu.address_space<workgroup>>, %arg2: memref<!mosaic_gpu.barrier, \
                 #gpu.address_space<workgroup>>, %arg3: i32) {
-                    \"mosaic_gpu.async_store_smem\"(%arg0, %arg1, %arg2, %arg3) <{atomic_type = \
-                #mosaic_gpu<atomic_op_type add>, cluster_dim = #mosaic_gpu<dimension x>, optimized = true}> : \
-                (vector<4xf32>, memref<4xf32, #gpu.address_space<workgroup>>, memref<!mosaic_gpu.barrier, \
-                #gpu.address_space<workgroup>>, i32) -> ()
+                    \"mosaic_gpu.async_store_smem\"(%arg0, %arg1, %arg2, %arg3) <{\
+                        atomic_type = 0 : i32, \
+                        cluster_dim = 0 : i32, \
+                        optimized = true\
+                    }> : (\
+                        vector<4xf32>, \
+                        memref<4xf32, #gpu.address_space<workgroup>>, \
+                        memref<!mosaic_gpu.barrier, #gpu.address_space<workgroup>>, \
+                        i32\
+                    ) -> ()
                     return
                   }
                 }

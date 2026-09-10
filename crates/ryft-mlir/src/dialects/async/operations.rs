@@ -1435,8 +1435,8 @@ mod tests {
                     %2 = async.runtime.load %1 : <index>
                     %3 = async.runtime.create_group %arg0 : !async.group
                     %4 = async.runtime.add_to_group %0, %3 : !async.token
-                    async.runtime.add_ref %0 {count = 1 : i64} : !async.token
-                    async.runtime.drop_ref %0 {count = 1 : i64} : !async.token
+                    async.runtime.add_ref %0 count = 1 : !async.token
+                    async.runtime.drop_ref %0 count = 1 : !async.token
                     async.runtime.set_available %0 : !async.token
                     async.runtime.set_error %0 : !async.token
                     %5 = async.runtime.is_error %0 : !async.token

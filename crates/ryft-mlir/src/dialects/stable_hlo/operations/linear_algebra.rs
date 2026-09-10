@@ -1948,13 +1948,9 @@ mod tests {
 
     use crate::attributes::tests::{test_attribute_casting, test_attribute_display_and_debug};
     use crate::dialects::func;
-    use crate::{Attribute, Block, Context, Float8TypeRef, FloatTypeRef, Operation, Size, Type};
+    use crate::{Attribute, Block, Context, Float8TypeRef, FloatTypeRef, Operation, Size, Type, Value};
 
-    use super::{
-        CholeskyOperation, DotAlgorithmPreset, DotGeneralOperation, DynamicConvolutionOperation, FftOperation, FftType,
-        HasPadding, Precision, StaticOrDynamicConvolutionOperation, TriangularSolveOperation,
-        TriangularSolveTransposeType, cholesky, convolution, dot_general, dynamic_convolution, fft, triangular_solve,
-    };
+    use super::*;
 
     #[test]
     fn test_precision_attribute() {
@@ -2543,6 +2539,69 @@ mod tests {
                 }
             "},
         );
+    }
+
+    #[test]
+    fn test_convolution_mixed_fp8() {
+        let context = Context::new();
+        let location = context.unknown_location();
+        let lhs_type = context
+            .tensor_type(
+                context.float8e4m3fn_type(),
+                &[Size::Static(1), Size::Static(4), Size::Static(2)],
+                None,
+                location,
+            )
+            .unwrap();
+        let rhs_type = context
+            .tensor_type(
+                context.float8e5m2_type(),
+                &[Size::Static(1), Size::Static(2), Size::Static(2)],
+                None,
+                location,
+            )
+            .unwrap();
+        let padding_type = context
+            .tensor_type(context.signless_integer_type(64), &[Size::Static(1), Size::Static(2)], None, location)
+            .unwrap();
+        let block = context.block(&[(lhs_type, location), (rhs_type, location), (padding_type, location)]);
+        let dimensions = context.stable_hlo_convolution_dimensions(0, 2, &[1], 1, 2, &[0], 0, 2, &[1]).unwrap();
+        let operation = convolution(
+            block.argument(0).unwrap(),
+            block.argument(1).unwrap(),
+            dimensions,
+            1,
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            lhs_type,
+            location,
+        )
+        .unwrap();
+        assert!(operation.verify());
+        assert_eq!(operation.result(0).unwrap().r#type().unwrap(), lhs_type.as_ref());
+        let dynamic_operation = dynamic_convolution(
+            block.argument(0).unwrap(),
+            block.argument(1).unwrap(),
+            block.argument(2).unwrap(),
+            dimensions,
+            1,
+            1,
+            None,
+            None,
+            None,
+            None,
+            None,
+            lhs_type,
+            location,
+        )
+        .unwrap();
+        assert!(dynamic_operation.verify());
+        assert_eq!(dynamic_operation.result(0).unwrap().r#type().unwrap(), lhs_type.as_ref());
     }
 
     #[test]

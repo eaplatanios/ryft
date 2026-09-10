@@ -757,12 +757,10 @@ impl<'t> Context<'t> {
         tiling: &[i32],
     ) -> Result<TileTransformAttributeRef<'c, 't>, Error> {
         self.load_dialect(DialectHandle::mosaic_gpu()?)?;
-        let mut tiling = tiling.to_vec();
-        let dimension_count =
-            i32::try_from(tiling.len()).map_err(|_| Error::invalid_argument("too many Mosaic GPU tile dimensions"))?;
+        let tiling = self.dense_i32_array_attribute(tiling)?;
         unsafe {
             TileTransformAttributeRef::from_c_api(
-                mlirMosaicGpuTileTransformAttrGet(*self.handle.borrow_mut(), tiling.as_mut_ptr(), dimension_count),
+                mlirMosaicGpuTileTransformAttrGet(*self.handle.borrow_mut(), tiling.to_c_api()),
                 self,
             )
             .map_err(|_| Error::invalid_argument("invalid arguments to `Context::mosaic_gpu_tile_transform_attribute`"))

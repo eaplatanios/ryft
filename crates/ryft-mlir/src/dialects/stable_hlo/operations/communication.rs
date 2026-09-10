@@ -1144,8 +1144,37 @@ pub fn collective_broadcast<'v, 'c: 'v, 't: 'c, V: Value<'v, 'c, 't>, L: Locatio
 
 /// Reduces tensors across each replica group and returns the reduced values on its root rank. The root is the first
 /// rank in each group unless `dynamic_roots` supplies a rank-one `i32` tensor with one root index per data operand.
-/// The single-block region combines scalar pairs for each operand. Refer to the
-/// [official StableHLO specification](https://openxla.org/stablehlo/spec#collective_reduce).
+/// The single block region combines scalar pairs for each operand.
+///
+/// # Example
+///
+/// The following is an example of a [`CollectiveReduceOperation`] represented using its
+/// [`Display`](std::fmt::Display) rendering:
+///
+/// ```mlir
+///
+/// // num_replicas: 4
+/// // num_partitions: 1
+/// // %operand@(0, 0): [[1, 2]]
+/// // %operand@(1, 0): [[3, 4]]
+/// // %operand@(2, 0): [[5, 6]]
+/// // %operand@(3, 0): [[7, 8]]
+/// %result = "stablehlo.collective_reduce"(%operand) <{
+///   replica_groups = dense<[[0, 1, 2, 3]]> : tensor<1x4xi64>,
+///   channel_handle = #stablehlo.channel_handle<handle = 0, type = 0>
+/// }> ({
+/// ^bb0(%left: tensor<i64>, %right: tensor<i64>):
+///   %sum = stablehlo.add %left, %right : tensor<i64>
+///   stablehlo.return %sum : tensor<i64>
+/// }) : (tensor<1x2xi64>) -> tensor<1x2xi64>
+/// // %result@(0, 0): [[16, 20]]
+/// // %result@(1, 0): [[0, 0]]
+/// // %result@(2, 0): [[0, 0]]
+/// // %result@(3, 0): [[0, 0]]
+/// ```
+///
+/// Refer to the [official StableHLO specification](https://openxla.org/stablehlo/spec#collective_reduce)
+/// for more information.
 pub trait CollectiveReduceOperation<'o, 'c: 'o, 't: 'c>:
     Operation<'o, 'c, 't> + HasReplicaGroups<'o, 'c, 't> + SupportsChannelHandle<'o, 'c, 't>
 {

@@ -2067,7 +2067,7 @@ mod tests {
             indoc! {"
                 module {
                   func.func @nvgpu_rcp(%arg0: vector<2xf32>) -> vector<2xf32> {
-                    %0 = nvgpu.rcp %arg0 {approx = true, ftz = true} : vector<2xf32>
+                    %0 = nvgpu.rcp %arg0 <approx = true, ftz = true> : vector<2xf32>
                     return %0 : vector<2xf32>
                   }
                 }
@@ -2406,12 +2406,12 @@ mod tests {
             indoc! {"
                 module {
                   func.func @nvgpu_operations(%arg0: memref<32x32xf16, 3>, %arg1: memref<64xf16>, %arg2: memref<32x32xf32, 3>, %arg3: memref<*xf32>, %arg4: index, %arg5: index, %arg6: index, %arg7: i1, %arg8: i16, %arg9: vector<4x2xf16>, %arg10: vector<2x2xf16>, %arg11: vector<2x2xf32>, %arg12: vector<2xi16>, %arg13: !nvgpu.device.async.token, %arg14: !nvgpu.mbarrier.group<memorySpace = #gpu.address_space<workgroup>, num_barriers = 4>, %arg15: !nvgpu.mbarrier.token, %arg16: !nvgpu.tensormap.descriptor<tensor = memref<32x32xf32, 3>, swizzle = swizzle_128b, l2promo = none, oob = zero, interleave = none>, %arg17: !nvgpu.warpgroup.descriptor<tensor = memref<64x64xf16, 3>>, %arg18: !nvgpu.warpgroup.descriptor<tensor = memref<64x128xf16, 3>>, %arg19: !nvgpu.warpgroup.accumulator<fragmented = vector<64x128xf32>>, %arg20: memref<64x128xf32, 3>) {
-                    %0 = nvgpu.ldmatrix %arg0[%arg4, %arg5] {numTiles = 4 : i32, transpose = true} : memref<32x32xf16, 3> -> vector<4x2xf16>
-                    %1 = nvgpu.mma.sync(%arg9, %arg10, %arg11) {mmaShape = [16, 8, 16]} : (vector<4x2xf16>, vector<2x2xf16>, vector<2x2xf32>) -> vector<2x2xf32>
-                    %2 = nvgpu.mma.sp.sync(%arg9, %arg9, %arg10) metadata(%arg12) {mmaShape = [16, 8, 32], sparsitySelector = 1 : i32} : (vector<4x2xf16>, vector<4x2xf16>, vector<2x2xf16>) -> vector<2x2xf16>
+                    %0 = nvgpu.ldmatrix %arg0[%arg4, %arg5] numTiles = 4 transpose = true : memref<32x32xf16, 3> -> vector<4x2xf16>
+                    %1 = nvgpu.mma.sync(%arg9, %arg10, %arg11) mmaShape = [16, 8, 16] : (vector<4x2xf16>, vector<2x2xf16>, vector<2x2xf32>) -> vector<2x2xf32>
+                    %2 = nvgpu.mma.sp.sync(%arg9, %arg9, %arg10) metadata(%arg12) mmaShape = [16, 8, 32] sparsitySelector = 1 : (vector<4x2xf16>, vector<4x2xf16>, vector<2x2xf16>) -> vector<2x2xf16>
                     %3 = nvgpu.device_async_copy %arg1[%arg6], %arg0[%arg4, %arg5], 4, %arg4 : memref<64xf16> to memref<32x32xf16, 3>
                     %4 = nvgpu.device_async_create_group %arg13
-                    nvgpu.device_async_wait %arg13 {numGroups = 2 : i32}
+                    nvgpu.device_async_wait %arg13 numGroups = 2
                     %5 = nvgpu.mbarrier.create -> <memorySpace = #gpu.address_space<workgroup>, num_barriers = 4>
                     %6 = nvgpu.mbarrier.get %arg14[%arg4] : <memorySpace = #gpu.address_space<workgroup>, num_barriers = 4> -> i64
                     nvgpu.mbarrier.init %arg14[%arg4], %arg5, predicate = %arg7 : <memorySpace = #gpu.address_space<workgroup>, num_barriers = 4>
@@ -2426,10 +2426,10 @@ mod tests {
                     nvgpu.tma.async.store %arg2 to %arg16[%arg4, %arg5], predicate = %arg7 : memref<32x32xf32, 3> -> <tensor = memref<32x32xf32, 3>, swizzle = swizzle_128b, l2promo = none, oob = zero, interleave = none>
                     %10 = nvgpu.tma.create.descriptor %arg3 box[%arg4, %arg5] : memref<*xf32> -> <tensor = memref<32x32xf32, 3>, swizzle = swizzle_128b, l2promo = none, oob = zero, interleave = none>
                     %11 = nvgpu.warpgroup.generate.descriptor %arg0, %arg16 : memref<32x32xf16, 3>, <tensor = memref<32x32xf32, 3>, swizzle = swizzle_128b, l2promo = none, oob = zero, interleave = none> -> <tensor = memref<64x64xf16, 3>>
-                    %12 = nvgpu.warpgroup.mma %arg17, %arg18, %arg19 {transposeA, transposeB, waitGroup = 2 : i64} : <tensor = memref<64x64xf16, 3>>, <tensor = memref<64x128xf16, 3>>, <fragmented = vector<64x128xf32>> -> <fragmented = vector<64x128xf32>>
+                    %12 = nvgpu.warpgroup.mma %arg17, %arg18, %arg19 waitGroup = 2 transposeA transposeB : <tensor = memref<64x64xf16, 3>>, <tensor = memref<64x128xf16, 3>>, <fragmented = vector<64x128xf32>> -> <fragmented = vector<64x128xf32>>
                     nvgpu.warpgroup.mma.store %arg19, %arg20 : <fragmented = vector<64x128xf32>> to memref<64x128xf32, 3>
                     %13 = nvgpu.warpgroup.mma.init.accumulator -> <fragmented = vector<64x128xf32>>
-                    %14 = nvgpu.rcp %arg11 {approx = true, ftz = true} : vector<2x2xf32>
+                    %14 = nvgpu.rcp %arg11 <approx = true, ftz = true> : vector<2x2xf32>
                     return
                   }
                 }

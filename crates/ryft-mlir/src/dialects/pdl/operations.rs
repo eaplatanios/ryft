@@ -784,7 +784,7 @@ mod tests {
                   pdl.pattern @apply_native_constraint_test : benefit(1) {
                     %0 = type : i32
                     %1 = operand : %0
-                    %2 = apply_native_constraint "check"(%1 : !pdl.value) : !pdl.attribute {isNegated = true}
+                    %2 = apply_native_constraint "check"(%1 : !pdl.value) is_negated = true : !pdl.attribute
                     %3 = operation "test.op"(%1 : !pdl.value)  {"label" = %2} -> (%0 : !pdl.type)
                     rewrite %3 with "finish"
                   }

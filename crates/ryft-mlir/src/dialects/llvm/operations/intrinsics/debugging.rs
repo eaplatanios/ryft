@@ -914,7 +914,7 @@ mod tests {
             indoc! {"
                 module {
                   func.func @llvm_intr_ubsantrap_test() {
-                    llvm.intr.ubsantrap <{failureKind = 1 : i8}>
+                    llvm.intr.ubsantrap <failureKind = 1>
                     return
                   }
                 }

@@ -3401,6 +3401,20 @@ pub trait SemaphoreSignalOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
             ))),
         }
     }
+
+    /// Returns the optional `subcore_id` operand.
+    fn subcore_id(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        let range = self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 4)?;
+        match range.len() {
+            0 => Ok(None),
+            1 => self.operand_value(range.start).map(Some),
+            _ => Err(Error::invalid_argument(format!(
+                "invalid `{}` attribute in `{}`",
+                OPERAND_SEGMENT_SIZES_ATTRIBUTE,
+                self.name(),
+            ))),
+        }
+    }
 }
 
 mlir_op!(SemaphoreSignal);
@@ -3413,6 +3427,7 @@ pub fn semaphore_signal<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     amount: ValueRef<'o, 'c, 't>,
     device_id: Option<ValueRef<'o, 'c, 't>>,
     core_id: Option<ValueRef<'o, 'c, 't>>,
+    subcore_id: Option<ValueRef<'o, 'c, 't>>,
     location: L,
 ) -> Result<DetachedSemaphoreSignalOperation<'c, 't>, Error> {
     let mut builder = OperationBuilder::new("tpu.sem_signal", location);
@@ -3430,6 +3445,12 @@ pub fn semaphore_signal<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     }
     if let Some(core_id) = core_id {
         operands.push(core_id);
+        operand_segment_sizes.push(1);
+    } else {
+        operand_segment_sizes.push(0);
+    }
+    if let Some(subcore_id) = subcore_id {
+        operands.push(subcore_id);
         operand_segment_sizes.push(1);
     } else {
         operand_segment_sizes.push(0);
@@ -3515,17 +3536,14 @@ pub trait EnqueueDmaOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
         self.operand_value(range.start)
     }
 
-    /// Returns the `target_semaphore` operand.
-    fn target_semaphore(&self) -> Result<ValueRef<'o, 'c, 't>, Error> {
+    /// Returns the optional `target_semaphore` operand.
+    fn target_semaphore(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
         let range = self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 3)?;
-        if range.len() != 1 {
-            return Err(Error::invalid_argument(format!(
-                "invalid `{}` attribute in `{}`",
-                OPERAND_SEGMENT_SIZES_ATTRIBUTE,
-                self.name(),
-            )));
+        match range.len() {
+            0 => Ok(None),
+            1 => self.operand_value(range.start).map(Some),
+            _ => Err(Error::invalid_argument("invalid target semaphore operand segment in `tpu.enqueue_dma`")),
         }
-        self.operand_value(range.start)
     }
 
     /// Returns the optional `device_id` operand.
@@ -3545,6 +3563,20 @@ pub trait EnqueueDmaOperation<'o, 'c: 'o, 't: 'c>: Operation<'o, 'c, 't> {
     /// Returns the optional `core_id` operand.
     fn core_id(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
         let range = self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 5)?;
+        match range.len() {
+            0 => Ok(None),
+            1 => self.operand_value(range.start).map(Some),
+            _ => Err(Error::invalid_argument(format!(
+                "invalid `{}` attribute in `{}`",
+                OPERAND_SEGMENT_SIZES_ATTRIBUTE,
+                self.name(),
+            ))),
+        }
+    }
+
+    /// Returns the optional `subcore_id` operand.
+    fn subcore_id(&self) -> Result<Option<ValueRef<'o, 'c, 't>>, Error> {
+        let range = self.dense_integer_32_array_attribute_segment_range(OPERAND_SEGMENT_SIZES_ATTRIBUTE, 6)?;
         match range.len() {
             0 => Ok(None),
             1 => self.operand_value(range.start).map(Some),
@@ -3604,9 +3636,10 @@ pub fn enqueue_dma<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     source: ValueRef<'o, 'c, 't>,
     source_semaphore: Option<ValueRef<'o, 'c, 't>>,
     target: ValueRef<'o, 'c, 't>,
-    target_semaphore: ValueRef<'o, 'c, 't>,
+    target_semaphore: Option<ValueRef<'o, 'c, 't>>,
     device_id: Option<ValueRef<'o, 'c, 't>>,
     core_id: Option<ValueRef<'o, 'c, 't>>,
+    subcore_id: Option<ValueRef<'o, 'c, 't>>,
     priority: Option<IntegerAttributeRef<'c, 't>>,
     strict_ordering: Option<BooleanAttributeRef<'c, 't>>,
     location: L,
@@ -3624,8 +3657,12 @@ pub fn enqueue_dma<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     }
     operands.push(target);
     operand_segment_sizes.push(1);
-    operands.push(target_semaphore);
-    operand_segment_sizes.push(1);
+    if let Some(target_semaphore) = target_semaphore {
+        operands.push(target_semaphore);
+        operand_segment_sizes.push(1);
+    } else {
+        operand_segment_sizes.push(0);
+    }
     if let Some(device_id) = device_id {
         operands.push(device_id);
         operand_segment_sizes.push(1);
@@ -3634,6 +3671,12 @@ pub fn enqueue_dma<'o, 'c: 'o, 't: 'c, L: Location<'c, 't>>(
     }
     if let Some(core_id) = core_id {
         operands.push(core_id);
+        operand_segment_sizes.push(1);
+    } else {
+        operand_segment_sizes.push(0);
+    }
+    if let Some(subcore_id) = subcore_id {
+        operands.push(subcore_id);
         operand_segment_sizes.push(1);
     } else {
         operand_segment_sizes.push(0);
@@ -5304,13 +5347,23 @@ mod tests {
     );
 
     mosaic_tpu_operation_test!(test_semaphore_signal_operation, |_context, location, values, _types, _attributes| {
-        let operation = semaphore_signal(values[0], values[1], Some(values[2]), Some(values[3]), location).unwrap();
+        let operation =
+            semaphore_signal(values[0], values[1], Some(values[2]), Some(values[3]), Some(values[4]), location)
+                .unwrap();
 
         assert_eq!(operation.name().as_str(), Ok("tpu.sem_signal"));
         assert_eq!(operation.semaphore().unwrap(), values[0]);
         assert_eq!(operation.amount().unwrap(), values[1]);
         assert_eq!(operation.device_id().unwrap(), Some(values[2]));
         assert_eq!(operation.core_id().unwrap(), Some(values[3]));
+        assert_eq!(operation.subcore_id().unwrap(), Some(values[4]));
+
+        let operation = semaphore_signal(values[0], values[1], None, None, None, location).unwrap();
+        assert_eq!(operation.semaphore().unwrap(), values[0]);
+        assert_eq!(operation.amount().unwrap(), values[1]);
+        assert_eq!(operation.device_id().unwrap(), None);
+        assert_eq!(operation.core_id().unwrap(), None);
+        assert_eq!(operation.subcore_id().unwrap(), None);
     });
 
     mosaic_tpu_operation_test!(test_barrier_operation, |_context, location, values, _types, _attributes| {
@@ -5325,9 +5378,10 @@ mod tests {
             values[0],
             Some(values[1]),
             values[2],
-            values[3],
+            Some(values[3]),
             Some(values[4]),
             Some(values[5]),
+            Some(values[6]),
             Some(attributes.two),
             Some(attributes.boolean),
             location,
@@ -5338,11 +5392,21 @@ mod tests {
         assert_eq!(operation.source().unwrap(), values[0]);
         assert_eq!(operation.source_semaphore().unwrap(), Some(values[1]));
         assert_eq!(operation.target().unwrap(), values[2]);
-        assert_eq!(operation.target_semaphore().unwrap(), values[3]);
+        assert_eq!(operation.target_semaphore().unwrap(), Some(values[3]));
         assert_eq!(operation.device_id().unwrap(), Some(values[4]));
         assert_eq!(operation.core_id().unwrap(), Some(values[5]));
+        assert_eq!(operation.subcore_id().unwrap(), Some(values[6]));
         assert_eq!(operation.priority().unwrap(), attributes.two);
         assert!(operation.strict_ordering().unwrap().value());
+
+        let operation = enqueue_dma(values[0], None, values[2], None, None, None, None, None, None, location).unwrap();
+        assert_eq!(operation.source().unwrap(), values[0]);
+        assert_eq!(operation.target().unwrap(), values[2]);
+        assert_eq!(operation.source_semaphore().unwrap(), None);
+        assert_eq!(operation.target_semaphore().unwrap(), None);
+        assert_eq!(operation.device_id().unwrap(), None);
+        assert_eq!(operation.core_id().unwrap(), None);
+        assert_eq!(operation.subcore_id().unwrap(), None);
     });
 
     mosaic_tpu_operation_test!(
