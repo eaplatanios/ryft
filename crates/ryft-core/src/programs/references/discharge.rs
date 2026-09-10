@@ -9207,15 +9207,15 @@ mod tests {
                 }
             }
 
-            fn validate_view(
+            fn validate_reference_view(
                 view: &ArrayReferenceView,
                 source: &ArrayIrType,
-                output: &ArrayIrType,
+                target: &ArrayIrType,
             ) -> Result<(), ReferenceViewValidationError> {
-                DischargeOperation::validate_view(view, source, output)
+                DischargeOperation::validate_reference_view(view, source, target)
             }
 
-            fn reapply_view<C: Context<Type = ArrayIrType, Operation = Self>>(
+            fn reapply_reference_view<C: Context<Type = ArrayIrType, Operation = Self>>(
                 context: &C,
                 view: &ArrayReferenceView,
                 source: C::Value,

@@ -78,7 +78,8 @@
 //!   validation infrastructure invoked explicitly by its consumers rather than a standing lint on every program.
 //! - `views.rs` defines the value-family-generic view contract [`ReferenceViewOperation`] (owned per-edge view
 //!   descriptions with static selections or symbolic values, their type-level validation, their reapplication to a
-//!   transformed reference, their batching, and their overlap query) and the retained [`ReferenceViewAnalysis`]
+//!   transformed reference, and their overlap query), the optional [`BatchableReferenceView`] capability, and the
+//!   retained [`ReferenceViewAnalysis`]
 //!   overlay that composes those descriptions into one [`ReferenceViewPath`] per reference-typed value of a closure.
 //! - [`crate::operations::references`] defines the six generic primitives in separate modules together with their
 //!   value-level capabilities: allocation ([`ReferenceNew`](crate::operations::ReferenceNew)), immutable reads
@@ -305,7 +306,6 @@ pub use discharge::{
     discharge_positional_region_operation, discharge_reference_free_operation,
 };
 pub use types::{ReferenceType, ReferenceTypeRefinements};
-
 pub use values::{
     PreparedReferenceReplacement, ReadyOrPendingReferenceGuard, ReadyReferenceGuard, Reference, ReferenceBoundary,
     ReferenceBoundaryError, ReferenceBoundaryPosition, ReferenceCompletion, ReferenceCompletionBackend,
@@ -313,10 +313,9 @@ pub use values::{
     ReferenceReplacementTransaction, TakenReferenceGuard, ValidatedPendingReplacementTransaction,
     validate_reference_boundary,
 };
-
 pub use views::{
-    NoReferenceViewBinding, ReferenceView, ReferenceViewAnalysis, ReferenceViewAnalysisError, ReferenceViewOperation,
-    ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError,
+    BatchableReferenceView, NoReferenceViewBinding, ReferenceView, ReferenceViewAnalysis, ReferenceViewAnalysisError,
+    ReferenceViewOperation, ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError,
     batch_reference_view_operation,
 };
 

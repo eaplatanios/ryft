@@ -43,10 +43,10 @@ use crate::operations::{
 };
 use crate::parameters::Parameter;
 use crate::programs::{
-    NoReferenceViewBinding, ProgramError, ReadyOrPendingReferenceGuard, Reference, ReferenceAccumulationPolicy,
-    ReferenceDischargePolicy, ReferenceDischargeableType, ReferenceError, ReferenceId, ReferenceType, ReferenceView,
-    ReferenceViewAnalysis, ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep, Type, TypeError,
-    TypeIdentityRenaming, Typed, Value, ValueId,
+    BatchableReferenceView, NoReferenceViewBinding, ProgramError, ReadyOrPendingReferenceGuard, Reference,
+    ReferenceAccumulationPolicy, ReferenceDischargePolicy, ReferenceDischargeableType, ReferenceError, ReferenceId,
+    ReferenceType, ReferenceView, ReferenceViewAnalysis, ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep,
+    Type, TypeError, TypeIdentityRenaming, Typed, Value, ValueId,
 };
 
 // TODO(eaplatanios): Review this module.
@@ -306,17 +306,49 @@ impl ReferenceView for ArrayReferenceView {
         }
     }
 
+    // Both paths fold to one range or symbolic index per root axis. Nonintersecting static ranges prove disjointness;
+    // identical static ranges or symbolic indices with equal bindings, offsets, and clamping extents prove equality.
+    // Everything else may overlap. A malformed path cannot be folded and is treated as
+    // possibly overlapping, because paths are validated when they are derived and this query must not fail.
+    fn overlap(
+        r#type: &ArrayIrType,
+        lhs: &[ReferenceViewStep<Self>],
+        rhs: &[ReferenceViewStep<Self>],
+    ) -> ReferenceViewOverlap {
+        let Some(shape) = <&ReferenceType<ArrayType>>::try_from(r#type)
+            .ok()
+            .and_then(|r#type| r#type.referent().static_shape())
+        else {
+            return ReferenceViewOverlap::MayOverlap;
+        };
+        let (Some(lhs), Some(rhs)) = (RootIndexSelection::fold(&shape, lhs), RootIndexSelection::fold(&shape, rhs))
+        else {
+            return ReferenceViewOverlap::MayOverlap;
+        };
+        let mut overlap = ReferenceViewOverlap::Same;
+        for (lhs, rhs) in lhs.iter().zip(rhs.iter()) {
+            match lhs.overlap(rhs) {
+                ReferenceViewOverlap::Disjoint => return ReferenceViewOverlap::Disjoint,
+                ReferenceViewOverlap::Same => {}
+                ReferenceViewOverlap::MayOverlap => overlap = ReferenceViewOverlap::MayOverlap,
+            }
+        }
+        overlap
+    }
+}
+
+impl BatchableReferenceView for ArrayReferenceView {
     // The batch axis of a reference is an axis of its packed referent that the per-item view never sees. Indexing
     // removes one per-item axis, so the packed view cannot keep both axis positions unchanged: a batch axis at or
     // before the indexed axis shifts the packed indexed axis one position later while the output keeps the batch axis,
     // and a batch axis after the indexed axis leaves the packed indexed axis alone while the output's batch axis moves
     // one position earlier. Slicing preserves rank, so the packed view selects the complete batch axis through an
     // identity selection inserted at the batch axis position and the output keeps the batch axis.
-    fn batch(&self, source: &ArrayIrType, batch_axis: BatchAxis) -> Result<(Self, BatchAxis), BatchingError> {
+    fn batch(&self, r#type: &ArrayIrType, batch_axis: BatchAxis) -> Result<(Self, BatchAxis), BatchingError> {
         let Some(axis) = batch_axis.axis() else {
             return Ok((self.clone(), batch_axis));
         };
-        let referent = <&ReferenceType<ArrayType>>::try_from(source)?.referent();
+        let referent = <&ReferenceType<ArrayType>>::try_from(r#type)?.referent();
         let position = axis.normalize(referent.rank())?;
         // Normalizing the batch axis proves that the packed rank is nonzero. Validate the descriptor's per-item
         // axes before shifting an index or inserting a slice axis, so malformed public descriptors cannot panic.
@@ -349,34 +381,6 @@ impl ReferenceView for ArrayReferenceView {
                 Ok((Self::Slice { axes }, batch_axis))
             }
         }
-    }
-
-    // Both paths fold to one range or symbolic index per root axis. Nonintersecting static ranges prove disjointness;
-    // identical static ranges or symbolic indices with equal bindings, offsets, and clamping extents prove equality.
-    // Everything else may overlap. A malformed path cannot be folded and is treated as
-    // possibly overlapping, because paths are validated when they are derived and this query must not fail.
-    fn overlap(
-        root: &ArrayIrType,
-        a: &[ReferenceViewStep<Self>],
-        b: &[ReferenceViewStep<Self>],
-    ) -> ReferenceViewOverlap {
-        let Some(shape) =
-            <&ReferenceType<ArrayType>>::try_from(root).ok().and_then(|root| root.referent().static_shape())
-        else {
-            return ReferenceViewOverlap::MayOverlap;
-        };
-        let (Some(a), Some(b)) = (RootIndexSelection::fold(&shape, a), RootIndexSelection::fold(&shape, b)) else {
-            return ReferenceViewOverlap::MayOverlap;
-        };
-        let mut overlap = ReferenceViewOverlap::Same;
-        for (a, b) in a.iter().zip(b.iter()) {
-            match a.overlap(b) {
-                ReferenceViewOverlap::Disjoint => return ReferenceViewOverlap::Disjoint,
-                ReferenceViewOverlap::Same => {}
-                ReferenceViewOverlap::MayOverlap => overlap = ReferenceViewOverlap::MayOverlap,
-            }
-        }
-        overlap
     }
 }
 
@@ -518,7 +522,7 @@ impl ViewSelection {
 }
 
 /// Immutable index mapping between a shared array-reference root and one derived handle: the array
-/// specialization of the generic [`ReferenceViewPath`], whose descriptions are [`ArrayReferenceView`]s.
+/// specialization of the generic [`ReferenceViewPath`], whose views are [`ArrayReferenceView`]s.
 ///
 /// The mapping stores validated transforms in root-to-handle order. The empty mapping ([`root`](Self::root)) is the
 /// identity view and denotes the complete root. Each additional transform is applied to the preceding view, so
@@ -1374,100 +1378,6 @@ mod tests {
     }
 
     #[test]
-    fn test_array_reference_view_batch() {
-        let packed = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2, 3, 4])));
-        let index = ArrayReferenceView::Index { axis: 1, index: ArrayReferenceViewIndex::Static(2) };
-        let slice =
-            ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(1, 1, 1), ArraySliceAxis::new(1, 2, 1)] };
-
-        // A batch axis at or before the indexed axis shifts the packed indexed axis one position later and the output
-        // keeps the batch axis, while a batch axis after the indexed axis leaves the packed indexed axis alone and the
-        // output batch axis moves one position earlier. Negative batch axes normalize against the packed rank.
-        assert_eq!(
-            index.batch(&packed, BatchAxis::new(0)),
-            Ok((ArrayReferenceView::Index { axis: 2, index: ArrayReferenceViewIndex::Static(2) }, BatchAxis::new(0))),
-        );
-        assert_eq!(
-            index.batch(&packed, BatchAxis::new(1)),
-            Ok((ArrayReferenceView::Index { axis: 2, index: ArrayReferenceViewIndex::Static(2) }, BatchAxis::new(1))),
-        );
-        assert_eq!(
-            index.batch(&packed, BatchAxis::new(2)),
-            Ok((ArrayReferenceView::Index { axis: 1, index: ArrayReferenceViewIndex::Static(2) }, BatchAxis::new(1))),
-        );
-        assert_eq!(
-            index.batch(&packed, BatchAxis::new(-1)),
-            Ok((ArrayReferenceView::Index { axis: 1, index: ArrayReferenceViewIndex::Static(2) }, BatchAxis::new(1))),
-        );
-
-        // Batching preserves the symbol that supplies the index.
-        let symbolic = ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(1) };
-        assert_eq!(
-            symbolic.batch(&packed, BatchAxis::new(0)),
-            Ok(
-                (ArrayReferenceView::Index { axis: 1, index: ArrayReferenceViewIndex::Symbolic(1) }, BatchAxis::new(0),)
-            ),
-        );
-
-        // Slicing inserts the complete batch axis at the batch axis position and keeps the batch axis.
-        assert_eq!(
-            slice.batch(&packed, BatchAxis::new(1)),
-            Ok((
-                ArrayReferenceView::Slice {
-                    axes: vec![
-                        ArraySliceAxis::new(1, 1, 1),
-                        ArraySliceAxis::new(0, 3, 1),
-                        ArraySliceAxis::new(1, 2, 1)
-                    ],
-                },
-                BatchAxis::new(1),
-            )),
-        );
-
-        // A replicated source leaves both transforms unchanged and replicated.
-        assert_eq!(index.batch(&packed, BatchAxis::replicated()), Ok((index.clone(), BatchAxis::replicated())));
-        assert_eq!(slice.batch(&packed, BatchAxis::replicated()), Ok((slice.clone(), BatchAxis::replicated())));
-
-        // The source must be a reference whose packed referent has the batch axis, and a static identity slice cannot
-        // span a dynamically sized batch axis.
-        let array = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2, 3, 4]));
-        assert!(matches!(index.batch(&array, BatchAxis::new(0)), Err(BatchingError::Type(_))));
-        assert!(matches!(index.batch(&packed, BatchAxis::new(3)), Err(BatchingError::Axis(_))));
-        let batch = DimensionVariable::new("batch", DimensionBounds::unbounded());
-        let dynamic = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(3)]));
-        assert_eq!(
-            ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(0, 3, 1)] }
-                .batch(&ArrayIrType::Reference(ReferenceType::new(dynamic.clone())), BatchAxis::new(0)),
-            Err(BatchingError::DynamicBatchAxis { r#type: Box::new(dynamic), axis: Axis::from(0) }),
-        );
-    }
-
-    #[test]
-    fn test_array_reference_view_batch_rejects_invalid_axes() {
-        let packed = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2, 3, 4])));
-        assert_eq!(
-            ArrayReferenceView::Index { axis: 2, index: ArrayReferenceViewIndex::Static(0) }
-                .batch(&packed, BatchAxis::new(0)),
-            Err(TypeError::invalid("reference index axis 2 is out of bounds for rank 2").into()),
-        );
-        // Shifting an unchecked maximum axis used to overflow before it could be rejected.
-        assert_eq!(
-            ArrayReferenceView::Index { axis: usize::MAX, index: ArrayReferenceViewIndex::Static(0) }
-                .batch(&packed, BatchAxis::new(0)),
-            Err(TypeError::invalid(format!("reference index axis {} is out of bounds for rank 2", usize::MAX,)).into()),
-        );
-        // Inserting the batch selection requires exactly one selection per unbatched input axis.
-        assert_eq!(
-            ArrayReferenceView::Slice { axes: Vec::new() }.batch(&packed, BatchAxis::new(2)),
-            Err(TypeError::invalid("reference slice has 0 axes but its input has rank 2").into()),
-        );
-        assert_eq!(
-            ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(0, 1, 1); 3] }.batch(&packed, BatchAxis::new(2)),
-            Err(TypeError::invalid("reference slice has 3 axes but its input has rank 2").into()),
-        );
-    }
-
-    #[test]
     fn test_array_reference_view_overlap() {
         let root = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [4, 3])));
         let empty: ArrayReferenceViewPath = ArrayReferenceViewPath::root();
@@ -1597,6 +1507,100 @@ mod tests {
             .with_view(ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Static(usize::MAX) });
         // Malformed relative indices cannot wrap around to become valid root indices.
         assert_eq!(view.overlap(&ArrayReferenceViewPath::root(), &root), ReferenceViewOverlap::MayOverlap);
+    }
+
+    #[test]
+    fn test_array_reference_view_batch() {
+        let packed = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2, 3, 4])));
+        let index = ArrayReferenceView::Index { axis: 1, index: ArrayReferenceViewIndex::Static(2) };
+        let slice =
+            ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(1, 1, 1), ArraySliceAxis::new(1, 2, 1)] };
+
+        // A batch axis at or before the indexed axis shifts the packed indexed axis one position later and the output
+        // keeps the batch axis, while a batch axis after the indexed axis leaves the packed indexed axis alone and the
+        // output batch axis moves one position earlier. Negative batch axes normalize against the packed rank.
+        assert_eq!(
+            index.batch(&packed, BatchAxis::new(0)),
+            Ok((ArrayReferenceView::Index { axis: 2, index: ArrayReferenceViewIndex::Static(2) }, BatchAxis::new(0))),
+        );
+        assert_eq!(
+            index.batch(&packed, BatchAxis::new(1)),
+            Ok((ArrayReferenceView::Index { axis: 2, index: ArrayReferenceViewIndex::Static(2) }, BatchAxis::new(1))),
+        );
+        assert_eq!(
+            index.batch(&packed, BatchAxis::new(2)),
+            Ok((ArrayReferenceView::Index { axis: 1, index: ArrayReferenceViewIndex::Static(2) }, BatchAxis::new(1))),
+        );
+        assert_eq!(
+            index.batch(&packed, BatchAxis::new(-1)),
+            Ok((ArrayReferenceView::Index { axis: 1, index: ArrayReferenceViewIndex::Static(2) }, BatchAxis::new(1))),
+        );
+
+        // Batching preserves the symbol that supplies the index.
+        let symbolic = ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(1) };
+        assert_eq!(
+            symbolic.batch(&packed, BatchAxis::new(0)),
+            Ok(
+                (ArrayReferenceView::Index { axis: 1, index: ArrayReferenceViewIndex::Symbolic(1) }, BatchAxis::new(0),)
+            ),
+        );
+
+        // Slicing inserts the complete batch axis at the batch axis position and keeps the batch axis.
+        assert_eq!(
+            slice.batch(&packed, BatchAxis::new(1)),
+            Ok((
+                ArrayReferenceView::Slice {
+                    axes: vec![
+                        ArraySliceAxis::new(1, 1, 1),
+                        ArraySliceAxis::new(0, 3, 1),
+                        ArraySliceAxis::new(1, 2, 1)
+                    ],
+                },
+                BatchAxis::new(1),
+            )),
+        );
+
+        // A replicated source leaves both transforms unchanged and replicated.
+        assert_eq!(index.batch(&packed, BatchAxis::replicated()), Ok((index.clone(), BatchAxis::replicated())));
+        assert_eq!(slice.batch(&packed, BatchAxis::replicated()), Ok((slice.clone(), BatchAxis::replicated())));
+
+        // The source must be a reference whose packed referent has the batch axis, and a static identity slice cannot
+        // span a dynamically sized batch axis.
+        let array = ArrayIrType::Array(ArrayType::new_static(DataType::F32, [2, 3, 4]));
+        assert!(matches!(index.batch(&array, BatchAxis::new(0)), Err(BatchingError::Type(_))));
+        assert!(matches!(index.batch(&packed, BatchAxis::new(3)), Err(BatchingError::Axis(_))));
+        let batch = DimensionVariable::new("batch", DimensionBounds::unbounded());
+        let dynamic = ArrayType::new(DataType::F32, Shape::new(vec![Dimension::Dynamic(batch), Dimension::Static(3)]));
+        assert_eq!(
+            ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(0, 3, 1)] }
+                .batch(&ArrayIrType::Reference(ReferenceType::new(dynamic.clone())), BatchAxis::new(0)),
+            Err(BatchingError::DynamicBatchAxis { r#type: Box::new(dynamic), axis: Axis::from(0) }),
+        );
+    }
+
+    #[test]
+    fn test_array_reference_view_batch_rejects_invalid_axes() {
+        let packed = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2, 3, 4])));
+        assert_eq!(
+            ArrayReferenceView::Index { axis: 2, index: ArrayReferenceViewIndex::Static(0) }
+                .batch(&packed, BatchAxis::new(0)),
+            Err(TypeError::invalid("reference index axis 2 is out of bounds for rank 2").into()),
+        );
+        // Shifting an unchecked maximum axis used to overflow before it could be rejected.
+        assert_eq!(
+            ArrayReferenceView::Index { axis: usize::MAX, index: ArrayReferenceViewIndex::Static(0) }
+                .batch(&packed, BatchAxis::new(0)),
+            Err(TypeError::invalid(format!("reference index axis {} is out of bounds for rank 2", usize::MAX,)).into()),
+        );
+        // Inserting the batch selection requires exactly one selection per unbatched input axis.
+        assert_eq!(
+            ArrayReferenceView::Slice { axes: Vec::new() }.batch(&packed, BatchAxis::new(2)),
+            Err(TypeError::invalid("reference slice has 0 axes but its input has rank 2").into()),
+        );
+        assert_eq!(
+            ArrayReferenceView::Slice { axes: vec![ArraySliceAxis::new(0, 1, 1); 3] }.batch(&packed, BatchAxis::new(2)),
+            Err(TypeError::invalid("reference slice has 3 axes but its input has rank 2").into()),
+        );
     }
 
     #[test]

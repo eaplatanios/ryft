@@ -13,7 +13,6 @@ use ryft_macros::Operation;
 use crate::arrays::arrays::Array;
 use crate::arrays::dimensions::DimensionValue;
 use crate::arrays::ir::ArrayIrValue;
-use crate::arrays::references::ArrayReferenceView;
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::dimensions::{Dimension, DimensionType};
 use crate::arrays::types::ir::ArrayIrType;
@@ -67,8 +66,8 @@ use crate::operations::{
 };
 use crate::partial::PartialValue;
 use crate::programs::{
-    MaybeZero, Operation, OperationProjection, ProgramError, ReferenceViewOperation, ReferenceViewValidationError,
-    Type, TypeError, TypeIdentityPosition, Typed, Value, ValueProjection,
+    MaybeZero, Operation, OperationProjection, ProgramError, Type, TypeError, TypeIdentityPosition, Typed, Value,
+    ValueProjection,
 };
 use crate::tracing::{Tracer, TracingContext};
 use crate::tracing_v2::RematerializeOperation;
@@ -99,9 +98,10 @@ pub(crate) use math::ElementExtremum;
 
 // TODO(eaplatanios): This seems a bit weirdly placed.
 pub use references::{
-    REFERENCE_DYNAMIC_INDEX_OPERATION_NAME, REFERENCE_INDEX_OPERATION_NAME, REFERENCE_SLICE_OPERATION_NAME,
-    ReferenceDynamicIndex, ReferenceDynamicIndexOperation, ReferenceIndex, ReferenceIndexOperation, ReferenceSlice,
-    ReferenceSliceOperation, reapply_array_reference_view, validate_array_reference_view,
+    ArrayReferenceViewOperation, REFERENCE_DYNAMIC_INDEX_OPERATION_NAME, REFERENCE_INDEX_OPERATION_NAME,
+    REFERENCE_SLICE_OPERATION_NAME, ReferenceDynamicIndex, ReferenceDynamicIndexOperation, ReferenceIndex,
+    ReferenceIndexOperation, ReferenceSlice, ReferenceSliceOperation, reapply_array_reference_view,
+    validate_array_reference_view,
 };
 
 /// Reusable [`Operation`] enum for ordinary staged programs over arrays.
@@ -550,90 +550,6 @@ pub enum ArrayIrOperation<A: Value<Type = ArrayType>> {
     /// storage universe. Local reference lifecycles inside the body are recomputed, reads of external references are
     /// saved rather than recomputed, and bodies that mutate external references are rejected.
     Rematerialize(RematerializeOperation<ArrayIrType>),
-}
-
-/// Operation-family constructors for the canonical array operations that one array-reference view traversal stages.
-///
-/// Mapping between a reference root and one derived handle's selected elements uses static or dynamic slices,
-/// reshapes, and corresponding updates. Both eager handles and the
-/// [`ArrayReferenceDischarge`](crate::ArrayReferenceDischarge) policy walk the same [`ArrayReferenceViewPath`](crate::ArrayReferenceViewPath). This contract lets the staging consumer
-/// construct those operations in a closed operation family, so core array IR and backend-owned supersets share one
-/// traversal without matching operation names.
-///
-/// The view contract itself (which outputs are views, their [`ArrayReferenceView`] descriptions, their
-/// type-level validation, and their reapplication to a transformed reference) is the family's
-/// [`ReferenceViewOperation`] implementation, which this trait refines to the array universe so that the array view
-/// overlay ([`ArrayReferenceAnalysis`](crate::ArrayReferenceAnalysis)) and the array discharge policy share one
-/// bound. The constructors here stage array-valued operations over *discharged* values and are discharge-only.
-pub trait ArrayReferenceViewOperation: ReferenceViewOperation<Type = ArrayIrType, View = ArrayReferenceView> {
-    /// Wraps a canonical homogeneous array reshape for reference-view staging.
-    fn from_reference_reshape(operation: ReshapeOperation) -> Self;
-
-    /// Wraps a canonical homogeneous array slice for reference-view staging.
-    fn from_reference_slice(operation: SliceOperation) -> Self;
-
-    /// Wraps a canonical homogeneous array update-slice for reference-view staging.
-    fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self;
-
-    /// Wraps a dynamic slice over discharged reference state.
-    fn from_reference_dynamic_slice(operation: DynamicSliceOperation) -> Self;
-
-    /// Wraps a dynamic update over discharged reference state.
-    fn from_reference_dynamic_update_slice(operation: DynamicUpdateSliceOperation) -> Self;
-}
-
-impl<A: Value<Type = ArrayType>> ReferenceViewOperation for ArrayIrOperation<A> {
-    type View = ArrayReferenceView;
-
-    fn reference_view(&self, output_index: usize) -> Option<ArrayReferenceView> {
-        // The view derivations are the only members whose reference semantics declare a view alias, and each
-        // declares it at its single output.
-        match self {
-            Self::ReferenceDynamicIndex(operation) if output_index == 0 => Some(operation.transform()),
-            Self::ReferenceIndex(operation) if output_index == 0 => Some(operation.transform()),
-            Self::ReferenceSlice(operation) if output_index == 0 => Some(operation.transform()),
-            _ => None,
-        }
-    }
-
-    fn validate_view(
-        view: &ArrayReferenceView,
-        source: &ArrayIrType,
-        output: &ArrayIrType,
-    ) -> Result<(), ReferenceViewValidationError> {
-        validate_array_reference_view(view, source, output)
-    }
-
-    fn reapply_view<C: Context<Type = ArrayIrType, Operation = Self>>(
-        context: &C,
-        view: &ArrayReferenceView,
-        source: C::Value,
-        symbols: &[C::Value],
-    ) -> Result<C::Value, ProgramError> {
-        reapply_array_reference_view(context, view, source, symbols)
-    }
-}
-
-impl<A: Value<Type = ArrayType>> ArrayReferenceViewOperation for ArrayIrOperation<A> {
-    fn from_reference_reshape(operation: ReshapeOperation) -> Self {
-        Self::Array(ArrayOperation::Reshape(operation))
-    }
-
-    fn from_reference_slice(operation: SliceOperation) -> Self {
-        Self::Array(ArrayOperation::Slice(operation))
-    }
-
-    fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self {
-        Self::Array(ArrayOperation::UpdateSlice(operation))
-    }
-
-    fn from_reference_dynamic_slice(operation: DynamicSliceOperation) -> Self {
-        Self::Array(ArrayOperation::DynamicSlice(operation))
-    }
-
-    fn from_reference_dynamic_update_slice(operation: DynamicUpdateSliceOperation) -> Self {
-        Self::Array(ArrayOperation::DynamicUpdateSlice(operation))
-    }
 }
 
 /// Value-level capability bundle paired with the [`ArrayIrOperation`] family.
@@ -1121,7 +1037,6 @@ mod tests {
     use crate::arrays::dimensions::DimensionValue;
     use crate::arrays::ir::ArrayIrValue;
     use crate::arrays::operations::{ArrayIrOperation, ArrayOperation, DimensionOperation};
-    use crate::arrays::references::ArrayReferenceViewIndex;
     use crate::arrays::types::arrays::ArrayType;
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{
@@ -1809,27 +1724,6 @@ mod tests {
         assert_eq!(
             condition.interpret(&context, &EmptyRegionDriver, &[]),
             Err(ProgramError::MalformedProgram("condition interpretation requires a predicate input".to_string(),)),
-        );
-    }
-
-    #[test]
-    fn test_array_ir_operation_reference_view_dynamic_index() {
-        let view = ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(1) };
-        let operation = TestOperation::ReferenceDynamicIndex(ReferenceDynamicIndexOperation::new(0));
-        assert_eq!(operation.reference_view(0), Some(view.clone()));
-        assert_eq!(operation.reference_view(1), None);
-
-        // The dynamic selection validates as one view step from the stacked reference to the selected slice
-        // reference, and any other output referent is a type mismatch.
-        let stacked = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3, 2])));
-        let slice = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2])));
-        assert_eq!(TestOperation::validate_view(&view, &stacked, &slice), Ok(()));
-        assert_eq!(
-            TestOperation::validate_view(&view, &stacked, &stacked),
-            Err(ReferenceViewValidationError::TypeMismatch {
-                expected: "f32[2]".to_string(),
-                actual: "f32[3, 2]".to_string(),
-            }),
         );
     }
 

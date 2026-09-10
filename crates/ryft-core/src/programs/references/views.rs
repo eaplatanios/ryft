@@ -1,25 +1,24 @@
 //! Contains machinery for representing and working with _reference views_ and paths layered on the structural
 //! [`ReferenceAnalysis`]. The generic analysis records _that_ a reference-typed value is a narrowing view of its
 //! [`ReferenceRoot`], through [`ReferenceAliasEdge`](crate::ReferenceAliasEdge)s of kind [`ReferenceAliasKind::View`],
-//! but leaves the selection itself to the value family (e.g., an array view is an index or slice, while a downstream
-//! family may split a register into halves). [`ReferenceViewOperation`] describes these selections for an operation
-//! family, and [`ReferenceViewAnalysis`] composes the per-edge descriptions into a [`ReferenceViewPath`] for every
-//! reference-typed value. Transforms that rebuild references (e.g., for tangent, cotangent, and residual
-//! reconstruction) consult the view analysis and reapply descriptions through the same contract, so no transform ever
-//! matches view operations by name, and downstream operations such as the array family's `reference_index` and
-//! `reference_slice` operations are not special-cased anywhere.
+//! but leaves the view itself to the value family (e.g., an array view is an index or slice, while a downstream family
+//! may split a register into halves). [`ReferenceViewOperation`] defines these views for an operation family, and
+//! [`ReferenceViewAnalysis`] composes the per-edge views into a [`ReferenceViewPath`] for every reference-typed value.
+//! Transforms that rebuild references (e.g., for tangent, cotangent, and residual reconstruction) consult the view
+//! analysis and reapply views through the same contract, so no transform ever matches view operations by name, and
+//! downstream operations such as the array family's `reference_index` and `reference_slice` operations are not
+//! special-cased anywhere.
 //!
-//! Everything in this module leverages static dispatch on the operation family `O`. View descriptions are owned data,
-//! validation and reapplication are associated functions of the family, so the contract composes with the closed
-//! operation enums that backends own.
+//! This module uses static dispatch on the operation family `O`. Views are owned data; validation and reapplication are
+//! associated functions of the family, so the contract composes with the closed operation enums that backends own.
 //!
 //! # Symbols And Bindings
 //!
-//! A view description may depend on values supplied to its [`Instruction`](crate::Instruction), such as a scalar array
-//! index. Its [`ReferenceView::symbols`] function lists the positions of those inputs. Analysis binds each position to
-//! the corresponding [`ValueId`]. The description and these bindings form a [`ReferenceViewStep`]. Static descriptions
-//! have no symbols and carry empty bindings. Index values created by an enclosing loop enter as ordinary region
-//! inputs, so analysis does not need loop-specific symbols or names.
+//! A view may depend on values supplied to its [`Instruction`](crate::Instruction), such as a scalar array index. Its
+//! [`ReferenceView::symbols`] function lists the positions of those inputs. Analysis binds each position to the
+//! corresponding [`ValueId`]. The view and these bindings form a [`ReferenceViewStep`]. Static views have no symbols
+//! and carry empty bindings. Index values created by an enclosing loop enter as ordinary region inputs, so analysis
+//! does not need loop-specific symbols or names.
 //!
 //! The binding type is a parameter of the path because the same path shape serves consumers that close symbols
 //! differently: the view analysis binds program identities, an eager handle carries only static steps and uses
@@ -27,34 +26,33 @@
 //!
 //! # Validating Views Against Transformed References
 //!
-//! A view description is validated against the _current_ source reference type before it is reapplied. A tangent or
-//! cotangent root may have a different referent type from the primal root (e.g., a widened floating-point tangent
-//! type), so a description that was valid on the primal root is re-checked against the transformed root rather than
-//! assumed to transfer.
+//! A view is validated against the _current_ source reference type before it is reapplied. A tangent or cotangent root
+//! may have a different referent type from the primal root (e.g., a widened floating-point tangent type), so a view
+//! that was valid on the primal root is re-checked against the transformed root rather than assumed to transfer.
 //!
 //! # Batching Moves The Axis Through The Mapping
 //!
-//! [`ReferenceViewOperation::reapply_reference_view`] rebuilds a description over a root with the same dimensions as
-//! the one it was derived on, which is what tangent, cotangent, and residual reconstruction need. Batching is different
-//! in that it inserts an axis into the packed root, and a primal description reapplied unchanged to a batched root
-//! would index or slice the wrong axis. The contract therefore splits the two concerns.
-//! [`BatchableReferenceView::batch`] is pure axis arithmetic on the description (i.e., given the packed source type
-//! and the source's batch axis, it returns the description that selects the same part of each item of the packed source
-//! together with the batch axis of the derived reference). The shared rule [`batch_reference_view_operation`] then
-//! binds that batched description through [`reapply_reference_view`](ReferenceViewOperation::reapply_reference_view)
-//! on the parent context, so every view operation of every family batches through one rule and no operation carries
-//! the axis arithmetic itself.
+//! [`ReferenceViewOperation::reapply_reference_view`] rebuilds a view over a root with the same dimensions as the one
+//! it was derived on, which is what tangent, cotangent, and residual reconstruction need. Batching is different in that
+//! it inserts an axis into the packed root, and a primal view reapplied unchanged to a batched root would index or
+//! slice the wrong axis. The contract therefore splits the two concerns. [`BatchableReferenceView::batch`] is pure axis
+//! arithmetic on the view (i.e., given the packed source type and the source's batch axis, it returns the view that
+//! selects the same part of each item of the packed source together with the batch axis of the derived reference). The
+//! shared rule [`batch_reference_view_operation`] then binds that batched view through
+//! [`reapply_reference_view`](ReferenceViewOperation::reapply_reference_view) on the parent context, so every view
+//! operation of every family batches through one rule and no operation carries the axis arithmetic itself.
 //!
 //! # Overlap Queries
 //!
 //! Two paths of one root may select the same part, provably disjoint parts, or parts whose overlap is not decidable
 //! statically. [`ReferenceView::overlap`] answers that question for two paths starting from the same complete reference
 //! as a [`ReferenceViewOverlap`]; [`ReferenceViewPath::overlap`] and [`ReferenceViewAnalysis::overlap`] expose it on
-//! paths and on analyzed values. Equal symbol bindings identify the same value, but the view descriptions must also
-//! agree for the selections to be identical. For example, array indexing can clamp the same index differently after
-//! two different slices. The value family accounts for these semantics; generic consumers must treat
-//! [`MayOverlap`](ReferenceViewOverlap::MayOverlap) conservatively. Proving disjoint selections does not establish
-//! independent reference lifetimes or permit a transform to split one allocation into independently updated states.
+//! paths and on analyzed values. Equal symbol bindings identify the same value, but the views must also agree for the
+//! selected parts to be identical. For example, array indexing can clamp the same index differently after two different
+//! slices. The value family accounts for these semantics; generic consumers must treat
+//! [`MayOverlap`](ReferenceViewOverlap::MayOverlap) conservatively. Proving that two views select disjoint parts does
+//! not establish independent reference lifetimes or permit a transform to split one allocation into independently
+//! updated states.
 //!
 //! # Region Boundaries
 //!
@@ -86,21 +84,21 @@ use crate::programs::transforms::{Transform, TransformArtifact};
 use crate::programs::types::{Type, Typed};
 use crate::programs::values::{Value, ValueId};
 
-/// Error produced by [`ReferenceViewOperation::validate_reference_view`] when a view description does not compose onto
-/// its source reference type or does not derive the declared output reference type.
+/// Error produced by [`ReferenceViewOperation::validate_reference_view`] when a view does not compose onto its source
+/// reference type or does not derive the declared output reference type.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum ReferenceViewValidationError {
-    /// The description composes onto the source but derives a referent type that differs from the declared one.
+    /// The view composes onto the source but derives a referent type that differs from the declared one.
     #[error("view declares referent type `{actual}` but derives referent type `{expected}` from its source")]
     TypeMismatch {
-        /// Referent type derived by the description from the source.
+        /// Referent type derived by the view from the source.
         expected: String,
 
         /// Referent type declared by the view output.
         actual: String,
     },
 
-    /// The description cannot be applied to the source reference type at all.
+    /// The view cannot be applied to the source reference type at all.
     #[error("invalid view composition: {message}")]
     InvalidComposition {
         /// Description of why the view is invalid for the source.
@@ -111,16 +109,16 @@ pub enum ReferenceViewValidationError {
 /// Error produced by [`ReferenceViewAnalysis`] when the generic reference analysis fails or when a derived view path
 /// cannot be reconciled with the program's declared reference types. Conversion to [`ProgramError`] preserves an
 /// underlying [`ReferenceAnalysisError`] through its typed conversion. View-specific failures are preserved through
-/// [`ReferenceError::ViewAnalysis`](crate::ReferenceError::ViewAnalysis). Invalid descriptions retain their
-/// [`ReferenceViewValidationError`] as an error source; positions and symbols identify the exact declaration
-/// that failed without duplicating the validation error's variants.
+/// [`ReferenceError::ViewAnalysis`](crate::ReferenceError::ViewAnalysis). Invalid views retain their
+/// [`ReferenceViewValidationError`] as an error source; positions and symbols identify the exact
+/// declaration that failed without duplicating the validation error's variants.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Error)]
 pub enum ReferenceViewAnalysisError {
     /// The structural reference analysis rejected the region and its attached computation regions.
     #[error(transparent)]
     Analysis(#[from] ReferenceAnalysisError),
 
-    /// An operation declares a view for an output but supplies no description for it.
+    /// An operation declares a view for an output but supplies no view for it.
     #[error(
         "operation `{operation}` at {instruction} declares a reference view at output {output_index} \
          but describes no view"
@@ -132,11 +130,11 @@ pub enum ReferenceViewAnalysisError {
         /// Instruction applying the operation.
         instruction: InstructionId,
 
-        /// Output whose view description is missing.
+        /// Output whose view is missing.
         output_index: usize,
     },
 
-    /// A view description cannot be applied to its source or derives a type different from the declared type.
+    /// A view cannot be applied to its source or derives a type different from the declared type.
     /// The underlying validation error retains the type mismatch or invalid-composition diagnostic.
     #[error("operation `{operation}` at {instruction} has an invalid view at output {output_index}: {source}")]
     InvalidView {
@@ -188,17 +186,17 @@ impl From<ReferenceViewAnalysisError> for ProgramError {
 }
 
 /// Uninhabited binding of [`ReferenceViewPath`]s that only ever carry static [`ReferenceViewStep`]s, such as the path
-/// of an eager array reference handle. Every step of such paths has empty bindings; consumers must reject descriptions
-/// that require symbols because no binding value can be supplied for them.
+/// of an eager array reference handle. Every step of such paths has empty bindings; consumers must reject views that
+/// require symbols because no binding value can be supplied for them.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum NoReferenceViewBinding {}
 
-/// Represents whether two views of the same reference allocation select separate parts, exactly the same part,
-/// or potentially overlapping parts, as determined by [`ReferenceView::overlap`]. Both paths describe selections
-/// starting from the complete allocation. For example, `root[0]` and `root[1]` select different elements and are
-/// disjoint, while `root[i]` and `root[j]` may overlap when the values of `i` and `j` are unknown. Each symbolic
-/// index in a path has a binding identifying the program value that supplies it; that binding does not imply that
-/// the index's runtime value is known.
+/// Represents whether two views of the same reference allocation select separate parts, exactly the same part, or
+/// potentially overlapping parts, as determined by [`ReferenceView::overlap`]. Both paths apply views starting from
+/// the complete allocation. For example, `root[0]` and `root[1]` select different elements and are disjoint, while
+/// `root[i]` and `root[j]` may overlap when the values of `i` and `j` are unknown. Each symbolic index in a path has a
+/// binding identifying the program value that supplies it; that binding does not imply that the index's runtime value
+/// is known.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ReferenceViewOverlap {
     /// The two paths _provably_ select disjoint parts of the root.
@@ -207,20 +205,20 @@ pub enum ReferenceViewOverlap {
     /// The two paths _provably_ select exactly the same part of the root.
     Same,
 
-    /// The two paths may overla meaning that their static selections intersect, or a selection depends on a symbol
-    /// whose binding cannot _prove_ the paths identical or disjoint.
+    /// The two paths may overlap: they select intersecting parts, or a view depends on a symbol whose binding cannot
+    /// prove the paths identical or disjoint.
     MayOverlap,
 }
 
-/// Owned description of one view step of a reference family, from a source reference to the reference it derives.
-/// Descriptions contain selection metadata, such as an array axis and a static index or an input position naming a
-/// dynamic index. They do not contain the reference allocation or the dynamic index value itself; [`ReferenceViewStep`]
-/// pairs a description with those index values or their program identities.
+/// Metadata describing a view from a source reference to a derived reference in the same allocation. Views contain
+/// metadata, such as an array axis and a static index or an input position naming a dynamic index. They do not contain
+/// the reference allocation or the dynamic index value itself; [`ReferenceViewStep`] pairs a view with those index
+/// values or their program identities.
 ///
 /// The `'static`, [`Send`], and [`Sync`] bounds allow [`ReferenceViewAnalysis`] to be retained as type-erased metadata
 /// in the region's transform cache (refer to [`RegionRef::transform`] for more information on that). In particular,
-/// `'static` prevents descriptions from borrowing temporary data; it does not require their instances to live forever.
-/// Owned selection metadata satisfies this bound. Equality supports revalidation against a fresh analysis, and hashing
+/// `'static` prevents views from borrowing temporary data; it does not require their instances to live forever.
+/// Owned view metadata satisfies this bound. Equality supports revalidation against a fresh analysis, and hashing
 /// lets paths serve as part of eager reference handles' identities.
 pub trait ReferenceView: 'static + Clone + Debug + PartialEq + Eq + Hash + Send + Sync {
     /// Reference type family this [`ReferenceView`] addresses.
@@ -231,7 +229,7 @@ pub trait ReferenceView: 'static + Clone + Debug + PartialEq + Eq + Hash + Send 
     /// [`Instruction`](crate::Instruction) that produces the view. For example, a dynamic indexing instruction with
     /// inputs `[reference, index]` uses symbol `1` to name its index input and returns `vec![1]`. That symbol is the
     /// input position, not the index's runtime value. A static index stored directly in the view needs no input
-    /// binding, so a view containing only static selections returns an empty vector.
+    /// binding, so a view containing only static views returns an empty vector.
     fn symbols(&self) -> Vec<usize>;
 
     /// Returns whether `lhs` and `rhs` select separate parts, exactly the same part, or potentially overlapping parts
@@ -239,11 +237,11 @@ pub trait ReferenceView: 'static + Clone + Debug + PartialEq + Eq + Hash + Send 
     /// complete allocation. For example, paths selecting `reference[0]` and `reference[1]` are disjoint, while paths
     /// selecting `reference[i]` and `reference[j]` may overlap when their indices are unknown. Equal symbol bindings
     /// identify the same program value. Different bindings do not prove that the runtime values differ. Comparing
-    /// symbolic selections must also account for the selections themselves, including any clamping.
+    /// symbolic views must also account for the views themselves, including any clamping.
     ///
     /// Note that an empty path selects the complete allocation, two empty paths are considered
-    /// [`Same`](ReferenceViewOverlap::Same), and an empty path may overlap with a path selecting only part of
-    /// the allocation. Paths are validated when they are derived, and implementations may conservatively return
+    /// [`Same`](ReferenceViewOverlap::Same), and an empty path may overlap with a path selecting only part of the
+    /// allocation. Paths are validated when they are derived, and implementations may conservatively return
     /// [`MayOverlap`](ReferenceViewOverlap::MayOverlap) for a malformed path instead of failing.
     ///
     /// # Parameters
@@ -258,15 +256,15 @@ pub trait ReferenceView: 'static + Clone + Debug + PartialEq + Eq + Hash + Send 
     ) -> ReferenceViewOverlap;
 }
 
-/// Optional batching capability for a [`ReferenceView`]. Implementations adjust a selection when its source reference
+/// Optional batching capability for a [`ReferenceView`]. Implementations adjust a view when its source reference
 /// gains a batch axis. Reference families that support analysis and discharge without batching need only implement
 /// [`ReferenceView`] but batching rules additionally require this trait.
 pub trait BatchableReferenceView: ReferenceView {
     /// Moves the batch axis of a source reference through this [`ReferenceView`] mapping. The batch axis of a reference
-    /// is an axis of its packed referent that the per-item view never sees, so the batched description must select the
-    /// same part of each item of the packed source that this description selects of the unbatched one, and the derived
-    /// reference has its own batch axis. This is pure axis arithmetic: the symbols of the description are untouched,
-    /// and a replicated `batch_axis` returns the description unchanged and replicated.
+    /// is an axis of its packed referent that the per-item view never sees, so the batched view must select the same
+    /// part of each item of the packed source that this view selects of the unbatched one, and the derived reference
+    /// has its own batch axis. This is pure axis arithmetic: the symbols of the view are untouched, and a replicated
+    /// `batch_axis` returns the view unchanged and replicated.
     ///
     /// # Parameters
     ///
@@ -275,40 +273,39 @@ pub trait BatchableReferenceView: ReferenceView {
     ///
     /// # Errors
     ///
-    /// Returns a [`BatchingError`] when this family cannot carry `batch_axis` through the description (e.g., a family
-    /// without axes rejects every mapped axis, and a static array slice cannot span a dynamically sized batch axis).
+    /// Returns a [`BatchingError`] when this family cannot carry `batch_axis` through the view (e.g., a family without
+    /// axes rejects every mapped axis, and a static array slice cannot span a dynamically sized batch axis).
     fn batch(&self, r#type: &Self::Type, batch_axis: BatchAxis) -> Result<(Self, BatchAxis), BatchingError>;
 }
 
-/// Static view contract of an operation family that specifies the owned description of every view alias the family
-/// can derive, its type-level validation, and its reapplication to another reference with compatible dimensions. An
-/// operation family implements this trait once, and every transform that rebuilds references (e.g., tangent, cotangent,
-/// and residual reconstruction) then reaches the family's views through it: [`ReferenceViewAnalysis`] composes the
-/// descriptions into per-value [`ReferenceViewPath`]s, and reconstruction reapplies them step by step to the
-/// transformed root. A tangent or cotangent root may have a different referent type from the primal root, so each
-/// description is validated against the current transformed source type before it is reapplied. Batching does not
-/// reapply a primal description unchanged, because a batched root has an extra axis; it first moves the batch axis
-/// through the description with [`BatchableReferenceView::batch`] and then reapplies the batched description, which
-/// is what [`batch_reference_view_operation`] does for every view operation.
+/// View contract of an operation family that specifies a view for every view alias the family can derive, its
+/// type-level validation, and its reapplication to another reference with compatible dimensions. An operation family
+/// implements this trait once, and every transform that rebuilds references (e.g., tangent, cotangent, and residual
+/// reconstruction) then reaches the family's views through it: [`ReferenceViewAnalysis`] composes the views into
+/// per-value [`ReferenceViewPath`]s, and reconstruction reapplies them step by step to the transformed root. A tangent
+/// or cotangent root may have a different referent type from the primal root, so each view is validated against the
+/// current transformed source type before it is reapplied. Batching does not reapply a primal view unchanged, because
+/// a batched root has an extra axis; it first moves the batch axis through the view with
+/// [`BatchableReferenceView::batch`] and then reapplies the batched view, which is what
+/// [`batch_reference_view_operation`] does for every view operation.
 pub trait ReferenceViewOperation: Operation {
-    /// Description of one view step of this family, addressing this family's reference types.
+    /// View type of this family, addressing this family's reference types.
     type View: ReferenceView<Type = Self::Type>;
 
-    /// Returns the description of the view this operation derives at output `output_index`, or [`None`] when
-    /// that output is not a reference view. Exactly the outputs whose [`effects`](Operation::effects) declare
-    /// a [`ReferenceAlias`](crate::ReferenceAlias) of kind [`ReferenceAliasKind::View`] return [`Some`].
+    /// Returns the view this operation derives at output `output_index`, or [`None`] when that output
+    /// is not a reference view. Exactly the outputs whose [`effects`](Operation::effects) declare a
+    /// [`ReferenceAlias`](crate::ReferenceAlias) of kind [`ReferenceAliasKind::View`] return [`Some`].
     /// An operation that declares such an alias but returns [`None`] is rejected by the view analysis with
     /// [`ReferenceViewAnalysisError::MissingView`]. Symbol positions refer to the operation's non-reference inputs.
     fn reference_view(&self, output_index: usize) -> Option<Self::View>;
 
-    /// Validates that applying `view` to a reference of type `source` produces a reference of type `target`.
-    /// Both arguments are reference types, so implementations inspect their referent types when checking selection
-    /// and type compatibility. This function does not validate symbol bindings or an entire [`ReferenceViewPath`].
-    /// A path is checked by validating each view against the preceding view's resulting reference type.
+    /// Validates that applying `view` to a reference of type `source` produces a reference of type `target`. Both
+    /// arguments are reference types, so implementations inspect their referent types when checking view and type
+    /// compatibility. This function does not validate symbol bindings or an entire [`ReferenceViewPath`]. A path is
+    /// checked by validating each view against the preceding view's resulting reference type.
     ///
-    /// This function accepts one view, but its representation is defined by the operation family. For example, an
-    /// array view represents one indexing or slicing selection. Another family may represent a compound selection
-    /// as one view.
+    /// This function accepts one view, but its representation is defined by the operation family. For example, an array
+    /// view represents one indexing or slicing operation. Another family may represent several operations as one view.
     ///
     /// # Errors
     ///
@@ -321,17 +318,15 @@ pub trait ReferenceViewOperation: Operation {
         target: &Self::Type,
     ) -> Result<(), ReferenceViewValidationError>;
 
-    // TODO(eaplatanios): Review from here onwards.
-
     /// Applies `view` to the reference `source` through `context` and returns the resulting reference view. The result
     /// selects part of the same allocation as `source`. It does not copy the referenced data into a new allocation. The
     /// context determines whether the operation executes eagerly or is staged into a program.
     ///
-    /// This function lets transforms recreate a selection on another reference, such as a tangent or cotangent buffer.
-    /// For example, to recreate `reference[index]` on a cotangent buffer, pass that buffer as `source` and the value
-    /// of `index` in the reconstruction context as the only entry of `symbols`. A symbolic input position of `1` in
-    /// the view still takes its value from `symbols[0]`. This slice contains only the symbol values, not all
-    /// instruction inputs or their program identities. A static selection needs an empty slice.
+    /// This function lets transforms recreate a view on another reference, such as a tangent or cotangent buffer. For
+    /// example, to recreate `reference[index]` on a cotangent buffer, pass that buffer as `source` and the value of
+    /// `index` in the reconstruction context as the only entry of `symbols`. A symbolic input position of `1` in the
+    /// view still takes its value from `symbols[0]`. This slice contains only the symbol values, not all instruction
+    /// inputs or their program identities. A static view needs an empty slice.
     ///
     /// This function reapplies one view, not an entire [`ReferenceViewPath`]. To reconstruct a path, apply each view to
     /// the preceding result. When a caller requires a particular target type, it must first check compatibility using
@@ -348,8 +343,8 @@ pub trait ReferenceViewOperation: Operation {
     ///
     /// # Errors
     ///
-    /// Returns an error when the number of symbol values is incorrect or the selection cannot be applied to the
-    /// supplied reference and symbol values. Propagates errors from binding the operation through `context`.
+    /// Returns an error when the number of symbol values is incorrect or the view cannot be applied to the supplied
+    /// reference and symbol values. Propagates errors from binding the operation through `context`.
     fn reapply_reference_view<C: Context<Type = Self::Type, Operation = Self>>(
         context: &C,
         view: &Self::View,
@@ -358,19 +353,21 @@ pub trait ReferenceViewOperation: Operation {
     ) -> Result<C::Value, ProgramError>;
 }
 
-/// One selection applied to a reference, stored as a description and the values or program identities it depends on.
-/// A [`ReferenceViewPath`] composes these steps from a root reference to a derived reference.
+// TODO(eaplatanios): Review from here onwards.
+
+/// One view together with bindings for the values it depends on. A [`ReferenceViewPath`] composes these steps from a
+/// root reference to a derived reference.
 ///
-/// `View` is the description type, typically an implementation of [`ReferenceView`]. For example,
+/// `View` is the view type, typically an implementation of [`ReferenceView`]. For example,
 /// [`ArrayReferenceView`](crate::arrays::ArrayReferenceView) describes indexing one axis or slicing an array. It stores
-/// selection metadata, not the referenced array. A dynamic index is represented in the description by the position of
+/// metadata, not the referenced array. A dynamic index is represented in the view by the position of
 /// the instruction input supplying that index.
 ///
 /// `Binding` is the type used to represent each such input: [`ValueId`] during program analysis, or a context value
 /// during reference discharge. The `bindings` vector contains one entry per symbol reported by
-/// [`ReferenceView::symbols`], in that order. Static selections have no symbols and carry an empty vector.
+/// [`ReferenceView::symbols`], in that order. Static views have no symbols and carry an empty vector.
 ///
-/// For example, an instruction selecting `root[index]` has inputs `[root, index]`. Its array view description is
+/// For example, an instruction selecting `root[index]` has inputs `[root, index]`. Its array view is
 /// `Index { axis: 0, index: Symbolic(1) }`: `1` names the instruction's second input, not the array element to select.
 /// During analysis, the step binds that symbol to the [`ValueId`] of `index`. During discharge, it instead binds the
 /// symbol to the context value representing `index`, which can be passed directly to a dynamic slice operation.
@@ -384,23 +381,23 @@ pub struct ReferenceViewStep<View, Binding = ValueId> {
 }
 
 impl<View, Binding> ReferenceViewStep<View, Binding> {
-    /// Returns the description of this step.
+    /// Returns the view of this step.
     #[inline]
     pub fn view(&self) -> &View {
         &self.view
     }
 
-    /// Returns the binding of each symbol of the description, in the description's symbol order.
+    /// Returns the binding of each symbol of the view, in the order returned by [`ReferenceView::symbols`].
     #[inline]
     pub fn bindings(&self) -> &[Binding] {
         self.bindings.as_slice()
     }
 }
 
-/// Sequence of selections from a reference root to one derived reference, in the order they are applied.
+/// Sequence of view steps from a reference root to one derived reference, in the order they are applied.
 ///
-/// `View` describes one selection, such as [`ArrayReferenceView`](crate::arrays::ArrayReferenceView), and `Binding`
-/// represents the inputs needed by a symbolic selection. Each [`ReferenceViewStep`] pairs a `View` with a vector of
+/// `View` is the type of each view, such as [`ArrayReferenceView`](crate::arrays::ArrayReferenceView), and `Binding`
+/// represents the inputs needed by a symbolic view. Each [`ReferenceViewStep`] pairs a `View` with a vector of
 /// `Binding`s. The path stores these steps, but neither the root allocation nor its identity; [`ReferenceAnalysis`]
 /// identifies the root when analyzing a program.
 ///
@@ -408,15 +405,15 @@ impl<View, Binding> ReferenceViewStep<View, Binding> {
 /// selects an element from that row. With `View = ArrayReferenceView` and `Binding = ValueId`, the steps describe the
 /// two indexing operations and store the program identities of `row` and `column`. During discharge,
 /// `Binding = C::Value` stores their values in the reconstruction context instead, so the same path traversal can
-/// emit the selections without looking up source program identities.
+/// reapply the views without looking up source program identities.
 ///
-/// Eager reference handles resolve indices immediately into static selections and use [`NoReferenceViewBinding`].
-/// Their steps have empty binding vectors. See [`ReferenceViewStep`] for how an instruction input position in a
-/// description corresponds to a binding.
+/// Eager reference handles resolve indices immediately into static views and use [`NoReferenceViewBinding`]. Their
+/// steps have empty binding vectors. See [`ReferenceViewStep`] for how an instruction input position in a view
+/// corresponds to a binding.
 ///
 /// The empty path denotes the complete root. Complete root handles, capture constants, and forwarded complete
-/// references carry it. Equality and hashing compare step descriptions and bindings, not the identities of the
-/// reference handles or the array elements selected by different step sequences.
+/// references carry it. Equality and hashing compare step views and bindings, not the identities of the reference
+/// handles or the array elements selected by different step sequences.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct ReferenceViewPath<View, Binding = ValueId> {
     /// Refer to the documentation of [`Self::steps`].
@@ -436,7 +433,7 @@ impl<View, Binding> ReferenceViewPath<View, Binding> {
         self.steps.as_slice()
     }
 
-    /// Returns the ordered descriptions applied from the root outward, without their bindings.
+    /// Returns the ordered views applied from the root outward, without their bindings.
     #[inline]
     pub fn views(&self) -> impl ExactSizeIterator<Item = &View> + DoubleEndedIterator {
         self.steps.iter().map(ReferenceViewStep::view)
@@ -448,9 +445,9 @@ impl<View, Binding> ReferenceViewPath<View, Binding> {
         self.steps.is_empty()
     }
 
-    /// Returns a copy of this path extended by one more step applied to its current end, closing the symbols of `view`
-    /// over `bindings`. The caller must supply one binding per symbol in the description's symbol order; this generic
-    /// container does not validate the description or its bindings.
+    /// Returns a copy of this path extended by one more step applied to its current end, binding the symbols of `view`
+    /// to `bindings`. The caller must supply one binding per symbol in the order returned by
+    /// [`ReferenceView::symbols`]; this generic container does not validate the view or its bindings.
     pub fn with_step(&self, view: View, bindings: Vec<Binding>) -> Self
     where
         View: Clone,
@@ -462,8 +459,8 @@ impl<View, Binding> ReferenceViewPath<View, Binding> {
         Self { steps }
     }
 
-    /// Returns a copy of this path extended by one more static description applied to its current end. This is the
-    /// shorthand of [`with_step`](Self::with_step) with no bindings; the caller must ensure `view` requires no symbols.
+    /// Returns a copy of this path extended by one more static view applied to its current end. This is the shorthand
+    /// of [`with_step`](Self::with_step) with no bindings; the caller must ensure `view` requires no symbols.
     #[inline]
     pub fn with_view(&self, view: View) -> Self
     where
@@ -498,10 +495,10 @@ impl<View, Binding> Default for ReferenceViewPath<View, Binding> {
 ///
 /// Every reference-typed value has exactly one path. A root handle (a region input, an allocation, a capture constant,
 /// or a forwarded region output) has the empty path, an identity alias copies the path of its source, and a view alias
-/// copies the path of its source and appends the description its producing operation reports for that edge's output,
-/// after that description was validated against the source and output reference types. Nested region inputs are
-/// separate roots of the structural analysis and carry empty paths. Instructions in each region create views of those
-/// roots, with any symbolic input positions bound to values in that region.
+/// copies the path of its source and appends the view its producing operation reports for that edge's output, after
+/// that view was validated against the source and output reference types. Nested region inputs are separate roots of
+/// the structural analysis and carry empty paths. Instructions in each region create views of those roots, with any
+/// symbolic input positions bound to values in that region.
 ///
 /// The view analysis is retained in the region's transform cache under exactly the cache identity of the structural
 /// analysis (refer to the documentation of [`RegionRef::reference_view_analysis`]) and shares that analysis through an
@@ -525,10 +522,10 @@ impl<View> ReferenceViewAnalysis<View> {
     ///
     /// # Errors
     ///
-    /// Returns the [`ReferenceAnalysisError`] of the structural analysis when the closure violates the reference
-    /// model, and otherwise the first path derivation failure in canonical value order: an operation declaring a view
-    /// alias without describing it, a description that is invalid for its source, or a declared output referent that
-    /// differs from the derived one.
+    /// Returns the [`ReferenceAnalysisError`] of the structural analysis when the closure violates the reference model,
+    /// and otherwise the first path derivation failure in canonical value order: an operation declaring a view alias
+    /// without describing it, a view that is invalid for its source, or a declared output referent that differs from
+    /// the derived one.
     pub fn new<V: Value, O: ReferenceViewOperation<Type = V::Type, View = View>>(
         region: RegionRef<'_, V, O>,
         capture_count: usize,
@@ -565,23 +562,22 @@ impl<View> ReferenceViewAnalysis<View> {
         &self.analysis
     }
 
-    /// Returns the [`ReferenceViewPath`] from the root of the reference-typed `value` to the part it selects,
-    /// or [`None`] when `value` is not a reference-typed value of the closure. Root handles carry the empty path, and
-    /// so does a nested region input forwarded as a complete handle.
+    /// Returns the [`ReferenceViewPath`] from the root of the reference-typed `value` to the part it selects, or
+    /// [`None`] when `value` is not a reference-typed value of the closure. Root handles carry the empty path, and so
+    /// does a nested region input forwarded as a complete handle.
     #[inline]
     pub fn path(&self, value: ValueId) -> Option<&ReferenceViewPath<View>> {
         self.paths.get(&value)
     }
 
-    /// Returns the [`ReferenceViewPath`] of every reference-typed value of the closure, in canonical [`ValueId`]
-    /// order.
+    /// Returns the [`ReferenceViewPath`] of every reference-typed value of the closure, in canonical [`ValueId`] order.
     #[inline]
     pub fn paths(&self) -> impl Iterator<Item = (ValueId, &ReferenceViewPath<View>)> + '_ {
         self.paths.iter().map(|(value, path)| (*value, path))
     }
 
-    /// Returns the [`ReferenceViewOverlap`] between the parts that the reference-typed values `a` and `b` of one
-    /// region select, or [`None`] when either is not a reference-typed value of the closure or the two values belong to
+    /// Returns the [`ReferenceViewOverlap`] between the parts that the reference-typed values `a` and `b` of one region
+    /// select, or [`None`] when either is not a reference-typed value of the closure or the two values belong to
     /// different regions. Roots are region-relative (a nested region input is a root of its own namespace even when it
     /// carries a caller root), so only values of one region have comparable roots: values of different roots are
     /// [`Disjoint`](ReferenceViewOverlap::Disjoint), and values of one root delegate to [`ReferenceView::overlap`] with
@@ -665,8 +661,8 @@ impl<View> ReferenceViewAnalysis<View> {
         Ok(())
     }
 
-    /// Validates one view description against its source and result reference types, then binds each symbol to the
-    /// describing instruction's input value.
+    /// Validates one view against its source and result reference types, then binds each symbol to the describing
+    /// instruction's input value.
     fn derive_view_step<V: Value, O: ReferenceViewOperation<Type = V::Type, View = View>>(
         region: RegionRef<'_, V, O>,
         id: InstructionId,
@@ -756,17 +752,17 @@ impl<'r, V: Value, O: ReferenceViewOperation<Type = V::Type>> RegionRef<'r, V, O
     }
 }
 
-/// Batches one reference-view operation of the family of `C` through the [`BatchableReferenceView`] contract: the shared
-/// [`BatchableOperation`](crate::batching::BatchableOperation) rule of every operation whose effects declare only
-/// [`View`](ReferenceAliasKind::View) aliases of one source input.
+/// Batches one reference-view operation of the family of `C` through the [`BatchableReferenceView`] contract: the
+/// shared [`BatchableOperation`](crate::batching::BatchableOperation) rule of every operation whose effects declare
+/// only [`View`](ReferenceAliasKind::View) aliases of one source input.
 ///
 /// The rule reads the operation's [`effects`](Operation::effects) to find the single source input and the view outputs,
 /// requires every other input (the inputs named by the views' symbols) to be replicated, and then, for each view output
-/// in output order, moves the source's batch axis through the description with [`BatchableReferenceView::batch`] and binds the
-/// batched description over the packed source through [`ReferenceViewOperation::reapply_reference_view`] on the parent context,
-/// supplying the packed value of each input a symbol names. Each reapplication binds one operation on the parent, so an
-/// operation with several view outputs (e.g., a family that splits a register into two halves) is bound once per
-/// output, each time keeping the output the description denotes.
+/// in output order, moves the source's batch axis through the view with [`BatchableReferenceView::batch`] and binds the
+/// batched view over the packed source through [`ReferenceViewOperation::reapply_reference_view`] on the parent
+/// context, supplying the packed value of each input a symbol names. Each reapplication binds one operation on the
+/// parent, so an operation with several view outputs (e.g., a family that splits a register into two halves) is bound
+/// once per output, each time keeping the output the view denotes.
 ///
 /// # Parameters
 ///
@@ -779,8 +775,8 @@ impl<'r, V: Value, O: ReferenceViewOperation<Type = V::Type>> RegionRef<'r, V, O
 ///
 /// Returns [`BatchingError::UnsupportedOperation`] when the operation derives no view, views more than one source
 /// input, has outputs other than its views, has observable effects or attached regions, or has a mapped non-source
-/// input (batching a view through a mapped symbol is not supported). Propagates errors from [`BatchableReferenceView::batch`]
-/// and the parent context's binding.
+/// input (batching a view through a mapped symbol is not supported). Propagates errors from
+/// [`BatchableReferenceView::batch`] and the parent context's binding.
 pub fn batch_reference_view_operation<C, P, O>(
     operation: &O,
     context: &BatchingContext<C, P>,
@@ -826,7 +822,7 @@ where
     let Some(source_index) = source_index else {
         return Err(BatchingError::UnsupportedOperation { message: format!("`{name}` derives no reference view") });
     };
-    // Replaying descriptions preserves only the views themselves. Reject effects and attached computations whose
+    // Replaying views preserves only the views themselves. Reject effects and attached computations whose
     // execution would otherwise be silently dropped by this rule.
     if effects.summary().has_observable_effects_when_unused() || !operation.region_slots().is_empty() {
         return Err(BatchingError::UnsupportedOperation {
@@ -990,9 +986,9 @@ mod tests {
         builder.build(vec![snapshot], vec![Placeholder], vec![Placeholder]).unwrap()
     }
 
-    /// Array-IR family extended with one two-input view operation whose description selects index `symbol` on
-    /// axis 0 of its reference input, `symbolic_view(reference: ref<f32[n]>, index: i64) -> ref<f32[]>`, and with
-    /// operations exposing additional behavior to test the shared batching rule's validation.
+    /// Array-IR family extended with one two-input view operation which selects index `symbol` on axis 0 of its
+    /// reference input, `symbolic_view(reference: ref<f32[n]>, index: i64) -> ref<f32[]>`, and with operations exposing
+    /// additional behavior to test the shared batching rule's validation.
     #[derive(Clone, Debug)]
     enum SymbolicViewOperation {
         Native(TestOperation),
@@ -1001,7 +997,7 @@ mod tests {
     }
 
     impl SymbolicViewOperation {
-        /// Returns the view description used by the symbolic test operation.
+        /// Returns the view used by the symbolic test operation.
         fn view(symbol: usize) -> ArrayReferenceView {
             ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(symbol) }
         }
@@ -1153,8 +1149,8 @@ mod tests {
         }
     }
 
-    /// Builds `f(vector: ref<f32[2]>, index: i64) = read(symbolic_view(vector, index))`, whose view
-    /// describes its index through `symbol`.
+    /// Builds `f(vector: ref<f32[2]>, index: i64) = read(symbolic_view(vector, index))`, whose view describes its index
+    /// through `symbol`.
     fn symbolic_view_program(
         symbol: usize,
     ) -> Program<TestValue, SymbolicViewOperation, Vec<TestValue>, Vec<TestValue>> {
@@ -1324,7 +1320,7 @@ mod tests {
         assert_eq!(bound.steps()[1].bindings(), &[value(0, 3)]);
         assert_eq!(row.views().collect::<Vec<_>>(), vec![&index(0, 1)]);
 
-        // Equal descriptions can select different indices when their source bindings differ.
+        // Equal views can select different indices when their source bindings differ.
         assert_eq!(bound, row.with_step(symbolic.clone(), vec![value(0, 3)]));
         assert_ne!(bound, row.with_step(symbolic.clone(), vec![value(0, 4)]));
         assert_ne!(bound, row.with_step(symbolic, vec![value(1, 0)]));
@@ -1715,7 +1711,7 @@ mod tests {
 
     #[test]
     fn test_reference_view_analysis_new_binds_input_symbols() {
-        // The view analysis closes the description over the describing instruction: its input symbol binds to the index
+        // The view analysis closes the view over the describing instruction: its input symbol binds to the index
         // input's identity, and the static read output has no path.
         let program = symbolic_view_program(1);
         let analysis = ReferenceViewAnalysis::new(program.entry_region_ref(), 0).unwrap();
@@ -1976,7 +1972,7 @@ mod tests {
             .reference_new()
             .unwrap();
 
-        // A mapped source moves its batch axis through the description and binds the batched view on the parent: the
+        // A mapped source moves its batch axis through the view and binds the batched view on the parent: the
         // leading batch axis shifts the indexed per-item axis to packed axis 1 and the output keeps batch axis 0.
         let batch = ArrayIrBatch::new(reference.clone(), BatchAxis::new(0)).unwrap();
         let outputs = batch_reference_view_operation(&ReferenceIndexOperation::new(0, 2), &context, &[batch.clone()])

@@ -779,7 +779,8 @@ where
 // replicated. Stacked inputs are arrays or references and stacked outputs are arrays, never first-class dimensions,
 // because one shared dimension value cannot represent a different stacked extent for each batch item. A reference
 // stack keeps the batch axis fixed by its referent (which must lie behind the leading scan axis). The body receives
-// the whole packed root, and its explicit view instruction adjusts the selected axis through `ReferenceView::batch`.
+// the whole packed root, and its explicit view instruction adjusts the selected axis through
+// `BatchableReferenceView::batch`.
 impl<A, C> BatchableOperation<C, ArrayIrBatchingPolicy> for ScanOperation<ArrayIrValue<A>>
 where
     A: Value<Type = ArrayType>,

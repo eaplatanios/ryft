@@ -48,26 +48,27 @@ use indoc::indoc;
 use pretty_assertions::assert_eq;
 
 use ryft_core::{
-    AddOperation, ArrayIrType, AtomId, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableType,
-    BatchedOutputs, BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError, BatchingPolicy,
-    BoundaryPreservingBatchedProgram, Context, CotangentAccumulator, CotangentDestination, CotangentDestinationKind,
-    CotangentSeed, DifferentiableOperation, DifferentiableType, DifferentiationContext, DifferentiationDriver,
-    DifferentiationDual, DifferentiationError, DifferentiationPolicy, Domain, EagerContext, EffectClass, EffectClasses,
-    Effects, ExternalReferenceBinding, InstructionId, InterpretableOperation, InterpretationDriver, MaybeZero,
-    NoIdentity, OneOperation, Operation, OperationProvider, OutputRegionProvenance, Parameter, PartialValue,
-    PartiallyEvaluatableOperation, Placeholder, Program, ProgramBatchingOutputAxesPolicy, ProgramBuilder, ProgramError,
-    RecursiveBatchingPolicy, RecursiveReferenceDischargeDriver, Reference, ReferenceAccessMode, ReferenceAddUpdate,
-    ReferenceAddUpdateOperation, ReferenceAlias, ReferenceAliasEdge, ReferenceAliasKind, ReferenceBoundary,
-    ReferenceBoundaryError, ReferenceDischargeContext, ReferenceDischargeDriver, ReferenceDischargePolicy,
-    ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion, ReferenceDischargeResult,
-    ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceDischargeableType,
-    ReferenceEffect, ReferenceFreeze, ReferenceFreezeOperation, ReferenceId, ReferenceNew, ReferenceNewOperation,
-    ReferenceRead, ReferenceReadOperation, ReferenceSource, ReferenceSwap, ReferenceSwapOperation, ReferenceType,
-    ReferenceView, ReferenceViewOperation, ReferenceViewOverlap, ReferenceViewPath, ReferenceViewStep,
-    ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation, RegionId, RegionInterface, RegionRef,
-    RegionSlot, Trace, Tracer, TracingContext, TransposableOperation, TranspositionContext, TranspositionDriver, Type,
-    TypeError, Typed, Value, ValueId, Zero, ZeroOperation, batch, batch_reference_view_operation, check_count,
-    differentiate_at, discharge_reference_free_operation, validate_reference_boundary,
+    AddOperation, ArrayIrType, AtomId, BatchAxis, BatchAxisSpecification, BatchableOperation, BatchableReferenceView,
+    BatchableType, BatchedOutputs, BatchingContext, BatchingDriver, BatchingEntrypointPolicy, BatchingError,
+    BatchingPolicy, BoundaryPreservingBatchedProgram, Context, CotangentAccumulator, CotangentDestination,
+    CotangentDestinationKind, CotangentSeed, DifferentiableOperation, DifferentiableType, DifferentiationContext,
+    DifferentiationDriver, DifferentiationDual, DifferentiationError, DifferentiationPolicy, Domain, EagerContext,
+    EffectClass, EffectClasses, Effects, ExternalReferenceBinding, InstructionId, InterpretableOperation,
+    InterpretationDriver, MaybeZero, NoIdentity, OneOperation, Operation, OperationProvider, OutputRegionProvenance,
+    Parameter, PartialValue, PartiallyEvaluatableOperation, Placeholder, Program, ProgramBatchingOutputAxesPolicy,
+    ProgramBuilder, ProgramError, RecursiveBatchingPolicy, RecursiveReferenceDischargeDriver, Reference,
+    ReferenceAccessMode, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceAlias, ReferenceAliasEdge,
+    ReferenceAliasKind, ReferenceBoundary, ReferenceBoundaryError, ReferenceDischargeContext, ReferenceDischargeDriver,
+    ReferenceDischargePolicy, ReferenceDischargeRegionBoundary, ReferenceDischargeRegionBoundaryInsertion,
+    ReferenceDischargeResult, ReferenceDischargeTarget, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    ReferenceDischargeableType, ReferenceEffect, ReferenceFreeze, ReferenceFreezeOperation, ReferenceId, ReferenceNew,
+    ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSource, ReferenceSwap,
+    ReferenceSwapOperation, ReferenceType, ReferenceView, ReferenceViewOperation, ReferenceViewOverlap,
+    ReferenceViewPath, ReferenceViewStep, ReferenceViewValidationError, ReferenceWrite, ReferenceWriteOperation,
+    RegionId, RegionInterface, RegionRef, RegionSlot, Trace, Tracer, TracingContext, TransposableOperation,
+    TranspositionContext, TranspositionDriver, Type, TypeError, Typed, Value, ValueId, Zero, ZeroOperation, batch,
+    batch_reference_view_operation, check_count, differentiate_at, discharge_reference_free_operation,
+    validate_reference_boundary,
 };
 
 /// Destination universe of the downstream programs: the eager context over the register family, which is what a
@@ -907,9 +908,8 @@ enum RegisterView {
     Bit(usize),
 }
 
-// A half is a static description while a bit depends on the one index its symbol names. Registers have no axes,
-// so a replicated batch axis passes through either description unchanged and a mapped one is rejected. Paths are
-// compared step by step: two static halves are disjoint as soon as they differ, two bits are the same index iff their
+// A half is a static description while a bit depends on the one index its symbol names. Paths are compared step
+// by step: two static halves are disjoint as soon as they differ, two bits are the same index iff their
 // bindings are equal and may otherwise overlap, a bit and a half may overlap, and paths that agree on every shared step
 // are the same when they have the same length and otherwise one is a strict prefix that contains the other.
 impl ReferenceView for RegisterView {
@@ -922,29 +922,34 @@ impl ReferenceView for RegisterView {
         }
     }
 
-    fn batch(&self, _source: &RegisterIrType, batch_axis: BatchAxis) -> Result<(Self, BatchAxis), BatchingError> {
+    fn overlap(
+        _type: &RegisterIrType,
+        lhs: &[ReferenceViewStep<Self>],
+        rhs: &[ReferenceViewStep<Self>],
+    ) -> ReferenceViewOverlap {
+        for (lhs, rhs) in lhs.iter().zip(rhs.iter()) {
+            match (lhs.view(), rhs.view()) {
+                (Self::Half(lhs_half), Self::Half(rhs_half)) if lhs_half != rhs_half => {
+                    return ReferenceViewOverlap::Disjoint;
+                }
+                (Self::Half(_), Self::Half(_)) => {}
+                (Self::Bit(_), Self::Bit(_)) if lhs == rhs => {}
+                _ => return ReferenceViewOverlap::MayOverlap,
+            }
+        }
+        if lhs.len() == rhs.len() { ReferenceViewOverlap::Same } else { ReferenceViewOverlap::MayOverlap }
+    }
+}
+
+// Registers have no axes: replicated descriptions pass through unchanged, while mapped axes are unsupported.
+impl BatchableReferenceView for RegisterView {
+    fn batch(&self, _type: &RegisterIrType, batch_axis: BatchAxis) -> Result<(Self, BatchAxis), BatchingError> {
         if !batch_axis.is_replicated() {
             return Err(BatchingError::UnsupportedOperation {
                 message: "a register view cannot carry a mapped batch axis; registers have no axes".to_string(),
             });
         }
         Ok((*self, batch_axis))
-    }
-
-    fn overlap(
-        _root: &RegisterIrType,
-        a: &[ReferenceViewStep<Self>],
-        b: &[ReferenceViewStep<Self>],
-    ) -> ReferenceViewOverlap {
-        for (a, b) in a.iter().zip(b.iter()) {
-            match (a.view(), b.view()) {
-                (Self::Half(a_half), Self::Half(b_half)) if a_half != b_half => return ReferenceViewOverlap::Disjoint,
-                (Self::Half(_), Self::Half(_)) => {}
-                (Self::Bit(_), Self::Bit(_)) if a == b => {}
-                _ => return ReferenceViewOverlap::MayOverlap,
-            }
-        }
-        if a.len() == b.len() { ReferenceViewOverlap::Same } else { ReferenceViewOverlap::MayOverlap }
     }
 }
 
@@ -963,12 +968,12 @@ impl ReferenceViewOperation for RegisterOperation {
         }
     }
 
-    fn validate_view(
+    fn validate_reference_view(
         _view: &RegisterView,
         source: &RegisterIrType,
-        output: &RegisterIrType,
+        target: &RegisterIrType,
     ) -> Result<(), ReferenceViewValidationError> {
-        for r#type in [source, output] {
+        for r#type in [source, target] {
             if !r#type.is_reference() {
                 return Err(ReferenceViewValidationError::InvalidComposition {
                     message: format!("expected a register reference but got `{type}`"),
@@ -978,7 +983,7 @@ impl ReferenceViewOperation for RegisterOperation {
         Ok(())
     }
 
-    fn reapply_view<C: Context<Type = RegisterIrType, Operation = Self>>(
+    fn reapply_reference_view<C: Context<Type = RegisterIrType, Operation = Self>>(
         context: &C,
         view: &RegisterView,
         source: C::Value,
@@ -1268,7 +1273,10 @@ impl TransposableOperation<RegisterValue, RegisterOperation> for RegisterOperati
 // view goes through the shared view rule instead, which moves the source's (replicated) batch axis through the
 // description and binds the batched view on the parent context with the packed index.
 impl<
-    C: Context<Type = RegisterIrType, Operation: ReferenceViewOperation + From<RegisterOperation>>,
+    C: Context<
+            Type = RegisterIrType,
+            Operation: ReferenceViewOperation<View: BatchableReferenceView> + From<RegisterOperation>,
+        >,
     P: BatchingPolicy<C>,
 > BatchableOperation<C, P> for RegisterOperation
 {
@@ -1909,7 +1917,7 @@ fn test_downstream_view_operation_records_output_indices_and_distinct_paths() {
         EagerContext::<RegisterValue, RegisterOperation>::trace(
             |inputs: Vec<Tracer<TracingContext<RegisterValue, RegisterOperation>>>| {
                 let context = inputs[0].context().clone();
-                let high = RegisterOperation::reapply_view(
+                let high = RegisterOperation::reapply_reference_view(
                     &context,
                     &RegisterView::Half(RegisterHalf::High),
                     inputs[0].clone(),
@@ -2083,6 +2091,97 @@ fn test_downstream_dynamic_view_analysis_closes_the_index_input() {
 }
 
 #[test]
+fn test_downstream_reference_view_analysis_does_not_require_batching() {
+    /// A bit-selection operation whose description supports analysis without implementing batching.
+    #[derive(Clone, Debug, PartialEq, Eq, Hash)]
+    struct UnbatchedBit;
+
+    impl Operation for UnbatchedBit {
+        type Type = RegisterIrType;
+
+        fn name(&self) -> &'static str {
+            "register.unbatched_bit"
+        }
+
+        fn effects(&self) -> Cow<'_, Effects> {
+            Cow::Owned(RegisterOperation::Bit.effects().into_owned())
+        }
+
+        fn infer_output_types(
+            &self,
+            input_types: &[RegisterIrType],
+            region_interfaces: &[RegionInterface<RegisterIrType>],
+        ) -> Result<Vec<RegisterIrType>, TypeError> {
+            RegisterOperation::Bit.infer_output_types(input_types, region_interfaces)
+        }
+    }
+
+    impl ReferenceView for UnbatchedBit {
+        type Type = RegisterIrType;
+
+        fn symbols(&self) -> Vec<usize> {
+            vec![1]
+        }
+
+        fn overlap(
+            _type: &RegisterIrType,
+            lhs: &[ReferenceViewStep<Self>],
+            rhs: &[ReferenceViewStep<Self>],
+        ) -> ReferenceViewOverlap {
+            if lhs == rhs { ReferenceViewOverlap::Same } else { ReferenceViewOverlap::MayOverlap }
+        }
+    }
+
+    impl ReferenceViewOperation for UnbatchedBit {
+        type View = Self;
+
+        fn reference_view(&self, output_index: usize) -> Option<Self> {
+            (output_index == 0).then_some(Self)
+        }
+
+        fn validate_reference_view(
+            _view: &Self,
+            source: &RegisterIrType,
+            target: &RegisterIrType,
+        ) -> Result<(), ReferenceViewValidationError> {
+            RegisterOperation::validate_reference_view(&RegisterView::Bit(1), source, target)
+        }
+
+        fn reapply_reference_view<C: Context<Type = RegisterIrType, Operation = Self>>(
+            context: &C,
+            _view: &Self,
+            source: C::Value,
+            symbols: &[C::Value],
+        ) -> Result<C::Value, ProgramError> {
+            check_count!("input", symbols, 1, ProgramError);
+            let mut outputs = context.bind(Self, Vec::new(), &[source, symbols[0].clone()])?;
+            check_count!("output", outputs, 1, ProgramError);
+            Ok(outputs.remove(0))
+        }
+    }
+
+    // Two selections of the same bit close their symbols over the same input value. This analysis and its overlap
+    // query must compile using only ReferenceView; UnbatchedBit deliberately has no BatchableReferenceView impl.
+    let mut builder = ProgramBuilder::<RegisterValue, UnbatchedBit>::new();
+    let root = builder.add_input(RegisterIrType::Reference(ReferenceType::new(RegisterType)));
+    let index = builder.add_input(RegisterIrType::Register(RegisterType));
+    let first = builder.add_instruction(UnbatchedBit, Vec::new(), vec![root, index], None).unwrap()[0];
+    let second = builder.add_instruction(UnbatchedBit, Vec::new(), vec![root, index], None).unwrap()[0];
+    let program = builder
+        .build::<Vec<RegisterValue>, Vec<RegisterValue>>(Vec::new(), vec![Placeholder; 2], Vec::new())
+        .unwrap();
+    let region = program.entry_region_ref();
+    let analysis = region.reference_view_analysis(0).unwrap();
+    let first = ValueId::new(region.id(), first);
+    let second = ValueId::new(region.id(), second);
+    assert_eq!(
+        analysis.path(first),
+        Some(&ReferenceViewPath::root().with_step(UnbatchedBit, vec![ValueId::new(region.id(), index)])),
+    );
+    assert_eq!(analysis.overlap(region, first, second), Some(ReferenceViewOverlap::Same));
+}
+
+#[test]
 fn test_downstream_reference_view_analysis_binds_explicit_region_inputs() {
     let mut builder = ProgramBuilder::<RegisterValue, RegisterOperation>::new();
     let reference = builder.add_input(RegisterIrType::Reference(ReferenceType::new(RegisterType)));
@@ -2132,15 +2231,16 @@ fn test_downstream_dynamic_view_reapplies_with_its_index() {
     let source = RegisterValue::Reference(reference.clone());
     let bit = RegisterView::Bit(1);
     let reapplied =
-        RegisterOperation::reapply_view(&context, &bit, source.clone(), &[RegisterValue::Register(1)]).unwrap();
+        RegisterOperation::reapply_reference_view(&context, &bit, source.clone(), &[RegisterValue::Register(1)])
+            .unwrap();
     assert_eq!(reapplied, RegisterValue::BitReference { root: reference.clone(), index: 1 });
     assert_eq!(reapplied.read(), Ok(RegisterValue::Register(1)));
     assert_eq!(
-        RegisterOperation::reapply_view(&context, &bit, source.clone(), &[]),
+        RegisterOperation::reapply_reference_view(&context, &bit, source.clone(), &[]),
         Err(ProgramError::InvalidInputCount { expected: 1, actual: 0 }),
     );
     assert_eq!(
-        RegisterOperation::reapply_view(
+        RegisterOperation::reapply_reference_view(
             &context,
             &RegisterView::Half(RegisterHalf::Low),
             source.clone(),

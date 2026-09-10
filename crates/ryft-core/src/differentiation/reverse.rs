@@ -540,8 +540,9 @@ impl<V: Value, O: Operation<Type = V::Type>> Typed for CotangentStorage<V, O> {
 /// A rule accessing a primal reference view receives the corresponding view of its root's cotangent buffer. For
 /// example, a primal slice `r[i..i + k]` needs a slice of the cotangent buffer using the same indices. The context
 /// obtains the view path from the region's [`ReferenceViewAnalysis`](crate::ReferenceViewAnalysis) and reapplies its
-/// steps through [`ReferenceViewOperation::reapply_view`]. The root buffer is allocated if needed, and reconstruction
-/// validates the resulting view's type. An unavailable view path is rejected rather than treated as the whole root.
+/// steps through [`ReferenceViewOperation::reapply_reference_view`]. The root buffer is allocated if needed, and
+/// reconstruction validates the resulting view's type. An unavailable view path is rejected rather than treated
+/// as the whole root.
 ///
 /// The reverse sweep materializes known primal values into the transposed program before a rule needs them. The context
 /// retains these values separately from the generated cotangent views: two slices may share the same dynamic index
@@ -922,7 +923,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
                         })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                O::reapply_view(&self.parent, step.view(), view, symbols.as_slice())
+                O::reapply_reference_view(&self.parent, step.view(), view, symbols.as_slice())
             })?;
         }
 

@@ -20,6 +20,7 @@ use ryft_macros::Parameter;
 
 use crate::arrays::addressing::ArraySliceAxis;
 use crate::arrays::ir::ArrayIrValue;
+use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
 use crate::arrays::references::{ArrayReference, ArrayReferenceView, ArrayReferenceViewIndex, ArrayReferenceViewPath};
 use crate::arrays::types::arrays::ArrayType;
 use crate::arrays::types::data::DataType;
@@ -36,20 +37,105 @@ use crate::interpretation::{InterpretableOperation, InterpretationDriver};
 use crate::macros::check_count;
 use crate::operations::references::forwarded_tangent;
 use crate::operations::{
-    Add, AddOperation, ReferenceAddUpdate, ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation,
-    ReferenceNew, ReferenceNewOperation, ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation,
-    ReferenceWrite, ReferenceWriteOperation, Reshape, Slice, UpdateSlice,
+    Add, AddOperation, DynamicSliceOperation, DynamicUpdateSliceOperation, ReferenceAddUpdate,
+    ReferenceAddUpdateOperation, ReferenceFreeze, ReferenceFreezeOperation, ReferenceNew, ReferenceNewOperation,
+    ReferenceRead, ReferenceReadOperation, ReferenceSwap, ReferenceSwapOperation, ReferenceWrite,
+    ReferenceWriteOperation, Reshape, ReshapeOperation, Slice, SliceOperation, UpdateSlice, UpdateSliceOperation,
 };
 use crate::parameters::Parameter;
 use crate::partial::{PartialValue, PartiallyEvaluatableOperation};
 use crate::programs::{
-    Concretizable, EffectClasses, Effects, MaybeZero, Operation, OperationFormatter, OperationProvider, ProgramError,
-    ProjectedValue, ReferenceAlias, ReferenceAliasKind, ReferenceDischargeContext, ReferenceDischargeDriver,
-    ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation, ReferenceType, ReferenceView,
-    ReferenceViewOperation, ReferenceViewValidationError, RegionInterface, TypeError, Typed, Value, ValueProjection,
-    batch_reference_view_operation,
+    BatchableReferenceView, Concretizable, EffectClasses, Effects, MaybeZero, Operation, OperationFormatter,
+    OperationProvider, ProgramError, ProjectedValue, ReferenceAlias, ReferenceAliasKind, ReferenceDischargeContext,
+    ReferenceDischargeDriver, ReferenceDischargePolicy, ReferenceDischargeValue, ReferenceDischargeableOperation,
+    ReferenceType, ReferenceView, ReferenceViewOperation, ReferenceViewValidationError, RegionInterface, TypeError,
+    Typed, Value, ValueProjection, batch_reference_view_operation,
 };
 use crate::tracing::{Tracer, TracingContext};
+
+/// Operation-family constructors for the canonical array operations that one array-reference view traversal stages.
+///
+/// Mapping between a reference root and one derived handle's selected elements uses static or dynamic slices,
+/// reshapes, and corresponding updates. Both eager handles and the
+/// [`ArrayReferenceDischarge`](crate::ArrayReferenceDischarge) policy walk the same [`ArrayReferenceViewPath`]. This
+/// contract lets the staging consumer construct those operations in a closed operation family, so core array IR and
+/// backend-owned supersets share one traversal without matching operation names.
+///
+/// The view contract itself (which outputs are views, their [`ArrayReferenceView`] values, their type-level validation,
+/// and their reapplication to a transformed reference) is the family's [`ReferenceViewOperation`] implementation,
+/// which this trait refines to the array universe so that [`ArrayReferenceAnalysis`](crate::ArrayReferenceAnalysis)
+/// and the array discharge policy share one bound. The constructors here stage array-valued operations over
+/// *discharged* values and are discharge-only.
+pub trait ArrayReferenceViewOperation: ReferenceViewOperation<Type = ArrayIrType, View = ArrayReferenceView> {
+    /// Wraps a canonical homogeneous array reshape for reference-view staging.
+    fn from_reference_reshape(operation: ReshapeOperation) -> Self;
+
+    /// Wraps a canonical homogeneous array slice for reference-view staging.
+    fn from_reference_slice(operation: SliceOperation) -> Self;
+
+    /// Wraps a canonical homogeneous array update-slice for reference-view staging.
+    fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self;
+
+    /// Wraps a dynamic slice over discharged reference state.
+    fn from_reference_dynamic_slice(operation: DynamicSliceOperation) -> Self;
+
+    /// Wraps a dynamic update over discharged reference state.
+    fn from_reference_dynamic_update_slice(operation: DynamicUpdateSliceOperation) -> Self;
+}
+
+impl<A: Value<Type = ArrayType>> ReferenceViewOperation for ArrayIrOperation<A> {
+    type View = ArrayReferenceView;
+
+    fn reference_view(&self, output_index: usize) -> Option<ArrayReferenceView> {
+        // The view derivations are the only members whose reference semantics declare a view alias, and each
+        // declares it at its single output.
+        match self {
+            Self::ReferenceDynamicIndex(operation) if output_index == 0 => Some(operation.transform()),
+            Self::ReferenceIndex(operation) if output_index == 0 => Some(operation.transform()),
+            Self::ReferenceSlice(operation) if output_index == 0 => Some(operation.transform()),
+            _ => None,
+        }
+    }
+
+    fn validate_reference_view(
+        view: &ArrayReferenceView,
+        source: &ArrayIrType,
+        target: &ArrayIrType,
+    ) -> Result<(), ReferenceViewValidationError> {
+        validate_array_reference_view(view, source, target)
+    }
+
+    fn reapply_reference_view<C: Context<Type = ArrayIrType, Operation = Self>>(
+        context: &C,
+        view: &ArrayReferenceView,
+        source: C::Value,
+        symbols: &[C::Value],
+    ) -> Result<C::Value, ProgramError> {
+        reapply_array_reference_view(context, view, source, symbols)
+    }
+}
+
+impl<A: Value<Type = ArrayType>> ArrayReferenceViewOperation for ArrayIrOperation<A> {
+    fn from_reference_reshape(operation: ReshapeOperation) -> Self {
+        Self::Array(ArrayOperation::Reshape(operation))
+    }
+
+    fn from_reference_slice(operation: SliceOperation) -> Self {
+        Self::Array(ArrayOperation::Slice(operation))
+    }
+
+    fn from_reference_update_slice(operation: UpdateSliceOperation) -> Self {
+        Self::Array(ArrayOperation::UpdateSlice(operation))
+    }
+
+    fn from_reference_dynamic_slice(operation: DynamicSliceOperation) -> Self {
+        Self::Array(ArrayOperation::DynamicSlice(operation))
+    }
+
+    fn from_reference_dynamic_update_slice(operation: DynamicUpdateSliceOperation) -> Self {
+        Self::Array(ArrayOperation::DynamicUpdateSlice(operation))
+    }
+}
 
 /// Canonical operation name for [`ReferenceIndexOperation`].
 pub const REFERENCE_INDEX_OPERATION_NAME: &str = "reference_index";
@@ -343,7 +429,10 @@ impl<C: Context<Type = ArrayIrType, Operation: From<ReferenceDynamicIndexOperati
 }
 
 impl<
-    C: Context<Type = ArrayIrType, Operation: ReferenceViewOperation + From<ReferenceDynamicIndexOperation>>,
+    C: Context<
+            Type = ArrayIrType,
+            Operation: ReferenceViewOperation<View: BatchableReferenceView> + From<ReferenceDynamicIndexOperation>,
+        >,
     P: BatchingPolicy<C>,
 > BatchableOperation<C, P> for ReferenceDynamicIndexOperation
 {
@@ -657,7 +746,10 @@ impl<C: Context<Type = ArrayIrType, Value: ReferenceSlice<C::Value>>> Differenti
 }
 
 impl<
-    C: Context<Type = ArrayIrType, Operation: ReferenceViewOperation + From<ReferenceIndexOperation>>,
+    C: Context<
+            Type = ArrayIrType,
+            Operation: ReferenceViewOperation<View: BatchableReferenceView> + From<ReferenceIndexOperation>,
+        >,
     P: BatchingPolicy<C>,
 > BatchableOperation<C, P> for ReferenceIndexOperation
 {
@@ -674,7 +766,10 @@ impl<
 }
 
 impl<
-    C: Context<Type = ArrayIrType, Operation: ReferenceViewOperation + From<ReferenceSliceOperation>>,
+    C: Context<
+            Type = ArrayIrType,
+            Operation: ReferenceViewOperation<View: BatchableReferenceView> + From<ReferenceSliceOperation>,
+        >,
     P: BatchingPolicy<C>,
 > BatchableOperation<C, P> for ReferenceSliceOperation
 {
@@ -689,40 +784,41 @@ impl<
     }
 }
 
-/// Validates one [`ArrayReferenceView`] as a step from the reference type `source` to the reference type
-/// `output`. This is the array family's
-/// [`ReferenceViewOperation::validate_view`](crate::programs::ReferenceViewOperation::validate_view) rule, shared by
-/// every operation family that embeds the array view operations: the transform's
-/// [`output_type`](ArrayReferenceView::output_type) must be defined for the source referent and must equal
-/// the output referent exactly.
+/// Validates that applying `view` to a reference of type `source` produces a reference of type `target`. This is the
+/// array family's
+/// [`ReferenceViewOperation::validate_reference_view`](crate::programs::ReferenceViewOperation::validate_reference_view)
+/// rule, shared by every operation family that embeds the array view operations. The view's
+/// [`output_type`](ArrayReferenceView::output_type) must be defined for the source referent and must equal the target
+/// referent exactly. This checks one indexing or slicing selection; it does not validate symbol bindings or a composed
+/// view path.
 ///
 /// # Errors
 ///
 /// Returns [`ReferenceViewValidationError::InvalidComposition`] when either type is not a reference type or the
-/// transform cannot be applied to the source referent, and [`ReferenceViewValidationError::TypeMismatch`] when the
-/// derived referent differs from the declared one.
+/// selection cannot be applied to the source referent, and [`ReferenceViewValidationError::TypeMismatch`] when the
+/// derived referent differs from the target referent.
 pub fn validate_array_reference_view(
     view: &ArrayReferenceView,
     source: &ArrayIrType,
-    output: &ArrayIrType,
+    target: &ArrayIrType,
 ) -> Result<(), ReferenceViewValidationError> {
     let invalid = |error: TypeError| ReferenceViewValidationError::InvalidComposition { message: error.to_string() };
     let source = <&ReferenceType<ArrayType>>::try_from(source).map_err(invalid)?;
-    let output = <&ReferenceType<ArrayType>>::try_from(output).map_err(invalid)?;
+    let target = <&ReferenceType<ArrayType>>::try_from(target).map_err(invalid)?;
     let expected = view.output_type(source.referent()).map_err(invalid)?;
-    if expected != *output.referent() {
+    if expected != *target.referent() {
         return Err(ReferenceViewValidationError::TypeMismatch {
             expected: expected.to_string(),
-            actual: output.referent().to_string(),
+            actual: target.referent().to_string(),
         });
     }
     Ok(())
 }
 
-/// Stages one [`ArrayReferenceView`] over the reference `source` through `context` and returns the derived
-/// reference. This is the array family's
-/// [`ReferenceViewOperation::reapply_view`](crate::programs::ReferenceViewOperation::reapply_view) rule, shared by
-/// every operation family that embeds the array view operations. Static and symbolic indices stage
+/// Stages one [`ArrayReferenceView`] over the reference `source` through `context` and returns the derived reference.
+/// This is the array family's
+/// [`ReferenceViewOperation::reapply_reference_view`](crate::programs::ReferenceViewOperation::reapply_reference_view)
+/// rule, shared by every operation family that embeds the array view operations. Static and symbolic indices stage
 /// [`ReferenceIndexOperation`] and [`ReferenceDynamicIndexOperation`], respectively; a slice stages
 /// [`ReferenceSliceOperation`]. `symbols` supplies the scalar integer value for a symbolic index and is empty for
 /// static transforms.
@@ -1151,7 +1247,6 @@ mod tests {
     use crate::arrays::arrays::Array;
     use crate::arrays::batching::{ArrayIrBatch, ArrayIrBatchingPolicy};
     use crate::arrays::dimensions::DimensionValue;
-    use crate::arrays::operations::{ArrayIrOperation, ArrayOperation};
     use crate::arrays::references::{ArrayReferenceDischarge, ArrayReferenceViewError};
     use crate::arrays::types::data::DataType;
     use crate::arrays::types::dimensions::{Dimension, DimensionBounds, DimensionType, DimensionVariable, Shape};
@@ -1185,6 +1280,27 @@ mod tests {
     type TestSwap = ReferenceSwapOperation<ArrayType, ArrayIrType>;
     type TestAddUpdate = ReferenceAddUpdateOperation<ArrayType, ArrayIrType>;
     type TestFreeze = ReferenceFreezeOperation<ArrayType, ArrayIrType>;
+
+    #[test]
+    fn test_array_ir_operation_reference_view_dynamic_index() {
+        let view = ArrayReferenceView::Index { axis: 0, index: ArrayReferenceViewIndex::Symbolic(1) };
+        let operation = TestOperation::ReferenceDynamicIndex(ReferenceDynamicIndexOperation::new(0));
+        assert_eq!(operation.reference_view(0), Some(view.clone()));
+        assert_eq!(operation.reference_view(1), None);
+
+        // The dynamic selection validates as one view step from the stacked reference to the selected slice
+        // reference, and any other output referent is a type mismatch.
+        let stacked = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3, 2])));
+        let slice = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2])));
+        assert_eq!(TestOperation::validate_reference_view(&view, &stacked, &slice), Ok(()));
+        assert_eq!(
+            TestOperation::validate_reference_view(&view, &stacked, &stacked),
+            Err(ReferenceViewValidationError::TypeMismatch {
+                expected: "f32[2]".to_string(),
+                actual: "f32[3, 2]".to_string(),
+            }),
+        );
+    }
 
     #[test]
     fn test_reference_dynamic_index_operation_new() {
