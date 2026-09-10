@@ -184,37 +184,45 @@ impl From<ReferenceViewAnalysisError> for ProgramError {
     }
 }
 
-// TODO(eaplatanios): Review from here onwards.
-
-/// Uninhabited binding of paths that only ever carry static steps, such as the path of an eager array-reference
-/// handle. Every step has empty bindings; consumers must reject descriptions that require symbols because no binding
-/// value can be supplied for them.
+/// Uninhabited binding of [`ReferenceViewPath`]s that only ever carry static [`ReferenceViewStep`]s, such as the path
+/// of an eager array reference handle. Every step of such paths has empty bindings; consumers must reject descriptions
+/// that require symbols because no binding value can be supplied for them.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub enum NoReferenceViewBinding {}
 
-/// Overlap between the parts selected by two closed root-relative paths of one reference root, as decided statically by
-/// [`ReferenceView::overlap`].
+/// Represents whether two views of the same reference allocation select separate parts, exactly the same part,
+/// or potentially overlapping parts, as determined by [`ReferenceView::overlap`]. Both paths describe selections
+/// starting from the complete allocation. For example, `root[0]` and `root[1]` select different elements and are
+/// disjoint, while `root[i]` and `root[j]` may overlap when the values of `i` and `j` are unknown. Each symbolic
+/// index in a path has a binding identifying the program value that supplies it; that binding does not imply that
+/// the index's runtime value is known.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ReferenceViewOverlap {
-    /// The two paths provably select disjoint parts of the root.
+    /// The two paths _provably_ select disjoint parts of the root.
     Disjoint,
 
-    /// The two paths provably select exactly the same part of the root.
+    /// The two paths _provably_ select exactly the same part of the root.
     Same,
 
-    /// The two paths may overlap: their static selections intersect, or a selection depends on a symbol whose
-    /// binding cannot prove the paths identical or disjoint.
+    /// The two paths may overla meaning that their static selections intersect, or a selection depends on a symbol
+    /// whose binding cannot _prove_ the paths identical or disjoint.
     MayOverlap,
 }
 
+// TODO(eaplatanios): Review from here onwards.
+
 /// Owned description of one view step of a reference family, from a source reference to the reference it derives.
+/// Descriptions contain selection metadata, such as an array axis and a static index or an input position naming a
+/// dynamic index. They do not contain the reference allocation or the dynamic index value itself; [`ReferenceViewStep`]
+/// pairs a description with those index values or their program identities.
 ///
-/// The bounds are what the retained [`ReferenceViewAnalysis`] needs to live in a region's transform cache and to be
-/// revalidated against a fresh derivation, plus hashing so that paths of descriptions can key eager handles. A
-/// description may depend on values outside itself, which it names through [`symbols`](Self::symbols); refer to the
-/// module documentation for how the view analysis closes them.
+/// The `'static`, [`Send`], and [`Sync`] bounds allow [`ReferenceViewAnalysis`] to be retained as type-erased metadata
+/// in the region's transform cache (refer to [`RegionRef::transform`] for more information on that). In particular,
+/// `'static` prevents descriptions from borrowing temporary data; it does not require their instances to live forever.
+/// Owned selection metadata satisfies this bound. Equality supports revalidation against a fresh analysis, and hashing
+/// lets paths serve as part of eager reference handles' identities.
 pub trait ReferenceView: 'static + Clone + Debug + PartialEq + Eq + Hash + Send + Sync {
-    /// Reference type family the description addresses.
+    /// Reference type family this [`ReferenceView`] addresses.
     type Type: Type;
 
     /// Returns the symbols this description depends on, in the order their bindings and values are supplied to every
@@ -310,8 +318,22 @@ pub trait ReferenceViewOperation: Operation {
     ) -> Result<C::Value, ProgramError>;
 }
 
-/// One closed view step of a [`ReferenceViewPath`]: a description together with one binding per symbol the description
-/// reports, in [`ReferenceView::symbols`] order. Static descriptions carry empty bindings.
+/// One selection applied to a reference, stored as a description and the values or program identities it depends on.
+/// A [`ReferenceViewPath`] composes these steps from a root reference to a derived reference.
+///
+/// `View` is the description type, typically an implementation of [`ReferenceView`]. For example,
+/// [`ArrayReferenceView`](crate::arrays::ArrayReferenceView) describes indexing one axis or slicing an array. It stores
+/// selection metadata, not the referenced array. A dynamic index is represented in the description by the position of
+/// the instruction input supplying that index.
+///
+/// `Binding` is the type used to represent each such input: [`ValueId`] during program analysis, or a context value
+/// during reference discharge. The `bindings` vector contains one entry per symbol reported by
+/// [`ReferenceView::symbols`], in that order. Static selections have no symbols and carry an empty vector.
+///
+/// For example, an instruction selecting `root[index]` has inputs `[root, index]`. Its array view description is
+/// `Index { axis: 0, index: Symbolic(1) }`: `1` names the instruction's second input, not the array element to select.
+/// During analysis, the step binds that symbol to the [`ValueId`] of `index`. During discharge, it instead binds the
+/// symbol to the context value representing `index`, which can be passed directly to a dynamic slice operation.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct ReferenceViewStep<View, Binding = ValueId> {
     /// Refer to the documentation of [`Self::view`].
@@ -335,19 +357,26 @@ impl<View, Binding> ReferenceViewStep<View, Binding> {
     }
 }
 
-/// Ordered closed view steps from a reference root to one derived reference-typed value.
+/// Sequence of selections from a reference root to one derived reference, in the order they are applied.
 ///
-/// The path stores only the steps, in root-to-value order; the root itself is a property of the structural
-/// [`ReferenceAnalysis`]. The empty path is the identity and denotes the complete root. Complete root handles, capture
-/// constants, and forwarded complete references carry it. Equality and hashing distinguish different step sequences,
-/// not the values they were derived for.
+/// `View` describes one selection, such as [`ArrayReferenceView`](crate::arrays::ArrayReferenceView), and `Binding`
+/// represents the inputs needed by a symbolic selection. Each [`ReferenceViewStep`] pairs a `View` with a vector of
+/// `Binding`s. The path stores these steps, but neither the root allocation nor its identity; [`ReferenceAnalysis`]
+/// identifies the root when analyzing a program.
 ///
-/// `Binding` specifies how symbolic indices are represented at the point where the path is used. View analysis stores
-/// [`ValueId`]s identifying source program values. Reference discharge instead stores context values, so a symbolic
-/// index can be used directly when rebuilding a read or update in that context. Eager reference handles resolve indices
-/// immediately and use [`NoReferenceViewBinding`], since their paths do not store unresolved symbolic values. These
-/// representations share the same descriptions and path operations; only the values bound to their symbols differ.
-/// Refer to the module documentation for more information.
+/// For example, selecting `root[row][column]` produces two steps: the first selects a row from the root, and the second
+/// selects an element from that row. With `View = ArrayReferenceView` and `Binding = ValueId`, the steps describe the
+/// two indexing operations and store the program identities of `row` and `column`. During discharge,
+/// `Binding = C::Value` stores their values in the reconstruction context instead, so the same path traversal can
+/// emit the selections without looking up source program identities.
+///
+/// Eager reference handles resolve indices immediately into static selections and use [`NoReferenceViewBinding`].
+/// Their steps have empty binding vectors. See [`ReferenceViewStep`] for how an instruction input position in a
+/// description corresponds to a binding.
+///
+/// The empty path denotes the complete root. Complete root handles, capture constants, and forwarded complete
+/// references carry it. Equality and hashing compare step descriptions and bindings, not the identities of the
+/// reference handles or the array elements selected by different step sequences.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Parameter)]
 pub struct ReferenceViewPath<View, Binding = ValueId> {
     /// Refer to the documentation of [`Self::steps`].
