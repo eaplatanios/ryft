@@ -397,7 +397,7 @@ where
         + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
         + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
-        + ResidualZeroProvider<C::Type>,
+        + ResidualZeroProvider<C::Type, Operation = C::Operation>,
 {
     #[inline]
     fn named_axis(&self, name: &str) -> Option<NamedAxis> {

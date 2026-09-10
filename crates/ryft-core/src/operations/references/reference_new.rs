@@ -157,7 +157,10 @@ where
     T: Type,
     U: DifferentiableType,
     ReferenceNewOperation<T, U>: Operation<Type = U>,
-    C: Context<Type = U, Operation: From<ReferenceNewOperation<T, U>> + ResidualZeroProvider<U>> + Zero<C::Value>,
+    C: Context<
+            Type = U,
+            Operation: From<ReferenceNewOperation<T, U>> + ResidualZeroProvider<U, Operation = C::Operation>,
+        > + Zero<C::Value>,
 {
     // Forward mode allocates a tangent reference beside the primal one, initialized from the initial value's tangent.
     // A symbolic zero tangent is instantiated first, because the tangent reference must exist as a concrete allocation

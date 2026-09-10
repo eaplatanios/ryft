@@ -153,7 +153,10 @@ where
     T: Type,
     U: DifferentiableType,
     ReferenceSwapOperation<T, U>: Operation<Type = U>,
-    C: Context<Type = U, Operation: From<ReferenceSwapOperation<T, U>> + ResidualZeroProvider<U>> + Zero<C::Value>,
+    C: Context<
+            Type = U,
+            Operation: From<ReferenceSwapOperation<T, U>> + ResidualZeroProvider<U, Operation = C::Operation>,
+        > + Zero<C::Value>,
 {
     // The tangent reference is swapped exactly as the primal reference is, so the returned previous value pairs with
     // the previous tangent contents. A plumbing reference returns its previous value with a symbolic zero tangent. The
@@ -227,7 +230,7 @@ where
     V: Value<Type = U>,
     O: ReferenceViewOperation<Type = U>
         + From<AddOperation<U>>
-        + ResidualZeroProvider<U>
+        + ResidualZeroProvider<U, Operation = O>
         + OperationProvider<U, ReferenceNewOperation<U, U>, Operation = O>
         + From<ReferenceSwapOperation<T, U>>,
 {

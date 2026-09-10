@@ -307,7 +307,7 @@ where
         + DifferentiableOperation<C>
         + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
-        + ResidualZeroProvider<C::Type>,
+        + ResidualZeroProvider<C::Type, Operation = C::Operation>,
 {
     type Capture = C::Capture;
 

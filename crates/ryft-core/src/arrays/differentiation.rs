@@ -348,7 +348,7 @@ pub fn materialize_array_tangent<
             Type = ArrayIrType,
             Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
             Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-            Operation: ResidualZeroProvider<ArrayIrType> + OperationProjection<ArrayType>,
+            Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation> + OperationProjection<ArrayType>,
         > + Zero<C::Value>,
 >(
     context: &ProjectedContext<C, ArrayType>,

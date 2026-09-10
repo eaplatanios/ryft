@@ -28,6 +28,12 @@ use crate::programs::{
 /// _family_. It is a set of associated functions with no receiver (i.e., `self` argument), because it is invoked
 /// precisely when no [`Operation`] instance exists.
 ///
+/// The provider itself need not be an operation. Its emitted family is [`OperationProvider::Operation`], which fixes
+/// the operation type of every builder, context, and assembled zero in the protocol. This separates residual semantics
+/// from operation representation (i.e., a provider parameterized by the emitted family can share its algorithms across
+/// core and backend operations). A transform using its operation family as the provider requires
+/// `ResidualZeroProvider<T, Operation = O>` on that family `O`.
+///
 /// # How to Use It
 ///
 /// The protocol has three steps, executed by the differentiation machinery rather than by implementors:
@@ -63,16 +69,17 @@ use crate::programs::{
 /// family with a `From<ZeroOperation<T>>` conversion) receives the whole protocol through a blanket implementation that
 /// declares nothing, captures nothing, and spends by constructing the type-only zero (i.e., the fail-loud default
 /// rejects unexpected residuals rather than ignoring them, so a mismatched linearize/transpose pairing cannot be
-/// silently accepted). Only families whose zero genuinely consumes runtime dimension operands (e.g., the composite
-/// program family and its XLA counterpart) override the declaration, capture, and operation-assembly functions. Every
-/// spending path reuses that shared assembly.
+/// silently accepted). Providers whose zeros consume runtime dimension operands override the declaration, capture,
+/// and operation-assembly functions. The composite program family and its XLA counterpart delegate these functions to
+/// [`ArrayIrResidualZeroProvider`](crate::ArrayIrResidualZeroProvider), parameterized by the destination family.
+/// Every spending path reuses that shared assembly.
 ///
 /// [`LinearCallOperation`](crate::LinearCallOperation) retains residual values needed to transpose a non-trivial linear
 /// map by attaching explicit forward/transpose regions to an instruction. This trait retains the values needed to
 /// construct zeros, which have no instruction to attach a region to. Both preserve values that would otherwise be out
 /// of scope during reverse mode, and both leave residual selection and threading to the differentiation transform
 /// rather than storing residuals in primal operation payloads.
-pub trait ResidualZeroProvider<T: Type>: Operation + OperationProvider<T, ZeroOperation<T>, Operation = Self> {
+pub trait ResidualZeroProvider<T: Type>: OperationProvider<T, ZeroOperation<T>> {
     /// Returns the types of the residual values that a zero of `r#type` needs, in the exact order in which
     /// [`Self::capture_zero_residuals`] captures them and [`Self::zero_operation_with_residuals`] consumes them.
     /// Input-free [`Operation`] families use the empty default. The array-dimension composite family returns one
@@ -90,7 +97,7 @@ pub trait ResidualZeroProvider<T: Type>: Operation + OperationProvider<T, ZeroOp
     /// capture nothing.
     #[inline]
     fn capture_zero_residuals<V: Value<Type = T>>(
-        _builder: &mut ProgramBuilder<V, Self>,
+        _builder: &mut ProgramBuilder<V, Self::Operation>,
         _source: AtomId,
         _type: &T,
     ) -> Result<Vec<AtomId>, ProgramError> {
@@ -104,7 +111,7 @@ pub trait ResidualZeroProvider<T: Type>: Operation + OperationProvider<T, ZeroOp
     /// default resolves each declared residual independently through [`Self::capture_zero_residual_value`], which lets
     /// operation families implement one identity-directed value-level capture primitive. Input-free families declare
     /// no residuals and therefore return an empty list without consulting `source`.
-    fn capture_zero_residual_values<C: Context<Type = T, Operation = Self>>(
+    fn capture_zero_residual_values<C: Context<Type = T, Operation = Self::Operation>>(
         context: &C,
         source: &C::Value,
         r#type: &T,
@@ -133,7 +140,7 @@ pub trait ResidualZeroProvider<T: Type>: Operation + OperationProvider<T, ZeroOp
     /// speculative read would leave dead instructions behind. Input-free [`Operation`] families declare no residuals
     /// and therefore never reach this function, so the default answers [`None`].
     #[inline]
-    fn capture_zero_residual_value<C: Context<Type = T, Operation = Self>>(
+    fn capture_zero_residual_value<C: Context<Type = T, Operation = Self::Operation>>(
         _context: &C,
         _source: &C::Value,
         _residual_type: &T,
@@ -145,10 +152,10 @@ pub trait ResidualZeroProvider<T: Type>: Operation + OperationProvider<T, ZeroOp
     /// represents an input-free zero operation. Families whose zero consumes runtime dimensions override this function
     /// so that value-level binding, residualization, and builder-level staging share one operation assembly.
     #[inline]
-    fn zero_operation_with_residuals<R: Clone>(r#type: T, residuals: &[R]) -> Result<(Self, Vec<R>), ProgramError>
-    where
-        Self: Operation<Type = T>,
-    {
+    fn zero_operation_with_residuals<R: Clone>(
+        r#type: T,
+        residuals: &[R],
+    ) -> Result<(Self::Operation, Vec<R>), ProgramError> {
         if !residuals.is_empty() {
             return Err(ProgramError::InvalidArgument {
                 message: format!("input-free zero expected 0 residuals but got {}", residuals.len()),
@@ -187,16 +194,13 @@ pub trait ResidualZeroProvider<T: Type>: Operation + OperationProvider<T, ZeroOp
     ///     Only zero types that declare residuals consult them.
     fn materialize_zero_from_residual_sources<
         'v,
-        C: Context<Type = T, Value: 'v, Operation = Self> + Zero<C::Value>,
+        C: Context<Type = T, Value: 'v, Operation = Self::Operation> + Zero<C::Value>,
         I: IntoIterator<Item = &'v C::Value>,
     >(
         context: &C,
         zero: MaybeZero<C::Value>,
         sources: I,
-    ) -> Result<C::Value, ProgramError>
-    where
-        Self: Operation<Type = T>,
-    {
+    ) -> Result<C::Value, ProgramError> {
         let r#type = match zero {
             MaybeZero::Value(value) => return Ok(value),
             MaybeZero::Zero(r#type) => r#type,
@@ -265,7 +269,9 @@ impl<T: Type, O: Operation<Type = T> + From<ZeroOperation<T>>> ResidualZeroProvi
 ///   - `source`: Primal value whose runtime dimensions determine the zero.
 ///   - `r#type`: Type of the zero that will eventually consume the captured residuals.
 ///   - `site`: Description of the capture site included in malformed-provider diagnostics.
-pub(crate) fn capture_and_validate_zero_residual_values<C: Context<Operation: ResidualZeroProvider<C::Type>>>(
+pub(crate) fn capture_and_validate_zero_residual_values<
+    C: Context<Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>>,
+>(
     context: &C,
     source: &C::Value,
     r#type: &C::Type,
@@ -402,7 +408,9 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
     ///
     /// Returns [`ProgramError::MalformedProgram`] if the primal value/type counts differ or if an operation family
     /// captures residual values whose count or types disagree with its declaration.
-    pub fn capture<C: Context<Value = V, Type = V::Type, Operation: ResidualZeroProvider<C::Type>>>(
+    pub fn capture<
+        C: Context<Value = V, Type = V::Type, Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>>,
+    >(
         context: &C,
         primal_values: &[C::Value],
         primal_types: &[C::Type],
@@ -453,7 +461,7 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
     /// Returns a [`ProgramError`] if a zero cannot be materialized or if `live_values` does not contain exactly one
     /// value for every nonzero-space boundary leaf.
     pub fn rebuild<
-        C: Context<Value = V, Type = V::Type, Operation: ResidualZeroProvider<C::Type>>,
+        C: Context<Value = V, Type = V::Type, Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>>,
         I: IntoIterator<Item = C::Value>,
     >(
         &self,
@@ -498,7 +506,7 @@ impl<V: Value<Type: DifferentiableType>> ZeroSpaceBoundaryReconstruction<V> {
     ///
     /// Propagates zero-materialization and callback errors unchanged, stopping before processing subsequent leaves.
     pub fn rebuild_with<
-        C: Context<Value = V, Type = V::Type, Operation: ResidualZeroProvider<C::Type>>,
+        C: Context<Value = V, Type = V::Type, Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>>,
         R,
         F: FnMut(usize, Option<V>) -> Result<R, ProgramError>,
     >(

@@ -425,7 +425,7 @@ where
     C: Context<Type = ArrayIrType> + Zero<C::Value>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Operation: ResidualZeroProvider<ArrayIrType>
+    C::Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
         + From<ConcatenateOperation<ArrayIrType>>
         + From<DimensionSizeOperation>
         + From<DynamicShapeSliceOperation>

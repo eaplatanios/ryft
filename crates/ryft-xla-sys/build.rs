@@ -56,6 +56,40 @@ static JAX_COMMIT: LazyLock<&'static str> = LazyLock::new(|| {
         .expect("failed to parse `JAX_COMMIT` from `WORKSPACE`")
 });
 
+/// Crate-relative files and directories required by the Bazel native build. Directory entries are copied recursively.
+/// Keeping one inventory for copying and Cargo change tracking prevents clean source builds from silently missing
+/// native sources that are referenced by `BUILD.bazel`.
+static BAZEL_BUILD_PATHS: &[&str] = &[
+    ".bazelrc",
+    ".bazelversion",
+    "bazel",
+    "BUILD.bazel",
+    "patches",
+    "pjrt_plugin.def",
+    "pjrt_plugin_exported_symbols.txt",
+    "pjrt_plugin_version_script.lds",
+    "src/c++",
+    "tests",
+    "tools",
+    "WORKSPACE",
+];
+
+/// Copies `source` recursively to `target` while preserving its relative directory structure.
+fn copy_build_path(source: &Path, target: &Path) -> Result<()> {
+    if source.is_dir() {
+        fs::create_dir_all(target)?;
+        for entry in fs::read_dir(source)? {
+            let entry = entry?;
+            copy_build_path(&entry.path(), &target.join(entry.file_name()))?;
+        }
+    } else {
+        let target_directory = target.parent().unwrap();
+        fs::create_dir_all(target_directory)?;
+        fs::copy(source, target)?;
+    }
+    Ok(())
+}
+
 /// URL paired with an expected SHA-256 checksum for verifying downloads.
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct UrlWithChecksum {
@@ -706,57 +740,13 @@ impl BuildConfiguration {
         let current_path = env::current_dir().with_context(|| "Failed to get the current directory.")?;
         let output_path = PathBuf::from(env::var("OUT_DIR").with_context(|| "`OUT_DIR` not set")?);
 
-        // Copy the Bazel workspace files to the output directory.
-        // Also, monitor when they change to determine when a rebuild is necessary.
-        let bazel_files = vec![
-            PathBuf::from("bazel").join("archive.bzl"),
-            PathBuf::from("bazel").join("BUILD.bazel"),
-            PathBuf::from(".bazelrc"),
-            PathBuf::from(".bazelversion"),
-            PathBuf::from("BUILD.bazel"),
-            PathBuf::from("patches").join("BUILD.bazel"),
-            PathBuf::from("patches").join("jax-mosaic-c-api-visibility.patch"),
-            PathBuf::from("pjrt_plugin.def"),
-            PathBuf::from("pjrt_plugin_exported_symbols.txt"),
-            PathBuf::from("pjrt_plugin_version_script.lds"),
-            PathBuf::from("src").join("c++").join("common.h"),
-            PathBuf::from("src").join("c++").join("distributed.cc"),
-            PathBuf::from("src").join("c++").join("distributed.h"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("arith.cc"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("arith.h"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("gpu.cc"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("gpu.h"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("llvm.cc"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("llvm.h"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("mosaic_gpu.cc"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("mosaic_gpu.h"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("mosaic_tpu.cc"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("mosaic_tpu.h"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("nvgpu.cc"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("nvgpu.h"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("shape.cc"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("shape.h"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("sparse_tensor.cc"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("sparse_tensor.h"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("transform.cc"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("transform.h"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("triton.cc"),
-            PathBuf::from("src").join("c++").join("mlir").join("dialects").join("triton.h"),
-            PathBuf::from("src").join("c++").join("profiler.cc"),
-            PathBuf::from("src").join("c++").join("profiler.h"),
-            PathBuf::from("WORKSPACE"),
-        ];
-
-        for file_name in bazel_files {
-            let source_file = current_path.join(&file_name);
-            let target_file = output_path.join(&file_name);
-            let target_directory = target_file.parent().unwrap();
-            if let Err(error) = fs::create_dir_all(target_directory) {
-                bail!("failed to create {}; {error}", target_directory.display());
-            }
-            if let Err(error) = fs::copy(&source_file, &target_file) {
-                bail!("failed to copy {} to {}; {error}", source_file.display(), target_file.display());
-            }
+        // Copy the complete, scoped Bazel source inventory to the output directory. This is the workspace
+        // used when Cargo must build a native archive from source rather than consume a precompiled one.
+        for path in BAZEL_BUILD_PATHS {
+            let source = current_path.join(path);
+            let target = output_path.join(path);
+            copy_build_path(&source, &target)
+                .with_context(|| format!("failed to copy {} to {}", source.display(), target.display()))?;
         }
 
         let bazel_configs = match (self.operating_system, self.architecture, self.device) {
@@ -954,15 +944,10 @@ fn main() {
         return;
     }
 
-    println!("cargo::rerun-if-changed=bazel/archive.bzl");
-    println!("cargo::rerun-if-changed=bazel/BUILD.bazel");
-    println!("cargo::rerun-if-changed=.bazelrc");
-    println!("cargo::rerun-if-changed=.bazelversion");
-    println!("cargo::rerun-if-changed=BUILD.bazel");
-    println!("cargo::rerun-if-changed=pjrt_plugin.def");
-    println!("cargo::rerun-if-changed=pjrt_plugin_exported_symbols.txt");
-    println!("cargo::rerun-if-changed=pjrt_plugin_version_script.lds");
-    println!("cargo::rerun-if-changed=WORKSPACE");
+    for path in BAZEL_BUILD_PATHS {
+        println!("cargo::rerun-if-changed={path}");
+    }
+
     println!("cargo::rerun-if-env-changed={RYFT_XLA_SYS_ARCHIVE}");
     println!("cargo::rerun-if-env-changed={PJRT_PLUGIN_CUDA_12_LIB}");
     println!("cargo::rerun-if-env-changed={PJRT_PLUGIN_CUDA_13_LIB}");

@@ -461,7 +461,7 @@ impl<V: Value, O: Operation<Type = V::Type>> Linearization<V, O> {
     where
         V::Type: DifferentiableType,
         O: TransposableOperation<V, O>
-            + ResidualZeroProvider<V::Type>
+            + ResidualZeroProvider<V::Type, Operation = O>
             + OperationProvider<V::Type, ReferenceNewOperation<V::Type, V::Type>, Operation = O>
             + OperationProvider<V::Type, ReferenceAddUpdateOperation<V::Type, V::Type>, Operation = O>
             + From<AddOperation<V::Type>>,
@@ -722,7 +722,7 @@ impl<
     #[inline]
     pub fn apply(&self, tangents: Input::To<C::Value>) -> Result<Output::To<C::Value>, ProgramError>
     where
-        C::Operation: ResidualZeroProvider<C::Type>,
+        C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>,
     {
         // Flatten the caller's structured tangent tree and first validate it against the complete primal boundary,
         // including the leaves whose differential spaces contain only zero.
@@ -1133,7 +1133,7 @@ where
         + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
         + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
-        + ResidualZeroProvider<C::Type>,
+        + ResidualZeroProvider<C::Type, Operation = C::Operation>,
 {
     #[inline]
     fn jvp_program(
@@ -1587,7 +1587,7 @@ impl<C: Context, P: DifferentiationPolicy<C>> DifferentiationContext<C, P> {
             + DifferentiableOperation<C>
             + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
             + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
-            + ResidualZeroProvider<C::Type>,
+            + ResidualZeroProvider<C::Type, Operation = C::Operation>,
     {
         operation.validate_region_count(driver.region_count())?;
 
@@ -1671,7 +1671,7 @@ where
         + DifferentiableOperation<C>
         + DifferentiableOperation<TracingContext<C::Constant, C::Operation>>
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<C::Constant, C::Operation>>>
-        + ResidualZeroProvider<C::Type>,
+        + ResidualZeroProvider<C::Type, Operation = C::Operation>,
 {
     #[inline]
     fn lift(&self, constant: C::Constant) -> Result<DifferentiationTracer<C, P>, ProgramError> {
@@ -1793,7 +1793,7 @@ where
     O: PartiallyEvaluatableOperation<TracingContext<V, O>>
         + DifferentiableOperation<TracingContext<V, O>>
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<V, O>>>
-        + ResidualZeroProvider<V::Type>,
+        + ResidualZeroProvider<V::Type, Operation = O>,
 {
     /// Builds the fused Jacobian-Vector Product (JVP) [`Program`] of this borrowed [`Region`] with respect to
     /// `input_indices`. The program receives all primal inputs in source order, followed by tangent inputs in the
@@ -2463,7 +2463,7 @@ where
     O: PartiallyEvaluatableOperation<TracingContext<V, O>>
         + DifferentiableOperation<TracingContext<V, O>>
         + DifferentiableOperation<PartialEvaluationContext<TracingContext<V, O>>>
-        + ResidualZeroProvider<V::Type>,
+        + ResidualZeroProvider<V::Type, Operation = O>,
 {
     /// Builds the _fused_ Jacobian-Vector Product (JVP) [`Program`] of this [`Program`]. Assume the input program
     /// represents a function `f` from its inputs to its outputs, `x ↦ y = f(x)`. This function returns the program that
@@ -2723,7 +2723,7 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
         capture: Capture,
     ) -> Result<(Output::To<Self::Value>, Output::To<Self::Value>), DifferentiationError>
     where
-        Self::Operation: DifferentiableOperation<Self> + ResidualZeroProvider<Self::Type>,
+        Self::Operation: DifferentiableOperation<Self> + ResidualZeroProvider<Self::Type, Operation = Self::Operation>,
     {
         if primal.parameters().next().is_none() {
             return Err(DifferentiationError::EmptyInput);
@@ -2833,7 +2833,7 @@ pub trait ForwardModeDifferentiate: Context<Type: DifferentiableType> {
     where
         Self::Operation: PartiallyEvaluatableOperation<Self>
             + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
-            + ResidualZeroProvider<Self::Type>,
+            + ResidualZeroProvider<Self::Type, Operation = Self::Operation>,
     {
         if primal.parameters().next().is_none() {
             return Err(DifferentiationError::EmptyInput);
@@ -3152,7 +3152,10 @@ pub fn jvp_projected_operation<
 ///   - `source`: Primal program atom from which the provider obtains runtime geometry.
 ///   - `r#type`: Type of the zero that will later be materialized.
 ///   - `site`: Description of the capture site included in malformed-program diagnostics.
-fn capture_and_validate_zero_residual_atoms<V: Value, O: Operation<Type = V::Type> + ResidualZeroProvider<V::Type>>(
+fn capture_and_validate_zero_residual_atoms<
+    V: Value,
+    O: Operation<Type = V::Type> + ResidualZeroProvider<V::Type, Operation = O>,
+>(
     builder: &mut ProgramBuilder<V, O>,
     source: AtomId,
     r#type: &V::Type,
@@ -3196,7 +3199,9 @@ fn capture_and_validate_zero_residual_atoms<V: Value, O: Operation<Type = V::Typ
 ///   - `r#type`: Type of the zero to materialize.
 ///   - `residual_values`: Runtime geometry values declared by [`ResidualZeroProvider::zero_residual_types`], in
 ///     provider-declaration order.
-fn residualize_zero_from_residual_values<C: Context<Operation: ResidualZeroProvider<C::Type>>>(
+fn residualize_zero_from_residual_values<
+    C: Context<Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>>,
+>(
     context: &PartialEvaluationContext<C>,
     r#type: C::Type,
     residual_values: Vec<C::Value>,

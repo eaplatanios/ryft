@@ -974,7 +974,9 @@ where
 impl<C: Context<Type: DifferentiableType + ScanTypeSemantics + TemporalResidualType> + Zero<C::Value>>
     DifferentiableOperation<C> for ScanOperation<C::Constant>
 where
-    C::Operation: ResidualZeroProvider<C::Type> + From<ScanOperation<C::Constant>> + TemporalResidualOperation<C::Type>,
+    C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>
+        + From<ScanOperation<C::Constant>>
+        + TemporalResidualOperation<C::Type>,
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -3256,7 +3258,7 @@ impl<V, F, Target> ScanTransposition<V, F, Target> for ArrayType
 where
     V: Value<Type = ArrayType>,
     F: Value<Type = ArrayType>,
-    Target: Operation<Type = ArrayType> + ResidualZeroProvider<ArrayType> + From<ScanOperation<F>>,
+    Target: Operation<Type = ArrayType> + ResidualZeroProvider<ArrayType, Operation = Target> + From<ScanOperation<F>>,
 {
     // The array universe has no reference types, so no operand carries a cotangent reference.
     fn transpose_scan<D: TranspositionDriver<V, Target>>(
@@ -3276,7 +3278,7 @@ where
     V: Value<Type = ArrayIrType>,
     F: Value<Type = ArrayIrType>,
     Target: ReferenceViewOperation<Type = ArrayIrType>
-        + ResidualZeroProvider<ArrayIrType>
+        + ResidualZeroProvider<ArrayIrType, Operation = Target>
         + From<ScanOperation<F>>
         + From<ReferenceNewOperation<ArrayType, ArrayIrType>>,
 {
@@ -3309,7 +3311,7 @@ fn transpose_array_scan<V, F, Target, D>(
 where
     V: Value<Type: DifferentiableType + ScanTypeSemantics>,
     F: Value<Type = V::Type>,
-    Target: Operation<Type = V::Type> + ResidualZeroProvider<V::Type> + From<ScanOperation<F>>,
+    Target: Operation<Type = V::Type> + ResidualZeroProvider<V::Type, Operation = Target> + From<ScanOperation<F>>,
     D: TranspositionDriver<V, Target>,
 {
     // A scan with only zero output cotangents and no live reference carry is a zero linear map. A live reference carry
@@ -3460,7 +3462,7 @@ pub fn transpose_primal_scan<V, O, F, D: TranspositionDriver<V, O>>(
 where
     V: Value<Type: DifferentiableType + ScanTypeSemantics>,
     F: Value<Type = V::Type>,
-    O: Operation<Type = V::Type> + ResidualZeroProvider<V::Type> + From<ScanOperation<F>>,
+    O: Operation<Type = V::Type> + ResidualZeroProvider<V::Type, Operation = O> + From<ScanOperation<F>>,
 {
     // A scan with only zero output cotangents and no live reference carry is a zero linear map, so every operand
     // cotangent is zero. A live reference carry keeps the rule live, because its accumulated state cotangent flows

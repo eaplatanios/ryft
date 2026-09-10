@@ -569,8 +569,10 @@ impl<
     }
 }
 
-impl<C: Context<Type: DifferentiableType, Operation: ResidualZeroProvider<C::Type>> + Zero<C::Value>>
-    DifferentiableOperation<C> for LinearCallOperation<C::Type>
+impl<
+    C: Context<Type: DifferentiableType, Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>>
+        + Zero<C::Value>,
+> DifferentiableOperation<C> for LinearCallOperation<C::Type>
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -647,7 +649,7 @@ impl<
     V: Value<Type: DifferentiableType>,
     O: Operation<Type = V::Type>
         + From<AddOperation<V::Type>>
-        + ResidualZeroProvider<V::Type>
+        + ResidualZeroProvider<V::Type, Operation = O>
         + From<LinearCallOperation<V::Type>>,
 > TransposableOperation<V, O> for LinearCallOperation<V::Type>
 {

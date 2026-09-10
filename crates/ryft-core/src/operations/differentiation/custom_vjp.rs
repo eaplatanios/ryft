@@ -498,7 +498,7 @@ where
 impl<C: Context + Zero<C::Value>> DifferentiableOperation<C> for CustomVjpOperation<C::Type>
 where
     C::Type: DifferentiableType,
-    C::Operation: ResidualZeroProvider<C::Type> + From<LinearCallOperation<C::Type>>,
+    C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation> + From<LinearCallOperation<C::Type>>,
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,

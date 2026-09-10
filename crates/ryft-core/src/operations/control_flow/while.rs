@@ -1845,7 +1845,7 @@ fn jvp_array_backed_while<C, D: DifferentiationDriver<C>, A, P: DifferentiationP
 where
     C: Context<Type: WhileResidualStackType> + Zero<C::Value>,
     C::Value: Concretizable<bool>,
-    C::Operation: ResidualZeroProvider<C::Type>
+    C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>
         + From<ConditionOperation<C::Constant>>
         + From<WhileOperation<C::Type>>
         + From<ScanOperation<C::Constant>>
@@ -1895,7 +1895,7 @@ where
 impl<C: Context<Type = ArrayType> + Zero<C::Value>> WhileJvp<C> for ArrayType
 where
     C::Value: Concretizable<bool>,
-    C::Operation: ResidualZeroProvider<ArrayType>
+    C::Operation: ResidualZeroProvider<ArrayType, Operation = C::Operation>
         + From<ConditionOperation<C::Constant>>
         + From<WhileOperation<ArrayType>>
         + From<ScanOperation<C::Constant>>
@@ -1923,7 +1923,7 @@ fn jvp_while_bounded<C, D: DifferentiationDriver<C>, A, P: DifferentiationPolicy
 ) -> Result<Vec<DifferentiationDual<C::Value>>, DifferentiationError>
 where
     C: Context<Type: WhileResidualStackType> + Zero<C::Value>,
-    C::Operation: ResidualZeroProvider<C::Type>
+    C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>
         + WhileResidualStackOperation<C::Type, A>
         + From<ConditionOperation<C::Constant>>
         + From<WhileOperation<C::Type>>
@@ -2217,7 +2217,7 @@ impl<C: Context<Type = ArrayIrType> + Zero<C::Value>> WhileJvp<C> for ArrayIrTyp
 where
     C::Constant: ValueProjection<ArrayType>,
     C::Value: Concretizable<bool>,
-    C::Operation: ResidualZeroProvider<ArrayIrType>
+    C::Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation>
         + From<ConditionOperation<C::Constant>>
         + From<WhileOperation<ArrayIrType>>
         + From<ScanOperation<C::Constant>>
@@ -2260,7 +2260,7 @@ fn jvp_while_fused<C, D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
 where
     C: Context + Zero<C::Value>,
     C::Type: DifferentiableType + WhileTypeSemantics,
-    C::Operation: ResidualZeroProvider<C::Type> + From<WhileOperation<C::Type>>,
+    C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation> + From<WhileOperation<C::Type>>,
 {
     let state_count = inputs.len();
 

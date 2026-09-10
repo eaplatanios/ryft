@@ -18,7 +18,7 @@ advised to use the higher-level safe APIs provided by the `ryft-mlir` and `ryft-
 
 ## Dependencies
 
-This crate depends on a static XLA library that it is linked to at built time. This library can be built from source
+This crate depends on a static XLA library that it is linked to at build time. This library can be built from source
 using Bazel (though that is not supported when using `cargo vendor` since it requires network access) or it can be
 provided as a precompiled archive using the `RYFT_XLA_SYS_ARCHIVE` environment variable. Note that, by default this
 crate will attempt to download a precompiled archive from GitHub releases of `ryft`, if one can be found for the target
@@ -159,6 +159,7 @@ Currently, precompiled binaries are only available for the following target plat
 
 - **`ryft-xla-sys` Static Library:**
     - Linux `x86_64`
+    - Linux `aarch64`
     - MacOS `aarch64`
     - Windows `x86_64`
 - **PJRT Plugins for CUDA 12 & 13, ROCm 7, TPUs, and AWS Neuron:**
@@ -167,6 +168,38 @@ Currently, precompiled binaries are only available for the following target plat
     - MacOS `aarch64`
 - **PJRT Plugin for MPS (`jax-mps`):**
     - MacOS `aarch64`
+
+CUDA 12 and CUDA 13 build rows prove that the plugins and their native dependencies compile and link. They do not claim
+GPU execution. Executable Mosaic GPU and cuTile seam probes require the dedicated Linux NVIDIA workflow, a supported
+compute capability, NVIDIA driver r580 or newer, CUDA Toolkit 13.1 or newer, and the pinned cuTile toolchain.
+
+### Native Archive Contract
+
+The static library archive contains one main library under `lib/`, public C/C++ headers under `include/`, Protobuf
+sources and descriptors under `proto/`, and MLIR TableGen inputs under `td/`. Archive construction normalizes member
+ordering, timestamps, ownership, and permissions so identical inputs produce byte-identical release artifacts.
+Archive tests reject missing or duplicate canonical paths and incidental libraries.
+
+Validate the source and archive contracts with `tests/symbol_contract_test.py`, passing `--archive` and the exact JAX,
+OpenXLA, LLVM/MLIR, `ryft-xla-sys`, and `ryft-mlir` source roots through the corresponding `--*-root` options. The
+checker compares pinned and local source surfaces, deliberately excludes TPU, and derives the required native symbols
+in memory before checking the finished archive. CI runs this combined check once and uses `python -m unittest
+tests/symbol_contract_test.py` to test the checker itself. No generated Pallas inventory or symbol list files are
+shipped in Cargo source packages or native release archives.
+
+### Mosaic GPU Contract
+
+The portable archive exposes the pinned Mosaic GPU dialect C API and the `mosaic_gpu-serde` pass. Its Rust constants
+record serde version 6, `MosaicGpuKernelProto` resource version 1, and the `mosaic_gpu_v2` XLA FFI target. Programs
+cross the compiler boundary as MLIR bytecode; the private wheel functions `MosaicGpuCompile`, `MosaicGpuUnload`, and
+`MosaicGpuClearKernelCache` are not a supported ABI.
+
+Only the Linux CUDA PJRT plugin links JAX's Mosaic GPU runtime, passes, target support, and custom-call registration.
+The registration is retained through JAX's always-link targets, and the build workflow asserts that every Linux CUDA
+plugin retains the `mosaic_gpu_v2` registration while exporting only `GetPjrtApi`. CPU, ROCm, macOS, and Windows
+builds remain free of that CUDA-only dependency; `tests/symbol_contract_test.py` rejects CPU archives that define the
+private `MosaicGpu*` runtime ABI, CUDA Driver API entry points such as `cuLaunchKernel`, or cuTile symbols. The native
+linkage does not impose a closed list of SM architectures; runtime and compiler capability checks remain authoritative.
 
 ## Contribution
 

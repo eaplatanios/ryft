@@ -41,13 +41,13 @@ use ryft_core::{
     ReferenceDischargeableOperation, ReferenceDynamicIndexOperation, ReferenceFreezeOperation, ReferenceIndexOperation,
     ReferenceNewOperation, ReferenceReadOperation, ReferenceSliceOperation, ReferenceSwapOperation,
     ReferenceViewOperation, ReferenceViewValidationError, ReferenceWriteOperation, RegionInterface, RegionSlot,
-    RemOperation, ReshapeOperation, ReshardOperation, ResidualZeroProvider, RoundOperation, RsqrtOperation,
-    ScaledDotOperation, ScanOperation, ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation,
-    SinOperation, SliceOperation, SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation,
-    TanhOperation, Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation,
-    TranspositionContext, TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation,
-    Value, ValueProjection, WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation,
-    discharge_positional_region_operation, reapply_array_reference_view, validate_array_reference_view,
+    RemOperation, ReshapeOperation, ReshardOperation, RoundOperation, RsqrtOperation, ScaledDotOperation,
+    ScanOperation, ScatterOperation, SelectOperation, ShardingConstraintOperation, SignOperation, SinOperation,
+    SliceOperation, SqrtOperation, StagingContext, StopGradientOperation, SubOperation, TagOperation, TanhOperation,
+    Tracer, TracingContext, TransferToMemoryOperation, TransposableOperation, TransposeOperation, TranspositionContext,
+    TranspositionDriver, Type, TypeError, TypeIdentityRenaming, Typed, UpdateSliceOperation, Value, ValueProjection,
+    WhileOperation, XorOperation, Zero, ZeroLikeOperation, ZeroOperation, discharge_positional_region_operation,
+    reapply_array_reference_view, validate_array_reference_view,
 };
 use ryft_macros::Parameter;
 
@@ -394,15 +394,15 @@ where
         }
     }
 
-    fn validate_view(
+    fn validate_reference_view(
         view: &ArrayReferenceView,
         source: &ArrayIrType,
-        output: &ArrayIrType,
+        target: &ArrayIrType,
     ) -> Result<(), ReferenceViewValidationError> {
-        validate_array_reference_view(view, source, output)
+        validate_array_reference_view(view, source, target)
     }
 
-    fn reapply_view<C: Context<Type = ArrayIrType, Operation = Self>>(
+    fn reapply_reference_view<C: Context<Type = ArrayIrType, Operation = Self>>(
         context: &C,
         view: &ArrayReferenceView,
         source: C::Value,
@@ -706,40 +706,6 @@ where
     #[inline]
     fn from(operation: AddOperation<ArrayIrType>) -> Self {
         ArrayIrOperation::<Constant::Projected>::from(operation).into()
-    }
-}
-
-impl<Constant> ResidualZeroProvider<ArrayIrType> for XlaOperation<Constant>
-where
-    Constant: Value<Type = ArrayIrType> + ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-{
-    fn zero_residual_types(r#type: &ArrayIrType) -> Vec<ArrayIrType> {
-        <ArrayIrOperation<Constant::Projected> as ResidualZeroProvider<ArrayIrType>>::zero_residual_types(r#type)
-    }
-
-    fn capture_zero_residuals<V: Value<Type = ArrayIrType>>(
-        builder: &mut ProgramBuilder<V, Self>,
-        source: ryft_core::AtomId,
-        r#type: &ArrayIrType,
-    ) -> Result<Vec<ryft_core::AtomId>, ProgramError> {
-        ArrayIrOperation::<Constant::Projected>::capture_zero_residuals(builder, source, r#type)
-    }
-
-    fn capture_zero_residual_value<C: Context<Type = ArrayIrType, Operation = Self>>(
-        context: &C,
-        source: &C::Value,
-        residual_type: &ArrayIrType,
-    ) -> Result<Option<C::Value>, ProgramError> {
-        ArrayIrOperation::<Constant::Projected>::capture_zero_residual_value(context, source, residual_type)
-    }
-
-    fn zero_operation_with_residuals<R: Clone>(
-        r#type: ArrayIrType,
-        residuals: &[R],
-    ) -> Result<(Self, Vec<R>), ProgramError> {
-        let (operation, operands) =
-            ArrayIrOperation::<Constant::Projected>::zero_operation_with_residuals(r#type, residuals)?;
-        Ok((operation.into(), operands))
     }
 }
 
@@ -1824,9 +1790,9 @@ mod tests {
         assert_eq!(operation.reference_view(1), None);
         let stacked = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [3, 2])));
         let slice = ArrayIrType::Reference(ReferenceType::new(ArrayType::new_static(DataType::F32, [2])));
-        assert_eq!(XlaOperation::<XlaConstant>::validate_view(&view, &stacked, &slice), Ok(()));
+        assert_eq!(XlaOperation::<XlaConstant>::validate_reference_view(&view, &stacked, &slice), Ok(()));
         assert_eq!(
-            XlaOperation::<XlaConstant>::validate_view(&view, &stacked, &stacked),
+            XlaOperation::<XlaConstant>::validate_reference_view(&view, &stacked, &stacked),
             Err(ReferenceViewValidationError::TypeMismatch {
                 expected: "f32[2]".to_string(),
                 actual: "f32[3, 2]".to_string(),
@@ -1923,9 +1889,8 @@ mod tests {
         let context = TracingContext::<XlaConstant, XlaOperation>::new();
         let primal = context.input(ArrayIrType::Array(primal_type));
 
-        // The XLA family delegates the singular identity-directed capture hook to the Array-IR implementation. A
-        // source with the same geometry but a different element representation therefore supplies the extent for the
-        // dynamic tangent zero instead of falling through to the input-free default.
+        // The shared array-IR blanket captures the named extent even when the source's element representation differs
+        // from the dynamic tangent zero's. The XLA family uses the same identity-directed rule as the core family.
         let zero = XlaOperation::<XlaConstant>::materialize_zero_from_residual_sources(
             &context,
             MaybeZero::Zero(ArrayIrType::Array(tangent_type.clone())),
@@ -1965,8 +1930,7 @@ mod tests {
         // No single source has the zero's type, so the geometry is assembled per declared residual: the statically
         // shaped candidate names neither identity and is skipped without staging anything, the dynamic array supplies
         // the row extent through a `dimension_size` read, and the first-class dimension supplies the column extent as
-        // itself. Only the composite delegation makes this reachable in the XLA family; the input-free default would
-        // report every residual as unsupplied.
+        // itself. The shared array-IR implementation emits XLA operations directly for the selected sources.
         let zero = XlaOperation::<XlaConstant>::materialize_zero_from_residual_sources(
             &context,
             MaybeZero::Zero(ArrayIrType::Array(zero_type.clone())),

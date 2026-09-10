@@ -676,7 +676,7 @@ where
 impl<C: Context<Type: ConditionTypeSemantics + DifferentiableType> + Zero<C::Value>> DifferentiableOperation<C>
     for ConditionOperation<C::Constant>
 where
-    C::Operation: ResidualZeroProvider<C::Type> + From<ConditionOperation<C::Constant>>,
+    C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation> + From<ConditionOperation<C::Constant>>,
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -1442,7 +1442,7 @@ where
 impl<V, O> ConditionTransposition<V, O> for ArrayType
 where
     V: Value<Type = ArrayType>,
-    O: Operation<Type = ArrayType> + ResidualZeroProvider<ArrayType> + From<ConditionOperation<V>>,
+    O: Operation<Type = ArrayType> + ResidualZeroProvider<ArrayType, Operation = O> + From<ConditionOperation<V>>,
 {
     // The array universe has no reference types, so no operand carries a cotangent reference.
     fn transpose_condition<D: TranspositionDriver<V, O>>(
@@ -1462,7 +1462,7 @@ impl<V, O> ConditionTransposition<V, O> for ArrayIrType
 where
     V: Value<Type = ArrayIrType>,
     O: ReferenceViewOperation<Type = ArrayIrType>
-        + ResidualZeroProvider<ArrayIrType>
+        + ResidualZeroProvider<ArrayIrType, Operation = O>
         + From<ConditionOperation<V>>
         + From<ReferenceNewOperation<ArrayType, ArrayIrType>>,
 {
@@ -1530,7 +1530,7 @@ pub fn transpose_primal_condition<V, O, D: TranspositionDriver<V, O>>(
 ) -> Result<Vec<MaybeZero<Tracer<TracingContext<V, O>>>>, ProgramError>
 where
     V: Value<Type: ConditionTypeSemantics + DifferentiableType>,
-    O: Operation<Type = V::Type> + ResidualZeroProvider<V::Type> + From<ConditionOperation<V>>,
+    O: Operation<Type = V::Type> + ResidualZeroProvider<V::Type, Operation = O> + From<ConditionOperation<V>>,
 {
     // A condition with no live output cotangents and no live reference operand is a zero linear map, so every operand
     // cotangent is zero. A live reference operand keeps the rule live, because its accumulated state cotangent flows

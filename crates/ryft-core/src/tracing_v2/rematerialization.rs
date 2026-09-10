@@ -446,7 +446,7 @@ impl<C: Context<Type: DifferentiableType>> PartiallyEvaluatableOperation<C> for 
 impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperation<C>
     for RematerializeOperation<C::Type>
 where
-    C::Operation: ResidualZeroProvider<C::Type> + From<LinearCallOperation<C::Type>>,
+    C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation> + From<LinearCallOperation<C::Type>>,
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,
@@ -2384,7 +2384,7 @@ where
             To<<D as Domain>::Constant> = OT::To<<D as Domain>::Constant>,
         >,
     <D as Domain>::Operation: From<RematerializeOperation<<D as Domain>::Type>>
-        + ResidualZeroProvider<D::Type>
+        + ResidualZeroProvider<D::Type, Operation = D::Operation>
         + OperationProvider<D::Type, ReferenceNewOperation<D::Type, D::Type>, Operation = <D as Domain>::Operation>
         + OperationProvider<D::Type, ReferenceAddUpdateOperation<D::Type, D::Type>, Operation = <D as Domain>::Operation>
         + From<AddOperation<D::Type>>

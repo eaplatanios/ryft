@@ -1,7 +1,9 @@
 load("@buildifier_prebuilt//:rules.bzl", "buildifier")
 load("@com_google_protobuf//bazel:proto_library.bzl", "proto_library")
+load("@llvm-project//mlir:tblgen.bzl", "gentbl_cc_library")
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_python//python:defs.bzl", "py_binary", "py_test")
 load("@xla//xla/tsl:tsl.bzl", "tsl_copts")
 load("//bazel:archive.bzl", "build_archive", "extract_headers")
 
@@ -43,10 +45,13 @@ platform(
 # ----------------------------------------------------
 
 XLA_DEPENDENCIES = [
+    ":mlir_complex_capi",
+    ":mlir_math_vector_pass_capi",
     ":triton_tt_dialect",
     "@com_google_absl//absl/status",
     "@com_google_absl//absl/status:statusor",
     "@jax//jaxlib/mosaic/dialect/gpu:gpu_dialect_capi_objects",
+    "@jax//jaxlib/mosaic/gpu:mlir_capi_objects",
     "@jax//jaxlib/mosaic:tpu_dialect_capi_objects",
     "@llvm-project//llvm:Support",
     "@llvm-project//mlir:AffineDialect",
@@ -84,12 +89,14 @@ XLA_DEPENDENCIES = [
     "@llvm-project//mlir:CAPITransforms",
     "@llvm-project//mlir:CAPIQuant",
     "@llvm-project//mlir:CAPIVector",
+    "@llvm-project//mlir:BufferizationDialect",
     "@llvm-project//mlir:FuncDialect",
     "@llvm-project//mlir:GPUDialect",
     "@llvm-project//mlir:IR",
     "@llvm-project//mlir:LLVMDialect",
     "@llvm-project//mlir:ShapeDialect",
     "@llvm-project//mlir:Support",
+    "@llvm-project//mlir:UBDialect",
     "@shardy//shardy/integrations/c:sdy_capi",
     "@stablehlo//:chlo_capi",
     "@stablehlo//:stablehlo_capi",
@@ -97,9 +104,19 @@ XLA_DEPENDENCIES = [
     "@stablehlo//:vhlo_capi",
     "@xla//xla/ffi/api:c_api",
     "@xla//xla/pjrt/c:pjrt_c_api_abi_version_extension_hdrs",
+    "@xla//xla/pjrt/c:pjrt_c_api_ffi_extension_hdrs",
+    "@xla//xla/pjrt/c:pjrt_c_api_layouts_extension_hdrs",
+    "@xla//xla/pjrt/c:pjrt_c_api_megascale_extension_hdrs",
+    "@xla//xla/pjrt/c:pjrt_c_api_memory_descriptions_extension_hdrs",
+    "@xla//xla/pjrt/c:pjrt_c_api_phase_compile_extension_hdrs",
+    "@xla//xla/pjrt/c:pjrt_c_api_profiler_extension_hdrs",
+    "@xla//xla/pjrt/c:pjrt_c_api_raw_buffer_extension_hdrs",
     "@xla//xla/pjrt/c:pjrt_c_api_status_utils",
+    "@xla//xla/pjrt/c:pjrt_c_api_stream_extension_hdrs",
+    "@xla//xla/pjrt/c:pjrt_c_api_triton_extension_hdrs",
     "@xla//xla/pjrt/c:pjrt_c_api_xla_transform_extension_hdrs",
     "@xla//xla/pjrt/extensions/host_allocator:host_allocator_extension",
+    "@xla//xla/pjrt/extensions/host_memory_allocator:host_memory_allocator_extension",
     "@xla//xla/mlir_hlo:CAPI",
     "@xla//xla/pjrt/distributed",
     "@xla//xla/python:aggregate_profile",
@@ -122,6 +139,108 @@ RYFT_PJRT_SYS_DEPENDENCIES = XLA_DEPENDENCIES + select({
         "@xla//xla/pjrt/c:pjrt_c_api_cpu",
     ],
 })
+
+# The XLA LLVM Bazel overlay exposes Math and Vector pass C API declarations but omits their generated implementations.
+# Generate those implementations from the same pinned TableGen sources so Rust bindings resolve from the native archive.
+gentbl_cc_library(
+    name = "arith_pass_capi_impl_inc_gen",
+    tbl_outs = {
+        "mlir/Dialect/Arith/Transforms/Passes.capi.cpp.inc": [
+            "-gen-pass-capi-impl",
+        ],
+    },
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "@llvm-project//mlir:include/mlir/Dialect/Arith/Transforms/Passes.td",
+    deps = ["@llvm-project//mlir:PassBaseTdFiles"],
+)
+
+gentbl_cc_library(
+    name = "llvm_pass_capi_impl_inc_gen",
+    tbl_outs = {
+        "mlir/Dialect/LLVMIR/Transforms/Passes.capi.cpp.inc": [
+            "-gen-pass-capi-impl",
+        ],
+    },
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "@llvm-project//mlir:include/mlir/Dialect/LLVMIR/Transforms/Passes.td",
+    deps = [
+        "@llvm-project//mlir:LLVMOpsTdFiles",
+        "@llvm-project//mlir:PassBaseTdFiles",
+    ],
+)
+
+gentbl_cc_library(
+    name = "math_pass_capi_impl_inc_gen",
+    tbl_outs = {
+        "mlir/Dialect/Math/Transforms/Passes.capi.cpp.inc": [
+            "-gen-pass-capi-impl",
+        ],
+    },
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "@llvm-project//mlir:include/mlir/Dialect/Math/Transforms/Passes.td",
+    deps = ["@llvm-project//mlir:PassBaseTdFiles"],
+)
+
+gentbl_cc_library(
+    name = "memref_pass_capi_impl_inc_gen",
+    tbl_outs = {
+        "mlir/Dialect/MemRef/Transforms/Passes.capi.cpp.inc": [
+            "-gen-pass-capi-impl",
+        ],
+    },
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "@llvm-project//mlir:include/mlir/Dialect/MemRef/Transforms/Passes.td",
+    deps = ["@llvm-project//mlir:PassBaseTdFiles"],
+)
+
+gentbl_cc_library(
+    name = "vector_pass_capi_impl_inc_gen",
+    tbl_outs = {
+        "mlir/Dialect/Vector/Transforms/Passes.capi.cpp.inc": [
+            "-gen-pass-capi-impl",
+        ],
+    },
+    tblgen = "@llvm-project//mlir:mlir-tblgen",
+    td_file = "@llvm-project//mlir:include/mlir/Dialect/Vector/Transforms/Passes.td",
+    deps = ["@llvm-project//mlir:PassBaseTdFiles"],
+)
+
+cc_library(
+    name = "mlir_complex_capi",
+    srcs = ["src/c++/mlir/dialects/complex.cc"],
+    hdrs = ["src/c++/mlir/dialects/complex.h"],
+    deps = [
+        "@llvm-project//mlir:CAPIIR",
+        "@llvm-project//mlir:ComplexDialect",
+    ],
+    alwayslink = True,
+)
+
+cc_library(
+    name = "mlir_math_vector_pass_capi",
+    srcs = ["src/c++/mlir/math_vector_passes.cc"],
+    deps = [
+        ":arith_pass_capi_impl_inc_gen",
+        ":llvm_pass_capi_impl_inc_gen",
+        ":math_pass_capi_impl_inc_gen",
+        ":memref_pass_capi_impl_inc_gen",
+        ":vector_pass_capi_impl_inc_gen",
+        "@llvm-project//mlir:ArithPassIncGen",
+        "@llvm-project//mlir:ArithTransforms",
+        "@llvm-project//mlir:CAPIIR",
+        "@llvm-project//mlir:LLVMIRTransforms",
+        "@llvm-project//mlir:LLVMPassIncGen",
+        "@llvm-project//mlir:MathDialect",
+        "@llvm-project//mlir:MathPassIncGen",
+        "@llvm-project//mlir:MathTransforms",
+        "@llvm-project//mlir:MemRefPassIncGen",
+        "@llvm-project//mlir:MemRefTransforms",
+        "@llvm-project//mlir:VectorDialect",
+        "@llvm-project//mlir:VectorPassIncGen",
+        "@llvm-project//mlir:VectorTransforms",
+    ],
+    alwayslink = True,
+)
 
 # `@triton//:TritonDialects` also compiles `TritonGPU`, `TritonNvidiaGPU`, and analysis utilities, but the
 # `ryft-mlir` TT wrappers only need the core `tt` IR dialect for type, attribute, operation, and dialect registration
@@ -185,6 +304,7 @@ cc_library(
         "src/c++/distributed.cc",
         "src/c++/mlir/dialects/affine.cc",
         "src/c++/mlir/dialects/arith.cc",
+        "src/c++/mlir/dialects/bufferization.cc",
         "src/c++/mlir/dialects/builtin.cc",
         "src/c++/mlir/dialects/gpu.cc",
         "src/c++/mlir/dialects/llvm.cc",
@@ -195,6 +315,7 @@ cc_library(
         "src/c++/mlir/dialects/sparse_tensor.cc",
         "src/c++/mlir/dialects/transform.cc",
         "src/c++/mlir/dialects/triton.cc",
+        "src/c++/mlir/dialects/ub.cc",
         "src/c++/profiler.cc",
     ],
     hdrs = [
@@ -202,6 +323,7 @@ cc_library(
         "src/c++/distributed.h",
         "src/c++/mlir/dialects/affine.h",
         "src/c++/mlir/dialects/arith.h",
+        "src/c++/mlir/dialects/bufferization.h",
         "src/c++/mlir/dialects/builtin.h",
         "src/c++/mlir/dialects/gpu.h",
         "src/c++/mlir/dialects/llvm.h",
@@ -212,6 +334,7 @@ cc_library(
         "src/c++/mlir/dialects/sparse_tensor.h",
         "src/c++/mlir/dialects/transform.h",
         "src/c++/mlir/dialects/triton.h",
+        "src/c++/mlir/dialects/ub.h",
         "src/c++/profiler.h",
     ],
     copts = tsl_copts() + [
@@ -241,6 +364,7 @@ filegroup(
 filegroup(
     name = "ryft-xla-sys-td-files",
     srcs = [
+        "@jax//jaxlib/mosaic/dialect/gpu:mosaic_gpu_td_files",
         "@llvm-project//mlir:AffineOpsTdFiles",
         "@llvm-project//mlir:ArithOpsTdFiles",
         "@llvm-project//mlir:AsyncOpsTdFiles",
@@ -274,6 +398,7 @@ filegroup(
         "@llvm-project//mlir:ShapeOpsTdFiles",
         "@llvm-project//mlir:TensorOpsTdFiles",
         "@llvm-project//mlir:TensorTransformOpsTdFiles",
+        "@llvm-project//mlir:UBDialectTdFiles",
         "@llvm-project//mlir:VCIXTdFiles",
         "@llvm-project//mlir:VectorOpsTdFiles",
         "@llvm-project//mlir:VectorTransformOpsTdFiles",
@@ -302,13 +427,36 @@ proto_library(
 
 build_archive(
     name = "ryft-xla-sys-archive",
+    library = ":ryft-xla-sys-static-library",
     deps = [
         ":ryft-xla-sys-headers",
         ":ryft-xla-sys-protos",
-        ":ryft-xla-sys-static-library",
         ":ryft-xla-sys-td-files",
         "@llvm-project//mlir:c_headers",
     ],
+)
+
+# General packaging utility so that native archives are byte-reproducible.
+py_binary(
+    name = "create-deterministic-archive",
+    srcs = ["tools/create_deterministic_archive.py"],
+    main = "tools/create_deterministic_archive.py",
+)
+
+py_test(
+    name = "ryft-xla-sys-archive-content-test",
+    srcs = ["tests/archive_contract_test.py"],
+    args = ["$(location :ryft-xla-sys-archive)"],
+    data = [":ryft-xla-sys-archive"],
+    main = "tests/archive_contract_test.py",
+)
+
+py_test(
+    name = "ryft-xla-sys-archive-reproducibility-test",
+    srcs = ["tests/archive_reproducibility_test.py"],
+    args = ["$(location :create-deterministic-archive)"],
+    data = [":create-deterministic-archive"],
+    main = "tests/archive_reproducibility_test.py",
 )
 
 cc_binary(
@@ -332,7 +480,7 @@ cc_binary(
         ],
     }),
     linkshared = True,
-    target_compatible_with = select({
+    target_compatible_with = ["@platforms//os:linux"] + select({
         "@local_config_cuda//:is_cuda_enabled": [],
         "@local_config_rocm//rocm:using_hipcc": [],
         "//conditions:default": ["@platforms//:incompatible"],
@@ -343,6 +491,7 @@ cc_binary(
         "@xla//xla/service:gpu_plugin",
     ] + select({
         "@local_config_cuda//:is_cuda_enabled": [
+            "@jax//jaxlib/mosaic/gpu:mosaic_gpu_support",
             "@xla//xla/stream_executor:cuda_platform",
         ],
         "@local_config_rocm//rocm:using_hipcc": [

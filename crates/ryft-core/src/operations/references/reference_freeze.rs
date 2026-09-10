@@ -227,7 +227,7 @@ where
     ReferenceFreezeOperation<T, U>: Operation<Type = U>,
     V: Value<Type = U>,
     O: ReferenceViewOperation<Type = U>
-        + ResidualZeroProvider<U>
+        + ResidualZeroProvider<U, Operation = O>
         + OperationProvider<U, ReferenceNewOperation<U, U>, Operation = O>,
     Tracer<TracingContext<V, O>>: ReferenceAddUpdate,
 {

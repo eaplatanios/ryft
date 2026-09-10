@@ -6,7 +6,10 @@ description = "Ryft bindings for XLA."
 keywords = ["ryft", "xla", "pjrt", "mlir", "gpu"]
 include = [
     "bazel/**/*",
+    "patches/**/*",
     "src/**/*",
+    "tests/**/*",
+    "tools/**/*",
     ".bazelrc",
     ".bazelversion",
     "build.rs",

@@ -281,7 +281,7 @@ impl<V: Typed> CotangentReferenceAccumulator<V> {
 impl<
     V: Value<Type: DifferentiableType>,
     O: Operation<Type = V::Type>
-        + ResidualZeroProvider<V::Type>
+        + ResidualZeroProvider<V::Type, Operation = O>
         + OperationProvider<V::Type, ReferenceNewOperation<V::Type, V::Type>, Operation = O>,
 > CotangentReferenceAccumulator<Tracer<TracingContext<V, O>>>
 {
@@ -769,7 +769,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     where
         V::Type: DifferentiableType,
         O: ReferenceViewOperation
-            + ResidualZeroProvider<V::Type>
+            + ResidualZeroProvider<V::Type, Operation = O>
             + OperationProvider<V::Type, ReferenceNewOperation<V::Type, V::Type>, Operation = O>,
     {
         let (_, value, root) = self.reference_input(driver, input_index)?;
@@ -973,7 +973,7 @@ impl<V: Value, O: Operation<Type = V::Type>> TranspositionContext<V, O> {
     where
         V::Type: DifferentiableType,
         O: ReferenceViewOperation
-            + ResidualZeroProvider<V::Type>
+            + ResidualZeroProvider<V::Type, Operation = O>
             + OperationProvider<V::Type, ReferenceNewOperation<V::Type, V::Type>, Operation = O>,
     {
         if !accumulators.is_empty() {
@@ -1274,7 +1274,7 @@ impl<
         input_structure: Input::ParameterStructure,
     ) -> Result<Self, ProgramError>
     where
-        C::Operation: ResidualZeroProvider<C::Type>,
+        C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>,
     {
         let (context, linear_program, residuals, primal_input_types, primal_output_types, primal_references) =
             pushforward.into_parts();
@@ -1325,7 +1325,7 @@ impl<
     ) -> Result<Arc<Program<C::Constant, C::Operation, Vec<C::Constant>, Vec<C::Constant>>>, DifferentiationError>
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type>
+            + ResidualZeroProvider<C::Type, Operation = C::Operation>
             + OperationProvider<C::Type, ReferenceNewOperation<C::Type, C::Type>, Operation = C::Operation>
             + OperationProvider<C::Type, ReferenceAddUpdateOperation<C::Type, C::Type>, Operation = C::Operation>
             + From<AddOperation<C::Type>>,
@@ -1374,7 +1374,7 @@ impl<
     >
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type>
+            + ResidualZeroProvider<C::Type, Operation = C::Operation>
             + OperationProvider<C::Type, ReferenceNewOperation<C::Type, C::Type>, Operation = C::Operation>
             + OperationProvider<C::Type, ReferenceAddUpdateOperation<C::Type, C::Type>, Operation = C::Operation>
             + From<AddOperation<C::Type>>,
@@ -1398,7 +1398,7 @@ impl<
     pub fn apply(&self, cotangents: Output::To<C::Value>) -> Result<Input::To<C::Value>, ProgramError>
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type>
+            + ResidualZeroProvider<C::Type, Operation = C::Operation>
             + OperationProvider<C::Type, ReferenceNewOperation<C::Type, C::Type>, Operation = C::Operation>
             + OperationProvider<C::Type, ReferenceAddUpdateOperation<C::Type, C::Type>, Operation = C::Operation>
             + From<AddOperation<C::Type>>,
@@ -1465,7 +1465,7 @@ impl<
     ) -> Result<Input::To<Option<C::Value>>, ProgramError>
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type>
+            + ResidualZeroProvider<C::Type, Operation = C::Operation>
             + OperationProvider<C::Type, ReferenceNewOperation<C::Type, C::Type>, Operation = C::Operation>
             + OperationProvider<C::Type, ReferenceAddUpdateOperation<C::Type, C::Type>, Operation = C::Operation>
             + From<AddOperation<C::Type>>,
@@ -1490,7 +1490,7 @@ impl<
     where
         C::Operation: OperationProvider<C::Type, ReferenceFreezeOperation<C::Type, C::Type>, Operation = C::Operation>
             + TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type>
+            + ResidualZeroProvider<C::Type, Operation = C::Operation>
             + OperationProvider<C::Type, ReferenceNewOperation<C::Type, C::Type>, Operation = C::Operation>
             + OperationProvider<C::Type, ReferenceAddUpdateOperation<C::Type, C::Type>, Operation = C::Operation>
             + From<AddOperation<C::Type>>,
@@ -1536,7 +1536,7 @@ impl<
     ) -> Result<Vec<Option<C::Value>>, ProgramError>
     where
         C::Operation: TransposableOperation<C::Constant, C::Operation>
-            + ResidualZeroProvider<C::Type>
+            + ResidualZeroProvider<C::Type, Operation = C::Operation>
             + OperationProvider<C::Type, ReferenceNewOperation<C::Type, C::Type>, Operation = C::Operation>
             + OperationProvider<C::Type, ReferenceAddUpdateOperation<C::Type, C::Type>, Operation = C::Operation>
             + From<AddOperation<C::Type>>,
@@ -1832,7 +1832,7 @@ impl<V: Value, O: Operation<Type = V::Type>> RegionDriver<V, O> for RecursiveTra
 impl<
     V: Value<Type: DifferentiableType>,
     O: TransposableOperation<V, O>
-        + ResidualZeroProvider<V::Type>
+        + ResidualZeroProvider<V::Type, Operation = O>
         + OperationProvider<V::Type, ReferenceNewOperation<V::Type, V::Type>, Operation = O>
         + OperationProvider<V::Type, ReferenceAddUpdateOperation<V::Type, V::Type>, Operation = O>
         + From<AddOperation<V::Type>>,
@@ -2059,7 +2059,7 @@ impl<
     T: DifferentiableType,
     V: Value<Type = T>,
     O: TransposableOperation<V, O>
-        + ResidualZeroProvider<T>
+        + ResidualZeroProvider<T, Operation = O>
         + OperationProvider<T, ReferenceNewOperation<T, T>, Operation = O>
         + OperationProvider<T, ReferenceAddUpdateOperation<T, T>, Operation = O>
         + From<AddOperation<T>>,
@@ -2872,7 +2872,7 @@ where
     T: DifferentiableType,
     V: Value<Type = T>,
     O: TransposableOperation<V, O>
-        + ResidualZeroProvider<T>
+        + ResidualZeroProvider<T, Operation = O>
         + OperationProvider<T, ReferenceNewOperation<T, T>, Operation = O>
         + OperationProvider<T, ReferenceAddUpdateOperation<T, T>, Operation = O>
         + From<AddOperation<T>>,
@@ -3108,7 +3108,7 @@ pub trait ReverseModeDifferentiate:
                        + PartiallyEvaluatableOperation<TracingContext<Self::Constant, Self::Operation>>
                        + DifferentiableOperation<PartialEvaluationContext<Self>>
                        + TransposableOperation<Self::Constant, Self::Operation>
-                       + ResidualZeroProvider<Self::Type>
+                       + ResidualZeroProvider<Self::Type, Operation = Self::Operation>
                        + OperationProvider<
             Self::Type,
             ReferenceNewOperation<Self::Type, Self::Type>,
@@ -3197,7 +3197,7 @@ impl<C: ForwardModeDifferentiate + Context> ReverseModeDifferentiate for C where
         + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
         + DifferentiableOperation<PartialEvaluationContext<C>>
         + TransposableOperation<C::Constant, C::Operation>
-        + ResidualZeroProvider<C::Type>
+        + ResidualZeroProvider<C::Type, Operation = C::Operation>
         + OperationProvider<C::Type, ReferenceNewOperation<C::Type, C::Type>, Operation = C::Operation>
         + OperationProvider<C::Type, ReferenceAddUpdateOperation<C::Type, C::Type>, Operation = C::Operation>
         + From<AddOperation<C::Type>>
@@ -3643,7 +3643,7 @@ fn gradient_destinations<C: Context + Zero<C::Value>, Input: Parameterized<C::Va
 where
     C::Type: DifferentiableType,
     C::Operation: OperationProvider<C::Type, ReferenceNewOperation<C::Type, C::Type>, Operation = C::Operation>
-        + ResidualZeroProvider<C::Type>,
+        + ResidualZeroProvider<C::Type, Operation = C::Operation>,
 {
     primals
         .parameters()

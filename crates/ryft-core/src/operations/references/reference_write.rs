@@ -149,7 +149,10 @@ where
     T: Type,
     U: DifferentiableType,
     ReferenceWriteOperation<T, U>: Operation<Type = U>,
-    C: Context<Type = U, Operation: From<ReferenceWriteOperation<T, U>> + ResidualZeroProvider<U>> + Zero<C::Value>,
+    C: Context<
+            Type = U,
+            Operation: From<ReferenceWriteOperation<T, U>> + ResidualZeroProvider<U, Operation = C::Operation>,
+        > + Zero<C::Value>,
 {
     // The replacement's tangent is stored into the tangent reference exactly as the primal replacement is stored into
     // the primal reference. The tangent pairing is resolved before either store so that a rejected plumbing store
@@ -218,7 +221,7 @@ where
     V: Value<Type = U>,
     O: ReferenceViewOperation<Type = U>
         + From<AddOperation<U>>
-        + ResidualZeroProvider<U>
+        + ResidualZeroProvider<U, Operation = O>
         + From<ReferenceSwapOperation<T, U>>,
     ReferenceSwapOperation<T, U>: Operation<Type = U>,
 {

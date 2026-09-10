@@ -573,7 +573,7 @@ where
     C: Context<Type = ArrayIrType> + Zero<C::Value>,
     C::Constant: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
     C::Value: ValueProjection<ArrayType, Projected: Value<Type = ArrayType>>,
-    C::Operation: ResidualZeroProvider<ArrayIrType> + OperationProjection<ArrayType>,
+    C::Operation: ResidualZeroProvider<ArrayIrType, Operation = C::Operation> + OperationProjection<ArrayType>,
     <C::Operation as OperationProjection<ArrayType>>::Projected: DifferentiableOperation<ProjectedContext<C, ArrayType>>
         + From<ScatterOperation>
         + From<ZeroLikeOperation<ArrayType>>

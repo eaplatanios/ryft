@@ -380,7 +380,7 @@ where
 
 impl<C: Context<Type: DifferentiableType> + Zero<C::Value>> DifferentiableOperation<C> for CustomJvpOperation<C::Type>
 where
-    C::Operation: ResidualZeroProvider<C::Type>,
+    C::Operation: ResidualZeroProvider<C::Type, Operation = C::Operation>,
 {
     fn jvp<D: DifferentiationDriver<C>, P: DifferentiationPolicy<C>>(
         &self,

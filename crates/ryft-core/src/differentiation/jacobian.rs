@@ -219,7 +219,7 @@ where
     C::Type: DenseDifferentiableType<C>,
     C::Operation: PartiallyEvaluatableOperation<C>
         + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
-        + ResidualZeroProvider<C::Type>,
+        + ResidualZeroProvider<C::Type, Operation = C::Operation>,
 {
     // Preserve the input tree while deriving an isomorphic tree of input types. Validate differentiability and the
     // ordinary-versus-holomorphic complex-type contract before tracing the derivative program.
@@ -419,7 +419,7 @@ where
         + PartiallyEvaluatableOperation<TracingContext<C::Constant, C::Operation>>
         + DifferentiableOperation<PartialEvaluationContext<C>>
         + TransposableOperation<C::Constant, C::Operation>
-        + ResidualZeroProvider<C::Type>
+        + ResidualZeroProvider<C::Type, Operation = C::Operation>
         + OperationProvider<C::Type, ReferenceNewOperation<C::Type, C::Type>, Operation = C::Operation>
         + OperationProvider<C::Type, ReferenceAddUpdateOperation<C::Type, C::Type>, Operation = C::Operation>
         + From<AddOperation<C::Type>>,
